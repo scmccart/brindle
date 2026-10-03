@@ -270,6 +270,18 @@ impl Workspace {
         self.activate(index, window, cx);
     }
 
+    /// Inserts `tab` at `index` without activating it; the active tab stays
+    /// the same. Used for tmux windows, which come to the front only when
+    /// tmux makes them current.
+    fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) {
+        let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 }).min(self.tabs.len());
+        if !self.tabs.is_empty() && index <= self.active {
+            self.active += 1;
+        }
+        self.tabs.insert(index, tab);
+        cx.notify();
+    }
+
     fn attach_tmux(&mut self, profile: Profile, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let session_name = profile.tmux_session_name().to_string();
@@ -324,7 +336,7 @@ impl Workspace {
                 let tab = Tab::new(profile, TabContent::Tmux { session: session.clone(), view }, subscriptions, cx);
                 // Keep a session's tabs together, in tmux's window order.
                 let index = self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)).map(|i| i + 1);
-                self.insert_tab(tab, index, window, cx);
+                self.insert_tab_inactive(tab, index, cx);
             }
             TmuxEvent::WindowClosed(window_id) => {
                 if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
@@ -332,8 +344,10 @@ impl Workspace {
                 }
             }
             TmuxEvent::WindowActivated(window_id) => {
+                // Tabs are added without activation, so the current window's
+                // tab may already be `active` (e.g. the first tab) yet unfocused.
                 if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx))
-                    && ix != self.active
+                    && (ix != self.active || !self.tabs[ix].focus_handle(cx).contains_focused(window, cx))
                 {
                     self.activate(ix, window, cx);
                 }
