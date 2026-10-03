@@ -281,24 +281,75 @@ fn paint_dividers(
 ) {
     let normal = theme.chrome_border().mix(theme.foreground, 0.15).hsla();
     let accent = theme.accent().hsla();
-    for d in dividers {
+    for (ix, d) in dividers.iter().enumerate() {
         let vertical = d.width == 1 && d.height > 1;
-        let segments = divider_segments(d, vertical, active);
-        for (start, end, highlighted) in segments {
+        // Along the divider: cell size, origin, and where a crossing line sits.
+        let (cell, start) = if vertical { (lh, origin.y) } else { (cw, origin.x) };
+        let line = |c: u16| (start + cell * c as f32 + cell / 2.0).floor();
+        let pixel = |edge: Edge| match edge {
+            Edge::Cell(c) => start + cell * c as f32,
+            Edge::AtLine(c) => line(c),
+            Edge::PastLine(c) => line(c) + px(1.0),
+        };
+        for (from, to, highlighted) in divider_segments(d, vertical, active) {
             let color: Hsla = if highlighted { accent } else { normal };
+            let (p0, p1) = (pixel(divider_edge(ix, dividers, vertical, from)), pixel(divider_edge(ix, dividers, vertical, to)));
             let bounds = if vertical {
                 let x = (origin.x + cw * d.x as f32 + cw / 2.0).floor();
-                let y0 = origin.y + lh * start as f32;
-                let y1 = origin.y + lh * end as f32;
-                Bounds::new(point(x, y0), size(px(1.0), y1 - y0))
+                Bounds::new(point(x, p0), size(px(1.0), p1 - p0))
             } else {
                 let y = (origin.y + lh * d.y as f32 + lh / 2.0).floor();
-                let x0 = origin.x + cw * start as f32;
-                let x1 = origin.x + cw * end as f32;
-                Bounds::new(point(x0, y), size(x1 - x0, px(1.0)))
+                Bounds::new(point(p0, y), size(p1 - p0, px(1.0)))
             };
             window.paint_quad(fill(bounds, color));
         }
+    }
+}
+
+/// Where a divider segment starts or ends, along the divider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// At the leading edge of cell `c`.
+    Cell(u16),
+    /// On the line drawn through cell `c`, including it.
+    AtLine(u16),
+    /// Just past the line drawn through cell `c`.
+    PastLine(u16),
+}
+
+/// Where boundary `at` (a cell position along divider `ix`) is drawn. Lines
+/// meet: an end that runs into another divider reaches its line, and a
+/// colour change next to a crossing divider happens on that divider's line.
+pub fn divider_edge(ix: usize, dividers: &[Rect], vertical: bool, at: u16) -> Edge {
+    let d = dividers[ix];
+    let covered = |x: i32, y: i32| {
+        dividers.iter().enumerate().any(|(other, r)| {
+            other != ix
+                && (r.x as i32..(r.x + r.width) as i32).contains(&x)
+                && (r.y as i32..(r.y + r.height) as i32).contains(&y)
+        })
+    };
+    // Cell `c` along the divider, and its two neighbours across it.
+    let on = |c: i32| if vertical { covered(d.x as i32, c) } else { covered(c, d.y as i32) };
+    let crossed = |c: i32| {
+        if vertical {
+            covered(d.x as i32 - 1, c) || covered(d.x as i32 + 1, c)
+        } else {
+            covered(c, d.y as i32 - 1) || covered(c, d.y as i32 + 1)
+        }
+    };
+    let (start, end) = if vertical { (d.y, d.y + d.height) } else { (d.x, d.x + d.width) };
+    let c = at as i32;
+    if at == start {
+        if on(c - 1) { Edge::AtLine(at - 1) } else { Edge::Cell(at) }
+    } else if at == end {
+        if on(c) { Edge::PastLine(at) } else { Edge::Cell(at) }
+    } else if crossed(c - 1) {
+        Edge::AtLine(at - 1)
+    } else if crossed(c) {
+        Edge::PastLine(at)
+    } else {
+        Edge::Cell(at)
     }
 }
 
@@ -334,6 +385,31 @@ mod tests {
 
     fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
         Rect { x, y, width, height }
+    }
+
+    #[test]
+    fn dividers_meet_at_junctions() {
+        use Edge::*;
+        // Left pane full height; right column split at row 16 (a T).
+        let t = [r(57, 0, 1, 33), r(58, 16, 56, 1)];
+        // The vertical's ends touch nothing; its highlight for the lower
+        // right pane starts on the horizontal's line, not at row 17.
+        assert_eq!(divider_edge(0, &t, true, 0), Cell(0));
+        assert_eq!(divider_edge(0, &t, true, 33), Cell(33));
+        assert_eq!(divider_edge(0, &t, true, 17), AtLine(16));
+        // The horizontal starts on the vertical's line.
+        assert_eq!(divider_edge(1, &t, false, 58), AtLine(57));
+        assert_eq!(divider_edge(1, &t, false, 114), Cell(114));
+
+        // 2x2 grid: a full-width horizontal crossed by a vertical in each row.
+        let grid = [r(0, 15, 114, 1), r(56, 0, 1, 15), r(56, 16, 1, 17)];
+        // The top-right highlight on the horizontal starts on the verticals' line.
+        assert_eq!(divider_edge(0, &grid, false, 57), AtLine(56));
+        // The verticals reach the horizontal's line from above and below.
+        assert_eq!(divider_edge(1, &grid, true, 15), PastLine(15));
+        assert_eq!(divider_edge(2, &grid, true, 16), AtLine(15));
+        // A boundary away from any junction stays on the cell edge.
+        assert_eq!(divider_edge(0, &grid, false, 30), Cell(30));
     }
 
     #[test]
