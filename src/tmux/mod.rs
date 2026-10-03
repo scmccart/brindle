@@ -20,6 +20,7 @@ use gpui::{AppContext as _, Context, Entity, EventEmitter, Task};
 
 use crate::config::{Config, Profile};
 use crate::terminal::{GridSize, Terminal};
+use crate::theme::Color;
 use layout::Layout;
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
 
@@ -611,13 +612,17 @@ impl TmuxSession {
                 }
             });
             let theme = self.config.profile_theme(&self.profile);
+            let reports = color_report_commands(id, theme.foreground, theme.background);
             let config = &self.config;
             let terminal = cx.new(|cx| Terminal::remote(size, theme, config, input, cx));
             self.panes.insert(id, Pane { terminal, restoring: Some(Restore::default()) });
 
+            let mut io = self.io.borrow_mut();
+            for command in reports {
+                io.send(command, Pending::Ignore);
+            }
             // Snapshot the pane: state, alternate-saved screen, then the visible
             // screen plus history. Sent back to back so no output slips between.
-            let mut io = self.io.borrow_mut();
             io.send(
                 format!("display-message -p -t %{id} -F {}", protocol::quote(PANE_STATE_FORMAT)),
                 Pending::PaneState(id),
@@ -648,10 +653,18 @@ impl TmuxSession {
         cx.emit(if self.attached { TmuxEvent::Detached(reason) } else { TmuxEvent::Failed(reason) });
     }
 
-    /// Picks up a reloaded config for panes created from now on.
+    /// Picks up a reloaded config for panes created from now on, and reports
+    /// the new theme's colors for the existing ones.
     pub fn set_config(&mut self, profile: Profile, config: &Config) {
         self.profile = profile;
         self.config = config.clone();
+        let theme = self.config.profile_theme(&self.profile);
+        let mut io = self.io.borrow_mut();
+        for &id in self.panes.keys() {
+            for command in color_report_commands(id, theme.foreground, theme.background) {
+                io.send(command, Pending::Ignore);
+            }
+        }
     }
 }
 
@@ -702,6 +715,19 @@ fn rename_window_command(window: WindowId, name: &str) -> Option<String> {
     (!name.is_empty()).then(|| format!("rename-window -t @{window} {}", protocol::quote(name)))
 }
 
+/// `refresh-client -r` commands giving tmux a pane's default foreground and
+/// background as OSC 10/11 reports. A control client has no tty for tmux to
+/// ask, so without them tmux answers color queries in the pane with black.
+fn color_report_commands(pane: PaneId, foreground: Color, background: Color) -> [String; 2] {
+    let report = |osc: u8, c: Color| {
+        format!(
+            r#"refresh-client -r "%{pane}:\033]{osc};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\033\\""#,
+            c.r, c.g, c.b
+        )
+    };
+    [report(10, foreground), report(11, background)]
+}
+
 fn join_lines(lines: &[Vec<u8>], out: &mut Vec<u8>) {
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
@@ -749,6 +775,13 @@ pub fn restore_bytes(state: &[u32], alternate: Option<&[Vec<u8>]>, screen: &[Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_reports_use_osc_10_and_11() {
+        let [fg, bg] = color_report_commands(0, Color::hex(0x00ff7f), Color::hex(0x1a1b26));
+        assert_eq!(fg, r#"refresh-client -r "%0:\033]10;rgb:0000/ffff/7f7f\033\\""#);
+        assert_eq!(bg, r#"refresh-client -r "%0:\033]11;rgb:1a1a/1b1b/2626\033\\""#);
+    }
 
     #[test]
     fn command_line_for_profile() {
