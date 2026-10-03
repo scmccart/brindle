@@ -33,6 +33,14 @@ actions!(
         ReloadConfig,
         OpenConfig,
         TmuxDetach,
+        TmuxSplitRight,
+        TmuxSplitDown,
+        TmuxClosePane,
+        TmuxZoomPane,
+        TmuxFocusLeft,
+        TmuxFocusRight,
+        TmuxFocusUp,
+        TmuxFocusDown,
         Quit,
         // Profile picker navigation.
         PickerUp,
@@ -91,6 +99,14 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "reload_config" => Box::new(ReloadConfig),
         "open_config" => Box::new(OpenConfig),
         "tmux_detach" => Box::new(TmuxDetach),
+        "tmux_split_right" => Box::new(TmuxSplitRight),
+        "tmux_split_down" => Box::new(TmuxSplitDown),
+        "tmux_close_pane" => Box::new(TmuxClosePane),
+        "tmux_zoom_pane" => Box::new(TmuxZoomPane),
+        "tmux_focus_left" => Box::new(TmuxFocusLeft),
+        "tmux_focus_right" => Box::new(TmuxFocusRight),
+        "tmux_focus_up" => Box::new(TmuxFocusUp),
+        "tmux_focus_down" => Box::new(TmuxFocusDown),
         "quit" => Box::new(Quit),
         _ => return None,
     })
@@ -126,6 +142,14 @@ pub const ACTION_NAMES: &[&str] = &[
     "reload_config",
     "open_config",
     "tmux_detach",
+    "tmux_split_right",
+    "tmux_split_down",
+    "tmux_close_pane",
+    "tmux_zoom_pane",
+    "tmux_focus_left",
+    "tmux_focus_right",
+    "tmux_focus_up",
+    "tmux_focus_down",
     "quit",
     "none",
 ];
@@ -136,6 +160,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let w = Some("Workspace");
     let t = Some("Terminal");
     let p = Some("ProfilePicker");
+    let x = Some("TmuxWindow");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -168,6 +193,14 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-home", ScrollToTop, t),
         KeyBinding::new("shift-end", ScrollToBottom, t),
         KeyBinding::new("ctrl-shift-k", ClearScrollback, t),
+        KeyBinding::new("ctrl-shift-e", TmuxSplitRight, x),
+        KeyBinding::new("ctrl-shift-o", TmuxSplitDown, x),
+        KeyBinding::new("ctrl-shift-x", TmuxClosePane, x),
+        KeyBinding::new("ctrl-shift-z", TmuxZoomPane, x),
+        KeyBinding::new("alt-left", TmuxFocusLeft, x),
+        KeyBinding::new("alt-right", TmuxFocusRight, x),
+        KeyBinding::new("alt-up", TmuxFocusUp, x),
+        KeyBinding::new("alt-down", TmuxFocusDown, x),
         KeyBinding::new("up", PickerUp, p),
         KeyBinding::new("down", PickerDown, p),
         KeyBinding::new("ctrl-p", PickerUp, p),

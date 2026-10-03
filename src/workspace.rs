@@ -272,6 +272,21 @@ impl Workspace {
             TmuxEvent::Detached(reason) => {
                 log::info!("tmux session detached: {reason}");
                 self.tmux_sessions.retain(|(s, _)| *s != session);
+                let had_tabs = self
+                    .tabs
+                    .iter()
+                    .any(|t| matches!(&t.content, TabContent::Tmux { session: s, .. } if *s == session));
+                if !had_tabs {
+                    // It never got as far as a window: say why in a tab.
+                    let profile = session.read(cx).profile.clone();
+                    let text = format!(
+                        "\x1b[1mtmux ({}) ended before attaching:\x1b[0m {reason}\r\n\r\n\
+                         Is tmux installed and on PATH? Profile settings: tmux_session, tmux_args, command.\r\n",
+                        profile.name
+                    );
+                    self.open_message_tab(profile, &text, window, cx);
+                    return;
+                }
                 let mut ix = 0;
                 while ix < self.tabs.len() {
                     if matches!(&self.tabs[ix].content, TabContent::Tmux { session: s, .. } if *s == session) {
@@ -295,7 +310,6 @@ impl Workspace {
                     }
                 }
             }
-            TmuxEvent::Changed => cx.notify(),
         }
     }
 
@@ -357,7 +371,30 @@ impl Workspace {
 
     // ---- actions ----------------------------------------------------------------
 
+    fn open_message_tab(&mut self, profile: Profile, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        let theme = config.theme(profile.theme.as_deref());
+        let terminal = cx.new(|cx| {
+            let mut t = Terminal::remote(crate::terminal::GridSize::default(), theme, &config, std::rc::Rc::new(|_| {}), cx);
+            t.feed(text.as_bytes(), cx);
+            t
+        });
+        let view = cx.new(|cx| TerminalView::new(terminal, profile.font_size, window, cx));
+        let id = self.next_id();
+        let tab = Tab { id, profile, content: TabContent::Terminal(view), bell: false, _subscriptions: Vec::new() };
+        let index = if self.tabs.is_empty() { 0 } else { self.active + 1 };
+        self.tabs.insert(index, tab);
+        self.activate(index, window, cx);
+    }
+
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        // In a tmux tab, a new tab is a new tmux window in the same session.
+        if let Some(tab) = self.tabs.get(self.active)
+            && let TabContent::Tmux { session, .. } = &tab.content
+        {
+            session.update(cx, |s, _| s.new_window());
+            return;
+        }
         let profile = Self::settings(cx).default_profile_index();
         self.launch(LaunchRequest { profile, command: None, cwd: None }, window, cx);
     }
