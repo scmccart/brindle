@@ -8,6 +8,7 @@
 //! borders and TUI frames join seamlessly regardless of line height.
 
 use alacritty_terminal::index::Point as GridPoint;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{self, CursorShape, NamedColor, Rgb};
 use gpui::{
@@ -19,7 +20,7 @@ use gpui::{
 };
 
 use crate::settings::Settings;
-use crate::terminal::{GridSize, resolve_color};
+use crate::terminal::{DIM_FACTOR, GridSize, resolve_color};
 use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Color;
 
@@ -44,6 +45,13 @@ pub fn cell_metrics(font_size_override: Option<f32>, window: &Window, cx: &App) 
         .unwrap_or(font_size * 0.6);
     let line_height = (font_size * settings.config.font.line_height).round();
     CellMetrics { font, font_size, cell_width, line_height }
+}
+
+/// How many whole cells fit in `size` after `padding` on every side.
+pub fn fit_grid(size: gpui::Size<Pixels>, padding: Pixels, cell_width: Pixels, line_height: Pixels) -> (usize, usize) {
+    let width = size.width - padding * 2.0;
+    let height = size.height - padding * 2.0;
+    (((width / cell_width).floor() as usize).max(2), ((height / line_height).floor() as usize).max(2))
 }
 
 pub struct TerminalElement {
@@ -75,12 +83,11 @@ pub struct Frame {
 }
 
 fn rgb_hsla(c: Rgb) -> Hsla {
-    Color { r: c.r, g: c.g, b: c.b }.hsla()
+    Color::from(c).hsla()
 }
 
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    let c = Color { r: a.r, g: a.g, b: a.b }.mix(Color { r: b.r, g: b.g, b: b.b }, t);
-    Rgb { r: c.r, g: c.g, b: c.b }
+    Color::from(a).mix(b.into(), t).into()
 }
 
 #[derive(Clone, PartialEq)]
@@ -144,9 +151,7 @@ impl Element for TerminalElement {
         let text_system = window.text_system().clone();
 
         let origin = bounds.origin + point(padding, padding);
-        let avail = bounds.size - size(padding * 2.0, padding * 2.0);
-        let fit_cols = ((avail.width / cell_width).floor() as usize).max(2);
-        let fit_rows = ((avail.height / line_height).floor() as usize).max(1);
+        let (fit_cols, fit_rows) = fit_grid(bounds.size, padding, cell_width, line_height);
 
         let terminal_entity = view.terminal.clone();
         let fixed = view.fixed_size;
@@ -179,18 +184,11 @@ impl Element for TerminalElement {
         let display_offset = content.display_offset as i32;
         let default_bg = resolve_color(ansi::Color::Named(NamedColor::Background), colors, terminal);
         let default_fg = resolve_color(ansi::Color::Named(NamedColor::Foreground), colors, terminal);
-        let cursor_color = colors[NamedColor::Cursor]
-            .unwrap_or(Rgb { r: theme.cursor.r, g: theme.cursor.g, b: theme.cursor.b });
-        let cursor_text = theme
-            .cursor_text
-            .map(|c| Rgb { r: c.r, g: c.g, b: c.b })
-            .unwrap_or(default_bg);
-        let selection_bg = Rgb {
-            r: theme.selection_background.r,
-            g: theme.selection_background.g,
-            b: theme.selection_background.b,
-        };
-        let selection_fg = theme.selection_foreground.map(|c| Rgb { r: c.r, g: c.g, b: c.b });
+        let cursor_color = resolve_color(ansi::Color::Named(NamedColor::Cursor), colors, terminal);
+        let cursor_text = theme.cursor_text.map(Rgb::from).unwrap_or(default_bg);
+        let selection_bg = Rgb::from(theme.selection_background);
+        let selection_fg = theme.selection_foreground.map(Rgb::from);
+        let mouse_mode = content.mode.intersects(TermMode::MOUSE_MODE);
 
         // Cursor placement in viewport coordinates.
         let cursor_point = content.cursor.point;
@@ -254,7 +252,7 @@ impl Element for TerminalElement {
             let mut fg_rgb = resolve_color(fg, colors, terminal);
             let mut bg_rgb = resolve_color(bg, colors, terminal);
             if cell.flags.contains(Flags::DIM) {
-                fg_rgb = mix(fg_rgb, bg_rgb, 0.4);
+                fg_rgb = mix(fg_rgb, bg_rgb, DIM_FACTOR);
             }
             let selected = content
                 .selection
@@ -434,7 +432,7 @@ impl Element for TerminalElement {
             cursor,
             preedit,
             line_height,
-            arrow_cursor: self.view.read(cx).mouse_cursor_is_arrow(cx),
+            arrow_cursor: mouse_mode,
         }
     }
 
@@ -483,24 +481,14 @@ impl Element for TerminalElement {
             &frame.hitbox,
         );
 
+        // Down and wheel only count over this terminal; move and up are
+        // global so drags keep tracking outside it.
         let view = self.view.clone();
         let hitbox = frame.hitbox.clone();
         window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                 view.update(cx, |view, cx| view.mouse_down(e, window, cx));
                 cx.stop_propagation();
-            }
-        });
-        let view = self.view.clone();
-        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble {
-                view.update(cx, |view, cx| view.mouse_move(e, window, cx));
-            }
-        });
-        let view = self.view.clone();
-        window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble {
-                view.update(cx, |view, cx| view.mouse_up(e, window, cx));
             }
         });
         let view = self.view.clone();
@@ -511,6 +499,19 @@ impl Element for TerminalElement {
                 cx.stop_propagation();
             }
         });
+        let view = self.view.clone();
+        let hitbox = frame.hitbox.clone();
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && (hitbox.is_hovered(window) || view.read(cx).is_dragging()) {
+                view.update(cx, |view, cx| view.mouse_move(e, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && view.read(cx).is_dragging() {
+                view.update(cx, |view, cx| view.mouse_up(e, window, cx));
+            }
+        });
     }
 }
 
@@ -518,6 +519,7 @@ impl Element for TerminalElement {
 /// (U+2580–U+259F).
 pub mod box_drawing {
     use gpui::{Bounds, Pixels, point, px, size};
+    use smallvec::{SmallVec, smallvec};
 
     /// A rectangle in cell-relative units (0..1), with `stroke` units for
     /// line thickness measured in multiples of the base stroke.
@@ -641,12 +643,14 @@ pub mod box_drawing {
         })
     }
 
-    fn line_rects(arms: [u8; 4]) -> Vec<Rect> {
+    pub type Rects = SmallVec<[Rect; 8]>;
+
+    fn line_rects(arms: [u8; 4]) -> Rects {
         let [up, right, down, left] = arms;
-        let mut out = Vec::new();
+        let mut out = Rects::new();
         // Vertical arms. Each arm extends past the center by half the
         // thickest crossing stroke so joints are filled.
-        let vertical = |from: f32, to: f32, weight: u8, out: &mut Vec<Rect>| match weight {
+        let vertical = |from: f32, to: f32, weight: u8, out: &mut Rects| match weight {
             1 | 2 => out.push(Rect {
                 stroke_x: weight as f32,
                 ..Rect::area(0.5, from, 0.5, to)
@@ -658,7 +662,7 @@ pub mod box_drawing {
             }
             _ => {}
         };
-        let horizontal = |from: f32, to: f32, weight: u8, out: &mut Vec<Rect>| match weight {
+        let horizontal = |from: f32, to: f32, weight: u8, out: &mut Rects| match weight {
             1 | 2 => out.push(Rect {
                 stroke_y: weight as f32,
                 ..Rect::area(from, 0.5, to, 0.5)
@@ -683,39 +687,39 @@ pub mod box_drawing {
         out
     }
 
-    fn block_rects(c: char) -> Option<Vec<Rect>> {
+    fn block_rects(c: char) -> Option<Rects> {
         let eighth = |n: f32| n / 8.0;
         Some(match c {
-            '█' => vec![Rect::area(0.0, 0.0, 1.0, 1.0)],
-            '▀' => vec![Rect::area(0.0, 0.0, 1.0, 0.5)],
-            '▄' => vec![Rect::area(0.0, 0.5, 1.0, 1.0)],
-            '▌' => vec![Rect::area(0.0, 0.0, 0.5, 1.0)],
-            '▐' => vec![Rect::area(0.5, 0.0, 1.0, 1.0)],
+            '█' => smallvec![Rect::area(0.0, 0.0, 1.0, 1.0)],
+            '▀' => smallvec![Rect::area(0.0, 0.0, 1.0, 0.5)],
+            '▄' => smallvec![Rect::area(0.0, 0.5, 1.0, 1.0)],
+            '▌' => smallvec![Rect::area(0.0, 0.0, 0.5, 1.0)],
+            '▐' => smallvec![Rect::area(0.5, 0.0, 1.0, 1.0)],
             '▁'..='▇' => {
                 let n = (c as u32 - '▁' as u32 + 1) as f32;
-                vec![Rect::area(0.0, 1.0 - eighth(n), 1.0, 1.0)]
+                smallvec![Rect::area(0.0, 1.0 - eighth(n), 1.0, 1.0)]
             }
             '▉'..='▏' => {
                 let n = (8 - (c as u32 - '▉' as u32 + 1)) as f32;
-                vec![Rect::area(0.0, 0.0, eighth(n), 1.0)]
+                smallvec![Rect::area(0.0, 0.0, eighth(n), 1.0)]
             }
-            '▔' => vec![Rect::area(0.0, 0.0, 1.0, eighth(1.0))],
-            '▕' => vec![Rect::area(1.0 - eighth(1.0), 0.0, 1.0, 1.0)],
-            '▖' => vec![Rect::area(0.0, 0.5, 0.5, 1.0)],
-            '▗' => vec![Rect::area(0.5, 0.5, 1.0, 1.0)],
-            '▘' => vec![Rect::area(0.0, 0.0, 0.5, 0.5)],
-            '▝' => vec![Rect::area(0.5, 0.0, 1.0, 0.5)],
-            '▙' => vec![Rect::area(0.0, 0.0, 0.5, 1.0), Rect::area(0.5, 0.5, 1.0, 1.0)],
-            '▚' => vec![Rect::area(0.0, 0.0, 0.5, 0.5), Rect::area(0.5, 0.5, 1.0, 1.0)],
-            '▛' => vec![Rect::area(0.0, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 0.5, 1.0)],
-            '▜' => vec![Rect::area(0.0, 0.0, 1.0, 0.5), Rect::area(0.5, 0.5, 1.0, 1.0)],
-            '▞' => vec![Rect::area(0.5, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 0.5, 1.0)],
-            '▟' => vec![Rect::area(0.5, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 1.0, 1.0)],
+            '▔' => smallvec![Rect::area(0.0, 0.0, 1.0, eighth(1.0))],
+            '▕' => smallvec![Rect::area(1.0 - eighth(1.0), 0.0, 1.0, 1.0)],
+            '▖' => smallvec![Rect::area(0.0, 0.5, 0.5, 1.0)],
+            '▗' => smallvec![Rect::area(0.5, 0.5, 1.0, 1.0)],
+            '▘' => smallvec![Rect::area(0.0, 0.0, 0.5, 0.5)],
+            '▝' => smallvec![Rect::area(0.5, 0.0, 1.0, 0.5)],
+            '▙' => smallvec![Rect::area(0.0, 0.0, 0.5, 1.0), Rect::area(0.5, 0.5, 1.0, 1.0)],
+            '▚' => smallvec![Rect::area(0.0, 0.0, 0.5, 0.5), Rect::area(0.5, 0.5, 1.0, 1.0)],
+            '▛' => smallvec![Rect::area(0.0, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 0.5, 1.0)],
+            '▜' => smallvec![Rect::area(0.0, 0.0, 1.0, 0.5), Rect::area(0.5, 0.5, 1.0, 1.0)],
+            '▞' => smallvec![Rect::area(0.5, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 0.5, 1.0)],
+            '▟' => smallvec![Rect::area(0.5, 0.0, 1.0, 0.5), Rect::area(0.0, 0.5, 1.0, 1.0)],
             _ => return None,
         })
     }
 
-    pub fn rects(c: char) -> Option<Vec<Rect>> {
+    pub fn rects(c: char) -> Option<Rects> {
         if !('\u{2500}'..='\u{259f}').contains(&c) {
             return None;
         }

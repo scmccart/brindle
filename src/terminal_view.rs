@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
@@ -13,7 +14,7 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task,
-    UTF16Selection, Window, div, px,
+    UTF16Selection, Window, div,
 };
 
 use crate::actions::*;
@@ -77,7 +78,8 @@ pub struct TerminalView {
     pub marked_text: Option<String>,
     mouse: MouseState,
     window_active: bool,
-    _blink: Task<()>,
+    /// Cursor blink timer; only runs while this terminal has focus.
+    _blink: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -101,10 +103,14 @@ impl TerminalView {
             cx.observe(&terminal, |_, _, cx| cx.notify()),
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
                 this.blink_visible = true;
+                this.start_blinking(window, cx);
                 this.report_focus(window.is_window_active(), cx);
                 cx.notify();
             }),
             cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
+                // Unfocused terminals draw a hollow cursor and don't blink.
+                this._blink = None;
+                this.blink_visible = true;
                 this.report_focus(false, cx);
                 cx.notify();
             }),
@@ -114,26 +120,6 @@ impl TerminalView {
                 cx.notify();
             }),
         ];
-
-        let blink = cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(BLINK_INTERVAL).await;
-                let alive = this.update_in(cx, |this, window, cx| {
-                    let terminal = this.terminal.read(cx);
-                    let blink = crate::settings::Settings::get(cx).config.cursor.blink;
-                    let idle = terminal.last_activity.elapsed() > BLINK_INTERVAL;
-                    let focused = this.focus_handle.is_focused(window) && window.is_window_active();
-                    let visible = !blink || !focused || !idle || !this.blink_visible;
-                    if visible != this.blink_visible {
-                        this.blink_visible = visible;
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
 
         Self {
             terminal,
@@ -145,7 +131,7 @@ impl TerminalView {
             marked_text: None,
             mouse: MouseState::default(),
             window_active: true,
-            _blink: blink,
+            _blink: None,
             _subscriptions: subscriptions,
         }
     }
@@ -155,6 +141,28 @@ impl TerminalView {
             self.window_active = focused;
             report_focus(self.terminal.read(cx), focused);
         }
+    }
+
+    fn start_blinking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::settings::Settings::get(cx).config.cursor.blink {
+            return;
+        }
+        self._blink = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK_INTERVAL).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    let idle = this.terminal.read(cx).last_activity.elapsed() > BLINK_INTERVAL;
+                    let visible = !window.is_window_active() || !idle || !this.blink_visible;
+                    if visible != this.blink_visible {
+                        this.blink_visible = visible;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     fn reset_blink(&mut self) {
@@ -202,28 +210,8 @@ impl TerminalView {
         self.terminal.update(cx, |t, cx| t.select_all(cx));
     }
 
-    fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll(1, cx));
-    }
-
-    fn scroll_line_down(&mut self, _: &ScrollLineDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll(-1, cx));
-    }
-
-    fn scroll_page_up(&mut self, _: &ScrollPageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll_page(true, cx));
-    }
-
-    fn scroll_page_down(&mut self, _: &ScrollPageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll_page(false, cx));
-    }
-
-    fn scroll_to_top(&mut self, _: &ScrollToTop, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll_to_edge(true, cx));
-    }
-
-    fn scroll_to_bottom(&mut self, _: &ScrollToBottom, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.scroll_to_edge(false, cx));
+    fn scroll(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |t, cx| t.scroll(scroll, cx));
     }
 
     fn clear_scrollback(&mut self, _: &ClearScrollback, _: &mut Window, cx: &mut Context<Self>) {
@@ -280,8 +268,8 @@ impl TerminalView {
         if self.mouse.selecting && e.pressed_button == Some(gpui::MouseButton::Left) {
             // Drag past the top/bottom edge scrolls the scrollback.
             match layout.contains_y(e.position.y) {
-                std::cmp::Ordering::Less => self.terminal.update(cx, |t, cx| t.scroll(1, cx)),
-                std::cmp::Ordering::Greater => self.terminal.update(cx, |t, cx| t.scroll(-1, cx)),
+                std::cmp::Ordering::Less => self.terminal.update(cx, |t, cx| t.scroll(Scroll::Delta(1), cx)),
+                std::cmp::Ordering::Greater => self.terminal.update(cx, |t, cx| t.scroll(Scroll::Delta(-1), cx)),
                 std::cmp::Ordering::Equal => {}
             }
             self.terminal.update(cx, |t, cx| t.update_selection(col, line, side, cx));
@@ -350,12 +338,13 @@ impl TerminalView {
         } else if let Some(bytes) = mouse::alternate_scroll(lines, mode) {
             self.terminal.read(cx).write(bytes);
         } else {
-            self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
+            self.terminal.update(cx, |t, cx| t.scroll(Scroll::Delta(lines), cx));
         }
     }
 
-    pub fn mouse_cursor_is_arrow(&self, cx: &App) -> bool {
-        self.mode(cx).intersects(TermMode::MOUSE_MODE)
+    /// A selection drag or a reported button press is in progress.
+    pub fn is_dragging(&self) -> bool {
+        self.mouse.selecting || self.mouse.reported_button.is_some()
     }
 }
 
@@ -370,12 +359,12 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::paste_primary))
             .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::scroll_line_up))
-            .on_action(cx.listener(Self::scroll_line_down))
-            .on_action(cx.listener(Self::scroll_page_up))
-            .on_action(cx.listener(Self::scroll_page_down))
-            .on_action(cx.listener(Self::scroll_to_top))
-            .on_action(cx.listener(Self::scroll_to_bottom))
+            .on_action(cx.listener(|this, _: &ScrollLineUp, _, cx| this.scroll(Scroll::Delta(1), cx)))
+            .on_action(cx.listener(|this, _: &ScrollLineDown, _, cx| this.scroll(Scroll::Delta(-1), cx)))
+            .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.scroll(Scroll::PageUp, cx)))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| this.scroll(Scroll::PageDown, cx)))
+            .on_action(cx.listener(|this, _: &ScrollToTop, _, cx| this.scroll(Scroll::Top, cx)))
+            .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll(Scroll::Bottom, cx)))
             .on_action(cx.listener(Self::clear_scrollback))
             .size_full()
             .child(TerminalElement::new(cx.entity()))
@@ -462,7 +451,7 @@ impl gpui::EntityInputHandler for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::point;
+    use gpui::{point, px};
 
     #[test]
     fn hit_testing() {

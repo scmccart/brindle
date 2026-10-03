@@ -10,10 +10,9 @@ pub struct Settings {
     pub config_error: Option<String>,
     /// Font size change from ctrl-+ / ctrl-- (applies to all tabs).
     pub zoom: f32,
-    /// The first installed family from `config.font.family`.
-    pub font_family: String,
+    font: Font,
     /// Proportional font for tabs and other chrome.
-    pub ui_font_family: String,
+    pub ui_font_family: gpui::SharedString,
 }
 
 impl Global for Settings {}
@@ -33,28 +32,30 @@ impl Settings {
     pub fn new(config: Config, config_error: Option<String>, cx: &App) -> Self {
         let font_family = resolve_family(&config.font.family, cx);
         log::info!("using font family {font_family:?}");
-        let ui_font_family = resolve_ui_family(cx);
-        Self { config, config_error, zoom: 0.0, font_family, ui_font_family }
+        let fallbacks = FALLBACK_FAMILIES
+            .iter()
+            .filter(|f| **f != font_family)
+            .map(|f| f.to_string())
+            .collect();
+        let font = Font {
+            family: font_family.into(),
+            // Ligatures would break the one-glyph-per-cell grid.
+            features: FontFeatures::disable_ligatures(),
+            fallbacks: Some(FontFallbacks::from_fonts(fallbacks)),
+            weight: Default::default(),
+            style: Default::default(),
+        };
+        let ui_font_family = resolve_ui_family(cx).into();
+        Self { config, config_error, zoom: 0.0, font, ui_font_family }
     }
 
     pub fn get(cx: &App) -> &Self {
         cx.global::<Self>()
     }
 
+    /// The terminal font (built once; cloning is cheap).
     pub fn font(&self) -> Font {
-        let fallbacks = FALLBACK_FAMILIES
-            .iter()
-            .filter(|f| **f != self.font_family)
-            .map(|f| f.to_string())
-            .collect();
-        Font {
-            family: self.font_family.clone().into(),
-            // Ligatures would break the one-glyph-per-cell grid.
-            features: FontFeatures::disable_ligatures(),
-            fallbacks: Some(FontFallbacks::from_fonts(fallbacks)),
-            weight: Default::default(),
-            style: Default::default(),
-        }
+        self.font.clone()
     }
 
     pub fn font_size(&self, profile_size: Option<f32>) -> Pixels {

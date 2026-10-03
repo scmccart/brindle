@@ -13,8 +13,6 @@ pub enum Button {
     None,
     WheelUp,
     WheelDown,
-    WheelLeft,
-    WheelRight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,13 +40,11 @@ impl Button {
             Button::None => 3,
             Button::WheelUp => 64,
             Button::WheelDown => 65,
-            Button::WheelLeft => 66,
-            Button::WheelRight => 67,
         }
     }
 
     fn is_wheel(self) -> bool {
-        matches!(self, Button::WheelUp | Button::WheelDown | Button::WheelLeft | Button::WheelRight)
+        matches!(self, Button::WheelUp | Button::WheelDown)
     }
 }
 

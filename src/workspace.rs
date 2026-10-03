@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
+    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, point, px,
+    Task, Window, canvas, div, point, px,
 };
 
 use crate::actions::*;
@@ -18,6 +18,7 @@ use crate::settings::Settings;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
+use crate::tmux::protocol::WindowId;
 use crate::tmux::{TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
 
@@ -34,23 +35,49 @@ pub struct Tab {
     pub profile: Profile,
     pub content: TabContent,
     pub bell: bool,
+    /// Cached so rendering never probes /proc; see [`Tab::refresh_title`].
+    title: SharedString,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Tab {
-    fn title(&self, cx: &App) -> String {
-        match &self.content {
+    fn new(profile: Profile, content: TabContent, subscriptions: Vec<Subscription>, cx: &mut App) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut tab = Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            profile,
+            content,
+            bell: false,
+            title: SharedString::default(),
+            _subscriptions: subscriptions,
+        };
+        tab.refresh_title(cx);
+        tab
+    }
+
+    /// Recomputes the title: the program's OSC title, else the foreground
+    /// process name, else the profile name. Returns whether it changed.
+    fn refresh_title(&mut self, cx: &App) -> bool {
+        let title: SharedString = match &self.content {
             TabContent::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
-                if let Some(title) = terminal.title().filter(|t| !t.trim().is_empty()) {
-                    return title.to_string();
+                match terminal.title().filter(|t| !t.trim().is_empty()) {
+                    Some(title) => title.to_string(),
+                    None => terminal.foreground_process_name().unwrap_or_else(|| self.profile.name.clone()),
                 }
-                terminal
-                    .foreground_process_name()
-                    .unwrap_or_else(|| self.profile.name.clone())
             }
             TabContent::Tmux { view, .. } => view.read(cx).title(cx),
         }
+        .into();
+        let changed = title != self.title;
+        self.title = title;
+        changed
+    }
+
+    /// Whether this tab shows `session` (and, if given, its `window`).
+    fn shows_tmux(&self, session: &Entity<TmuxSession>, window: Option<WindowId>, cx: &App) -> bool {
+        matches!(&self.content, TabContent::Tmux { session: s, view }
+            if s == session && window.is_none_or(|w| view.read(cx).window_id == w))
     }
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -86,6 +113,12 @@ pub struct LaunchRequest {
     pub cwd: Option<PathBuf>,
 }
 
+impl LaunchRequest {
+    pub fn profile(profile: usize) -> Self {
+        Self { profile, command: None, cwd: None }
+    }
+}
+
 #[derive(Clone)]
 struct DraggedTab {
     id: u64,
@@ -112,12 +145,12 @@ impl Render for DraggedTab {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    next_tab_id: u64,
     picker: Option<(Entity<ProfilePicker>, Subscription)>,
     focus_handle: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
-    last_title: String,
+    last_title: SharedString,
+    _title_refresh: Task<()>,
 }
 
 impl Workspace {
@@ -125,12 +158,31 @@ impl Workspace {
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
-            next_tab_id: 1,
             picker: None,
             focus_handle: cx.focus_handle(),
             tmux_sessions: Vec::new(),
-            last_title: String::new(),
+            last_title: SharedString::default(),
+            _title_refresh: Task::ready(()),
         };
+        this._title_refresh = cx.spawn(async move |this, cx| {
+            // Foreground processes change without any event (e.g. `vim`
+            // starting), so poll their names gently.
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let alive = this.update(cx, |this, cx| {
+                    let mut changed = false;
+                    for tab in &mut this.tabs {
+                        changed |= tab.refresh_title(cx);
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
         this.launch(launch, window, cx);
         this
     }
@@ -172,7 +224,7 @@ impl Workspace {
                     "new-session".into(),
                     "-A".into(),
                     "-s".into(),
-                    profile.tmux_session.clone().unwrap_or_else(|| "main".into()),
+                    profile.tmux_session_name().to_string(),
                 ]);
                 Some(("tmux".into(), args))
             }
@@ -187,19 +239,23 @@ impl Workspace {
         let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let view = cx.new(|cx| TerminalView::new(terminal.clone(), font_size, window, cx));
-        let id = self.next_id();
-        let subscriptions = vec![cx.subscribe_in(&terminal, window, move |this, _, event, window, cx| {
-            this.on_terminal_event(id, event, window, cx)
+        let subscriptions = vec![cx.subscribe_in(&terminal, window, |this, terminal, event, window, cx| {
+            this.on_terminal_event(terminal, event, window, cx)
         })];
-        let tab = Tab { id, profile, content: TabContent::Terminal(view), bell: false, _subscriptions: subscriptions };
-        let index = if self.tabs.is_empty() { 0 } else { self.active + 1 };
+        let tab = Tab::new(profile, TabContent::Terminal(view), subscriptions, cx);
+        self.insert_tab(tab, None, window, cx);
+    }
+
+    /// Inserts `tab` at `index` (default: after the active tab) and activates it.
+    fn insert_tab(&mut self, tab: Tab, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 });
         self.tabs.insert(index, tab);
         self.activate(index, window, cx);
     }
 
     fn attach_tmux(&mut self, profile: Profile, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
-        let session_name = profile.tmux_session.clone().unwrap_or_else(|| "main".into());
+        let session_name = profile.tmux_session_name().to_string();
         if let Some((session, _)) = self
             .tmux_sessions
             .iter()
@@ -207,7 +263,7 @@ impl Workspace {
         {
             // Already attached: just focus its first tab.
             let session = session.clone();
-            if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.content, TabContent::Tmux { session: s, .. } if *s == session)) {
+            if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, None, cx)) {
                 self.activate(ix, window, cx);
             }
             return;
@@ -230,97 +286,83 @@ impl Workspace {
         match event {
             TmuxEvent::WindowAdded(window_id) => {
                 let window_id = *window_id;
-                if self.tabs.iter().any(|t| matches!(&t.content, TabContent::Tmux { session: s, view } if *s == session && view.read(cx).window_id == window_id)) {
+                if self.tabs.iter().any(|t| t.shows_tmux(&session, Some(window_id), cx)) {
                     return;
                 }
                 let profile = session.read(cx).profile.clone();
-                let theme = Self::settings(cx).theme(profile.theme.as_deref());
+                let theme = Self::settings(cx).profile_theme(&profile);
                 let view = cx.new(|cx| TmuxWindowView::new(session.clone(), window_id, theme, profile.font_size, window, cx));
-                let id = self.next_id();
-                let subscriptions = vec![cx.observe(&view, |_, _, cx| cx.notify())];
-                let tab = Tab {
-                    id,
-                    profile,
-                    content: TabContent::Tmux { session: session.clone(), view },
-                    bell: false,
-                    _subscriptions: subscriptions,
-                };
+                let subscriptions = vec![cx.observe(&view, |this, _, cx| {
+                    // Window renames arrive through the view.
+                    for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
+                        tab.refresh_title(cx);
+                    }
+                    cx.notify();
+                })];
+                let tab = Tab::new(profile, TabContent::Tmux { session: session.clone(), view }, subscriptions, cx);
                 // Keep a session's tabs together, in tmux's window order.
-                let index = self
-                    .tabs
-                    .iter()
-                    .rposition(|t| matches!(&t.content, TabContent::Tmux { session: s, .. } if *s == session))
-                    .map(|i| i + 1)
-                    .unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 });
-                self.tabs.insert(index, tab);
-                self.activate(index, window, cx);
+                let index = self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)).map(|i| i + 1);
+                self.insert_tab(tab, index, window, cx);
             }
             TmuxEvent::WindowClosed(window_id) => {
-                let window_id = *window_id;
-                if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.content, TabContent::Tmux { session: s, view } if *s == session && view.read(cx).window_id == window_id)) {
+                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
                     self.remove_tab(ix, window, cx);
                 }
             }
             TmuxEvent::WindowActivated(window_id) => {
-                let window_id = *window_id;
-                if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.content, TabContent::Tmux { session: s, view } if *s == session && view.read(cx).window_id == window_id)) {
-                    if ix != self.active {
-                        self.activate(ix, window, cx);
-                    }
+                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx))
+                    && ix != self.active
+                {
+                    self.activate(ix, window, cx);
                 }
+            }
+            TmuxEvent::Failed(reason) => {
+                self.tmux_sessions.retain(|(s, _)| *s != session);
+                let profile = session.read(cx).profile.clone();
+                let text = format!(
+                    "\x1b[1mtmux ({}) ended before attaching:\x1b[0m {reason}\r\n\r\n\
+                     Is tmux installed and on PATH? Profile settings: tmux_session, tmux_args, command.\r\n",
+                    profile.name
+                );
+                self.open_message_tab(profile, &text, window, cx);
             }
             TmuxEvent::Detached(reason) => {
                 log::info!("tmux session detached: {reason}");
                 self.tmux_sessions.retain(|(s, _)| *s != session);
-                let had_tabs = self
-                    .tabs
-                    .iter()
-                    .any(|t| matches!(&t.content, TabContent::Tmux { session: s, .. } if *s == session));
-                if !had_tabs {
-                    // It never got as far as a window: say why in a tab.
-                    let profile = session.read(cx).profile.clone();
-                    let text = format!(
-                        "\x1b[1mtmux ({}) ended before attaching:\x1b[0m {reason}\r\n\r\n\
-                         Is tmux installed and on PATH? Profile settings: tmux_session, tmux_args, command.\r\n",
-                        profile.name
-                    );
-                    self.open_message_tab(profile, &text, window, cx);
-                    return;
-                }
-                let mut ix = 0;
-                while ix < self.tabs.len() {
-                    if matches!(&self.tabs[ix].content, TabContent::Tmux { session: s, .. } if *s == session) {
-                        self.remove_tab(ix, window, cx);
+                if self.tabs.iter().all(|t| t.shows_tmux(&session, None, cx)) {
+                    // Nothing else would be left: open a plain shell first so
+                    // the window doesn't vanish when tmux goes away.
+                    let config = Self::settings(cx);
+                    let default = config.default_profile_index();
+                    let fallback = if config.profiles[default].tmux == TmuxMode::Control {
+                        config.profiles.iter().position(|p| p.tmux == TmuxMode::None)
                     } else {
-                        ix += 1;
-                    }
-                }
-                if self.tabs.is_empty() {
-                    // Nothing else to show: fall back to a plain shell so the
-                    // window doesn't vanish when tmux exits.
-                    let profile = Self::settings(cx).default_profile_index();
-                    let profile = if Self::settings(cx).profiles[profile].tmux == TmuxMode::Control {
-                        Self::settings(cx).profiles.iter().position(|p| p.tmux == TmuxMode::None)
-                    } else {
-                        Some(profile)
+                        Some(default)
                     };
-                    match profile {
-                        Some(profile) => self.launch(LaunchRequest { profile, command: None, cwd: None }, window, cx),
-                        None => window.remove_window(),
+                    if let Some(profile) = fallback {
+                        self.launch(LaunchRequest::profile(profile), window, cx);
                     }
+                }
+                // Removing the last tab closes the window, as for any tab.
+                while let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, None, cx)) {
+                    self.remove_tab(ix, window, cx);
                 }
             }
         }
     }
 
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        id
-    }
-
-    fn on_terminal_event(&mut self, tab_id: u64, event: &TerminalEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+    fn on_terminal_event(
+        &mut self,
+        terminal: &Entity<Terminal>,
+        event: &TerminalEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.tabs.iter().position(|t| {
+            matches!(&t.content, TabContent::Terminal(view) if view.read(cx).terminal == *terminal)
+        }) else {
+            return;
+        };
         match event {
             TerminalEvent::Exited => self.remove_tab(ix, window, cx),
             TerminalEvent::Bell => {
@@ -329,7 +371,11 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            TerminalEvent::TitleChanged => cx.notify(),
+            TerminalEvent::TitleChanged => {
+                if self.tabs[ix].refresh_title(cx) {
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -373,18 +419,11 @@ impl Workspace {
 
     fn open_message_tab(&mut self, profile: Profile, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
-        let theme = config.theme(profile.theme.as_deref());
-        let terminal = cx.new(|cx| {
-            let mut t = Terminal::remote(crate::terminal::GridSize::default(), theme, &config, std::rc::Rc::new(|_| {}), cx);
-            t.feed(text.as_bytes(), cx);
-            t
-        });
+        let theme = config.profile_theme(&profile);
+        let terminal = cx.new(|cx| Terminal::message(text, theme, &config, cx));
         let view = cx.new(|cx| TerminalView::new(terminal, profile.font_size, window, cx));
-        let id = self.next_id();
-        let tab = Tab { id, profile, content: TabContent::Terminal(view), bell: false, _subscriptions: Vec::new() };
-        let index = if self.tabs.is_empty() { 0 } else { self.active + 1 };
-        self.tabs.insert(index, tab);
-        self.activate(index, window, cx);
+        let tab = Tab::new(profile, TabContent::Terminal(view), Vec::new(), cx);
+        self.insert_tab(tab, None, window, cx);
     }
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -396,12 +435,12 @@ impl Workspace {
             return;
         }
         let profile = Self::settings(cx).default_profile_index();
-        self.launch(LaunchRequest { profile, command: None, cwd: None }, window, cx);
+        self.launch(LaunchRequest::profile(profile), window, cx);
     }
 
     fn new_tab_with_profile(&mut self, action: &NewTabWithProfile, window: &mut Window, cx: &mut Context<Self>) {
         if action.0 < Self::settings(cx).profiles.len() {
-            self.launch(LaunchRequest { profile: action.0, command: None, cwd: None }, window, cx);
+            self.launch(LaunchRequest::profile(action.0), window, cx);
         }
     }
 
@@ -485,7 +524,7 @@ impl Workspace {
             PickerEvent::Confirmed(ix) => {
                 let ix = *ix;
                 this.dismiss_picker(window, cx);
-                this.launch(LaunchRequest { profile: ix, command: None, cwd: None }, window, cx);
+                this.launch(LaunchRequest::profile(ix), window, cx);
             }
             PickerEvent::Dismissed => this.dismiss_picker(window, cx),
         });
@@ -549,20 +588,24 @@ impl Workspace {
     pub fn apply_config(&mut self, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         for tab in &mut self.tabs {
-            if let Some(p) = config.profiles.iter().find(|p| p.name == tab.profile.name) {
+            if let Some(p) = config.profile(&tab.profile.name) {
                 tab.profile = p.clone();
             }
-            let theme = config.theme(tab.profile.theme.as_deref());
+            let theme = config.profile_theme(&tab.profile);
+            let font_size = tab.profile.font_size;
             match &tab.content {
-                TabContent::Terminal(view) => {
-                    let font_size = tab.profile.font_size;
-                    view.update(cx, |view, cx| {
-                        view.font_size_override = font_size;
-                        view.terminal.update(cx, |t, _| t.theme = theme)
-                    });
-                }
-                TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_theme(theme, cx)),
+                TabContent::Terminal(view) => view.update(cx, |view, cx| {
+                    view.font_size_override = font_size;
+                    view.terminal.update(cx, |t, _| t.theme = theme)
+                }),
+                TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
             }
+        }
+        for (session, _) in &self.tmux_sessions {
+            session.update(cx, |s, _| {
+                let profile = config.profile(&s.profile.name).cloned().unwrap_or_else(|| s.profile.clone());
+                s.set_config(profile, &config);
+            });
         }
         cx.notify();
     }
@@ -582,14 +625,14 @@ impl Workspace {
             out.push_str(&format!(
                 "--- tab {} {:?}{}\n",
                 ix + 1,
-                tab.title(cx),
+                tab.title,
                 if ix == self.active { " (active)" } else { "" }
             ));
         }
         if let Some(terminal) = self.tabs.get(self.active).and_then(|t| t.active_terminal(cx)) {
             let terminal = terminal.read(cx);
             let size = terminal.size();
-            out.push_str(&format!("--- screen {}x{}\n", size.cols, size.rows));
+            out.push_str(&format!("--- screen {}x{} mode {:?}\n", size.cols, size.rows, terminal.mode()));
             out.push_str(&terminal.screen_text());
         }
         out
@@ -610,7 +653,7 @@ impl Workspace {
 
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let active = ix == self.active;
-            let title: SharedString = tab.title(cx).into();
+            let title = tab.title.clone();
             let bell = tab.bell;
             let tmux = tab.is_tmux();
             let dragged = DraggedTab { id: tab.id, title: title.clone(), theme: theme.clone() };
@@ -790,7 +833,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.tabs.get(self.active).map(|t| t.title(cx)).unwrap_or_default();
+        let title = self.tabs.get(self.active).map(|t| t.title.clone()).unwrap_or_default();
         if title != self.last_title {
             window.set_window_title(&title);
             self.last_title = title;
@@ -844,7 +887,7 @@ impl Render for Workspace {
                     .when(!tiling.right, |d| d.border_r_1())
                     .when(!tiling.is_tiled(), |d| {
                         d.shadow(vec![gpui::BoxShadow {
-                            color: Hsla { h: 0., s: 0., l: 0., a: 0.35 },
+                            color: gpui::black().opacity(0.35),
                             blur_radius: inset / 2.,
                             spread_radius: px(0.),
                             offset: point(px(0.0), px(0.0)),

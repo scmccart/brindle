@@ -106,11 +106,11 @@ pub struct Terminal {
     title: Option<String>,
     exited: bool,
     pub theme: Theme,
-    osc52_paste: bool,
     copy_on_select: bool,
-    pub default_cursor: CursorShapeConfig,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
+    /// Pending flush of a synchronized update (mode 2026) on remote terminals.
+    sync_flush: Option<Task<()>>,
     _events: Task<()>,
 }
 
@@ -157,6 +157,29 @@ impl Terminal {
         })
     }
 
+    fn new(
+        term: Arc<FairMutex<Term<Listener>>>,
+        rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
+        backend: Backend,
+        size: GridSize,
+        theme: Theme,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            _events: Self::spawn_events(rx, cx),
+            term,
+            backend,
+            size,
+            title: None,
+            exited: false,
+            theme,
+            copy_on_select: config.copy_on_select,
+            last_activity: Instant::now(),
+            sync_flush: None,
+        }
+    }
+
     /// Spawns `profile`'s program on a new PTY. If that fails, the terminal
     /// shows the error instead so the tab explains what went wrong.
     pub fn spawn_pty(
@@ -166,11 +189,6 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (tx, rx) = unbounded();
-        let listener = Listener(tx);
-        let size = GridSize::default();
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
-
         let (program, args) = command_override.unwrap_or_else(|| {
             let program = profile
                 .command
@@ -179,15 +197,6 @@ impl Terminal {
                 .unwrap_or_else(|| "/bin/sh".into());
             (program, profile.args.clone())
         });
-
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("TERM".into(), "xterm-256color".into());
-        env.insert("COLORTERM".into(), "truecolor".into());
-        env.insert("TERM_PROGRAM".into(), "Brindle".into());
-        env.insert("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into());
-        for (k, v) in &profile.env {
-            env.insert(k.clone(), v.clone());
-        }
 
         let working_directory = cwd_override
             .or_else(|| profile.working_directory())
@@ -198,8 +207,13 @@ impl Terminal {
             shell: Some(tty::Shell::new(program.clone(), args)),
             working_directory,
             drain_on_exit: true,
-            env,
+            env: child_env(profile),
         };
+
+        let (tx, rx) = unbounded();
+        let listener = Listener(tx);
+        let size = GridSize::default();
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let spawned = (|| -> anyhow::Result<Backend> {
             let pty = tty::new(&options, size.into(), 0)?;
             let child_pid = pty.child().id();
@@ -210,34 +224,15 @@ impl Terminal {
             Ok(Backend::Pty { sender, child_pid, master_fd })
         })();
 
-        let (backend, error) = match spawned {
-            Ok(backend) => (backend, None),
+        let theme = config.profile_theme(profile);
+        match spawned {
+            Ok(backend) => Self::new(term, rx, backend, size, theme, config, cx),
             Err(err) => {
                 log::error!("failed to launch {program:?}: {err:#}");
-                let backend = Backend::Remote { processor: Box::new(Processor::new()), input: Rc::new(|_| {}) };
-                (backend, Some(format!("\x1b[31mBrindle could not start {program:?}:\x1b[0m\r\n{err:#}\r\n")))
+                let text = format!("\x1b[31mBrindle could not start {program:?}:\x1b[0m\r\n{err:#}\r\n");
+                Self::message(&text, theme, config, cx)
             }
-        };
-
-        let theme = config.theme(profile.theme.as_deref());
-        let mut this = Self {
-            term,
-            backend,
-            size,
-            title: None,
-            exited: false,
-            theme,
-            osc52_paste: config.osc52_paste,
-            copy_on_select: config.copy_on_select,
-            default_cursor: config.cursor.shape,
-            last_activity: Instant::now(),
-            _events: Task::ready(()),
-        };
-        this._events = Self::spawn_events(rx, cx);
-        if let Some(error) = error {
-            this.feed(error.as_bytes(), cx);
         }
-        this
     }
 
     /// A terminal whose output is supplied via [`Terminal::feed`] and whose
@@ -251,20 +246,14 @@ impl Terminal {
     ) -> Self {
         let (tx, rx) = unbounded();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx))));
-        let mut this = Self {
-            term,
-            backend: Backend::Remote { processor: Box::new(Processor::new()), input },
-            size,
-            title: None,
-            exited: false,
-            theme,
-            osc52_paste: config.osc52_paste,
-            copy_on_select: config.copy_on_select,
-            default_cursor: config.cursor.shape,
-            last_activity: Instant::now(),
-            _events: Task::ready(()),
-        };
-        this._events = Self::spawn_events(rx, cx);
+        let backend = Backend::Remote { processor: Box::new(Processor::new()), input };
+        Self::new(term, rx, backend, size, theme, config, cx)
+    }
+
+    /// A read-only terminal showing `text` (used to report errors in a tab).
+    pub fn message(text: &str, theme: Theme, config: &Config, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::remote(GridSize::default(), theme, config, Rc::new(|_| {}), cx);
+        this.feed(text.as_bytes(), cx);
         this
     }
 
@@ -284,18 +273,20 @@ impl Terminal {
         self.last_activity = Instant::now();
         // A synchronized update (mode 2026) may be buffering; make sure it is
         // flushed once its timeout passes even if no more output arrives.
-        if let Some(deadline) = processor.sync_timeout().sync_timeout() {
+        if let Some(deadline) = processor.sync_timeout().sync_timeout()
+            && self.sync_flush.is_none()
+        {
             let wait = deadline.saturating_duration_since(Instant::now());
-            cx.spawn(async move |this, cx| {
+            self.sync_flush = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
                 this.update(cx, |this, cx| this.flush_sync(cx)).ok();
-            })
-            .detach();
+            }));
         }
         cx.notify();
     }
 
     fn flush_sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_flush = None;
         if let Backend::Remote { processor, .. } = &mut self.backend
             && processor.sync_timeout().sync_timeout().is_some_and(|t| t <= Instant::now())
         {
@@ -327,10 +318,6 @@ impl Terminal {
         }
     }
 
-    pub fn has_exited(&self) -> bool {
-        self.exited
-    }
-
     pub fn mark_exited(&mut self, cx: &mut Context<Self>) {
         if !self.exited {
             self.exited = true;
@@ -339,7 +326,6 @@ impl Terminal {
     }
 
     fn handle_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
-        let remote = self.is_remote();
         match event {
             AlacEvent::Wakeup => self.last_activity = Instant::now(),
             AlacEvent::Title(title) => self.set_title(Some(title), cx),
@@ -351,28 +337,23 @@ impl Terminal {
                     ClipboardType::Selection => cx.write_to_primary(item),
                 }
             }
+            // Only sent when the config allows OSC 52 reads (see `term_config`).
             AlacEvent::ClipboardLoad(kind, format) => {
-                if !self.osc52_paste {
-                    return;
-                }
                 let item = match kind {
                     ClipboardType::Clipboard => cx.read_from_clipboard(),
                     ClipboardType::Selection => cx.read_from_primary(),
                 };
                 let text = item.and_then(|i| i.text()).unwrap_or_default();
-                self.write(format(&text).into_bytes());
+                self.reply(format(&text).into_bytes());
             }
-            // Remote panes: tmux answers queries itself; replying would inject garbage.
-            AlacEvent::ColorRequest(index, format) if !remote => {
+            AlacEvent::ColorRequest(index, format) => {
                 let color = self.term.lock().colors()[index].unwrap_or_else(|| self.default_color(index));
-                self.write(format(color).into_bytes());
+                self.reply(format(color).into_bytes());
             }
-            AlacEvent::PtyWrite(text) if !remote => self.write(text.into_bytes()),
-            AlacEvent::TextAreaSizeRequest(format) if !remote => {
-                self.write(format(self.size.into()).into_bytes())
-            }
+            AlacEvent::PtyWrite(text) => self.reply(text.into_bytes()),
+            AlacEvent::TextAreaSizeRequest(format) => self.reply(format(self.size.into()).into_bytes()),
             AlacEvent::Bell => cx.emit(TerminalEvent::Bell),
-            AlacEvent::Exit | AlacEvent::ChildExit(_) if !remote => self.mark_exited(cx),
+            AlacEvent::Exit | AlacEvent::ChildExit(_) => self.mark_exited(cx),
             _ => {}
         }
     }
@@ -396,13 +377,22 @@ impl Terminal {
             i if i == NamedColor::Background as usize => t.background,
             i if i == NamedColor::Cursor as usize => t.cursor,
             i if i == NamedColor::BrightForeground as usize => t.foreground,
-            i if i == NamedColor::DimForeground as usize => t.foreground.mix(t.background, 0.33),
+            i if i == NamedColor::DimForeground as usize => t.foreground.mix(t.background, DIM_FACTOR),
             i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
-                t.ansi[i - NamedColor::DimBlack as usize].mix(t.background, 0.33)
+                t.ansi[i - NamedColor::DimBlack as usize].mix(t.background, DIM_FACTOR)
             }
             _ => t.foreground,
         };
-        Rgb { r: c.r, g: c.g, b: c.b }
+        c.into()
+    }
+
+    /// Sends a reply the emulator generated (device/color/size reports).
+    /// Remote panes drop these: tmux answers such queries itself, and
+    /// forwarding them would inject garbage into the pane's input.
+    fn reply(&self, bytes: Vec<u8>) {
+        if !self.is_remote() {
+            self.write(bytes);
+        }
     }
 
     /// Writes raw bytes to the program.
@@ -452,32 +442,14 @@ impl Terminal {
         }
     }
 
-    pub fn scroll(&mut self, delta_lines: i32, cx: &mut Context<Self>) {
-        self.term.lock().scroll_display(Scroll::Delta(delta_lines));
-        cx.notify();
-    }
-
-    pub fn scroll_page(&mut self, up: bool, cx: &mut Context<Self>) {
-        self.term.lock().scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
-        cx.notify();
-    }
-
-    pub fn scroll_to_edge(&mut self, top: bool, cx: &mut Context<Self>) {
-        self.term.lock().scroll_display(if top { Scroll::Top } else { Scroll::Bottom });
+    pub fn scroll(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
+        self.term.lock().scroll_display(scroll);
         cx.notify();
     }
 
     pub fn clear_scrollback(&mut self, cx: &mut Context<Self>) {
         self.term.lock().grid_mut().clear_history();
         cx.notify();
-    }
-
-    pub fn display_offset(&self) -> usize {
-        self.term.lock().grid().display_offset()
-    }
-
-    pub fn history_size(&self) -> usize {
-        self.term.lock().grid().history_size()
     }
 
     // ---- selection ----------------------------------------------------------
@@ -506,12 +478,6 @@ impl Terminal {
         let mut term = self.term.lock();
         if let Some(selection) = term.selection.as_mut() {
             selection.update(point, side);
-            cx.notify();
-        }
-    }
-
-    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        if self.term.lock().selection.take().is_some() {
             cx.notify();
         }
     }
@@ -606,6 +572,24 @@ pub fn screen_text<T>(term: &Term<T>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// How far dim text and dim palette colors fade towards the background.
+pub const DIM_FACTOR: f32 = 0.4;
+
+/// Environment for programs started by Brindle (shells and tmux alike).
+pub fn child_env(profile: &Profile) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = [
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("TERM_PROGRAM", "Brindle"),
+        ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    env.extend(profile.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
 }
 
 /// Prepares clipboard text for the PTY.

@@ -23,7 +23,6 @@ pub enum Notification {
     SessionWindowChanged { window: WindowId },
     SessionChanged { name: String },
     SessionRenamed { name: String },
-    PaneModeChanged(PaneId),
     Exit(Option<String>),
     /// Anything else (`%sessions-changed`, `%message`, …) or an unparseable line.
     Other(String),
@@ -90,7 +89,6 @@ pub fn parse_line(line: &[u8]) -> Notification {
             let name = rest.split_once(' ').map(|(_, n)| n).unwrap_or(rest);
             Some(Notification::SessionRenamed { name: name.to_string() })
         }
-        "%pane-mode-changed" => id(rest, '%').map(Notification::PaneModeChanged),
         "%exit" => Some(Notification::Exit((!rest.is_empty()).then(|| rest.to_string()))),
         _ => None,
     };
@@ -181,9 +179,13 @@ pub fn send_keys_commands(pane: PaneId, bytes: &[u8]) -> Vec<String> {
     bytes
         .chunks(256)
         .map(|chunk| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut cmd = format!("send-keys -t %{pane} -H");
-            for b in chunk {
-                cmd.push_str(&format!(" {b:02x}"));
+            cmd.reserve(chunk.len() * 3);
+            for &b in chunk {
+                cmd.push(' ');
+                cmd.push(HEX[(b >> 4) as usize] as char);
+                cmd.push(HEX[(b & 0xf) as usize] as char);
             }
             cmd
         })

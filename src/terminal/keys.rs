@@ -38,15 +38,6 @@ fn tilde_key(n: u8, m: &Modifiers) -> Vec<u8> {
     }
 }
 
-/// F1-F4 use SS3 when unmodified.
-fn ss3_function_key(letter: char, m: &Modifiers) -> Vec<u8> {
-    if any_modifier(m) {
-        format!("\x1b[1;{}{letter}", modifier_param(m)).into_bytes()
-    } else {
-        format!("\x1bO{letter}").into_bytes()
-    }
-}
-
 fn with_alt(m: &Modifiers, bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 1);
     if m.alt {
@@ -107,10 +98,11 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: TermMode) -> Option<Cow<'static, 
         "delete" => tilde_key(3, m),
         "pageup" => tilde_key(5, m),
         "pagedown" => tilde_key(6, m),
-        "f1" => ss3_function_key('P', m),
-        "f2" => ss3_function_key('Q', m),
-        "f3" => ss3_function_key('R', m),
-        "f4" => ss3_function_key('S', m),
+        // F1-F4 use SS3 when unmodified, like app-mode cursor keys.
+        "f1" => cursor_key('P', m, TermMode::APP_CURSOR),
+        "f2" => cursor_key('Q', m, TermMode::APP_CURSOR),
+        "f3" => cursor_key('R', m, TermMode::APP_CURSOR),
+        "f4" => cursor_key('S', m, TermMode::APP_CURSOR),
         "f5" => tilde_key(15, m),
         "f6" => tilde_key(17, m),
         "f7" => tilde_key(18, m),

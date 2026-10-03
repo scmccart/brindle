@@ -13,7 +13,7 @@ use gpui::{
 use crate::actions::*;
 use crate::settings::Settings;
 use crate::terminal::Terminal;
-use crate::terminal_element::cell_metrics;
+use crate::terminal_element::{cell_metrics, fit_grid};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use crate::tmux::layout::Rect;
@@ -25,10 +25,14 @@ pub struct TmuxWindowView {
     pub window_id: WindowId,
     pub theme: Theme,
     font_size_override: Option<f32>,
-    panes: HashMap<PaneId, (Entity<TerminalView>, Subscription)>,
+    views: HashMap<PaneId, (Entity<TerminalView>, Subscription)>,
+    /// Pane rects and dividers from the window's layout, refreshed whenever
+    /// the session changes rather than on every frame.
+    panes: Vec<(PaneId, Rect)>,
+    dividers: Vec<Rect>,
+    active: Option<PaneId>,
+    zoomed: bool,
     focus_handle: FocusHandle,
-    /// Active pane as of the last render, to follow tmux-driven focus changes.
-    last_active: Option<PaneId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -38,73 +42,81 @@ impl TmuxWindowView {
         window_id: WindowId,
         theme: Theme,
         font_size_override: Option<f32>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![cx.observe(&session, |_, _, cx| cx.notify())];
-        Self {
+        let subscriptions =
+            vec![cx.observe_in(&session, window, |this, _, window, cx| this.sync(window, cx))];
+        let mut this = Self {
             session,
             window_id,
             theme,
             font_size_override,
-            panes: HashMap::new(),
+            views: HashMap::new(),
+            panes: Vec::new(),
+            dividers: Vec::new(),
+            active: None,
+            zoomed: false,
             focus_handle: cx.focus_handle(),
-            last_active: None,
             _subscriptions: subscriptions,
-        }
+        };
+        this.sync(window, cx);
+        this
     }
 
     pub fn title(&self, cx: &App) -> String {
         let session = self.session.read(cx);
         session
-            .windows
-            .get(&self.window_id)
+            .window(self.window_id)
             .map(|w| w.name.clone())
             .unwrap_or_else(|| session.session_name.clone())
     }
 
-    fn active_pane(&self, cx: &App) -> Option<PaneId> {
-        self.session.read(cx).active_pane_of(Some(self.window_id))
-    }
-
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.active_pane(cx)
-            .and_then(|id| self.panes.get(&id))
+        self.active
+            .and_then(|id| self.views.get(&id))
             .map(|(view, _)| view.read(cx).focus_handle.clone())
             .unwrap_or_else(|| self.focus_handle.clone())
     }
 
     pub fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
-        self.session.read(cx).pane_terminal(self.active_pane(cx)?)
+        self.session.read(cx).pane_terminal(self.active?)
     }
 
-    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+    /// Applies a reloaded profile (theme and font size).
+    pub fn set_profile(&mut self, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
-        for (view, _) in self.panes.values() {
+        self.font_size_override = font_size;
+        for (view, _) in self.views.values() {
             let theme = theme.clone();
-            view.update(cx, |view, cx| view.terminal.update(cx, |t, _| t.theme = theme));
+            view.update(cx, |view, cx| {
+                view.font_size_override = font_size;
+                view.terminal.update(cx, |t, _| t.theme = theme)
+            });
         }
         cx.notify();
     }
 
-    /// Creates views for new panes and drops views for closed ones.
-    fn sync_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<(PaneId, Rect)> {
+    /// Mirrors the session: creates views for new panes, drops closed ones,
+    /// and moves focus when tmux changes the active pane.
+    fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
-        let layout_panes = session
-            .windows
-            .get(&self.window_id)
-            .and_then(|w| w.layout.as_ref())
-            .map(|l| l.panes())
-            .unwrap_or_default();
-        let terminals: Vec<(PaneId, Option<Entity<Terminal>>)> =
-            layout_panes.iter().map(|(id, _)| (*id, session.pane_terminal(*id))).collect();
+        let tmux_window = session.window(self.window_id);
+        let layout = tmux_window.and_then(|w| w.layout.as_ref());
+        self.panes = layout.map(|l| l.panes()).unwrap_or_default();
+        self.dividers = layout.map(|l| l.dividers()).unwrap_or_default();
+        self.zoomed = tmux_window.is_some_and(|w| w.zoomed);
+        let active = session.active_pane_of(self.window_id);
+        let new_terminals: Vec<(PaneId, Entity<Terminal>)> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| !self.views.contains_key(id))
+            .filter_map(|(id, _)| Some((*id, session.pane_terminal(*id)?)))
+            .collect();
 
-        self.panes.retain(|id, _| layout_panes.iter().any(|(p, _)| p == id));
-        for (id, terminal) in terminals {
-            if self.panes.contains_key(&id) {
-                continue;
-            }
-            let Some(terminal) = terminal else { continue };
+        let panes = &self.panes;
+        self.views.retain(|id, _| panes.iter().any(|(p, _)| p == id));
+        for (id, terminal) in new_terminals {
             let font_size = self.font_size_override;
             let view = cx.new(|cx| {
                 let mut view = TerminalView::new(terminal, font_size, window, cx);
@@ -116,72 +128,41 @@ impl TmuxWindowView {
             let subscription = cx.on_focus_in(&focus, window, move |_, _, cx| {
                 session.update(cx, |s, cx| s.select_pane(id, cx));
             });
-            self.panes.insert(id, (view, subscription));
+            self.views.insert(id, (view, subscription));
         }
-        layout_panes
+
+        // Follow tmux-driven focus changes (select-pane, a pane closing, …)
+        // while this tab has focus.
+        if active != self.active {
+            let had_focus = self.focus_handle.contains_focused(window, cx)
+                || self.views.values().any(|(v, _)| v.read(cx).focus_handle.is_focused(window));
+            self.active = active;
+            if had_focus {
+                window.focus(&self.focus_handle(cx));
+            }
+        }
+        cx.notify();
     }
 
-    fn split_right(&mut self, _: &TmuxSplitRight, _: &mut Window, cx: &mut Context<Self>) {
+    fn with_session(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut TmuxSession, WindowId)) {
         let id = self.window_id;
-        self.session.update(cx, |s, _| s.split(id, true));
-    }
-
-    fn split_down(&mut self, _: &TmuxSplitDown, _: &mut Window, cx: &mut Context<Self>) {
-        let id = self.window_id;
-        self.session.update(cx, |s, _| s.split(id, false));
-    }
-
-    fn close_pane(&mut self, _: &TmuxClosePane, _: &mut Window, cx: &mut Context<Self>) {
-        let id = self.window_id;
-        self.session.update(cx, |s, _| s.kill_pane(id));
-    }
-
-    fn zoom_pane(&mut self, _: &TmuxZoomPane, _: &mut Window, cx: &mut Context<Self>) {
-        let id = self.window_id;
-        self.session.update(cx, |s, _| s.toggle_zoom(id));
-    }
-
-    fn focus(&mut self, direction: Direction, cx: &mut Context<Self>) {
-        let id = self.window_id;
-        self.session.update(cx, |s, _| s.focus_direction(id, direction));
+        self.session.update(cx, |s, _| f(s, id));
     }
 }
 
 impl Render for TmuxWindowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let panes = self.sync_panes(window, cx);
-        let active = self.active_pane(cx);
         let metrics = cell_metrics(self.font_size_override, window, cx);
         let (cw, lh) = (metrics.cell_width, metrics.line_height);
         let padding = px(Settings::get(cx).config.padding);
-        let zoomed = self.session.read(cx).windows.get(&self.window_id).is_some_and(|w| w.zoomed);
-        let dividers = self
-            .session
-            .read(cx)
-            .windows
-            .get(&self.window_id)
-            .and_then(|w| w.layout.as_ref())
-            .map(|l| l.dividers())
-            .unwrap_or_default();
-
-        // Follow focus when tmux changes the active pane (select-pane, a pane
-        // closing, …) while this tab has focus.
-        if active != self.last_active {
-            self.last_active = active;
-            let has_focus = self.focus_handle.contains_focused(window, cx)
-                || self.panes.values().any(|(v, _)| v.read(cx).focus_handle.is_focused(window));
-            if has_focus && let Some((view, _)) = active.and_then(|id| self.panes.get(&id)) {
-                window.focus(&view.read(cx).focus_handle);
-            }
-        }
-
-        let active_rect = panes.iter().find(|(id, _)| Some(*id) == active).map(|(_, r)| *r);
+        let active_rect = self.panes.iter().find(|(id, _)| Some(*id) == self.active).map(|(_, r)| *r);
         let theme = self.theme.clone();
         let session = self.session.clone();
-        let multiple = panes.len() > 1;
+        let dividers = self.dividers.clone();
+        let multiple = self.panes.len() > 1;
 
-        let pane_elements = panes.iter().filter_map(|(id, rect)| {
-            let (view, _) = self.panes.get(id)?;
+        let pane_elements = self.panes.iter().filter_map(|(id, rect)| {
+            let (view, _) = self.views.get(id)?;
             Some(
                 div()
                     .absolute()
@@ -196,14 +177,22 @@ impl Render for TmuxWindowView {
         div()
             .key_context("TmuxWindow")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::split_right))
-            .on_action(cx.listener(Self::split_down))
-            .on_action(cx.listener(Self::close_pane))
-            .on_action(cx.listener(Self::zoom_pane))
-            .on_action(cx.listener(|this, _: &TmuxFocusLeft, _, cx| this.focus(Direction::Left, cx)))
-            .on_action(cx.listener(|this, _: &TmuxFocusRight, _, cx| this.focus(Direction::Right, cx)))
-            .on_action(cx.listener(|this, _: &TmuxFocusUp, _, cx| this.focus(Direction::Up, cx)))
-            .on_action(cx.listener(|this, _: &TmuxFocusDown, _, cx| this.focus(Direction::Down, cx)))
+            .on_action(cx.listener(|this, _: &TmuxSplitRight, _, cx| this.with_session(cx, |s, w| s.split(w, true))))
+            .on_action(cx.listener(|this, _: &TmuxSplitDown, _, cx| this.with_session(cx, |s, w| s.split(w, false))))
+            .on_action(cx.listener(|this, _: &TmuxClosePane, _, cx| this.with_session(cx, |s, w| s.kill_pane(w))))
+            .on_action(cx.listener(|this, _: &TmuxZoomPane, _, cx| this.with_session(cx, |s, w| s.toggle_zoom(w))))
+            .on_action(cx.listener(|this, _: &TmuxFocusLeft, _, cx| {
+                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Left))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxFocusRight, _, cx| {
+                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Right))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxFocusUp, _, cx| {
+                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Up))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxFocusDown, _, cx| {
+                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Down))
+            }))
             .relative()
             .size_full()
             .bg(theme.background.hsla())
@@ -211,10 +200,8 @@ impl Render for TmuxWindowView {
                 canvas(
                     move |bounds, _, cx| {
                         // The client size tells tmux how much room its windows get.
-                        let avail = bounds.size - size(padding * 2.0, padding * 2.0);
-                        let cols = (avail.width / cw).floor().max(2.0) as u16;
-                        let rows = (avail.height / lh).floor().max(2.0) as u16;
-                        session.update(cx, |s, _| s.set_client_size(cols, rows));
+                        let (cols, rows) = fit_grid(bounds.size, padding, cw, lh);
+                        session.update(cx, |s, _| s.set_client_size(cols as u16, rows as u16));
                     },
                     move |bounds, _, window, _| {
                         let origin = bounds.origin + point(padding, padding);
@@ -225,7 +212,7 @@ impl Render for TmuxWindowView {
                 .size_full(),
             )
             .children(pane_elements)
-            .when(zoomed, |d| {
+            .when(self.zoomed, |d| {
                 d.child(
                     div()
                         .absolute()
