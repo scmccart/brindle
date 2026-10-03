@@ -2,15 +2,17 @@
 //! exactly as tmux arranged them, with native dividers.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Hsla, InteractiveElement,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Hsla, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Window, canvas, div, fill,
     point, px, size,
 };
 
 use crate::actions::*;
+use crate::picker::PromptRequest;
 use crate::settings::Settings;
 use crate::terminal::Terminal;
 use crate::terminal_element::{cell_metrics, fit_grid};
@@ -35,6 +37,9 @@ pub struct TmuxWindowView {
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
+
+/// Prompted commands ask the workspace to show the prompt.
+impl EventEmitter<PromptRequest> for TmuxWindowView {}
 
 impl TmuxWindowView {
     pub fn new(
@@ -148,6 +153,30 @@ impl TmuxWindowView {
         let id = self.window_id;
         self.session.update(cx, |s, _| f(s, id));
     }
+
+    fn rename_window(&mut self, _: &TmuxRenameWindow, _: &mut Window, cx: &mut Context<Self>) {
+        let (session, window) = (self.session.clone(), self.window_id);
+        let initial = session.read(cx).window(window).map(|w| w.name.clone()).unwrap_or_default();
+        cx.emit(PromptRequest {
+            label: "Rename tmux window".into(),
+            initial,
+            submit: Rc::new(move |name, cx| {
+                session.update(cx, |s, _| s.rename_window(window, &name));
+                let (tx, rx) = futures::channel::oneshot::channel();
+                tx.send(Ok(())).ok();
+                rx
+            }),
+        });
+    }
+
+    fn run_command(&mut self, _: &TmuxCommand, _: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.clone();
+        cx.emit(PromptRequest {
+            label: "tmux command".into(),
+            initial: String::new(),
+            submit: Rc::new(move |line, cx| session.update(cx, |s, _| s.run_user_command(&line))),
+        });
+    }
 }
 
 impl Render for TmuxWindowView {
@@ -177,10 +206,31 @@ impl Render for TmuxWindowView {
         div()
             .key_context("TmuxWindow")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &TmuxDetach, _, cx| this.with_session(cx, |s, _| s.detach())))
             .on_action(cx.listener(|this, _: &TmuxSplitRight, _, cx| this.with_session(cx, |s, w| s.split(w, true))))
             .on_action(cx.listener(|this, _: &TmuxSplitDown, _, cx| this.with_session(cx, |s, w| s.split(w, false))))
             .on_action(cx.listener(|this, _: &TmuxClosePane, _, cx| this.with_session(cx, |s, w| s.kill_pane(w))))
             .on_action(cx.listener(|this, _: &TmuxZoomPane, _, cx| this.with_session(cx, |s, w| s.toggle_zoom(w))))
+            .on_action(cx.listener(|this, _: &TmuxNewWindow, _, cx| this.with_session(cx, |s, _| s.new_window())))
+            .on_action(cx.listener(|this, _: &TmuxLayoutEvenHorizontal, _, cx| {
+                this.with_session(cx, |s, w| s.select_layout(w, "even-horizontal"))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxLayoutEvenVertical, _, cx| {
+                this.with_session(cx, |s, w| s.select_layout(w, "even-vertical"))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxLayoutMainVertical, _, cx| {
+                this.with_session(cx, |s, w| s.select_layout(w, "main-vertical"))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxLayoutTiled, _, cx| {
+                this.with_session(cx, |s, w| s.select_layout(w, "tiled"))
+            }))
+            .on_action(cx.listener(|this, _: &TmuxNextLayout, _, cx| this.with_session(cx, |s, w| s.next_layout(w))))
+            .on_action(cx.listener(|this, _: &TmuxRotatePanes, _, cx| this.with_session(cx, |s, w| s.rotate(w))))
+            .on_action(cx.listener(|this, _: &TmuxSwapPanePrev, _, cx| this.with_session(cx, |s, w| s.swap_pane(w, true))))
+            .on_action(cx.listener(|this, _: &TmuxSwapPaneNext, _, cx| this.with_session(cx, |s, w| s.swap_pane(w, false))))
+            .on_action(cx.listener(Self::rename_window))
+            .on_action(cx.listener(Self::run_command))
+            .on_action(cx.listener(|this, _: &TmuxBreakPane, _, cx| this.with_session(cx, |s, w| s.break_pane(w))))
             .on_action(cx.listener(|this, _: &TmuxFocusLeft, _, cx| {
                 this.with_session(cx, |s, w| s.focus_direction(w, Direction::Left))
             }))

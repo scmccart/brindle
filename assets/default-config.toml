@@ -26,7 +26,7 @@ shape = "block"   # block | beam | underline
 blink = true
 
 # ---------------------------------------------------------------------------
-# Profiles. Open the profile picker with ctrl-shift-p, or open profile N
+# Profiles. Open the new-tab palette with ctrl-shift-space, or open profile N
 # directly with ctrl-alt-N.
 # ---------------------------------------------------------------------------
 

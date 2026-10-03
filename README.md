@@ -51,7 +51,8 @@ On first launch Brindle writes a commented config to
 | ctrl-tab, ctrl-pageup/down | switch tab |
 | alt-1 … alt-9 | go to tab (9 = last) |
 | ctrl-shift-pageup/down | move tab |
-| ctrl-shift-p | profile picker |
+| ctrl-shift-p | command palette (every command, with its shortcut) |
+| ctrl-shift-space, or the strip's `⌄` | new tab with a profile |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
 | ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
 | shift-pageup/down, shift-home/end | scrollback |
@@ -60,6 +61,10 @@ On first launch Brindle writes a commented config to
 | ctrl-, | edit config |
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
+
+**Breaking change:** ctrl-shift-p used to open the profile list and now opens the
+command palette. The profile list is on ctrl-shift-space and the `⌄` button; to
+get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.
 
 ### tmux control mode
 
@@ -76,6 +81,14 @@ bindings instead:
 | ctrl-shift-z | zoom pane |
 | alt-arrows | move between panes |
 | ctrl-shift-d | detach (the session keeps running) |
+
+More tmux commands have no default key and are run from the command palette
+(ctrl-shift-p): layouts (even horizontal/vertical, main vertical, tiled, next),
+rotate panes, swap a pane with the previous or next one, break a pane out into a
+new tab, **rename window**, and **run command**, which takes any tmux command line.
+Run command shows tmux's error if the line fails, and new windows or panes it
+creates start in the current pane's directory. Each command can also be bound to
+a key; see `brindle --list-actions`.
 
 Clicking a pane selects it in tmux. If the program in a pane has turned on mouse
 reporting, clicks go to it; otherwise you get normal text selection.

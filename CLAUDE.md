@@ -53,7 +53,11 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - Tab titles are cached and refreshed on `TitleChanged` plus a 1 s poll of `/proc`.
   - Removing the last tab closes the window, and closing the last window quits.
 - **`settings.rs`** — a GPUI global holding the `Config`, the resolved font (built once) and the zoom level. Live reload (`main.rs` polls the file mtime) rebuilds it, rebinds keys, and calls `Workspace::apply_config`.
-- **`actions.rs`** — one `ACTIONS` table drives both config-name lookup and `--list-actions`. Default bindings use the key contexts `Workspace`, `Terminal`, `TmuxWindow` and `ProfilePicker`. User bindings go in the `Terminal` context, so they win over the defaults.
+- **`actions.rs`** — one `ACTIONS` table drives config-name lookup, `--list-actions` and the command palette (an entry's label puts it in the palette). Default bindings use the key contexts `Workspace`, `Terminal`, `TmuxWindow` and `Palette`. User bindings go in the `Terminal` context, so they win over the defaults.
+  - tmux actions (detach included) are handled only in `TmuxWindow`. ctrl-shift-d is also bound to the hidden `Swallow` action in `Workspace`, so outside tmux tabs it never reaches a shell as `^D`.
+- **`picker.rs`** — `Palette`, the overlay list behind both the new-tab palette (profiles) and the command palette, plus a one-line prompt mode.
+  - The command palette lists the labelled actions available from the tab that had focus, snapshotted before the palette takes focus. It needs both `available_actions` (for global listeners) and `is_action_available` (for `no_json` actions). Running a command refocuses the tab and calls `window.dispatch_action`, so it takes the keybinding's path.
+  - Prompted commands (`TmuxRenameWindow`, `TmuxCommand`) are ordinary actions. Their handlers emit a prompt request that `Workspace` opens, so a keybinding and the palette behave the same.
 - **`tmux/`** — control mode over plain pipes (`tmux -C`, not `-CC`):
   - **Framing (`protocol.rs`):** `Collector` groups output into `%begin…%end/%error` responses and notifications. Responses to our commands (flags bit 0) are matched FIFO against `Io.pending`, because the `%begin` number is tmux's global counter, not a request id.
   - **Windows:** `%window-add` carries no layout and isn't followed by `%layout-change`, so window state always comes from a full `list-windows`.

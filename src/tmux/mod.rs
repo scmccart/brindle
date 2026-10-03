@@ -15,6 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
 use futures::StreamExt as _;
+use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Task};
 
 use crate::config::{Config, Profile};
@@ -49,6 +50,10 @@ enum Pending {
     PaneState(PaneId),
     CaptureAlternate(PaneId),
     Capture(PaneId),
+    /// A line the user typed, followed by `display-message -p <token>`. Its
+    /// commands each reply with their own block, so every block up to the
+    /// token's belongs to it.
+    UserCommand { token: String, first_error: Option<String>, reply: oneshot::Sender<Result<(), String>> },
 }
 
 /// The write side of the control connection, shared with pane input closures.
@@ -59,11 +64,36 @@ struct Io {
 
 impl Io {
     fn send(&mut self, command: String, pending: Pending) {
-        log::debug!("tmux <- {command}");
-        if self.writer.send(command).is_ok() {
+        if self.write(command) {
             self.pending.push_back(pending);
         }
     }
+
+    /// Writes a command line without expecting a reply of its own.
+    fn write(&mut self, command: String) -> bool {
+        log::debug!("tmux <- {command}");
+        self.writer.send(command).is_ok()
+    }
+}
+
+/// Matches one reply block to the pending queue and returns what it answers.
+/// Blocks of an unfinished user command are absorbed (`None`); the user
+/// command itself is returned when its sentinel block arrives.
+fn match_reply(pending: &mut VecDeque<Pending>, ok: bool, body: &[Vec<u8>]) -> Option<Pending> {
+    if let Some(Pending::UserCommand { token, first_error, .. }) = pending.front_mut() {
+        if !ok {
+            first_error.get_or_insert_with(|| join_body(body));
+            return None;
+        }
+        if !matches!(body, [line] if line == token.as_bytes()) {
+            return None;
+        }
+    }
+    pending.pop_front()
+}
+
+fn join_body(body: &[Vec<u8>]) -> String {
+    body.iter().map(|l| String::from_utf8_lossy(l)).collect::<Vec<_>>().join(" ")
 }
 
 pub struct TmuxWindow {
@@ -103,6 +133,8 @@ pub struct TmuxSession {
     pub active_window: Option<WindowId>,
     client_size: Option<(u16, u16)>,
     child: Option<Child>,
+    /// Numbers the sentinels of user-typed commands.
+    user_commands: u64,
     /// A window list has been received, i.e. the session really attached.
     attached: bool,
     detached: bool,
@@ -217,6 +249,7 @@ impl TmuxSession {
             active_window: None,
             client_size: None,
             child,
+            user_commands: 0,
             attached: false,
             detached: false,
             _reader: reader,
@@ -315,6 +348,61 @@ impl TmuxSession {
         self.send_to_active_pane(window, |p| format!("select-pane {flag} -t %{p}"));
     }
 
+    /// `name` is one of tmux's preset layouts, e.g. `tiled`.
+    pub fn select_layout(&mut self, window: WindowId, name: &str) {
+        self.send(format!("select-layout -t @{window} {name}"));
+    }
+
+    pub fn next_layout(&mut self, window: WindowId) {
+        self.send(format!("next-layout -t @{window}"));
+    }
+
+    pub fn rotate(&mut self, window: WindowId) {
+        self.send(format!("rotate-window -Z -t @{window}"));
+    }
+
+    /// Swaps the active pane with the previous (`up`) or next pane. Without
+    /// `-d` the active pane moves along; without `-s` a marked pane is ignored.
+    pub fn swap_pane(&mut self, window: WindowId, up: bool) {
+        let flag = if up { "-U" } else { "-D" };
+        self.send_to_active_pane(window, |p| format!("swap-pane {flag} -t %{p}"));
+    }
+
+    /// Moves the active pane into a new window, which becomes current.
+    pub fn break_pane(&mut self, window: WindowId) {
+        self.send_to_active_pane(window, |p| format!("break-pane -s %{p}"));
+    }
+
+    pub fn rename_window(&mut self, window: WindowId, name: &str) {
+        if let Some(command) = rename_window_command(window, name) {
+            self.send(command);
+        }
+    }
+
+    /// Runs a command line the user typed. The result is tmux's first error,
+    /// if any; output is discarded. New windows and panes start in the current
+    /// pane's directory unless the line says otherwise.
+    pub fn run_user_command(&mut self, line: &str) -> oneshot::Receiver<Result<(), String>> {
+        let (reply, result) = oneshot::channel();
+        let line = line.replace(['\r', '\n'], " ");
+        if line.trim().is_empty() {
+            reply.send(Err("Type a tmux command".into())).ok();
+            return result;
+        }
+        self.user_commands += 1;
+        let token = format!("brindle-sync-{}", self.user_commands);
+        // Written back to back under one borrow so nothing else is queued
+        // between the line and its sentinel.
+        let mut io = self.io.borrow_mut();
+        if io.write(protocol::with_start_dir(&line)) {
+            io.send(
+                format!("display-message -p {token}"),
+                Pending::UserCommand { token, first_error: None, reply },
+            );
+        }
+        result
+    }
+
     pub fn detach(&mut self) {
         self.send("detach-client");
     }
@@ -346,7 +434,7 @@ impl TmuxSession {
         match event {
             Event::Response { ours: false, .. } => {}
             Event::Response { ours: true, ok, body } => {
-                let pending = self.io.borrow_mut().pending.pop_front();
+                let pending = match_reply(&mut self.io.borrow_mut().pending, ok, &body);
                 match pending {
                     Some(Pending::ListWindows) if ok => self.on_window_list(body, cx),
                     Some(Pending::PaneState(pane)) => {
@@ -369,10 +457,12 @@ impl TmuxSession {
                         }
                     }
                     Some(Pending::Capture(pane)) => self.finish_restore(pane, if ok { body } else { Vec::new() }, cx),
+                    Some(Pending::UserCommand { first_error, reply, .. }) => {
+                        reply.send(first_error.map_or(Ok(()), Err)).ok();
+                    }
                     Some(Pending::ListWindows) | Some(Pending::Ignore) | None => {
                         if !ok {
-                            let message = body.iter().map(|l| String::from_utf8_lossy(l)).collect::<Vec<_>>().join(" ");
-                            log::warn!("tmux command failed: {message}");
+                            log::warn!("tmux command failed: {}", join_body(&body));
                         }
                     }
                 }
@@ -536,6 +626,9 @@ impl TmuxSession {
             return;
         }
         self.detached = true;
+        // Nothing more will be answered; dropping waiting user commands
+        // closes their prompts.
+        self.io.borrow_mut().pending.clear();
         for pane in self.panes.values() {
             pane.terminal.update(cx, |t, cx| t.mark_exited(cx));
         }
@@ -561,6 +654,12 @@ impl Drop for TmuxSession {
             });
         }
     }
+}
+
+/// The command renaming `window`, or `None` for an empty name.
+fn rename_window_command(window: WindowId, name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| format!("rename-window -t @{window} {}", protocol::quote(name)))
 }
 
 fn join_lines(lines: &[Vec<u8>], out: &mut Vec<u8>) {
@@ -622,6 +721,48 @@ mod tests {
         let (program, args) = command_line(&profile, Some(&PathBuf::from("/tmp")));
         assert_eq!(program, "tmux");
         assert_eq!(args, ["-L", "x", "-C", "new-session", "-A", "-s", "work", "-c", "/tmp"]);
+    }
+
+    #[test]
+    fn user_command_replies_up_to_its_sentinel() {
+        let lines = |s: &str| vec![s.as_bytes().to_vec()];
+        let user = |n: u32| {
+            let (reply, result) = oneshot::channel();
+            (Pending::UserCommand { token: format!("brindle-sync-{n}"), first_error: None, reply }, result)
+        };
+        let mut queue = VecDeque::new();
+        let (first, _r1) = user(1);
+        let (second, _r2) = user(2);
+        let (third, _r3) = user(3);
+        queue.extend([first, Pending::ListWindows, second, third, Pending::Ignore]);
+
+        // One command, then its sentinel: Ok.
+        assert!(match_reply(&mut queue, true, &[]).is_none());
+        let done = match_reply(&mut queue, true, &lines("brindle-sync-1"));
+        assert!(matches!(done, Some(Pending::UserCommand { first_error: None, .. })));
+        // The next pending entry is matched normally.
+        assert!(matches!(match_reply(&mut queue, true, &lines("@1\t0")), Some(Pending::ListWindows)));
+        // An error, then the sentinel: Err with the first message.
+        assert!(match_reply(&mut queue, false, &lines("unknown command: bogus")).is_none());
+        let done = match_reply(&mut queue, true, &lines("brindle-sync-2"));
+        assert!(
+            matches!(done, Some(Pending::UserCommand { first_error: Some(ref e), .. }) if e == "unknown command: bogus")
+        );
+        // Two commands (`a ; b`) produce two blocks before the sentinel.
+        assert!(match_reply(&mut queue, true, &[]).is_none());
+        assert!(match_reply(&mut queue, true, &lines("output")).is_none());
+        assert!(matches!(
+            match_reply(&mut queue, true, &lines("brindle-sync-3")),
+            Some(Pending::UserCommand { first_error: None, .. })
+        ));
+        assert!(matches!(match_reply(&mut queue, true, &[]), Some(Pending::Ignore)));
+    }
+
+    #[test]
+    fn rename_window_quotes_and_skips_empty() {
+        assert_eq!(rename_window_command(3, "build"), Some(r#"rename-window -t @3 "build""#.into()));
+        assert_eq!(rename_window_command(3, r#"a "b" $c"#), Some(r#"rename-window -t @3 "a \"b\" \$c""#.into()));
+        assert_eq!(rename_window_command(3, "  "), None);
     }
 
     #[test]

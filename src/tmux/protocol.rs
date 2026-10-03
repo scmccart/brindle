@@ -163,6 +163,73 @@ pub fn decode_output(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Makes a user-typed command line start new windows and panes in the
+/// client's current pane directory: `-c "#{pane_current_path}"` is inserted
+/// after each top-level `new-window` / `split-window` (or alias). Quoted
+/// text, escapes and `{ … }` blocks are copied untouched, and a `-c` the user
+/// gave comes later on the line, so it wins.
+pub fn with_start_dir(line: &str) -> String {
+    const COMMANDS: [&str; 4] = ["new-window", "neww", "split-window", "splitw"];
+    const START_DIR: &str = " -c \"#{pane_current_path}\"";
+
+    let mut inserts = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut expecting_command = true;
+    let mut word_start: Option<usize> = None;
+    let mut finish_word = |start: &mut Option<usize>, end: usize, expecting: &mut bool| {
+        if let Some(begin) = start.take() {
+            if COMMANDS.contains(&&line[begin..end]) {
+                inserts.push(end);
+            }
+            *expecting = false;
+        }
+    };
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if depth == 0 && (c.is_whitespace() || c == ';') {
+            finish_word(&mut word_start, i, &mut expecting_command);
+            if c == ';' {
+                expecting_command = true;
+            }
+            continue;
+        }
+        if depth == 0 && expecting_command && word_start.is_none() {
+            word_start = Some(i);
+        }
+        match c {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(c),
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    finish_word(&mut word_start, line.len(), &mut expecting_command);
+
+    let mut out = String::with_capacity(line.len() + inserts.len() * START_DIR.len());
+    let mut last = 0;
+    for at in inserts {
+        out.push_str(&line[last..at]);
+        out.push_str(START_DIR);
+        last = at;
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
 /// Quotes an argument for a tmux command line.
 pub fn quote(arg: &str) -> String {
     let escaped = arg
@@ -197,6 +264,39 @@ mod tests {
     use super::*;
 
     // Lines below are taken from a real tmux 3.6 `-C` session.
+
+    #[test]
+    fn start_dir_is_added_to_top_level_window_and_pane_commands() {
+        const C: &str = r##"-c "#{pane_current_path}""##;
+        assert_eq!(with_start_dir("split-window -h"), format!("split-window {C} -h"));
+        assert_eq!(with_start_dir("new-window"), format!("new-window {C}"));
+        assert_eq!(with_start_dir("  splitw"), format!("  splitw {C}"));
+        assert_eq!(with_start_dir("neww ; splitw -v"), format!("neww {C} ; splitw {C} -v"));
+        assert_eq!(with_start_dir("neww; splitw"), format!("neww {C}; splitw {C}"));
+        assert_eq!(with_start_dir("new-window -c /tmp"), format!("new-window {C} -c /tmp"));
+        assert_eq!(with_start_dir("rename-window x ; neww"), format!("rename-window x ; neww {C}"));
+    }
+
+    #[test]
+    fn start_dir_leaves_other_text_alone() {
+        for line in [
+            "select-layout tiled",
+            "rename-window 'a;b'",
+            "rename-window 'a; neww'",
+            r#"display-message "x; neww""#,
+            r"rename-window a\; neww",
+            "if-shell true { split-window ; neww }",
+            "set -g status off",
+            "",
+        ] {
+            assert_eq!(with_start_dir(line), line);
+        }
+        // Commands after a brace block are still top level.
+        assert_eq!(
+            with_start_dir("if-shell true { neww } ; splitw"),
+            r##"if-shell true { neww } ; splitw -c "#{pane_current_path}""##
+        );
+    }
 
     #[test]
     fn command_framing() {
