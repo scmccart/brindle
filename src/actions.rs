@@ -60,99 +60,69 @@ pub struct ActivateTab(pub usize);
 #[action(namespace = brindle, no_json)]
 pub struct NewTabWithProfile(pub usize);
 
-/// Every bindable action, by config name.
+/// Every bindable action without a parameter, by config name.
+const ACTIONS: &[(&str, fn() -> Box<dyn Action>)] = &[
+    ("new_tab", || Box::new(NewTab)),
+    ("close_tab", || Box::new(CloseTab)),
+    ("next_tab", || Box::new(NextTab)),
+    ("prev_tab", || Box::new(PrevTab)),
+    ("last_tab", || Box::new(ActivateTab(usize::MAX))),
+    ("move_tab_left", || Box::new(MoveTabLeft)),
+    ("move_tab_right", || Box::new(MoveTabRight)),
+    ("new_window", || Box::new(NewWindow)),
+    ("close_window", || Box::new(CloseWindow)),
+    ("copy", || Box::new(Copy)),
+    ("paste", || Box::new(Paste)),
+    ("paste_primary", || Box::new(PastePrimary)),
+    ("select_all", || Box::new(SelectAll)),
+    ("increase_font_size", || Box::new(IncreaseFontSize)),
+    ("decrease_font_size", || Box::new(DecreaseFontSize)),
+    ("reset_font_size", || Box::new(ResetFontSize)),
+    ("scroll_line_up", || Box::new(ScrollLineUp)),
+    ("scroll_line_down", || Box::new(ScrollLineDown)),
+    ("scroll_page_up", || Box::new(ScrollPageUp)),
+    ("scroll_page_down", || Box::new(ScrollPageDown)),
+    ("scroll_to_top", || Box::new(ScrollToTop)),
+    ("scroll_to_bottom", || Box::new(ScrollToBottom)),
+    ("clear_scrollback", || Box::new(ClearScrollback)),
+    ("open_profile_picker", || Box::new(OpenProfilePicker)),
+    ("reload_config", || Box::new(ReloadConfig)),
+    ("open_config", || Box::new(OpenConfig)),
+    ("tmux_detach", || Box::new(TmuxDetach)),
+    ("tmux_split_right", || Box::new(TmuxSplitRight)),
+    ("tmux_split_down", || Box::new(TmuxSplitDown)),
+    ("tmux_close_pane", || Box::new(TmuxClosePane)),
+    ("tmux_zoom_pane", || Box::new(TmuxZoomPane)),
+    ("tmux_focus_left", || Box::new(TmuxFocusLeft)),
+    ("tmux_focus_right", || Box::new(TmuxFocusRight)),
+    ("tmux_focus_up", || Box::new(TmuxFocusUp)),
+    ("tmux_focus_down", || Box::new(TmuxFocusDown)),
+    ("quit", || Box::new(Quit)),
+    ("none", || Box::new(NoAction)),
+];
+
+/// Actions taking a 1-based number, written as `<prefix><N>`.
+const NUMBERED_ACTIONS: &[(&str, fn(usize) -> Box<dyn Action>)] = &[
+    ("activate_tab_", |n| Box::new(ActivateTab(n))),
+    ("new_tab_with_profile_", |n| Box::new(NewTabWithProfile(n))),
+];
+
 pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
-    if let Some(n) = name.strip_prefix("activate_tab_") {
-        let n: usize = n.parse().ok()?;
-        return Some(Box::new(ActivateTab(n.checked_sub(1)?)));
+    for (prefix, build) in NUMBERED_ACTIONS {
+        if let Some(n) = name.strip_prefix(prefix) {
+            return Some(build(n.parse::<usize>().ok()?.checked_sub(1)?));
+        }
     }
-    if let Some(n) = name.strip_prefix("new_tab_with_profile_") {
-        let n: usize = n.parse().ok()?;
-        return Some(Box::new(NewTabWithProfile(n.checked_sub(1)?)));
-    }
-    Some(match name {
-        "none" => Box::new(NoAction),
-        "new_tab" => Box::new(NewTab),
-        "close_tab" => Box::new(CloseTab),
-        "next_tab" => Box::new(NextTab),
-        "prev_tab" => Box::new(PrevTab),
-        "last_tab" => Box::new(ActivateTab(usize::MAX)),
-        "move_tab_left" => Box::new(MoveTabLeft),
-        "move_tab_right" => Box::new(MoveTabRight),
-        "new_window" => Box::new(NewWindow),
-        "close_window" => Box::new(CloseWindow),
-        "copy" => Box::new(Copy),
-        "paste" => Box::new(Paste),
-        "paste_primary" => Box::new(PastePrimary),
-        "select_all" => Box::new(SelectAll),
-        "increase_font_size" => Box::new(IncreaseFontSize),
-        "decrease_font_size" => Box::new(DecreaseFontSize),
-        "reset_font_size" => Box::new(ResetFontSize),
-        "scroll_line_up" => Box::new(ScrollLineUp),
-        "scroll_line_down" => Box::new(ScrollLineDown),
-        "scroll_page_up" => Box::new(ScrollPageUp),
-        "scroll_page_down" => Box::new(ScrollPageDown),
-        "scroll_to_top" => Box::new(ScrollToTop),
-        "scroll_to_bottom" => Box::new(ScrollToBottom),
-        "clear_scrollback" => Box::new(ClearScrollback),
-        "open_profile_picker" => Box::new(OpenProfilePicker),
-        "reload_config" => Box::new(ReloadConfig),
-        "open_config" => Box::new(OpenConfig),
-        "tmux_detach" => Box::new(TmuxDetach),
-        "tmux_split_right" => Box::new(TmuxSplitRight),
-        "tmux_split_down" => Box::new(TmuxSplitDown),
-        "tmux_close_pane" => Box::new(TmuxClosePane),
-        "tmux_zoom_pane" => Box::new(TmuxZoomPane),
-        "tmux_focus_left" => Box::new(TmuxFocusLeft),
-        "tmux_focus_right" => Box::new(TmuxFocusRight),
-        "tmux_focus_up" => Box::new(TmuxFocusUp),
-        "tmux_focus_down" => Box::new(TmuxFocusDown),
-        "quit" => Box::new(Quit),
-        _ => return None,
-    })
+    ACTIONS.iter().find(|(n, _)| *n == name).map(|(_, build)| build())
 }
 
-pub const ACTION_NAMES: &[&str] = &[
-    "new_tab",
-    "new_tab_with_profile_<N>",
-    "close_tab",
-    "next_tab",
-    "prev_tab",
-    "activate_tab_<N>",
-    "last_tab",
-    "move_tab_left",
-    "move_tab_right",
-    "new_window",
-    "close_window",
-    "copy",
-    "paste",
-    "paste_primary",
-    "select_all",
-    "increase_font_size",
-    "decrease_font_size",
-    "reset_font_size",
-    "scroll_line_up",
-    "scroll_line_down",
-    "scroll_page_up",
-    "scroll_page_down",
-    "scroll_to_top",
-    "scroll_to_bottom",
-    "clear_scrollback",
-    "open_profile_picker",
-    "reload_config",
-    "open_config",
-    "tmux_detach",
-    "tmux_split_right",
-    "tmux_split_down",
-    "tmux_close_pane",
-    "tmux_zoom_pane",
-    "tmux_focus_left",
-    "tmux_focus_right",
-    "tmux_focus_up",
-    "tmux_focus_down",
-    "quit",
-    "none",
-];
+/// Bindable action names, for `--list-actions`.
+pub fn action_names() -> impl Iterator<Item = String> {
+    NUMBERED_ACTIONS
+        .iter()
+        .map(|(prefix, _)| format!("{prefix}<N>"))
+        .chain(ACTIONS.iter().map(|(name, _)| name.to_string()))
+}
 
 /// Default bindings follow GNOME Terminal / kitty conventions so plain
 /// ctrl-<letter> always reaches the shell (and tmux's prefix).
@@ -251,8 +221,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_documented_action_resolves() {
-        for name in ACTION_NAMES {
+    fn every_listed_action_resolves() {
+        for name in action_names() {
             let name = name.replace("<N>", "3");
             assert!(action_by_name(&name).is_some(), "{name}");
         }

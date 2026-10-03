@@ -41,16 +41,25 @@ OPTIONS:
     -V, --version                Print version
 
 DEBUGGING:
-        --send <TEXT>            Type TEXT into the first tab after startup (\\r = Enter)
+        --send <TEXT>            Type TEXT into the active tab (\\r = Enter)
+        --action <NAME>          Run an action (see --list-actions)
+                                 --send/--action steps run in order, 1s apart
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
 ";
+
+#[derive(Debug, Clone)]
+enum Step {
+    Send(String),
+    Action(String),
+}
 
 #[derive(Default, Debug)]
 struct Args {
     command: Option<(String, Vec<String>)>,
     profile: Option<String>,
     cwd: Option<PathBuf>,
-    send: Option<String>,
+    /// `--send` / `--action` steps, run in order one second apart.
+    steps: Vec<Step>,
     dump_after: Option<f64>,
 }
 
@@ -68,7 +77,7 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             "--list-actions" => {
-                for name in actions::ACTION_NAMES {
+                for name in actions::action_names() {
                     println!("{name}");
                 }
                 std::process::exit(0);
@@ -93,7 +102,8 @@ fn parse_args() -> Args {
                     unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
                 }
             }
-            "--send" => args.send = it.next().map(|s| unescape(&s)),
+            "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
+            "--action" => args.steps.extend(it.next().map(Step::Action)),
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("brindle: unknown argument {other:?}\n\n{HELP}");
@@ -195,7 +205,7 @@ fn main() {
         cx.on_action(|_: &ReloadConfig, cx| reload_config(cx));
         cx.on_action(|_: &NewWindow, cx| {
             let profile = Settings::get(cx).config.default_profile_index();
-            open_window(LaunchRequest { profile, command: None, cwd: None }, cx);
+            open_window(LaunchRequest::profile(profile), cx);
         });
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -211,13 +221,23 @@ fn main() {
         };
         watch_config(cx);
 
-        if let Some(text) = args.send.clone() {
-            cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(1500)).await;
-                window.update(cx, |ws, _, cx| ws.send_to_active(text.as_bytes(), cx)).ok();
-            })
-            .detach();
-        }
+        let steps = args.steps.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(500)).await;
+            for step in steps {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                window
+                    .update(cx, |ws, window, cx| match &step {
+                        Step::Send(text) => ws.send_to_active(text.as_bytes(), cx),
+                        Step::Action(name) => match actions::action_by_name(name) {
+                            Some(action) => window.dispatch_action(action, cx),
+                            None => log::error!("--action: unknown action {name:?}"),
+                        },
+                    })
+                    .ok();
+            }
+        })
+        .detach();
         if let Some(secs) = args.dump_after {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs_f64(secs)).await;

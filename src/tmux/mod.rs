@@ -27,7 +27,10 @@ pub enum TmuxEvent {
     WindowAdded(WindowId),
     WindowClosed(WindowId),
     WindowActivated(WindowId),
+    /// The session ended after it had been attached.
     Detached(String),
+    /// tmux exited before the session ever attached.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +77,7 @@ pub struct TmuxWindow {
 
 const PANE_STATE_FORMAT: &str = "#{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} \
     #{keypad_cursor_flag} #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} \
-    #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_utf8_flag}";
+    #{mouse_all_flag} #{mouse_sgr_flag} #{mouse_utf8_flag}";
 
 /// Snapshot pieces collected while restoring a pane's existing contents.
 #[derive(Default)]
@@ -100,6 +103,8 @@ pub struct TmuxSession {
     pub active_window: Option<WindowId>,
     client_size: Option<(u16, u16)>,
     child: Option<Child>,
+    /// A window list has been received, i.e. the session really attached.
+    attached: bool,
     detached: bool,
     _reader: Task<()>,
 }
@@ -111,7 +116,7 @@ pub fn command_line(profile: &Profile, cwd: Option<&PathBuf>) -> (String, Vec<St
     let program = profile.command.clone().unwrap_or_else(|| "tmux".into());
     let mut args = profile.tmux_args.clone();
     args.extend(["-C".into(), "new-session".into(), "-A".into(), "-s".into()]);
-    args.push(profile.tmux_session.clone().unwrap_or_else(|| "main".into()));
+    args.push(profile.tmux_session_name().to_string());
     if let Some(dir) = cwd {
         args.push("-c".into());
         args.push(dir.to_string_lossy().into_owned());
@@ -121,7 +126,7 @@ pub fn command_line(profile: &Profile, cwd: Option<&PathBuf>) -> (String, Vec<St
 
 impl TmuxSession {
     pub fn attach(profile: Profile, cwd: Option<PathBuf>, config: &Config, cx: &mut Context<Self>) -> Self {
-        let session_name = profile.tmux_session.clone().unwrap_or_else(|| "main".into());
+        let session_name = profile.tmux_session_name().to_string();
         let (program, args) = command_line(&profile, cwd.as_ref().filter(|d| d.is_dir()));
         let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<Option<Event>>();
         let (writer_tx, writer_rx) = std::sync::mpsc::channel::<String>();
@@ -132,11 +137,7 @@ impl TmuxSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor");
-        for (k, v) in &profile.env {
-            command.env(k, v);
-        }
+            .envs(crate::terminal::child_env(&profile));
         let mut startup_error = None;
         let child = match command.spawn() {
             Ok(mut child) => {
@@ -206,7 +207,7 @@ impl TmuxSession {
             }
         });
 
-        let mut this = Self {
+        let this = Self {
             profile,
             session_name,
             config: config.clone(),
@@ -216,6 +217,7 @@ impl TmuxSession {
             active_window: None,
             client_size: None,
             child,
+            attached: false,
             detached: false,
             _reader: reader,
         };
@@ -281,47 +283,48 @@ impl TmuxSession {
         self.send(format!("new-window -c {}", protocol::quote("#{pane_current_path}")));
     }
 
-    pub fn split(&mut self, window: WindowId, horizontal: bool) {
-        if let Some(pane) = self.active_pane_of(Some(window)) {
-            let flag = if horizontal { "-h" } else { "-v" };
-            self.send(format!("split-window {flag} -t %{pane} -c {}", protocol::quote("#{pane_current_path}")));
+    /// Runs `command` (a format with `{pane}` for the target) against the
+    /// window's active pane.
+    fn send_to_active_pane(&self, window: WindowId, command: impl Fn(PaneId) -> String) {
+        if let Some(pane) = self.active_pane_of(window) {
+            self.send(command(pane));
         }
+    }
+
+    pub fn split(&mut self, window: WindowId, horizontal: bool) {
+        let flag = if horizontal { "-h" } else { "-v" };
+        let dir = protocol::quote("#{pane_current_path}");
+        self.send_to_active_pane(window, |p| format!("split-window {flag} -t %{p} -c {dir}"));
     }
 
     pub fn kill_pane(&mut self, window: WindowId) {
-        if let Some(pane) = self.active_pane_of(Some(window)) {
-            self.send(format!("kill-pane -t %{pane}"));
-        }
+        self.send_to_active_pane(window, |p| format!("kill-pane -t %{p}"));
     }
 
     pub fn toggle_zoom(&mut self, window: WindowId) {
-        if let Some(pane) = self.active_pane_of(Some(window)) {
-            self.send(format!("resize-pane -Z -t %{pane}"));
-        }
+        self.send_to_active_pane(window, |p| format!("resize-pane -Z -t %{p}"));
     }
 
     pub fn focus_direction(&mut self, window: WindowId, direction: Direction) {
-        if let Some(pane) = self.active_pane_of(Some(window)) {
-            let flag = match direction {
-                Direction::Left => "-L",
-                Direction::Right => "-R",
-                Direction::Up => "-U",
-                Direction::Down => "-D",
-            };
-            self.send(format!("select-pane {flag} -t %{pane}"));
-        }
-    }
-
-    pub fn rename_window(&mut self, window: WindowId, name: &str) {
-        self.send(format!("rename-window -t @{window} {}", protocol::quote(name)));
+        let flag = match direction {
+            Direction::Left => "-L",
+            Direction::Right => "-R",
+            Direction::Up => "-U",
+            Direction::Down => "-D",
+        };
+        self.send_to_active_pane(window, |p| format!("select-pane {flag} -t %{p}"));
     }
 
     pub fn detach(&mut self) {
         self.send("detach-client");
     }
 
-    pub fn active_pane_of(&self, window: Option<WindowId>) -> Option<PaneId> {
-        let window = self.windows.get(&window?)?;
+    pub fn window(&self, window: WindowId) -> Option<&TmuxWindow> {
+        self.windows.get(&window)
+    }
+
+    pub fn active_pane_of(&self, window: WindowId) -> Option<PaneId> {
+        let window = self.windows.get(&window)?;
         window
             .active_pane
             .or_else(|| window.layout.as_ref()?.panes().first().map(|(id, _)| *id))
@@ -434,6 +437,7 @@ impl TmuxSession {
     }
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        self.attached = true;
         let mut seen = Vec::new();
         let mut added = Vec::new();
         let mut active = None;
@@ -503,9 +507,9 @@ impl TmuxSession {
                     io.send(command, Pending::Ignore);
                 }
             });
-            let theme = self.config.theme(self.profile.theme.as_deref());
-            let config = self.config.clone();
-            let terminal = cx.new(|cx| Terminal::remote(size, theme, &config, input, cx));
+            let theme = self.config.profile_theme(&self.profile);
+            let config = &self.config;
+            let terminal = cx.new(|cx| Terminal::remote(size, theme, config, input, cx));
             self.panes.insert(id, Pane { terminal, restoring: Some(Restore::default()) });
 
             // Snapshot the pane: state, alternate-saved screen, then the visible
@@ -535,11 +539,13 @@ impl TmuxSession {
         for pane in self.panes.values() {
             pane.terminal.update(cx, |t, cx| t.mark_exited(cx));
         }
-        cx.emit(TmuxEvent::Detached(reason));
+        cx.emit(if self.attached { TmuxEvent::Detached(reason) } else { TmuxEvent::Failed(reason) });
     }
 
-    pub fn is_detached(&self) -> bool {
-        self.detached
+    /// Picks up a reloaded config for panes created from now on.
+    pub fn set_config(&mut self, profile: Profile, config: &Config) {
+        self.profile = profile;
+        self.config = config.clone();
     }
 }
 

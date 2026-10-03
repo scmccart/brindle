@@ -143,6 +143,10 @@ impl Profile {
         Self { name: "Shell".into(), ..Default::default() }
     }
 
+    pub fn tmux_session_name(&self) -> &str {
+        self.tmux_session.as_deref().unwrap_or("main")
+    }
+
     pub fn working_directory(&self) -> Option<PathBuf> {
         self.cwd.as_deref().map(expand_tilde)
     }
@@ -231,6 +235,14 @@ impl Config {
         self.profiles.iter().position(|p| p.name.eq_ignore_ascii_case(name))
     }
 
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.profile_index(name).map(|ix| &self.profiles[ix])
+    }
+
+    pub fn profile_theme(&self, profile: &Profile) -> Theme {
+        self.theme(profile.theme.as_deref())
+    }
+
     pub fn theme(&self, name: Option<&str>) -> Theme {
         let name = name.unwrap_or(&self.theme);
         if let Some(theme) = self.themes.get(name) {
@@ -238,7 +250,7 @@ impl Config {
         }
         builtin_theme(name).unwrap_or_else(|| {
             log::warn!("unknown theme {name:?}, using brindle-dark");
-            builtin_theme("brindle-dark").unwrap()
+            Theme::default()
         })
     }
 }

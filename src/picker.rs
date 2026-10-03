@@ -116,14 +116,8 @@ impl Render for ProfilePicker {
         let rows = matches.iter().enumerate().map(|(row, &ix)| {
             let profile = &profiles[ix];
             let detail: SharedString = match profile.tmux {
-                TmuxMode::Control => format!(
-                    "tmux control mode · {}",
-                    profile.tmux_session.as_deref().unwrap_or("main")
-                )
-                .into(),
-                TmuxMode::Plain => {
-                    format!("tmux · {}", profile.tmux_session.as_deref().unwrap_or("main")).into()
-                }
+                TmuxMode::Control => format!("tmux control mode · {}", profile.tmux_session_name()).into(),
+                TmuxMode::Plain => format!("tmux · {}", profile.tmux_session_name()).into(),
                 TmuxMode::None => profile
                     .command
                     .clone()

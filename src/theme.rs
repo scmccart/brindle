@@ -55,6 +55,18 @@ impl Color {
     }
 }
 
+impl From<Color> for alacritty_terminal::vte::ansi::Rgb {
+    fn from(c: Color) -> Self {
+        Self { r: c.r, g: c.g, b: c.b }
+    }
+}
+
+impl From<alacritty_terminal::vte::ansi::Rgb> for Color {
+    fn from(c: alacritty_terminal::vte::ansi::Rgb) -> Self {
+        Self { r: c.r, g: c.g, b: c.b }
+    }
+}
+
 impl fmt::Display for Color {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
