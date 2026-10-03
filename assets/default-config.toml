@@ -1,0 +1,72 @@
+# Brindle configuration.
+# Reload with ctrl-shift-r (or restart). Every setting is optional.
+
+# Profile used for new tabs (ctrl-shift-t) and new windows.
+default_profile = "Shell"
+
+# Built-in themes: brindle-dark, brindle-light, tokyo-night, gruvbox-dark,
+# solarized-dark. Define your own under [themes.<name>].
+theme = "brindle-dark"
+
+scrollback_lines = 10000
+padding = 6
+copy_on_select = false
+# Let programs read your clipboard through OSC 52. Writing is always allowed
+# (that is what tmux `set-clipboard on` uses).
+osc52_paste = false
+
+[font]
+# First installed family wins.
+family = ["JetBrains Mono", "FiraCode Nerd Font Mono", "Hack Nerd Font Mono", "DejaVu Sans Mono", "Liberation Mono"]
+size = 14
+line_height = 1.25
+
+[cursor]
+shape = "block"   # block | beam | underline
+blink = true
+
+# ---------------------------------------------------------------------------
+# Profiles. Open the profile picker with ctrl-shift-p, or open profile N
+# directly with ctrl-alt-N.
+# ---------------------------------------------------------------------------
+
+[[profiles]]
+name = "Shell"
+# command = "/bin/zsh"
+# args = ["-l"]
+# cwd = "~"
+# env = { EDITOR = "nvim" }
+# theme = "tokyo-night"
+# font_size = 13
+
+# tmux in control mode: each tmux window becomes a Brindle tab and panes are
+# drawn natively. Detaching (ctrl-shift-d) keeps the session running.
+[[profiles]]
+name = "tmux"
+tmux = "control"
+tmux_session = "main"
+
+# Classic tmux running inside the terminal, with full mouse, clipboard
+# (OSC 52), true-color and focus-event support.
+[[profiles]]
+name = "tmux (classic)"
+tmux = "plain"
+tmux_session = "main"
+
+# ---------------------------------------------------------------------------
+# Custom themes. Unspecified colors inherit from brindle-dark.
+# ---------------------------------------------------------------------------
+# [themes.my-theme]
+# foreground = "#d0d0d0"
+# background = "#101010"
+# cursor = "#ffcc00"
+# selection_background = "#404040"
+# ansi = ["#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+#         "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"]
+
+# ---------------------------------------------------------------------------
+# Extra keybindings ("keys" = "action"). Run `brindle --list-actions` to see
+# every action name. Bind to "none" to disable a default binding.
+# ---------------------------------------------------------------------------
+[keybindings]
+# "ctrl-shift-enter" = "new_window"
