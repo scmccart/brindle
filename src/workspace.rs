@@ -119,20 +119,17 @@ impl LaunchRequest {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PaletteKind {
     NewTab,
-    Commands,
+    /// The command palette: its actions by row, and the tab that had focus
+    /// when it opened, which they run in.
+    Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
     Prompt,
 }
 
 struct OpenPalette {
     palette: Entity<Palette>,
     kind: PaletteKind,
-    /// The command palette's actions, by row.
-    commands: Vec<Box<dyn Action>>,
-    /// The tab that had focus when the command palette opened.
-    tab_focus: Option<FocusHandle>,
     _subscription: Subscription,
 }
 
@@ -265,21 +262,21 @@ impl Workspace {
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
     fn insert_tab(&mut self, tab: Tab, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 });
-        self.tabs.insert(index, tab);
+        let index = self.insert_tab_inactive(tab, index, cx);
         self.activate(index, window, cx);
     }
 
     /// Inserts `tab` at `index` without activating it; the active tab stays
     /// the same. Used for tmux windows, which come to the front only when
     /// tmux makes them current.
-    fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) {
+    fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) -> usize {
         let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 }).min(self.tabs.len());
         if !self.tabs.is_empty() && index <= self.active {
             self.active += 1;
         }
         self.tabs.insert(index, tab);
         cx.notify();
+        index
     }
 
     fn attach_tmux(&mut self, profile: Profile, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -344,11 +341,9 @@ impl Workspace {
                 }
             }
             TmuxEvent::WindowActivated(window_id) => {
-                // Tabs are added without activation, so the current window's
-                // tab may already be `active` (e.g. the first tab) yet unfocused.
-                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx))
-                    && (ix != self.active || !self.tabs[ix].focus_handle(cx).contains_focused(window, cx))
-                {
+                // Always activate: tabs are added without activation, so the
+                // current window's tab may already be `active` yet unfocused.
+                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
                     self.activate(ix, window, cx);
                 }
             }
@@ -550,9 +545,10 @@ impl Workspace {
     }
 
     fn open_profile_picker(&mut self, _: &OpenProfilePicker, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_palette_toggling(PaletteKind::NewTab, window, cx) {
+        if self.close_palette_toggling(|k| matches!(k, PaletteKind::NewTab), window, cx) {
             return;
         }
+        let tab_focus = self.tabs.get(self.active).map(|t| t.focus_handle(cx));
         let rows = Self::settings(cx)
             .profiles
             .iter()
@@ -566,16 +562,16 @@ impl Workspace {
                         profile.command.clone().unwrap_or_else(|| "default shell".into()).into()
                     }
                 }),
-                shortcut: (ix < 9).then(|| format!("ctrl-alt-{}", ix + 1).into()),
+                shortcut: tab_focus.as_ref().and_then(|f| shortcut(&NewTabWithProfile(ix), f, window)),
             })
             .collect();
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::list(rows, "Open profile…", theme, cx));
-        self.show_palette(palette, PaletteKind::NewTab, Vec::new(), None, window, cx);
+        self.show_palette(palette, PaletteKind::NewTab, window, cx);
     }
 
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_palette_toggling(PaletteKind::Commands, window, cx) {
+        if self.close_palette_toggling(|k| matches!(k, PaletteKind::Commands { .. }), window, cx) {
             return;
         }
         let Some(tab_focus) = self.tabs.get(self.active).map(|t| t.focus_handle(cx)) else { return };
@@ -590,29 +586,32 @@ impl Workspace {
             .map(|(label, action)| PaletteRow {
                 label: (*label).into(),
                 detail: None,
-                shortcut: window.highest_precedence_binding_for_action_in(&**action, &tab_focus).map(|b| {
-                    b.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into()
-                }),
+                shortcut: shortcut(&**action, &tab_focus, window),
             })
             .collect();
         let actions = commands.into_iter().map(|(_, a)| a).collect();
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::list(rows, "Run a command…", theme, cx));
-        self.show_palette(palette, PaletteKind::Commands, actions, Some(tab_focus), window, cx);
+        self.show_palette(palette, PaletteKind::Commands { actions, tab_focus }, window, cx);
     }
 
     /// Asks for a line of text, replacing any open palette.
     fn open_prompt(&mut self, request: PromptRequest, window: &mut Window, cx: &mut Context<Self>) {
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::prompt(request, theme, cx));
-        self.show_palette(palette, PaletteKind::Prompt, Vec::new(), None, window, cx);
+        self.show_palette(palette, PaletteKind::Prompt, window, cx);
     }
 
-    /// Closes any open palette. Returns true if it was of `kind`, so that
-    /// opening a palette again toggles it.
-    fn close_palette_toggling(&mut self, kind: PaletteKind, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// Closes any open palette. Returns true if it was of the kind `is`
+    /// matches, so that opening a palette again toggles it.
+    fn close_palette_toggling(
+        &mut self,
+        is: impl Fn(&PaletteKind) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(open) = &self.palette else { return false };
-        let same = open.kind == kind;
+        let same = is(&open.kind);
         self.dismiss_palette(window, cx);
         same
     }
@@ -621,8 +620,6 @@ impl Workspace {
         &mut self,
         palette: Entity<Palette>,
         kind: PaletteKind,
-        commands: Vec<Box<dyn Action>>,
-        tab_focus: Option<FocusHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -631,7 +628,7 @@ impl Workspace {
             PaletteEvent::Dismissed => this.dismiss_palette(window, cx),
         });
         window.focus(&palette.focus_handle(cx));
-        self.palette = Some(OpenPalette { palette, kind, commands, tab_focus, _subscription: subscription });
+        self.palette = Some(OpenPalette { palette, kind, _subscription: subscription });
         cx.notify();
     }
 
@@ -642,16 +639,15 @@ impl Workspace {
                 self.dismiss_palette(window, cx);
                 self.launch(LaunchRequest::profile(ix), window, cx);
             }
-            PaletteKind::Commands => {
-                let Some(action) = open.commands.get(ix).map(|a| a.boxed_clone()) else { return };
+            PaletteKind::Commands { actions, tab_focus } => {
                 // Run it from the tab, exactly as its keybinding would.
-                match &open.tab_focus {
-                    Some(focus) => window.focus(focus),
-                    None => self.dismiss_palette(window, cx),
-                }
+                window.focus(&tab_focus);
                 cx.notify();
-                window.dispatch_action(action, cx);
+                if let Some(action) = actions.into_iter().nth(ix) {
+                    window.dispatch_action(action, cx);
+                }
             }
+            // A prompt has no rows to confirm.
             PaletteKind::Prompt => {}
         }
     }
@@ -698,7 +694,6 @@ impl Workspace {
             cx,
         );
     }
-
 
     /// Applies a reloaded config to running terminals.
     pub fn apply_config(&mut self, cx: &mut Context<Self>) {
@@ -920,6 +915,12 @@ impl Workspace {
             None => div().into_any_element(),
         }
     }
+}
+
+/// The keys that run `action` in the element `focus`, as the palettes show them.
+fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
+    let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
+    Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
 }
 
 fn shell_quote(s: &str) -> String {

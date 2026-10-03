@@ -321,7 +321,7 @@ impl TmuxSession {
     pub fn new_window(&mut self) {
         // Formats in -c expand against the client's current pane, so the new
         // window starts where the user is, like local tabs do.
-        self.send(format!("new-window -c {}", protocol::quote("#{pane_current_path}")));
+        self.send(format!("new-window -c {}", protocol::quote(protocol::PANE_CWD)));
     }
 
     /// Runs `command` (a format with `{pane}` for the target) against the
@@ -334,7 +334,7 @@ impl TmuxSession {
 
     pub fn split(&mut self, window: WindowId, horizontal: bool) {
         let flag = if horizontal { "-h" } else { "-v" };
-        let dir = protocol::quote("#{pane_current_path}");
+        let dir = protocol::quote(protocol::PANE_CWD);
         self.send_to_active_pane(window, |p| format!("split-window {flag} -t %{p} -c {dir}"));
     }
 
@@ -391,12 +391,11 @@ impl TmuxSession {
     /// if any; output is discarded. New windows and panes start in the current
     /// pane's directory unless the line says otherwise.
     pub fn run_user_command(&mut self, line: &str) -> oneshot::Receiver<Result<(), String>> {
-        let (reply, result) = oneshot::channel();
-        let line = line.replace(['\r', '\n'], " ");
+        let line = crate::picker::single_line(line);
         if line.trim().is_empty() {
-            reply.send(Err("Type a tmux command".into())).ok();
-            return result;
+            return crate::picker::ready(Err("Type a tmux command".into()));
         }
+        let (reply, result) = oneshot::channel();
         self.user_commands += 1;
         let token = format!("brindle-sync-{}", self.user_commands);
         // Written back to back under one borrow so nothing else is queued
@@ -687,11 +686,11 @@ fn parse_window_line(line: &str) -> Option<WindowLine> {
     let fields: Vec<&str> = line.splitn(7, '\t').collect();
     let [id, index, active, zoomed, pane, layout, name] = fields[..] else { return None };
     Some(WindowLine {
-        id: id.strip_prefix('@')?.parse().ok()?,
+        id: protocol::id(id, '@')?,
         index: index.parse().unwrap_or(0),
         active: active == "1",
         zoomed: zoomed == "1",
-        active_pane: pane.strip_prefix('%').and_then(|p| p.parse().ok()),
+        active_pane: protocol::id(pane, '%'),
         layout: layout.to_string(),
         name: name.to_string(),
     })

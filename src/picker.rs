@@ -48,8 +48,25 @@ struct Prompt {
 }
 
 enum Mode {
-    List { rows: Vec<PaletteRow>, placeholder: SharedString, query: String, selected: usize },
+    List(List),
     Prompt(Prompt),
+}
+
+struct List {
+    rows: Vec<PaletteRow>,
+    placeholder: SharedString,
+    query: String,
+    /// Indices of the rows matching `query`, refreshed on every edit.
+    matches: Vec<usize>,
+    /// Index into `matches`.
+    selected: usize,
+}
+
+impl List {
+    fn refilter(&mut self) {
+        self.matches = filter(&self.query, self.rows.iter().map(|r| r.label.as_ref()));
+        self.selected = 0;
+    }
 }
 
 pub struct Palette {
@@ -92,10 +109,18 @@ pub fn single_line(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
+/// A prompt result that is already known.
+pub fn ready(result: Result<(), String>) -> oneshot::Receiver<Result<(), String>> {
+    let (tx, rx) = oneshot::channel();
+    tx.send(result).ok();
+    rx
+}
+
 impl Palette {
     pub fn list(rows: Vec<PaletteRow>, placeholder: impl Into<SharedString>, theme: Theme, cx: &mut Context<Self>) -> Self {
-        let mode = Mode::List { rows, placeholder: placeholder.into(), query: String::new(), selected: 0 };
-        Self { focus_handle: cx.focus_handle(), scroll: ScrollHandle::new(), mode, theme }
+        let matches = (0..rows.len()).collect();
+        let list = List { rows, placeholder: placeholder.into(), query: String::new(), matches, selected: 0 };
+        Self { focus_handle: cx.focus_handle(), scroll: ScrollHandle::new(), mode: Mode::List(list), theme }
     }
 
     pub fn prompt(request: PromptRequest, theme: Theme, cx: &mut Context<Self>) -> Self {
@@ -112,10 +137,10 @@ impl Palette {
     /// Debug description for `--dump-screen-after`.
     pub fn describe(&self) -> String {
         match &self.mode {
-            Mode::List { rows, query, .. } => {
-                let mut out = format!("--- palette list query={query:?}\n");
-                for ix in filter(query, rows.iter().map(|r| r.label.as_ref())) {
-                    let row = &rows[ix];
+            Mode::List(list) => {
+                let mut out = format!("--- palette list query={:?}\n", list.query);
+                for &ix in &list.matches {
+                    let row = &list.rows[ix];
                     out.push_str(&format!("{}", row.label));
                     if let Some(shortcut) = &row.shortcut {
                         out.push_str(&format!("  [{shortcut}]"));
@@ -134,20 +159,13 @@ impl Palette {
         }
     }
 
-    fn matches(&self) -> Vec<usize> {
-        match &self.mode {
-            Mode::List { rows, query, .. } => filter(query, rows.iter().map(|r| r.label.as_ref())),
-            Mode::Prompt(_) => Vec::new(),
-        }
-    }
-
     fn move_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let count = self.matches().len();
-        if let Mode::List { selected, .. } = &mut self.mode
-            && count > 0
+        if let Mode::List(list) = &mut self.mode
+            && !list.matches.is_empty()
         {
-            *selected = if forward { (*selected + 1) % count } else { (*selected + count - 1) % count };
-            self.scroll.scroll_to_item(*selected);
+            let count = list.matches.len();
+            list.selected = if forward { (list.selected + 1) % count } else { (list.selected + count - 1) % count };
+            self.scroll.scroll_to_item(list.selected);
             cx.notify();
         }
     }
@@ -161,10 +179,9 @@ impl Palette {
     }
 
     fn confirm(&mut self, _: &PickerConfirm, _: &mut Window, cx: &mut Context<Self>) {
-        let matches = self.matches();
         match &mut self.mode {
-            Mode::List { selected, .. } => {
-                if let Some(&ix) = matches.get(*selected) {
+            Mode::List(list) => {
+                if let Some(&ix) = list.matches.get(list.selected) {
                     cx.emit(PaletteEvent::Confirmed(ix));
                 }
             }
@@ -208,9 +225,9 @@ impl Palette {
     /// Applies an edit to the query or prompt text.
     fn edit(&mut self, f: impl FnOnce(&mut String), cx: &mut Context<Self>) {
         match &mut self.mode {
-            Mode::List { query, selected, .. } => {
-                f(query);
-                *selected = 0;
+            Mode::List(list) => {
+                f(&mut list.query);
+                list.refilter();
                 self.scroll.scroll_to_item(0);
             }
             Mode::Prompt(prompt) => {
@@ -240,19 +257,16 @@ impl Palette {
         cx.stop_propagation();
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Mode::List { rows, placeholder, query, selected } = &self.mode else { unreachable!() };
+    fn render_list(&self, list: &List, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = &self.theme;
         let fg = t.foreground.hsla();
         let muted = t.muted_foreground().hsla();
         let panel = t.chrome_background();
         let accent = t.accent();
-        let matches = self.matches();
-        let selected = (*selected).min(matches.len().saturating_sub(1));
 
-        let items = matches.iter().enumerate().map(|(n, &ix)| {
-            let row = &rows[ix];
-            let is_selected = n == selected;
+        let items = list.matches.iter().enumerate().map(|(n, &ix)| {
+            let row = &list.rows[ix];
+            let is_selected = n == list.selected;
             div()
                 .id(("row", ix))
                 .flex()
@@ -281,7 +295,8 @@ impl Palette {
                 })
         });
 
-        let header: SharedString = if query.is_empty() { placeholder.clone() } else { query.clone().into() };
+        let query = &list.query;
+        let header: SharedString = if query.is_empty() { list.placeholder.clone() } else { query.clone().into() };
         div()
             .flex()
             .flex_col()
@@ -306,14 +321,13 @@ impl Palette {
                     .track_scroll(&self.scroll)
                     .children(items),
             )
-            .when(matches.is_empty(), |d| {
+            .when(list.matches.is_empty(), |d| {
                 d.child(div().px_3().py_2().text_color(muted).child("Nothing matches"))
             })
             .into_any_element()
     }
 
-    fn render_prompt(&self) -> gpui::AnyElement {
-        let Mode::Prompt(prompt) = &self.mode else { unreachable!() };
+    fn render_prompt(&self, prompt: &Prompt) -> gpui::AnyElement {
         let t = &self.theme;
         let muted = t.muted_foreground().hsla();
         div()
@@ -340,9 +354,9 @@ impl Palette {
 
 impl Render for Palette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match self.mode {
-            Mode::List { .. } => self.render_list(cx),
-            Mode::Prompt(_) => self.render_prompt(),
+        let content = match &self.mode {
+            Mode::List(list) => self.render_list(list, cx),
+            Mode::Prompt(prompt) => self.render_prompt(prompt),
         };
         let t = &self.theme;
         div()
