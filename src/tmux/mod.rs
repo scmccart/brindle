@@ -272,8 +272,9 @@ impl TmuxSession {
     }
 
     fn list_windows(&self) {
+        // In list-windows, pane formats refer to each window's active pane.
         let format = "#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t\
-                      #{window_visible_layout}\t#{window_name}";
+                      #{pane_id}\t#{window_visible_layout}\t#{window_name}";
         self.io
             .borrow_mut()
             .send(format!("list-windows -F {}", protocol::quote(format)), Pending::ListWindows);
@@ -296,14 +297,21 @@ impl TmuxSession {
         }
     }
 
+    /// Makes `pane` active, telling tmux only when that changes tmux's
+    /// known state: focusing the pane tmux already has active is a no-op, and
+    /// if tmux hasn't reported one yet our guess is never written back.
     pub fn select_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         let Some(window) = self.window_of_pane(pane) else { return };
         let window = self.windows.get_mut(&window).unwrap();
-        if window.active_pane != Some(pane) {
-            window.active_pane = Some(pane);
-            self.send(format!("select-pane -t %{pane}"));
-            cx.notify();
+        let known = window.active_pane;
+        if known == Some(pane) {
+            return;
         }
+        window.active_pane = Some(pane);
+        if known.is_some() {
+            self.send(format!("select-pane -t %{pane}"));
+        }
+        cx.notify();
     }
 
     pub fn kill_window(&mut self, window: WindowId) {
@@ -532,22 +540,25 @@ impl TmuxSession {
         let mut added = Vec::new();
         let mut active = None;
         for line in body {
-            let line = String::from_utf8_lossy(&line);
-            let fields: Vec<&str> = line.splitn(6, '\t').collect();
-            let [id, index, is_active, zoomed, layout, name] = fields[..] else { continue };
-            let Some(id) = id.strip_prefix('@').and_then(|s| s.parse().ok()) else { continue };
+            let Some(line) = parse_window_line(&String::from_utf8_lossy(&line)) else { continue };
+            let id = line.id;
             seen.push(id);
-            if is_active == "1" {
+            if line.active {
                 active = Some(id);
             }
             let window = self.windows.entry(id).or_insert_with(|| {
                 added.push(id);
                 TmuxWindow { id, index: 0, name: String::new(), layout: None, active_pane: None, zoomed: false }
             });
-            window.index = index.parse().unwrap_or(0);
-            window.name = name.to_string();
-            window.zoomed = zoomed == "1";
-            window.layout = layout::parse(layout);
+            window.index = line.index;
+            window.name = line.name;
+            window.zoomed = line.zoomed;
+            window.layout = layout::parse(&line.layout);
+            // Only fills in what we don't know: afterwards %window-pane-changed
+            // is authoritative, and a list in flight could be older than a click.
+            if window.active_pane.is_none() {
+                window.active_pane = line.active_pane;
+            }
         }
         let closed: Vec<WindowId> = self.windows.keys().filter(|id| !seen.contains(id)).copied().collect();
         for id in &closed {
@@ -556,16 +567,19 @@ impl TmuxSession {
         self.sync_panes(cx);
 
         added.sort_by_key(|id| self.windows[id].index);
+        // Record tmux's current window before announcing tabs, so activating
+        // its tab never sends a select-window back.
+        let activated = active.filter(|&a| self.active_window != Some(a));
+        if activated.is_some() {
+            self.active_window = activated;
+        }
         for id in closed {
             cx.emit(TmuxEvent::WindowClosed(id));
         }
         for id in added {
             cx.emit(TmuxEvent::WindowAdded(id));
         }
-        if let Some(active) = active
-            && self.active_window != Some(active)
-        {
-            self.active_window = Some(active);
+        if let Some(active) = activated {
             cx.emit(TmuxEvent::WindowActivated(active));
         }
         cx.notify();
@@ -654,6 +668,33 @@ impl Drop for TmuxSession {
             });
         }
     }
+}
+
+/// One line of the `list-windows` reply (see `TmuxSession::list_windows`).
+#[derive(Debug, PartialEq)]
+struct WindowLine {
+    id: WindowId,
+    index: u32,
+    active: bool,
+    zoomed: bool,
+    /// The window's active pane, if tmux reported one.
+    active_pane: Option<PaneId>,
+    layout: String,
+    name: String,
+}
+
+fn parse_window_line(line: &str) -> Option<WindowLine> {
+    let fields: Vec<&str> = line.splitn(7, '\t').collect();
+    let [id, index, active, zoomed, pane, layout, name] = fields[..] else { return None };
+    Some(WindowLine {
+        id: id.strip_prefix('@')?.parse().ok()?,
+        index: index.parse().unwrap_or(0),
+        active: active == "1",
+        zoomed: zoomed == "1",
+        active_pane: pane.strip_prefix('%').and_then(|p| p.parse().ok()),
+        layout: layout.to_string(),
+        name: name.to_string(),
+    })
 }
 
 /// The command renaming `window`, or `None` for an empty name.
@@ -756,6 +797,29 @@ mod tests {
             Some(Pending::UserCommand { first_error: None, .. })
         ));
         assert!(matches!(match_reply(&mut queue, true, &[]), Some(Pending::Ignore)));
+    }
+
+    #[test]
+    fn window_lines() {
+        let line = parse_window_line("@3\t2\t1\t0\t%7\tb25d,80x24,0,0,7\tbuild").unwrap();
+        assert_eq!(
+            line,
+            WindowLine {
+                id: 3,
+                index: 2,
+                active: true,
+                zoomed: false,
+                active_pane: Some(7),
+                layout: "b25d,80x24,0,0,7".into(),
+                name: "build".into(),
+            }
+        );
+        // The name is last, so tabs in it survive.
+        assert_eq!(parse_window_line("@1\t0\t0\t1\t%2\tl\ta\tb").unwrap().name, "a\tb");
+        // A missing pane id leaves the active pane unknown.
+        let line = parse_window_line("@1\t0\t0\t0\t\tl\tsh").unwrap();
+        assert_eq!((line.active_pane, line.name.as_str()), (None, "sh"));
+        assert_eq!(parse_window_line("@1\t0\t0\t0\tl\tsh"), None);
     }
 
     #[test]

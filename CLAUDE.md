@@ -60,7 +60,8 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - Prompted commands (`TmuxRenameWindow`, `TmuxCommand`) are ordinary actions. Their handlers emit a prompt request that `Workspace` opens, so a keybinding and the palette behave the same.
 - **`tmux/`** — control mode over plain pipes (`tmux -C`, not `-CC`):
   - **Framing (`protocol.rs`):** `Collector` groups output into `%begin…%end/%error` responses and notifications. Responses to our commands (flags bit 0) are matched FIFO against `Io.pending`, because the `%begin` number is tmux's global counter, not a request id.
-  - **Windows:** `%window-add` carries no layout and isn't followed by `%layout-change`, so window state always comes from a full `list-windows`.
+  - **Windows:** `%window-add` carries no layout and isn't followed by `%layout-change`, so window state always comes from a full `list-windows`. Its `#{pane_id}` is each window's active pane; it only fills in panes we don't know yet, and `%window-pane-changed` is authoritative after that.
+  - **Never write tmux's selection back:** attaching must not change tmux's current window or active panes. tmux tabs are inserted inactive and come to the front only on `WindowActivated`. `active_window` is set before the tabs are announced, and `select_pane` sends nothing when the pane is already active or tmux hasn't reported one yet.
   - **Layout:** we render `#{window_visible_layout}`, the third field of `%layout-change`, which reflects zoom.
   - **Pane restore:** three commands are sent back to back — `display-message` (`PANE_STATE_FORMAT`), `capture-pane -a`, `capture-pane`. `%output` for the pane is dropped until the last capture arrives, then `restore_bytes` replays the snapshot. Mode 1003 is `#{mouse_all_flag}`; `mouse_any_flag` means *any* mouse mode.
   - **Input:** `send-keys -H`. Size: `refresh-client -C` from the tab's area.
