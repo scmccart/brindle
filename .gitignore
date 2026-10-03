@@ -1,12 +1,2 @@
 /target
-/.toolchain/*
-!/.toolchain/env.sh
-!/.toolchain/bootstrap.sh
 /.rtk
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target

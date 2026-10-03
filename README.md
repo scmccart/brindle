@@ -23,18 +23,14 @@ On Debian/Ubuntu:
 
 ```sh
 sudo apt install build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
-  libwayland-dev libfontconfig-dev libfreetype-dev libvulkan-dev libxcb1-dev \
-  libx11-xcb-dev libssl-dev tmux
+  libxcb1-dev libfreetype-dev tmux
 cargo build --release
 ./target/release/brindle
 ```
 
-No root access? `.toolchain/bootstrap.sh` downloads the same packages as
-`.deb`s and unpacks them into `.toolchain/root`. After that:
-
-```sh
-source .toolchain/env.sh && cargo build --release
-```
+Wayland, fontconfig and Vulkan are loaded at runtime (dlopen), so only their
+runtime libraries are needed, and every desktop install has them. `tmux` is
+only needed for the tmux profiles.
 
 `Cargo.lock` starts from gpui 0.2.2's own lockfile; newer transitive versions
 (e.g. `libc`) break its dependencies.
