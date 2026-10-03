@@ -28,7 +28,7 @@ pub enum Notification {
     Other(String),
 }
 
-fn id(s: &str, sigil: char) -> Option<u32> {
+pub fn id(s: &str, sigil: char) -> Option<u32> {
     s.strip_prefix(sigil)?.parse().ok()
 }
 
@@ -163,6 +163,9 @@ pub fn decode_output(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The client's current pane directory, for `-c` on new windows and panes.
+pub const PANE_CWD: &str = "#{pane_current_path}";
+
 /// Makes a user-typed command line start new windows and panes in the
 /// client's current pane directory: `-c "#{pane_current_path}"` is inserted
 /// after each top-level `new-window` / `split-window` (or alias). Quoted
@@ -170,40 +173,36 @@ pub fn decode_output(data: &[u8]) -> Vec<u8> {
 /// gave comes later on the line, so it wins.
 pub fn with_start_dir(line: &str) -> String {
     const COMMANDS: [&str; 4] = ["new-window", "neww", "split-window", "splitw"];
-    const START_DIR: &str = " -c \"#{pane_current_path}\"";
 
     let mut inserts = Vec::new();
-    let mut quote: Option<char> = None;
+    let mut quoted: Option<char> = None;
     let mut escaped = false;
     let mut depth = 0usize;
     let mut expecting_command = true;
     let mut word_start: Option<usize> = None;
-    let mut finish_word = |start: &mut Option<usize>, end: usize, expecting: &mut bool| {
-        if let Some(begin) = start.take() {
-            if COMMANDS.contains(&&line[begin..end]) {
-                inserts.push(end);
-            }
-            *expecting = false;
-        }
-    };
-    for (i, c) in line.char_indices() {
+    // A trailing `;` closes the last word. If it is swallowed (open quote,
+    // escape or brace), that word holds a special character and can't match.
+    for (i, c) in line.char_indices().chain([(line.len(), ';')]) {
         if escaped {
             escaped = false;
             continue;
         }
-        if let Some(q) = quote {
+        if let Some(q) = quoted {
             if c == '\\' && q == '"' {
                 escaped = true;
             } else if c == q {
-                quote = None;
+                quoted = None;
             }
             continue;
         }
         if depth == 0 && (c.is_whitespace() || c == ';') {
-            finish_word(&mut word_start, i, &mut expecting_command);
-            if c == ';' {
-                expecting_command = true;
+            if let Some(begin) = word_start.take() {
+                if COMMANDS.contains(&&line[begin..i]) {
+                    inserts.push(i);
+                }
+                expecting_command = false;
             }
+            expecting_command |= c == ';';
             continue;
         }
         if depth == 0 && expecting_command && word_start.is_none() {
@@ -211,19 +210,19 @@ pub fn with_start_dir(line: &str) -> String {
         }
         match c {
             '\\' => escaped = true,
-            '\'' | '"' => quote = Some(c),
+            '\'' | '"' => quoted = Some(c),
             '{' => depth += 1,
             '}' => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
-    finish_word(&mut word_start, line.len(), &mut expecting_command);
 
-    let mut out = String::with_capacity(line.len() + inserts.len() * START_DIR.len());
+    let start_dir = format!(" -c {}", quote(PANE_CWD));
+    let mut out = String::with_capacity(line.len() + inserts.len() * start_dir.len());
     let mut last = 0;
     for at in inserts {
         out.push_str(&line[last..at]);
-        out.push_str(START_DIR);
+        out.push_str(&start_dir);
         last = at;
     }
     out.push_str(&line[last..]);

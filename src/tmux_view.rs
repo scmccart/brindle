@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use crate::actions::*;
-use crate::picker::PromptRequest;
+use crate::picker::{PromptRequest, ready};
 use crate::settings::Settings;
 use crate::terminal::Terminal;
 use crate::terminal_element::{cell_metrics, fit_grid};
@@ -154,6 +154,11 @@ impl TmuxWindowView {
         self.session.update(cx, |s, _| f(s, id));
     }
 
+    /// A listener for an action that runs `f` against this tab's window.
+    fn on_session<A>(f: fn(&mut TmuxSession, WindowId)) -> impl Fn(&mut Self, &A, &mut Window, &mut Context<Self>) {
+        move |this, _, _, cx| this.with_session(cx, f)
+    }
+
     fn rename_window(&mut self, _: &TmuxRenameWindow, _: &mut Window, cx: &mut Context<Self>) {
         let (session, window) = (self.session.clone(), self.window_id);
         let initial = session.read(cx).window(window).map(|w| w.name.clone()).unwrap_or_default();
@@ -162,9 +167,7 @@ impl TmuxWindowView {
             initial,
             submit: Rc::new(move |name, cx| {
                 session.update(cx, |s, _| s.rename_window(window, &name));
-                let (tx, rx) = futures::channel::oneshot::channel();
-                tx.send(Ok(())).ok();
-                rx
+                ready(Ok(()))
             }),
         });
     }
@@ -206,43 +209,29 @@ impl Render for TmuxWindowView {
         div()
             .key_context("TmuxWindow")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &TmuxDetach, _, cx| this.with_session(cx, |s, _| s.detach())))
-            .on_action(cx.listener(|this, _: &TmuxSplitRight, _, cx| this.with_session(cx, |s, w| s.split(w, true))))
-            .on_action(cx.listener(|this, _: &TmuxSplitDown, _, cx| this.with_session(cx, |s, w| s.split(w, false))))
-            .on_action(cx.listener(|this, _: &TmuxClosePane, _, cx| this.with_session(cx, |s, w| s.kill_pane(w))))
-            .on_action(cx.listener(|this, _: &TmuxZoomPane, _, cx| this.with_session(cx, |s, w| s.toggle_zoom(w))))
-            .on_action(cx.listener(|this, _: &TmuxNewWindow, _, cx| this.with_session(cx, |s, _| s.new_window())))
-            .on_action(cx.listener(|this, _: &TmuxLayoutEvenHorizontal, _, cx| {
-                this.with_session(cx, |s, w| s.select_layout(w, "even-horizontal"))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxLayoutEvenVertical, _, cx| {
-                this.with_session(cx, |s, w| s.select_layout(w, "even-vertical"))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxLayoutMainVertical, _, cx| {
-                this.with_session(cx, |s, w| s.select_layout(w, "main-vertical"))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxLayoutTiled, _, cx| {
-                this.with_session(cx, |s, w| s.select_layout(w, "tiled"))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxNextLayout, _, cx| this.with_session(cx, |s, w| s.next_layout(w))))
-            .on_action(cx.listener(|this, _: &TmuxRotatePanes, _, cx| this.with_session(cx, |s, w| s.rotate(w))))
-            .on_action(cx.listener(|this, _: &TmuxSwapPanePrev, _, cx| this.with_session(cx, |s, w| s.swap_pane(w, true))))
-            .on_action(cx.listener(|this, _: &TmuxSwapPaneNext, _, cx| this.with_session(cx, |s, w| s.swap_pane(w, false))))
+            .on_action(cx.listener(Self::on_session::<TmuxDetach>(|s, _| s.detach())))
+            .on_action(cx.listener(Self::on_session::<TmuxSplitRight>(|s, w| s.split(w, true))))
+            .on_action(cx.listener(Self::on_session::<TmuxSplitDown>(|s, w| s.split(w, false))))
+            .on_action(cx.listener(Self::on_session::<TmuxClosePane>(|s, w| s.kill_pane(w))))
+            .on_action(cx.listener(Self::on_session::<TmuxZoomPane>(|s, w| s.toggle_zoom(w))))
+            .on_action(cx.listener(Self::on_session::<TmuxNewWindow>(|s, _| s.new_window())))
+            .on_action(cx.listener(Self::on_session::<TmuxLayoutEvenHorizontal>(|s, w| {
+                s.select_layout(w, "even-horizontal")
+            })))
+            .on_action(cx.listener(Self::on_session::<TmuxLayoutEvenVertical>(|s, w| s.select_layout(w, "even-vertical"))))
+            .on_action(cx.listener(Self::on_session::<TmuxLayoutMainVertical>(|s, w| s.select_layout(w, "main-vertical"))))
+            .on_action(cx.listener(Self::on_session::<TmuxLayoutTiled>(|s, w| s.select_layout(w, "tiled"))))
+            .on_action(cx.listener(Self::on_session::<TmuxNextLayout>(|s, w| s.next_layout(w))))
+            .on_action(cx.listener(Self::on_session::<TmuxRotatePanes>(|s, w| s.rotate(w))))
+            .on_action(cx.listener(Self::on_session::<TmuxSwapPanePrev>(|s, w| s.swap_pane(w, true))))
+            .on_action(cx.listener(Self::on_session::<TmuxSwapPaneNext>(|s, w| s.swap_pane(w, false))))
+            .on_action(cx.listener(Self::on_session::<TmuxBreakPane>(|s, w| s.break_pane(w))))
+            .on_action(cx.listener(Self::on_session::<TmuxFocusLeft>(|s, w| s.focus_direction(w, Direction::Left))))
+            .on_action(cx.listener(Self::on_session::<TmuxFocusRight>(|s, w| s.focus_direction(w, Direction::Right))))
+            .on_action(cx.listener(Self::on_session::<TmuxFocusUp>(|s, w| s.focus_direction(w, Direction::Up))))
+            .on_action(cx.listener(Self::on_session::<TmuxFocusDown>(|s, w| s.focus_direction(w, Direction::Down))))
             .on_action(cx.listener(Self::rename_window))
             .on_action(cx.listener(Self::run_command))
-            .on_action(cx.listener(|this, _: &TmuxBreakPane, _, cx| this.with_session(cx, |s, w| s.break_pane(w))))
-            .on_action(cx.listener(|this, _: &TmuxFocusLeft, _, cx| {
-                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Left))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxFocusRight, _, cx| {
-                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Right))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxFocusUp, _, cx| {
-                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Up))
-            }))
-            .on_action(cx.listener(|this, _: &TmuxFocusDown, _, cx| {
-                this.with_session(cx, |s, w| s.focus_direction(w, Direction::Down))
-            }))
             .relative()
             .size_full()
             .bg(theme.background.hsla())

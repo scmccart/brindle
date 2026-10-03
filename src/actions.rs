@@ -158,9 +158,8 @@ pub fn action_names() -> impl Iterator<Item = String> {
 pub fn palette_commands(mut available: impl FnMut(&dyn Action) -> bool) -> Vec<(&'static str, Box<dyn Action>)> {
     ACTIONS
         .iter()
-        .filter_map(|(_, label, build)| Some((label.as_ref()?, build())))
+        .filter_map(|(_, label, build)| Some(((*label)?, build())))
         .filter(|(_, action)| available(&**action))
-        .map(|(label, action)| (*label, action))
         .collect()
 }
 
