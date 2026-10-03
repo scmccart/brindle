@@ -1,5 +1,6 @@
 mod actions;
 mod config;
+mod desktop;
 mod picker;
 mod settings;
 mod terminal;
@@ -37,6 +38,10 @@ OPTIONS:
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
+        --install-desktop        Add Brindle to the desktop's launcher, then exit
+        --uninstall-desktop      Remove it from the launcher, then exit
+        --prefix <DIR>           With the two above: use DIR/share instead of
+                                 ~/.local/share (e.g. /usr/local)
     -h, --help                   Print help
     -V, --version                Print version
 
@@ -61,10 +66,12 @@ struct Args {
     /// `--send` / `--action` steps, run in order one second apart.
     steps: Vec<Step>,
     dump_after: Option<f64>,
+    desktop: Option<desktop::Request>,
 }
 
 fn parse_args() -> Args {
     let mut args = Args::default();
+    let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -105,13 +112,25 @@ fn parse_args() -> Args {
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
-            other => {
-                eprintln!("brindle: unknown argument {other:?}\n\n{HELP}");
-                std::process::exit(2);
-            }
+            "--install-desktop" => install_desktop = true,
+            "--uninstall-desktop" => uninstall_desktop = true,
+            "--prefix" => match it.next() {
+                Some(dir) => prefix = Some(config::expand_tilde(&dir)),
+                None => usage_error("--prefix needs a directory"),
+            },
+            other => usage_error(&format!("unknown argument {other:?}")),
         }
     }
+    match desktop::request(install_desktop, uninstall_desktop, prefix) {
+        Ok(request) => args.desktop = request,
+        Err(message) => usage_error(message),
+    }
     args
+}
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("brindle: {message}\n\n{HELP}");
+    std::process::exit(2);
 }
 
 fn unescape(s: &str) -> String {
@@ -187,6 +206,14 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
         .init();
     let args = parse_args();
+    // Desktop registration needs no display, so it runs before GPUI starts.
+    if let Some(request) = &args.desktop {
+        if let Err(err) = desktop::run(request) {
+            eprintln!("brindle: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     Application::new().run(move |cx: &mut App| {
         let (config, error) = Config::load_or_default();

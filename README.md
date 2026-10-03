@@ -35,11 +35,41 @@ only needed for the tmux profiles.
 `Cargo.lock` starts from gpui 0.2.2's own lockfile; newer transitive versions
 (e.g. `libc`) break its dependencies.
 
+## Installing
+
+From a checkout, after installing the build dependencies above:
+
+```sh
+scripts/install.sh                     # binary to ~/.local/bin, plus launcher entry and icon
+PREFIX=/usr/local scripts/install.sh   # system-wide; builds as you, uses sudo only to copy
+```
+
+The script always installs under `$PREFIX/share`, even if `XDG_DATA_HOME` is
+set; `brindle --install-desktop` on its own follows `XDG_DATA_HOME`. To update,
+re-run the script. Windows that are already open keep running the
+old build; new windows get the new one.
+
+With cargo, the binary registers itself:
+
+```sh
+cargo install --locked --path .
+brindle --install-desktop
+```
+
+The launcher entry runs the binary by its absolute path, so it works even when
+`~/.cargo/bin` isn't on the desktop session's `PATH`. After moving or upgrading
+the binary, run `brindle --install-desktop` again so the entry stays current.
+
+To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
+`brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
+in `~/.config/brindle` is kept either way.
+
 ## Usage
 
 ```
 brindle [-p PROFILE] [-d DIR] [-e COMMAND ARGS...]
 brindle --list-actions | --list-themes
+brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
 
 On first launch Brindle writes a commented config to
