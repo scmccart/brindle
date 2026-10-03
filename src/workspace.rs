@@ -1,11 +1,11 @@
 //! A Brindle window: the tab strip (which doubles as the title bar), the
-//! active tab's content, and the profile picker.
+//! active tab's content, and the palettes.
 
 use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
+    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, canvas, div, point, px,
@@ -13,7 +13,7 @@ use gpui::{
 
 use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode};
-use crate::picker::{PickerEvent, ProfilePicker};
+use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
 use crate::settings::Settings;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::TerminalView;
@@ -119,6 +119,23 @@ impl LaunchRequest {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaletteKind {
+    NewTab,
+    Commands,
+    Prompt,
+}
+
+struct OpenPalette {
+    palette: Entity<Palette>,
+    kind: PaletteKind,
+    /// The command palette's actions, by row.
+    commands: Vec<Box<dyn Action>>,
+    /// The tab that had focus when the command palette opened.
+    tab_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
 #[derive(Clone)]
 struct DraggedTab {
     id: u64,
@@ -145,7 +162,7 @@ impl Render for DraggedTab {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    picker: Option<(Entity<ProfilePicker>, Subscription)>,
+    palette: Option<OpenPalette>,
     focus_handle: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
@@ -158,7 +175,7 @@ impl Workspace {
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
-            picker: None,
+            palette: None,
             focus_handle: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
@@ -292,13 +309,18 @@ impl Workspace {
                 let profile = session.read(cx).profile.clone();
                 let theme = Self::settings(cx).profile_theme(&profile);
                 let view = cx.new(|cx| TmuxWindowView::new(session.clone(), window_id, theme, profile.font_size, window, cx));
-                let subscriptions = vec![cx.observe(&view, |this, _, cx| {
-                    // Window renames arrive through the view.
-                    for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
-                        tab.refresh_title(cx);
-                    }
-                    cx.notify();
-                })];
+                let subscriptions = vec![
+                    cx.observe(&view, |this, _, cx| {
+                        // Window renames arrive through the view.
+                        for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
+                            tab.refresh_title(cx);
+                        }
+                        cx.notify();
+                    }),
+                    cx.subscribe_in(&view, window, |this, _, request: &PromptRequest, window, cx| {
+                        this.open_prompt(request.clone(), window, cx)
+                    }),
+                ];
                 let tab = Tab::new(profile, TabContent::Tmux { session: session.clone(), view }, subscriptions, cx);
                 // Keep a session's tabs together, in tmux's window order.
                 let index = self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)).map(|i| i + 1);
@@ -391,7 +413,7 @@ impl Workspace {
             session.update(cx, |s, _| s.select_window(window_id));
         }
         let focus = tab.focus_handle(cx);
-        if self.picker.is_none() {
+        if self.palette.is_none() {
             window.focus(&focus);
         }
         cx.notify();
@@ -514,27 +536,114 @@ impl Workspace {
     }
 
     fn open_profile_picker(&mut self, _: &OpenProfilePicker, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.is_some() {
-            self.dismiss_picker(window, cx);
+        if self.close_palette_toggling(PaletteKind::NewTab, window, cx) {
             return;
         }
+        let rows = Self::settings(cx)
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(ix, profile)| PaletteRow {
+                label: profile.name.clone().into(),
+                detail: Some(match profile.tmux {
+                    TmuxMode::Control => format!("tmux control mode · {}", profile.tmux_session_name()).into(),
+                    TmuxMode::Plain => format!("tmux · {}", profile.tmux_session_name()).into(),
+                    TmuxMode::None => {
+                        profile.command.clone().unwrap_or_else(|| "default shell".into()).into()
+                    }
+                }),
+                shortcut: (ix < 9).then(|| format!("ctrl-alt-{}", ix + 1).into()),
+            })
+            .collect();
         let theme = self.active_theme(cx);
-        let picker = cx.new(|cx| ProfilePicker::new(theme, cx));
-        let subscription = cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
-            PickerEvent::Confirmed(ix) => {
-                let ix = *ix;
-                this.dismiss_picker(window, cx);
-                this.launch(LaunchRequest::profile(ix), window, cx);
-            }
-            PickerEvent::Dismissed => this.dismiss_picker(window, cx),
+        let palette = cx.new(|cx| Palette::list(rows, "Open profile…", theme, cx));
+        self.show_palette(palette, PaletteKind::NewTab, Vec::new(), None, window, cx);
+    }
+
+    fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_palette_toggling(PaletteKind::Commands, window, cx) {
+            return;
+        }
+        let Some(tab_focus) = self.tabs.get(self.active).map(|t| t.focus_handle(cx)) else { return };
+        // Snapshot what the tab can do while it still has focus.
+        window.focus(&tab_focus);
+        let types: std::collections::HashSet<std::any::TypeId> =
+            window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
+        let commands =
+            palette_commands(|a| types.contains(&a.as_any().type_id()) || window.is_action_available(a, cx));
+        let rows = commands
+            .iter()
+            .map(|(label, action)| PaletteRow {
+                label: (*label).into(),
+                detail: None,
+                shortcut: window.highest_precedence_binding_for_action_in(&**action, &tab_focus).map(|b| {
+                    b.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into()
+                }),
+            })
+            .collect();
+        let actions = commands.into_iter().map(|(_, a)| a).collect();
+        let theme = self.active_theme(cx);
+        let palette = cx.new(|cx| Palette::list(rows, "Run a command…", theme, cx));
+        self.show_palette(palette, PaletteKind::Commands, actions, Some(tab_focus), window, cx);
+    }
+
+    /// Asks for a line of text, replacing any open palette.
+    fn open_prompt(&mut self, request: PromptRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = self.active_theme(cx);
+        let palette = cx.new(|cx| Palette::prompt(request, theme, cx));
+        self.show_palette(palette, PaletteKind::Prompt, Vec::new(), None, window, cx);
+    }
+
+    /// Closes any open palette. Returns true if it was of `kind`, so that
+    /// opening a palette again toggles it.
+    fn close_palette_toggling(&mut self, kind: PaletteKind, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(open) = &self.palette else { return false };
+        let same = open.kind == kind;
+        self.dismiss_palette(window, cx);
+        same
+    }
+
+    fn show_palette(
+        &mut self,
+        palette: Entity<Palette>,
+        kind: PaletteKind,
+        commands: Vec<Box<dyn Action>>,
+        tab_focus: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
+            PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
+            PaletteEvent::Dismissed => this.dismiss_palette(window, cx),
         });
-        window.focus(&picker.focus_handle(cx));
-        self.picker = Some((picker, subscription));
+        window.focus(&palette.focus_handle(cx));
+        self.palette = Some(OpenPalette { palette, kind, commands, tab_focus, _subscription: subscription });
         cx.notify();
     }
 
-    fn dismiss_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = None;
+    fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.palette.take() else { return };
+        match open.kind {
+            PaletteKind::NewTab => {
+                self.dismiss_palette(window, cx);
+                self.launch(LaunchRequest::profile(ix), window, cx);
+            }
+            PaletteKind::Commands => {
+                let Some(action) = open.commands.get(ix).map(|a| a.boxed_clone()) else { return };
+                // Run it from the tab, exactly as its keybinding would.
+                match &open.tab_focus {
+                    Some(focus) => window.focus(focus),
+                    None => self.dismiss_palette(window, cx),
+                }
+                cx.notify();
+                window.dispatch_action(action, cx);
+            }
+            PaletteKind::Prompt => {}
+        }
+    }
+
+    fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = None;
         if let Some(tab) = self.tabs.get(self.active) {
             window.focus(&tab.focus_handle(cx));
         }
@@ -576,13 +685,6 @@ impl Workspace {
         );
     }
 
-    fn tmux_detach(&mut self, _: &TmuxDetach, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active)
-            && let TabContent::Tmux { session, .. } = &tab.content
-        {
-            session.update(cx, |s, _| s.detach());
-        }
-    }
 
     /// Applies a reloaded config to running terminals.
     pub fn apply_config(&mut self, cx: &mut Context<Self>) {
@@ -634,6 +736,9 @@ impl Workspace {
             let size = terminal.size();
             out.push_str(&format!("--- screen {}x{} mode {:?}\n", size.cols, size.rows, terminal.mode()));
             out.push_str(&terminal.screen_text());
+        }
+        if let Some(open) = &self.palette {
+            out.push_str(&open.palette.read(cx).describe());
         }
         out
     }
@@ -859,11 +964,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::move_tab_right))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_profile_picker))
+            .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::open_config))
-            .on_action(cx.listener(Self::tmux_detach))
+            // Consumes keys bound to `Swallow` (ctrl-shift-d outside tmux tabs).
+            .on_action(cx.listener(|_, _: &Swallow, _, _| {}))
             .relative()
             .flex()
             .flex_col()
@@ -909,7 +1016,7 @@ impl Render for Workspace {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
-            .when_some(self.picker.as_ref(), |d, (picker, _)| {
+            .when_some(self.palette.as_ref().map(|p| p.palette.clone()), |d, palette| {
                 d.child(
                     div()
                         .absolute()
@@ -918,7 +1025,7 @@ impl Render for Workspace {
                         .right_0()
                         .flex()
                         .justify_center()
-                        .child(picker.clone()),
+                        .child(palette),
                 )
             });
 

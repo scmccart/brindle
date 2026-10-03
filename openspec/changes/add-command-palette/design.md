@@ -29,7 +29,7 @@
 - **List:** rows of `label`, optional `detail` and optional `shortcut`. It filters with the existing `fuzzy_match` and emits `Confirmed(row index)` or `Dismissed`.
 - **Prompt:** a label, an editable single-line value and an optional error line. Submitting returns a future of `Result<(), String>`. The palette shows a busy state while it waits, closes on `Ok`, shows the message on `Err`, and closes if the future is cancelled.
 
-`Workspace` keeps a single `palette: Option<(Entity<Palette>, PaletteKind, Subscription)>`, where `PaletteKind` is `NewTab` or `Commands`. Opening either kind replaces whatever is open. Opening the kind that is already open closes it.
+`Workspace` keeps a single `palette: Option<(Entity<Palette>, PaletteKind, Subscription)>`, where `PaletteKind` is `NewTab`, `Commands` or `Prompt` (a prompt opened by a command, from the list or a keybinding). Opening either kind replaces whatever is open. Opening the kind that is already open closes it.
 
 The key context is renamed from `ProfilePicker` to `Palette`. User bindings always go into the `Terminal` context, so the rename doesn't affect users. Backspace and character input stay in `key_down`. Pasting (ctrl-shift-v, while the palette has focus) is added for the prompt, with line breaks replaced by spaces.
 
@@ -98,6 +98,12 @@ Every other `Pending` kind still pops on its first block. If the session ends, t
 The submitted line is not given a `-t` target. Brindle already keeps the control client's current window and pane in sync with the focused tab through `select-window` and `select-pane`, so tmux's default target is the tab's active pane.
 
 Before framing, the line goes through the directory rewrite in §6a.
+
+Checked against tmux 3.6 (`-C`, throwaway server):
+- `rename-window a ; split-window` replies with two blocks before the sentinel's.
+- `bogus-command` replies with one `%error` block: `parse error: unknown command: bogus-command`.
+- `if-shell true 'split-window'` replies with one block before the sentinel's. The inner command runs, but in the session directory: it isn't top level, so it isn't rewritten.
+- `new-window -c "#{pane_current_path}" -c /tmp` starts in `/tmp`, so the last `-c` wins.
 
 *Alternatives:*
 - Parse the line to count commands. That was rejected because tmux's quoting and `{}` blocks make this fragile, and the count has to be exact: a miscount corrupts reply matching.
