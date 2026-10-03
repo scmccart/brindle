@@ -66,6 +66,7 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - **Layout:** we render `#{window_visible_layout}`, the third field of `%layout-change`, which reflects zoom.
   - **Pane restore:** three commands are sent back to back — `display-message` (`PANE_STATE_FORMAT`), `capture-pane -a`, `capture-pane`. `%output` for the pane is dropped until the last capture arrives, then `restore_bytes` replays the snapshot. Mode 1003 is `#{mouse_all_flag}`; `mouse_any_flag` means *any* mouse mode.
   - **Input:** `send-keys -H`. Size: `refresh-client -C` from the tab's area.
+  - **Color queries:** a control client has no tty, so tmux answers OSC 10/11 in panes with black unless told otherwise. Each pane's theme foreground and background are reported with `refresh-client -r` when the pane is created and again on config reload.
   - **Events:** `Failed` (tmux exited before ever attaching) is distinct from `Detached`.
   - The tmux prefix can't work in control mode, so native `Tmux*` actions replace it.
 - **`tmux_view.rs`** — `TmuxWindowView` mirrors one tmux window. It creates pane views and follows tmux's active pane in a session observer (`sync`), not during render, and draws the dividers.
