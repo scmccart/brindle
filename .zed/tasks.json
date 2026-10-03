@@ -1,0 +1,17 @@
+[
+  {
+    "label": "cargo build --release",
+    "command": "cargo",
+    "args": ["build", "--release"]
+  },
+  {
+    "label": "cargo clippy --all-targets",
+    "command": "cargo",
+    "args": ["clippy", "--all-targets"]
+  },
+  {
+    "label": "brindle --list-actions",
+    "command": "cargo",
+    "args": ["run", "--", "--list-actions"]
+  }
+]
