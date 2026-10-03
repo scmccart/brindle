@@ -23,6 +23,29 @@ use crate::terminal::{GridSize, resolve_color};
 use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Color;
 
+pub struct CellMetrics {
+    pub font: gpui::Font,
+    pub font_size: Pixels,
+    pub cell_width: Pixels,
+    pub line_height: Pixels,
+}
+
+/// Font and cell size for a terminal. Everything that positions cells must
+/// use this so tmux panes line up exactly with their grids.
+pub fn cell_metrics(font_size_override: Option<f32>, window: &Window, cx: &App) -> CellMetrics {
+    let settings = Settings::get(cx);
+    let font = settings.font();
+    let font_size = settings.font_size(font_size_override);
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&font);
+    let cell_width = text_system
+        .advance(font_id, font_size, 'm')
+        .map(|s| s.width)
+        .unwrap_or(font_size * 0.6);
+    let line_height = (font_size * settings.config.font.line_height).round();
+    CellMetrics { font, font_size, cell_width, line_height }
+}
+
 pub struct TerminalElement {
     view: Entity<TerminalView>,
 }
@@ -113,20 +136,12 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Frame {
-        let settings = Settings::get(cx);
         let view = self.view.read(cx);
-        let base_font = settings.font();
-        let font_size = settings.font_size(view.font_size_override);
-        let padding = px(settings.config.padding);
-        let line_height_mult = settings.config.font.line_height;
-
+        let CellMetrics { font: base_font, font_size, cell_width, line_height } =
+            cell_metrics(view.font_size_override, window, cx);
+        // tmux panes are positioned on an exact cell grid by their container.
+        let padding = if view.fixed_size { px(0.0) } else { px(Settings::get(cx).config.padding) };
         let text_system = window.text_system().clone();
-        let font_id = text_system.resolve_font(&base_font);
-        let cell_width = text_system
-            .advance(font_id, font_size, 'm')
-            .map(|s| s.width)
-            .unwrap_or(font_size * 0.6);
-        let line_height = (font_size * line_height_mult).round();
 
         let origin = bounds.origin + point(padding, padding);
         let avail = bounds.size - size(padding * 2.0, padding * 2.0);
