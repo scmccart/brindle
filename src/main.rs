@@ -269,8 +269,8 @@ fn main() {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
                 window
-                    .update(cx, |ws, _, cx| {
-                        print!("{}", ws.dump_active_screen(cx));
+                    .update(cx, |ws, window, cx| {
+                        print!("{}", ws.dump_active_screen(window.scale_factor(), cx));
                     })
                     .ok();
                 cx.update(|cx| cx.quit()).ok();

@@ -101,6 +101,10 @@ impl TmuxWindowView {
             .unwrap_or_else(|| self.focus_handle.clone())
     }
 
+    pub fn active_view(&self) -> Option<Entity<TerminalView>> {
+        self.views.get(&self.active?).map(|(view, _)| view.clone())
+    }
+
     pub fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
         self.session.read(cx).pane_terminal(self.active?)
     }

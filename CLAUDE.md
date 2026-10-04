@@ -11,7 +11,7 @@ Build dependencies are the system packages listed in README.md. Wayland, fontcon
 ```sh
 cargo build                          # deps built at opt-level 2 (Blade is unusable unoptimized)
 cargo build --release                # stripped, thin LTO
-cargo test                           # all unit tests (no GUI needed)
+cargo test                           # all unit tests (no GUI needed; the e2e suite skips itself)
 cargo test tmux::layout              # one module
 cargo test collector_matches_the_spike_transcript   # one test
 ```
@@ -30,9 +30,26 @@ BRINDLE_CONFIG=/tmp/test-config.toml ./target/release/brindle -p tmux \
 ```
 
 - `--send` and `--action` steps run in order, one second apart, against the active tab. Action names are listed by `--list-actions`.
-- `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, and its screen text, then exits.
-- For pixels, run under Xwayland (`env -u WAYLAND_DISPLAY DISPLAY=:0`) and grab the window with an x11rb `GetImage` helper.
+- `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, its grid geometry (`--- grid origin=X,Y cell=WxH scale=S`, logical window pixels), and its screen text, then exits.
+- For pixels, run under Xwayland (`env -u WAYLAND_DISPLAY DISPLAY=:0`) and grab the window with x11rb `GetImage` (`tests/e2e/capture.rs`).
 - For tmux tests, use a throwaway server (profile `tmux_args = ["-L", "brindle-e2e", "-f", "/dev/null"]`), never the user's default server or `main` session, and kill it afterwards.
+
+### End-to-end suite
+
+Repeatable GUI checks live in `tests/e2e/` as named cases. It's an opt-in `harness = false` test target, so plain `cargo test` skips it:
+
+```sh
+BRINDLE_E2E=1 cargo test --test e2e                  # every case (opens windows: ask first)
+BRINDLE_E2E=1 cargo test --test e2e -- titles tmux-  # cases whose names contain a filter
+BRINDLE_E2E=1 cargo test --test e2e -- --list        # case names; "(no display)" ones open no windows
+BRINDLE_E2E=1 cargo test --test e2e -- --self-test   # the harness's own parser tests
+```
+
+- Each case starts its own throwaway tmux server (`brindle-e2e-<pid>-<n>`) and runs Brindle against it with the debug hooks. Cases compare the dump with `capture-pane`, sample colors in window captures, or read OSC 10/11 replies. `tmux-*` cases check tmux behaviour Brindle relies on, over a raw `tmux -C` client, with no display.
+- Expected colors come from the `e2e` theme in the generated test config (`tests/e2e/brindle.rs`), not from built-in themes.
+- `BRINDLE_E2E_BIN` tests another binary (default: this build's). `BRINDLE_E2E_SLOW=2` doubles every delay. `BRINDLE_E2E_DISPLAY` picks the X display (default `:0`).
+- Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
+- When a change adds a GUI check, add it as a case here instead of a one-off script.
 
 ## Architecture
 
