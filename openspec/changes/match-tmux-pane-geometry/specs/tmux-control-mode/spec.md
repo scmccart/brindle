@@ -17,6 +17,10 @@ Each pane SHALL be drawn at the position and size tmux gives the pane itself, no
 - **WHEN** a full-screen program is running in a pane and border status lines are turned on
 - **THEN** after the program redraws, Brindle's pane matches tmux's screen row for row, with no stale or doubled lines
 
+#### Scenario: Panes rotated
+- **WHEN** the user rotates a window's panes (Rotate Panes, or `rotate-window`), which tmux reports without a layout change
+- **THEN** within about a second each pane is shown in its new place and size, matching `capture-pane`
+
 #### Scenario: No border status lines
 - **WHEN** `pane-border-status` is `off`
 - **THEN** panes fill their layout cells exactly as before

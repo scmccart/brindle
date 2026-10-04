@@ -23,22 +23,26 @@ In tmux's code, the title row sits at `yoff - 1` (top) or `yoff + sy` (bottom).
 
 ## Decisions
 
-1. **Cells and pane rectangles are tracked separately.** `TmuxSession` keeps a `geometry: HashMap<PaneId, Rect>` holding tmux's reported pane rectangles. A `pane_rect(id, cell)` helper returns the reported rectangle when it lies within the cell, and the cell otherwise. That fallback covers panes not reported yet and stale reports after a layout change. `TmuxWindowView` positions and sizes pane views from `pane_rect`, but keeps the cells for dividers and the active highlight. That way divider adjacency doesn't change, and the reserved row reads as part of the divider area.
+1. **Cells and insets, not stored rectangles.** For each pane, `TmuxSession` stores an `Inset`: the number of rows tmux's reported rectangle is short of the pane's layout cell at the top and at the bottom. A pane's rectangle is always derived as `cell.inset(inset)`, and is the whole cell if the inset doesn't fit. `TmuxWindowView` positions and sizes pane views from `TmuxSession::pane_rect`, but keeps the cells for dividers and the active highlight, so divider adjacency doesn't change and the reserved row reads as part of the divider area.
+   - Changed during implementation: storing reported rectangles and using one "when it lies within the cell" is wrong after a split is dragged larger, because the old, smaller rectangle still lies inside the new cell.
+   - A report is converted to an inset with `cell.inset_of(report)`. A report that doesn't fit the current cell is ignored as stale: its x or width differs, or it extends outside the cell.
 
-2. **Insets carry over across layout changes.** A layout change shouldn't wait for a fresh report. For each pane Brindle stores its inset, which is the number of rows the reported rectangle is short of its cell at the top and at the bottom. On `%layout-change` it applies the stored inset to the new cell straight away. Insets only change when a pane moves to or from a window edge, or when the option changes, and the subscription corrects those cases (decision 4).
+2. **Insets carry over across layout changes.** On `%layout-change` the stored inset is applied to the new cell straight away, so a layout change needs no fresh report. Insets only change when a pane moves to or from a window edge, or when the option changes, and the subscription corrects those cases (decision 4).
    - **Alternative considered:** encode tmux's rule (panes touching the top or bottom edge lose a row, zoomed panes too) from a subscribed `#{pane-border-status}`. That predicts edge moves correctly, but it hard-codes tmux 3.6 behaviour, which has changed between versions, and still needs decision 4 as a backstop. Insets are less code and stay correct across versions.
    - **Alternative considered:** run `list-panes` after every `%layout-change`. Its reply can race the program's redraw, and the size would differ from what `sync_panes` just set, causing a re-snapshot on every layout change.
 
 3. **Initial geometry comes with the pane state.** `PANE_STATE_FORMAT` gains `#{pane_left} #{pane_top} #{pane_width} #{pane_height}`, appended after the existing fields so the field indices `restore_bytes` uses don't move. When the state reply arrives, before the captures, Brindle records the geometry and resizes the terminal. The captures then fill a grid of the right size, so a new pane or a fresh attach is correct from its first frame.
 
 4. **A subscription is the source of truth for later changes.** Once attached (on the first window list), Brindle sends `refresh-client -B 'brindle-geometry:%*:#{pane_left} #{pane_top} #{pane_width} #{pane_height}'` once, as `Pending::Ignore`. `protocol.rs` parses `%subscription-changed` into `Notification::SubscriptionChanged { name, window, pane, value }`; the pane is `None` for `-`. On a geometry value:
-   - Update `geometry` and the pane's inset.
+   - Update the pane's inset.
    - If the size differs from the terminal's current size, resize the terminal and re-snapshot the pane (decision 5).
    - If only the position differs, re-render. Nothing else is needed.
 
+   - If the report doesn't fit the pane's cell, Brindle's layout is stale. tmux 3.6 sends no `%layout-change` for `rotate-window`, and Brindle's own Rotate Panes action uses it. In that case Brindle stores the report, marks the pane, and fetches the window list again. `sync_panes` derives insets from stored reports that fit the new cells, and re-snapshots marked panes whose size changed. This was added during implementation; it also fixes Rotate Panes leaving panes in their old places, with or without border status.
+
    A failed `-B` on older tmux logs a warning and degrades to today's behaviour.
 
-5. **A re-snapshot is the existing restore, run again.** Set `restoring` to a fresh `Restore`, which starts dropping `%output`, and send the same three commands. When the snapshot arrives, prefix the replay with `ESC c` (RIS). alacritty's `reset_state` clears both grids and the history, so replaying the snapshot doesn't duplicate scrollback. A pane that is still restoring isn't re-snapshotted again: the newest geometry is applied when its state reply lands.
+5. **A re-snapshot is the existing restore, run again.** Set `restoring` to a fresh `Restore`, which starts dropping `%output`, and send the same three commands. When the snapshot arrives, prefix the replay with `ESC c` (RIS). alacritty's `reset_state` clears both grids and the history, so replaying the snapshot doesn't duplicate scrollback. A pane that is still restoring when its size changes is marked, and snapshotted again once the current restore finishes.
    - **Alternative considered:** resize only, and wait for the program's next redraw. Programs redraw on SIGWINCH, which tmux already delivered before Brindle heard about the change, so there may be no further redraw.
 
 6. **Subscription plumbing is generic.** `SubscriptionChanged` is dispatched on `name`, so `show-tmux-pane-titles` and `apply-tmux-pane-styles` can add their own subscriptions without touching the parser.

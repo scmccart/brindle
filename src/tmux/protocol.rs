@@ -23,6 +23,9 @@ pub enum Notification {
     SessionWindowChanged { window: WindowId },
     SessionChanged { name: String },
     SessionRenamed { name: String },
+    /// A `refresh-client -B` subscription's value changed. `window` and
+    /// `pane` are `None` when the subscription isn't scoped to one.
+    SubscriptionChanged { name: String, window: Option<WindowId>, pane: Option<PaneId>, value: String },
     Exit(Option<String>),
     /// Anything else (`%sessions-changed`, `%message`, …) or an unparseable line.
     Other(String),
@@ -89,6 +92,16 @@ pub fn parse_line(line: &[u8]) -> Notification {
             let name = rest.split_once(' ').map(|(_, n)| n).unwrap_or(rest);
             Some(Notification::SessionRenamed { name: name.to_string() })
         }
+        "%subscription-changed" => rest.split_once(" : ").and_then(|(fields, value)| {
+            // name $session @window window-index %pane [...]
+            let mut fields = fields.split(' ');
+            let name = fields.next()?.to_string();
+            let _session = fields.next()?;
+            let window = id(fields.next()?, '@');
+            let _index = fields.next()?;
+            let pane = id(fields.next()?, '%');
+            Some(Notification::SubscriptionChanged { name, window, pane, value: value.to_string() })
+        }),
         "%exit" => Some(Notification::Exit((!rest.is_empty()).then(|| rest.to_string()))),
         _ => None,
     };
@@ -350,6 +363,37 @@ mod tests {
         assert_eq!(parse_line(b"%exit"), Notification::Exit(None));
         assert_eq!(parse_line(b"%exit server exited"), Notification::Exit(Some("server exited".into())));
         assert_eq!(parse_line(b"%sessions-changed"), Notification::Other("%sessions-changed".into()));
+    }
+
+    #[test]
+    fn subscription_changes() {
+        // Lines below are taken from a tmux 3.6 `-C` session.
+        assert_eq!(
+            parse_line(b"%subscription-changed geom $0 @0 0 %1 : 1 29 49"),
+            Notification::SubscriptionChanged {
+                name: "geom".into(),
+                window: Some(0),
+                pane: Some(1),
+                value: "1 29 49".into()
+            }
+        );
+        assert_eq!(
+            parse_line(b"%subscription-changed pbs $0 @3 0 - : off"),
+            Notification::SubscriptionChanged { name: "pbs".into(), window: Some(3), pane: None, value: "off".into() }
+        );
+        assert_eq!(
+            parse_line(b"%subscription-changed title $0 @0 0 %0 : a : b"),
+            Notification::SubscriptionChanged {
+                name: "title".into(),
+                window: Some(0),
+                pane: Some(0),
+                value: "a : b".into()
+            }
+        );
+        assert_eq!(
+            parse_line(b"%subscription-changed empty $0 @0 0 %0 : "),
+            Notification::SubscriptionChanged { name: "empty".into(), window: Some(0), pane: Some(0), value: String::new() }
+        );
     }
 
     #[test]
