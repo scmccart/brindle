@@ -45,6 +45,20 @@ impl GridLayout {
         (col, line, side)
     }
 
+    /// The `--dump-screen-after` line that lets pixel checks find cells:
+    /// the first cell's corner and the cell size in logical window pixels,
+    /// and the scale factor to device pixels.
+    pub fn describe(&self, scale: f32) -> String {
+        format!(
+            "--- grid origin={},{} cell={}x{} scale={}\n",
+            f32::from(self.origin.x),
+            f32::from(self.origin.y),
+            f32::from(self.cell_width),
+            f32::from(self.line_height),
+            scale
+        )
+    }
+
     pub fn contains_y(&self, y: Pixels) -> std::cmp::Ordering {
         let top = self.origin.y;
         let bottom = top + self.line_height * self.rows as f32;
@@ -451,6 +465,18 @@ impl gpui::EntityInputHandler for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_description() {
+        let grid = GridLayout {
+            origin: gpui::point(gpui::px(6.0), gpui::px(51.0)),
+            cell_width: gpui::px(8.4),
+            line_height: gpui::px(18.0),
+            ..Default::default()
+        };
+        assert_eq!(grid.describe(1.0), "--- grid origin=6,51 cell=8.4x18 scale=1\n");
+        assert_eq!(grid.describe(2.0), "--- grid origin=6,51 cell=8.4x18 scale=2\n");
+    }
     use gpui::{point, px};
 
     #[test]

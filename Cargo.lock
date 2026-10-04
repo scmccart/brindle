@@ -689,6 +689,7 @@ dependencies = [
  "smallvec",
  "toml 0.8.23",
  "unicode-width",
+ "x11rb",
 ]
 
 [[package]]

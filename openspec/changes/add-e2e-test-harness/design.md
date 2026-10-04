@@ -49,7 +49,7 @@
      - `Run`, a builder for one Brindle run: profile, `--send`/`--action` steps, dump time, and a timeline of tmux commands at offsets, run from a thread;
      - writes the test config into a temp dir;
      - returns the parsed `Dump`, which holds the tabs, the size, the modes, the grid geometry and the screen lines.
-   - `capture.rs`: finds the window by `_NET_WM_PID` and takes it with `GetImage`. It returns an in-memory RGB image with region and color helpers, and on failure writes PPM files to `target/e2e/<case>/`, so no image crate is needed.
+   - `capture.rs`: finds the window by `_NET_WM_PID` and takes it with `GetImage`. It returns an in-memory RGB image with region and color helpers, and on failure writes PPM files to `target/tmp/e2e/<case>/` (`CARGO_TARGET_TMPDIR`), so no image crate is needed.
    - `query.rs`: writes the OSC 10/11 query script into the temp dir and parses its output from `capture-pane`.
    - `cases/{geometry,colors,titles,styles,tmux}.rs`: the cases.
 

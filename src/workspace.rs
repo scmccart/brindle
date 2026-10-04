@@ -16,7 +16,7 @@ use crate::config::{Config, Profile, TmuxMode};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
 use crate::settings::Settings;
 use crate::terminal::{Terminal, TerminalEvent};
-use crate::terminal_view::TerminalView;
+use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{TmuxEvent, TmuxSession};
@@ -98,6 +98,14 @@ impl Tab {
         match &self.content {
             TabContent::Terminal(view) => Some(view.read(cx).terminal.clone()),
             TabContent::Tmux { view, .. } => view.read(cx).active_terminal(cx),
+        }
+    }
+
+    /// Where the active terminal was last painted.
+    fn active_grid(&self, cx: &App) -> Option<GridLayout> {
+        match &self.content {
+            TabContent::Terminal(view) => view.read(cx).layout.get(),
+            TabContent::Tmux { view, .. } => view.read(cx).active_view()?.read(cx).layout.get(),
         }
     }
 
@@ -730,7 +738,7 @@ impl Workspace {
     }
 
     /// Debug hook for `--dump-screen-after`.
-    pub fn dump_active_screen(&self, cx: &App) -> String {
+    pub fn dump_active_screen(&self, scale: f32, cx: &App) -> String {
         let mut out = String::new();
         for (ix, tab) in self.tabs.iter().enumerate() {
             out.push_str(&format!(
@@ -744,6 +752,9 @@ impl Workspace {
             let terminal = terminal.read(cx);
             let size = terminal.size();
             out.push_str(&format!("--- screen {}x{} mode {:?}\n", size.cols, size.rows, terminal.mode()));
+            if let Some(grid) = self.tabs.get(self.active).and_then(|t| t.active_grid(cx)) {
+                out.push_str(&grid.describe(scale));
+            }
             out.push_str(&terminal.screen_text());
         }
         if let Some(open) = &self.palette {
