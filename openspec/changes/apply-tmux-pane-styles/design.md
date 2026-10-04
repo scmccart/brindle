@@ -43,6 +43,13 @@ Tested on tmux 3.6:
 
 5. **Border colors.** `TmuxWindowView` reads the window's resolved border foregrounds. `paint_dividers` uses them in place of the theme's `normal` and `accent` when they are set. Title base colors from `show-tmux-pane-titles` use the same two colors, so a title sits in its border's color as in tmux.
 
+6. **Names as implemented.**
+   - The override is `Terminal::default_colors: DefaultColors`, resolved through a pure `palette_color(theme, defaults, index)` so it can be unit-tested without a GPUI context.
+   - The resolver is `style::pane_defaults`, and the border helper is `style::border_color` with tmux's built-in values as constants.
+   - `tmux::resolve_color` maps a `TmuxColor` through a theme for the session, the view and titles.
+   - `TmuxSession::set_config` now takes the context so it can update pane terminals on reload.
+   - Title cache keys hold the base color instead of an active flag, so a border style change re-shapes the titles.
+
 ## Risks / Trade-offs
 
 - [A user who copies tmux's default `pane-active-border-style` value verbatim into their config] → It is treated as unset, and Brindle shows its accent. This is harmless.

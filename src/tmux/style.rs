@@ -63,6 +63,41 @@ impl Style {
     }
 }
 
+impl Style {
+    /// The style a style option's value (`fg=blue,bg=default`) describes.
+    pub fn parse(value: &str) -> Style {
+        let mut style = Style::default();
+        style.apply(value);
+        style
+    }
+}
+
+/// A pane's default foreground and background under tmux's pane styles:
+/// the active pane takes `window-active-style`'s colors where it sets them,
+/// and `window-style`'s otherwise. `None` is the theme's color.
+pub fn pane_defaults(
+    window_style: &Style,
+    active_style: &Style,
+    active: bool,
+) -> (Option<TmuxColor>, Option<TmuxColor>) {
+    let pick = |own: Option<TmuxColor>, active_own: Option<TmuxColor>| active_own.filter(|_| active).or(own);
+    (pick(window_style.fg, active_style.fg), pick(window_style.bg, active_style.bg))
+}
+
+/// tmux's built-in values for the border style options. Brindle draws its
+/// own theme colors for them, rather than tmux's green active border.
+pub const DEFAULT_BORDER_STYLE: &str = "default";
+pub const DEFAULT_ACTIVE_BORDER_STYLE: &str = "#{?pane_in_mode,fg=yellow,#{?synchronize-panes,fg=red,fg=green}}";
+
+/// The color a border style option sets, from its raw value (to recognise
+/// tmux's built-in default) and its expanded value.
+pub fn border_color(raw: &str, expanded: &str, builtin: &str) -> Option<TmuxColor> {
+    if raw.trim() == builtin {
+        return None;
+    }
+    Style::parse(expanded).fg
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledRun {
     pub text: String,
@@ -155,6 +190,28 @@ mod tests {
         assert_eq!(TmuxColor::parse("default"), None);
         assert_eq!(TmuxColor::parse("colour300"), None);
         assert_eq!(TmuxColor::parse("#abc"), None);
+    }
+
+    #[test]
+    fn pane_default_colors() {
+        let blue = Some(TmuxColor::Indexed(4));
+        let dark = Some(TmuxColor::Rgb(Color::hex(0x202020)));
+        let window = Style::parse("fg=blue");
+        let active = Style::parse("bg=#202020");
+        assert_eq!(pane_defaults(&window, &active, false), (blue, None));
+        assert_eq!(pane_defaults(&window, &active, true), (blue, dark));
+        assert_eq!(pane_defaults(&window, &Style::parse("fg=red"), true), (Some(TmuxColor::Indexed(1)), None));
+        let none = Style::parse("default");
+        assert_eq!(pane_defaults(&none, &Style::parse(""), true), (None, None));
+    }
+
+    #[test]
+    fn border_colors_ignore_tmux_defaults() {
+        assert_eq!(border_color("default", "default", DEFAULT_BORDER_STYLE), None);
+        assert_eq!(border_color(DEFAULT_ACTIVE_BORDER_STYLE, "fg=green", DEFAULT_ACTIVE_BORDER_STYLE), None);
+        assert_eq!(border_color("fg=magenta", "fg=magenta", DEFAULT_BORDER_STYLE), Some(TmuxColor::Indexed(5)));
+        assert_eq!(border_color("fg=green", "fg=green", DEFAULT_ACTIVE_BORDER_STYLE), Some(TmuxColor::Indexed(2)));
+        assert_eq!(border_color("bold", "bold", DEFAULT_BORDER_STYLE), None);
     }
 
     #[test]
