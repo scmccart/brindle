@@ -5,6 +5,10 @@ A GPU-accelerated terminal emulator for Linux, written in Rust on
 Terminal emulation comes from `alacritty_terminal`; rendering goes through
 GPUI's Vulkan renderer.
 
+Brindle treats tmux as a native windowing layer, not just a program running
+inside the terminal: tmux windows become tabs and panes are drawn natively,
+while sessions stay in tmux, persistent and detachable.
+
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
 - **Profiles**: command, args, working directory, environment, theme and font size per profile.
 - **tmux**, both ways:
@@ -16,6 +20,18 @@ GPUI's Vulkan renderer.
     Each tmux window is a native tab and each pane is drawn natively on tmux's
     layout grid. Existing panes are restored on attach, including their alternate
     screen and mouse modes. Detaching leaves the session running.
+
+## Control mode or classic?
+
+Control mode gives each pane its own scrollback (the wheel scrolls it, with no
+copy mode) and selection that stays inside the pane. tmux windows become
+draggable tabs, native shortcuts and the command palette replace the prefix,
+and dividers and title lines are painted in your tmux styles. Attaching
+doesn't change tmux's current window or active pane.
+
+Classic mode runs your tmux config unchanged, including the prefix and custom
+bindings, which control mode can't use. Pick control mode when tmux is your
+main workspace, and classic mode when you depend on the prefix.
 
 ## Building
 
