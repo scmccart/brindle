@@ -107,6 +107,24 @@ impl Theme {
         self.accent.unwrap_or(self.ansi[4])
     }
 
+    /// The color for an xterm palette index: the theme's 16 ANSI colors,
+    /// then the standard 6x6x6 cube and gray ramp.
+    pub fn indexed(&self, index: u8) -> Color {
+        let i = index as usize;
+        match i {
+            0..=15 => self.ansi[i],
+            16..=231 => {
+                let i = i - 16;
+                let step = |v: usize| if v == 0 { 0 } else { (v * 40 + 55) as u8 };
+                Color { r: step(i / 36), g: step((i / 6) % 6), b: step(i % 6) }
+            }
+            _ => {
+                let v = ((i - 232) * 10 + 8) as u8;
+                Color { r: v, g: v, b: v }
+            }
+        }
+    }
+
     pub fn is_dark(&self) -> bool {
         self.background.luminance() < 0.5
     }
