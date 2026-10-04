@@ -35,6 +35,23 @@ only needed for the tmux profiles.
 `Cargo.lock` starts from gpui 0.2.2's own lockfile; newer transitive versions
 (e.g. `libc`) break its dependencies.
 
+## Testing
+
+```sh
+cargo test                                      # unit tests; no display needed
+BRINDLE_E2E=1 cargo test --test e2e             # end-to-end suite
+BRINDLE_E2E=1 cargo test --test e2e -- titles   # only cases whose names contain "titles"
+BRINDLE_E2E=1 cargo test --test e2e -- --list   # list the cases
+```
+
+The end-to-end suite in `tests/e2e/` runs Brindle against throwaway tmux
+servers and compares what it shows with tmux: screen text, window pixels and
+replies to color queries. It is opt-in because it opens Brindle windows (under
+Xwayland, display `:0` unless `BRINDLE_E2E_DISPLAY` says otherwise) and needs
+`tmux`, `bash` and `less`. Without `BRINDLE_E2E=1`, `cargo test` skips it.
+Each case keeps its logs, screen dumps and window captures in
+`target/tmp/e2e/<case>/`.
+
 ## Installing
 
 From a checkout, after installing the build dependencies above:
