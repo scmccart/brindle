@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use futures::StreamExt as _;
 use futures::channel::oneshot;
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Task};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
 use crate::config::{Config, Profile};
 use crate::terminal::{DefaultColors, GridSize, Terminal};
@@ -59,9 +59,16 @@ enum Pending {
     UserCommand { token: String, first_error: Option<String>, reply: oneshot::Sender<Result<(), String>> },
 }
 
+/// What the writer thread is asked to do.
+enum WriterMessage {
+    Line(String),
+    /// Acknowledge once everything queued before it has been written.
+    Flush(oneshot::Sender<()>),
+}
+
 /// The write side of the control connection, shared with pane input closures.
 struct Io {
-    writer: std::sync::mpsc::Sender<String>,
+    writer: std::sync::mpsc::Sender<WriterMessage>,
     pending: VecDeque<Pending>,
 }
 
@@ -75,7 +82,14 @@ impl Io {
     /// Writes a command line without expecting a reply of its own.
     fn write(&mut self, command: String) -> bool {
         log::debug!("tmux <- {command}");
-        self.writer.send(command).is_ok()
+        self.writer.send(WriterMessage::Line(command)).is_ok()
+    }
+
+    /// Resolves once everything sent so far has been written to tmux.
+    fn flush(&mut self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.writer.send(WriterMessage::Flush(tx)).ok();
+        rx
     }
 }
 
@@ -160,6 +174,30 @@ const BORDER_STYLE_SUBSCRIPTION: &str = "brindle-border-style";
 const BORDER_STYLE_FORMAT: &str =
     "#{pane-border-style}|#{T:pane-border-style}|#{pane-active-border-style}|#{T:pane-active-border-style}";
 
+/// Every subscription Brindle registers: name, scope and format.
+const SUBSCRIPTIONS: [(&str, &str, &str); 5] = [
+    (GEOMETRY_SUBSCRIPTION, "%*", GEOMETRY_FORMAT),
+    (TITLE_SUBSCRIPTION, "%*", TITLE_FORMAT),
+    (BORDER_STATUS_SUBSCRIPTION, "@*", BORDER_STATUS_FORMAT),
+    (PANE_STYLE_SUBSCRIPTION, "%*", PANE_STYLE_FORMAT),
+    (BORDER_STYLE_SUBSCRIPTION, "@*", BORDER_STYLE_FORMAT),
+];
+
+fn subscribe_commands() -> Vec<String> {
+    SUBSCRIPTIONS
+        .iter()
+        .map(|(name, scope, format)| format!("refresh-client -B {}", protocol::quote(&format!("{name}:{scope}:{format}"))))
+        .collect()
+}
+
+/// Removing a client's last subscription stops tmux's subscription timer.
+/// tmux up to 3.6 crashes if that timer fires after the client has started
+/// leaving (`control_check_subs_timer` reads through a NULL session), so
+/// these are sent before Brindle detaches, quits or ends the session.
+fn unsubscribe_commands() -> Vec<String> {
+    SUBSCRIPTIONS.iter().map(|(name, _, _)| format!("refresh-client -B {}", protocol::quote(name))).collect()
+}
+
 /// Snapshot pieces collected while restoring a pane's existing contents.
 #[derive(Default)]
 struct Restore {
@@ -205,7 +243,12 @@ pub struct TmuxSession {
     /// A window list has been received, i.e. the session really attached.
     attached: bool,
     detached: bool,
+    /// Subscriptions are registered (see `unsubscribe_commands`).
+    subscribed: bool,
+    /// `release` has run: the session is being left.
+    released: bool,
     _reader: Task<()>,
+    _quit: Option<Subscription>,
 }
 
 impl EventEmitter<TmuxEvent> for TmuxSession {}
@@ -228,7 +271,7 @@ impl TmuxSession {
         let session_name = profile.tmux_session_name().to_string();
         let (program, args) = command_line(&profile, cwd.as_ref().filter(|d| d.is_dir()));
         let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<Option<Event>>();
-        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<String>();
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<WriterMessage>();
 
         let mut command = Command::new(&program);
         command
@@ -267,16 +310,23 @@ impl TmuxSession {
                 std::thread::Builder::new()
                     .name("tmux-writer".into())
                     .spawn(move || {
-                        while let Ok(command) = writer_rx.recv() {
-                            let mut batch = command;
-                            batch.push('\n');
+                        while let Ok(first) = writer_rx.recv() {
                             // Coalesce queued commands into one write.
-                            while let Ok(more) = writer_rx.try_recv() {
-                                batch.push_str(&more);
-                                batch.push('\n');
+                            let (mut batch, mut acks) = (String::new(), Vec::new());
+                            for message in std::iter::once(first).chain(std::iter::from_fn(|| writer_rx.try_recv().ok())) {
+                                match message {
+                                    WriterMessage::Line(command) => {
+                                        batch.push_str(&command);
+                                        batch.push('\n');
+                                    }
+                                    WriterMessage::Flush(ack) => acks.push(ack),
+                                }
                             }
-                            if stdin.write_all(batch.as_bytes()).and_then(|_| stdin.flush()).is_err() {
+                            if !batch.is_empty() && stdin.write_all(batch.as_bytes()).and_then(|_| stdin.flush()).is_err() {
                                 break;
+                            }
+                            for ack in acks {
+                                ack.send(()).ok();
                             }
                         }
                     })
@@ -324,8 +374,23 @@ impl TmuxSession {
             user_commands: 0,
             attached: false,
             detached: false,
+            subscribed: false,
+            released: false,
             _reader: reader,
+            _quit: None,
         };
+        // Quitting may not leave time for `Drop`'s commands to be written, so
+        // leave the session here and wait (briefly) until tmux has them.
+        let quit = cx.on_app_quit(|this: &mut TmuxSession, cx| {
+            this.release();
+            let written = this.io.borrow_mut().flush();
+            let timeout = cx.background_executor().timer(std::time::Duration::from_millis(50));
+            async move {
+                futures::future::select(written, timeout).await;
+            }
+        });
+        let mut this = this;
+        this._quit = Some(quit);
         if let Some(err) = startup_error {
             log::error!("{err}");
             // Defer so the workspace has subscribed before we report.
@@ -387,6 +452,10 @@ impl TmuxSession {
     }
 
     pub fn kill_window(&mut self, window: WindowId) {
+        // The session ends with its last window.
+        if self.windows.len() == 1 && self.windows.contains_key(&window) {
+            self.unsubscribe();
+        }
         self.send(format!("kill-window -t @{window}"));
     }
 
@@ -411,6 +480,11 @@ impl TmuxSession {
     }
 
     pub fn kill_pane(&mut self, window: WindowId) {
+        // The session ends with its last pane.
+        let panes = self.windows.get(&window).and_then(|w| w.layout.as_ref()).map_or(0, |l| l.panes().len());
+        if self.windows.len() == 1 && panes == 1 {
+            self.unsubscribe();
+        }
         self.send_to_active_pane(window, |p| format!("kill-pane -t %{p}"));
     }
 
@@ -483,7 +557,25 @@ impl TmuxSession {
     }
 
     pub fn detach(&mut self) {
+        self.release();
+    }
+
+    /// Leaves the session: removes the subscriptions, then detaches. Runs once.
+    fn release(&mut self) {
+        if self.released || self.detached || self.child.is_none() {
+            return;
+        }
+        self.released = true;
+        self.unsubscribe();
         self.send("detach-client");
+    }
+
+    fn unsubscribe(&mut self) {
+        if std::mem::take(&mut self.subscribed) {
+            for command in unsubscribe_commands() {
+                self.send(command);
+            }
+        }
     }
 
     pub fn window(&self, window: WindowId) -> Option<&TmuxWindow> {
@@ -666,16 +758,11 @@ impl TmuxSession {
     }
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
-        if !self.attached {
-            for subscription in [
-                format!("{GEOMETRY_SUBSCRIPTION}:%*:{GEOMETRY_FORMAT}"),
-                format!("{TITLE_SUBSCRIPTION}:%*:{TITLE_FORMAT}"),
-                format!("{BORDER_STATUS_SUBSCRIPTION}:@*:{BORDER_STATUS_FORMAT}"),
-                format!("{PANE_STYLE_SUBSCRIPTION}:%*:{PANE_STYLE_FORMAT}"),
-                format!("{BORDER_STYLE_SUBSCRIPTION}:@*:{BORDER_STYLE_FORMAT}"),
-            ] {
-                self.send(format!("refresh-client -B {}", protocol::quote(&subscription)));
+        if !self.attached && !self.released {
+            for command in subscribe_commands() {
+                self.send(command);
             }
+            self.subscribed = true;
         }
         self.attached = true;
         let mut seen = Vec::new();
@@ -932,9 +1019,9 @@ impl TmuxSession {
 
 impl Drop for TmuxSession {
     fn drop(&mut self) {
+        // Detach politely; the server and its session keep running.
+        self.release();
         if let Some(mut child) = self.child.take() {
-            // Detach politely; the server and its session keep running.
-            self.io.borrow_mut().send("detach-client".into(), Pending::Ignore);
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 child.kill().ok();
@@ -1069,6 +1156,19 @@ pub fn restore_bytes(state: &[u32], alternate: Option<&[Vec<u8>]>, screen: &[Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_subscription_is_removed() {
+        let subscribe = subscribe_commands();
+        let unsubscribe = unsubscribe_commands();
+        assert_eq!(subscribe.len(), unsubscribe.len());
+        for (on, off) in subscribe.iter().zip(&unsubscribe) {
+            let name = off.strip_prefix("refresh-client -B \"").and_then(|n| n.strip_suffix('"')).unwrap();
+            assert!(!name.contains(':'), "a removal has no format: {off}");
+            assert!(on.starts_with(&format!("refresh-client -B \"{name}:")), "{on} vs {off}");
+        }
+        assert_eq!(subscribe[0], r#"refresh-client -B "brindle-geometry:%*:#{pane_left} #{pane_top} #{pane_width} #{pane_height}""#);
+    }
 
     #[test]
     fn pane_geometry_is_parsed() {
