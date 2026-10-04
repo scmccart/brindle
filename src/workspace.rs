@@ -713,9 +713,9 @@ impl Workspace {
             }
         }
         for (session, _) in &self.tmux_sessions {
-            session.update(cx, |s, _| {
+            session.update(cx, |s, cx| {
                 let profile = config.profile(&s.profile.name).cloned().unwrap_or_else(|| s.profile.clone());
-                s.set_config(profile, &config);
+                s.set_config(profile, &config, cx);
             });
         }
         cx.notify();

@@ -20,11 +20,11 @@ use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Task};
 
 use crate::config::{Config, Profile};
-use crate::terminal::{GridSize, Terminal};
-use crate::theme::Color;
+use crate::terminal::{DefaultColors, GridSize, Terminal};
+use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
-use style::StyledRun;
+use style::{Style, StyledRun, TmuxColor};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TmuxEvent {
@@ -107,6 +107,9 @@ pub struct TmuxWindow {
     pub active_pane: Option<PaneId>,
     pub zoomed: bool,
     pub border_status: BorderStatus,
+    /// Colors set by `pane-border-style` and `pane-active-border-style`,
+    /// unless they have tmux's built-in values.
+    pub border_colors: (Option<TmuxColor>, Option<TmuxColor>),
 }
 
 /// Where a window's panes show their title lines (`pane-border-status`).
@@ -148,6 +151,15 @@ const TITLE_FORMAT: &str = "#{T:pane-border-format}";
 const BORDER_STATUS_SUBSCRIPTION: &str = "brindle-border-status";
 const BORDER_STATUS_FORMAT: &str = "#{pane-border-status}";
 
+/// Pane styles, which tmux only applies for terminal clients: each pane's
+/// `window-style` and `window-active-style`, and each window's border
+/// styles, raw (to recognise tmux's defaults) and expanded.
+const PANE_STYLE_SUBSCRIPTION: &str = "brindle-pane-style";
+const PANE_STYLE_FORMAT: &str = "#{T:window-style}|#{T:window-active-style}";
+const BORDER_STYLE_SUBSCRIPTION: &str = "brindle-border-style";
+const BORDER_STYLE_FORMAT: &str =
+    "#{pane-border-style}|#{T:pane-border-style}|#{pane-active-border-style}|#{T:pane-active-border-style}";
+
 /// Snapshot pieces collected while restoring a pane's existing contents.
 #[derive(Default)]
 struct Restore {
@@ -175,6 +187,8 @@ pub struct TmuxSession {
     pub panes: HashMap<PaneId, Pane>,
     /// Rows tmux takes from each pane's layout cell (see [`Inset`]).
     insets: HashMap<PaneId, Inset>,
+    /// Each pane's `window-style` and `window-active-style`.
+    pane_styles: HashMap<PaneId, (Style, Style)>,
     /// Each pane's title line (see `TITLE_SUBSCRIPTION`).
     titles: HashMap<PaneId, Vec<StyledRun>>,
     /// The latest geometry tmux reported for each pane.
@@ -300,6 +314,7 @@ impl TmuxSession {
             windows: BTreeMap::new(),
             panes: HashMap::new(),
             insets: HashMap::new(),
+            pane_styles: HashMap::new(),
             titles: HashMap::new(),
             reported: HashMap::new(),
             stale: HashSet::new(),
@@ -585,6 +600,12 @@ impl TmuxSession {
             Notification::WindowPaneChanged { window, pane } => {
                 if let Some(w) = self.windows.get_mut(&window) {
                     w.active_pane = Some(pane);
+                    // window-active-style moves with the active pane.
+                    let panes: Vec<PaneId> =
+                        w.layout.as_ref().map(|l| l.panes().into_iter().map(|(id, _)| id).collect()).unwrap_or_default();
+                    for pane in panes {
+                        self.update_pane_colors(pane, false, cx);
+                    }
                     cx.notify();
                 }
             }
@@ -610,6 +631,25 @@ impl TmuxSession {
                         cx.notify();
                     }
                 }
+                (PANE_STYLE_SUBSCRIPTION, _, Some(pane)) => {
+                    if self.panes.contains_key(&pane) {
+                        let (window_style, active_style) = value.split_once('|').unwrap_or((&value, ""));
+                        self.pane_styles.insert(pane, (Style::parse(window_style), Style::parse(active_style)));
+                        self.update_pane_colors(pane, false, cx);
+                    }
+                }
+                (BORDER_STYLE_SUBSCRIPTION, Some(window), None) => {
+                    if let Some(w) = self.windows.get_mut(&window) {
+                        let fields: Vec<&str> = value.split('|').collect();
+                        if let [raw, expanded, active_raw, active_expanded] = fields[..] {
+                            w.border_colors = (
+                                style::border_color(raw, expanded, style::DEFAULT_BORDER_STYLE),
+                                style::border_color(active_raw, active_expanded, style::DEFAULT_ACTIVE_BORDER_STYLE),
+                            );
+                            cx.notify();
+                        }
+                    }
+                }
                 (BORDER_STATUS_SUBSCRIPTION, Some(window), None) => {
                     if let Some(w) = self.windows.get_mut(&window) {
                         w.border_status = BorderStatus::parse(&value);
@@ -631,6 +671,8 @@ impl TmuxSession {
                 format!("{GEOMETRY_SUBSCRIPTION}:%*:{GEOMETRY_FORMAT}"),
                 format!("{TITLE_SUBSCRIPTION}:%*:{TITLE_FORMAT}"),
                 format!("{BORDER_STATUS_SUBSCRIPTION}:@*:{BORDER_STATUS_FORMAT}"),
+                format!("{PANE_STYLE_SUBSCRIPTION}:%*:{PANE_STYLE_FORMAT}"),
+                format!("{BORDER_STYLE_SUBSCRIPTION}:@*:{BORDER_STYLE_FORMAT}"),
             ] {
                 self.send(format!("refresh-client -B {}", protocol::quote(&subscription)));
             }
@@ -656,6 +698,7 @@ impl TmuxSession {
                     active_pane: None,
                     zoomed: false,
                     border_status: BorderStatus::Off,
+                    border_colors: (None, None),
                 }
             });
             window.index = line.index;
@@ -708,6 +751,7 @@ impl TmuxSession {
         self.insets.retain(|id, _| live.contains_key(id));
         self.reported.retain(|id, _| live.contains_key(id));
         self.titles.retain(|id, _| live.contains_key(id));
+        self.pane_styles.retain(|id, _| live.contains_key(id));
         self.stale.retain(|id| live.contains_key(id));
 
         for (&id, &cell) in &live {
@@ -848,13 +892,38 @@ impl TmuxSession {
 
     /// Picks up a reloaded config for panes created from now on, and reports
     /// the new theme's colors for the existing ones.
-    pub fn set_config(&mut self, profile: Profile, config: &Config) {
+    pub fn set_config(&mut self, profile: Profile, config: &Config, cx: &mut Context<Self>) {
         self.profile = profile;
         self.config = config.clone();
+        let panes: Vec<PaneId> = self.panes.keys().copied().collect();
+        for pane in panes {
+            self.update_pane_colors(pane, true, cx);
+        }
+    }
+
+    /// Applies a pane's tmux styles to its default colors, and reports the
+    /// colors it shows to tmux, which answers OSC 10/11 queries from our
+    /// report before looking at `window-style`. `report` sends the report
+    /// even if the colors are unchanged (the theme may have changed).
+    fn update_pane_colors(&mut self, pane: PaneId, report: bool, cx: &mut Context<Self>) {
+        let Some(p) = self.panes.get(&pane) else { return };
         let theme = self.config.profile_theme(&self.profile);
-        let mut io = self.io.borrow_mut();
-        for &id in self.panes.keys() {
-            for command in color_report_commands(id, theme.foreground, theme.background) {
+        let (window_style, active_style) = self.pane_styles.get(&pane).copied().unwrap_or_default();
+        let active = self.window_of_pane(pane).and_then(|w| self.windows[&w].active_pane) == Some(pane);
+        let (fg, bg) = style::pane_defaults(&window_style, &active_style, active);
+        let colors = DefaultColors { foreground: resolve_color(fg, &theme), background: resolve_color(bg, &theme) };
+        let changed = p.terminal.read(cx).default_colors != colors;
+        if changed {
+            p.terminal.update(cx, |t, cx| {
+                t.default_colors = colors;
+                cx.notify();
+            });
+        }
+        if changed || report {
+            let fg = colors.foreground.unwrap_or(theme.foreground);
+            let bg = colors.background.unwrap_or(theme.background);
+            let mut io = self.io.borrow_mut();
+            for command in color_report_commands(pane, fg, bg) {
                 io.send(command, Pending::Ignore);
             }
         }
@@ -906,6 +975,14 @@ fn parse_window_line(line: &str) -> Option<WindowLine> {
 fn rename_window_command(window: WindowId, name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty()).then(|| format!("rename-window -t @{window} {}", protocol::quote(name)))
+}
+
+/// A tmux color in a theme: palette indexes use the theme's palette.
+pub fn resolve_color(color: Option<TmuxColor>, theme: &Theme) -> Option<Color> {
+    match color? {
+        TmuxColor::Indexed(i) => Some(theme.indexed(i)),
+        TmuxColor::Rgb(c) => Some(c),
+    }
 }
 
 /// `refresh-client -r` commands giving tmux a pane's default foreground and

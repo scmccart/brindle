@@ -29,7 +29,7 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
-use crate::theme::Theme;
+use crate::theme::{Color, Theme};
 
 #[derive(Clone)]
 pub struct Listener(UnboundedSender<AlacEvent>);
@@ -106,6 +106,8 @@ pub struct Terminal {
     title: Option<String>,
     exited: bool,
     pub theme: Theme,
+    /// Replace the theme's default colors (set from tmux pane styles).
+    pub default_colors: DefaultColors,
     copy_on_select: bool,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
@@ -174,6 +176,7 @@ impl Terminal {
             title: None,
             exited: false,
             theme,
+            default_colors: DefaultColors::default(),
             copy_on_select: config.copy_on_select,
             last_activity: Instant::now(),
             sync_flush: None,
@@ -361,20 +364,7 @@ impl Terminal {
     /// Theme color for an xterm color index (0-255 palette, then the named
     /// colors alacritty uses for foreground/background/cursor).
     pub fn default_color(&self, index: usize) -> Rgb {
-        let t = &self.theme;
-        let c = match index {
-            0..=255 => t.indexed(index as u8),
-            i if i == NamedColor::Foreground as usize => t.foreground,
-            i if i == NamedColor::Background as usize => t.background,
-            i if i == NamedColor::Cursor as usize => t.cursor,
-            i if i == NamedColor::BrightForeground as usize => t.foreground,
-            i if i == NamedColor::DimForeground as usize => t.foreground.mix(t.background, DIM_FACTOR),
-            i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
-                t.ansi[i - NamedColor::DimBlack as usize].mix(t.background, DIM_FACTOR)
-            }
-            _ => t.foreground,
-        };
-        c.into()
+        palette_color(&self.theme, self.default_colors, index).into()
     }
 
     /// Sends a reply the emulator generated (device/color/size reports).
@@ -565,6 +555,33 @@ pub fn screen_text<T>(term: &Term<T>) -> String {
     out
 }
 
+/// Default foreground and background that replace the theme's for one
+/// terminal; `None` keeps the theme's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DefaultColors {
+    pub foreground: Option<Color>,
+    pub background: Option<Color>,
+}
+
+/// The color for an xterm palette index or one of the named colors
+/// alacritty uses after it (foreground, background, cursor, dim colors).
+fn palette_color(t: &Theme, defaults: DefaultColors, index: usize) -> Color {
+    let fg = defaults.foreground.unwrap_or(t.foreground);
+    let bg = defaults.background.unwrap_or(t.background);
+    match index {
+        0..=255 => t.indexed(index as u8),
+        i if i == NamedColor::Foreground as usize => fg,
+        i if i == NamedColor::Background as usize => bg,
+        i if i == NamedColor::Cursor as usize => t.cursor,
+        i if i == NamedColor::BrightForeground as usize => fg,
+        i if i == NamedColor::DimForeground as usize => fg.mix(bg, DIM_FACTOR),
+        i if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&i) => {
+            t.ansi[i - NamedColor::DimBlack as usize].mix(bg, DIM_FACTOR)
+        }
+        _ => fg,
+    }
+}
+
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
 
@@ -621,6 +638,24 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_colors_replace_the_theme() {
+        let t = Theme::default();
+        let none = DefaultColors::default();
+        let fg = NamedColor::Foreground as usize;
+        let bg = NamedColor::Background as usize;
+        assert_eq!(palette_color(&t, none, fg), t.foreground);
+        assert_eq!(palette_color(&t, none, bg), t.background);
+        let blue = Color::hex(0x0000ff);
+        let tinted = DefaultColors { foreground: Some(blue), background: None };
+        assert_eq!(palette_color(&t, tinted, fg), blue);
+        assert_eq!(palette_color(&t, tinted, bg), t.background);
+        assert_eq!(palette_color(&t, tinted, NamedColor::DimForeground as usize), blue.mix(t.background, DIM_FACTOR));
+        // Palette entries and the cursor keep the theme's colors.
+        assert_eq!(palette_color(&t, tinted, 1), t.ansi[1]);
+        assert_eq!(palette_color(&t, tinted, NamedColor::Cursor as usize), t.cursor);
+    }
 
     #[test]
     fn paste_normalizes_newlines() {
