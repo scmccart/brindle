@@ -28,9 +28,12 @@ pub struct TmuxWindowView {
     pub theme: Theme,
     font_size_override: Option<f32>,
     views: HashMap<PaneId, (Entity<TerminalView>, Subscription)>,
-    /// Pane rects and dividers from the window's layout, refreshed whenever
+    /// Pane cells and dividers from the window's layout, refreshed whenever
     /// the session changes rather than on every frame.
     panes: Vec<(PaneId, Rect)>,
+    /// Where each pane sits in its cell; tmux may keep rows of the cell for
+    /// a border status line.
+    pane_rects: HashMap<PaneId, Rect>,
     dividers: Vec<Rect>,
     active: Option<PaneId>,
     zoomed: bool,
@@ -59,6 +62,7 @@ impl TmuxWindowView {
             font_size_override,
             views: HashMap::new(),
             panes: Vec::new(),
+            pane_rects: HashMap::new(),
             dividers: Vec::new(),
             active: None,
             zoomed: false,
@@ -109,6 +113,7 @@ impl TmuxWindowView {
         let tmux_window = session.window(self.window_id);
         let layout = tmux_window.and_then(|w| w.layout.as_ref());
         self.panes = layout.map(|l| l.panes()).unwrap_or_default();
+        self.pane_rects = self.panes.iter().map(|&(id, cell)| (id, session.pane_rect(id, cell))).collect();
         self.dividers = layout.map(|l| l.dividers()).unwrap_or_default();
         self.zoomed = tmux_window.is_some_and(|w| w.zoomed);
         let active = session.active_pane_of(self.window_id);
@@ -193,8 +198,9 @@ impl Render for TmuxWindowView {
         let dividers = self.dividers.clone();
         let multiple = self.panes.len() > 1;
 
-        let pane_elements = self.panes.iter().filter_map(|(id, rect)| {
+        let pane_elements = self.panes.iter().filter_map(|(id, _)| {
             let (view, _) = self.views.get(id)?;
+            let rect = self.pane_rects.get(id)?;
             Some(
                 div()
                     .absolute()

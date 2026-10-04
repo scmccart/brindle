@@ -13,6 +13,36 @@ pub struct Rect {
     pub height: u16,
 }
 
+/// Rows tmux takes from the top and bottom of a pane's layout cell for
+/// border status lines (`pane-border-status`). Layout strings never show
+/// them, so they are learned from the pane geometry tmux reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Inset {
+    pub top: u16,
+    pub bottom: u16,
+}
+
+impl Rect {
+    /// The pane inside this layout cell, or the whole cell if `inset`
+    /// doesn't fit (it was learned for a different cell).
+    pub fn inset(self, inset: Inset) -> Rect {
+        if inset.top + inset.bottom >= self.height {
+            return self;
+        }
+        Rect { y: self.y + inset.top, height: self.height - inset.top - inset.bottom, ..self }
+    }
+
+    /// How a pane's reported geometry sits in this cell, or `None` if it
+    /// doesn't fit inside it (the report belongs to an older layout).
+    pub fn inset_of(self, pane: Rect) -> Option<Inset> {
+        let inside = pane.x == self.x
+            && pane.width == self.width
+            && pane.y >= self.y
+            && pane.y + pane.height <= self.y + self.height;
+        inside.then(|| Inset { top: pane.y - self.y, bottom: self.y + self.height - pane.y - pane.height })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layout {
     Pane { id: PaneId, rect: Rect },
@@ -152,6 +182,30 @@ pub fn parse(layout: &str) -> Option<Layout> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insets_from_reported_geometry() {
+        let cell = r(51, 0, 49, 15);
+        // pane-border-status top on a pane touching the window's top edge.
+        assert_eq!(cell.inset_of(r(51, 1, 49, 14)), Some(Inset { top: 1, bottom: 0 }));
+        // pane-border-status bottom.
+        assert_eq!(cell.inset_of(r(51, 0, 49, 14)), Some(Inset { top: 0, bottom: 1 }));
+        assert_eq!(cell.inset_of(cell), Some(Inset::default()));
+        // Reports from an older layout don't fit the cell.
+        assert_eq!(cell.inset_of(r(0, 1, 49, 14)), None);
+        assert_eq!(cell.inset_of(r(51, 1, 40, 14)), None);
+        assert_eq!(cell.inset_of(r(51, 1, 49, 15)), None);
+    }
+
+    #[test]
+    fn insets_carry_over_to_new_cells() {
+        let top = Inset { top: 1, bottom: 0 };
+        assert_eq!(r(0, 0, 50, 30).inset(top), r(0, 1, 50, 29));
+        assert_eq!(r(0, 0, 80, 20).inset(Inset { top: 0, bottom: 1 }), r(0, 0, 80, 19));
+        assert_eq!(r(0, 0, 50, 30).inset(Inset::default()), r(0, 0, 50, 30));
+        // An inset that doesn't fit leaves the cell alone.
+        assert_eq!(r(0, 0, 50, 1).inset(top), r(0, 0, 50, 1));
+    }
 
     fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
         Rect { x, y, width, height }

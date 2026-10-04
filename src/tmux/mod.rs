@@ -8,7 +8,7 @@ pub mod layout;
 pub mod protocol;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -21,7 +21,7 @@ use gpui::{AppContext as _, Context, Entity, EventEmitter, Task};
 use crate::config::{Config, Profile};
 use crate::terminal::{GridSize, Terminal};
 use crate::theme::Color;
-use layout::Layout;
+use layout::{Inset, Layout, Rect};
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,13 +108,26 @@ pub struct TmuxWindow {
 
 const PANE_STATE_FORMAT: &str = "#{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} \
     #{keypad_cursor_flag} #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} \
-    #{mouse_all_flag} #{mouse_sgr_flag} #{mouse_utf8_flag}";
+    #{mouse_all_flag} #{mouse_sgr_flag} #{mouse_utf8_flag} #{pane_left} #{pane_top} #{pane_width} #{pane_height}";
+
+/// Where the pane geometry starts in a `PANE_STATE_FORMAT` reply.
+const PANE_STATE_GEOMETRY: usize = 11;
+
+/// Reports every pane's geometry. Layout strings leave out the rows tmux
+/// reserves for border status lines, and setting `pane-border-status`
+/// sends no `%layout-change`, so this is how Brindle learns about them.
+const GEOMETRY_SUBSCRIPTION: &str = "brindle-geometry";
+const GEOMETRY_FORMAT: &str = "#{pane_left} #{pane_top} #{pane_width} #{pane_height}";
 
 /// Snapshot pieces collected while restoring a pane's existing contents.
 #[derive(Default)]
 struct Restore {
     state: Option<Vec<u32>>,
     alternate: Option<Vec<Vec<u8>>>,
+    /// The pane already shows something, so reset it before the replay.
+    reset: bool,
+    /// The pane changed size meanwhile, so snapshot it again afterwards.
+    again: bool,
 }
 
 pub struct Pane {
@@ -131,6 +144,14 @@ pub struct TmuxSession {
     io: Rc<RefCell<Io>>,
     pub windows: BTreeMap<WindowId, TmuxWindow>,
     pub panes: HashMap<PaneId, Pane>,
+    /// Rows tmux takes from each pane's layout cell (see [`Inset`]).
+    insets: HashMap<PaneId, Inset>,
+    /// The latest geometry tmux reported for each pane.
+    reported: HashMap<PaneId, Rect>,
+    /// Panes whose reported geometry didn't fit their layout cell: tmux
+    /// moved them without a `%layout-change` (`rotate-window` does this),
+    /// so the window list is being fetched again.
+    stale: HashSet<PaneId>,
     pub active_window: Option<WindowId>,
     client_size: Option<(u16, u16)>,
     child: Option<Child>,
@@ -247,6 +268,9 @@ impl TmuxSession {
             io: Rc::new(RefCell::new(Io { writer: writer_tx, pending: VecDeque::new() })),
             windows: BTreeMap::new(),
             panes: HashMap::new(),
+            insets: HashMap::new(),
+            reported: HashMap::new(),
+            stale: HashSet::new(),
             active_window: None,
             client_size: None,
             child,
@@ -432,6 +456,12 @@ impl TmuxSession {
         })
     }
 
+    /// Where a pane sits inside its layout cell: tmux may keep rows of the
+    /// cell for a border status line.
+    pub fn pane_rect(&self, pane: PaneId, cell: Rect) -> Rect {
+        cell.inset(self.insets.get(&pane).copied().unwrap_or_default())
+    }
+
     pub fn pane_terminal(&self, pane: PaneId) -> Option<Entity<Terminal>> {
         self.panes.get(&pane).map(|p| p.terminal.clone())
     }
@@ -446,7 +476,7 @@ impl TmuxSession {
                 match pending {
                     Some(Pending::ListWindows) if ok => self.on_window_list(body, cx),
                     Some(Pending::PaneState(pane)) => {
-                        let state = body
+                        let state: Vec<u32> = body
                             .first()
                             .map(|l| {
                                 String::from_utf8_lossy(l)
@@ -455,6 +485,10 @@ impl TmuxSession {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        // Size the grid before the captures are replayed into it.
+                        if let Some(geometry) = geometry_from_state(&state) {
+                            self.apply_geometry(pane, geometry, cx);
+                        }
                         if let Some(restore) = self.panes.get_mut(&pane).and_then(|p| p.restoring.as_mut()) {
                             restore.state = Some(state);
                         }
@@ -527,6 +561,14 @@ impl TmuxSession {
                 self.session_name = name;
                 cx.notify();
             }
+            Notification::SubscriptionChanged { name, pane, value, .. } => {
+                if name == GEOMETRY_SUBSCRIPTION
+                    && let Some(pane) = pane
+                    && let Some(geometry) = parse_geometry(&value)
+                {
+                    self.on_pane_geometry(pane, geometry, cx);
+                }
+            }
             Notification::Exit(reason) => {
                 self.on_detached(reason.unwrap_or_else(|| "detached".into()), cx)
             }
@@ -535,6 +577,10 @@ impl TmuxSession {
     }
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        if !self.attached {
+            let subscription = format!("{GEOMETRY_SUBSCRIPTION}:%*:{GEOMETRY_FORMAT}");
+            self.send(format!("refresh-client -B {}", protocol::quote(&subscription)));
+        }
         self.attached = true;
         let mut seen = Vec::new();
         let mut added = Vec::new();
@@ -597,13 +643,27 @@ impl TmuxSession {
             }
         }
         self.panes.retain(|id, _| live.contains_key(id));
+        self.insets.retain(|id, _| live.contains_key(id));
+        self.reported.retain(|id, _| live.contains_key(id));
+        self.stale.retain(|id| live.contains_key(id));
 
-        for (&id, rect) in &live {
-            let size = GridSize { cols: rect.width.max(1), rows: rect.height.max(1), ..Default::default() };
-            if let Some(pane) = self.panes.get(&id) {
-                pane.terminal.update(cx, |t, _| t.resize(size));
+        for (&id, &cell) in &live {
+            // A report that fits the new cell is current; otherwise the
+            // inset carries over until tmux reports again.
+            if let Some(inset) = self.reported.get(&id).and_then(|&g| cell.inset_of(g)) {
+                self.insets.insert(id, inset);
+            }
+            let rect = self.pane_rect(id, cell);
+            if self.panes.contains_key(&id) {
+                // A pane tmux moved behind our back was already redrawn
+                // for its new size, into the grid it had.
+                if self.resize_pane(id, rect, cx) && self.stale.contains(&id) {
+                    self.resnapshot(id);
+                }
+                self.stale.remove(&id);
                 continue;
             }
+            let size = GridSize { cols: rect.width.max(1), rows: rect.height.max(1), ..Default::default() };
             let io = self.io.clone();
             let input: Rc<dyn Fn(&[u8])> = Rc::new(move |bytes: &[u8]| {
                 let mut io = io.borrow_mut();
@@ -615,28 +675,98 @@ impl TmuxSession {
             let reports = color_report_commands(id, theme.foreground, theme.background);
             let config = &self.config;
             let terminal = cx.new(|cx| Terminal::remote(size, theme, config, input, cx));
-            self.panes.insert(id, Pane { terminal, restoring: Some(Restore::default()) });
+            self.panes.insert(id, Pane { terminal, restoring: None });
 
             let mut io = self.io.borrow_mut();
             for command in reports {
                 io.send(command, Pending::Ignore);
             }
-            // Snapshot the pane: state, alternate-saved screen, then the visible
-            // screen plus history. Sent back to back so no output slips between.
-            io.send(
-                format!("display-message -p -t %{id} -F {}", protocol::quote(PANE_STATE_FORMAT)),
-                Pending::PaneState(id),
-            );
-            io.send(format!("capture-pane -p -e -a -q -t %{id} -S -"), Pending::CaptureAlternate(id));
-            io.send(format!("capture-pane -p -e -t %{id} -S -"), Pending::Capture(id));
+            drop(io);
+            self.snapshot(id, false);
+        }
+    }
+
+    /// Restores a pane from tmux: its state, alternate-saved screen, then the
+    /// visible screen plus history. Sent back to back so no output slips
+    /// between; output is dropped until the last capture arrives.
+    fn snapshot(&mut self, id: PaneId, reset: bool) {
+        let Some(pane) = self.panes.get_mut(&id) else { return };
+        pane.restoring = Some(Restore { reset, ..Default::default() });
+        let mut io = self.io.borrow_mut();
+        io.send(
+            format!("display-message -p -t %{id} -F {}", protocol::quote(PANE_STATE_FORMAT)),
+            Pending::PaneState(id),
+        );
+        io.send(format!("capture-pane -p -e -a -q -t %{id} -S -"), Pending::CaptureAlternate(id));
+        io.send(format!("capture-pane -p -e -t %{id} -S -"), Pending::Capture(id));
+    }
+
+    fn cell_of(&self, pane: PaneId) -> Option<Rect> {
+        self.windows
+            .values()
+            .filter_map(|w| w.layout.as_ref())
+            .find_map(|l| l.panes().into_iter().find(|(id, _)| *id == pane).map(|(_, rect)| rect))
+    }
+
+    /// Records where tmux says a pane is, and resizes its grid to match.
+    /// Returns whether the size changed.
+    fn apply_geometry(&mut self, pane: PaneId, geometry: Rect, cx: &mut Context<Self>) -> bool {
+        self.reported.insert(pane, geometry);
+        let Some(cell) = self.cell_of(pane) else { return false };
+        let Some(inset) = cell.inset_of(geometry) else {
+            // tmux moved the pane without telling us; the window list has
+            // the layout it really has now.
+            if self.stale.is_empty() {
+                self.list_windows();
+            }
+            self.stale.insert(pane);
+            return false;
+        };
+        self.insets.insert(pane, inset);
+        self.resize_pane(pane, cell.inset(inset), cx)
+    }
+
+    /// Resizes a pane's grid to `rect`. Returns whether the size changed.
+    fn resize_pane(&self, pane: PaneId, rect: Rect, cx: &mut Context<Self>) -> bool {
+        let Some(p) = self.panes.get(&pane) else { return false };
+        let size = p.terminal.read(cx).size();
+        if (size.cols, size.rows) == (rect.width.max(1), rect.height.max(1)) {
+            return false;
+        }
+        let size = GridSize { cols: rect.width.max(1), rows: rect.height.max(1), ..Default::default() };
+        p.terminal.update(cx, |t, _| t.resize(size));
+        true
+    }
+
+    /// A pane's geometry changed without a layout change, as when border
+    /// status lines are turned on.
+    fn on_pane_geometry(&mut self, pane: PaneId, geometry: Rect, cx: &mut Context<Self>) {
+        if self.apply_geometry(pane, geometry, cx) {
+            self.resnapshot(pane);
+        }
+        cx.notify();
+    }
+
+    /// The program already redrew for a new size into the grid it had, so
+    /// show tmux's screen again.
+    fn resnapshot(&mut self, pane: PaneId) {
+        let Some(p) = self.panes.get_mut(&pane) else { return };
+        match p.restoring.as_mut() {
+            // A state reply still on its way carries the geometry its
+            // captures were taken at, so only a received one is stale.
+            Some(restore) => restore.again |= restore.state.is_some(),
+            None => self.snapshot(pane, true),
         }
     }
 
     fn finish_restore(&mut self, pane: PaneId, screen: Vec<Vec<u8>>, cx: &mut Context<Self>) {
         let Some(p) = self.panes.get_mut(&pane) else { return };
         let Some(restore) = p.restoring.take() else { return };
-        let bytes = restore_bytes(restore.state.as_deref().unwrap_or(&[]), restore.alternate.as_deref(), &screen);
+        let bytes = replay_bytes(&restore, &screen);
         p.terminal.update(cx, |t, cx| t.feed(&bytes, cx));
+        if restore.again {
+            self.snapshot(pane, true);
+        }
     }
 
     fn on_detached(&mut self, reason: String, cx: &mut Context<Self>) {
@@ -738,6 +868,30 @@ fn join_lines(lines: &[Vec<u8>], out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[0m");
 }
 
+/// Full reset (RIS), sent before replaying a snapshot into a pane that
+/// already shows one: it clears the screen, history and modes.
+const RESET: &[u8] = b"\x1bc";
+
+/// What to feed a pane once its snapshot is complete.
+fn replay_bytes(restore: &Restore, screen: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = if restore.reset { RESET.to_vec() } else { Vec::new() };
+    bytes.extend(restore_bytes(restore.state.as_deref().unwrap_or(&[]), restore.alternate.as_deref(), screen));
+    bytes
+}
+
+/// A pane's geometry from a `PANE_STATE_FORMAT` reply.
+fn geometry_from_state(state: &[u32]) -> Option<Rect> {
+    let field = |i: usize| state.get(PANE_STATE_GEOMETRY + i).and_then(|&v| u16::try_from(v).ok());
+    Some(Rect { x: field(0)?, y: field(1)?, width: field(2)?, height: field(3)? })
+}
+
+/// A pane's geometry from a `GEOMETRY_FORMAT` subscription value.
+fn parse_geometry(value: &str) -> Option<Rect> {
+    let mut fields = value.split(' ').map(|f| f.trim().parse().ok());
+    let mut next = || fields.next().flatten();
+    Some(Rect { x: next()?, y: next()?, width: next()?, height: next()? })
+}
+
 /// Escape sequences that recreate a pane from its `capture-pane` snapshot
 /// and the modes reported by `display-message` (see `PANE_STATE_FORMAT`).
 pub fn restore_bytes(state: &[u32], alternate: Option<&[Vec<u8>]>, screen: &[Vec<u8>]) -> Vec<u8> {
@@ -775,6 +929,26 @@ pub fn restore_bytes(state: &[u32], alternate: Option<&[Vec<u8>]>, screen: &[Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_geometry_is_parsed() {
+        let mut state = vec![0; PANE_STATE_GEOMETRY];
+        assert_eq!(geometry_from_state(&state), None);
+        state.extend([51, 1, 49, 14]);
+        assert_eq!(geometry_from_state(&state), Some(Rect { x: 51, y: 1, width: 49, height: 14 }));
+        assert_eq!(parse_geometry("0 1 50 29"), Some(Rect { x: 0, y: 1, width: 50, height: 29 }));
+        assert_eq!(parse_geometry("0 1 50"), None);
+        assert_eq!(parse_geometry(""), None);
+    }
+
+    #[test]
+    fn snapshots_after_the_first_reset_the_pane() {
+        let screen = vec![b"hi".to_vec()];
+        let first = Restore { state: Some(vec![2, 0]), ..Default::default() };
+        let again = Restore { state: Some(vec![2, 0]), reset: true, ..Default::default() };
+        assert!(!replay_bytes(&first, &screen).starts_with(RESET));
+        assert_eq!(replay_bytes(&again, &screen), [RESET, &replay_bytes(&first, &screen)[..]].concat());
+    }
 
     #[test]
     fn color_reports_use_osc_10_and_11() {
