@@ -363,16 +363,7 @@ impl Terminal {
     pub fn default_color(&self, index: usize) -> Rgb {
         let t = &self.theme;
         let c = match index {
-            0..=15 => t.ansi[index],
-            16..=231 => {
-                let i = index - 16;
-                let step = |v: usize| if v == 0 { 0 } else { (v * 40 + 55) as u8 };
-                return Rgb { r: step(i / 36), g: step((i / 6) % 6), b: step(i % 6) };
-            }
-            232..=255 => {
-                let v = ((index - 232) * 10 + 8) as u8;
-                return Rgb { r: v, g: v, b: v };
-            }
+            0..=255 => t.indexed(index as u8),
             i if i == NamedColor::Foreground as usize => t.foreground,
             i if i == NamedColor::Background as usize => t.background,
             i if i == NamedColor::Cursor as usize => t.cursor,

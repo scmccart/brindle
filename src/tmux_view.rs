@@ -6,21 +6,23 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Window, canvas, div, fill,
-    point, px, size,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, ShapedLine, SharedString, Styled,
+    Subscription, TextRun, Window, canvas, div, fill, point, px, size,
 };
+use unicode_width::UnicodeWidthChar as _;
 
 use crate::actions::*;
 use crate::picker::{PromptRequest, ready};
 use crate::settings::Settings;
 use crate::terminal::Terminal;
-use crate::terminal_element::{cell_metrics, fit_grid};
+use crate::terminal_element::{CellMetrics, cell_metrics, fit_grid};
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use crate::tmux::layout::Rect;
 use crate::tmux::protocol::{PaneId, WindowId};
-use crate::tmux::{Direction, TmuxSession};
+use crate::tmux::style::{StyledRun, TmuxColor};
+use crate::tmux::{BorderStatus, Direction, TmuxSession};
 
 pub struct TmuxWindowView {
     session: Entity<TmuxSession>,
@@ -35,6 +37,11 @@ pub struct TmuxWindowView {
     /// a border status line.
     pane_rects: HashMap<PaneId, Rect>,
     dividers: Vec<Rect>,
+    /// Where title lines go (`pane-border-status`), and the window's height.
+    border_status: BorderStatus,
+    window_rows: u16,
+    /// Shaped title lines, rebuilt only when what they show changes.
+    titles: HashMap<PaneId, (TitleKey, Vec<TitleRun>)>,
     active: Option<PaneId>,
     zoomed: bool,
     focus_handle: FocusHandle,
@@ -64,6 +71,9 @@ impl TmuxWindowView {
             panes: Vec::new(),
             pane_rects: HashMap::new(),
             dividers: Vec::new(),
+            border_status: BorderStatus::Off,
+            window_rows: 0,
+            titles: HashMap::new(),
             active: None,
             zoomed: false,
             focus_handle: cx.focus_handle(),
@@ -96,6 +106,7 @@ impl TmuxWindowView {
     pub fn set_profile(&mut self, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
         self.font_size_override = font_size;
+        self.titles.clear();
         for (view, _) in self.views.values() {
             let theme = theme.clone();
             view.update(cx, |view, cx| {
@@ -116,6 +127,8 @@ impl TmuxWindowView {
         self.pane_rects = self.panes.iter().map(|&(id, cell)| (id, session.pane_rect(id, cell))).collect();
         self.dividers = layout.map(|l| l.dividers()).unwrap_or_default();
         self.zoomed = tmux_window.is_some_and(|w| w.zoomed);
+        self.border_status = tmux_window.map_or(BorderStatus::Off, |w| w.border_status);
+        self.window_rows = layout.map_or(0, |l| l.rect().height);
         let active = session.active_pane_of(self.window_id);
         let new_terminals: Vec<(PaneId, Entity<Terminal>)> = self
             .panes
@@ -187,6 +200,165 @@ impl TmuxWindowView {
     }
 }
 
+/// What a pane's title line shows; its shaped runs are reused until it changes.
+struct TitleKey {
+    runs: Vec<StyledRun>,
+    active: bool,
+    columns: u16,
+    font_size: Pixels,
+}
+
+/// One shaped piece of a title line, `col` cells from the line's start.
+#[derive(Clone)]
+struct TitleRun {
+    col: u16,
+    cols: u16,
+    background: Hsla,
+    line: ShapedLine,
+}
+
+/// A title line ready to paint, in window cells.
+struct TitleLine {
+    row: u16,
+    col: u16,
+    /// Columns of a reserved row inside the pane's own cell, which no
+    /// divider crosses, so a border line is drawn there (`x`, width).
+    border: Option<(u16, u16)>,
+    border_color: Hsla,
+    runs: Vec<TitleRun>,
+}
+
+impl TmuxWindowView {
+    /// Title lines for the visible panes, as tmux draws them for terminal
+    /// clients when `pane-border-status` is on.
+    fn title_lines(&mut self, metrics: &CellMetrics, window: &Window, cx: &App) -> Vec<TitleLine> {
+        if self.border_status == BorderStatus::Off {
+            self.titles.clear();
+            return Vec::new();
+        }
+        let session = self.session.read(cx);
+        let theme = &self.theme;
+        let (normal, accent) = border_colors(theme);
+        let mut lines = Vec::new();
+        for &(id, cell) in &self.panes {
+            let Some(&rect) = self.pane_rects.get(&id) else { continue };
+            let Some((row, col, columns)) = title_span(rect, self.border_status, self.window_rows) else {
+                continue;
+            };
+            let active = Some(id) == self.active;
+            let title = session.pane_title(id);
+            let runs = match self.titles.get(&id) {
+                Some((k, runs))
+                    if k.runs == title && k.active == active && k.columns == columns && k.font_size == metrics.font_size =>
+                {
+                    runs.clone()
+                }
+                _ => {
+                    let key = TitleKey { runs: title.to_vec(), active, columns, font_size: metrics.font_size };
+                    let runs = shape_title(&key, theme, metrics, window);
+                    self.titles.insert(id, (key, runs.clone()));
+                    runs
+                }
+            };
+            let inside_cell = row >= cell.y && row < cell.y + cell.height;
+            lines.push(TitleLine {
+                row,
+                col,
+                border: inside_cell.then_some((rect.x, rect.width)),
+                border_color: if active { accent } else { normal },
+                runs,
+            });
+        }
+        let panes = &self.panes;
+        self.titles.retain(|id, _| panes.iter().any(|(p, _)| p == id));
+        lines
+    }
+}
+
+/// Where tmux puts a pane's title line: the row above (`top`) or below
+/// (`bottom`) the pane, from two columns in to the pane's right edge.
+/// Returns `(row, first column, columns)`.
+fn title_span(pane: Rect, status: BorderStatus, window_rows: u16) -> Option<(u16, u16, u16)> {
+    let row = match status {
+        BorderStatus::Off => return None,
+        BorderStatus::Top => pane.y.checked_sub(1)?,
+        BorderStatus::Bottom => pane.y + pane.height,
+    };
+    let columns = pane.width.saturating_sub(2);
+    (row < window_rows && columns > 0).then_some((row, pane.x + 2, columns))
+}
+
+/// Shapes a title's runs, clipped to its columns. Runs without a color use
+/// the border's: the accent for the active pane, the foreground otherwise.
+fn shape_title(key: &TitleKey, theme: &Theme, metrics: &CellMetrics, window: &Window) -> Vec<TitleRun> {
+    let base_fg = if key.active { theme.accent() } else { theme.foreground };
+    let color = |c: Option<TmuxColor>| match c {
+        Some(TmuxColor::Indexed(i)) => Some(theme.indexed(i)),
+        Some(TmuxColor::Rgb(c)) => Some(c),
+        None => None,
+    };
+    let mut out = Vec::new();
+    let mut col = 0;
+    for run in &key.runs {
+        let mut text = String::new();
+        let mut cols = 0;
+        for ch in run.text.chars() {
+            let w = ch.width().unwrap_or(0) as u16;
+            if col + cols + w > key.columns {
+                break;
+            }
+            text.push(ch);
+            cols += w;
+        }
+        if text.is_empty() {
+            continue;
+        }
+        let (mut fg, mut bg) = (color(run.style.fg).unwrap_or(base_fg), color(run.style.bg).unwrap_or(theme.background));
+        if run.style.reverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let mut font = metrics.font.clone();
+        if run.style.bold {
+            font.weight = FontWeight::BOLD;
+        }
+        let text_run = TextRun {
+            len: text.len(),
+            font,
+            color: fg.hsla(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window.text_system().shape_line(SharedString::from(text), metrics.font_size, &[text_run], None);
+        out.push(TitleRun { col, cols, background: bg.hsla(), line });
+        col += cols;
+    }
+    out
+}
+
+fn paint_titles(titles: &[TitleLine], origin: gpui::Point<Pixels>, cw: Pixels, lh: Pixels, window: &mut Window, cx: &mut App) {
+    for title in titles {
+        let y = origin.y + lh * title.row as f32;
+        if let Some((x, width)) = title.border {
+            let line_y = (y + lh / 2.0).floor();
+            let x0 = (origin.x + cw * x as f32).floor();
+            let x1 = (origin.x + cw * (x + width) as f32).floor();
+            window.paint_quad(fill(Bounds::new(point(x0, line_y), size(x1 - x0, px(1.0))), title.border_color));
+        }
+        for run in &title.runs {
+            let x = origin.x + cw * (title.col + run.col) as f32;
+            let (x0, x1) = (x.floor(), (x + cw * run.cols as f32).floor());
+            window.paint_quad(fill(Bounds::new(point(x0, y.floor()), size(x1 - x0, lh)), run.background));
+            run.line.paint(point(x, y), lh, window, cx).ok();
+        }
+    }
+}
+
+/// Divider colors: a muted line, and the accent next to the active pane.
+fn border_colors(theme: &Theme) -> (Hsla, Hsla) {
+    (theme.chrome_border().mix(theme.foreground, 0.15).hsla(), theme.accent().hsla())
+}
+
 impl Render for TmuxWindowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = cell_metrics(self.font_size_override, window, cx);
@@ -197,6 +369,7 @@ impl Render for TmuxWindowView {
         let session = self.session.clone();
         let dividers = self.dividers.clone();
         let multiple = self.panes.len() > 1;
+        let titles = self.title_lines(&metrics, window, cx);
 
         let pane_elements = self.panes.iter().filter_map(|(id, _)| {
             let (view, _) = self.views.get(id)?;
@@ -248,9 +421,10 @@ impl Render for TmuxWindowView {
                         let (cols, rows) = fit_grid(bounds.size, padding, cw, lh);
                         session.update(cx, |s, _| s.set_client_size(cols as u16, rows as u16));
                     },
-                    move |bounds, _, window, _| {
+                    move |bounds, _, window, cx| {
                         let origin = bounds.origin + point(padding, padding);
                         paint_dividers(&dividers, active_rect.filter(|_| multiple), origin, cw, lh, &theme, window);
+                        paint_titles(&titles, origin, cw, lh, window, cx);
                     },
                 )
                 .absolute()
@@ -285,8 +459,7 @@ fn paint_dividers(
     theme: &Theme,
     window: &mut Window,
 ) {
-    let normal = theme.chrome_border().mix(theme.foreground, 0.15).hsla();
-    let accent = theme.accent().hsla();
+    let (normal, accent) = border_colors(theme);
     for (ix, d) in dividers.iter().enumerate() {
         let vertical = d.width == 1 && d.height > 1;
         // Along the divider: cell size, origin, and where a crossing line sits.
@@ -391,6 +564,21 @@ mod tests {
 
     fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
         Rect { x, y, width, height }
+    }
+
+    #[test]
+    fn title_spans() {
+        let pane = r(51, 1, 49, 14);
+        assert_eq!(title_span(pane, BorderStatus::Off, 30), None);
+        assert_eq!(title_span(pane, BorderStatus::Top, 30), Some((0, 53, 47)));
+        assert_eq!(title_span(r(51, 16, 49, 13), BorderStatus::Top, 30), Some((15, 53, 47)));
+        assert_eq!(title_span(r(0, 0, 50, 29), BorderStatus::Bottom, 30), Some((29, 2, 48)));
+        // Zoomed: one pane covering the window, title in the reserved row.
+        assert_eq!(title_span(r(0, 1, 113, 32), BorderStatus::Top, 33), Some((0, 2, 111)));
+        // No row to put it in, or no room in it.
+        assert_eq!(title_span(r(0, 0, 50, 30), BorderStatus::Top, 30), None);
+        assert_eq!(title_span(r(0, 0, 50, 30), BorderStatus::Bottom, 30), None);
+        assert_eq!(title_span(r(0, 1, 2, 10), BorderStatus::Top, 30), None);
     }
 
     #[test]

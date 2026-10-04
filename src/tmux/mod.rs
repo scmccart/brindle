@@ -6,6 +6,7 @@
 
 pub mod layout;
 pub mod protocol;
+pub mod style;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -23,6 +24,7 @@ use crate::terminal::{GridSize, Terminal};
 use crate::theme::Color;
 use layout::{Inset, Layout, Rect};
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
+use style::StyledRun;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TmuxEvent {
@@ -104,6 +106,26 @@ pub struct TmuxWindow {
     pub layout: Option<Layout>,
     pub active_pane: Option<PaneId>,
     pub zoomed: bool,
+    pub border_status: BorderStatus,
+}
+
+/// Where a window's panes show their title lines (`pane-border-status`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BorderStatus {
+    #[default]
+    Off,
+    Top,
+    Bottom,
+}
+
+impl BorderStatus {
+    fn parse(value: &str) -> BorderStatus {
+        match value.trim() {
+            "top" => BorderStatus::Top,
+            "bottom" => BorderStatus::Bottom,
+            _ => BorderStatus::Off,
+        }
+    }
 }
 
 const PANE_STATE_FORMAT: &str = "#{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} \
@@ -118,6 +140,13 @@ const PANE_STATE_GEOMETRY: usize = 11;
 /// sends no `%layout-change`, so this is how Brindle learns about them.
 const GEOMETRY_SUBSCRIPTION: &str = "brindle-geometry";
 const GEOMETRY_FORMAT: &str = "#{pane_left} #{pane_top} #{pane_width} #{pane_height}";
+
+/// Title lines, which tmux only draws for terminal clients: each pane's
+/// expanded `pane-border-format`, and each window's `pane-border-status`.
+const TITLE_SUBSCRIPTION: &str = "brindle-title";
+const TITLE_FORMAT: &str = "#{T:pane-border-format}";
+const BORDER_STATUS_SUBSCRIPTION: &str = "brindle-border-status";
+const BORDER_STATUS_FORMAT: &str = "#{pane-border-status}";
 
 /// Snapshot pieces collected while restoring a pane's existing contents.
 #[derive(Default)]
@@ -146,6 +175,8 @@ pub struct TmuxSession {
     pub panes: HashMap<PaneId, Pane>,
     /// Rows tmux takes from each pane's layout cell (see [`Inset`]).
     insets: HashMap<PaneId, Inset>,
+    /// Each pane's title line (see `TITLE_SUBSCRIPTION`).
+    titles: HashMap<PaneId, Vec<StyledRun>>,
     /// The latest geometry tmux reported for each pane.
     reported: HashMap<PaneId, Rect>,
     /// Panes whose reported geometry didn't fit their layout cell: tmux
@@ -269,6 +300,7 @@ impl TmuxSession {
             windows: BTreeMap::new(),
             panes: HashMap::new(),
             insets: HashMap::new(),
+            titles: HashMap::new(),
             reported: HashMap::new(),
             stale: HashSet::new(),
             active_window: None,
@@ -462,6 +494,11 @@ impl TmuxSession {
         cell.inset(self.insets.get(&pane).copied().unwrap_or_default())
     }
 
+    /// A pane's title line, as tmux would draw it with border status on.
+    pub fn pane_title(&self, pane: PaneId) -> &[StyledRun] {
+        self.titles.get(&pane).map_or(&[], Vec::as_slice)
+    }
+
     pub fn pane_terminal(&self, pane: PaneId) -> Option<Entity<Terminal>> {
         self.panes.get(&pane).map(|p| p.terminal.clone())
     }
@@ -561,14 +598,26 @@ impl TmuxSession {
                 self.session_name = name;
                 cx.notify();
             }
-            Notification::SubscriptionChanged { name, pane, value, .. } => {
-                if name == GEOMETRY_SUBSCRIPTION
-                    && let Some(pane) = pane
-                    && let Some(geometry) = parse_geometry(&value)
-                {
-                    self.on_pane_geometry(pane, geometry, cx);
+            Notification::SubscriptionChanged { name, window, pane, value } => match (name.as_str(), window, pane) {
+                (GEOMETRY_SUBSCRIPTION, _, Some(pane)) => {
+                    if let Some(geometry) = parse_geometry(&value) {
+                        self.on_pane_geometry(pane, geometry, cx);
+                    }
                 }
-            }
+                (TITLE_SUBSCRIPTION, _, Some(pane)) => {
+                    if self.panes.contains_key(&pane) {
+                        self.titles.insert(pane, style::parse_format(&value));
+                        cx.notify();
+                    }
+                }
+                (BORDER_STATUS_SUBSCRIPTION, Some(window), None) => {
+                    if let Some(w) = self.windows.get_mut(&window) {
+                        w.border_status = BorderStatus::parse(&value);
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            },
             Notification::Exit(reason) => {
                 self.on_detached(reason.unwrap_or_else(|| "detached".into()), cx)
             }
@@ -578,8 +627,13 @@ impl TmuxSession {
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
         if !self.attached {
-            let subscription = format!("{GEOMETRY_SUBSCRIPTION}:%*:{GEOMETRY_FORMAT}");
-            self.send(format!("refresh-client -B {}", protocol::quote(&subscription)));
+            for subscription in [
+                format!("{GEOMETRY_SUBSCRIPTION}:%*:{GEOMETRY_FORMAT}"),
+                format!("{TITLE_SUBSCRIPTION}:%*:{TITLE_FORMAT}"),
+                format!("{BORDER_STATUS_SUBSCRIPTION}:@*:{BORDER_STATUS_FORMAT}"),
+            ] {
+                self.send(format!("refresh-client -B {}", protocol::quote(&subscription)));
+            }
         }
         self.attached = true;
         let mut seen = Vec::new();
@@ -594,7 +648,15 @@ impl TmuxSession {
             }
             let window = self.windows.entry(id).or_insert_with(|| {
                 added.push(id);
-                TmuxWindow { id, index: 0, name: String::new(), layout: None, active_pane: None, zoomed: false }
+                TmuxWindow {
+                    id,
+                    index: 0,
+                    name: String::new(),
+                    layout: None,
+                    active_pane: None,
+                    zoomed: false,
+                    border_status: BorderStatus::Off,
+                }
             });
             window.index = line.index;
             window.name = line.name;
@@ -645,6 +707,7 @@ impl TmuxSession {
         self.panes.retain(|id, _| live.contains_key(id));
         self.insets.retain(|id, _| live.contains_key(id));
         self.reported.retain(|id, _| live.contains_key(id));
+        self.titles.retain(|id, _| live.contains_key(id));
         self.stale.retain(|id| live.contains_key(id));
 
         for (&id, &cell) in &live {

@@ -39,6 +39,8 @@ Tested: a subscription on `#{T:pane-border-format}` gives each pane's expanded s
 
    `apply-tmux-pane-styles` reuses `TmuxColor` and the style parsing.
 
+   As implemented, `TmuxColor` is `Indexed(u8)` or `Rgb(Color)`, and `default`, `terminal` and unknown values are `None` wherever a color is optional. `Style::apply` takes a directive list, so the same code parses `#[...]` runs and style option values. Indexed colors resolve through a new `Theme::indexed`, which `Terminal::default_color` now uses too, so titles and pane text map the 256-color palette the same way.
+
 3. **Painting happens in the existing canvas, after the dividers.** For each visible pane whose window has border status on:
    - The title row is `rect.y - 1` (top) or `rect.y + rect.height` (bottom), using the pane rectangle, and is skipped if it falls outside the window.
    - Text starts at column `rect.x + 2` and is clipped to `rect.width - 2` columns, measured with `unicode-width`.
