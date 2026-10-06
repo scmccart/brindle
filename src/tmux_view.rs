@@ -148,6 +148,10 @@ impl TmuxWindowView {
         let panes = &self.panes;
         self.views.retain(|id, _| panes.iter().any(|(p, _)| p == id));
         for (id, terminal) in new_terminals {
+            // Panes start with the profile's theme; a settings preview may
+            // have given this window another.
+            let theme = self.theme.clone();
+            terminal.update(cx, |t, _| t.theme = theme);
             let font_size = self.font_size_override;
             let view = cx.new(|cx| {
                 let mut view = TerminalView::new(terminal, font_size, window, cx);

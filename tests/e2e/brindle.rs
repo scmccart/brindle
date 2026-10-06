@@ -46,7 +46,8 @@ pub mod theme {
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
 }
 
-fn config(socket: &str, theme_name: &str) -> String {
+/// The test config, with `theme_name` as the global theme.
+pub fn config(socket: &str, theme_name: &str) -> String {
     use theme::*;
     let ansi: Vec<String> = ANSI.iter().map(|c| format!("\"{}\"", c.hex())).collect();
     format!(
@@ -271,6 +272,8 @@ pub struct Dump {
     pub size: Option<(u16, u16)>,
     pub grid: Option<Grid>,
     pub screen: Vec<String>,
+    /// The settings dialog's line, when it is open.
+    pub settings: Option<String>,
 }
 
 impl Dump {
@@ -290,6 +293,9 @@ impl Dump {
                 in_screen = true;
             } else if let Some(rest) = line.strip_prefix("--- grid ") {
                 dump.grid = parse_grid(rest);
+            } else if let Some(rest) = line.strip_prefix("--- settings ") {
+                dump.settings = Some(rest.to_string());
+                in_screen = false;
             } else if in_screen {
                 screen.push(line);
             }
@@ -347,6 +353,10 @@ pub fn self_test_dump() -> Result {
     let grid = Grid { x: 6.0, y: 51.5, cell_width: 8.4, line_height: 18.0, scale: 2.0 };
     ensure!(dump.grid == Some(grid), "grid {:?}", dump.grid);
     ensure!(dump.screen == ["hello", "", "world"], "screen {:?}", dump.screen);
+    ensure!(dump.settings.is_none(), "settings {:?}", dump.settings);
+    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
+    ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
+    ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);
     ensure!(Dump::parse("nothing").size.is_none(), "size from nothing");
     Ok(())
 }

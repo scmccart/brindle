@@ -191,6 +191,7 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let mode = self.mode(cx);
+        log::debug!("key {} reached the terminal unbound", event.keystroke.unparse());
         if let Some(bytes) = keys::to_esc_str(&event.keystroke, mode) {
             self.reset_blink();
             self.terminal.update(cx, |t, cx| t.input(bytes, cx));
@@ -423,6 +424,7 @@ impl gpui::EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        log::debug!("text {text:?} from the input method");
         self.marked_text = None;
         self.reset_blink();
         let bytes = text.as_bytes().to_vec();

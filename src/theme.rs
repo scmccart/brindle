@@ -125,6 +125,13 @@ impl Theme {
         }
     }
 
+    /// This theme with `cursor_text` and `accent` filled in with the colors
+    /// they fall back to, so they survive being written to a config (where
+    /// an omitted key means brindle-dark's color instead).
+    pub fn with_effective_colors(&self) -> Theme {
+        Theme { cursor_text: Some(self.cursor_text.unwrap_or(self.background)), accent: Some(self.accent()), ..self.clone() }
+    }
+
     pub fn is_dark(&self) -> bool {
         self.background.luminance() < 0.5
     }

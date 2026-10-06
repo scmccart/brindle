@@ -15,6 +15,7 @@ use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
 use crate::settings::Settings;
+use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Theme;
@@ -135,6 +136,12 @@ enum PaletteKind {
     Prompt,
 }
 
+/// What is shown over the tabs; at most one at a time.
+enum Overlay {
+    Palette(OpenPalette),
+    Settings { dialog: Entity<SettingsDialog>, _subscription: Subscription },
+}
+
 struct OpenPalette {
     palette: Entity<Palette>,
     kind: PaletteKind,
@@ -167,7 +174,10 @@ impl Render for DraggedTab {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    palette: Option<OpenPalette>,
+    overlay: Option<Overlay>,
+    /// A theme being previewed by the settings dialog, shown on the tabs
+    /// that follow the global theme.
+    theme_preview: Option<Theme>,
     focus_handle: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
@@ -180,7 +190,8 @@ impl Workspace {
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
-            palette: None,
+            overlay: None,
+            theme_preview: None,
             focus_handle: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
@@ -282,6 +293,10 @@ impl Workspace {
         if !self.tabs.is_empty() && index <= self.active {
             self.active += 1;
         }
+        if self.theme_preview.is_some() && tab.profile.theme.is_none() {
+            let theme = self.tab_theme(&tab.profile, Self::settings(cx));
+            set_tab_theme(&tab, theme, cx);
+        }
         self.tabs.insert(index, tab);
         cx.notify();
         index
@@ -324,7 +339,7 @@ impl Workspace {
                     return;
                 }
                 let profile = session.read(cx).profile.clone();
-                let theme = Self::settings(cx).profile_theme(&profile);
+                let theme = self.tab_theme(&profile, Self::settings(cx));
                 let view = cx.new(|cx| TmuxWindowView::new(session.clone(), window_id, theme, profile.font_size, window, cx));
                 let subscriptions = vec![
                     cx.observe(&view, |this, _, cx| {
@@ -430,7 +445,7 @@ impl Workspace {
             session.update(cx, |s, _| s.select_window(window_id));
         }
         let focus = tab.focus_handle(cx);
-        if self.palette.is_none() {
+        if self.overlay.is_none() {
             window.focus(&focus);
         }
         cx.notify();
@@ -618,9 +633,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(open) = &self.palette else { return false };
-        let same = is(&open.kind);
-        self.dismiss_palette(window, cx);
+        if self.overlay.is_none() {
+            return false;
+        }
+        let same = matches!(&self.overlay, Some(Overlay::Palette(open)) if is(&open.kind));
+        self.dismiss_overlay(window, cx);
         same
     }
 
@@ -633,18 +650,19 @@ impl Workspace {
     ) {
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
             PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
-            PaletteEvent::Dismissed => this.dismiss_palette(window, cx),
+            PaletteEvent::Dismissed => this.dismiss_overlay(window, cx),
         });
+        self.close_overlay(cx);
         window.focus(&palette.focus_handle(cx));
-        self.palette = Some(OpenPalette { palette, kind, _subscription: subscription });
+        self.overlay = Some(Overlay::Palette(OpenPalette { palette, kind, _subscription: subscription }));
         cx.notify();
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open) = self.palette.take() else { return };
+        let Some(Overlay::Palette(open)) = self.overlay.take() else { return };
         match open.kind {
             PaletteKind::NewTab => {
-                self.dismiss_palette(window, cx);
+                self.dismiss_overlay(window, cx);
                 self.launch(LaunchRequest::profile(ix), window, cx);
             }
             PaletteKind::Commands { actions, tab_focus } => {
@@ -660,12 +678,43 @@ impl Workspace {
         }
     }
 
-    fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Settings { .. })) {
+            self.dismiss_overlay(window, cx);
+            return;
+        }
+        let config = Self::settings(cx);
+        let model = settings_dialog::Model::new(Config::path(), config.theme.clone(), config.themes.clone());
+        let theme = config.theme(None);
+        let dialog = cx.new(|cx| SettingsDialog::new(model, theme, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
+            SettingsEvent::Preview(theme) => this.set_theme_preview(Some(theme.clone()), cx),
+            // Deferred by GPUI, so the reload sees this window idle.
+            SettingsEvent::ConfigWritten => window.dispatch_action(Box::new(ReloadConfig), cx),
+            SettingsEvent::Close => this.dismiss_overlay(window, cx),
+        });
+        self.close_overlay(cx);
+        window.focus(&dialog.focus_handle(cx));
+        self.overlay = Some(Overlay::Settings { dialog, _subscription: subscription });
+        cx.notify();
+    }
+
+    /// Closes whatever overlay is open and gives focus back to the tab.
+    fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_overlay(cx);
         if let Some(tab) = self.tabs.get(self.active) {
             window.focus(&tab.focus_handle(cx));
         }
         cx.notify();
+    }
+
+    /// Drops the open overlay. Closing the settings dialog this way cancels
+    /// it, ending any preview.
+    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        self.overlay = None;
+        if self.theme_preview.is_some() {
+            self.set_theme_preview(None, cx);
+        }
     }
 
     fn change_font_size(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
@@ -703,6 +752,32 @@ impl Workspace {
         );
     }
 
+    /// The theme a tab with `profile` shows: the preview for tabs that
+    /// follow the global theme, else the profile's theme.
+    fn tab_theme(&self, profile: &Profile, config: &Config) -> Theme {
+        match (&self.theme_preview, &profile.theme) {
+            (Some(preview), None) => preview.clone(),
+            _ => config.profile_theme(profile),
+        }
+    }
+
+    /// Re-themes every tab from the config and the preview.
+    fn apply_tab_themes(&mut self, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        for tab in &self.tabs {
+            set_tab_theme(tab, self.tab_theme(&tab.profile, &config), cx);
+        }
+    }
+
+    /// Shows `preview` on the tabs that follow the global theme, or, with
+    /// `None`, puts their configured theme back. tmux isn't told: color
+    /// reports are only sent on a real config change.
+    pub fn set_theme_preview(&mut self, preview: Option<Theme>, cx: &mut Context<Self>) {
+        self.theme_preview = preview;
+        self.apply_tab_themes(cx);
+        cx.notify();
+    }
+
     /// Applies a reloaded config to running terminals.
     pub fn apply_config(&mut self, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
@@ -710,16 +785,8 @@ impl Workspace {
             if let Some(p) = config.profile(&tab.profile.name) {
                 tab.profile = p.clone();
             }
-            let theme = config.profile_theme(&tab.profile);
-            let font_size = tab.profile.font_size;
-            match &tab.content {
-                TabContent::Terminal(view) => view.update(cx, |view, cx| {
-                    view.font_size_override = font_size;
-                    view.terminal.update(cx, |t, _| t.theme = theme)
-                }),
-                TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
-            }
         }
+        self.apply_tab_themes(cx);
         for (session, _) in &self.tmux_sessions {
             session.update(cx, |s, cx| {
                 let profile = config.profile(&s.profile.name).cloned().unwrap_or_else(|| s.profile.clone());
@@ -757,8 +824,10 @@ impl Workspace {
             }
             out.push_str(&terminal.screen_text());
         }
-        if let Some(open) = &self.palette {
-            out.push_str(&open.palette.read(cx).describe());
+        match &self.overlay {
+            Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe()),
+            Some(Overlay::Settings { dialog, .. }) => out.push_str(&dialog.read(cx).describe()),
+            None => {}
         }
         out
     }
@@ -919,12 +988,42 @@ impl Workspace {
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
     }
 
+    fn render_overlay(&self) -> Option<AnyElement> {
+        let overlay = match self.overlay.as_ref()? {
+            Overlay::Palette(open) => open.palette.clone().into_any_element(),
+            Overlay::Settings { dialog, .. } => dialog.clone().into_any_element(),
+        };
+        Some(
+            div()
+                .absolute()
+                .top(px(TAB_BAR_HEIGHT + 8.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(overlay)
+                .into_any_element(),
+        )
+    }
+
     fn render_content(&self) -> AnyElement {
         match self.tabs.get(self.active).map(|t| &t.content) {
             Some(TabContent::Terminal(view)) => view.clone().into_any_element(),
             Some(TabContent::Tmux { view, .. }) => view.clone().into_any_element(),
             None => div().into_any_element(),
         }
+    }
+}
+
+/// Gives a tab's terminals `theme`, keeping its font size.
+fn set_tab_theme(tab: &Tab, theme: Theme, cx: &mut App) {
+    let font_size = tab.profile.font_size;
+    match &tab.content {
+        TabContent::Terminal(view) => view.update(cx, |view, cx| {
+            view.font_size_override = font_size;
+            view.terminal.update(cx, |t, _| t.theme = theme)
+        }),
+        TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
     }
 }
 
@@ -976,27 +1075,33 @@ impl Render for Workspace {
         let rounding = px(8.0);
         let config_error = Settings::get(cx).config_error.clone();
 
+        // While the settings dialog previews a theme, only the overlay
+        // toggles act, so nothing (such as a new tab) changes underneath it.
+        let settings_open = matches!(self.overlay, Some(Overlay::Settings { .. }));
         let body = div()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::new_tab))
-            .on_action(cx.listener(Self::new_tab_with_profile))
-            .on_action(cx.listener(Self::close_tab))
-            .on_action(cx.listener(Self::next_tab))
-            .on_action(cx.listener(Self::prev_tab))
-            .on_action(cx.listener(Self::activate_tab))
-            .on_action(cx.listener(Self::move_tab_left))
-            .on_action(cx.listener(Self::move_tab_right))
-            .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_profile_picker))
             .on_action(cx.listener(Self::open_command_palette))
-            .on_action(cx.listener(Self::increase_font_size))
-            .on_action(cx.listener(Self::decrease_font_size))
-            .on_action(cx.listener(Self::reset_font_size))
-            .on_action(cx.listener(Self::open_config))
+            .on_action(cx.listener(Self::open_settings))
             // Consumes keys bound to `Swallow` (ctrl-shift-d outside tmux tabs).
             .on_action(cx.listener(|_, _: &Swallow, _, _| {}))
+            .when(!settings_open, |d| {
+                d.on_action(cx.listener(Self::new_tab))
+                    .on_action(cx.listener(Self::new_tab_with_profile))
+                    .on_action(cx.listener(Self::close_tab))
+                    .on_action(cx.listener(Self::next_tab))
+                    .on_action(cx.listener(Self::prev_tab))
+                    .on_action(cx.listener(Self::activate_tab))
+                    .on_action(cx.listener(Self::move_tab_left))
+                    .on_action(cx.listener(Self::move_tab_right))
+                    .on_action(cx.listener(Self::close_window))
+                    .on_action(cx.listener(Self::increase_font_size))
+                    .on_action(cx.listener(Self::decrease_font_size))
+                    .on_action(cx.listener(Self::reset_font_size))
+                    .on_action(cx.listener(Self::open_config))
+            })
             .relative()
             .flex()
             .flex_col()
@@ -1042,18 +1147,7 @@ impl Render for Workspace {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
-            .when_some(self.palette.as_ref().map(|p| p.palette.clone()), |d, palette| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top(px(TAB_BAR_HEIGHT + 8.0))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
-                        .child(palette),
-                )
-            });
+            .when_some(self.render_overlay(), |d, overlay| d.child(overlay));
 
         // With client-side decorations we draw a transparent margin around the
         // window for the shadow and the resize handles.
