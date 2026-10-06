@@ -5,7 +5,8 @@
 default_profile = "Shell"
 
 # Built-in themes: brindle-dark, brindle-light, tokyo-night, gruvbox-dark,
-# solarized-dark. Define your own under [themes.<name>].
+# solarized-dark. Define your own under [themes.<name>], or pick and edit
+# themes with a live preview in the settings dialog (ctrl-shift-,).
 theme = "brindle-dark"
 
 scrollback_lines = 10000

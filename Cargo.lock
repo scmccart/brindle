@@ -688,6 +688,7 @@ dependencies = [
  "serde",
  "smallvec",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "unicode-width",
  "x11rb",
 ]

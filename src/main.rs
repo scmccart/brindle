@@ -1,8 +1,10 @@
 mod actions;
 mod config;
+mod config_edit;
 mod desktop;
 mod picker;
 mod settings;
+mod settings_dialog;
 mod terminal;
 mod terminal_element;
 mod terminal_view;
@@ -227,9 +229,17 @@ fn main() {
         };
         cx.set_global(settings);
         actions::bind_keys(cx);
+        // RUST_LOG=brindle=debug shows every keystroke and what it ran.
+        cx.observe_keystrokes(|e, _, _| {
+            let action = e.action.as_ref().map(|a| a.name()).unwrap_or("no action");
+            log::debug!("keystroke {} -> {action}", e.keystroke.unparse());
+        })
+        .detach();
 
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_action(|_: &ReloadConfig, cx| reload_config(cx));
+        // Global listeners run inside the dispatching window's update, where
+        // `reload_config` couldn't update that window; defer until it's back.
+        cx.on_action(|_: &ReloadConfig, cx| cx.defer(reload_config));
         cx.on_action(|_: &NewWindow, cx| {
             let profile = Settings::get(cx).config.default_profile_index();
             open_window(LaunchRequest::profile(profile), cx);

@@ -33,6 +33,7 @@ actions!(
         OpenCommandPalette,
         ReloadConfig,
         OpenConfig,
+        OpenSettings,
         TmuxDetach,
         TmuxSplitRight,
         TmuxSplitDown,
@@ -62,6 +63,16 @@ actions!(
         PickerDown,
         PickerConfirm,
         PickerCancel,
+        // Settings dialog.
+        SettingsUp,
+        SettingsDown,
+        SettingsConfirm,
+        SettingsCancel,
+        SettingsNextField,
+        SettingsPrevField,
+        SettingsNew,
+        SettingsEdit,
+        SettingsDelete,
     ]
 );
 
@@ -105,6 +116,7 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("open_command_palette", None, || Box::new(OpenCommandPalette)),
     ("reload_config", Some("Reload Config"), || Box::new(ReloadConfig)),
     ("open_config", Some("Open Config"), || Box::new(OpenConfig)),
+    ("open_settings", Some("Open Settings"), || Box::new(OpenSettings)),
     ("tmux_detach", Some("tmux: Detach"), || Box::new(TmuxDetach)),
     ("tmux_split_right", Some("tmux: Split Right"), || Box::new(TmuxSplitRight)),
     ("tmux_split_down", Some("tmux: Split Down"), || Box::new(TmuxSplitDown)),
@@ -127,6 +139,17 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("tmux_rename_window", Some("tmux: Rename Window"), || Box::new(TmuxRenameWindow)),
     ("tmux_command", Some("tmux: Run Command"), || Box::new(TmuxCommand)),
     ("quit", Some("Quit"), || Box::new(Quit)),
+    // The settings dialog's own actions: unlabelled, so they stay out of the
+    // command palette, but `--action` and user bindings can reach them.
+    ("settings_up", None, || Box::new(SettingsUp)),
+    ("settings_down", None, || Box::new(SettingsDown)),
+    ("settings_confirm", None, || Box::new(SettingsConfirm)),
+    ("settings_cancel", None, || Box::new(SettingsCancel)),
+    ("settings_next_field", None, || Box::new(SettingsNextField)),
+    ("settings_prev_field", None, || Box::new(SettingsPrevField)),
+    ("settings_new", None, || Box::new(SettingsNew)),
+    ("settings_edit", None, || Box::new(SettingsEdit)),
+    ("settings_delete", None, || Box::new(SettingsDelete)),
     ("none", None, || Box::new(NoAction)),
 ];
 
@@ -170,6 +193,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let t = Some("Terminal");
     let p = Some("Palette");
     let x = Some("TmuxWindow");
+    let s = Some("SettingsDialog");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -187,6 +211,10 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-space", OpenProfilePicker, w),
         KeyBinding::new("ctrl-shift-r", ReloadConfig, w),
         KeyBinding::new("ctrl-,", OpenConfig, w),
+        // GPUI reports shift-, as `<` (without shift) on US-style layouts;
+        // the readable spelling comes last so the palette shows it.
+        KeyBinding::new("ctrl-<", OpenSettings, w),
+        KeyBinding::new("ctrl-shift-,", OpenSettings, w),
         // Detach only means something in a control-mode tab; elsewhere the
         // key is swallowed so habit never sends ^D to a shell.
         KeyBinding::new("ctrl-shift-d", Swallow, w),
@@ -224,6 +252,16 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", PickerCancel, p),
         KeyBinding::new("ctrl-shift-v", Paste, p),
         KeyBinding::new("shift-insert", Paste, p),
+        KeyBinding::new("up", SettingsUp, s),
+        KeyBinding::new("down", SettingsDown, s),
+        KeyBinding::new("ctrl-p", SettingsUp, s),
+        KeyBinding::new("ctrl-n", SettingsDown, s),
+        KeyBinding::new("enter", SettingsConfirm, s),
+        KeyBinding::new("escape", SettingsCancel, s),
+        KeyBinding::new("tab", SettingsNextField, s),
+        KeyBinding::new("shift-tab", SettingsPrevField, s),
+        KeyBinding::new("ctrl-shift-v", Paste, s),
+        KeyBinding::new("shift-insert", Paste, s),
     ];
     for n in 1..=9 {
         let index = if n == 9 { usize::MAX } else { n - 1 };
@@ -292,6 +330,31 @@ mod tests {
             assert!(action.partial_eq(&*build()), "{name}");
         }
         assert!(palette_commands(|_| true).iter().all(|(_, a)| !a.partial_eq(&OpenCommandPalette) && !a.partial_eq(&NoAction)));
+    }
+
+    #[test]
+    fn default_bindings_parse() {
+        // KeyBinding::new panics on a keystroke it can't parse.
+        let bindings = default_bindings();
+        let settings = bindings.iter().filter(|b| b.action().partial_eq(&OpenSettings)).count();
+        assert_eq!(settings, 2);
+    }
+
+    #[test]
+    fn settings_key_matches_what_gpui_reports() {
+        // ctrl-shift-, on a US layout: xkb gives `<`, and GPUI drops shift
+        // for symbols.
+        let typed = gpui::Keystroke {
+            modifiers: gpui::Modifiers { control: true, ..Default::default() },
+            key: "<".into(),
+            key_char: Some("<".into()),
+        };
+        let matched = default_bindings()
+            .iter()
+            .filter(|b| b.action().partial_eq(&OpenSettings))
+            .map(|b| (format!("{:?}", b.keystrokes()), b.match_keystrokes(&[typed.clone()])))
+            .collect::<Vec<_>>();
+        assert!(matched.iter().any(|(_, m)| *m == Some(false)), "{matched:#?}");
     }
 
     #[test]

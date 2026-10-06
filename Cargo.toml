@@ -19,6 +19,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 toml = "0.8"
+toml_edit = "0.22.27"
 unicode-width = "0.2"
 libc = "0.2"
 

@@ -3,6 +3,7 @@
 mod colors;
 mod dump;
 mod geometry;
+mod settings;
 mod styles;
 mod titles;
 mod tmux;
@@ -43,6 +44,9 @@ pub fn all() -> Vec<Case> {
         display("styles-tint", styles::tint),
         display("styles-active-pane", styles::active_pane),
         display("styles-borders", styles::borders),
+        display("settings-preview", settings::preview),
+        display("settings-cancel", settings::cancel),
+        display("settings-apply", settings::apply),
     ]
 }
 

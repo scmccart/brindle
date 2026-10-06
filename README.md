@@ -7,6 +7,8 @@ GPUI's Vulkan renderer.
 
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
 - **Profiles**: command, args, working directory, environment, theme and font size per profile.
+- **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
+  previews themes live on your open tabs and has an editor for custom themes.
 - **tmux**, both ways:
   - *Classic*: tmux runs inside the terminal with SGR mouse, focus events (1004),
     bracketed paste, OSC 52 clipboard, true color, styled underlines, cursor
@@ -105,7 +107,15 @@ On first launch Brindle writes a commented config to
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-n | new window |
+| ctrl-shift-, | settings (theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
+
+In the settings dialog, up/down previews a theme and enter applies it as the
+default; escape puts the previous theme back. `n` makes a new theme (a copy of
+the selected one), `e` edits a custom theme and `d` deletes one. Built-in themes
+can't be changed, so editing one starts from a copy. In the editor, tab moves
+between fields and every valid color shows on the tabs as you type. Saving
+updates `config.toml` in place: your comments and the rest of the file are kept.
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
 

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use futures::channel::oneshot;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    KeyDownEvent, Keystroke, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 
@@ -38,9 +38,44 @@ pub struct PromptRequest {
     pub submit: SubmitFn,
 }
 
+/// One line of editable text: typing appends, backspace deletes the last
+/// character, and pasted line breaks become spaces. Shared by the palettes
+/// and the settings dialog; there is no cursor movement within the text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextField {
+    pub text: String,
+}
+
+impl TextField {
+    pub fn new(text: &str) -> Self {
+        Self { text: single_line(text) }
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        self.text.push_str(&single_line(text));
+    }
+
+    /// Whether `ks` edits text (as opposed to being a shortcut or a
+    /// navigation key that a keybinding handles).
+    pub fn is_edit_key(ks: &Keystroke) -> bool {
+        !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform)
+            && !matches!(ks.key.as_str(), "enter" | "tab" | "escape")
+            && (ks.key == "backspace" || ks.key_char.is_some())
+    }
+
+    /// Applies an edit key (see [`Self::is_edit_key`]).
+    pub fn apply_key(&mut self, ks: &Keystroke) {
+        if ks.key == "backspace" {
+            self.text.pop();
+        } else if let Some(ch) = ks.key_char.as_deref() {
+            self.text.push_str(&single_line(ch));
+        }
+    }
+}
+
 struct Prompt {
     label: SharedString,
-    text: String,
+    text: TextField,
     error: Option<String>,
     submit: SubmitFn,
     /// Waiting for the submitted command's result.
@@ -55,7 +90,7 @@ enum Mode {
 struct List {
     rows: Vec<PaletteRow>,
     placeholder: SharedString,
-    query: String,
+    query: TextField,
     /// Indices of the rows matching `query`, refreshed on every edit.
     matches: Vec<usize>,
     /// Index into `matches`.
@@ -64,7 +99,7 @@ struct List {
 
 impl List {
     fn refilter(&mut self) {
-        self.matches = filter(&self.query, self.rows.iter().map(|r| r.label.as_ref()));
+        self.matches = filter(&self.query.text, self.rows.iter().map(|r| r.label.as_ref()));
         self.selected = 0;
     }
 }
@@ -119,14 +154,14 @@ pub fn ready(result: Result<(), String>) -> oneshot::Receiver<Result<(), String>
 impl Palette {
     pub fn list(rows: Vec<PaletteRow>, placeholder: impl Into<SharedString>, theme: Theme, cx: &mut Context<Self>) -> Self {
         let matches = (0..rows.len()).collect();
-        let list = List { rows, placeholder: placeholder.into(), query: String::new(), matches, selected: 0 };
+        let list = List { rows, placeholder: placeholder.into(), query: TextField::default(), matches, selected: 0 };
         Self { focus_handle: cx.focus_handle(), scroll: ScrollHandle::new(), mode: Mode::List(list), theme }
     }
 
     pub fn prompt(request: PromptRequest, theme: Theme, cx: &mut Context<Self>) -> Self {
         let prompt = Prompt {
             label: request.label,
-            text: single_line(&request.initial),
+            text: TextField::new(&request.initial),
             error: None,
             submit: request.submit,
             running: None,
@@ -138,7 +173,7 @@ impl Palette {
     pub fn describe(&self) -> String {
         match &self.mode {
             Mode::List(list) => {
-                let mut out = format!("--- palette list query={:?}\n", list.query);
+                let mut out = format!("--- palette list query={:?}\n", list.query.text);
                 for &ix in &list.matches {
                     let row = &list.rows[ix];
                     out.push_str(&format!("{}", row.label));
@@ -152,7 +187,7 @@ impl Palette {
             Mode::Prompt(p) => format!(
                 "--- palette prompt {:?} text={:?} error={:?} running={}\n",
                 p.label,
-                p.text,
+                p.text.text,
                 p.error,
                 p.running.is_some()
             ),
@@ -190,7 +225,7 @@ impl Palette {
                     return;
                 }
                 prompt.error = None;
-                let result = (prompt.submit)(prompt.text.clone(), cx);
+                let result = (prompt.submit)(prompt.text.text.clone(), cx);
                 prompt.running = Some(cx.spawn(async move |this, cx| {
                     let result = result.await;
                     this.update(cx, |this, cx| {
@@ -218,12 +253,12 @@ impl Palette {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit(|s| s.push_str(&single_line(&text)), cx);
+            self.edit(|field| field.paste(&text), cx);
         }
     }
 
     /// Applies an edit to the query or prompt text.
-    fn edit(&mut self, f: impl FnOnce(&mut String), cx: &mut Context<Self>) {
+    fn edit(&mut self, f: impl FnOnce(&mut TextField), cx: &mut Context<Self>) {
         match &mut self.mode {
             Mode::List(list) => {
                 f(&mut list.query);
@@ -243,17 +278,10 @@ impl Palette {
 
     fn key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let ks = &e.keystroke;
-        if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
+        if !TextField::is_edit_key(ks) {
             return;
         }
-        if ks.key == "backspace" {
-            self.edit(|s| _ = s.pop(), cx);
-        } else if let Some(ch) = ks.key_char.as_deref() {
-            let ch = single_line(ch);
-            self.edit(|s| s.push_str(&ch), cx);
-        } else {
-            return;
-        }
+        self.edit(|field| field.apply_key(ks), cx);
         cx.stop_propagation();
     }
 
@@ -295,7 +323,7 @@ impl Palette {
                 })
         });
 
-        let query = &list.query;
+        let query = &list.query.text;
         let header: SharedString = if query.is_empty() { list.placeholder.clone() } else { query.clone().into() };
         div()
             .flex()
@@ -341,7 +369,7 @@ impl Palette {
                 div()
                     .flex()
                     .text_color(t.foreground.hsla())
-                    .child(SharedString::from(prompt.text.clone()))
+                    .child(SharedString::from(prompt.text.text.clone()))
                     .child(div().w(px(1.5)).h(px(16.0)).bg(t.accent().hsla())),
             )
             .when(prompt.running.is_some(), |d| d.child(div().text_xs().text_color(muted).child("Running…")))
@@ -406,6 +434,21 @@ mod tests {
         assert_eq!(filter("c", labels), vec![0, 1, 2]);
         assert_eq!(filter("clrsc", labels), vec![1]);
         assert!(filter("zzz", labels).is_empty());
+    }
+
+    #[test]
+    fn text_field_edits() {
+        let key = |s: &str| Keystroke::parse(s).unwrap();
+        let mut field = TextField::new("a\nb");
+        assert_eq!(field.text, "a b");
+        field.paste("c\r\nd");
+        assert_eq!(field.text, "a bc d");
+        assert!(TextField::is_edit_key(&key("backspace")));
+        field.apply_key(&key("backspace"));
+        assert_eq!(field.text, "a bc ");
+        for k in ["enter", "tab", "escape", "ctrl-a", "up"] {
+            assert!(!TextField::is_edit_key(&key(k)), "{k}");
+        }
     }
 
     #[test]
