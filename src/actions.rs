@@ -73,6 +73,25 @@ actions!(
         SettingsNew,
         SettingsEdit,
         SettingsDelete,
+        // Text inputs.
+        TextInputLeft,
+        TextInputRight,
+        TextInputWordLeft,
+        TextInputWordRight,
+        TextInputHome,
+        TextInputEnd,
+        TextInputSelectLeft,
+        TextInputSelectRight,
+        TextInputSelectWordLeft,
+        TextInputSelectWordRight,
+        TextInputSelectHome,
+        TextInputSelectEnd,
+        TextInputBackspace,
+        TextInputDelete,
+        TextInputDeleteWordBack,
+        TextInputCopy,
+        TextInputCut,
+        TextInputPaste,
     ]
 );
 
@@ -150,6 +169,29 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("settings_new", None, || Box::new(SettingsNew)),
     ("settings_edit", None, || Box::new(SettingsEdit)),
     ("settings_delete", None, || Box::new(SettingsDelete)),
+    // Palette navigation and text editing, for `--action` and user bindings.
+    ("picker_up", None, || Box::new(PickerUp)),
+    ("picker_down", None, || Box::new(PickerDown)),
+    ("picker_confirm", None, || Box::new(PickerConfirm)),
+    ("picker_cancel", None, || Box::new(PickerCancel)),
+    ("text_input_left", None, || Box::new(TextInputLeft)),
+    ("text_input_right", None, || Box::new(TextInputRight)),
+    ("text_input_word_left", None, || Box::new(TextInputWordLeft)),
+    ("text_input_word_right", None, || Box::new(TextInputWordRight)),
+    ("text_input_home", None, || Box::new(TextInputHome)),
+    ("text_input_end", None, || Box::new(TextInputEnd)),
+    ("text_input_select_left", None, || Box::new(TextInputSelectLeft)),
+    ("text_input_select_right", None, || Box::new(TextInputSelectRight)),
+    ("text_input_select_word_left", None, || Box::new(TextInputSelectWordLeft)),
+    ("text_input_select_word_right", None, || Box::new(TextInputSelectWordRight)),
+    ("text_input_select_home", None, || Box::new(TextInputSelectHome)),
+    ("text_input_select_end", None, || Box::new(TextInputSelectEnd)),
+    ("text_input_backspace", None, || Box::new(TextInputBackspace)),
+    ("text_input_delete", None, || Box::new(TextInputDelete)),
+    ("text_input_delete_word_back", None, || Box::new(TextInputDeleteWordBack)),
+    ("text_input_copy", None, || Box::new(TextInputCopy)),
+    ("text_input_cut", None, || Box::new(TextInputCut)),
+    ("text_input_paste", None, || Box::new(TextInputPaste)),
     ("none", None, || Box::new(NoAction)),
 ];
 
@@ -194,6 +236,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let p = Some("Palette");
     let x = Some("TmuxWindow");
     let s = Some("SettingsDialog");
+    let i = Some("TextInput");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -250,8 +293,6 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-n", PickerDown, p),
         KeyBinding::new("enter", PickerConfirm, p),
         KeyBinding::new("escape", PickerCancel, p),
-        KeyBinding::new("ctrl-shift-v", Paste, p),
-        KeyBinding::new("shift-insert", Paste, p),
         KeyBinding::new("up", SettingsUp, s),
         KeyBinding::new("down", SettingsDown, s),
         KeyBinding::new("ctrl-p", SettingsUp, s),
@@ -260,8 +301,37 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", SettingsCancel, s),
         KeyBinding::new("tab", SettingsNextField, s),
         KeyBinding::new("shift-tab", SettingsPrevField, s),
-        KeyBinding::new("ctrl-shift-v", Paste, s),
-        KeyBinding::new("shift-insert", Paste, s),
+        // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
+        // to the palette or dialog around them.
+        KeyBinding::new("left", TextInputLeft, i),
+        KeyBinding::new("right", TextInputRight, i),
+        KeyBinding::new("ctrl-left", TextInputWordLeft, i),
+        KeyBinding::new("ctrl-right", TextInputWordRight, i),
+        KeyBinding::new("home", TextInputHome, i),
+        KeyBinding::new("ctrl-a", TextInputHome, i),
+        KeyBinding::new("end", TextInputEnd, i),
+        KeyBinding::new("ctrl-e", TextInputEnd, i),
+        KeyBinding::new("shift-left", TextInputSelectLeft, i),
+        KeyBinding::new("shift-right", TextInputSelectRight, i),
+        KeyBinding::new("ctrl-shift-left", TextInputSelectWordLeft, i),
+        KeyBinding::new("ctrl-shift-right", TextInputSelectWordRight, i),
+        KeyBinding::new("shift-home", TextInputSelectHome, i),
+        KeyBinding::new("ctrl-shift-a", TextInputSelectHome, i),
+        KeyBinding::new("shift-end", TextInputSelectEnd, i),
+        KeyBinding::new("ctrl-shift-e", TextInputSelectEnd, i),
+        KeyBinding::new("backspace", TextInputBackspace, i),
+        KeyBinding::new("shift-backspace", TextInputBackspace, i),
+        KeyBinding::new("delete", TextInputDelete, i),
+        KeyBinding::new("ctrl-backspace", TextInputDeleteWordBack, i),
+        KeyBinding::new("ctrl-w", TextInputDeleteWordBack, i),
+        KeyBinding::new("ctrl-insert", TextInputCopy, i),
+        KeyBinding::new("ctrl-shift-c", TextInputCopy, i),
+        KeyBinding::new("ctrl-c", TextInputCopy, i),
+        KeyBinding::new("shift-delete", TextInputCut, i),
+        KeyBinding::new("ctrl-x", TextInputCut, i),
+        KeyBinding::new("shift-insert", TextInputPaste, i),
+        KeyBinding::new("ctrl-shift-v", TextInputPaste, i),
+        KeyBinding::new("ctrl-v", TextInputPaste, i),
     ];
     for n in 1..=9 {
         let index = if n == 9 { usize::MAX } else { n - 1 };

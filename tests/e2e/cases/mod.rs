@@ -3,6 +3,7 @@
 mod colors;
 mod dump;
 mod geometry;
+mod input;
 mod settings;
 mod styles;
 mod titles;
@@ -47,6 +48,10 @@ pub fn all() -> Vec<Case> {
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
+        display("input-palette", input::palette),
+        display("input-palette-run", input::palette_run),
+        display("input-settings-tab", input::settings_tab),
+        display("input-prompt-preselected", input::prompt_preselected),
     ]
 }
 

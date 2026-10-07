@@ -537,7 +537,7 @@ impl TmuxSession {
     /// if any; output is discarded. New windows and panes start in the current
     /// pane's directory unless the line says otherwise.
     pub fn run_user_command(&mut self, line: &str) -> oneshot::Receiver<Result<(), String>> {
-        let line = crate::picker::single_line(line);
+        let line = crate::text_input::single_line(line);
         if line.trim().is_empty() {
             return crate::picker::ready(Err("Type a tmux command".into()));
         }

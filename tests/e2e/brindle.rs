@@ -274,6 +274,27 @@ pub struct Dump {
     pub screen: Vec<String>,
     /// The settings dialog's line, when it is open.
     pub settings: Option<String>,
+    /// The palette's lines (its header first), when it is open.
+    pub palette: Vec<String>,
+    /// The focused text input, in a palette or the settings dialog.
+    pub input: Option<Input>,
+}
+
+/// `--- input text="split" cursor=4 selection=4..4`
+#[derive(Debug, PartialEq)]
+pub struct Input {
+    pub text: String,
+    pub cursor: usize,
+    pub selection: (usize, usize),
+}
+
+fn parse_input(rest: &str) -> Option<Input> {
+    let (text, fields) = rest.strip_prefix("text=")?.rsplit_once(" cursor=")?;
+    let (cursor, selection) = fields.split_once(" selection=")?;
+    let (start, end) = selection.split_once("..")?;
+    // The text is Rust-debug quoted; tests use plain ASCII without escapes.
+    let text = text.strip_prefix('"')?.strip_suffix('"')?.replace("\\\"", "\"");
+    Some(Input { text, cursor: cursor.parse().ok()?, selection: (start.parse().ok()?, end.parse().ok()?) })
 }
 
 impl Dump {
@@ -296,6 +317,14 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- palette ") {
+                dump.palette.push(rest.to_string());
+                in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- input ") {
+                dump.input = parse_input(rest);
+                in_screen = false;
+            } else if !dump.palette.is_empty() && dump.input.is_none() && !in_screen {
+                dump.palette.push(line.to_string());
             } else if in_screen {
                 screen.push(line);
             }
@@ -357,6 +386,14 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- palette list query=\"splt\"\ntmux: Split Right  [ctrl-shift-e]\n\
+         --- input text=\"split\" cursor=4 selection=1..4\n",
+    );
+    ensure!(dump.screen == ["hi"], "screen before the palette {:?}", dump.screen);
+    ensure!(dump.palette == ["list query=\"splt\"", "tmux: Split Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
+    let input = Input { text: "split".into(), cursor: 4, selection: (1, 4) };
+    ensure!(dump.input == Some(input), "input {:?}", dump.input);
     ensure!(Dump::parse("nothing").size.is_none(), "size from nothing");
     Ok(())
 }

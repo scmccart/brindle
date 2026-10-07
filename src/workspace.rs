@@ -14,6 +14,7 @@ use gpui::{
 use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
+use crate::text_input::TextInput;
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::{Terminal, TerminalEvent};
@@ -796,8 +797,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Debug hook for `--send`: types into the active tab.
-    pub fn send_to_active(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    /// The overlay's text input that has keyboard focus, if any.
+    fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
+        match &self.overlay {
+            Some(Overlay::Palette(open)) => {
+                let input = open.palette.read(cx).input();
+                input.read(cx).is_focused(window).then(|| input.clone())
+            }
+            Some(Overlay::Settings { dialog, .. }) => dialog.read(cx).focused_input(window, cx),
+            None => None,
+        }
+    }
+
+    /// Debug hook for `--send`: types into the focused text input, or else
+    /// the active tab.
+    pub fn send_to_active(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.focused_input(window, cx) {
+            let text: String = String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect();
+            input.update(cx, |input, cx| input.insert(&text, cx));
+            return;
+        }
         if let Some(terminal) = self.tabs.get(self.active).and_then(|t| t.active_terminal(cx)) {
             let bytes = bytes.to_vec();
             terminal.update(cx, |t, cx| t.input(bytes, cx));
@@ -805,7 +824,8 @@ impl Workspace {
     }
 
     /// Debug hook for `--dump-screen-after`.
-    pub fn dump_active_screen(&self, scale: f32, cx: &App) -> String {
+    pub fn dump_active_screen(&self, window: &Window, cx: &App) -> String {
+        let scale = window.scale_factor();
         let mut out = String::new();
         for (ix, tab) in self.tabs.iter().enumerate() {
             out.push_str(&format!(
@@ -825,9 +845,12 @@ impl Workspace {
             out.push_str(&terminal.screen_text());
         }
         match &self.overlay {
-            Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe()),
+            Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe(cx)),
             Some(Overlay::Settings { dialog, .. }) => out.push_str(&dialog.read(cx).describe()),
             None => {}
+        }
+        if let Some(input) = self.focused_input(window, cx) {
+            out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
         }
         out
     }
