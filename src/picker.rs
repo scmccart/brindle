@@ -6,12 +6,13 @@ use std::rc::Rc;
 
 use futures::channel::oneshot;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, div, px,
+    App, AppContext as _, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, Window, div, px,
 };
 
-use crate::actions::{Paste, PickerCancel, PickerConfirm, PickerDown, PickerUp};
+use crate::actions::{PickerCancel, PickerConfirm, PickerDown, PickerUp};
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 pub enum PaletteEvent {
@@ -38,44 +39,9 @@ pub struct PromptRequest {
     pub submit: SubmitFn,
 }
 
-/// One line of editable text: typing appends, backspace deletes the last
-/// character, and pasted line breaks become spaces. Shared by the palettes
-/// and the settings dialog; there is no cursor movement within the text.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TextField {
-    pub text: String,
-}
-
-impl TextField {
-    pub fn new(text: &str) -> Self {
-        Self { text: single_line(text) }
-    }
-
-    pub fn paste(&mut self, text: &str) {
-        self.text.push_str(&single_line(text));
-    }
-
-    /// Whether `ks` edits text (as opposed to being a shortcut or a
-    /// navigation key that a keybinding handles).
-    pub fn is_edit_key(ks: &Keystroke) -> bool {
-        !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform)
-            && !matches!(ks.key.as_str(), "enter" | "tab" | "escape")
-            && (ks.key == "backspace" || ks.key_char.is_some())
-    }
-
-    /// Applies an edit key (see [`Self::is_edit_key`]).
-    pub fn apply_key(&mut self, ks: &Keystroke) {
-        if ks.key == "backspace" {
-            self.text.pop();
-        } else if let Some(ch) = ks.key_char.as_deref() {
-            self.text.push_str(&single_line(ch));
-        }
-    }
-}
-
 struct Prompt {
     label: SharedString,
-    text: TextField,
+    input: Entity<TextInput>,
     error: Option<String>,
     submit: SubmitFn,
     /// Waiting for the submitted command's result.
@@ -89,8 +55,7 @@ enum Mode {
 
 struct List {
     rows: Vec<PaletteRow>,
-    placeholder: SharedString,
-    query: TextField,
+    query: Entity<TextInput>,
     /// Indices of the rows matching `query`, refreshed on every edit.
     matches: Vec<usize>,
     /// Index into `matches`.
@@ -98,24 +63,25 @@ struct List {
 }
 
 impl List {
-    fn refilter(&mut self) {
-        self.matches = filter(&self.query.text, self.rows.iter().map(|r| r.label.as_ref()));
+    fn refilter(&mut self, cx: &App) {
+        self.matches = filter(self.query.read(cx).text(), self.rows.iter().map(|r| r.label.as_ref()));
         self.selected = 0;
     }
 }
 
 pub struct Palette {
-    focus_handle: FocusHandle,
     scroll: ScrollHandle,
     mode: Mode,
     theme: Theme,
+    _input_subscription: Subscription,
 }
 
 impl EventEmitter<PaletteEvent> for Palette {}
 
+/// Focus goes to the text input; the palette's actions bubble up from it.
 impl Focusable for Palette {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input().focus_handle(cx)
     }
 }
 
@@ -139,11 +105,6 @@ pub fn filter<'a>(query: &str, labels: impl IntoIterator<Item = &'a str>) -> Vec
         .collect()
 }
 
-/// Prompt text is a single line: line breaks become spaces.
-pub fn single_line(text: &str) -> String {
-    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
-}
-
 /// A prompt result that is already known.
 pub fn ready(result: Result<(), String>) -> oneshot::Receiver<Result<(), String>> {
     let (tx, rx) = oneshot::channel();
@@ -154,26 +115,49 @@ pub fn ready(result: Result<(), String>) -> oneshot::Receiver<Result<(), String>
 impl Palette {
     pub fn list(rows: Vec<PaletteRow>, placeholder: impl Into<SharedString>, theme: Theme, cx: &mut Context<Self>) -> Self {
         let matches = (0..rows.len()).collect();
-        let list = List { rows, placeholder: placeholder.into(), query: TextField::default(), matches, selected: 0 };
-        Self { focus_handle: cx.focus_handle(), scroll: ScrollHandle::new(), mode: Mode::List(list), theme }
+        let placeholder = placeholder.into();
+        let query = cx.new(|cx| TextInput::new("", cx).with_placeholder(placeholder));
+        let subscription = cx.subscribe(&query, |this, _, _: &TextInputEvent, cx| {
+            if let Mode::List(list) = &mut this.mode {
+                list.refilter(cx);
+                this.scroll.scroll_to_item(0);
+                cx.notify();
+            }
+        });
+        let list = List { rows, query, matches, selected: 0 };
+        Self { scroll: ScrollHandle::new(), mode: Mode::List(list), theme, _input_subscription: subscription }
     }
 
     pub fn prompt(request: PromptRequest, theme: Theme, cx: &mut Context<Self>) -> Self {
-        let prompt = Prompt {
-            label: request.label,
-            text: TextField::new(&request.initial),
-            error: None,
-            submit: request.submit,
-            running: None,
-        };
-        Self { focus_handle: cx.focus_handle(), scroll: ScrollHandle::new(), mode: Mode::Prompt(prompt), theme }
+        // The pre-filled value is selected, so typing replaces it.
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(&request.initial, cx);
+            input.select_all(cx);
+            input
+        });
+        let subscription = cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
+            if let Mode::Prompt(prompt) = &mut this.mode {
+                prompt.error = None;
+                cx.notify();
+            }
+        });
+        let prompt = Prompt { label: request.label, input, error: None, submit: request.submit, running: None };
+        Self { scroll: ScrollHandle::new(), mode: Mode::Prompt(prompt), theme, _input_subscription: subscription }
+    }
+
+    /// The filter or prompt input.
+    pub fn input(&self) -> &Entity<TextInput> {
+        match &self.mode {
+            Mode::List(list) => &list.query,
+            Mode::Prompt(prompt) => &prompt.input,
+        }
     }
 
     /// Debug description for `--dump-screen-after`.
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, cx: &App) -> String {
         match &self.mode {
             Mode::List(list) => {
-                let mut out = format!("--- palette list query={:?}\n", list.query.text);
+                let mut out = format!("--- palette list query={:?}\n", list.query.read(cx).text());
                 for &ix in &list.matches {
                     let row = &list.rows[ix];
                     out.push_str(&format!("{}", row.label));
@@ -187,7 +171,7 @@ impl Palette {
             Mode::Prompt(p) => format!(
                 "--- palette prompt {:?} text={:?} error={:?} running={}\n",
                 p.label,
-                p.text.text,
+                p.input.read(cx).text(),
                 p.error,
                 p.running.is_some()
             ),
@@ -225,7 +209,8 @@ impl Palette {
                     return;
                 }
                 prompt.error = None;
-                let result = (prompt.submit)(prompt.text.text.clone(), cx);
+                let text = prompt.input.read(cx).text().to_string();
+                let result = (prompt.submit)(text, cx);
                 prompt.running = Some(cx.spawn(async move |this, cx| {
                     let result = result.await;
                     this.update(cx, |this, cx| {
@@ -249,40 +234,6 @@ impl Palette {
 
     fn cancel(&mut self, _: &PickerCancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PaletteEvent::Dismissed);
-    }
-
-    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit(|field| field.paste(&text), cx);
-        }
-    }
-
-    /// Applies an edit to the query or prompt text.
-    fn edit(&mut self, f: impl FnOnce(&mut TextField), cx: &mut Context<Self>) {
-        match &mut self.mode {
-            Mode::List(list) => {
-                f(&mut list.query);
-                list.refilter();
-                self.scroll.scroll_to_item(0);
-            }
-            Mode::Prompt(prompt) => {
-                if prompt.running.is_some() {
-                    return;
-                }
-                f(&mut prompt.text);
-                prompt.error = None;
-            }
-        }
-        cx.notify();
-    }
-
-    fn key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let ks = &e.keystroke;
-        if !TextField::is_edit_key(ks) {
-            return;
-        }
-        self.edit(|field| field.apply_key(ks), cx);
-        cx.stop_propagation();
     }
 
     fn render_list(&self, list: &List, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -323,8 +274,6 @@ impl Palette {
                 })
         });
 
-        let query = &list.query.text;
-        let header: SharedString = if query.is_empty() { list.placeholder.clone() } else { query.clone().into() };
         div()
             .flex()
             .flex_col()
@@ -336,8 +285,8 @@ impl Palette {
                     .mb_1()
                     .border_b_1()
                     .border_color(t.chrome_border().hsla())
-                    .text_color(if query.is_empty() { muted } else { fg })
-                    .child(header),
+                    .text_color(fg)
+                    .child(list.query.clone()),
             )
             .child(
                 div()
@@ -365,13 +314,7 @@ impl Palette {
             .px_3()
             .py_2()
             .child(div().text_xs().text_color(muted).child(prompt.label.clone()))
-            .child(
-                div()
-                    .flex()
-                    .text_color(t.foreground.hsla())
-                    .child(SharedString::from(prompt.text.text.clone()))
-                    .child(div().w(px(1.5)).h(px(16.0)).bg(t.accent().hsla())),
-            )
+            .child(div().flex().text_color(t.foreground.hsla()).child(prompt.input.clone()))
             .when(prompt.running.is_some(), |d| d.child(div().text_xs().text_color(muted).child("Running…")))
             .when_some(prompt.error.clone(), |d, error| {
                 d.child(div().text_xs().text_color(t.ansi[1].hsla()).child(SharedString::from(error)))
@@ -389,15 +332,16 @@ impl Render for Palette {
         let t = &self.theme;
         div()
             .key_context("Palette")
-            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::paste))
-            .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismissed)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Hide the terminal behind from the mouse, so its I-beam cursor
+            // doesn't show over the palette.
+            .occlude()
+            .cursor(CursorStyle::Arrow)
             .w(px(460.0))
             .flex()
             .flex_col()
@@ -434,26 +378,5 @@ mod tests {
         assert_eq!(filter("c", labels), vec![0, 1, 2]);
         assert_eq!(filter("clrsc", labels), vec![1]);
         assert!(filter("zzz", labels).is_empty());
-    }
-
-    #[test]
-    fn text_field_edits() {
-        let key = |s: &str| Keystroke::parse(s).unwrap();
-        let mut field = TextField::new("a\nb");
-        assert_eq!(field.text, "a b");
-        field.paste("c\r\nd");
-        assert_eq!(field.text, "a bc d");
-        assert!(TextField::is_edit_key(&key("backspace")));
-        field.apply_key(&key("backspace"));
-        assert_eq!(field.text, "a bc ");
-        for k in ["enter", "tab", "escape", "ctrl-a", "up"] {
-            assert!(!TextField::is_edit_key(&key(k)), "{k}");
-        }
-    }
-
-    #[test]
-    fn prompt_text_is_one_line() {
-        assert_eq!(single_line("a\nb\r\nc\rd"), "a b c d");
-        assert_eq!(single_line("plain"), "plain");
     }
 }

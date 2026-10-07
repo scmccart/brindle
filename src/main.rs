@@ -8,6 +8,7 @@ mod settings_dialog;
 mod terminal;
 mod terminal_element;
 mod terminal_view;
+mod text_input;
 mod theme;
 mod tmux;
 mod tmux_view;
@@ -48,7 +49,8 @@ OPTIONS:
     -V, --version                Print version
 
 DEBUGGING:
-        --send <TEXT>            Type TEXT into the active tab (\\r = Enter)
+        --send <TEXT>            Type TEXT into the focused text field, else
+                                 the active tab (\\r = Enter)
         --action <NAME>          Run an action (see --list-actions)
                                  --send/--action steps run in order, 1s apart
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
@@ -265,7 +267,7 @@ fn main() {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 window
                     .update(cx, |ws, window, cx| match &step {
-                        Step::Send(text) => ws.send_to_active(text.as_bytes(), cx),
+                        Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
                         Step::Action(name) => match actions::action_by_name(name) {
                             Some(action) => window.dispatch_action(action, cx),
                             None => log::error!("--action: unknown action {name:?}"),
@@ -280,7 +282,7 @@ fn main() {
                 cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
                 window
                     .update(cx, |ws, window, cx| {
-                        print!("{}", ws.dump_active_screen(window.scale_factor(), cx));
+                        print!("{}", ws.dump_active_screen(window, cx));
                     })
                     .ok();
                 cx.update(|cx| cx.quit()).ok();

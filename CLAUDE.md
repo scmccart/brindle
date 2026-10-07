@@ -29,8 +29,8 @@ BRINDLE_CONFIG=/tmp/test-config.toml ./target/release/brindle -p tmux \
   --send 'echo hi\r' --action tmux_split_right --dump-screen-after 5
 ```
 
-- `--send` and `--action` steps run in order, one second apart, against the active tab. Action names are listed by `--list-actions`.
-- `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, its grid geometry (`--- grid origin=X,Y cell=WxH scale=S`, logical window pixels), and its screen text, then exits.
+- `--send` and `--action` steps run in order, one second apart, against the active tab. Action names are listed by `--list-actions`. While a palette or the settings dialog has a text input focused, `--send` types into that input (control characters dropped) instead of the terminal; use `--action` (`picker_confirm`, `text_input_left`, …) for keys.
+- `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, its grid geometry (`--- grid origin=X,Y cell=WxH scale=S`, logical window pixels), and its screen text, then exits. An open overlay adds its `--- palette` or `--- settings` line, and a focused text input adds `--- input text=… cursor=N selection=A..B`.
 - For pixels, run under Xwayland (`env -u WAYLAND_DISPLAY DISPLAY=:0`) and grab the window with x11rb `GetImage` (`tests/e2e/capture.rs`).
 - For tmux tests, use a throwaway server (profile `tmux_args = ["-L", "brindle-e2e", "-f", "/dev/null"]`), never the user's default server or `main` session, and kill it afterwards.
 
@@ -71,11 +71,15 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - Removing the last tab closes the window, and closing the last window quits.
 - **`settings.rs`** — a GPUI global holding the `Config`, the resolved font (built once) and the zoom level. Live reload (`main.rs` polls the file mtime) rebuilds it, rebinds keys, and calls `Workspace::apply_config`.
 - **`desktop.rs`** — `--install-desktop` / `--uninstall-desktop` register Brindle with freedesktop launchers. They write `brindle.desktop` (its `Exec` is the running binary's absolute path) and the embedded `assets/brindle.svg` icon, and they run in `main` before GPUI starts, so no display is needed. `scripts/install.sh` delegates to them. Linux icons come only from the desktop entry and the icon theme, matched through the `brindle` app_id. The icon cache is refreshed only where one already exists.
-- **`actions.rs`** — one `ACTIONS` table drives config-name lookup, `--list-actions` and the command palette (an entry's label puts it in the palette). Default bindings use the key contexts `Workspace`, `Terminal`, `TmuxWindow` and `Palette`. User bindings go in the `Terminal` context, so they win over the defaults.
+- **`actions.rs`** — one `ACTIONS` table drives config-name lookup, `--list-actions` and the command palette (an entry's label puts it in the palette). Default bindings use the key contexts `Workspace`, `Terminal`, `TmuxWindow`, `Palette`, `SettingsDialog` and `TextInput`. User bindings go in the `Terminal` context, so they win over the defaults.
   - tmux actions (detach included) are handled only in `TmuxWindow`. ctrl-shift-d is also bound to the hidden `Swallow` action in `Workspace`, so outside tmux tabs it never reaches a shell as `^D`.
 - **`picker.rs`** — `Palette`, the overlay list behind both the new-tab palette (profiles) and the command palette, plus a one-line prompt mode.
   - The command palette lists the labelled actions available from the tab that had focus, snapshotted before the palette takes focus. It needs both `available_actions` (for global listeners) and `is_action_available` (for `no_json` actions). Running a command refocuses the tab and calls `window.dispatch_action`, so it takes the keybinding's path.
   - Prompted commands (`TmuxRenameWindow`, `TmuxCommand`) are ordinary actions. Their handlers emit a prompt request that `Workspace` opens, so a keybinding and the palette behave the same.
+  - The filter and the prompt are `TextInput`s, and the palette's focus is the input's, so the palette's actions bubble up from it.
+- **`text_input.rs`** — the single-line `TextInput` used by every overlay text field. `EditState` (text, selection, IME composition, UTF-16 offsets) is pure and unit-tested; the entity adds focus, the `TextInput` key context, mouse, clipboard and `EntityInputHandler`, so typed text and IME arrive through the platform input handler as in terminals.
+  - The `TextInput` context binds no enter, escape, tab, up/down or ctrl-p/ctrl-n, so those reach the `Palette` and `SettingsDialog` contexts around it.
+  - Owners keep plain strings: they subscribe to `TextInputEvent::Changed` and call `set_text` (which emits nothing) for their own changes. The settings dialog's inputs are tab stops, and tab moves real focus with `Window::focus_next`.
 - **`tmux/`** — control mode over plain pipes (`tmux -C`, not `-CC`):
   - **Framing (`protocol.rs`):** `Collector` groups output into `%begin…%end/%error` responses and notifications. Responses to our commands (flags bit 0) are matched FIFO against `Io.pending`, because the `%begin` number is tmux's global counter, not a request id.
   - **Windows:** `%window-add` carries no layout and isn't followed by `%layout-change`, so window state always comes from a full `list-windows`. Its `#{pane_id}` is each window's active pane; it only fills in panes we don't know yet, and `%window-pane-changed` is authoritative after that.

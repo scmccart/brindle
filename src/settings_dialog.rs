@@ -11,17 +11,17 @@ use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    AnyElement, App, AppContext as _, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 
 use crate::actions::{
-    Paste, SettingsCancel, SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit, SettingsNew, SettingsNextField,
+    SettingsCancel, SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit, SettingsNew, SettingsNextField,
     SettingsPrevField, SettingsUp,
 };
 use crate::config_edit;
-use crate::picker::TextField;
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 const SECTIONS: &[&str] = &["Theme"];
@@ -150,9 +150,9 @@ struct Editor {
     original: Option<String>,
     /// List selection to go back to on discard.
     return_to: usize,
-    name: TextField,
+    name: String,
     /// One field per [`SLOTS`] entry.
-    colors: Vec<TextField>,
+    colors: Vec<String>,
     /// 0 is the name; `n` is `colors[n - 1]`.
     focused: usize,
     /// The theme as of the last valid edit of every field.
@@ -166,14 +166,14 @@ impl Editor {
         let current = theme.with_effective_colors();
         let colors = SLOTS
             .iter()
-            .map(|slot| TextField::new(&slot.get(&current).map(|c| c.to_string()).unwrap_or_default()))
+            .map(|slot| slot.get(&current).map(|c| c.to_string()).unwrap_or_default())
             .collect();
-        Self { original, return_to, name: TextField::new(&name), colors, focused: 0, current }
+        Self { original, return_to, name, colors, focused: 0, current }
     }
 
     /// Parses color field `ix`: `Ok(None)` is a cleared optional color.
     fn parse_color(&self, ix: usize) -> Result<Option<Color>, &'static str> {
-        let text = self.colors[ix].text.trim();
+        let text = self.colors[ix].trim();
         if text.is_empty() && SLOTS[ix].optional() {
             return Ok(None);
         }
@@ -185,21 +185,29 @@ impl Editor {
     }
 
     fn name_result(&self, others: &[&str]) -> Result<String, String> {
-        config_edit::validate_theme_name(&self.name.text, others.iter().copied())
+        config_edit::validate_theme_name(&self.name, others.iter().copied())
     }
 
-    /// Applies `f` to the focused field and updates the preview theme if the
-    /// field now holds a valid color.
-    fn edit_focused(&mut self, f: impl FnOnce(&mut TextField)) {
-        match self.focused {
-            0 => f(&mut self.name),
-            n => {
+    /// Sets field `field` (0 is the name) and updates the preview theme if
+    /// it now holds a valid color.
+    fn set_field(&mut self, field: usize, text: &str) {
+        match field {
+            0 => self.name = text.to_string(),
+            n if n < FIELD_COUNT => {
                 let ix = n - 1;
-                f(&mut self.colors[ix]);
+                self.colors[ix] = text.to_string();
                 if let Ok(color) = self.parse_color(ix) {
                     SLOTS[ix].set(&mut self.current, color);
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn field(&self, field: usize) -> &str {
+        match field {
+            0 => &self.name,
+            n => &self.colors[n - 1],
         }
     }
 
@@ -477,17 +485,10 @@ impl Model {
         Outcome::Written
     }
 
-    /// Typing in the editor's focused field, or list shortcuts.
+    /// List shortcuts. In the editor, keys belong to the text inputs.
     pub fn key(&mut self, ks: &Keystroke) -> bool {
         match &mut self.mode {
-            Mode::Editor(editor) => {
-                if !TextField::is_edit_key(ks) {
-                    return false;
-                }
-                editor.edit_focused(|f| f.apply_key(ks));
-                self.error = None;
-                true
-            }
+            Mode::Editor(_) => false,
             Mode::List if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform => false,
             Mode::List => {
                 match ks.key.as_str() {
@@ -502,9 +503,24 @@ impl Model {
         }
     }
 
-    pub fn paste(&mut self, text: &str) {
+    /// A field's text changed in its input.
+    pub fn set_field(&mut self, field: usize, text: &str) {
         if let Mode::Editor(editor) = &mut self.mode {
-            editor.edit_focused(|f| f.paste(text));
+            editor.set_field(field, text);
+            self.error = None;
+        }
+    }
+
+    /// The editor's field texts (name first), when editing.
+    pub fn editor_fields(&self) -> Option<Vec<String>> {
+        let Mode::Editor(editor) = &self.mode else { return None };
+        Some((0..FIELD_COUNT).map(|field| editor.field(field).to_string()).collect())
+    }
+
+    pub fn focused_field(&self) -> Option<usize> {
+        match &self.mode {
+            Mode::Editor(editor) => Some(editor.focused),
+            _ => None,
         }
     }
 
@@ -514,12 +530,13 @@ impl Model {
         }
     }
 
-    pub fn clear_selection_foreground(&mut self) {
-        if let Mode::Editor(editor) = &mut self.mode {
-            let ix = SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap();
-            editor.focused = ix + 1;
-            editor.edit_focused(|f| f.text.clear());
-        }
+    /// Clears the selection foreground; returns its field.
+    pub fn clear_selection_foreground(&mut self) -> Option<usize> {
+        let Mode::Editor(editor) = &mut self.mode else { return None };
+        let field = SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1;
+        editor.focused = field;
+        editor.set_field(field, "");
+        Some(field)
     }
 
     pub fn in_list(&self) -> bool {
@@ -538,7 +555,7 @@ impl Model {
             ),
             Mode::Editor(editor) => format!(
                 "--- settings section={section} mode=editor name={:?} field={:?} invalid={:?} can_save={} error={:?}\n",
-                editor.name.text,
+                editor.name,
                 editor.focused_label(),
                 editor.invalid_colors().iter().map(|&ix| SLOTS[ix].label()).collect::<Vec<_>>(),
                 self.editor_can_save(),
@@ -570,6 +587,9 @@ pub struct SettingsDialog {
     theme: Theme,
     list_scroll: ScrollHandle,
     editor_scroll: ScrollHandle,
+    /// The editor's inputs, one per field (name first); empty in the list.
+    fields: Vec<Entity<TextInput>>,
+    _field_subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsDialog {}
@@ -585,34 +605,104 @@ impl SettingsDialog {
         let theme = model.preview().unwrap_or(theme);
         let list_scroll = ScrollHandle::new();
         list_scroll.scroll_to_item(model.selected);
-        Self { focus_handle: cx.focus_handle(), model, theme, list_scroll, editor_scroll: ScrollHandle::new() }
+        Self {
+            focus_handle: cx.focus_handle(),
+            model,
+            theme,
+            list_scroll,
+            editor_scroll: ScrollHandle::new(),
+            fields: Vec::new(),
+            _field_subscriptions: Vec::new(),
+        }
     }
 
     pub fn describe(&self) -> String {
         self.model.describe()
     }
 
-    /// After any change: preview the theme the model now shows, and redraw.
-    fn changed(&mut self, cx: &mut Context<Self>) {
+    /// The editor input that has keyboard focus.
+    pub fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
+        self.fields.iter().find(|f| f.read(cx).is_focused(window)).cloned()
+    }
+
+    /// After any change: preview the theme the model now shows, keep the
+    /// editor's inputs and focus in step with the model, and redraw.
+    fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview(cx);
+        self.sync_fields(window, cx);
+        match &self.model.mode {
+            Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
+            Mode::Editor(editor) => self.scroll_to_field(editor.focused),
+            Mode::ConfirmDelete => {}
+        }
+        cx.notify();
+    }
+
+    fn preview(&mut self, cx: &mut Context<Self>) {
         if let Some(preview) = self.model.preview()
             && preview != self.theme
         {
             self.theme = preview.clone();
             cx.emit(SettingsEvent::Preview(preview));
         }
-        match &self.model.mode {
-            Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
-            Mode::Editor(editor) => self.editor_scroll.scroll_to_item(editor.focused),
-            Mode::ConfirmDelete => {}
-        }
-        cx.notify();
     }
 
-    fn outcome(&mut self, outcome: Outcome, cx: &mut Context<Self>) {
+    /// Creates the inputs when the editor opens and drops them when it
+    /// closes, and moves focus to the model's focused field (or back to the
+    /// dialog, for the list's shortcuts).
+    fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(texts) = self.model.editor_fields() else {
+            if !self.fields.is_empty() {
+                self.fields.clear();
+                self._field_subscriptions.clear();
+                window.focus(&self.focus_handle);
+            }
+            return;
+        };
+        if self.fields.is_empty() {
+            for (field, text) in texts.iter().enumerate() {
+                let input = cx.new(|cx| TextInput::new(text, cx).tab_stop());
+                let changed = cx.subscribe_in(&input, window, move |this, input, _: &TextInputEvent, _, cx| {
+                    let text = input.read(cx).text().to_string();
+                    this.model.set_field(field, &text);
+                    this.preview(cx);
+                    cx.notify();
+                });
+                self._field_subscriptions.push(changed);
+                self.fields.push(input);
+            }
+        }
+        if let Some(input) = self.model.focused_field().and_then(|field| self.fields.get(field))
+            && !input.read(cx).is_focused(window)
+        {
+            window.focus(&input.focus_handle(cx));
+        }
+    }
+
+    /// Tells the model which input has focus (after tab, or a click on an
+    /// input), so the highlight and the dump follow it.
+    fn sync_focus_from_window(&mut self, window: &Window, cx: &App) {
+        let focused = self.fields.iter().position(|f| f.read(cx).is_focused(window));
+        if let Some(field) = focused
+            && Some(field) != self.model.focused_field()
+        {
+            self.model.focus_field(field);
+            self.scroll_to_field(field);
+        }
+    }
+
+    /// The scrolling body holds the color rows; the name sits above it.
+    fn scroll_to_field(&self, field: usize) {
+        if field > 0 {
+            self.editor_scroll.scroll_to_item(field - 1);
+        }
+    }
+
+    fn outcome(&mut self, outcome: Outcome, window: &mut Window, cx: &mut Context<Self>) {
         match outcome {
-            Outcome::Nothing => self.changed(cx),
+            Outcome::Nothing => self.changed(window, cx),
             Outcome::Written => {
-                self.changed(cx);
+                self.changed(window, cx);
                 cx.emit(SettingsEvent::ConfigWritten);
             }
             Outcome::Applied => {
@@ -622,69 +712,66 @@ impl SettingsDialog {
         }
     }
 
-    fn up(&mut self, _: &SettingsUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn up(&mut self, _: &SettingsUp, window: &mut Window, cx: &mut Context<Self>) {
         self.model.move_selection(false);
-        self.changed(cx);
+        self.changed(window, cx);
     }
 
-    fn down(&mut self, _: &SettingsDown, _: &mut Window, cx: &mut Context<Self>) {
+    fn down(&mut self, _: &SettingsDown, window: &mut Window, cx: &mut Context<Self>) {
         self.model.move_selection(true);
-        self.changed(cx);
+        self.changed(window, cx);
     }
 
-    fn next_field(&mut self, _: &SettingsNextField, _: &mut Window, cx: &mut Context<Self>) {
+    /// Tab: the inputs are the window's only tab stops while the dialog is
+    /// open.
+    fn next_field(&mut self, _: &SettingsNextField, window: &mut Window, cx: &mut Context<Self>) {
         if !self.model.in_list() {
-            self.model.move_selection(true);
-            self.changed(cx);
+            window.focus_next();
+            self.sync_focus_from_window(window, cx);
+            cx.notify();
         }
     }
 
-    fn prev_field(&mut self, _: &SettingsPrevField, _: &mut Window, cx: &mut Context<Self>) {
+    fn prev_field(&mut self, _: &SettingsPrevField, window: &mut Window, cx: &mut Context<Self>) {
         if !self.model.in_list() {
-            self.model.move_selection(false);
-            self.changed(cx);
+            window.focus_prev();
+            self.sync_focus_from_window(window, cx);
+            cx.notify();
         }
     }
 
-    fn confirm(&mut self, _: &SettingsConfirm, _: &mut Window, cx: &mut Context<Self>) {
+    fn confirm(&mut self, _: &SettingsConfirm, window: &mut Window, cx: &mut Context<Self>) {
         let outcome = self.model.confirm();
-        self.outcome(outcome, cx);
+        self.outcome(outcome, window, cx);
     }
 
-    fn cancel(&mut self, _: &SettingsCancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn cancel(&mut self, _: &SettingsCancel, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.cancel() {
             cx.emit(SettingsEvent::Close);
         } else {
-            self.changed(cx);
+            self.changed(window, cx);
         }
     }
 
-    fn new_theme(&mut self, _: &SettingsNew, _: &mut Window, cx: &mut Context<Self>) {
+    fn new_theme(&mut self, _: &SettingsNew, window: &mut Window, cx: &mut Context<Self>) {
         self.model.start_new();
-        self.changed(cx);
+        self.changed(window, cx);
     }
 
-    fn edit_theme(&mut self, _: &SettingsEdit, _: &mut Window, cx: &mut Context<Self>) {
+    fn edit_theme(&mut self, _: &SettingsEdit, window: &mut Window, cx: &mut Context<Self>) {
         self.model.start_edit();
-        self.changed(cx);
+        self.changed(window, cx);
     }
 
-    fn delete_theme(&mut self, _: &SettingsDelete, _: &mut Window, cx: &mut Context<Self>) {
+    fn delete_theme(&mut self, _: &SettingsDelete, window: &mut Window, cx: &mut Context<Self>) {
         self.model.request_delete();
-        self.changed(cx);
+        self.changed(window, cx);
     }
 
-    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.model.paste(&text);
-            self.changed(cx);
-        }
-    }
-
-    fn key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.key(&e.keystroke) {
             cx.stop_propagation();
-            self.changed(cx);
+            self.changed(window, cx);
         }
     }
 
@@ -752,13 +839,13 @@ impl SettingsDialog {
                 .rounded_md()
                 .when(selected, |d| d.bg(panel.mix(accent, 0.22).hsla()))
                 .when(readable, |d| {
-                    d.hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla())).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                    d.hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla())).on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         this.model.select(ix);
                         if e.click_count() >= 2 {
                             let outcome = this.model.confirm();
-                            this.outcome(outcome, cx);
+                            this.outcome(outcome, window, cx);
                         } else {
-                            this.changed(cx);
+                            this.changed(window, cx);
                         }
                     }))
                 });
@@ -802,36 +889,36 @@ impl SettingsDialog {
                 .items_center()
                 .gap_2()
                 .child(div().flex_1().text_color(fg).child(SharedString::from(format!("Delete {name:?}?"))))
-                .child(self.button("delete-no", "Keep", false, true, cx, |this, _, cx| {
+                .child(self.button("delete-no", "Keep", false, true, cx, |this, window, cx| {
                     this.model.cancel();
-                    this.changed(cx);
+                    this.changed(window, cx);
                 }))
-                .child(self.button("delete-yes", "Delete (enter)", true, true, cx, |this, _, cx| {
+                .child(self.button("delete-yes", "Delete (enter)", true, true, cx, |this, window, cx| {
                     let outcome = this.model.confirm();
-                    this.outcome(outcome, cx);
+                    this.outcome(outcome, window, cx);
                 }))
         } else {
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(self.button("new", "New (n)", false, true, cx, |this, _, cx| {
+                .child(self.button("new", "New (n)", false, true, cx, |this, window, cx| {
                     this.model.start_new();
-                    this.changed(cx);
+                    this.changed(window, cx);
                 }))
-                .child(self.button("edit", "Edit (e)", false, true, cx, |this, _, cx| {
+                .child(self.button("edit", "Edit (e)", false, true, cx, |this, window, cx| {
                     this.model.start_edit();
-                    this.changed(cx);
+                    this.changed(window, cx);
                 }))
-                .child(self.button("delete", "Delete (d)", false, custom_selected, cx, |this, _, cx| {
+                .child(self.button("delete", "Delete (d)", false, custom_selected, cx, |this, window, cx| {
                     this.model.request_delete();
-                    this.changed(cx);
+                    this.changed(window, cx);
                 }))
                 .child(div().flex_1())
                 .child(self.button("cancel", "Cancel", false, true, cx, |_, _, cx| cx.emit(SettingsEvent::Close)))
-                .child(self.button("apply", "Apply", true, true, cx, |this, _, cx| {
+                .child(self.button("apply", "Apply", true, true, cx, |this, window, cx| {
                     let outcome = this.model.confirm();
-                    this.outcome(outcome, cx);
+                    this.outcome(outcome, window, cx);
                 }))
         };
 
@@ -857,7 +944,7 @@ impl SettingsDialog {
             .into_any_element()
     }
 
-    fn render_field(&self, field: usize, text: &str, focused: bool, invalid: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_field(&self, field: usize, focused: bool, invalid: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         let border = if invalid {
             t.ansi[1].hsla()
@@ -879,12 +966,12 @@ impl SettingsDialog {
             .border_color(border)
             .bg(t.background.hsla())
             .text_color(t.foreground.hsla())
-            .on_click(cx.listener(move |this, _, _, cx| {
+            // Clicks on the padding focus the input too.
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.model.focus_field(field);
-                this.changed(cx);
+                this.changed(window, cx);
             }))
-            .child(SharedString::from(text.to_string()))
-            .when(focused, |d| d.child(div().w(px(1.5)).h(px(15.0)).bg(t.accent().hsla())))
+            .when_some(self.fields.get(field).cloned(), |d, input| d.child(input))
     }
 
     fn render_editor(&self, editor: &Editor, cx: &mut Context<Self>) -> AnyElement {
@@ -905,11 +992,15 @@ impl SettingsDialog {
                 .gap_2()
                 .child(label(slot.label().into()))
                 .child(self.swatch(color, 18.0))
-                .child(self.render_field(field, &editor.colors[ix].text, editor.focused == field, invalid, cx))
+                .child(self.render_field(field, editor.focused == field, invalid, cx))
                 .when(slot.optional(), |d| {
-                    d.child(self.button("clear-selection-fg", "Clear", false, color.is_some(), cx, |this, _, cx| {
-                        this.model.clear_selection_foreground();
-                        this.changed(cx);
+                    d.child(self.button("clear-selection-fg", "Clear", false, color.is_some(), cx, |this, window, cx| {
+                        if let Some(field) = this.model.clear_selection_foreground()
+                            && let Some(input) = this.fields.get(field)
+                        {
+                            input.update(cx, |input, cx| input.set_text("", cx));
+                        }
+                        this.changed(window, cx);
                     }))
                 })
         })
@@ -933,7 +1024,7 @@ impl SettingsDialog {
                     .items_center()
                     .gap_2()
                     .child(label("Name".into()))
-                    .child(self.render_field(0, &editor.name.text, editor.focused == 0, name_error.is_some(), cx)),
+                    .child(self.render_field(0, editor.focused == 0, name_error.is_some(), cx)),
             )
             .when_some(name_error, |d, e| d.child(div().text_xs().text_color(red).child(SharedString::from(e))))
             .child(
@@ -954,13 +1045,13 @@ impl SettingsDialog {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().text_xs().text_color(muted).child("tab moves between fields · #rrggbb or #rgb"))
-                    .child(self.button("discard", "Discard", false, true, cx, |this, _, cx| {
+                    .child(self.button("discard", "Discard", false, true, cx, |this, window, cx| {
                         this.model.cancel();
-                        this.changed(cx);
+                        this.changed(window, cx);
                     }))
-                    .child(self.button("save", "Save", true, can_save, cx, |this, _, cx| {
+                    .child(self.button("save", "Save", true, can_save, cx, |this, window, cx| {
                         let outcome = this.model.confirm();
-                        this.outcome(outcome, cx);
+                        this.outcome(outcome, window, cx);
                     })),
             )
             .into_any_element()
@@ -968,7 +1059,9 @@ impl SettingsDialog {
 }
 
 impl Render for SettingsDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A click on an input focuses it directly; focus changes redraw.
+        self.sync_focus_from_window(window, cx);
         let t = self.theme.clone();
         let content = match &self.model.mode {
             Mode::Editor(editor) => {
@@ -1000,11 +1093,14 @@ impl Render for SettingsDialog {
             .on_action(cx.listener(Self::new_theme))
             .on_action(cx.listener(Self::edit_theme))
             .on_action(cx.listener(Self::delete_theme))
-            .on_action(cx.listener(Self::paste))
             .on_key_down(cx.listener(Self::key_down))
             // A stray click outside shouldn't throw away an edit in progress.
             .when(in_list, |d| d.on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close))))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Hide the terminal behind from the mouse, so its I-beam cursor
+            // doesn't show over the dialog.
+            .occlude()
+            .cursor(CursorStyle::Arrow)
             .w(px(680.0))
             .h(px(460.0))
             .flex()
@@ -1129,11 +1225,10 @@ background = "nope"
         }
     }
 
-    fn type_text(model: &mut Model, text: &str) {
-        for ch in text.chars() {
-            let ks = Keystroke { key: ch.to_string(), key_char: Some(ch.to_string()), modifiers: Default::default() };
-            assert!(model.key(&ks));
-        }
+    /// Edits field `field` as its input would: the model gets the new text.
+    fn type_into(model: &mut Model, field: usize, text: &str) {
+        model.focus_field(field);
+        model.set_field(field, text);
     }
 
     fn editor(model: &Model) -> &Editor {
@@ -1210,7 +1305,7 @@ background = "nope"
         key(&mut model, "n");
         let tokyo = builtin_theme("tokyo-night").unwrap();
         let e = editor(&model);
-        assert_eq!(e.name.text, "tokyo-night-custom");
+        assert_eq!(e.name, "tokyo-night-custom");
         assert_eq!(e.original, None);
         assert_eq!(e.current.accent, Some(tokyo.ansi[4]));
         assert_eq!(e.current, tokyo.with_effective_colors());
@@ -1218,7 +1313,7 @@ background = "nope"
         // Edit on a built-in copies it too.
         model.cancel();
         key(&mut model, "e");
-        assert_eq!(editor(&model).name.text, "tokyo-night-custom");
+        assert_eq!(editor(&model).name, "tokyo-night-custom");
     }
 
     #[test]
@@ -1227,22 +1322,19 @@ background = "nope"
         let mut model = f.model("brindle-dark");
         model.start_new();
         // Field 2 is the background.
-        model.focus_field(2);
-        for _ in 0..7 {
-            key(&mut model, "backspace");
-        }
-        type_text(&mut model, "#000");
+        type_into(&mut model, 2, "#000");
         assert_eq!(model.preview().unwrap().background, Color::hex(0));
         assert!(model.editor_can_save());
         // Field 3 is the cursor: an invalid value keeps the previous color.
         let cursor = model.preview().unwrap().cursor;
         model.move_selection(true);
-        key(&mut model, "backspace");
         assert_eq!(editor(&model).focused_label(), "Cursor");
+        let text = model.editor_fields().unwrap()[3].clone();
+        model.set_field(3, &text[..text.len() - 1]);
         assert_eq!(model.preview().unwrap().cursor, cursor);
         assert!(!model.editor_can_save());
         assert!(model.describe().contains("invalid=[\"Cursor\"]"), "{}", model.describe());
-        type_text(&mut model, "x");
+        model.set_field(3, &format!("{}x", &text[..text.len() - 1]));
         assert_eq!(model.confirm(), Outcome::Nothing);
         assert!(model.error.is_some());
         assert_eq!(f.text(), CONFIG);
@@ -1255,16 +1347,9 @@ background = "nope"
         model.start_edit();
         // Keeping its own name is fine.
         assert!(model.editor_can_save());
-        model.focus_field(0);
-        for _ in 0.."mine".len() {
-            key(&mut model, "backspace");
-        }
-        type_text(&mut model, "spare");
+        type_into(&mut model, 0, "spare");
         assert!(!model.editor_can_save());
-        for _ in 0.."spare".len() {
-            key(&mut model, "backspace");
-        }
-        type_text(&mut model, "tokyo-night");
+        type_into(&mut model, 0, "tokyo-night");
         assert!(!model.editor_can_save());
         assert_eq!(model.confirm(), Outcome::Nothing);
         assert!(model.error.as_deref().unwrap().contains("built-in"));
@@ -1290,11 +1375,7 @@ background = "nope"
         let f = Fixture::new("rename", &CONFIG.replace("name = \"Shell\"", "name = \"Shell\"\ntheme = \"mine\""));
         let mut model = f.model("mine");
         model.start_edit();
-        model.focus_field(0);
-        for _ in 0.."mine".len() {
-            key(&mut model, "backspace");
-        }
-        type_text(&mut model, "ours");
+        type_into(&mut model, 0, "ours");
         assert_eq!(model.confirm(), Outcome::Written);
         let text = f.text();
         assert!(text.contains("theme = \"ours\"\n\n[[profiles]]"), "{text}");
@@ -1310,8 +1391,7 @@ background = "nope"
         let mut model = f.model("mine");
         model.move_selection(true);
         model.start_edit();
-        model.focus_field(2);
-        key(&mut model, "backspace");
+        type_into(&mut model, 2, "#1");
         assert!(!model.cancel());
         assert!(model.in_list());
         assert_eq!(model.selected_entry().unwrap().name, "spare");
@@ -1330,6 +1410,24 @@ background = "nope"
         assert!(model.editor_can_save());
         assert_eq!(model.confirm(), Outcome::Written);
         assert!(!f.text().contains("selection_foreground"));
+    }
+
+    #[test]
+    fn editor_fields_and_keys() {
+        let f = Fixture::new("fields", CONFIG);
+        let mut model = f.model("mine");
+        assert_eq!(model.editor_fields(), None);
+        model.start_edit();
+        let fields = model.editor_fields().unwrap();
+        assert_eq!(fields.len(), FIELD_COUNT);
+        assert_eq!(fields[0], "mine");
+        assert_eq!(fields[2], "#000000");
+        assert_eq!(model.focused_field(), Some(0));
+        // Typing belongs to the inputs; list shortcuts are off.
+        assert!(!model.key(&Keystroke::parse("n").unwrap()));
+        assert_eq!(model.clear_selection_foreground(), Some(6));
+        assert_eq!(model.editor_fields().unwrap()[6], "");
+        assert_eq!(model.focused_field(), Some(6));
     }
 
     #[test]
