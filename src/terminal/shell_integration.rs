@@ -12,7 +12,7 @@
 //! and finding it again afterwards (alacritty rotates rows, it never copies
 //! their cells), which still works when the history is full and recycling
 //! rows. Resizes remap marks through logical (unwrapped) lines; see
-//! `openspec/changes/archive/*-add-shell-integration/design.md`.
+//! `openspec/changes/archive/2026-10-08-add-shell-integration/design.md`.
 
 use std::collections::VecDeque;
 use std::time::Instant;
