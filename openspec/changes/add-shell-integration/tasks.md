@@ -24,7 +24,7 @@
 
 ## 4. Shell scripts and CLI
 
-- [ ] 4.1 Write `shell-integration/brindle.bash`, `brindle.zsh` and `brindle.fish`, and add `--shell-integration <shell>` to `main.rs`, embedding them with `include_str!`. Verify by running `bash -n` on the bash script. Run an interactive bash in a pty (`script`) with the script loaded, and check that its output contains `133;A`, `133;B`, `133;C` and `133;D;1` after `false`, and that `$?` and an existing `PROMPT_COMMAND` still work. Check `brindle --shell-integration tcsh` exits 2.
+- [x] 4.1 Write `shell-integration/brindle.bash`, `brindle.zsh` and `brindle.fish`, and add `--shell-integration <shell>` to `main.rs`, embedding them with `include_str!`. Verify by running `bash -n` on the bash script. Run an interactive bash in a pty (`script`) with the script loaded, and check that its output contains `133;A`, `133;B`, `133;C` and `133;D;1` after `false`, and that `$?` and an existing `PROMPT_COMMAND` still work. Check `brindle --shell-integration tcsh` exits 2.
 
 ## 5. Docs and end-to-end checks
 
