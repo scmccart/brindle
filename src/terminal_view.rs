@@ -331,7 +331,10 @@ impl TerminalView {
     pub fn hover(&mut self, position: Point<Pixels>, modifiers: Modifiers, force: bool, cx: &mut Context<Self>) {
         self.mouse.pointer = Some(position);
         self.mouse.modifiers = modifiers;
-        if !wants_links(&modifiers) {
+        // No link feedback in the middle of a (block) selection or a drag
+        // the program is receiving.
+        let dragging = self.mouse.selecting || self.mouse.reported_button.is_some();
+        if !wants_links(&modifiers) || dragging {
             self.mouse.hover_cell = None;
             self.set_hovered(None, cx);
             return;

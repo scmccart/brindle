@@ -67,7 +67,7 @@ Text a program marks with an OSC 8 hyperlink SHALL be a link to that hyperlink's
 - **THEN** the link under the mouse is `https://a.example`
 
 ### Requirement: Hover feedback
-While ctrl is held (without alt) and the mouse is over a link in a terminal, that link's cells SHALL be underlined and the mouse pointer SHALL be a pointing hand. The feedback SHALL go away when ctrl is released, the mouse leaves the link, the view scrolls, or the window is deactivated, and it SHALL follow the text when output changes it. Without ctrl, links SHALL look and behave like other text.
+While ctrl is held (without alt) and the mouse is over a link in a terminal, that link's cells SHALL be underlined and the mouse pointer SHALL be a pointing hand. The feedback SHALL go away when ctrl is released, the mouse leaves the link, or the window is deactivated. It SHALL follow the text under the mouse when the view scrolls or output changes it. There SHALL be none during a selection drag. Without ctrl, links SHALL look and behave like other text.
 
 #### Scenario: Holding ctrl over a URL
 - **WHEN** the mouse is over a URL and the user holds ctrl

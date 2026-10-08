@@ -408,6 +408,15 @@ impl Render for TmuxWindowView {
         div()
             .key_context("TmuxWindow")
             .track_focus(&self.focus_handle)
+            // Modifier changes only reach the focused pane on their own; pass
+            // them to every pane so ctrl over an inactive pane's link shows
+            // (and hides) its hover feedback too.
+            .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, window, cx| {
+                let position = window.mouse_position();
+                for (view, _) in this.views.values() {
+                    view.update(cx, |view, cx| view.modifiers_changed(position, e.modifiers, cx));
+                }
+            }))
             .on_action(cx.listener(Self::on_session::<TmuxDetach>(|s, _| s.detach())))
             .on_action(cx.listener(Self::on_session::<TmuxSplitRight>(|s, w| s.split(w, true))))
             .on_action(cx.listener(Self::on_session::<TmuxSplitDown>(|s, w| s.split(w, false))))
