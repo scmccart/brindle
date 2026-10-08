@@ -2,13 +2,13 @@
 
 ## 1. Mark parsing and anchoring
 
-- [ ] 1.1 Create `src/terminal/shell_integration.rs` with the `Scanner` state machine (ground, escape, CSI, OSC, strings; CAN/SUB; persistent across calls) reporting OSC 133 marks, alternate-screen switches, `CSI 3 J` and `ESC c` split points. Verify with unit tests run by `cargo test shell_integration`:
+- [x] 1.1 Create `src/terminal/shell_integration.rs` with the `Scanner` state machine (ground, escape, CSI, OSC, strings; CAN/SUB; persistent across calls) reporting OSC 133 marks, alternate-screen switches, `CSI 3 J` and `ESC c` split points. Verify with unit tests run by `cargo test shell_integration`:
   - each kind, with BEL and `ESC \` terminators;
   - every split position of a mark sequence across two reads gives the same result;
   - OSC 133 inside a DCS string, non-133 OSCs and over-long OSCs are ignored;
   - `D` exit parsing (missing, non-numeric, negative).
-- [ ] 1.2 Add `Marks` (commands grouped from marks, absolute positions, `base`), row-identity scroll tracking around every processor call, pruning, `clear`, and the logical-line snapshot/restore used for resize and the alternate screen. Verify with unit tests against a real `Term` with a small grid: prompts survive scrolling, history overflow (scrollback 5 and 0), `CSI 2 J` + `CSI 3 J`, `ESC c`, narrower and wider resizes with wrapped lines, and a resize while `?1049h` is active.
-- [ ] 1.3 Add `Parser` (vte processor + scanner) with `advance(term, marks, bytes)` and tracked `stop_sync`, flushing a synchronized update before marks and screen switches. Verify with unit tests: a mark inside `CSI ? 2026 h` lands at the right position; grouping rules (redraw `A`, `D` without `C` ignored).
+- [x] 1.2 Add `Marks` (commands grouped from marks, absolute positions, `base`), row-identity scroll tracking around every processor call, pruning, `clear`, and the logical-line snapshot/restore used for resize and the alternate screen. Verify with unit tests against a real `Term` with a small grid: prompts survive scrolling, history overflow (scrollback 5 and 0), `CSI 2 J` + `CSI 3 J`, `ESC c`, narrower and wider resizes with wrapped lines, and a resize while `?1049h` is active.
+- [x] 1.3 Add `Parser` (vte processor + scanner) with `advance(term, marks, bytes)` and tracked `stop_sync`, flushing a synchronized update before marks and screen switches. Verify with unit tests: a mark inside `CSI ? 2026 h` lands at the right position; grouping rules (redraw `A`, `D` without `C` ignored).
 
 ## 2. Backends
 

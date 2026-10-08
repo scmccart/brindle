@@ -8,6 +8,7 @@
 
 pub mod keys;
 pub mod mouse;
+pub mod shell_integration;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
