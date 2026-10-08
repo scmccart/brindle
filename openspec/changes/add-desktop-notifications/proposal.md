@@ -35,6 +35,6 @@ Long-running commands, builds and agents (Claude Code among them) finish in a ta
   - `workspace.rs`: one handler for bells and notifications from local and tmux tabs, and focusing a tab by id;
   - `config.rs` and `assets/default-config.toml`: the `[notifications]` table;
   - `main.rs`: installs the notification service.
-- **Dependencies:** `zbus` 5.12, `raw-window-handle` 0.6, `wayland-client` 0.31, `wayland-backend` 0.3 and `wayland-protocols` 0.31. All are already in `Cargo.lock` through gpui, with the needed features already enabled, so the lock file only gains entries in Brindle's own dependency list.
+- **Dependencies:** `zbus` 5.12, `raw-window-handle` 0.6, `wayland-client` 0.31, `wayland-backend` 0.3, `wayland-protocols` 0.31 and `polling` 3 (for the PTY wrapper's trait signatures). All are already in `Cargo.lock` through gpui, with the needed features already enabled, so the lock file only gains entries in Brindle's own dependency list.
 - **Specs:** a new `desktop-notifications` spec and deltas to `tabs`, `tmux-control-mode` and `command-line`.
 - **Tests:** unit tests for OSC scanning (split reads, terminators, ConEmu sub-commands, OSC 777 forms), the focus rule and the rate limiter; end-to-end cases for OSC notifications in a local tab, background-tab bells and notifications in tmux control mode, and a headless check that tmux forwards these sequences in `%output`.

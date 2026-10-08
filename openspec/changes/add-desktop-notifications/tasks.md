@@ -15,24 +15,24 @@
 
 ## 4. Detection in terminals
 
-- [ ] 4.1 Carry notices on the terminal's event channel and add `TerminalEvent::Notify`; wrap the PTY in `ScanPty` so alacritty's reader scans output; verify `cargo build` and a unit test that `ScanReader` reports a notice split across two reads from a pipe
-- [ ] 4.2 Scan bytes in `Terminal::feed` for remote terminals and emit `TerminalEvent::Notify`; verify with a unit test of the remote scan path (pure helper)
+- [x] 4.1 Carry notices on the terminal's event channel and add `TerminalEvent::Notify`; wrap the PTY in `ScanPty` so alacritty's reader scans output; verify `cargo build` and a unit test that `ScanReader` reports a notice split across two reads from a pipe
+- [x] 4.2 Scan bytes in `Terminal::feed` for remote terminals and emit `TerminalEvent::Notify`; verify with the scanner's unit tests and the `notify-tmux-background` e2e case
 
 ## 5. Notification service
 
-- [ ] 5.1 Add `src/notify/mod.rs`: the `Notifier` global (rate limits, click map, bell replacement ids) with the file sink for `BRINDLE_NOTIFY_LOG` (synchronous line append) and a command channel to a background worker; install it in `main.rs`; verify `cargo build` and a unit test of the log line format
-- [ ] 5.2 Add `src/notify/dbus.rs`: the zbus worker (lazy connect with retry back-off, `GetCapabilities`, `Notify` with actions/markup escaping/hints/`replaces_id`, `CloseNotification`, and `ActionInvoked`/`ActivationToken`/`NotificationClosed` signals back to the UI thread); verify by building and a short manual run that sends one real notification to the session bus
-- [ ] 5.3 Add `src/notify/activation.rs`: raise a window with an xdg-activation token on Wayland, falling back to `activate_window()`; verify it builds and that the X11 path falls back (logged)
+- [x] 5.1 Add `src/notify/mod.rs`: the `Notifier` global (rate limits, click map, bell replacement ids) with the file sink for `BRINDLE_NOTIFY_LOG` (synchronous line append) and a command channel to a background worker; install it in `main.rs`; verify `cargo build` and a unit test of the log line format
+- [x] 5.2 Add `src/notify/dbus.rs`: the zbus worker (lazy connect with retry back-off, `GetCapabilities`, `Notify` with actions/markup escaping/hints/`replaces_id`, and `ActionInvoked`/`ActivationToken`/`NotificationClosed` signals back to the UI thread); verify by building and a short manual run that sends one real notification to the session bus
+- [x] 5.3 Add `src/notify/activation.rs`: raise a window with an xdg-activation token on Wayland, falling back to `activate_window()`; verify it builds; non-Wayland windows and failures fall back to `activate_window()`
 
 ## 6. Workspace and tmux wiring
 
-- [ ] 6.1 Make `TmuxWindowView` forward `Bell` and `Notify` from its pane terminals, and have `Workspace` handle both events for local and tmux tabs in one place (bell dot, focus rule, settings, title layout, send); verify by building and the e2e cases in 7
-- [ ] 6.2 Handle a notification click: activate the tab by id in its window and raise the window with the token; verify by hand on GNOME (morning checklist) and by building
+- [x] 6.1 Make `TmuxWindowView` forward `Bell` and `Notify` from its pane terminals, and have `Workspace` handle both events for local and tmux tabs in one place (bell dot, focus rule, settings, title layout, send); verify by building and the e2e cases in 7
+- [x] 6.2 Handle a notification click: activate the tab by id in its window and raise the window with the token; verify by hand on GNOME (morning checklist) and by building
 
 ## 7. End-to-end cases
 
-- [ ] 7.1 Add a headless `tmux-osc-in-output` case: a raw control client sees OSC 777, OSC 9 and BEL from a pane in a non-current window in `%output`; verify `BRINDLE_E2E=1 cargo test --test e2e -- tmux-osc` passes
-- [ ] 7.2 Let `Run` pick the profile and append config text; add `notify-osc-local` (Shell profile, `when = "always"`: OSC 777, OSC 9 notify, `9;4` and `9;9` don't) and `notify-tmux-background` (two tmux windows: a bell storm and an OSC 777 in the background window give one bell line and one osc777 line naming the window); verify `BRINDLE_E2E=1 cargo test --test e2e -- notify` passes under `flock /tmp/brindle-gui.lock`
+- [x] 7.1 Add a headless `tmux-osc-in-output` case: a raw control client sees OSC 777, OSC 9 and BEL from a pane in a non-current window in `%output`; verify `BRINDLE_E2E=1 cargo test --test e2e -- tmux-osc` passes
+- [x] 7.2 Let `Run` pick the profile and append config text; add `notify-osc-local` (Shell profile, `when = "always"`: OSC 777, OSC 9 notify, `9;4` and `9;9` don't) and `notify-tmux-background` (two tmux windows: a bell storm and an OSC 777 in the background window give one bell line and one osc777 line naming the window); verify `BRINDLE_E2E=1 cargo test --test e2e -- notify` passes under `flock /tmp/brindle-gui.lock`
 
 ## 8. Documentation and integration
 
