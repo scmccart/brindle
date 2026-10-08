@@ -34,4 +34,4 @@
 
 ## 5. Integration
 
-- [ ] 5.1 Run `cargo build`, `cargo test`, `cargo build --release`, and the full e2e suite under `flock /tmp/brindle-gui.lock`. Verify that every command passes and `git diff Cargo.lock` is empty.
+- [x] 5.1 Run `cargo build`, `cargo test`, `cargo build --release`, and the full e2e suite under `flock /tmp/brindle-gui.lock`. Verify that every command passes and `git diff Cargo.lock` is empty.
