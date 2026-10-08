@@ -3,6 +3,7 @@
 mod colors;
 mod dump;
 mod geometry;
+mod notify;
 mod settings;
 mod styles;
 mod titles;
@@ -21,6 +22,7 @@ pub fn all() -> Vec<Case> {
         headless("tmux-border-status-no-layout-change", tmux::border_status_no_layout_change),
         headless("tmux-rotate-no-layout-change", tmux::rotate_no_layout_change),
         headless("tmux-color-report-precedence", tmux::color_report_precedence),
+        headless("tmux-osc-in-output", notify::tmux_osc_in_output),
         display("tmux-subscriptions-removed", tmux::subscriptions_removed),
         display("dump-grid-geometry", dump::grid_geometry),
         display("geometry-plain", geometry::plain),
@@ -47,6 +49,8 @@ pub fn all() -> Vec<Case> {
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
+        display("notify-osc-local", notify::osc_local),
+        display("notify-tmux-background", notify::tmux_background),
     ]
 }
 

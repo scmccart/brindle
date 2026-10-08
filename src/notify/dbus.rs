@@ -71,6 +71,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, replies: UnboundedSen
         match command {
             Command::Notify { key, replaces, summary, body } => match notify(s, replaces, &summary, &body).await {
                 Ok(id) => {
+                    log::debug!("notification {id} shown");
                     replies.unbounded_send(Reply::Shown { key, id }).ok();
                 }
                 Err(err) => {

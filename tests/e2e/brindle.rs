@@ -101,6 +101,9 @@ pub struct Run<'a> {
     ctx: &'a Ctx,
     server: &'a TmuxServer,
     label: &'static str,
+    profile: &'static str,
+    /// Appended to the test config (after its tables).
+    extra_config: String,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     timeline: Vec<(f64, Event)>,
@@ -120,6 +123,8 @@ impl<'a> Run<'a> {
             ctx,
             server,
             label,
+            profile: "tmux",
+            extra_config: String::new(),
             steps: Vec::new(),
             env: Vec::new(),
             timeline: Vec::new(),
@@ -138,6 +143,18 @@ impl<'a> Run<'a> {
     /// is `<label>.log`).
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Starts Brindle with another profile of the test config (default `tmux`).
+    pub fn profile(mut self, name: &'static str) -> Self {
+        self.profile = name;
+        self
+    }
+
+    /// Adds TOML to the test config, e.g. a `[notifications]` table.
+    pub fn config(mut self, text: &str) -> Self {
+        self.extra_config.push_str(text);
         self
     }
 
@@ -172,11 +189,12 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        std::fs::write(&config_path, config(&self.server.socket, "e2e")).map_err(|e| e.to_string())?;
+        let text = config(&self.server.socket, "e2e") + &self.extra_config;
+        std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
         let mut child = Command::new(&ctx.bin)
-            .args(["-p", "tmux"])
+            .args(["-p", self.profile])
             .args(&self.steps)
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
