@@ -54,6 +54,8 @@ pub fn all() -> Vec<Case> {
         display("shell-failed-mark", shell::failed_mark),
         display("shell-select-output", shell::select_output),
         display("shell-tmux-prompt-jump", shell::tmux_prompt_jump),
+        display("shell-clear-up-down", shell::clear_up_down),
+        display("shell-tmux-clear-up-down", shell::tmux_clear_up_down),
     ]
 }
 
