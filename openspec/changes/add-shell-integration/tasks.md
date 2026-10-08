@@ -12,9 +12,9 @@
 
 ## 2. Backends
 
-- [ ] 2.1 Add `polling = "3.11"` to `Cargo.toml` without running `cargo update`. Verify that `git diff Cargo.lock` only adds the dependency edge to brindle's entry.
-- [ ] 2.2 Add `MarkedPty`/`ParsingReader` and use them in `Terminal::spawn_pty`. Route `Terminal::feed` through the same `Parser`, and move sync-timeout flushing into one path for both backends (scheduled on `Wakeup`). Wrap `Terminal::resize` and `clear_scrollback` with mark remapping and pruning. Verify that `cargo build` succeeds and that existing unit tests pass. Check by hand in a launch that typing in a local tab works and that `exit` closes the tab (drain on exit still works).
-- [ ] 2.3 Add `Terminal` queries: `jump_to_prompt(previous)`, `select_last_output`, `last_output_text`, and failed-row ranges for a viewport. Verify with unit tests on the pure parts (target selection and output range from a `Marks` and a `Term`).
+- [x] 2.1 Add `polling = "3.11"` to `Cargo.toml` without running `cargo update`. Verify that `git diff Cargo.lock` only adds the dependency edge to brindle's entry.
+- [x] 2.2 Add `MarkedPty`/`ParsingReader` and use them in `Terminal::spawn_pty`. Route `Terminal::feed` through the same `Parser`, and move sync-timeout flushing into one path for both backends (scheduled on `Wakeup`). Wrap `Terminal::resize` and `clear_scrollback` with mark remapping and pruning. Verify that `cargo build` succeeds and that existing unit tests pass. Check by hand in a launch that typing in a local tab works and that `exit` closes the tab (drain on exit still works).
+- [x] 2.3 Add `Terminal` queries: `jump_to_prompt(previous)`, `select_last_output`, `last_output_text`, and failed-row ranges for a viewport. Verify with unit tests on the pure parts (target selection and output range from a `Marks` and a `Term`).
 
 ## 3. Actions, rendering and config
 
