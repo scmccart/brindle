@@ -17,7 +17,7 @@ use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::{Terminal, TerminalEvent};
-use crate::terminal_view::{GridLayout, TerminalView};
+use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{TmuxEvent, TmuxSession};
@@ -104,9 +104,14 @@ impl Tab {
 
     /// Where the active terminal was last painted.
     fn active_grid(&self, cx: &App) -> Option<GridLayout> {
+        self.active_view(cx)?.read(cx).layout.get()
+    }
+
+    /// The terminal view that has (or last had) focus in this tab.
+    fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
         match &self.content {
-            TabContent::Terminal(view) => view.read(cx).layout.get(),
-            TabContent::Tmux { view, .. } => view.read(cx).active_view()?.read(cx).layout.get(),
+            TabContent::Terminal(view) => Some(view.clone()),
+            TabContent::Tmux { view, .. } => view.read(cx).active_view(),
         }
     }
 
@@ -804,6 +809,15 @@ impl Workspace {
         }
     }
 
+    /// Debug hook for `--hover` / `--click`: mouse events for a cell of the
+    /// active terminal, through its own handlers.
+    pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
+        match self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
+            Some(view) => view.update(cx, |view, cx| view.debug_pointer(step, window, cx)),
+            None => log::error!("--hover/--click: no active terminal"),
+        }
+    }
+
     /// Debug hook for `--dump-screen-after`.
     pub fn dump_active_screen(&self, scale: f32, cx: &App) -> String {
         let mut out = String::new();
@@ -821,6 +835,10 @@ impl Workspace {
             out.push_str(&format!("--- screen {}x{} mode {:?}\n", size.cols, size.rows, terminal.mode()));
             if let Some(grid) = self.tabs.get(self.active).and_then(|t| t.active_grid(cx)) {
                 out.push_str(&grid.describe(scale));
+            }
+            let view = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
+            if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
+                out.push_str(&format!("--- link {}\n", link.uri));
             }
             out.push_str(&terminal.screen_text());
         }
