@@ -29,6 +29,8 @@ pub struct Config {
     pub copy_on_select: bool,
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
+    /// Desktop notifications from bells and OSC 9/777.
+    pub notifications: NotificationConfig,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
     /// Extra keybindings: `"ctrl-shift-x" = "action_name"`.
@@ -46,6 +48,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             copy_on_select: false,
             osc52_paste: false,
+            notifications: NotificationConfig::default(),
             profiles: Vec::new(),
             themes: BTreeMap::new(),
             keybindings: BTreeMap::new(),
@@ -100,6 +103,36 @@ pub struct CursorConfig {
 impl Default for CursorConfig {
     fn default() -> Self {
         Self { shape: CursorShapeConfig::Block, blink: true }
+    }
+}
+
+/// When a notification is shown for a tab.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyWhen {
+    /// Only when the tab isn't in front of the user: it is a background
+    /// tab, or its window isn't focused.
+    #[default]
+    Unfocused,
+    /// Also for the tab the user is looking at.
+    Always,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    /// A bell (BEL) raises a notification.
+    pub bell: bool,
+    /// `OSC 9 ; message`.
+    pub osc9: bool,
+    /// `OSC 777 ; notify ; title ; body`.
+    pub osc777: bool,
+    pub when: NotifyWhen,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self { bell: true, osc9: true, osc777: true, when: NotifyWhen::Unfocused }
     }
 }
 
@@ -320,6 +353,19 @@ mod tests {
         assert_eq!(config.font.size, 96.0);
         let theme = config.theme(None);
         assert_eq!(theme.background.to_string(), "#000000");
+    }
+
+    #[test]
+    fn notification_settings() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.notifications, NotificationConfig::default());
+        assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
+        let config = Config::parse("[notifications]\nbell = false\nwhen = \"always\"").unwrap();
+        assert!(!config.notifications.bell);
+        assert!(config.notifications.osc9);
+        assert_eq!(config.notifications.when, NotifyWhen::Always);
+        assert!(Config::parse("[notifications]\nwhen = \"sometimes\"").is_err());
+        assert!(Config::parse("[notifications]\nsound = true").is_err());
     }
 
     #[test]

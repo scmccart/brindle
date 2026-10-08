@@ -2,6 +2,7 @@ mod actions;
 mod config;
 mod config_edit;
 mod desktop;
+mod notify;
 mod picker;
 mod settings;
 mod settings_dialog;

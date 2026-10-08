@@ -28,7 +28,7 @@
 
 ### 1. Pre-parse OSC 9/777 with a streaming scanner beside vte
 
-`notify::osc::Scanner` is a small byte state machine (`Ground → Esc → OscNum → OscBody → OscEsc`) that keeps its state between calls, so a sequence split across reads is found. It mirrors vte's rules where they matter: BEL or `ESC \` terminates; CAN/SUB cancel; ESC followed by anything else cancels the OSC (and that ESC starts a new escape); other C0 bytes inside the payload are ignored, as vte ignores them. It only collects OSCs whose number is `9` or `777`; every other OSC is skipped without buffering. Payloads over 4096 bytes are dropped. A BEL that terminates an OSC never counts as a bell, because bells only come from alacritty's own `Bell` event and alacritty makes the same distinction.
+`notify::osc::Scanner` is a small byte state machine (`Ground → Esc → OscNum → OscBody → OscEsc`) that keeps its state between calls, so a sequence split across reads is found. It follows vte where that matters (other C0 bytes inside the payload are ignored; any ESC ends the OSC and starts a new escape) but is stricter about completion: only BEL or `ESC \` complete a notification. vte also dispatches an OSC ended by CAN, SUB or a stray ESC; Brindle treats those as cancelled, so a truncated or interrupted sequence never pops up a half message. It only collects OSCs whose number is `9` or `777`; every other OSC is skipped without buffering. Payloads over 4096 bytes are dropped. A BEL that terminates an OSC never counts as a bell, because bells only come from alacritty's own `Bell` event and alacritty makes the same distinction.
 
 C1 introducers (0x9D) are not recognised: vte 0.15 runs in UTF-8 mode, where 0x9D is a continuation byte, so alacritty doesn't treat it as OSC either.
 

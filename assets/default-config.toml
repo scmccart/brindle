@@ -26,6 +26,17 @@ line_height = 1.25
 shape = "block"   # block | beam | underline
 blink = true
 
+# Desktop notifications. Programs ask for them with OSC 9 or OSC 777, e.g.
+#   printf '\033]777;notify;Build;finished\a'
+# and a bell (BEL) raises one too. Clicking a notification shows its tab.
+[notifications]
+bell = true
+osc9 = true
+osc777 = true
+# "unfocused": only for a tab that isn't in front of you (a background tab,
+# or any tab while its window isn't focused). "always": every time.
+when = "unfocused"
+
 # ---------------------------------------------------------------------------
 # Profiles. Open the new-tab palette with ctrl-shift-space, or open profile N
 # directly with ctrl-alt-N.
