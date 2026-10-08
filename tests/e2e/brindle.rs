@@ -274,6 +274,8 @@ pub struct Dump {
     pub screen: Vec<String>,
     /// The settings dialog's line, when it is open.
     pub settings: Option<String>,
+    /// The active terminal's selected text, when there is a selection.
+    pub selection: Option<String>,
 }
 
 impl Dump {
@@ -293,6 +295,8 @@ impl Dump {
                 in_screen = true;
             } else if let Some(rest) = line.strip_prefix("--- grid ") {
                 dump.grid = parse_grid(rest);
+            } else if let Some(rest) = line.strip_prefix("--- selection ") {
+                dump.selection = unquote(rest);
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
@@ -307,6 +311,32 @@ impl Dump {
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
+}
+
+/// Undoes the Rust `{:?}` quoting of a string (the escapes it produces
+/// for ordinary text).
+fn unquote(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '0' => out.push('\0'),
+            'u' => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 /// `origin=6,51 cell=8.4x18 scale=1`
@@ -354,6 +384,12 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.grid == Some(grid), "grid {:?}", dump.grid);
     ensure!(dump.screen == ["hello", "", "world"], "screen {:?}", dump.screen);
     ensure!(dump.settings.is_none(), "settings {:?}", dump.settings);
+    ensure!(dump.selection.is_none(), "selection {:?}", dump.selection);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- selection \"one\\ntwo \\\"q\\\" \\u{1b}\"\nhi\n",
+    );
+    ensure!(dump.selection.as_deref() == Some("one\ntwo \"q\" \x1b"), "selection {:?}", dump.selection);
+    ensure!(dump.screen == ["hi"], "screen after selection {:?}", dump.screen);
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);

@@ -18,9 +18,9 @@
 
 ## 3. Actions, rendering and config
 
-- [ ] 3.1 Add `JumpToPreviousPrompt`, `JumpToNextPrompt`, `SelectLastOutput` and `CopyLastOutput` to `actions.rs` with labels, config names and default bindings ctrl-shift-up/down (`Terminal` context), replacing the `ScrollLine*` defaults. Handle them in `TerminalView`, with line-scroll fallback. Verify with `cargo test actions`, and check `--list-actions`.
-- [ ] 3.2 Add `mark_failed_commands` (default `true`) to `Config` and `assets/default-config.toml`, and draw the gutter bar in `TerminalElement::prepaint`/`paint`. Verify that the `default_config_file_parses` test still passes and that `cargo build` succeeds.
-- [ ] 3.3 Add the `--- selection` dump line and parse it in the e2e `Dump`. Verify with the harness self-test (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`).
+- [x] 3.1 Add `JumpToPreviousPrompt`, `JumpToNextPrompt`, `SelectLastOutput` and `CopyLastOutput` to `actions.rs` with labels, config names and default bindings ctrl-shift-up/down (`Terminal` context), replacing the `ScrollLine*` defaults. Handle them in `TerminalView`, with line-scroll fallback. Verify with `cargo test actions`, and check `--list-actions`.
+- [x] 3.2 Add `mark_failed_commands` (default `true`) to `Config` and `assets/default-config.toml`, and draw the gutter bar in `TerminalElement::prepaint`/`paint`. Verify that the `default_config_file_parses` test still passes and that `cargo build` succeeds.
+- [x] 3.3 Add the `--- selection` dump line and parse it in the e2e `Dump`. Verify with the harness self-test (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`).
 
 ## 4. Shell scripts and CLI
 

@@ -822,6 +822,9 @@ impl Workspace {
             if let Some(grid) = self.tabs.get(self.active).and_then(|t| t.active_grid(cx)) {
                 out.push_str(&grid.describe(scale));
             }
+            if let Some(text) = terminal.selection_text() {
+                out.push_str(&format!("--- selection {text:?}\n"));
+            }
             out.push_str(&terminal.screen_text());
         }
         match &self.overlay {

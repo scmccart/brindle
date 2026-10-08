@@ -382,12 +382,9 @@ pub struct Marks {
 }
 
 impl Marks {
+    #[cfg(test)]
     pub fn commands(&self) -> &VecDeque<Command> {
         &self.commands
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
     }
 
     /// A position's grid line (`Line` value; negative is history).
