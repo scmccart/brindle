@@ -65,8 +65,9 @@ impl State {
         State { version: VERSION, windows }
     }
 
-    /// Parses a state file. Unknown versions, malformed data and states
-    /// with nothing to restore are errors, each with a reason to log.
+    /// Parses a state file. Unknown versions and malformed data are errors,
+    /// each with a reason to log. Windows without tabs are dropped, so the
+    /// result may have no windows (the last window was closed).
     pub fn parse(text: &str) -> Result<State, String> {
         #[derive(Deserialize)]
         struct Version {
@@ -80,9 +81,6 @@ impl State {
         }
         let mut state: State = toml::from_str(text).map_err(|e| format!("not a valid state file: {}", e.message()))?;
         state.windows.retain(|w| !w.tabs.is_empty());
-        if state.windows.is_empty() {
-            return Err("no windows recorded".into());
-        }
         for window in &mut state.windows {
             window.active = window.active.min(window.tabs.len() - 1);
         }
@@ -121,7 +119,12 @@ pub fn load(dir: &Path) -> Result<Option<State>, String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("ignoring session state {}: {err}", path.display())),
     };
-    State::parse(&text).map(Some).map_err(|why| format!("ignoring session state {}: {why}", path.display()))
+    match State::parse(&text) {
+        // Nothing was open at the end (the last tab closed): a normal launch.
+        Ok(state) if state.windows.is_empty() => Ok(None),
+        Ok(state) => Ok(Some(state)),
+        Err(why) => Err(format!("ignoring session state {}: {why}", path.display())),
+    }
 }
 
 static WRITE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -386,9 +389,9 @@ mod tests {
         assert!(State::parse("[[windows]]\nactive = 0\n").unwrap_err().contains("no format version"));
         let unknown_kind = "version = 1\n[[windows]]\n[[windows.tabs]]\nkind = \"ssh\"\nprofile = \"x\"\n";
         assert!(State::parse(unknown_kind).is_err());
-        assert!(State::parse("version = 1\n").unwrap_err().contains("no windows"));
+        assert!(State::parse("version = 1\n").unwrap().windows.is_empty());
         // Windows without tabs are dropped, then nothing is left.
-        assert!(State::parse("version = 1\n[[windows]]\nactive = 0\n").is_err());
+        assert!(State::parse("version = 1\n[[windows]]\nactive = 0\n").unwrap().windows.is_empty());
     }
 
     #[test]
@@ -414,6 +417,9 @@ mod tests {
         write_atomic(&dir, "version = 1\n", new).unwrap();
         write_atomic(&dir, &sample().to_text(), old).unwrap();
         assert_eq!(std::fs::read_to_string(state_path(&dir)).unwrap(), "version = 1\n");
+        // A state with no windows is a normal launch, not an error.
+        write_atomic(&dir, "version = 1\nwindows = []\n", next_generation()).unwrap();
+        assert_eq!(load(&dir), Ok(None));
         std::fs::write(state_path(&dir), "garbage").unwrap();
         assert!(load(&dir).unwrap_err().contains("ignoring session state"));
         std::fs::remove_dir_all(&dir).ok();
@@ -533,7 +539,7 @@ mod tests {
         let mut store = SessionStore { lock: Some(Lock::acquire(&dir).unwrap()), ..Default::default() };
         store.forget(1);
         let text = store.pending_write().expect("written");
-        assert!(State::parse(&text).is_err(), "nothing to restore: {text}");
+        assert!(State::parse(&text).unwrap().windows.is_empty(), "nothing to restore: {text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

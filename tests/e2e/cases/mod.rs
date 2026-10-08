@@ -52,6 +52,7 @@ pub fn all() -> Vec<Case> {
         display("restore-fallbacks", restore::fallbacks),
         display("restore-tmux-session", restore::tmux_session),
         display("restore-forget-on-exit", restore::forget_on_exit),
+        display("restore-close-window", restore::close_window),
         display("restore-second-instance", restore::second_instance),
     ]
 }

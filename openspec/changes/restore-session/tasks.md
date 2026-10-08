@@ -31,6 +31,7 @@
 
   A second run with the tmux entry active makes tmux's current window the active tab. Verify with the same command.
 - [x] 4.5 `restore-forget-on-exit` (the only tab exits, so the state records no windows) and `restore-second-instance` (a second process neither restores nor records, and says so in its log). Verify with the same command.
+- [x] 4.6 `restore-close-window`: `close_window` on the only window, which still has a tab, quits and keeps the tab and its directory for the next launch. `restore-forget-on-exit` also checks that the launch after an `exit` is a normal one and logs no "ignoring session state". Verify with the same command.
 
 ## 5. Integration
 
