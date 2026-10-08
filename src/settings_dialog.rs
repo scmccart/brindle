@@ -68,6 +68,10 @@ enum Slot {
     SelectionBackground,
     SelectionForeground,
     Accent,
+    SearchMatchBackground,
+    SearchMatchForeground,
+    SearchFocusedBackground,
+    SearchFocusedForeground,
     Ansi(usize),
 }
 
@@ -90,7 +94,7 @@ const ANSI_NAMES: [&str; 16] = [
     "Bright white",
 ];
 
-const SLOTS: [Slot; 23] = [
+const SLOTS: [Slot; 27] = [
     Slot::Foreground,
     Slot::Background,
     Slot::Cursor,
@@ -98,6 +102,10 @@ const SLOTS: [Slot; 23] = [
     Slot::SelectionBackground,
     Slot::SelectionForeground,
     Slot::Accent,
+    Slot::SearchMatchBackground,
+    Slot::SearchMatchForeground,
+    Slot::SearchFocusedBackground,
+    Slot::SearchFocusedForeground,
     Slot::Ansi(0),
     Slot::Ansi(1),
     Slot::Ansi(2),
@@ -126,6 +134,10 @@ impl Slot {
             Slot::SelectionBackground => "Selection background",
             Slot::SelectionForeground => "Selection foreground",
             Slot::Accent => "Accent",
+            Slot::SearchMatchBackground => "Search match",
+            Slot::SearchMatchForeground => "Search match text",
+            Slot::SearchFocusedBackground => "Current match",
+            Slot::SearchFocusedForeground => "Current match text",
             Slot::Ansi(i) => ANSI_NAMES[i],
         }
     }
@@ -145,6 +157,10 @@ impl Slot {
             Slot::SelectionBackground => Some(theme.selection_background),
             Slot::SelectionForeground => theme.selection_foreground,
             Slot::Accent => theme.accent,
+            Slot::SearchMatchBackground => theme.search_match_background,
+            Slot::SearchMatchForeground => theme.search_match_foreground,
+            Slot::SearchFocusedBackground => theme.search_focused_match_background,
+            Slot::SearchFocusedForeground => theme.search_focused_match_foreground,
             Slot::Ansi(i) => Some(theme.ansi[i]),
         }
     }
@@ -159,6 +175,10 @@ impl Slot {
             (Slot::CursorText, Some(c)) => theme.cursor_text = Some(c),
             (Slot::SelectionBackground, Some(c)) => theme.selection_background = c,
             (Slot::Accent, Some(c)) => theme.accent = Some(c),
+            (Slot::SearchMatchBackground, Some(c)) => theme.search_match_background = Some(c),
+            (Slot::SearchMatchForeground, Some(c)) => theme.search_match_foreground = Some(c),
+            (Slot::SearchFocusedBackground, Some(c)) => theme.search_focused_match_background = Some(c),
+            (Slot::SearchFocusedForeground, Some(c)) => theme.search_focused_match_foreground = Some(c),
             (Slot::Ansi(i), Some(c)) => theme.ansi[i] = c,
         }
     }
@@ -1741,6 +1761,26 @@ background = "nope"
         type_into(&mut model, 2, "#123456");
         assert!(!model.next_section(true));
         assert_eq!(f.text(), CONFIG);
+    }
+
+    #[test]
+    fn copies_save_the_derived_search_colors() {
+        let f = Fixture::new("search-colors", CONFIG);
+        let mut model = f.model("tokyo-night");
+        model.start_new();
+        let tokyo = builtin_theme("tokyo-night").unwrap();
+        assert_eq!(editor(&model).current.search_focused_match_background, Some(tokyo.ansi[3]));
+        assert_eq!(model.confirm(), Outcome::Written);
+        let text = f.text();
+        let (match_bg, match_fg) = tokyo.search_match();
+        for (key, color) in [
+            ("search_match_background", match_bg),
+            ("search_match_foreground", match_fg),
+            ("search_focused_match_background", tokyo.ansi[3]),
+            ("search_focused_match_foreground", tokyo.background),
+        ] {
+            assert!(text.contains(&format!("{key} = \"{color}\"")), "{key} missing in:\n{text}");
+        }
     }
 
     #[test]
