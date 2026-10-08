@@ -27,9 +27,9 @@
 
 ## 6. End-to-end cases
 
-- [ ] 6.1 In `tests/e2e`, add a profile setter to `Run` and `--- find` parsing to `Dump`, plus a self-test line. Give the `e2e` theme explicit search colors. Verify with `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`.
-- [ ] 6.2 Add the case `search-local`: a local shell prints numbered lines with a token near the top, `--find` the token, then dump and capture. Check that the screen scrolled to the token, the dump count and focused position, that the focused cells are drawn in the focused match background, and that another visible match is drawn in the match background. Add `search-close-restores`: after `find_close` the screen is back at the bottom and has no highlight.
-- [ ] 6.3 Add the case `search-tmux-pane`: two panes print the same token, find it in the active pane, and check that the active pane's token is highlighted and the other pane's is not.
+- [x] 6.1 In `tests/e2e`, add a profile setter to `Run` and `--- find` parsing to `Dump`, plus a self-test line. Give the `e2e` theme explicit search colors. Verify with `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`.
+- [x] 6.2 Add the case `search-local`: a local shell prints numbered lines with a token near the top, `--find` the token, then dump and capture. Check that the screen scrolled to the token, the dump count and focused position, that the focused cells are drawn in the focused match background, and that another visible match is drawn in the match background. Add `search-close-restores`: after `find_close` the screen is back at the bottom and has no highlight.
+- [x] 6.3 Add the case `search-tmux-pane`: two panes print the same token, find it in the active pane, and check that the active pane's token is highlighted and the other pane's is not.
 - [ ] 6.4 Run the new cases and a regression sample (`settings-`, `colors-attach`, `dump-grid-geometry`) under `flock /tmp/brindle-gui.lock`, and verify that they pass.
 
 ## 7. Integration

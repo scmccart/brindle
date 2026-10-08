@@ -45,6 +45,9 @@ pub struct FindBar {
     /// `None` until counted (or for an empty query).
     count: Option<Count>,
     recount: Option<Task<()>>,
+    /// The last edit's search was limited to nearby lines and found
+    /// nothing; the next count searches the whole buffer once.
+    full_search_pending: bool,
 }
 
 /// What a closed bar leaves behind for the next one.
@@ -89,6 +92,7 @@ impl TerminalView {
                 saved_offset,
                 count: None,
                 recount: None,
+                full_search_pending: false,
             });
             self.research(cx);
         }
@@ -123,11 +127,13 @@ impl TerminalView {
         bar.focused = None;
         bar.count = None;
         bar.recount = None;
+        bar.full_search_pending = false;
         if let Some(regex) = &mut bar.regex {
             let mut term = self.terminal.read(cx).term().lock();
-            bar.focused = search::find_from(&term, regex, bar.origin);
-            if let Some(m) = &bar.focused {
-                search::scroll_to(&mut term, m);
+            bar.focused = search::find_from(&term, regex, bar.origin, Some(search::MAX_LINES_WHILE_TYPING));
+            match &bar.focused {
+                Some(m) => search::scroll_to(&mut term, m),
+                None => bar.full_search_pending = true,
             }
             drop(term);
             self.schedule_count(COUNT_AFTER_EDIT, cx);
@@ -141,7 +147,7 @@ impl TerminalView {
         let mut term = self.terminal.read(cx).term().lock();
         let next = match &bar.focused {
             Some(current) => search::step(&term, regex, current, step),
-            None => search::find_from(&term, regex, search::view_bottom(&term)),
+            None => search::find_from(&term, regex, search::view_bottom(&term), None),
         };
         if let Some(m) = &next {
             bar.origin = *m.start();
@@ -150,6 +156,7 @@ impl TerminalView {
         bar.focused = next;
         bar.count = Some(search::count(&term, regex, bar.focused.as_ref(), COUNT_CAP));
         bar.recount = None;
+        bar.full_search_pending = false;
         drop(term);
         cx.notify();
     }
@@ -168,7 +175,13 @@ impl TerminalView {
         let Some(bar) = &mut self.find else { return };
         bar.recount = None;
         let Some(regex) = &mut bar.regex else { return };
-        let term = self.terminal.read(cx).term().lock();
+        let mut term = self.terminal.read(cx).term().lock();
+        if std::mem::take(&mut bar.full_search_pending) {
+            bar.focused = search::find_from(&term, regex, bar.origin, None);
+            if let Some(m) = &bar.focused {
+                search::scroll_to(&mut term, m);
+            }
+        }
         let count = search::count(&term, regex, bar.focused.as_ref(), COUNT_CAP);
         drop(term);
         if bar.focused.is_some() && count.index.is_none() && !count.capped {

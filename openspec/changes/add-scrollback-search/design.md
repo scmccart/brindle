@@ -161,7 +161,9 @@ It runs:
 
 The count pass also checks that the current match is still one of the matches. If output shifted the grid under it, the current match is cleared, and the bar shows `–/N` until the next step.
 
-A query with no match scans the whole buffer, at most 10,000 lines by default. That is what `search_next` does on every keystroke anyway, and the debounce keeps it off the typing path.
+A query with no match scans the whole buffer, at most 10,000 lines by default. Measured during implementation, at 114 columns with alacritty at opt-level 2: about 60 ms for a full scan with no match, and about 1 ms for a capped count of a common letter.
+
+60 ms on every keystroke is noticeable, so while the query is being edited, the search for the current match looks at most 1000 lines up from the origin (`MAX_LINES_WHILE_TYPING`, alacritty's own limit while typing). If that finds nothing, the debounced count pass runs one full search from the origin before counting. A distant match is therefore still found and scrolled to about 100 ms after the user stops typing. Enter and shift-enter always search the whole buffer.
 
 ### 11. Editing and the restored query
 
