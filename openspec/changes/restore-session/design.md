@@ -112,9 +112,13 @@ The first process that needs the state (at launch with the setting on, or on the
 
 ### 11. Window size
 
-- **Recorded:** the size of `window.inner_window_bounds()` (the restore size, even when maximized), and `maximized` from the `WindowBounds::Maximized` variant. Fullscreen is recorded as not maximized. `window_bounds()` was tried first. Under Xwayland it includes the 6 px client-decoration inset on each side, so the window grew by 12×12 px on every restore (1000×660 → 1012×672 → 1024×684). `inner_window_bounds()` gives back exactly the requested 1000×660.
+- **Recorded:** the window's size and `maximized` (from the `WindowBounds::Maximized` variant). Fullscreen is recorded as not maximized. Neither platform size can be recorded as is:
+  - `window_bounds()` includes the 6 px client-decoration inset on each side once the window manager has applied GPUI's `_GTK_FRAME_EXTENTS`. Recording it grew the window by 12×12 px on every restore (1000×660 → 1012×672 → 1024×684).
+  - `inner_window_bounds()` subtracts the inset whether or not the window manager has applied it yet. One e2e run recorded 988×648.
+
+  So each `Workspace` keeps the size it was opened with (`window.bounds()` at creation, which is the requested size). A snapshot keeps that size while the outer and inner sizes are both within 2×inset+1 px of it. Otherwise the user resized the window, and the inner size (what they see) becomes the new size to keep. While maximized, the last windowed size is recorded, because X11 reports the maximized size as the bounds. The pure rule (`recorded_size`) is unit-tested, and the e2e round trip checks that 1000×660 survives a restore (stable over repeated runs).
 - **Restored:** `WindowBounds::Windowed(Bounds::centered(size))`, or `Maximized(...)`, which GPUI turns into `zoom()` when it opens the window. Sizes are clamped to at least the 360×200 minimum.
-- The e2e round trip checks under X11 that the size doesn't drift across restores. With client-side decorations on Wayland, GPUI's bounds might include the shadow inset, which would grow the window on each restore. If the X11 check shows `inner_window_bounds` is the one that matches the requested size, that is used instead. The Wayland case is left for the user's hand test.
+- A resize smaller than 13 px is ignored by this rule, which is accepted. Native Wayland (not Xwayland) isn't exercised by the e2e suite, so it is part of the hand-test checklist.
 
 ### 12. Code layout
 

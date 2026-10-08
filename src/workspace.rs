@@ -221,6 +221,9 @@ pub struct Workspace {
     /// Restored tmux sessions without tabs yet: their first tab goes after
     /// this tab (`None`: at the front).
     anchors: HashMap<EntityId, Option<u64>>,
+    /// The window's size as recorded for restore: the size it opened
+    /// with, until the user resizes it (see [`recorded_size`]).
+    windowed_size: std::cell::Cell<Size<Pixels>>,
 }
 
 impl Workspace {
@@ -239,6 +242,7 @@ impl Workspace {
             order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             quiet_sessions: HashSet::new(),
             anchors: HashMap::new(),
+            windowed_size: std::cell::Cell::new(window.bounds().size),
         };
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
             // Foreground processes change without any event (e.g. `vim`
@@ -348,14 +352,16 @@ impl Workspace {
         }
         tabs.extend(pending.iter().filter(|s| !self.anchors.contains_key(&s.entity_id())).map(|s| session_tab(s)));
         let (tabs, active) = session::collapse(&tabs, active.unwrap_or(0));
-        // Without the client-side-decoration inset, which `open_window` adds back.
-        let (bounds, maximized) = match window.inner_window_bounds() {
-            WindowBounds::Maximized(b) => (b, true),
-            WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
-        };
+        let maximized = matches!(window.window_bounds(), WindowBounds::Maximized(_));
+        if !maximized {
+            let outer = window.window_bounds().get_bounds().size;
+            let inner = window.inner_window_bounds().get_bounds().size;
+            self.windowed_size.set(recorded_size(self.windowed_size.get(), outer, inner));
+        }
+        let size = self.windowed_size.get();
         WindowState {
-            width: Some(f32::from(bounds.size.width).round()),
-            height: Some(f32::from(bounds.size.height).round()),
+            width: Some(f32::from(size.width).round()),
+            height: Some(f32::from(size.height).round()),
             maximized,
             active,
             tabs,
@@ -1220,6 +1226,21 @@ fn set_tab_theme(tab: &Tab, theme: Theme, cx: &mut App) {
     }
 }
 
+/// The size to record for a window last recorded (or opened) at `known`,
+/// whose platform bounds are now `outer`, or `inner` without the client
+/// inset. Whether the window manager has grown the window by the inset yet
+/// varies (X11 only gets `_GTK_FRAME_EXTENTS`), so either can be off by
+/// the inset on each side: within that, `known` stands. A bigger change is
+/// the user resizing, and then the inner size is what they see.
+fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) -> Size<Pixels> {
+    let slack = 2.0 * RESIZE_BORDER + 1.0;
+    let near = |a: Size<Pixels>| {
+        (f32::from(a.width) - f32::from(known.width)).abs() <= slack
+            && (f32::from(a.height) - f32::from(known.height)).abs() <= slack
+    };
+    if near(outer) && near(inner) { known } else { inner }
+}
+
 /// The keys that run `action` in the element `focus`, as the palettes show them.
 fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
@@ -1408,6 +1429,17 @@ mod tests {
         assert_eq!(resize_edge(point(px(400.0), px(598.0)), i, s), Some(ResizeEdge::Bottom));
         assert_eq!(resize_edge(point(px(799.0), px(300.0)), i, s), Some(ResizeEdge::Right));
         assert_eq!(resize_edge(point(px(400.0), px(300.0)), i, s), None);
+    }
+
+    #[test]
+    fn recorded_sizes() {
+        let known = size(px(1000.0), px(660.0));
+        // Before and after the window manager adds the inset.
+        assert_eq!(recorded_size(known, known, size(px(988.0), px(648.0))), known);
+        assert_eq!(recorded_size(known, size(px(1012.0), px(672.0)), known), known);
+        // Resized by the user.
+        let inner = size(px(1188.0), px(748.0));
+        assert_eq!(recorded_size(known, size(px(1200.0), px(760.0)), inner), inner);
     }
 
     #[test]

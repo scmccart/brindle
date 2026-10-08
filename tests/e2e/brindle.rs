@@ -48,12 +48,17 @@ pub mod theme {
 
 /// The test config, with `theme_name` as the global theme.
 pub fn config(socket: &str, theme_name: &str) -> String {
+    config_with(socket, theme_name, "tmux", "")
+}
+
+/// The test config with another default profile and extra top-level lines.
+pub fn config_with(socket: &str, theme_name: &str, default_profile: &str, top: &str) -> String {
     use theme::*;
     let ansi: Vec<String> = ANSI.iter().map(|c| format!("\"{}\"", c.hex())).collect();
     format!(
-        r#"default_profile = "tmux"
+        r#"default_profile = "{default_profile}"
 theme = "{theme_name}"
-padding = 6
+{top}padding = 6
 
 [cursor]
 blink = false
@@ -106,6 +111,11 @@ pub struct Run<'a> {
     timeline: Vec<(f64, Event)>,
     dump_at: f64,
     capture_at: Option<f64>,
+    /// Session restore: a plain launch (no `-p`) with `restore_session`
+    /// on and the state in `<case dir>/state`.
+    restore: bool,
+    default_profile: &'static str,
+    args: Vec<String>,
 }
 
 pub struct Output {
@@ -125,7 +135,28 @@ impl<'a> Run<'a> {
             timeline: Vec::new(),
             dump_at: 4.0,
             capture_at: None,
+            restore: false,
+            default_profile: "tmux",
+            args: Vec::new(),
         }
+    }
+
+    /// Launches without `-p`, with session restore on and its state in
+    /// [`state_dir`].
+    pub fn restore(mut self) -> Self {
+        self.restore = true;
+        self
+    }
+
+    pub fn default_profile(mut self, name: &'static str) -> Self {
+        self.default_profile = name;
+        self
+    }
+
+    /// An extra command-line argument.
+    pub fn arg(mut self, arg: &str) -> Self {
+        self.args.push(arg.to_string());
+        self
     }
 
     /// Types text into the active tab (`\r` is Enter). Steps run 1 s apart.
@@ -172,11 +203,19 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        std::fs::write(&config_path, config(&self.server.socket, "e2e")).map_err(|e| e.to_string())?;
+        let top = if self.restore { "restore_session = true\n" } else { "" };
+        let text = config_with(&self.server.socket, "e2e", self.default_profile, top);
+        std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
-        let mut child = Command::new(&ctx.bin)
-            .args(["-p", "tmux"])
+        let mut command = Command::new(&ctx.bin);
+        if self.restore {
+            command.env("BRINDLE_STATE_DIR", state_dir(ctx));
+        } else {
+            command.args(["-p", "tmux"]);
+        }
+        let mut child = command
+            .args(&self.args)
             .args(&self.steps)
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
@@ -252,6 +291,11 @@ impl<'a> Run<'a> {
         ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
     }
+}
+
+/// The session-restore state directory of runs made with [`Run::restore`].
+pub fn state_dir(ctx: &Ctx) -> std::path::PathBuf {
+    ctx.dir.join("state")
 }
 
 /// Where the active terminal's cells are, in logical window pixels.
