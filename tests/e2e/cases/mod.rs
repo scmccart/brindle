@@ -3,6 +3,7 @@
 mod colors;
 mod dump;
 mod geometry;
+mod restore;
 mod settings;
 mod styles;
 mod titles;
@@ -47,6 +48,11 @@ pub fn all() -> Vec<Case> {
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
+        display("restore-local-tabs", restore::local_tabs),
+        display("restore-fallbacks", restore::fallbacks),
+        display("restore-tmux-session", restore::tmux_session),
+        display("restore-forget-on-exit", restore::forget_on_exit),
+        display("restore-second-instance", restore::second_instance),
     ]
 }
 

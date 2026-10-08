@@ -307,9 +307,10 @@ impl SessionStore {
 
     /// Drops a window, e.g. because its last tab closed.
     pub fn forget(&mut self, window: u64) {
-        let before = self.entries.len();
         self.entries.retain(|e| e.window != window);
-        self.touched |= self.entries.len() != before;
+        // Even if the window was never recorded (its tabs closed within the
+        // first second), the file it was restored from is now out of date.
+        self.touched = true;
     }
 
     /// Drops windows that closed, unless none are left: then the app is
@@ -524,5 +525,15 @@ mod tests {
         assert!(store.state().windows.is_empty());
         assert!(store.pending_write().is_some(), "an emptied store is written");
         std::fs::remove_dir_all(tmp_dir("store")).ok();
+    }
+
+    #[test]
+    fn forgetting_an_unrecorded_window_still_writes() {
+        let dir = tmp_dir("forget");
+        let mut store = SessionStore { lock: Some(Lock::acquire(&dir).unwrap()), ..Default::default() };
+        store.forget(1);
+        let text = store.pending_write().expect("written");
+        assert!(State::parse(&text).is_err(), "nothing to restore: {text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

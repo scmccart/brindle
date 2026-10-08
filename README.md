@@ -102,7 +102,7 @@ in `~/.config/brindle` is kept either way.
 ## Usage
 
 ```
-brindle [-p PROFILE] [-d DIR] [-e COMMAND ARGS...]
+brindle [-p PROFILE] [-d DIR] [--no-restore] [-e COMMAND ARGS...]
 brindle --list-actions | --list-themes
 brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
@@ -138,6 +138,31 @@ Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usua
 **Breaking change:** ctrl-shift-p used to open the profile list and now opens the
 command palette. The profile list is on ctrl-shift-space and the `⌄` button; to
 get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.
+
+### Session restore
+
+With `restore_session = true` in the config (it is off by default), launching
+`brindle` with none of `-p`, `-d` or `-e` reopens the windows and tabs you had
+when it last quit:
+
+- each window's size, its tabs in order, and its active tab;
+- each tab's profile, in its shell's last directory;
+- classic tmux tabs, which reattach to their session;
+- control-mode sessions, attached once each. Their windows come back as tabs
+  where they were, and tmux's current window and panes are left as they are.
+
+Scrollback and running programs are not restored: shells start fresh in
+their directory. `brindle --no-restore` skips restoring once.
+
+The state is written to `~/.local/state/brindle/session.toml`
+(`$XDG_STATE_HOME/brindle/`, or `$BRINDLE_STATE_DIR` when it is set) a second
+or two after anything changes, and again on quit, so a crash or logout loses
+at most the last couple of seconds. If a profile or directory has gone
+since then, the default profile or the home directory is used. A tmux session
+that no longer exists is created again. Closing a window's last tab forgets
+that window, and quitting keeps everything that is open. While one Brindle is
+running, launching another one opens a normal window and doesn't touch the
+saved session.
 
 ### tmux control mode
 
