@@ -59,6 +59,8 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - `Pty`: alacritty's `EventLoop` runs on its own thread.
   - `Remote`: bytes are pushed in with `feed()` and input goes to a closure. Used for tmux panes and for error-message tabs (`Terminal::message`).
 
+  `links.rs` finds URLs in a line of chars and runs the opener (`xdg-open`, or `BRINDLE_LINK_OPENER`) on a background thread. `link_at` returns the link at a grid point: the cell's OSC 8 hyperlink, or else a URL found in the logical line, where rows are joined by `WRAPLINE`. `TerminalView` looks links up only in event handlers while ctrl is held (hover) or on a ctrl-click, never in `prepaint`, which just underlines the stored spans.
+
   Alacritty events reach GPUI through an unbounded channel drained by a spawned task. Replies the emulator generates go through `reply()`, which drops them for `Remote` terminals, because tmux answers terminal queries itself. `keys.rs` and `mouse.rs` are pure xterm encoders with unit tests.
 - **`terminal_view.rs` / `terminal_element.rs`**
   - Key handling: GPUI resolves keybindings *before* `on_key_down`. `key_down` encodes special keys and modifier combos and calls `stop_propagation`. Plain text (no modifiers or shift only) instead arrives through the `EntityInputHandler` path, which is what makes IME work. That's why app shortcuts are ctrl-shift-*.
