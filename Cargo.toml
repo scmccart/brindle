@@ -30,6 +30,8 @@ raw-window-handle = "0.6"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.31.2", features = ["client", "staging"] }
+# The PTY wrapper that scans output implements alacritty's polling traits.
+polling = "3.8"
 
 [dev-dependencies]
 # Window captures for the end-to-end suite; the version GPUI already uses.

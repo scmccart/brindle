@@ -685,6 +685,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "polling",
  "raw-window-handle",
  "serde",
  "smallvec",
