@@ -12,14 +12,14 @@ use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task,
-    UTF16Selection, Window, div,
+    IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription,
+    Task, UTF16Selection, Window, div,
 };
 
 use crate::actions::*;
 use crate::terminal::mouse::{self, Button};
-use crate::terminal::{Terminal, keys, report_focus};
+use crate::terminal::{Link, Terminal, keys, links, report_focus};
 use crate::terminal_element::TerminalElement;
 
 /// Geometry of the last painted frame, used for hit-testing.
@@ -59,6 +59,22 @@ impl GridLayout {
         )
     }
 
+    /// Whether `position` is over one of the grid's cells.
+    pub fn contains(&self, position: Point<Pixels>) -> bool {
+        let right = self.origin.x + self.cell_width * self.cols as f32;
+        position.x >= self.origin.x
+            && position.x < right
+            && self.contains_y(position.y) == std::cmp::Ordering::Equal
+    }
+
+    /// Logical window position of the centre of a cell (for debug hooks).
+    pub fn cell_center(&self, col: usize, line: usize) -> Point<Pixels> {
+        Point {
+            x: self.origin.x + self.cell_width * (col as f32 + 0.5),
+            y: self.origin.y + self.line_height * (line as f32 + 0.5),
+        }
+    }
+
     pub fn contains_y(&self, y: Pixels) -> std::cmp::Ordering {
         let top = self.origin.y;
         let bottom = top + self.line_height * self.rows as f32;
@@ -72,6 +88,36 @@ impl GridLayout {
     }
 }
 
+/// A `--hover` or `--click` debug step: `[mods-]COL,ROW`, zero-based cells
+/// of the active terminal, e.g. `ctrl-3,0` or `ctrl-shift-10,2`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointerStep {
+    pub modifiers: Modifiers,
+    pub col: usize,
+    pub row: usize,
+    pub click: bool,
+}
+
+impl PointerStep {
+    pub fn parse(text: &str, click: bool) -> Result<PointerStep, String> {
+        let mut parts: Vec<&str> = text.split('-').collect();
+        let position = parts.pop().unwrap_or_default();
+        let mut modifiers = Modifiers::default();
+        for part in parts {
+            match part {
+                "ctrl" | "control" => modifiers.control = true,
+                "shift" => modifiers.shift = true,
+                "alt" => modifiers.alt = true,
+                "super" | "platform" => modifiers.platform = true,
+                other => return Err(format!("unknown modifier {other:?} in {text:?}")),
+            }
+        }
+        let (col, row) = position.split_once(',').ok_or_else(|| format!("expected COL,ROW in {text:?}"))?;
+        let number = |s: &str| s.trim().parse::<usize>().map_err(|_| format!("bad cell {s:?} in {text:?}"));
+        Ok(PointerStep { modifiers, col: number(col)?, row: number(row)?, click })
+    }
+}
+
 #[derive(Default)]
 struct MouseState {
     selecting: bool,
@@ -79,6 +125,19 @@ struct MouseState {
     reported_button: Option<Button>,
     last_reported_cell: Option<(usize, usize)>,
     scroll_remainder: f32,
+    /// Last position seen over this terminal.
+    pointer: Option<Point<Pixels>>,
+    /// The cell `hovered_link` was computed for (`None` when ctrl isn't held).
+    hover_cell: Option<(usize, usize)>,
+    /// Modifiers of the last pointer event.
+    modifiers: Modifiers,
+    /// A ctrl-press on this link opens it if released over the same link.
+    pending_link: Option<Link>,
+}
+
+/// Link activation takes ctrl without alt (alt-drag stays a block selection).
+fn wants_links(modifiers: &Modifiers) -> bool {
+    modifiers.control && !modifiers.alt
 }
 
 pub struct TerminalView {
@@ -90,6 +149,8 @@ pub struct TerminalView {
     pub layout: Rc<Cell<Option<GridLayout>>>,
     pub blink_visible: bool,
     pub marked_text: Option<String>,
+    /// The link under the mouse while ctrl is held; underlined when painted.
+    pub hovered_link: Option<Link>,
     mouse: MouseState,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
@@ -114,7 +175,13 @@ impl TerminalView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
-            cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&terminal, |this, _, cx| {
+                // Output may have changed the text under an underlined link.
+                if this.hovered_link.is_some() {
+                    this.refresh_hover(cx);
+                }
+                cx.notify()
+            }),
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
                 this.blink_visible = true;
                 this.start_blinking(window, cx);
@@ -131,6 +198,10 @@ impl TerminalView {
             cx.observe_window_activation(window, |this, window, cx| {
                 let focused = this.focus_handle.is_focused(window) && window.is_window_active();
                 this.report_focus(focused, cx);
+                // A ctrl release while another window is active never reaches us.
+                if !window.is_window_active() {
+                    this.clear_hover(cx);
+                }
                 cx.notify();
             }),
         ];
@@ -143,6 +214,7 @@ impl TerminalView {
             layout: Rc::new(Cell::new(None)),
             blink_visible: true,
             marked_text: None,
+            hovered_link: None,
             mouse: MouseState::default(),
             window_active: true,
             _blink: None,
@@ -233,6 +305,74 @@ impl TerminalView {
         self.terminal.update(cx, |t, cx| t.clear_scrollback(cx));
     }
 
+    // ---- links ----------------------------------------------------------------
+
+    /// The link at a window position over this terminal's grid. Looks at the
+    /// grid, so call it from event handlers, never while painting.
+    fn link_under(&self, position: Point<Pixels>, cx: &App) -> Option<Link> {
+        let layout = self.layout.get()?;
+        if !layout.contains(position) {
+            return None;
+        }
+        let (col, line, _) = layout.cell_at(position);
+        self.terminal.read(cx).link_at_viewport(col, line)
+    }
+
+    fn set_hovered(&mut self, link: Option<Link>, cx: &mut Context<Self>) {
+        if self.hovered_link != link {
+            self.hovered_link = link;
+            cx.notify();
+        }
+    }
+
+    /// Updates the hovered link for the pointer at `position`. The link is
+    /// looked up only while ctrl is held, and only when the cell changed
+    /// unless `force` (the text or the scroll position may have changed).
+    pub fn hover(&mut self, position: Point<Pixels>, modifiers: Modifiers, force: bool, cx: &mut Context<Self>) {
+        self.mouse.pointer = Some(position);
+        self.mouse.modifiers = modifiers;
+        if !wants_links(&modifiers) {
+            self.mouse.hover_cell = None;
+            self.set_hovered(None, cx);
+            return;
+        }
+        let cell = self.layout.get().filter(|l| l.contains(position)).map(|l| {
+            let (col, line, _) = l.cell_at(position);
+            (col, line)
+        });
+        if !force && cell.is_some() && cell == self.mouse.hover_cell {
+            return;
+        }
+        self.mouse.hover_cell = cell;
+        let link = cell.and_then(|_| self.link_under(position, cx));
+        self.set_hovered(link, cx);
+    }
+
+    /// Recomputes the hovered link where the pointer last was.
+    fn refresh_hover(&mut self, cx: &mut Context<Self>) {
+        if let Some(position) = self.mouse.pointer {
+            self.hover(position, self.mouse.modifiers, true, cx);
+        }
+    }
+
+    /// Drops hover feedback (the pointer left, or the window lost focus).
+    pub fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        self.mouse.hover_cell = None;
+        self.set_hovered(None, cx);
+    }
+
+    /// Ctrl pressed or released over this terminal.
+    pub fn modifiers_changed(&mut self, position: Point<Pixels>, modifiers: Modifiers, cx: &mut Context<Self>) {
+        self.hover(position, modifiers, true, cx);
+    }
+
+    fn copy_link(&mut self, _: &CopyLink, window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.mouse.pointer.unwrap_or_else(|| window.mouse_position());
+        if let Some(link) = self.link_under(position, cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(link.uri));
+        }
+    }
+
     // ---- mouse ----------------------------------------------------------------
 
     /// Whether mouse events go to the application rather than to selection.
@@ -246,6 +386,16 @@ impl TerminalView {
         let Some(layout) = self.layout.get() else { return };
         let (col, line, side) = layout.cell_at(e.position);
         let mode = self.mode(cx);
+
+        // A ctrl-click on a link is ours, even when the program reports the
+        // mouse (as shift is for selection). It opens on release.
+        if e.button == gpui::MouseButton::Left
+            && wants_links(&e.modifiers)
+            && let Some(link) = self.link_under(e.position, cx)
+        {
+            self.mouse.pending_link = Some(link);
+            return;
+        }
 
         if self.reporting(mode, &e.modifiers) {
             if let Some(button) = Button::from_gpui(e.button)
@@ -277,6 +427,10 @@ impl TerminalView {
 
     pub fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.get() else { return };
+        self.hover(e.position, e.modifiers, false, cx);
+        if self.mouse.pending_link.is_some() {
+            return;
+        }
         let (col, line, side) = layout.cell_at(e.position);
         let mode = self.mode(cx);
 
@@ -306,6 +460,14 @@ impl TerminalView {
     }
 
     pub fn mouse_up(&mut self, e: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if e.button == gpui::MouseButton::Left
+            && let Some(pressed) = self.mouse.pending_link.take()
+        {
+            if self.link_under(e.position, cx).is_some_and(|link| link.uri == pressed.uri) {
+                links::open(&pressed.uri);
+            }
+            return;
+        }
         if self.mouse.selecting && e.button == gpui::MouseButton::Left {
             self.mouse.selecting = false;
             self.terminal.update(cx, |t, cx| t.finish_selection(cx));
@@ -355,11 +517,31 @@ impl TerminalView {
         } else {
             self.terminal.update(cx, |t, cx| t.scroll(Scroll::Delta(lines), cx));
         }
+        // Different text may be under the pointer now.
+        self.hover(e.position, e.modifiers, true, cx);
     }
 
-    /// A selection drag or a reported button press is in progress.
+    /// Debug hook for `--hover` / `--click`: feeds GPUI mouse events for a
+    /// cell straight to this view's handlers. No OS-level input is made.
+    pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = self.layout.get() else {
+            log::error!("--hover/--click: the terminal hasn't been painted yet");
+            return;
+        };
+        let position = layout.cell_center(step.col, step.row);
+        let modifiers = step.modifiers;
+        self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
+        if step.click {
+            let button = gpui::MouseButton::Left;
+            self.mouse_down(&MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false }, window, cx);
+            self.mouse_up(&MouseUpEvent { button, position, modifiers, click_count: 1 }, window, cx);
+        }
+    }
+
+    /// A selection drag, a reported button press or a press on a link is in
+    /// progress.
     pub fn is_dragging(&self) -> bool {
-        self.mouse.selecting || self.mouse.reported_button.is_some()
+        self.mouse.selecting || self.mouse.reported_button.is_some() || self.mouse.pending_link.is_some()
     }
 }
 
@@ -374,6 +556,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::paste_primary))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::copy_link))
             .on_action(cx.listener(|this, _: &ScrollLineUp, _, cx| this.scroll(Scroll::Delta(1), cx)))
             .on_action(cx.listener(|this, _: &ScrollLineDown, _, cx| this.scroll(Scroll::Delta(-1), cx)))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.scroll(Scroll::PageUp, cx)))
@@ -480,6 +663,40 @@ mod tests {
         assert_eq!(grid.describe(2.0), "--- grid origin=6,51 cell=8.4x18 scale=2\n");
     }
     use gpui::{point, px};
+
+    #[test]
+    fn pointer_steps() {
+        let step = PointerStep::parse("ctrl-3,0", true).unwrap();
+        assert_eq!((step.col, step.row, step.click), (3, 0, true));
+        assert!(step.modifiers.control && !step.modifiers.shift && !step.modifiers.alt);
+        let step = PointerStep::parse("ctrl-shift-10,2", false).unwrap();
+        assert!(step.modifiers.control && step.modifiers.shift);
+        assert_eq!((step.col, step.row), (10, 2));
+        assert_eq!(PointerStep::parse("4,5", false).unwrap().modifiers, Modifiers::default());
+        assert!(PointerStep::parse("hyper-1,1", false).is_err());
+        assert!(PointerStep::parse("ctrl-1", false).is_err());
+        assert!(PointerStep::parse("ctrl-a,1", false).is_err());
+        assert!(PointerStep::parse("", false).is_err());
+    }
+
+    #[test]
+    fn grid_contains_and_centres() {
+        let layout = GridLayout {
+            origin: point(px(10.0), px(20.0)),
+            cell_width: px(8.0),
+            line_height: px(16.0),
+            cols: 80,
+            rows: 24,
+            cursor: None,
+        };
+        assert!(layout.contains(point(px(10.0), px(20.0))));
+        assert!(!layout.contains(point(px(9.0), px(20.0))));
+        assert!(!layout.contains(point(px(10.0 + 8.0 * 80.0), px(30.0))));
+        assert!(!layout.contains(point(px(20.0), px(20.0 + 16.0 * 24.0))));
+        let centre = layout.cell_center(3, 2);
+        assert_eq!(layout.cell_at(centre), (3, 2, Side::Left));
+        assert_eq!(centre, point(px(10.0 + 8.0 * 3.5), px(20.0 + 16.0 * 2.5)));
+    }
 
     #[test]
     fn hit_testing() {

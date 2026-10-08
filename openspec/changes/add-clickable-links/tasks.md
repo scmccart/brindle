@@ -2,19 +2,19 @@
 
 ## 1. Detection
 
-- [ ] 1.1 Add `src/terminal/links.rs` with `find_url(text, at)` (scheme list, run boundaries, trailing trimming, bracket balancing) and `valid_scheme(uri)`; verify with unit tests for sentence punctuation, parentheses, markdown links, balanced Wikipedia URLs, quotes, `mailto:`, unknown schemes, schemes inside words, and `at` outside the URL (`cargo test terminal::links`)
-- [ ] 1.2 Add `Link` and `Terminal::link_at(point)` in `src/terminal/mod.rs`: OSC 8 first (all visible cells with an equal hyperlink), else detection over the logical line joined by `WRAPLINE` (bounded to 32 rows each side, skipping wide-char spacers); verify with unit tests on a `Term` fed wrapped URLs, hard line breaks, wide characters and OSC 8 text (`cargo test terminal::tests`)
+- [x] 1.1 Add `src/terminal/links.rs` with `find_url(text, at)` (scheme list, run boundaries, trailing trimming, bracket balancing) and `has_scheme(uri)`; verify with unit tests for sentence punctuation, parentheses, markdown links, balanced Wikipedia URLs, quotes, `mailto:`, unknown schemes, schemes inside words, and `at` outside the URL (`cargo test terminal::links`)
+- [x] 1.2 Add `Link` and `Terminal::link_at(point)` in `src/terminal/mod.rs`: OSC 8 first (all visible cells with an equal hyperlink), else detection over the logical line joined by `WRAPLINE` (bounded to 32 rows each side, skipping wide-char spacers); verify with unit tests on a `Term` fed wrapped URLs, hard line breaks, wide characters and OSC 8 text (`cargo test terminal::tests`)
 
 ## 2. Opening
 
-- [ ] 2.1 Add `links::open(uri)`: `BRINDLE_LINK_OPENER` or `xdg-open`, spawned and reaped on a background thread with null stdio and its own process group, failures logged; verify with a unit test that runs a recording script through the override and finds the URI it wrote
+- [x] 2.1 Add `links::open(uri)`: `BRINDLE_LINK_OPENER` or `xdg-open`, spawned and reaped on a background thread with null stdio and its own process group, failures logged; verify with a unit test that runs a recording script through the override and finds the URI it wrote
 
 ## 3. Hover, click and copy in the view
 
 - [ ] 3.1 Track pointer and hovered link in `TerminalView` (`update_hover`), recomputed on mouse move (cell or modifier change), modifiers-changed, terminal output while hovered and wheel scroll, and cleared on leave and window deactivation; verify `cargo build` and the hover e2e case's `--- link` line
 - [ ] 3.2 Underline hovered-link cells in `prepaint` and use the pointing-hand cursor in `paint`, registering the modifiers-changed and widened mouse-move listeners; verify with the e2e capture that the underline is drawn under the link cells
 - [ ] 3.3 Implement the click rule in `mouse_down`/`mouse_up` (ctrl without alt on a link: consume, open on release over the same link; `is_dragging` covers the pending link); verify with the e2e cases for a local shell and a mouse-reporting program
-- [ ] 3.4 Add the `copy_link` action ("Copy Link Under Mouse", `Terminal` context, no default key) to `ACTIONS` and handle it in `TerminalView`; verify `brindle --list-actions` lists it and the actions unit tests pass
+- [x] 3.4 Add the `copy_link` action ("Copy Link Under Mouse", `Terminal` context, no default key) to `ACTIONS` and handle it in `TerminalView`; verify `brindle --list-actions` lists it and the actions unit tests pass
 
 ## 4. Debug hooks
 

@@ -50,7 +50,10 @@ OPTIONS:
 DEBUGGING:
         --send <TEXT>            Type TEXT into the active tab (\\r = Enter)
         --action <NAME>          Run an action (see --list-actions)
-                                 --send/--action steps run in order, 1s apart
+        --hover [MODS-]COL,ROW   Move the mouse over a cell of the active terminal
+                                 (e.g. ctrl-3,0); in-process, not OS input
+        --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
+                                 Steps run in order, 1s apart
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
 ";
 
@@ -58,6 +61,8 @@ DEBUGGING:
 enum Step {
     Send(String),
     Action(String),
+    /// `--hover` / `--click`, or the reason the position didn't parse.
+    Pointer(Result<terminal_view::PointerStep, String>),
 }
 
 #[derive(Default, Debug)]
@@ -113,6 +118,11 @@ fn parse_args() -> Args {
             }
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
+            "--hover" | "--click" => {
+                let click = arg == "--click";
+                let pos = it.next().unwrap_or_default();
+                args.steps.push(Step::Pointer(terminal_view::PointerStep::parse(&pos, click)));
+            }
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
             "--install-desktop" => install_desktop = true,
             "--uninstall-desktop" => uninstall_desktop = true,
@@ -270,6 +280,8 @@ fn main() {
                             Some(action) => window.dispatch_action(action, cx),
                             None => log::error!("--action: unknown action {name:?}"),
                         },
+                        Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
+                        Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
                     })
                     .ok();
             }
