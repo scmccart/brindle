@@ -8,6 +8,7 @@
 
 pub mod keys;
 pub mod mouse;
+mod pty;
 pub mod shell_integration;
 
 use std::borrow::Cow;
@@ -24,10 +25,13 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{self, NamedColor, Processor, Rgb, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
+use parking_lot::Mutex;
+
+use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::theme::{Color, Theme};
@@ -95,7 +99,6 @@ enum Backend {
         master_fd: i32,
     },
     Remote {
-        processor: Box<Processor<StdSyncHandler>>,
         input: Rc<dyn Fn(&[u8])>,
     },
 }
@@ -103,6 +106,11 @@ enum Backend {
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     backend: Backend,
+    /// The vte processor and OSC 133 scanner. Locked before `term`; the PTY
+    /// reader thread uses it too (see `pty.rs`).
+    parser: Arc<Mutex<Parser>>,
+    /// Shell-integration marks. Locked after `term`.
+    marks: Arc<Mutex<Marks>>,
     size: GridSize,
     title: Option<String>,
     exited: bool,
@@ -112,7 +120,7 @@ pub struct Terminal {
     copy_on_select: bool,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
-    /// Pending flush of a synchronized update (mode 2026) on remote terminals.
+    /// Pending flush of a synchronized update (mode 2026).
     sync_flush: Option<Task<()>>,
     _events: Task<()>,
 }
@@ -160,10 +168,13 @@ impl Terminal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
         rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
         backend: Backend,
+        parser: Arc<Mutex<Parser>>,
+        marks: Arc<Mutex<Marks>>,
         size: GridSize,
         theme: Theme,
         config: &Config,
@@ -173,6 +184,8 @@ impl Terminal {
             _events: Self::spawn_events(rx, cx),
             term,
             backend,
+            parser,
+            marks,
             size,
             title: None,
             exited: false,
@@ -218,10 +231,13 @@ impl Terminal {
         let listener = Listener(tx);
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
+        let parser = Arc::new(Mutex::new(Parser::new()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
         let spawned = (|| -> anyhow::Result<Backend> {
             let pty = tty::new(&options, size.into(), 0)?;
             let child_pid = pty.child().id();
             let master_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
+            let pty = pty::MarkedPty::new(pty, term.clone(), parser.clone(), marks.clone(), listener.clone())?;
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
@@ -230,7 +246,7 @@ impl Terminal {
 
         let theme = config.profile_theme(profile);
         match spawned {
-            Ok(backend) => Self::new(term, rx, backend, size, theme, config, cx),
+            Ok(backend) => Self::new(term, rx, backend, parser, marks, size, theme, config, cx),
             Err(err) => {
                 log::error!("failed to launch {program:?}: {err:#}");
                 let text = format!("\x1b[31mBrindle could not start {program:?}:\x1b[0m\r\n{err:#}\r\n");
@@ -250,8 +266,10 @@ impl Terminal {
     ) -> Self {
         let (tx, rx) = unbounded();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx))));
-        let backend = Backend::Remote { processor: Box::new(Processor::new()), input };
-        Self::new(term, rx, backend, size, theme, config, cx)
+        let backend = Backend::Remote { input };
+        let parser = Arc::new(Mutex::new(Parser::new()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
+        Self::new(term, rx, backend, parser, marks, size, theme, config, cx)
     }
 
     /// A read-only terminal showing `text` (used to report errors in a tab).
@@ -267,35 +285,49 @@ impl Terminal {
 
     /// Feeds output into a remote terminal.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let Backend::Remote { processor, .. } = &mut self.backend else {
+        if !self.is_remote() {
             return;
-        };
+        }
         {
-            let mut term = self.term.lock();
-            processor.advance(&mut *term, bytes);
+            let mut parser = self.parser.lock();
+            let mut term = self.term.lock_unfair();
+            parser.advance(&mut *term, &self.marks, bytes);
         }
         self.last_activity = Instant::now();
-        // A synchronized update (mode 2026) may be buffering; make sure it is
-        // flushed once its timeout passes even if no more output arrives.
-        if let Some(deadline) = processor.sync_timeout().sync_timeout()
-            && self.sync_flush.is_none()
-        {
-            let wait = deadline.saturating_duration_since(Instant::now());
-            self.sync_flush = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(wait).await;
-                this.update(cx, |this, cx| this.flush_sync(cx)).ok();
-            }));
-        }
+        self.schedule_sync_flush(cx);
         cx.notify();
+    }
+
+    /// A synchronized update (mode 2026) may be buffering output; make sure
+    /// it is flushed once its timeout passes even if no more output arrives.
+    fn schedule_sync_flush(&mut self, cx: &mut Context<Self>) {
+        if self.sync_flush.is_some() {
+            return;
+        }
+        let Some(deadline) = self.parser.lock().sync_deadline() else { return };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        self.sync_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |this, cx| this.flush_sync(cx)).ok();
+        }));
     }
 
     fn flush_sync(&mut self, cx: &mut Context<Self>) {
         self.sync_flush = None;
-        if let Backend::Remote { processor, .. } = &mut self.backend
-            && processor.sync_timeout().sync_timeout().is_some_and(|t| t <= Instant::now())
-        {
-            processor.stop_sync(&mut *self.term.lock());
-            cx.notify();
+        let pending = {
+            let mut parser = self.parser.lock();
+            match parser.sync_deadline() {
+                Some(t) if t <= Instant::now() => {
+                    parser.stop_sync(&mut *self.term.lock_unfair(), &self.marks);
+                    cx.notify();
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            }
+        };
+        if pending {
+            self.schedule_sync_flush(cx);
         }
     }
 
@@ -331,7 +363,10 @@ impl Terminal {
 
     fn handle_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
         match event {
-            AlacEvent::Wakeup => self.last_activity = Instant::now(),
+            AlacEvent::Wakeup => {
+                self.last_activity = Instant::now();
+                self.schedule_sync_flush(cx);
+            }
             AlacEvent::Title(title) => self.set_title(Some(title), cx),
             AlacEvent::ResetTitle => self.set_title(None, cx),
             AlacEvent::ClipboardStore(kind, text) => {
@@ -418,7 +453,9 @@ impl Terminal {
             return;
         }
         self.size = size;
-        self.term.lock().resize(size);
+        let mut term = self.term.lock();
+        self.marks.lock().resize(&mut *term, size);
+        drop(term);
         if let Backend::Pty { sender, .. } = &self.backend {
             sender.send(Msg::Resize(size.into())).ok();
         }
@@ -430,8 +467,62 @@ impl Terminal {
     }
 
     pub fn clear_scrollback(&mut self, cx: &mut Context<Self>) {
-        self.term.lock().grid_mut().clear_history();
+        let mut term = self.term.lock();
+        term.grid_mut().clear_history();
+        self.marks.lock().prune(&term);
         cx.notify();
+    }
+
+    // ---- shell integration ----------------------------------------------------
+
+    /// The shell-integration marks; lock only after (or without) the term.
+    pub fn marks(&self) -> &Arc<Mutex<Marks>> {
+        &self.marks
+    }
+
+    /// Scrolls the view so the previous (or next) prompt is its top line.
+    /// Returns `false`, doing nothing, when the terminal has no prompt marks.
+    pub fn jump_to_prompt(&mut self, previous: bool, cx: &mut Context<Self>) -> bool {
+        let mut term = self.term.lock();
+        let offset = term.grid().display_offset() as i64;
+        let target = {
+            let marks = self.marks.lock();
+            if marks.prompt_lines().next().is_none() {
+                return false;
+            }
+            marks.jump_target(-offset, previous)
+        };
+        let history = term.grid().history_size() as i64;
+        let new_offset = match target {
+            Some(line) => (-line).clamp(0, history),
+            None if previous => offset,
+            None => 0,
+        };
+        if new_offset != offset {
+            term.scroll_display(Scroll::Delta((new_offset - offset) as i32));
+            cx.notify();
+        }
+        true
+    }
+
+    /// Selects the last command's output. Returns `false` when there is none.
+    pub fn select_last_output(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut term = self.term.lock();
+        let Some((start, end)) = self.marks.lock().last_output(&term) else { return false };
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+        drop(term);
+        self.finish_selection(cx);
+        cx.notify();
+        true
+    }
+
+    /// The last command's output as text, leaving the selection alone.
+    pub fn last_output_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        let (start, end) = self.marks.lock().last_output(&term)?;
+        Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
     }
 
     // ---- selection ----------------------------------------------------------
@@ -639,6 +730,7 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     #[test]
     fn default_colors_replace_the_theme() {

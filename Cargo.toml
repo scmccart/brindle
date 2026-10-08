@@ -22,6 +22,9 @@ toml = "0.8"
 toml_edit = "0.22.27"
 unicode-width = "0.2"
 libc = "0.2"
+# Names the types in alacritty's `EventedReadWrite` trait (shell integration
+# wraps its PTY); the version alacritty_terminal already uses.
+polling = "3.11"
 
 [dev-dependencies]
 # Window captures for the end-to-end suite; the version GPUI already uses.
