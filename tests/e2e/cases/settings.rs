@@ -76,3 +76,95 @@ pub fn apply(ctx: &Ctx) -> Result<Outcome> {
     ensure!(config_text(ctx)? == want, "config after apply:\n{}", config_text(ctx)?);
     Ok(Outcome::Pass)
 }
+
+/// Opens the profile editor on the `tmux` profile (the run's profile and the
+/// default, so it is selected) and moves focus to its theme choice.
+fn edit_tmux_theme(run: Run) -> Run {
+    let run = run.action("open_settings").action("settings_section_next").action("settings_edit");
+    // Name, Command, Arguments, Directory, Environment, then Theme.
+    (0..5).fold(run, |run, _| run.action("settings_down"))
+}
+
+/// After the theme choice has focus: "follow global" wraps back to the last
+/// theme, `e2e-alt`.
+fn choose_alt_theme(run: Run) -> Run {
+    run.action("settings_choice_prev")
+}
+
+pub fn profile_preview(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    server.type_line("%0", "clear")?;
+    ctx.sleep(0.5);
+    let out = choose_alt_theme(edit_tmux_theme(Run::new(ctx, &server, "preview"))).capture_at(10.3).dump_at(10.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("section=Profiles mode=editor name=\"tmux\" field=\"Theme\" theme=\"e2e-alt\""),
+        "dialog state: {settings:?}"
+    );
+    expect_background("profile preview", &server, &out, theme::ALT_BACKGROUND)?;
+    ensure!(config_text(ctx)? == brindle::config(&server.socket, "e2e"), "previewing changed the config");
+
+    let out = choose_alt_theme(edit_tmux_theme(Run::new(ctx, &server, "cancel")))
+        .action("settings_cancel")
+        .action("settings_cancel")
+        .capture_at(12.3)
+        .dump_at(12.8)
+        .run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
+    expect_background("background after cancel", &server, &out, theme::BACKGROUND)?;
+    ensure!(config_text(ctx)? == brindle::config(&server.socket, "e2e"), "cancelling changed the config");
+    Ok(Outcome::Pass)
+}
+
+/// The test config with `theme = "e2e-alt"` added to the tmux profile, as
+/// the editor writes it.
+fn with_tmux_profile_theme(config: &str) -> Result<String> {
+    let anchor = "tmux_args = [";
+    let start = config.find(anchor).ok_or("no tmux_args in the test config")?;
+    let end = start + config[start..].find('\n').ok_or("no newline")? + 1;
+    Ok(format!("{}theme = \"e2e-alt\"\n{}", &config[..end], &config[end..]))
+}
+
+pub fn profile_save(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    server.type_line("%0", "clear")?;
+    ctx.sleep(0.5);
+    let out = choose_alt_theme(edit_tmux_theme(Run::new(ctx, &server, "run")))
+        .action("settings_confirm")
+        .capture_at(11.3)
+        .dump_at(11.8)
+        .run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.contains("section=Profiles mode=list selected=\"tmux\""), "dialog state: {settings:?}");
+    expect_background("background after save", &server, &out, theme::ALT_BACKGROUND)?;
+    let want = with_tmux_profile_theme(&brindle::config(&server.socket, "e2e"))?;
+    ensure!(config_text(ctx)? == want, "config after save:\n{}", config_text(ctx)?);
+    Ok(Outcome::Pass)
+}
+
+pub fn profile_rename(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    server.type_line("%0", "clear")?;
+    ctx.sleep(0.5);
+    // Rename tmux to work and save, then edit `work`'s theme: the open tab
+    // only shows it if it followed the rename.
+    let run = Run::new(ctx, &server, "run")
+        .action("open_settings")
+        .action("settings_section_next")
+        .action("settings_edit")
+        .action("text_input_select_home")
+        .send("work")
+        .action("settings_confirm")
+        .action("settings_edit");
+    let run = (0..5).fold(run, |run, _| run.action("settings_down"));
+    let out = choose_alt_theme(run).action("settings_confirm").capture_at(16.3).dump_at(16.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.contains("section=Profiles mode=list selected=\"work\""), "dialog state: {settings:?}");
+    let config = config_text(ctx)?;
+    ensure!(
+        config.contains("default_profile = \"work\"") && config.contains("name = \"work\"\ntmux = \"control\""),
+        "config after rename:\n{config}"
+    );
+    expect_background("renamed profile's theme", &server, &out, theme::ALT_BACKGROUND)?;
+    Ok(Outcome::Pass)
+}

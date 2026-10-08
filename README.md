@@ -10,7 +10,8 @@ inside the terminal: tmux windows become tabs and panes are drawn natively,
 while sessions stay in tmux, persistent and detachable.
 
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
-- **Profiles**: command, args, working directory, environment, theme and font size per profile.
+- **Profiles**: command, args, working directory, environment, theme and font size per
+  profile, editable in the settings dialog.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **tmux**, both ways:
@@ -123,7 +124,7 @@ On first launch Brindle writes a commented config to
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-n | new window |
-| ctrl-shift-, | settings (theme picker with live preview, custom theme editor) |
+| ctrl-shift-, | settings (theme picker with live preview, custom theme editor, profiles) |
 | ctrl-, | edit config |
 
 In the settings dialog, up/down previews a theme and enter applies it as the
@@ -132,6 +133,14 @@ the selected one), `e` edits a custom theme and `d` deletes one. Built-in themes
 can't be changed, so editing one starts from a copy. In the editor, tab moves
 between fields and every valid color shows on the tabs as you type. Saving
 updates `config.toml` in place: your comments and the rest of the file are kept.
+
+ctrl-tab switches to the Profiles section, which lists your profiles with their
+ctrl-alt-N numbers. Enter or `e` edits one, `n` makes a new one, `c` duplicates
+the selected one, `d` deletes it, and alt-up/alt-down reorder the list. The
+editor covers every profile setting; arguments, environment (`KEY=value`) and
+tmux arguments are written as shell words. A profile's theme and font size show
+on its open tabs while you edit; the other settings apply to new tabs. Renaming
+a profile keeps its open tabs linked to it and updates `default_profile`.
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
 

@@ -147,6 +147,15 @@ impl Profile {
         self.tmux_session.as_deref().unwrap_or("main")
     }
 
+    /// A short description of what the profile runs.
+    pub fn description(&self) -> String {
+        match self.tmux {
+            TmuxMode::Control => format!("tmux control mode · {}", self.tmux_session_name()),
+            TmuxMode::Plain => format!("tmux · {}", self.tmux_session_name()),
+            TmuxMode::None => self.command.clone().unwrap_or_else(|| "default shell".into()),
+        }
+    }
+
     pub fn working_directory(&self) -> Option<PathBuf> {
         self.cwd.as_deref().map(expand_tilde)
     }

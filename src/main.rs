@@ -169,6 +169,12 @@ pub fn open_window(launch: LaunchRequest, cx: &mut App) -> Option<gpui::WindowHa
 }
 
 fn reload_config(cx: &mut App) {
+    reload_config_renaming(cx, &[]);
+}
+
+/// Reloads the config into every window. `renames` are profiles renamed in
+/// the settings dialog, whose open tabs follow the new name.
+pub(crate) fn reload_config_renaming(cx: &mut App, renames: &[(String, String)]) {
     let (config, error) = Config::load_or_default();
     let zoom = Settings::get(cx).zoom;
     let mut settings = Settings::new(config, error, cx);
@@ -177,7 +183,7 @@ fn reload_config(cx: &mut App) {
     actions::bind_keys(cx);
     for window in cx.windows() {
         if let Some(window) = window.downcast::<Workspace>() {
-            window.update(cx, |workspace, _, cx| workspace.apply_config(cx)).ok();
+            window.update(cx, |workspace, _, cx| workspace.apply_config(renames, cx)).ok();
         }
     }
     cx.refresh_windows();
