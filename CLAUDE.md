@@ -51,6 +51,21 @@ BRINDLE_E2E=1 cargo test --test e2e -- --self-test   # the harness's own parser 
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
 
+### Performance suite
+
+`tests/perf/` is a separate opt-in target that reports numbers rather than pass/fail, so it isn't part of e2e:
+
+```sh
+cargo build --release                              # it times target/release/brindle
+BRINDLE_PERF=1 cargo test --test perf              # every case (opens windows: ask first)
+BRINDLE_PERF=1 cargo test --test perf -- --self-test
+```
+
+- Cases: `latency-shell` and `latency-tmux` (`--latency-bench`), and `throughput-brindle` and `throughput-tmux` (vtebench at a pinned commit, fetched into `target/perf-tools/vtebench`).
+- Each run goes to `target/tmp/perf/<UTC time>/` with a `summary.toml`. `BRINDLE_PERF_BASELINE=<run dir>` prints changes against an earlier run.
+- `tests/common/` holds what both suites share (`Result`, `ensure!`, `TmuxServer`).
+- Latency probes live in `src/latency.rs`. They are a GPUI global that exists only with `--latency-log` or `--latency-bench`. A probe completes on the paint whose grid includes output newer than the key, tracked by each `Terminal`'s `OutputMarker`, so repaints the key itself causes don't count.
+
 ## Architecture
 
 Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `TerminalElement` (paint)**, with `Workspace` owning the tabs of one window.

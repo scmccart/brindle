@@ -1,0 +1,12 @@
+latency (ms)                   p50            p95            p99            max  timeouts
+latency-shell output  0.40 (-0.10)   0.80 (+0.00)   1.20 (+0.20)   2.00 (+0.00)     1/500
+latency-shell paint   2.50 (+0.50)   3.00 (+0.00)   4.00 (+0.00)   5.00 (+0.00)     1/500
+latency-shell frame   9.00 (+0.00)  15.00 (+0.00)  16.00 (+0.00)  17.00 (+0.00)     1/500
+latency-tmux output           3.00           4.00           5.00           6.00     0/500
+latency-tmux paint            4.00           5.00           6.00           7.00     0/500
+latency-tmux frame           12.00          18.00          20.00          22.00     0/500
+
+throughput (mean ms)         brindle    tmux
+grid                          118x33  118x33
+dense_cells           210.00 (+5.0%)  900.00
+unicode               90.00 (-10.0%)       -

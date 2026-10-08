@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use crate::actions::*;
+use crate::latency::Latency;
 use crate::terminal::mouse::{self, Button};
 use crate::terminal::{Terminal, keys, report_focus};
 use crate::terminal_element::TerminalElement;
@@ -193,9 +194,19 @@ impl TerminalView {
         let mode = self.mode(cx);
         log::debug!("key {} reached the terminal unbound", event.keystroke.unparse());
         if let Some(bytes) = keys::to_esc_str(&event.keystroke, mode) {
+            self.probe_latency(|| event.keystroke.unparse(), cx);
             self.reset_blink();
             self.terminal.update(cx, |t, cx| t.input(bytes, cx));
             cx.stop_propagation();
+        }
+    }
+
+    /// Starts a latency probe for a keystroke (only with `--latency-*`).
+    fn probe_latency(&self, label: impl FnOnce() -> String, cx: &mut Context<Self>) {
+        if Latency::enabled(cx) {
+            let terminal = self.terminal.read(cx);
+            let generation = terminal.output_marker().generation();
+            Latency::key(self.terminal.entity_id(), label, generation, cx);
         }
     }
 
@@ -426,6 +437,7 @@ impl gpui::EntityInputHandler for TerminalView {
     ) {
         log::debug!("text {text:?} from the input method");
         self.marked_text = None;
+        self.probe_latency(|| text.to_string(), cx);
         self.reset_blink();
         let bytes = text.as_bytes().to_vec();
         self.terminal.update(cx, |t, cx| t.input(bytes, cx));
