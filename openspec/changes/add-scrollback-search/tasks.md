@@ -2,13 +2,13 @@
 
 ## 1. Search logic
 
-- [ ] 1.1 Add `src/terminal/search.rs` with `SearchOptions`, `escape`, `pattern(query, options) -> Option<Result<RegexSearch, String>>` (design §4), `find_from` (incremental and next/previous, §5), `visible_matches` (§7), `count` (§10, capped at 1000, numbered from the bottom) and `centered_offset` (§6). Unit-test against a real `Term` fed through `Processor`: literal escaping (`a.c`), case on/off in both directions (`Foo`/`foo`), regex on, invalid regex, stepping up and down with wrap-around, the count and index, a match across a wrapped line, visible matches limited to the viewport, and centering clamped at both ends. Verify with `cargo test terminal::search`.
+- [x] 1.1 Add `src/terminal/search.rs` with `SearchOptions`, `escape`, `pattern(query, options) -> Option<Result<RegexSearch, String>>` (design §4), `find_from` (incremental and next/previous, §5), `visible_matches` (§7), `count` (§10, capped at 1000, numbered from the bottom) and `centered_offset` (§6). Unit-test against a real `Term` fed through `Processor`: literal escaping (`a.c`), case on/off in both directions (`Foo`/`foo`), regex on, invalid regex, stepping up and down with wrap-around, the count and index, a match across a wrapped line, visible matches limited to the viewport, and centering clamped at both ends. Verify with `cargo test terminal::search`.
 
 ## 2. Theme colors
 
-- [ ] 2.1 Add the four `search_*` fields to `Theme` with derived accessors, and fill them in `with_effective_colors` (design §9). Unit-test the defaults for brindle-dark and a partial custom theme, and that explicit colors win. Verify with `cargo test theme`.
-- [ ] 2.2 Write the four colors in `config_edit::upsert_theme`, and add four non-optional slots to the settings editor after Accent. Update any tests that count slots or compare written theme text, and add one that a saved copy of a built-in theme carries the derived search colors. Verify with `cargo test config_edit settings_dialog`.
-- [ ] 2.3 Document the keys in `assets/default-config.toml`'s custom theme example, and verify that the default config still parses (`cargo test config`).
+- [x] 2.1 Add the four `search_*` fields to `Theme` with derived accessors, and fill them in `with_effective_colors` (design §9). Unit-test the defaults for brindle-dark and a partial custom theme, and that explicit colors win. Verify with `cargo test theme`.
+- [x] 2.2 Write the four colors in `config_edit::upsert_theme`, and add four non-optional slots to the settings editor after Accent. Update any tests that count slots or compare written theme text, and add one that a saved copy of a built-in theme carries the derived search colors. Verify with `cargo test config_edit settings_dialog`.
+- [x] 2.3 Document the keys in `assets/default-config.toml`'s custom theme example, and verify that the default config still parses (`cargo test config`).
 
 ## 3. Actions and keys
 
