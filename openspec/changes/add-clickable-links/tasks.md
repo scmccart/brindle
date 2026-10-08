@@ -11,21 +11,21 @@
 
 ## 3. Hover, click and copy in the view
 
-- [ ] 3.1 Track pointer and hovered link in `TerminalView` (`update_hover`), recomputed on mouse move (cell or modifier change), modifiers-changed, terminal output while hovered and wheel scroll, and cleared on leave and window deactivation; verify `cargo build` and the hover e2e case's `--- link` line
-- [ ] 3.2 Underline hovered-link cells in `prepaint` and use the pointing-hand cursor in `paint`, registering the modifiers-changed and widened mouse-move listeners; verify with the e2e capture that the underline is drawn under the link cells
-- [ ] 3.3 Implement the click rule in `mouse_down`/`mouse_up` (ctrl without alt on a link: consume, open on release over the same link; `is_dragging` covers the pending link); verify with the e2e cases for a local shell and a mouse-reporting program
+- [x] 3.1 Track pointer and hovered link in `TerminalView` (`update_hover`), recomputed on mouse move (cell or modifier change), modifiers-changed, terminal output while hovered and wheel scroll, and cleared on leave and window deactivation; verify `cargo build` and the hover e2e case's `--- link` line
+- [x] 3.2 Underline hovered-link cells in `prepaint` and use the pointing-hand cursor in `paint`, registering the modifiers-changed and widened mouse-move listeners; verify with the e2e capture that the underline is drawn under the link cells
+- [x] 3.3 Implement the click rule in `mouse_down`/`mouse_up` (ctrl without alt on a link: consume, open on release over the same link; `is_dragging` covers the pending link); verify with the e2e cases for a local shell and a mouse-reporting program
 - [x] 3.4 Add the `copy_link` action ("Copy Link Under Mouse", `Terminal` context, no default key) to `ACTIONS` and handle it in `TerminalView`; verify `brindle --list-actions` lists it and the actions unit tests pass
 
 ## 4. Debug hooks
 
-- [ ] 4.1 Add `--hover`/`--click` steps with `[mods-]COL,ROW` parsing in `src/main.rs`, plus `Workspace::debug_mouse` that drives the active `TerminalView` handlers, and a `--- link <uri>` dump line; document them in `--help`; verify with parser unit tests and `brindle --help`
-- [ ] 4.2 Extend the e2e harness: `Run::profile`, `Run::hover`, `Run::click`, `Dump::link` parsing (with `--self-test` coverage); verify `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`
+- [x] 4.1 Add `--hover`/`--click` steps with `[mods-]COL,ROW` parsing in `src/main.rs`, plus `Workspace::debug_mouse` that drives the active `TerminalView` handlers, and a `--- link <uri>` dump line; document them in `--help`; verify with parser unit tests and `brindle --help`
+- [x] 4.2 Extend the e2e harness: `Run::profile`, `Run::hover`, `Run::click`, `Dump::link` parsing (with `--self-test` coverage); verify `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`
 
 ## 5. End-to-end cases
 
-- [ ] 5.1 Add `links-local-click` (Shell profile: ctrl-click a URL and an OSC 8 link, recorded by the opener override), `links-mouse-mode` (ctrl-click opens with mouse reporting on, and nothing is reported to the program), `links-hover-underline` (capture shows the underline) and `links-tmux` (OSC 8 in a control-mode pane, including content present before attach); verify each passes with `BRINDLE_E2E=1 cargo test --test e2e -- links-`, run under `flock /tmp/brindle-gui.lock`
+- [x] 5.1 Add `links-local-click` (Shell profile: ctrl-click a URL and an OSC 8 link, recorded by the opener override), `links-mouse-mode` (ctrl-click opens with mouse reporting on, and nothing is reported to the program), `links-hover-underline` (capture shows the underline) and `links-tmux` (OSC 8 in a control-mode pane, including content present before attach); verify each passes with `BRINDLE_E2E=1 cargo test --test e2e -- links-`, run under `flock /tmp/brindle-gui.lock`
 
 ## 6. Docs and integration
 
-- [ ] 6.1 Document links in README (usage table: ctrl-click opens, ctrl-hover, `copy_link`, `BRINDLE_LINK_OPENER`) and add the links module to CLAUDE.md's architecture notes; verify by reading the rendered text
-- [ ] 6.2 Run `cargo build`, `cargo test`, `cargo build --release`, and confirm `git diff Cargo.lock` is empty
+- [x] 6.1 Document links in README (usage table: ctrl-click opens, ctrl-hover, `copy_link`, `BRINDLE_LINK_OPENER`) and add the links module to CLAUDE.md's architecture notes; verify by reading the rendered text
+- [x] 6.2 Run `cargo build`, `cargo test`, `cargo build --release`, and confirm `git diff Cargo.lock` is empty

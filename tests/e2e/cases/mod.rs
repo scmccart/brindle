@@ -3,6 +3,7 @@
 mod colors;
 mod dump;
 mod geometry;
+mod links;
 mod settings;
 mod styles;
 mod titles;
@@ -47,6 +48,9 @@ pub fn all() -> Vec<Case> {
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
+        display("links-local-click", links::local_click),
+        display("links-mouse-mode", links::mouse_mode),
+        display("links-tmux", links::tmux),
     ]
 }
 
