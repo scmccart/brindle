@@ -112,7 +112,7 @@ The first process that needs the state (at launch with the setting on, or on the
 
 ### 11. Window size
 
-- **Recorded:** the size of `window.window_bounds().get_bounds()` (the restore size, even when maximized), and `maximized` from the `WindowBounds::Maximized` variant. Fullscreen is recorded as not maximized.
+- **Recorded:** the size of `window.inner_window_bounds()` (the restore size, even when maximized), and `maximized` from the `WindowBounds::Maximized` variant. Fullscreen is recorded as not maximized. `window_bounds()` was tried first. Under Xwayland it includes the 6 px client-decoration inset on each side, so the window grew by 12×12 px on every restore (1000×660 → 1012×672 → 1024×684). `inner_window_bounds()` gives back exactly the requested 1000×660.
 - **Restored:** `WindowBounds::Windowed(Bounds::centered(size))`, or `Maximized(...)`, which GPUI turns into `zoom()` when it opens the window. Sizes are clamped to at least the 360×200 minimum.
 - The e2e round trip checks under X11 that the size doesn't drift across restores. With client-side decorations on Wayland, GPUI's bounds might include the shadow inset, which would grow the window on each restore. If the X11 check shows `inner_window_bounds` is the one that matches the requested size, that is used instead. The Wayland case is left for the user's hand test.
 
