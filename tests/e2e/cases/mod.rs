@@ -4,6 +4,7 @@ mod colors;
 mod dump;
 mod geometry;
 mod settings;
+mod shell;
 mod styles;
 mod titles;
 mod tmux;
@@ -21,6 +22,7 @@ pub fn all() -> Vec<Case> {
         headless("tmux-border-status-no-layout-change", tmux::border_status_no_layout_change),
         headless("tmux-rotate-no-layout-change", tmux::rotate_no_layout_change),
         headless("tmux-color-report-precedence", tmux::color_report_precedence),
+        headless("tmux-osc133-passthrough", shell::tmux_passthrough),
         display("tmux-subscriptions-removed", tmux::subscriptions_removed),
         display("dump-grid-geometry", dump::grid_geometry),
         display("geometry-plain", geometry::plain),
@@ -47,6 +49,11 @@ pub fn all() -> Vec<Case> {
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
+        display("shell-prompt-jump", shell::prompt_jump),
+        display("shell-no-marks-scroll-line", shell::no_marks_scroll_line),
+        display("shell-failed-mark", shell::failed_mark),
+        display("shell-select-output", shell::select_output),
+        display("shell-tmux-prompt-jump", shell::tmux_prompt_jump),
     ]
 }
 
