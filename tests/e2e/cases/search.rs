@@ -70,6 +70,35 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The text on the current match's row.
+fn focused_line(out: &Output) -> Result<String> {
+    let (row, _) = focused(out)?;
+    Ok(out.dump.screen.get(row as usize).cloned().unwrap_or_default())
+}
+
+/// Next and previous, through the actions' bubbling from the bar to the
+/// terminal: one step up, back down, then down past the newest match,
+/// which wraps to the oldest (`line-4`, number 11).
+pub fn step(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let up = Run::new(ctx, &server, "up").profile("Shell").send(PRINT_LINES).find("line-4").action("find_next").dump_at(5.0).run()?;
+    ensure!(up.dump.find_field("index") == Some("2"), "after find_next: {:?}", up.dump.find);
+    ensure!(focused_line(&up)? == "line-48", "after find_next the current match is on {:?}", focused_line(&up)?);
+
+    let wrap = Run::new(ctx, &server, "wrap")
+        .profile("Shell")
+        .send(PRINT_LINES)
+        .find("line-4")
+        .action("find_next")
+        .action("find_previous")
+        .action("find_previous")
+        .dump_at(7.0)
+        .run()?;
+    ensure!(wrap.dump.find_field("index") == Some("11"), "after wrapping: {:?}", wrap.dump.find);
+    ensure!(focused_line(&wrap)? == "line-4", "after wrapping the current match is on {:?}", focused_line(&wrap)?);
+    Ok(Outcome::Pass)
+}
+
 pub fn close_restores(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let out = Run::new(ctx, &server, "run")
