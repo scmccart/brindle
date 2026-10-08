@@ -24,7 +24,28 @@ use crate::config_edit;
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
-const SECTIONS: &[&str] = &["Theme"];
+mod profiles;
+
+use crate::config::Profile;
+use profiles::ProfilesState;
+
+/// The dialog's sections, in the order they are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Theme,
+    Profiles,
+}
+
+const SECTIONS: [Section; 2] = [Section::Theme, Section::Profiles];
+
+impl Section {
+    fn label(self) -> &'static str {
+        match self {
+            Section::Theme => "Theme",
+            Section::Profiles => "Profiles",
+        }
+    }
+}
 
 // ---- model ------------------------------------------------------------------
 
@@ -157,6 +178,8 @@ struct Editor {
     focused: usize,
     /// The theme as of the last valid edit of every field.
     current: Theme,
+    /// The fields as the editor opened, to tell unsaved edits.
+    initial: Vec<String>,
 }
 
 const FIELD_COUNT: usize = 1 + SLOTS.len();
@@ -164,11 +187,12 @@ const FIELD_COUNT: usize = 1 + SLOTS.len();
 impl Editor {
     fn new(original: Option<String>, name: String, theme: &Theme, return_to: usize) -> Self {
         let current = theme.with_effective_colors();
-        let colors = SLOTS
+        let colors: Vec<String> = SLOTS
             .iter()
             .map(|slot| slot.get(&current).map(|c| c.to_string()).unwrap_or_default())
             .collect();
-        Self { original, return_to, name, colors, focused: 0, current }
+        let initial = std::iter::once(name.clone()).chain(colors.iter().cloned()).collect();
+        Self { original, return_to, name, colors, focused: 0, current, initial }
     }
 
     /// Parses color field `ix`: `Ok(None)` is a cleared optional color.
@@ -202,6 +226,10 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    fn dirty(&self) -> bool {
+        (0..FIELD_COUNT).any(|field| self.field(field) != self.initial[field])
     }
 
     fn field(&self, field: usize) -> &str {
@@ -252,12 +280,33 @@ pub struct Model {
     error: Option<String>,
     /// Custom themes to list when the file can't be parsed.
     fallback: BTreeMap<String, Theme>,
+    section: Section,
+    profiles: ProfilesState,
+    /// Profiles to list (read-only) when the file can't be parsed.
+    fallback_profiles: Vec<Profile>,
 }
 
 impl Model {
-    pub fn new(config_path: PathBuf, active: String, fallback: BTreeMap<String, Theme>) -> Self {
-        let mut model =
-            Self { config_path, entries: Vec::new(), active, selected: 0, mode: Mode::List, error: None, fallback };
+    pub fn new(
+        config_path: PathBuf,
+        active: String,
+        fallback: BTreeMap<String, Theme>,
+        fallback_profiles: Vec<Profile>,
+        fallback_default: Option<String>,
+    ) -> Self {
+        let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
+        let mut model = Self {
+            config_path,
+            entries: Vec::new(),
+            active,
+            selected: 0,
+            mode: Mode::List,
+            error: None,
+            fallback,
+            section: Section::Theme,
+            profiles,
+            fallback_profiles,
+        };
         model.reload_entries();
         let active = model.active.clone();
         model.selected = model.selectable_index(&active).or_else(|| model.selectable_index("brindle-dark")).unwrap_or(0);
@@ -301,6 +350,11 @@ impl Model {
     }
 
     pub fn move_selection(&mut self, forward: bool) {
+        if self.section == Section::Profiles {
+            self.profiles.move_selection(forward);
+            self.error = None;
+            return;
+        }
         match &mut self.mode {
             Mode::List => {
                 let count = self.entries.len();
@@ -320,6 +374,11 @@ impl Model {
     }
 
     pub fn select(&mut self, ix: usize) {
+        if self.section == Section::Profiles {
+            self.profiles.select(ix);
+            self.error = None;
+            return;
+        }
         if matches!(self.mode, Mode::List) && self.entries.get(ix).is_some_and(|e| e.theme.is_ok()) {
             self.selected = ix;
             self.error = None;
@@ -341,6 +400,17 @@ impl Model {
 
     /// Enter: apply in the list, save in the editor, delete when confirming.
     pub fn confirm(&mut self) -> Outcome {
+        if self.section == Section::Profiles {
+            let result = match &self.profiles.mode {
+                profiles::Mode::List => {
+                    let themes = self.theme_names();
+                    self.profiles.start_edit(&themes).map(|()| profiles::Done::Nothing)
+                }
+                profiles::Mode::Editor(_) => self.profiles.save(&self.config_path, &self.fallback_profiles),
+                profiles::Mode::ConfirmDelete => self.profiles.delete_selected(&self.config_path, &self.fallback_profiles),
+            };
+            return self.profiles_done(result);
+        }
         match &self.mode {
             Mode::List => self.apply(),
             Mode::Editor(_) => self.save_editor(),
@@ -350,6 +420,20 @@ impl Model {
 
     /// Escape: `true` when the whole dialog should close (cancel).
     pub fn cancel(&mut self) -> bool {
+        if self.section == Section::Profiles {
+            self.error = None;
+            return match self.profiles.mode {
+                profiles::Mode::List => true,
+                profiles::Mode::Editor(_) => {
+                    self.profiles.discard();
+                    false
+                }
+                profiles::Mode::ConfirmDelete => {
+                    self.profiles.mode = profiles::Mode::List;
+                    false
+                }
+            };
+        }
         match std::mem::replace(&mut self.mode, Mode::List) {
             Mode::List => true,
             Mode::Editor(editor) => {
@@ -375,6 +459,14 @@ impl Model {
 
     /// New: a copy of the selected theme under an unused name.
     pub fn start_new(&mut self) {
+        if self.section == Section::Profiles {
+            if matches!(self.profiles.mode, profiles::Mode::List) {
+                let themes = self.theme_names();
+                let result = self.profiles.start_new(&themes).map(|()| profiles::Done::Nothing);
+                self.profiles_done(result);
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::List) {
             return;
         }
@@ -386,6 +478,14 @@ impl Model {
 
     /// Edit: a custom theme in place; a built-in is copied first.
     pub fn start_edit(&mut self) {
+        if self.section == Section::Profiles {
+            if matches!(self.profiles.mode, profiles::Mode::List) {
+                let themes = self.theme_names();
+                let result = self.profiles.start_edit(&themes).map(|()| profiles::Done::Nothing);
+                self.profiles_done(result);
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::List) {
             return;
         }
@@ -445,6 +545,13 @@ impl Model {
 
     /// Delete: asks for confirmation, or explains why the theme can't go.
     pub fn request_delete(&mut self) {
+        if self.section == Section::Profiles {
+            if matches!(self.profiles.mode, profiles::Mode::List) {
+                let result = self.profiles.request_delete().map(|()| profiles::Done::Nothing);
+                self.profiles_done(result);
+            }
+            return;
+        }
         if !matches!(self.mode, Mode::List) {
             return;
         }
@@ -487,6 +594,20 @@ impl Model {
 
     /// List shortcuts. In the editor, keys belong to the text inputs.
     pub fn key(&mut self, ks: &Keystroke) -> bool {
+        if self.section == Section::Profiles {
+            let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
+            if !plain || !matches!(self.profiles.mode, profiles::Mode::List) {
+                return false;
+            }
+            match ks.key.as_str() {
+                "n" => self.start_new(),
+                "e" => self.start_edit(),
+                "c" => self.start_duplicate(),
+                "delete" | "d" => self.request_delete(),
+                _ => return false,
+            }
+            return true;
+        }
         match &mut self.mode {
             Mode::Editor(_) => false,
             Mode::List if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform => false,
@@ -540,12 +661,124 @@ impl Model {
     }
 
     pub fn in_list(&self) -> bool {
-        matches!(self.mode, Mode::List)
+        match self.section {
+            Section::Theme => matches!(self.mode, Mode::List),
+            Section::Profiles => matches!(self.profiles.mode, profiles::Mode::List),
+        }
+    }
+
+    pub fn section(&self) -> Section {
+        self.section
+    }
+
+    /// Switches section, refused while an editor has unsaved edits. Leaving
+    /// Theme drops an unapplied preview: its selection goes back to the
+    /// active theme.
+    pub fn select_section(&mut self, section: Section) -> bool {
+        if section == self.section {
+            return true;
+        }
+        let dirty = match self.section {
+            Section::Theme => matches!(&self.mode, Mode::Editor(e) if e.dirty()),
+            Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
+        };
+        if dirty {
+            self.error = Some("Save or discard the edits first".into());
+            return false;
+        }
+        match self.section {
+            Section::Theme => {
+                self.mode = Mode::List;
+                let active = self.active.clone();
+                self.selected = self.selectable_index(&active).or_else(|| self.selectable_index("brindle-dark")).unwrap_or(0);
+            }
+            Section::Profiles => {
+                if !matches!(self.profiles.mode, profiles::Mode::List) {
+                    self.profiles.discard();
+                }
+            }
+        }
+        if section == Section::Profiles {
+            // Pick up edits made elsewhere since the dialog opened.
+            self.profiles.reload(&self.config_path, &self.fallback_profiles, None);
+        }
+        self.section = section;
+        self.error = None;
+        true
+    }
+
+    /// Cycles through the sections (ctrl-tab).
+    pub fn next_section(&mut self, forward: bool) -> bool {
+        let ix = SECTIONS.iter().position(|s| *s == self.section).unwrap_or(0);
+        let n = SECTIONS.len();
+        self.select_section(SECTIONS[if forward { (ix + 1) % n } else { (ix + n - 1) % n }])
+    }
+
+    /// Every theme a profile can choose: built-ins, then custom themes.
+    fn theme_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for entry in self.entries.iter().filter(|e| e.theme.is_ok()) {
+            if !names.contains(&entry.name) {
+                names.push(entry.name.clone());
+            }
+        }
+        names
+    }
+
+    fn profiles_done(&mut self, result: Result<profiles::Done, String>) -> Outcome {
+        match result {
+            Ok(profiles::Done::Written) => {
+                self.error = None;
+                Outcome::Written
+            }
+            Ok(profiles::Done::Nothing) => {
+                self.error = None;
+                Outcome::Nothing
+            }
+            Err(e) => {
+                self.error = Some(e);
+                Outcome::Nothing
+            }
+        }
+    }
+
+    /// Duplicate (profiles only).
+    pub fn start_duplicate(&mut self) {
+        if self.section == Section::Profiles && matches!(self.profiles.mode, profiles::Mode::List) {
+            let themes = self.theme_names();
+            let result = self.profiles.start_duplicate(&themes).map(|()| profiles::Done::Nothing);
+            self.profiles_done(result);
+        }
+    }
+
+    /// alt-up / alt-down in the profile list.
+    pub fn move_profile(&mut self, up: bool) -> Outcome {
+        if self.section != Section::Profiles {
+            return Outcome::Nothing;
+        }
+        let result = self.profiles.move_selected(up, &self.config_path, &self.fallback_profiles);
+        self.profiles_done(result)
+    }
+
+    /// The edited profile's name and the settings its tabs should preview.
+    pub fn profile_preview(&self) -> Option<(String, Profile)> {
+        if self.section != Section::Profiles {
+            return None;
+        }
+        self.profiles.preview()
+    }
+
+    /// Profile renames saved since the last call, for the reload.
+    pub fn take_renames(&mut self) -> Vec<(String, String)> {
+        self.profiles.take_renames()
     }
 
     /// Debug description for `--dump-screen-after`.
     pub fn describe(&self) -> String {
-        let section = SECTIONS[0];
+        if self.section == Section::Profiles {
+            return self.profiles.describe(&self.error);
+        }
+        let section = "Theme";
         match &self.mode {
             Mode::List => format!(
                 "--- settings section={section} mode=list selected={:?} active={:?} error={:?}\n",
@@ -574,8 +807,12 @@ impl Model {
 pub enum SettingsEvent {
     /// Show this theme on the tabs that follow the global theme.
     Preview(Theme),
-    /// The config file was written; reload it.
-    ConfigWritten,
+    /// Show this profile's theme and font size on its tabs (by its saved
+    /// name), or stop.
+    ProfilePreview(Option<(String, Profile)>),
+    /// The config file was written; reload it, with these profile renames
+    /// (old, new) applied to open tabs.
+    ConfigWritten(Vec<(String, String)>),
     /// Close the dialog, ending any preview.
     Close,
 }
@@ -590,6 +827,14 @@ pub struct SettingsDialog {
     /// The editor's inputs, one per field (name first); empty in the list.
     fields: Vec<Entity<TextInput>>,
     _field_subscriptions: Vec<Subscription>,
+    /// What the last profile preview showed: name, theme and font size.
+    profile_previewed: Option<(String, Option<String>, Option<f32>)>,
+    /// The profile editor's text inputs and its choice and checkbox focus
+    /// handles (tab stops); empty unless it is open.
+    profile_inputs: Vec<(profiles::Field, Entity<TextInput>)>,
+    choice_handles: Vec<(profiles::Field, FocusHandle)>,
+    profile_list_scroll: ScrollHandle,
+    profile_editor_scroll: ScrollHandle,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsDialog {}
@@ -613,6 +858,11 @@ impl SettingsDialog {
             editor_scroll: ScrollHandle::new(),
             fields: Vec::new(),
             _field_subscriptions: Vec::new(),
+            profile_previewed: None,
+            profile_inputs: Vec::new(),
+            choice_handles: Vec::new(),
+            profile_list_scroll: ScrollHandle::new(),
+            profile_editor_scroll: ScrollHandle::new(),
         }
     }
 
@@ -622,7 +872,8 @@ impl SettingsDialog {
 
     /// The editor input that has keyboard focus.
     pub fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
-        self.fields.iter().find(|f| f.read(cx).is_focused(window)).cloned()
+        let mut inputs = self.fields.iter().chain(self.profile_inputs.iter().map(|(_, i)| i));
+        inputs.find(|f| f.read(cx).is_focused(window)).cloned()
     }
 
     /// After any change: preview the theme the model now shows, keep the
@@ -630,10 +881,17 @@ impl SettingsDialog {
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview(cx);
         self.sync_fields(window, cx);
-        match &self.model.mode {
-            Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
-            Mode::Editor(editor) => self.scroll_to_field(editor.focused),
-            Mode::ConfirmDelete => {}
+        match self.model.section() {
+            Section::Theme => match &self.model.mode {
+                Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
+                Mode::Editor(editor) => self.scroll_to_field(editor.focused),
+                Mode::ConfirmDelete => {}
+            },
+            Section::Profiles => match &self.model.profiles.mode {
+                profiles::Mode::List => self.profile_list_scroll.scroll_to_item(self.model.profiles.selected),
+                profiles::Mode::Editor(editor) => self.scroll_to_profile_field(editor.focused),
+                profiles::Mode::ConfirmDelete => {}
+            },
         }
         cx.notify();
     }
@@ -645,12 +903,19 @@ impl SettingsDialog {
             self.theme = preview.clone();
             cx.emit(SettingsEvent::Preview(preview));
         }
+        let profile = self.model.profile_preview();
+        let shown = profile.as_ref().map(|(name, p)| (name.clone(), p.theme.clone(), p.font_size));
+        if shown != self.profile_previewed {
+            self.profile_previewed = shown;
+            cx.emit(SettingsEvent::ProfilePreview(profile));
+        }
     }
 
     /// Creates the inputs when the editor opens and drops them when it
     /// closes, and moves focus to the model's focused field (or back to the
     /// dialog, for the list's shortcuts).
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_profile_fields(window, cx);
         let Some(texts) = self.model.editor_fields() else {
             if !self.fields.is_empty() {
                 self.fields.clear();
@@ -682,6 +947,7 @@ impl SettingsDialog {
     /// Tells the model which input has focus (after tab, or a click on an
     /// input), so the highlight and the dump follow it.
     fn sync_focus_from_window(&mut self, window: &Window, cx: &App) {
+        self.sync_profile_focus_from_window(window, cx);
         let focused = self.fields.iter().position(|f| f.read(cx).is_focused(window));
         if let Some(field) = focused
             && Some(field) != self.model.focused_field()
@@ -702,11 +968,12 @@ impl SettingsDialog {
         match outcome {
             Outcome::Nothing => self.changed(window, cx),
             Outcome::Written => {
+                // The preview ends (the editor closed) before the reload.
                 self.changed(window, cx);
-                cx.emit(SettingsEvent::ConfigWritten);
+                cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
             }
             Outcome::Applied => {
-                cx.emit(SettingsEvent::ConfigWritten);
+                cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
                 cx.emit(SettingsEvent::Close);
             }
         }
@@ -791,6 +1058,7 @@ impl SettingsDialog {
         let accent = t.accent();
         div()
             .id(id)
+            .flex_none()
             .px_3()
             .py_1()
             .rounded_md()
@@ -888,7 +1156,7 @@ impl SettingsDialog {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(div().flex_1().text_color(fg).child(SharedString::from(format!("Delete {name:?}?"))))
+                .child(div().flex_1().min_w_0().text_color(fg).child(SharedString::from(format!("Delete {name:?}?"))))
                 .child(self.button("delete-no", "Keep", false, true, cx, |this, window, cx| {
                     this.model.cancel();
                     this.changed(window, cx);
@@ -1044,7 +1312,7 @@ impl SettingsDialog {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().text_xs().text_color(muted).child("tab moves between fields · #rrggbb or #rgb"))
+                    .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("tab moves between fields · #rrggbb or #rgb"))
                     .child(self.button("discard", "Discard", false, true, cx, |this, window, cx| {
                         this.model.cancel();
                         this.changed(window, cx);
@@ -1063,24 +1331,31 @@ impl Render for SettingsDialog {
         // A click on an input focuses it directly; focus changes redraw.
         self.sync_focus_from_window(window, cx);
         let t = self.theme.clone();
-        let content = match &self.model.mode {
-            Mode::Editor(editor) => {
+        let content = match (self.model.section(), &self.model.mode) {
+            (Section::Profiles, _) => self.render_profiles(cx),
+            (Section::Theme, Mode::Editor(editor)) => {
                 let editor = editor.clone();
                 self.render_editor(&editor, cx)
             }
-            _ => self.render_list(cx),
+            (Section::Theme, _) => self.render_list(cx),
         };
         let panel = t.chrome_background();
-        let sections = SECTIONS.iter().enumerate().map(|(ix, name)| {
+        let current = self.model.section();
+        let sections = SECTIONS.iter().map(|&section| {
             div()
+                .id(section.label())
                 .px_3()
                 .py_1p5()
                 .rounded_md()
-                .when(ix == 0, |d| d.bg(panel.mix(t.accent(), 0.22).hsla()))
+                .when(section == current, |d| d.bg(panel.mix(t.accent(), 0.22).hsla()))
+                .when(section != current, |d| d.hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla())))
                 .text_color(t.foreground.hsla())
-                .child(*name)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.model.select_section(section);
+                    this.changed(window, cx);
+                }))
+                .child(section.label())
         });
-        let in_list = self.model.in_list();
         div()
             .key_context("SettingsDialog")
             .track_focus(&self.focus_handle)
@@ -1093,15 +1368,19 @@ impl Render for SettingsDialog {
             .on_action(cx.listener(Self::new_theme))
             .on_action(cx.listener(Self::edit_theme))
             .on_action(cx.listener(Self::delete_theme))
+            .on_action(cx.listener(Self::section_next))
+            .on_action(cx.listener(Self::section_prev))
+            .on_action(cx.listener(Self::duplicate))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
             .on_key_down(cx.listener(Self::key_down))
             // A stray click outside shouldn't throw away an edit in progress.
-            .when(in_list, |d| d.on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close))))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // Hide the terminal behind from the mouse, so its I-beam cursor
             // doesn't show over the dialog.
             .occlude()
             .cursor(CursorStyle::Arrow)
-            .w(px(680.0))
+            .w(px(760.0))
             .h(px(460.0))
             .flex()
             .flex_col()
@@ -1201,7 +1480,7 @@ background = "nope"
         }
 
         fn model(&self, active: &str) -> Model {
-            Model::new(self.path.clone(), active.into(), BTreeMap::new())
+            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None)
         }
 
         fn text(&self) -> String {
@@ -1278,7 +1557,7 @@ background = "nope"
     #[test]
     fn apply_on_a_malformed_file_keeps_the_dialog() {
         let f = Fixture::new("malformed", "theme = \"mine\"\n[oops\n");
-        let mut model = Model::new(f.path.clone(), "mine".into(), BTreeMap::from([("mine".into(), Theme::default())]));
+        let mut model = Model::new(f.path.clone(), "mine".into(), BTreeMap::from([("mine".into(), Theme::default())]), Vec::new(), None);
         // The fallback themes are still listed.
         assert_eq!(model.selected_entry().unwrap().name, "mine");
         model.move_selection(false);
@@ -1428,6 +1707,40 @@ background = "nope"
         assert_eq!(model.clear_selection_foreground(), Some(6));
         assert_eq!(model.editor_fields().unwrap()[6], "");
         assert_eq!(model.focused_field(), Some(6));
+    }
+
+    #[test]
+    fn switching_sections() {
+        let f = Fixture::new("sections", CONFIG);
+        let mut model = f.model("mine");
+        assert_eq!(model.section(), Section::Theme);
+        // An unapplied preview is dropped on leaving Theme.
+        model.move_selection(true);
+        assert_eq!(model.selected_entry().unwrap().name, "spare");
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Profiles);
+        assert_eq!(model.selected_entry().unwrap().name, "mine");
+        assert!(model.describe().starts_with("--- settings section=Profiles mode=list selected=\"Shell\""), "{}", model.describe());
+        // Escape in the profile list closes the dialog.
+        assert!(model.cancel());
+        // A dirty profile editor holds the section; a clean one doesn't.
+        key(&mut model, "e");
+        assert!(!model.in_list());
+        assert!(model.select_section(Section::Theme));
+        assert!(model.in_list());
+        model.select_section(Section::Profiles);
+        key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::Cwd, "~/src");
+        assert!(!model.select_section(Section::Theme));
+        assert_eq!(model.section(), Section::Profiles);
+        assert!(model.error.as_deref().unwrap().contains("Save or discard"));
+        // The same for the theme editor.
+        model.cancel();
+        model.select_section(Section::Theme);
+        model.start_edit();
+        type_into(&mut model, 2, "#123456");
+        assert!(!model.next_section(true));
+        assert_eq!(f.text(), CONFIG);
     }
 
     #[test]

@@ -179,6 +179,9 @@ pub struct Workspace {
     /// A theme being previewed by the settings dialog, shown on the tabs
     /// that follow the global theme.
     theme_preview: Option<Theme>,
+    /// The profile the settings dialog is editing (by its saved name) and
+    /// the settings its tabs preview: theme and font size.
+    profile_preview: Option<(String, Profile)>,
     focus_handle: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
@@ -193,6 +196,7 @@ impl Workspace {
             active: 0,
             overlay: None,
             theme_preview: None,
+            profile_preview: None,
             focus_handle: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
@@ -294,9 +298,10 @@ impl Workspace {
         if !self.tabs.is_empty() && index <= self.active {
             self.active += 1;
         }
-        if self.theme_preview.is_some() && tab.profile.theme.is_none() {
-            let theme = self.tab_theme(&tab.profile, Self::settings(cx));
-            set_tab_theme(&tab, theme, cx);
+        if self.theme_preview.is_some() || self.profile_preview.is_some() {
+            let profile = self.effective_profile(&tab.profile);
+            let theme = self.tab_theme(profile, Self::settings(cx));
+            set_tab_theme(&tab, theme, profile.font_size, cx);
         }
         self.tabs.insert(index, tab);
         cx.notify();
@@ -579,13 +584,7 @@ impl Workspace {
             .enumerate()
             .map(|(ix, profile)| PaletteRow {
                 label: profile.name.clone().into(),
-                detail: Some(match profile.tmux {
-                    TmuxMode::Control => format!("tmux control mode · {}", profile.tmux_session_name()).into(),
-                    TmuxMode::Plain => format!("tmux · {}", profile.tmux_session_name()).into(),
-                    TmuxMode::None => {
-                        profile.command.clone().unwrap_or_else(|| "default shell".into()).into()
-                    }
-                }),
+                detail: Some(profile.description().into()),
                 shortcut: tab_focus.as_ref().and_then(|f| shortcut(&NewTabWithProfile(ix), f, window)),
             })
             .collect();
@@ -685,13 +684,24 @@ impl Workspace {
             return;
         }
         let config = Self::settings(cx);
-        let model = settings_dialog::Model::new(Config::path(), config.theme.clone(), config.themes.clone());
+        let model = settings_dialog::Model::new(
+            Config::path(),
+            config.theme.clone(),
+            config.themes.clone(),
+            config.profiles.clone(),
+            config.default_profile.clone(),
+        );
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
             SettingsEvent::Preview(theme) => this.set_theme_preview(Some(theme.clone()), cx),
             // Deferred by GPUI, so the reload sees this window idle.
-            SettingsEvent::ConfigWritten => window.dispatch_action(Box::new(ReloadConfig), cx),
+            SettingsEvent::ProfilePreview(preview) => this.set_profile_preview(preview.clone(), cx),
+            // Deferred, so the reload sees this window idle (as ReloadConfig).
+            SettingsEvent::ConfigWritten(renames) => {
+                let renames = renames.clone();
+                cx.defer(move |cx| crate::reload_config_renaming(cx, &renames));
+            }
             SettingsEvent::Close => this.dismiss_overlay(window, cx),
         });
         self.close_overlay(cx);
@@ -715,6 +725,9 @@ impl Workspace {
         self.overlay = None;
         if self.theme_preview.is_some() {
             self.set_theme_preview(None, cx);
+        }
+        if self.profile_preview.is_some() {
+            self.set_profile_preview(None, cx);
         }
     }
 
@@ -762,12 +775,31 @@ impl Workspace {
         }
     }
 
-    /// Re-themes every tab from the config and the preview.
+    /// A tab's profile, or the settings dialog's preview of it.
+    fn effective_profile<'a>(&'a self, profile: &'a Profile) -> &'a Profile {
+        match &self.profile_preview {
+            Some((name, preview)) if name.eq_ignore_ascii_case(&profile.name) => preview,
+            _ => profile,
+        }
+    }
+
+    /// Re-themes every tab (and sets its font size) from the config and the
+    /// previews.
     fn apply_tab_themes(&mut self, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         for tab in &self.tabs {
-            set_tab_theme(tab, self.tab_theme(&tab.profile, &config), cx);
+            let profile = self.effective_profile(&tab.profile);
+            set_tab_theme(tab, self.tab_theme(profile, &config), profile.font_size, cx);
         }
+    }
+
+    /// Shows the edited profile's theme and font size on its tabs, or, with
+    /// `None`, puts their configured ones back. As with the theme preview,
+    /// tmux isn't told.
+    pub fn set_profile_preview(&mut self, preview: Option<(String, Profile)>, cx: &mut Context<Self>) {
+        self.profile_preview = preview;
+        self.apply_tab_themes(cx);
+        cx.notify();
     }
 
     /// Shows `preview` on the tabs that follow the global theme, or, with
@@ -779,9 +811,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Applies a reloaded config to running terminals.
-    pub fn apply_config(&mut self, cx: &mut Context<Self>) {
+    /// Applies a reloaded config to running terminals. `renames` (old, new)
+    /// are profiles renamed in the settings dialog: their tabs follow the
+    /// new name.
+    pub fn apply_config(&mut self, renames: &[(String, String)], cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
+        for tab in &mut self.tabs {
+            if let Some(new) = renamed(&tab.profile.name, renames) {
+                tab.profile.name = new.to_string();
+            }
+        }
+        for (session, _) in &self.tmux_sessions {
+            session.update(cx, |s, _| {
+                if let Some(new) = renamed(&s.profile.name, renames) {
+                    s.profile.name = new.to_string();
+                }
+            });
+        }
         for tab in &mut self.tabs {
             if let Some(p) = config.profile(&tab.profile.name) {
                 tab.profile = p.clone();
@@ -1039,8 +1085,13 @@ impl Workspace {
 }
 
 /// Gives a tab's terminals `theme`, keeping its font size.
-fn set_tab_theme(tab: &Tab, theme: Theme, cx: &mut App) {
-    let font_size = tab.profile.font_size;
+/// The new name for a profile called `name`, if it was renamed (names
+/// match ignoring case, as profile lookups do).
+fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
+    renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
+}
+
+fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
     match &tab.content {
         TabContent::Terminal(view) => view.update(cx, |view, cx| {
             view.font_size_override = font_size;
@@ -1243,5 +1294,14 @@ mod tests {
     #[test]
     fn quoting() {
         assert_eq!(shell_quote("/a b/c'd"), "'/a b/c'\\''d'");
+    }
+
+    #[test]
+    fn renamed_profiles_match_ignoring_case() {
+        let renames = vec![("Work".to_string(), "Job".to_string())];
+        assert_eq!(renamed("Work", &renames), Some("Job"));
+        assert_eq!(renamed("work", &renames), Some("Job"));
+        assert_eq!(renamed("Shell", &renames), None);
+        assert_eq!(renamed("Work", &[]), None);
     }
 }

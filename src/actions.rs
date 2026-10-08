@@ -73,6 +73,14 @@ actions!(
         SettingsNew,
         SettingsEdit,
         SettingsDelete,
+        SettingsSectionNext,
+        SettingsSectionPrev,
+        SettingsDuplicate,
+        SettingsMoveUp,
+        SettingsMoveDown,
+        SettingsChoiceNext,
+        SettingsChoicePrev,
+        SettingsToggle,
         // Text inputs.
         TextInputLeft,
         TextInputRight,
@@ -169,6 +177,14 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("settings_new", None, || Box::new(SettingsNew)),
     ("settings_edit", None, || Box::new(SettingsEdit)),
     ("settings_delete", None, || Box::new(SettingsDelete)),
+    ("settings_section_next", None, || Box::new(SettingsSectionNext)),
+    ("settings_section_prev", None, || Box::new(SettingsSectionPrev)),
+    ("settings_duplicate", None, || Box::new(SettingsDuplicate)),
+    ("settings_move_up", None, || Box::new(SettingsMoveUp)),
+    ("settings_move_down", None, || Box::new(SettingsMoveDown)),
+    ("settings_choice_next", None, || Box::new(SettingsChoiceNext)),
+    ("settings_choice_prev", None, || Box::new(SettingsChoicePrev)),
+    ("settings_toggle", None, || Box::new(SettingsToggle)),
     // Palette navigation and text editing, for `--action` and user bindings.
     ("picker_up", None, || Box::new(PickerUp)),
     ("picker_down", None, || Box::new(PickerDown)),
@@ -237,6 +253,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let x = Some("TmuxWindow");
     let s = Some("SettingsDialog");
     let i = Some("TextInput");
+    let c = Some("SettingsChoice");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -301,6 +318,16 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", SettingsCancel, s),
         KeyBinding::new("tab", SettingsNextField, s),
         KeyBinding::new("shift-tab", SettingsPrevField, s),
+        KeyBinding::new("ctrl-pagedown", SettingsSectionNext, s),
+        KeyBinding::new("ctrl-pageup", SettingsSectionPrev, s),
+        KeyBinding::new("ctrl-tab", SettingsSectionNext, s),
+        KeyBinding::new("ctrl-shift-tab", SettingsSectionPrev, s),
+        KeyBinding::new("alt-up", SettingsMoveUp, s),
+        KeyBinding::new("alt-down", SettingsMoveDown, s),
+        // The profile editor's theme and tmux choices and default checkbox.
+        KeyBinding::new("left", SettingsChoicePrev, c),
+        KeyBinding::new("right", SettingsChoiceNext, c),
+        KeyBinding::new("space", SettingsToggle, c),
         // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
         // to the palette or dialog around them.
         KeyBinding::new("left", TextInputLeft, i),

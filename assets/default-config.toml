@@ -28,7 +28,8 @@ blink = true
 
 # ---------------------------------------------------------------------------
 # Profiles. Open the new-tab palette with ctrl-shift-space, or open profile N
-# directly with ctrl-alt-N.
+# directly with ctrl-alt-N. Profiles can also be edited in the settings dialog
+# (ctrl-shift-,).
 # ---------------------------------------------------------------------------
 
 [[profiles]]

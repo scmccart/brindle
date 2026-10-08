@@ -394,6 +394,10 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.palette == ["list query=\"splt\"", "tmux: Split Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
     let input = Input { text: "split".into(), cursor: 4, selection: (1, 4) };
     ensure!(dump.input == Some(input), "input {:?}", dump.input);
+    let line = "--- settings section=Profiles mode=editor name=\"tmux\" field=\"Theme\" theme=\"e2e-alt\" tmux=\"control\" default=true invalid=[] can_save=true error=None\n";
+    let dump = Dump::parse(line);
+    let settings = dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.starts_with("section=Profiles mode=editor") && settings.contains("theme=\"e2e-alt\""), "settings {settings:?}");
     ensure!(Dump::parse("nothing").size.is_none(), "size from nothing");
     Ok(())
 }
