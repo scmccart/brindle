@@ -29,6 +29,8 @@ pub struct Config {
     pub copy_on_select: bool,
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
+    /// Reopen the last session's windows and tabs on a plain launch.
+    pub restore_session: bool,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
     /// Extra keybindings: `"ctrl-shift-x" = "action_name"`.
@@ -46,6 +48,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             copy_on_select: false,
             osc52_paste: false,
+            restore_session: false,
             profiles: Vec::new(),
             themes: BTreeMap::new(),
             keybindings: BTreeMap::new(),
@@ -320,6 +323,13 @@ mod tests {
         assert_eq!(config.font.size, 96.0);
         let theme = config.theme(None);
         assert_eq!(theme.background.to_string(), "#000000");
+    }
+
+    #[test]
+    fn restore_session_setting() {
+        assert!(!Config::parse("").unwrap().restore_session);
+        assert!(!Config::parse(DEFAULT_CONFIG).unwrap().restore_session);
+        assert!(Config::parse("restore_session = true").unwrap().restore_session);
     }
 
     #[test]

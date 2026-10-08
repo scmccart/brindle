@@ -1,6 +1,7 @@
 //! A Brindle window: the tab strip (which doubles as the title bar), the
 //! active tab's content, and the palettes.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
@@ -8,12 +9,14 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, canvas, div, point, px,
+    Task, Window, WindowBounds, canvas, div, point, px,
 };
+use gpui::EntityId;
 
 use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
+use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::{Terminal, TerminalEvent};
@@ -31,10 +34,22 @@ pub enum TabContent {
     Tmux { session: Entity<TmuxSession>, view: Entity<TmuxWindowView> },
 }
 
+/// What a tab was opened as, for session restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabOrigin {
+    /// A program in a PTY (a profile, a command override, classic tmux).
+    Local,
+    /// A tmux control-mode window.
+    Tmux,
+    /// A message, such as an attach failure; never recorded.
+    Message,
+}
+
 pub struct Tab {
     pub id: u64,
     pub profile: Profile,
     pub content: TabContent,
+    pub origin: TabOrigin,
     pub bell: bool,
     /// Cached so rendering never probes /proc; see [`Tab::refresh_title`].
     title: SharedString,
@@ -42,12 +57,19 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(profile: Profile, content: TabContent, subscriptions: Vec<Subscription>, cx: &mut App) -> Self {
+    fn new(
+        profile: Profile,
+        content: TabContent,
+        origin: TabOrigin,
+        subscriptions: Vec<Subscription>,
+        cx: &mut App,
+    ) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut tab = Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             profile,
             content,
+            origin,
             bell: false,
             title: SharedString::default(),
             _subscriptions: subscriptions,
@@ -128,6 +150,13 @@ impl LaunchRequest {
     }
 }
 
+/// What a new window opens with.
+pub enum Launch {
+    Request(LaunchRequest),
+    /// A window recorded by session restore.
+    Restore(WindowState),
+}
+
 enum PaletteKind {
     NewTab,
     /// The command palette: its actions by row, and the tab that had focus
@@ -183,10 +212,20 @@ pub struct Workspace {
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
     last_title: SharedString,
     _title_refresh: Task<()>,
+    /// This window's id and creation order, for session restore.
+    window_id: u64,
+    order: u64,
+    /// Restored tmux sessions whose first `WindowActivated` must not take
+    /// the active tab (another tab was active when they were recorded).
+    quiet_sessions: HashSet<EntityId>,
+    /// Restored tmux sessions without tabs yet: their first tab goes after
+    /// this tab (`None`: at the front).
+    anchors: HashMap<EntityId, Option<u64>>,
 }
 
 impl Workspace {
-    pub fn new(launch: LaunchRequest, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
@@ -196,13 +235,18 @@ impl Workspace {
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
             _title_refresh: Task::ready(()),
+            window_id: window.window_handle().window_id().as_u64(),
+            order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            quiet_sessions: HashSet::new(),
+            anchors: HashMap::new(),
         };
-        this._title_refresh = cx.spawn(async move |this, cx| {
+        this._title_refresh = cx.spawn_in(window, async move |this, cx| {
             // Foreground processes change without any event (e.g. `vim`
-            // starting), so poll their names gently.
+            // starting), so poll their names gently. The same poll records
+            // the window for session restore (directories have no events).
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
-                let alive = this.update(cx, |this, cx| {
+                let alive = this.update_in(cx, |this, window, cx| {
                     let mut changed = false;
                     for tab in &mut this.tabs {
                         changed |= tab.refresh_title(cx);
@@ -210,14 +254,124 @@ impl Workspace {
                     if changed {
                         cx.notify();
                     }
+                    this.record_session(window, cx);
                 });
                 if alive.is_err() {
                     break;
                 }
             }
         });
-        this.launch(launch, window, cx);
+        match launch {
+            Launch::Request(request) => this.launch(request, window, cx),
+            Launch::Restore(state) => this.restore(state, window, cx),
+        }
         this
+    }
+
+    /// Opens a recorded window's tabs. Local tabs open in order; each tmux
+    /// session is attached once and its windows arrive later, placed after
+    /// the tab recorded before it. The recorded active tab is activated if
+    /// it is local; for a tmux session, tmux's current window decides.
+    fn restore(&mut self, state: WindowState, window: &mut Window, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let mut previous: Option<u64> = None;
+        let mut active_tab = None;
+        for (ix, entry) in state.tabs.iter().enumerate() {
+            match session::resolve_tab(entry, &config, &home) {
+                RestoredTab::Local { profile, cwd } => {
+                    self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx);
+                    let Some(tab) = self.tabs.get(self.active) else { continue };
+                    previous = Some(tab.id);
+                    if ix == state.active {
+                        active_tab = Some(tab.id);
+                    }
+                }
+                RestoredTab::Tmux { profile, session } => {
+                    let mut profile = config.profiles[profile].clone();
+                    profile.tmux_session = Some(session);
+                    if let Some(session) = self.attach_tmux(profile, None, window, cx) {
+                        let id = session.entity_id();
+                        self.anchors.insert(id, previous);
+                        if ix != state.active {
+                            self.quiet_sessions.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ix) = active_tab.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// This window as session restore records it.
+    pub fn snapshot(&self, window: &Window, cx: &App) -> WindowState {
+        let session_tab = |session: &Entity<TmuxSession>| {
+            let s = session.read(cx);
+            SnapshotTab::Tmux {
+                profile: s.profile.name.clone(),
+                session: s.session_name.clone(),
+                key: session.entity_id().as_u64(),
+            }
+        };
+        // Sessions still attaching have no tabs yet; record them where
+        // their tabs will go, so a quit meanwhile doesn't lose them.
+        let pending: Vec<&Entity<TmuxSession>> = self
+            .tmux_sessions
+            .iter()
+            .map(|(s, _)| s)
+            .filter(|s| !self.tabs.iter().any(|t| t.shows_tmux(s, None, cx)))
+            .collect();
+        let pending_after = |anchor: Option<u64>| -> Vec<SnapshotTab> {
+            pending
+                .iter()
+                .filter(|s| self.anchors.get(&s.entity_id()) == Some(&anchor))
+                .map(|s| session_tab(s))
+                .collect()
+        };
+        let mut tabs: Vec<SnapshotTab> = pending_after(None);
+        let mut active = None;
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            if ix == self.active {
+                active = Some(tabs.len());
+            }
+            tabs.push(match (&tab.origin, &tab.content) {
+                (TabOrigin::Message, _) => SnapshotTab::Skip,
+                (_, TabContent::Tmux { session, .. }) => session_tab(session),
+                (_, TabContent::Terminal(view)) => SnapshotTab::Local {
+                    profile: tab.profile.name.clone(),
+                    cwd: view.read(cx).terminal.read(cx).working_directory(),
+                },
+            });
+            tabs.extend(pending_after(Some(tab.id)));
+        }
+        tabs.extend(pending.iter().filter(|s| !self.anchors.contains_key(&s.entity_id())).map(|s| session_tab(s)));
+        let (tabs, active) = session::collapse(&tabs, active.unwrap_or(0));
+        // Without the client-side-decoration inset, which `open_window` adds back.
+        let (bounds, maximized) = match window.inner_window_bounds() {
+            WindowBounds::Maximized(b) => (b, true),
+            WindowBounds::Windowed(b) | WindowBounds::Fullscreen(b) => (b, false),
+        };
+        WindowState {
+            width: Some(f32::from(bounds.size.width).round()),
+            height: Some(f32::from(bounds.size.height).round()),
+            maximized,
+            active,
+            tabs,
+        }
+    }
+
+    /// Stores this window's snapshot, when session restore is on and this
+    /// process owns the session.
+    pub fn record_session(&self, window: &Window, cx: &mut Context<Self>) {
+        let enabled = Self::settings(cx).restore_session;
+        if !cx.update_global(|store: &mut SessionStore, _| store.is_owner(enabled)) {
+            return;
+        }
+        let state = self.snapshot(window, cx);
+        let (id, order) = (self.window_id, self.order);
+        cx.update_global(|store: &mut SessionStore, _| store.record(id, order, state));
     }
 
     fn settings(cx: &App) -> &Config {
@@ -275,7 +429,7 @@ impl Workspace {
         let subscriptions = vec![cx.subscribe_in(&terminal, window, |this, terminal, event, window, cx| {
             this.on_terminal_event(terminal, event, window, cx)
         })];
-        let tab = Tab::new(profile, TabContent::Terminal(view), subscriptions, cx);
+        let tab = Tab::new(profile, TabContent::Terminal(view), TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -302,7 +456,15 @@ impl Workspace {
         index
     }
 
-    fn attach_tmux(&mut self, profile: Profile, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Attaches `profile`'s session, or focuses it if it is already
+    /// attached. Returns the newly attached session.
+    fn attach_tmux(
+        &mut self,
+        profile: Profile,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TmuxSession>> {
         let config = Self::settings(cx).clone();
         let session_name = profile.tmux_session_name().to_string();
         if let Some((session, _)) = self
@@ -315,14 +477,15 @@ impl Workspace {
             if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, None, cx)) {
                 self.activate(ix, window, cx);
             }
-            return;
+            return None;
         }
         let cwd = cwd.or_else(|| self.active_cwd(cx));
         let session = cx.new(|cx| TmuxSession::attach(profile.clone(), cwd, &config, cx));
         let subscription = cx.subscribe_in(&session, window, |this, session, event, window, cx| {
             this.on_tmux_event(session.clone(), event, window, cx)
         });
-        self.tmux_sessions.push((session, subscription));
+        self.tmux_sessions.push((session.clone(), subscription));
+        Some(session)
     }
 
     fn on_tmux_event(
@@ -353,9 +516,24 @@ impl Workspace {
                         this.open_prompt(request.clone(), window, cx)
                     }),
                 ];
-                let tab = Tab::new(profile, TabContent::Tmux { session: session.clone(), view }, subscriptions, cx);
-                // Keep a session's tabs together, in tmux's window order.
-                let index = self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)).map(|i| i + 1);
+                let tab = Tab::new(
+                    profile,
+                    TabContent::Tmux { session: session.clone(), view },
+                    TabOrigin::Tmux,
+                    subscriptions,
+                    cx,
+                );
+                // Keep a session's tabs together, in tmux's window order. A
+                // restored session's first tab goes where it was recorded.
+                let anchor = self.anchors.remove(&session.entity_id());
+                let index = match self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)) {
+                    Some(last) => Some(last + 1),
+                    None => match anchor {
+                        Some(Some(id)) => self.tabs.iter().position(|t| t.id == id).map(|i| i + 1),
+                        Some(None) => Some(0),
+                        None => None,
+                    },
+                };
                 self.insert_tab_inactive(tab, index, cx);
             }
             TmuxEvent::WindowClosed(window_id) => {
@@ -364,6 +542,11 @@ impl Workspace {
                 }
             }
             TmuxEvent::WindowActivated(window_id) => {
+                // A restored session that wasn't the active tab stays in the
+                // background once; nothing is sent to tmux either way.
+                if self.quiet_sessions.remove(&session.entity_id()) {
+                    return;
+                }
                 // Always activate: tabs are added without activation, so the
                 // current window's tab may already be `active` yet unfocused.
                 if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
@@ -372,6 +555,7 @@ impl Workspace {
             }
             TmuxEvent::Failed(reason) => {
                 self.tmux_sessions.retain(|(s, _)| *s != session);
+                self.forget_restore(&session);
                 let profile = session.read(cx).profile.clone();
                 let text = format!(
                     "\x1b[1mtmux ({}) ended before attaching:\x1b[0m {reason}\r\n\r\n\
@@ -383,6 +567,7 @@ impl Workspace {
             TmuxEvent::Detached(reason) => {
                 log::info!("tmux session detached: {reason}");
                 self.tmux_sessions.retain(|(s, _)| *s != session);
+                self.forget_restore(&session);
                 if self.tabs.iter().all(|t| t.shows_tmux(&session, None, cx)) {
                     // Nothing else would be left: open a plain shell first so
                     // the window doesn't vanish when tmux goes away.
@@ -403,6 +588,11 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    fn forget_restore(&mut self, session: &Entity<TmuxSession>) {
+        self.quiet_sessions.remove(&session.entity_id());
+        self.anchors.remove(&session.entity_id());
     }
 
     fn on_terminal_event(
@@ -460,6 +650,9 @@ impl Workspace {
             view.read(cx).terminal.clone().update(cx, |t, _| t.shutdown());
         }
         if self.tabs.is_empty() {
+            // Nothing to restore for a window whose tabs all closed.
+            let id = self.window_id;
+            cx.update_global(|store: &mut SessionStore, _| store.forget(id));
             window.remove_window();
             return;
         }
@@ -476,7 +669,7 @@ impl Workspace {
         let theme = config.profile_theme(&profile);
         let terminal = cx.new(|cx| Terminal::message(text, theme, &config, cx));
         let view = cx.new(|cx| TerminalView::new(terminal, profile.font_size, window, cx));
-        let tab = Tab::new(profile, TabContent::Terminal(view), Vec::new(), cx);
+        let tab = Tab::new(profile, TabContent::Terminal(view), TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
