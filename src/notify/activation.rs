@@ -25,8 +25,11 @@ use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::{self, Xd
 pub fn raise(window: &mut Window, token: Option<&str>) {
     if let Some(token) = token {
         match activate_with_token(window, token) {
-            Ok(true) => return,
-            Ok(false) => {}
+            Ok(true) => {
+                log::debug!("raised the window with the notification's activation token");
+                return;
+            }
+            Ok(false) => log::debug!("not a Wayland window; raising it without the token"),
             Err(err) => log::warn!("raising the window with the notification's token failed: {err:#}"),
         }
     }
