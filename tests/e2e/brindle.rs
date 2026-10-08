@@ -101,6 +101,7 @@ pub struct Run<'a> {
     ctx: &'a Ctx,
     server: &'a TmuxServer,
     label: &'static str,
+    profile: &'static str,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     timeline: Vec<(f64, Event)>,
@@ -120,12 +121,20 @@ impl<'a> Run<'a> {
             ctx,
             server,
             label,
+            profile: "tmux",
             steps: Vec::new(),
             env: Vec::new(),
             timeline: Vec::new(),
             dump_at: 4.0,
             capture_at: None,
         }
+    }
+
+    /// Opens the window with another profile of the test config (default
+    /// `tmux`; `Shell` is a local bash with no rc files).
+    pub fn profile(mut self, name: &'static str) -> Self {
+        self.profile = name;
+        self
     }
 
     /// Types text into the active tab (`\r` is Enter). Steps run 1 s apart.
@@ -176,7 +185,7 @@ impl<'a> Run<'a> {
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
         let mut child = Command::new(&ctx.bin)
-            .args(["-p", "tmux"])
+            .args(["-p", self.profile])
             .args(&self.steps)
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)

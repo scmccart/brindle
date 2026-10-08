@@ -28,8 +28,8 @@
 
 ## 5. Docs and end-to-end checks
 
-- [ ] 5.1 Document shell integration in README.md (setup per shell, keys, palette commands, `mark_failed_commands`, tmux behaviour, how to restore line scrolling). Verify by reading it back against the specs.
-- [ ] 5.2 Extend the e2e `Run` so it can open a local `Shell` tab (no tmux server needed). Add these cases:
+- [x] 5.1 Document shell integration in README.md (setup per shell, keys, palette commands, `mark_failed_commands`, tmux behaviour, how to restore line scrolling). Verify by reading it back against the specs.
+- [x] 5.2 Extend the e2e `Run` so it can open a local `Shell` tab (no tmux server needed). Add these cases:
   - `shell-prompt-jump`: bash with the script; `seq` output scrolls the prompts into history; two `jump_to_previous_prompt` steps; the dump's first line is the earlier prompt;
   - `shell-failed-mark`: `false`, then a capture; red gutter pixels beside the `false` prompt and none beside the `true` one;
   - `shell-select-output`: `printf 'one\ntwo\n'`, then `select_last_output`; the dump's selection line is `one\ntwo`;
