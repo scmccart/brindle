@@ -55,6 +55,27 @@ pub fn fit_grid(size: gpui::Size<Pixels>, padding: Pixels, cell_width: Pixels, l
     (((width / cell_width).floor() as usize).max(2), ((height / line_height).floor() as usize).max(2))
 }
 
+/// Which highlight a cell gets; the earlier variants win.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Highlight {
+    Selection,
+    FocusedMatch,
+    Match,
+    None,
+}
+
+fn cell_highlight(selected: bool, in_match: bool, in_focused: bool) -> Highlight {
+    if selected {
+        Highlight::Selection
+    } else if in_focused {
+        Highlight::FocusedMatch
+    } else if in_match {
+        Highlight::Match
+    } else {
+        Highlight::None
+    }
+}
+
 pub struct TerminalElement {
     view: Entity<TerminalView>,
 }
@@ -147,6 +168,8 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Frame {
+        // Search matches in view; bounded by the viewport, like the cell loop.
+        let highlights = self.view.update(cx, |view, cx| view.find_highlights(cx));
         let view = self.view.read(cx);
         let CellMetrics { font: base_font, font_size, cell_width, line_height } =
             cell_metrics(view.font_size_override, window, cx);
@@ -194,6 +217,14 @@ impl Element for TerminalElement {
         let cursor_text = theme.cursor_text.map(Rgb::from).unwrap_or(default_bg);
         let selection_bg = Rgb::from(theme.selection_background);
         let selection_fg = theme.selection_foreground.map(Rgb::from);
+        let (match_bg, match_fg) = theme.search_match();
+        let (focused_bg, focused_fg) = theme.search_focused_match();
+        let (matches, focused_match) = match &highlights {
+            Some(h) => (h.matches.as_slice(), h.focused.as_ref()),
+            None => (&[][..], None),
+        };
+        // Matches are in order, like the cells: walk them with an index.
+        let mut next_match = 0;
         let mouse_mode = content.mode.intersects(TermMode::MOUSE_MODE);
 
         // Cursor placement in viewport coordinates.
@@ -263,11 +294,22 @@ impl Element for TerminalElement {
             let selected = content
                 .selection
                 .is_some_and(|s| s.contains(GridPoint::new(indexed.point.line, indexed.point.column)));
-            if selected {
-                bg_rgb = selection_bg;
-                if let Some(sfg) = selection_fg {
-                    fg_rgb = sfg;
+            let point = GridPoint::new(indexed.point.line, indexed.point.column);
+            while next_match < matches.len() && *matches[next_match].end() < point {
+                next_match += 1;
+            }
+            let in_match = matches.get(next_match).is_some_and(|m| *m.start() <= point);
+            let in_focused = focused_match.is_some_and(|m| m.contains(&point));
+            match cell_highlight(selected, in_match, in_focused) {
+                Highlight::Selection => {
+                    bg_rgb = selection_bg;
+                    if let Some(sfg) = selection_fg {
+                        fg_rgb = sfg;
+                    }
                 }
+                Highlight::FocusedMatch => (bg_rgb, fg_rgb) = (focused_bg.into(), focused_fg.into()),
+                Highlight::Match => (bg_rgb, fg_rgb) = (match_bg.into(), match_fg.into()),
+                Highlight::None => {}
             }
             if cell.flags.contains(Flags::HIDDEN) {
                 fg_rgb = bg_rgb;
@@ -777,6 +819,15 @@ pub mod box_drawing {
             assert_eq!(f32::from(lower.origin.y), 210.0);
             assert_eq!(f32::from(rects('▏').unwrap()[0].place(cell()).size.width), 1.0);
             assert_eq!(f32::from(rects('▉').unwrap()[0].place(cell()).size.width), 7.0);
+        }
+
+        #[test]
+        fn highlight_precedence() {
+            use super::super::{Highlight, cell_highlight};
+            assert_eq!(cell_highlight(true, true, true), Highlight::Selection);
+            assert_eq!(cell_highlight(false, true, true), Highlight::FocusedMatch);
+            assert_eq!(cell_highlight(false, true, false), Highlight::Match);
+            assert_eq!(cell_highlight(false, false, false), Highlight::None);
         }
 
         #[test]

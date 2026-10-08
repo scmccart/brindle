@@ -12,18 +12,18 @@
 
 ## 3. Actions and keys
 
-- [ ] 3.1 Add `Find`, `FindNext`, `FindPrevious`, `FindClose`, `FindToggleCase` and `FindToggleRegex` to `actions!` and `ACTIONS` (only `Find` labelled, as "Find"). Add the default bindings of design §2, including `Paste` in `FindBar`. Extend the actions tests: the new names resolve, and ctrl-shift-f, enter and escape parse. Verify with `cargo test actions` and `cargo run -- --list-actions | grep find`.
+- [x] 3.1 Add `Find`, `FindNext`, `FindPrevious`, `FindClose`, `FindToggleCase` and `FindToggleRegex` to `actions!` and `ACTIONS` (only `Find` labelled, as "Find"). Add the default bindings of design §2, including `Paste` in `FindBar`. Extend the actions tests: the new names resolve, and ctrl-shift-f, enter and escape parse. Verify with `cargo test actions` and `cargo run -- --list-actions | grep find`.
 
 ## 4. Find bar and highlights
 
-- [ ] 4.1 In `src/terminal_view.rs`, add `FindBar` state and the handlers: open/focus, edit keys, paste, toggles, next/previous, close with offset restore, the remembered query with the select-on-restore flag, and the debounced count (§§1, 5, 10–12). Guard `key_down` so keys only reach the program when the terminal itself is focused. Verify that `cargo build` passes with no warnings.
-- [ ] 4.2 Render the bar (query with caret or selected state, count or "No results"/"Invalid regex", Aa and .* toggles, ↑ ↓ × buttons) at the top right, occluding the mouse, with theme colors. Verify that `cargo build` passes.
-- [ ] 4.3 In `src/terminal_element.rs`, compute the visible matches in prepaint and apply match and focused-match colors with the precedence of design §8. Verify that `cargo test` passes, with a unit test of the precedence helper.
+- [x] 4.1 In `src/terminal_view.rs`, add `FindBar` state and the handlers: open/focus, edit keys, paste, toggles, next/previous, close with offset restore, the remembered query with the select-on-restore flag, and the debounced count (§§1, 5, 10–12). Guard `key_down` so keys only reach the program when the terminal itself is focused. Verify that `cargo build` passes with no warnings.
+- [x] 4.2 Render the bar (query with caret or selected state, count or "No results"/"Invalid regex", Aa and .* toggles, ↑ ↓ × buttons) at the top right, occluding the mouse, with theme colors. Verify that `cargo build` passes.
+- [x] 4.3 In `src/terminal_element.rs`, compute the visible matches in prepaint and apply match and focused-match colors with the precedence of design §8. Verify that `cargo test` passes, with a unit test of the precedence helper.
 
 ## 5. Debug hook, dump and docs
 
-- [ ] 5.1 Add the `--find <TEXT>` step to `main.rs` (help text included), `Workspace::find_in_active`, and the `--- find` dump line (design §13). Verify with a locked run: `flock /tmp/brindle-gui.lock ./target/debug/brindle -p Shell --send 'echo needle\r' --find needle --dump-screen-after 4`, using a temporary `BRINDLE_CONFIG`. The dump should show `count=1` and a focused position.
-- [ ] 5.2 Update the README: ctrl-shift-f in the keybinding table, a short find bar section (enter/shift-enter, alt-c/alt-r, escape), and the theme keys. Verify that the README matches `default_bindings()`.
+- [x] 5.1 Add the `--find <TEXT>` step to `main.rs` (help text included), `Workspace::find_in_active`, and the `--- find` dump line (design §13). Verify with a locked run: `flock /tmp/brindle-gui.lock ./target/debug/brindle -p Shell --send 'echo needle\r' --find needle --dump-screen-after 4`, using a temporary `BRINDLE_CONFIG`. The dump should show `count=1` and a focused position.
+- [x] 5.2 Update the README: ctrl-shift-f in the keybinding table, a short find bar section (enter/shift-enter, alt-c/alt-r, escape), and the theme keys. Verify that the README matches `default_bindings()`.
 
 ## 6. End-to-end cases
 

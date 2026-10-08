@@ -159,6 +159,7 @@ On first launch Brindle writes a commented config to
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
 | ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
 | shift-pageup/down, shift-home/end | scrollback |
+| ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-n | new window |
 | ctrl-shift-, | settings (theme picker with live preview, custom theme editor, profiles) |
@@ -180,6 +181,28 @@ on its open tabs while you edit; the other settings apply to new tabs. Renaming
 a profile keeps its open tabs linked to it and updates `default_profile`.
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
+
+### Find
+
+ctrl-shift-f (or "Find" in the command palette) opens a find bar over the
+focused terminal. Matches are highlighted as you type, and the current one is
+scrolled into view.
+
+| Keys in the find bar | Action |
+|---|---|
+| enter / shift-enter | next match up (older output) / down |
+| alt-c | match case (off by default) |
+| alt-r | regular expression (off by default: the text matches literally) |
+| escape | close, and put the view back where it was |
+
+The bar shows the current match's number, counted from the newest output, and
+the total. Clicking the terminal leaves the bar open, so you can type into the
+program while the matches stay highlighted. In tmux control mode each pane has
+its own bar and searches only its own scrollback. `find_next`, `find_previous`
+and `find_close` can be bound to keys of your own. Themes can set the highlight
+colors with `search_match_background`, `search_match_foreground`,
+`search_focused_match_background` and `search_focused_match_foreground`;
+otherwise they come from the theme's yellow.
 
 **Breaking change:** ctrl-shift-p used to open the profile list and now opens the
 command palette. The profile list is on ctrl-shift-space and the `⌄` button; to

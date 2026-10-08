@@ -103,6 +103,14 @@ impl Tab {
         }
     }
 
+    /// The view of the terminal that has (or last had) focus in this tab.
+    fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        match &self.content {
+            TabContent::Terminal(view) => Some(view.clone()),
+            TabContent::Tmux { view, .. } => view.read(cx).active_view(),
+        }
+    }
+
     /// Where the active terminal was last painted.
     fn active_grid(&self, cx: &App) -> Option<GridLayout> {
         match &self.content {
@@ -869,6 +877,13 @@ impl Workspace {
         }
     }
 
+    /// Debug hook for `--find`: searches the active terminal for `query`.
+    pub fn find_in_active(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
+            view.update(cx, |view, cx| view.find_text(query, window, cx));
+        }
+    }
+
     /// Debug hook for `--dump-screen-after`.
     pub fn dump_active_screen(&self, window: &Window, cx: &App) -> String {
         let scale = window.scale_factor();
@@ -889,6 +904,9 @@ impl Workspace {
                 out.push_str(&grid.describe(scale));
             }
             out.push_str(&terminal.screen_text());
+        }
+        if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
+            out.push_str(&find);
         }
         match &self.overlay {
             Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe(cx)),
