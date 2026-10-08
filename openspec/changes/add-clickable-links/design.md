@@ -78,7 +78,9 @@ Hover is cleared when:
 
 **Prepaint** maps each span to viewport rows (`line + display_offset`). For cells inside a span it forces a single underline in the cell's foreground color, and sets `Frame::pointing_hand`. Paint uses `CursorStyle::PointingHand` over the hitbox in that case, ahead of the arrow and I-beam choice.
 
-*Limitation:* `ModifiersChangedEvent` reaches only the focused terminal. When the pointer rests over an unfocused tmux pane and ctrl is pressed, the underline appears on the next mouse move. Clicking still works, because mouse down checks the modifiers and computes the link itself.
+**Modifiers in tmux panes:** `ModifiersChangedEvent` reaches only the focused terminal's listener. `TmuxWindowView`'s root, which is always on the focus path while one of its panes has focus, also listens. It passes each change, with `window.mouse_position()`, to every pane view, and each pane shows or clears feedback depending on whether the pointer is over its grid. So pressing or releasing ctrl over an inactive pane updates it at once.
+
+**No feedback while dragging:** while a selection drag or a reported drag is in progress, `hover` clears instead of looking links up. A ctrl block selection therefore doesn't flash underlines or switch to a pointing hand as it sweeps over URLs.
 
 ### 5. Click rule: ctrl takes a press on a link, open on release
 
