@@ -685,12 +685,17 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "raw-window-handle",
  "serde",
  "smallvec",
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "unicode-width",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols 0.31.2",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

@@ -2,16 +2,16 @@
 
 ## 1. Dependencies
 
-- [ ] 1.1 Add `zbus` (5.12, no default features, `async-io`), `raw-window-handle` 0.6, `wayland-client` 0.31, `wayland-backend` 0.3 (`client_system`, `dlopen`) and `wayland-protocols` 0.31.2 (`client`, `staging`) to `Cargo.toml`; verify `cargo build` succeeds and `git diff Cargo.lock` only adds lines to Brindle's own dependency list
+- [x] 1.1 Add `zbus` (5.12, no default features, `async-io`), `raw-window-handle` 0.6, `wayland-client` 0.31, `wayland-backend` 0.3 (`client_system`, `dlopen`) and `wayland-protocols` 0.31.2 (`client`, `staging`) to `Cargo.toml`; verify `cargo build` succeeds and `git diff Cargo.lock` only adds lines to Brindle's own dependency list
 
 ## 2. OSC scanner and policy (pure)
 
-- [ ] 2.1 Add `src/notify/osc.rs`: the streaming scanner and OSC 9/777 payload parsing with text clean-up; verify unit tests for BEL/ST terminators, split reads at every byte, CAN/SUB/ESC cancellation, other OSCs ignored, oversize payloads, ConEmu sub-commands 1–12 vs `9;42`, OSC 777 `notify` with `;` in the body, other 777 sub-commands, control-character stripping and truncation
-- [ ] 2.2 Add `src/notify/policy.rs`: the focus rule, the notification title/body layout, and the token-bucket rate limiter with an injected clock; verify unit tests for visible/background/unfocused × `unfocused`/`always`, per-source switches, bell storm (one per 5 s), OSC burst of 3 then 1 per 2 s, the global cap, and no charge when denied
+- [x] 2.1 Add `src/notify/osc.rs`: the streaming scanner and OSC 9/777 payload parsing with text clean-up; verify unit tests for BEL/ST terminators, split reads at every byte, CAN/SUB/ESC cancellation, other OSCs ignored, oversize payloads, ConEmu sub-commands 1–12 vs `9;42`, OSC 777 `notify` with `;` in the body, other 777 sub-commands, control-character stripping and truncation
+- [x] 2.2 Add `src/notify/policy.rs`: the focus rule, the notification title/body layout, and the token-bucket rate limiter with an injected clock; verify unit tests for visible/background/unfocused × `unfocused`/`always`, per-source switches, bell storm (one per 5 s), OSC burst of 3 then 1 per 2 s, the global cap, and no charge when denied
 
 ## 3. Configuration
 
-- [ ] 3.1 Add the `[notifications]` table (`bell`, `osc9`, `osc777`, `when`) to `Config` and a commented section to `assets/default-config.toml`; verify `default_config_file_parses` and a new parse test for the table, its defaults and an invalid `when`
+- [x] 3.1 Add the `[notifications]` table (`bell`, `osc9`, `osc777`, `when`) to `Config` and a commented section to `assets/default-config.toml`; verify `default_config_file_parses` and a new parse test for the table, its defaults and an invalid `when`
 
 ## 4. Detection in terminals
 
