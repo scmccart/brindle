@@ -114,18 +114,17 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// The only tab exiting closes the window and quits: nothing is left to
-/// restore. This run never dumps (the window is gone), so it is started
-/// directly and the state file is checked after it exits.
-pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    write_state(ctx, &state(0, &[local("Shell", &ctx.dir)]))?;
+/// Runs a plain restore launch whose steps close its only window, so it
+/// quits without ever dumping, and waits for it to exit.
+fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &[&str]) -> Result {
     let config = ctx.dir.join("config.toml");
     std::fs::write(&config, crate::brindle::config_with(&server.socket, "e2e", "Shell", "restore_session = true\n"))
         .map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(ctx.dir.join("exit.log")).map_err(|e| e.to_string())?;
+    let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
     let mut child = std::process::Command::new(&ctx.bin)
-        .args(["--send", "exit\\r", "--dump-screen-after", &ctx.secs(20.0).to_string()])
+        .args(steps)
+        // Only reached if the window doesn't close.
+        .args(["--dump-screen-after", &ctx.secs(20.0).to_string()])
         .env("BRINDLE_CONFIG", &config)
         .env("BRINDLE_STATE_DIR", state_dir(ctx))
         .env("DISPLAY", &ctx.display)
@@ -134,17 +133,50 @@ pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
         .stderr(log)
         .spawn()
         .map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(ctx.secs(10.0));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(ctx.secs(12.0));
     while child.try_wait().map_err(|e| e.to_string())?.is_none() {
         if std::time::Instant::now() > deadline {
             child.kill().ok();
-            return Err("Brindle didn't quit after its only tab exited".into());
+            return Err(format!("{label}: Brindle didn't quit when its window closed"));
         }
         ctx.sleep(0.1);
     }
+    Ok(())
+}
+
+/// The only tab exiting closes the window and quits: nothing is left to
+/// restore, and the next launch is a normal one without complaints.
+pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    write_state(ctx, &state(0, &[local("Shell", &ctx.dir)]))?;
+    run_until_window_closes(ctx, &server, "exit", &["--send", "exit\\r"])?;
     let text = state_text(ctx)?;
     ctx.save("after-exit.toml", &text);
     ensure!(!text.contains("[[windows"), "a window is still recorded:\n{text}");
+
+    let out = Run::new(ctx, &server, "next").restore().default_profile("Shell").dump_at(3.0).run()?;
+    ensure!(out.dump.tabs.len() == 1, "next launch: tabs {:?}", out.dump.tabs);
+    let log = std::fs::read_to_string(ctx.dir.join("next.log")).unwrap_or_default();
+    ensure!(!log.contains("ignoring session state"), "an empty state is reported as bad:\n{log}");
+    Ok(Outcome::Pass)
+}
+
+/// Closing the last window while it still has tabs (the close button, or
+/// close_window) quits and keeps the tabs for the next launch.
+pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let kept = dir(ctx, "kept")?;
+    // cd at ~1.5 s, recorded by the 2 s poll, window closed at ~2.5 s.
+    let cd = format!("cd '{}'\\r", kept.display());
+    run_until_window_closes(ctx, &server, "close", &["--send", &cd, "--action", "close_window"])?;
+    let text = state_text(ctx)?;
+    ctx.save("after-close.toml", &text);
+    ensure!(text.matches("kind = \"local\"").count() == 1, "recorded tabs:\n{text}");
+    ensure!(text.contains(&format!("cwd = \"{}\"", kept.display())), "recorded directory:\n{text}");
+
+    let out = Run::new(ctx, &server, "reopen").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
+    ensure!(out.dump.tabs.len() == 1, "reopened tabs {:?}", out.dump.tabs);
+    ensure!(out.dump.screen.iter().any(|l| *l == kept.display().to_string()), "pwd: {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }
 

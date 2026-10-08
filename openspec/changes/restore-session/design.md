@@ -142,6 +142,8 @@ The first process that needs the state (at launch with the setting on, or on the
 - [Polling every second for snapshots.] → It reuses the existing title poll. The added work is one `readlink` per local tab and a string compare, and the file is only written when the text changes.
 - [With two windows attached to the same tmux session, restoring attaches it once per window, as before the quit.] → Accepted. This mirrors what was open.
 - [Quiet sessions suppress exactly one `WindowActivated`.] → `list-windows` always marks one window active, so the first window list emits it, and the flag is used up there. Even if it lingered, at most one later activation would be skipped.
+- [Two tmux sessions recorded next to each other, with no local tab between them, share an anchor, so their order on restore follows which one attaches first.] → Accepted. Each session's own tabs stay together and in order. Only the order of the two groups can swap.
+- [A state file with no windows (left by closing the last tab) is a normal launch, not a bad file.] → `load` treats it as no state and logs nothing.
 - [The state file records directory paths.] → It is written 0600 under the user's state directory.
 - [Snapshots are skipped while restore is off, so turning it on mid-run records from the next tick only.] → As specified ("within a few seconds").
 
