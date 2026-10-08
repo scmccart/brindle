@@ -36,5 +36,5 @@
 
 ## 8. Documentation and integration
 
-- [ ] 8.1 Document notifications in README.md (config, examples, tmux behaviour) and CLAUDE.md (architecture notes, `BRINDLE_NOTIFY_LOG`); verify the README commands match the default config
+- [x] 8.1 Document notifications in README.md (config, examples, tmux behaviour) and CLAUDE.md (architecture notes, `BRINDLE_NOTIFY_LOG`); verify the README commands match the default config
 - [ ] 8.2 Run `cargo test`, `cargo build --release`, the e2e `notify`/`tmux-` cases and the full e2e suite; verify everything passes

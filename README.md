@@ -11,6 +11,8 @@ while sessions stay in tmux, persistent and detachable.
 
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
 - **Profiles**: command, args, working directory, environment, theme and font size per profile.
+- **Desktop notifications** from OSC 9, OSC 777 and bells in tabs you can't see;
+  clicking one takes you to its tab.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **tmux**, both ways:
@@ -138,6 +140,38 @@ Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usua
 **Breaking change:** ctrl-shift-p used to open the profile list and now opens the
 command palette. The profile list is on ctrl-shift-space and the `⌄` button; to
 get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.
+
+### Desktop notifications
+
+Programs can raise a desktop notification with OSC 9 or OSC 777, and a bell
+raises one too:
+
+```sh
+printf '\033]9;Build finished\a'                  # OSC 9: a message
+printf '\033]777;notify;Tests;12 passed\a'        # OSC 777: title and body
+sleep 3; printf '\a'                              # a bell; switch tabs meanwhile
+```
+
+By default a tab notifies only when it isn't in front of you: it's a background
+tab, or its window isn't focused. The notification's title names the tab, and
+clicking it raises the window and switches to that tab. ConEmu's numbered
+`OSC 9;N` commands (progress `9;4`, working directory `9;9`, …) never notify.
+Bells notify at most once every 5 seconds per tab, and programs can send a
+burst of three, then one every 2 seconds, so a bell storm can't flood the
+desktop. Configure it in `config.toml`:
+
+```toml
+[notifications]
+bell = true          # bells
+osc9 = true          # OSC 9
+osc777 = true        # OSC 777
+when = "unfocused"   # or "always"
+```
+
+In tmux control mode, bells and notifications from any pane, in any tmux window,
+work the same way. In classic tmux, tmux itself swallows OSC 9 and 777 unless the
+program wraps them in tmux's passthrough (`set -g allow-passthrough on`); bells
+get through.
 
 ### tmux control mode
 

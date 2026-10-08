@@ -30,6 +30,7 @@ BRINDLE_CONFIG=/tmp/test-config.toml ./target/release/brindle -p tmux \
 ```
 
 - `--send` and `--action` steps run in order, one second apart, against the active tab. Action names are listed by `--list-actions`.
+- `BRINDLE_NOTIFY_LOG=<file>` appends each desktop notification to the file (`source<TAB>title<TAB>body`) instead of sending it over D-Bus.
 - `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, its grid geometry (`--- grid origin=X,Y cell=WxH scale=S`, logical window pixels), and its screen text, then exits.
 - For pixels, run under Xwayland (`env -u WAYLAND_DISPLAY DISPLAY=:0`) and grab the window with x11rb `GetImage` (`tests/e2e/capture.rs`).
 - For tmux tests, use a throwaway server (profile `tmux_args = ["-L", "brindle-e2e", "-f", "/dev/null"]`), never the user's default server or `main` session, and kill it afterwards.
@@ -70,6 +71,12 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - Tab titles are cached and refreshed on `TitleChanged` plus a 1 s poll of `/proc`.
   - Removing the last tab closes the window, and closing the last window quits.
 - **`settings.rs`** — a GPUI global holding the `Config`, the resolved font (built once) and the zoom level. Live reload (`main.rs` polls the file mtime) rebuilds it, rebinds keys, and calls `Workspace::apply_config`.
+- **`notify/`** — desktop notifications.
+  - `osc.rs` scans output for OSC 9/777, beside alacritty, which drops OSCs it doesn't know. It keeps state across reads. ConEmu's `9;1`–`9;12` commands are not messages.
+  - Local tabs scan on alacritty's I/O thread: `terminal/scan.rs` wraps the `Pty` and gives the event loop a reader over a dup of the PTY fd. Notices travel on the terminal's event channel (`ChannelEvent`). Remote terminals scan in `feed()`.
+  - `TmuxWindowView` re-emits its panes' `Bell`/`Notify`, so `Workspace::on_attention` handles local and tmux tabs alike (bell dot, focus rule, settings).
+  - `Notifier` (a GPUI global) rate-limits (`policy.rs`), then sends to a zbus worker on the background executor, or to the `BRINDLE_NOTIFY_LOG` file (written synchronously, since `--dump-screen-after` quits right after). It maps notification ids to window and tab for clicks.
+  - A click activates the tab and raises the window. On Wayland, `activation.rs` uses the server's `ActivationToken` on GPUI's own `wl_surface` (foreign display, own event queue), because GPUI's own activation request is refused when unfocused.
 - **`desktop.rs`** — `--install-desktop` / `--uninstall-desktop` register Brindle with freedesktop launchers. They write `brindle.desktop` (its `Exec` is the running binary's absolute path) and the embedded `assets/brindle.svg` icon, and they run in `main` before GPUI starts, so no display is needed. `scripts/install.sh` delegates to them. Linux icons come only from the desktop entry and the icon theme, matched through the `brindle` app_id. The icon cache is refreshed only where one already exists.
 - **`actions.rs`** — one `ACTIONS` table drives config-name lookup, `--list-actions` and the command palette (an entry's label puts it in the palette). Default bindings use the key contexts `Workspace`, `Terminal`, `TmuxWindow` and `Palette`. User bindings go in the `Terminal` context, so they win over the defaults.
   - tmux actions (detach included) are handled only in `TmuxWindow`. ctrl-shift-d is also bound to the hidden `Swallow` action in `Workspace`, so outside tmux tabs it never reaches a shell as `^D`.
