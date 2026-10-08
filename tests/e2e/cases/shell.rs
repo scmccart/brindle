@@ -132,6 +132,47 @@ pub fn tmux_prompt_jump(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// Up then down after `clear` typed at a marked prompt lower on the screen:
+/// down must reach the `false` prompt (the view's bottom, where it and the
+/// current prompt are), not stop at the erased prompt's leftover mark.
+/// `clear` is `CSI H CSI J CSI 3 J` under tmux's TERM (erase in place); a
+/// local tab gets the same bytes from `printf`.
+fn clear_then_up_down(ctx: &Ctx, local: bool) -> Result<Outcome> {
+    let server = server()?;
+    let clear = if local { r"printf '\033[H\033[J\033[3J'\r" } else { r"clear\r" };
+    let mut run = Run::new(ctx, &server, "run");
+    if local {
+        run = run.profile("Shell");
+    }
+    let out = run
+        .send(&setup(ctx))
+        .send(r"seq 1 5\r")
+        .send(clear)
+        .send(r"seq 1 60\r")
+        .send(r"false\r")
+        .action("jump_to_previous_prompt")
+        .action("jump_to_next_prompt")
+        .dump_at(9.0)
+        .run()?;
+    let screen = &out.dump.screen;
+    let tail: Vec<&str> = screen.iter().rev().take(2).rev().map(String::as_str).collect();
+    ensure!(
+        tail == ["$ false", "$"],
+        "after up then down the view should be back at the bottom showing the `false` prompt; \
+         it ends {tail:?} (starts {:?})",
+        screen.first()
+    );
+    Ok(Outcome::Pass)
+}
+
+pub fn clear_up_down(ctx: &Ctx) -> Result<Outcome> {
+    clear_then_up_down(ctx, true)
+}
+
+pub fn tmux_clear_up_down(ctx: &Ctx) -> Result<Outcome> {
+    clear_then_up_down(ctx, false)
+}
+
 /// tmux passes OSC 133 from a pane to control clients unchanged (both
 /// terminators). `Terminal::feed` relies on this for marks in panes.
 pub fn tmux_passthrough(ctx: &Ctx) -> Result<Outcome> {

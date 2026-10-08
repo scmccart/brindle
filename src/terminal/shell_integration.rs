@@ -44,6 +44,11 @@ enum Split {
     AltScreen,
     /// Before the final byte of `CSI 3 J`.
     ClearHistory,
+    /// Before the final byte of `CSI J` / `CSI 0 J` (cursor to end of
+    /// screen) or, with `above`, `CSI 1 J` (start of screen to cursor).
+    /// These erase in place without scrolling; tmux's `clear` is
+    /// `CSI H CSI J`, unlike xterm's scrolling `CSI 2 J`.
+    Erase { above: bool },
     /// After `ESC c`.
     Reset,
 }
@@ -52,7 +57,7 @@ impl Split {
     /// Whether the stream is split before the byte that completed the
     /// sequence (which is then fed on its own) rather than after it.
     fn before(self) -> bool {
-        matches!(self, Split::AltScreen | Split::ClearHistory)
+        matches!(self, Split::AltScreen | Split::ClearHistory | Split::Erase { .. })
     }
 }
 
@@ -215,7 +220,12 @@ impl Scanner {
             return None;
         }
         match final_byte {
-            b'J' if self.buf == b"3" => Some(Split::ClearHistory),
+            b'J' => match self.buf.as_slice() {
+                b"3" => Some(Split::ClearHistory),
+                b"" | b"0" => Some(Split::Erase { above: false }),
+                b"1" => Some(Split::Erase { above: true }),
+                _ => None,
+            },
             b'h' | b'l' => {
                 let params = self.buf.strip_prefix(b"?")?;
                 params
@@ -487,6 +497,26 @@ impl Marks {
         }
     }
 
+    /// Forgets commands whose prompt is about to be erased in place by
+    /// `CSI J` (below the cursor) or `CSI 1 J` (above it). Only the prompt
+    /// decides: shells erase below the cursor right after drawing their
+    /// prompt, which must keep the current prompt (it starts before the
+    /// cursor), and a late `D` for a dropped command is ignored anyway.
+    pub fn erase<T>(&mut self, term: &Term<T>, above: bool) {
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let cursor = self.pos(term);
+        let erased = |p: Pos| {
+            if above {
+                p.line < cursor.line || (p.line == cursor.line && p.col <= cursor.col)
+            } else {
+                p.line > cursor.line || (p.line == cursor.line && p.col >= cursor.col)
+            }
+        };
+        self.commands.retain(|c| !erased(c.prompt));
+    }
+
     /// Drops commands whose lines are no longer in the grid.
     pub fn prune<T>(&mut self, term: &Term<T>) {
         let grid = term.grid();
@@ -677,6 +707,9 @@ impl Parser {
                     marks.alt_snapshot = Some(marks.snapshot(term));
                     marks.alt_resized = false;
                 }
+                if let Split::Erase { above } = split {
+                    marks.lock().erase(term, above);
+                }
                 self.feed(term, marks, &bytes[at..=at]);
             } else {
                 self.feed(term, marks, &bytes[fed..=at]);
@@ -686,7 +719,7 @@ impl Parser {
                         marks.lock().record(term, mark);
                     }
                     Split::Reset => marks.lock().clear(),
-                    Split::AltScreen | Split::ClearHistory => {}
+                    Split::AltScreen | Split::ClearHistory | Split::Erase { .. } => {}
                 }
             }
             fed = scanned;
@@ -779,7 +812,15 @@ mod tests {
     #[test]
     fn scanner_finds_screen_sequences() {
         assert_eq!(scan_all(&[b"\x1b[?1049h\x1b[?25;1049l\x1b[?2026h"]), [Split::AltScreen, Split::AltScreen]);
-        assert_eq!(scan_all(&[b"\x1b[2J\x1b[3J\x1b[J"]), [Split::ClearHistory]);
+        assert_eq!(
+            scan_all(&[b"\x1b[2J\x1b[3J\x1b[J\x1b[0J\x1b[1J\x1b[?J\x1b[K"]),
+            [
+                Split::ClearHistory,
+                Split::Erase { above: false },
+                Split::Erase { above: false },
+                Split::Erase { above: true }
+            ]
+        );
         assert_eq!(scan_all(&[b"\x1bc\x1b(c"]), [Split::Reset]);
     }
 
@@ -891,6 +932,40 @@ mod tests {
         h.feed(b"\x1b[3J");
         assert_eq!(h.prompts(), ["$ three"]);
         h.feed(b"\x1bc");
+        assert!(h.prompts().is_empty());
+    }
+
+    /// tmux's `clear` (`CSI H CSI J CSI 3 J`) erases the screen in place.
+    /// The prompt `clear` was typed at used to keep its mark on the blank
+    /// row, so after scrolling it sat between the next prompts and caught
+    /// Jump to Next Prompt.
+    #[test]
+    fn erase_in_place_forgets_prompts() {
+        let mut h = Harness::new(20, 8, 100);
+        h.command("old", 3, 0);
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07clear\r\n\x1b]133;C\x07\x1b[H\x1b[J\x1b[3J\x1b]133;D;0\x07");
+        h.command("seq", 12, 0).command("false", 0, 1).feed(b"\x1b]133;A\x07$ ");
+        assert_eq!(h.prompts(), ["$ seq", "$ false", "$"]);
+        let marks = h.marks.lock();
+        let lines: Vec<i64> = marks.prompt_lines().collect();
+        // Up from the bottom reaches `seq`; down from there reaches `false`.
+        let up = marks.jump_target(0, true).unwrap();
+        assert_eq!(up, lines[0]);
+        assert_eq!(marks.jump_target(up, false), Some(lines[1]));
+    }
+
+    /// Shells erase below the cursor after drawing a prompt (zsh, fish,
+    /// oh-my-posh): that prompt keeps its mark.
+    #[test]
+    fn erase_after_prompt_keeps_it() {
+        let mut h = Harness::new(20, 8, 100);
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[J");
+        assert_eq!(h.prompts(), ["$"]);
+        // Erasing from the prompt's own start (cursor back at column 0) drops it.
+        h.feed(b"\r\x1b[J");
+        assert!(h.prompts().is_empty());
+        // CSI 1 J drops prompts above the cursor.
+        h.command("one", 1, 0).feed(b"\x1b]133;A\x07$ two\r\n\x1b[1J");
         assert!(h.prompts().is_empty());
     }
 
