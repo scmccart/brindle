@@ -1,10 +1,9 @@
-# Spec Delta
+# session-restore Specification
 
 ## Purpose
-
 Bring back the windows and tabs a user had open when Brindle last quit, so a logout, reboot or crash doesn't mean rebuilding the same tabs, directories and tmux attachments by hand. Restoring is opt-in.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Restore is opt-in
 Session recording and restoring SHALL happen only when the config sets `restore_session = true`. With the setting off (the default), Brindle SHALL NOT read or write a session state file, and every launch SHALL start as it does without this feature.
@@ -32,7 +31,7 @@ On a plain launch (see `command-line`) with the setting on and a usable state fi
 - **THEN** the next plain launch opens two windows, each with its own recorded tabs
 
 ### Requirement: Local tabs restore their profile and directory
-A restored local tab SHALL run its recorded profile's program, starting in the recorded working directory. The recorded directory SHALL be the working directory of the tab's foreground process, the same directory a new tab would inherit. A tab that was opened with a command (`-e`, or the config editor tab) SHALL come back as its profile's program in the recorded directory. Tabs that only show a message, such as an attach failure, SHALL NOT be recorded. Classic tmux tabs SHALL rerun their profile, which reattaches to their session.
+A restored local tab SHALL run its recorded profile's program, starting in the recorded working directory. The recorded directory SHALL be the working directory of the tab's foreground process, the same directory a new tab would inherit. Classic tmux tabs SHALL rerun their profile, which reattaches to their session.
 
 #### Scenario: Directory comes back
 - **WHEN** a tab's shell was in `/srv/www` when Brindle quit
@@ -41,6 +40,17 @@ A restored local tab SHALL run its recorded profile's program, starting in the r
 #### Scenario: Classic tmux tab
 - **WHEN** a classic tmux tab for session `main` was open when Brindle quit
 - **THEN** after a plain launch a tab runs `tmux new-session -A -s main` and shows that session
+
+### Requirement: Commands and messages are not replayed
+A tab that was opened with a command (`-e`, or the config editor tab) SHALL come back as its profile's program in the recorded directory, without the command. Tabs that only show a message, such as an attach failure, SHALL NOT be recorded.
+
+#### Scenario: Command tab
+- **WHEN** Brindle was started with `-e htop` in `~/src` and then quit
+- **THEN** after a plain launch the tab runs the default profile's shell in `~/src`, not htop
+
+#### Scenario: Attach-failure tab
+- **WHEN** the only other tab showed a tmux attach failure when Brindle quit
+- **THEN** that tab is not restored
 
 ### Requirement: Control-mode sessions are reattached once
 For tmux control-mode tabs, Brindle SHALL record the session (profile and current session name), once per window, at the position of the session's first tab. Restoring SHALL attach each recorded session once. The session's windows SHALL then arrive as tabs at the position the session had among the other tabs, in tmux's window order. Restoring SHALL NOT select any tmux window or pane: the requirements of `tmux-control-mode` for attaching apply unchanged.
@@ -59,9 +69,9 @@ For tmux control-mode tabs, Brindle SHALL record the session (profile and curren
 
 ### Requirement: Restoring falls back when things have changed
 Restoring SHALL succeed even when the recorded state no longer matches the system:
-- a recorded profile that no longer exists SHALL be replaced by the default profile, with a log line;
-- a recorded directory that no longer exists SHALL be replaced by the profile's own directory, or the home directory when the profile sets none;
-- a control-mode session that no longer exists SHALL be created again by the attach, as opening the profile does. If tmux can't attach, the attach-failure tab of `tmux-control-mode` SHALL be shown.
+- a missing profile SHALL be replaced by the default profile, with a log line;
+- a missing directory SHALL be replaced by the profile's own directory, else the home directory;
+- a missing control-mode session SHALL be created again by the attach, as opening the profile does. If tmux can't attach, the attach-failure tab of `tmux-control-mode` SHALL be shown.
 
 #### Scenario: Profile removed from the config
 - **WHEN** a recorded tab's profile `Work` has been removed from the config
