@@ -59,6 +59,8 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
   - `Pty`: alacritty's `EventLoop` runs on its own thread.
   - `Remote`: bytes are pushed in with `feed()` and input goes to a closure. Used for tmux panes and for error-message tabs (`Terminal::message`).
 
+  - **Parsing and shell integration (`shell_integration.rs`, `pty.rs`):** both backends parse through Brindle's own `Parser` (vte processor + OSC 133 scanner). For `Pty`, `MarkedPty` wraps alacritty's `Pty` so the event loop's reader parses under the term lock and returns `Ok(0)`; alacritty's own processor never sees bytes. Lock order is parser → term (`lock_unfair` while holding the parser) → marks. Marks are absolute lines (`base + Line`); `base` is kept by finding the row that was at `Line(0)` after each processor call (rows rotate, their cells never move), and resizes remap marks through logical lines. Synchronized-update timeouts are flushed from the GPUI side on `Wakeup`.
+
   Alacritty events reach GPUI through an unbounded channel drained by a spawned task. Replies the emulator generates go through `reply()`, which drops them for `Remote` terminals, because tmux answers terminal queries itself. `keys.rs` and `mouse.rs` are pure xterm encoders with unit tests.
 - **`terminal_view.rs` / `terminal_element.rs`**
   - Key handling: GPUI resolves keybindings *before* `on_key_down`. `key_down` encodes special keys and modifier combos and calls `stop_propagation`. Plain text (no modifiers or shift only) instead arrives through the `EntityInputHandler` path, which is what makes IME work. That's why app shortcuts are ctrl-shift-*.

@@ -37,4 +37,4 @@
   - `tmux-prompt-jump`: the bash script in a control-mode pane, jump works.
 
   Verify by running them under `flock /tmp/brindle-gui.lock`.
-- [ ] 5.3 Integration check: `cargo build`, `cargo test`, `cargo build --release`, and the e2e cases above, plus `dump-grid-geometry` and `geometry-plain` as regression checks for the PTY and feed paths.
+- [x] 5.3 Integration check: `cargo build`, `cargo test`, `cargo build --release`, and the e2e cases above, plus `dump-grid-geometry` and `geometry-plain` as regression checks for the PTY and feed paths.
