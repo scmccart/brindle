@@ -33,7 +33,7 @@ Brindle doesn't know where a shell prompt starts, where a command's output begin
   - `terminal_view.rs`: the new actions; `terminal_element.rs`: the gutter bar;
   - `actions.rs`, `config.rs`, `main.rs` (`--shell-integration`), `workspace.rs` (dump);
   - `shell-integration/brindle.{bash,zsh,fish}`.
-- **Dependencies:** `polling = "3.11"`, needed to name the types in alacritty's `EventedReadWrite` trait. Version 3.11.0 is already in `Cargo.lock` through `alacritty_terminal`, so only a dependency edge is added.
+- **Dependencies:** `polling = "=3.11.0"`, needed to name the types in alacritty's `EventedReadWrite` trait. Version 3.11.0 is already in `Cargo.lock` through `alacritty_terminal`, so only a dependency edge is added.
 - **Specs:** a new `shell-integration` spec, and deltas to `configuration`, `command-line` and `terminal-emulation`.
 - **Tests:**
   - unit tests for the scanner, including sequences split across reads, and for anchoring through scroll, history overflow, clear, alt screen and resize;
