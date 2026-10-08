@@ -75,7 +75,7 @@
    - The JSON log line is `{"key":"x","output_ms":…,"paint_ms":…,"frame_ms":…}`, or `{"key":"x","timeout":true}` for a timeout. It is written by hand, so no serde is needed.
 
 6. **The suite is its own target, `tests/perf/`**: `[[test]] name = "perf"`, `harness = false`. It is opted into with `BRINDLE_PERF=1` and accepts the same name filters and `--list` as e2e.
-   - It reuses `tests/e2e/brindle.rs` and `tmux.rs` through `#[path]` modules. Anything there that depends on e2e-only types moves into a small shared module.
+   - It shares `Result`, `ensure!` and `TmuxServer` with e2e through `tests/common/`, included with `#[path]`. It has its own small runner for Brindle: e2e's `brindle::Run` is built around `--dump-screen-after`, window captures and the e2e theme, and none of that applies here.
    - It isn't a set of e2e cases because e2e cases pass or fail and run as one batch. Perf runs take minutes, need a quiet machine, and produce numbers rather than verdicts. CLAUDE.md's rule that GUI checks belong in e2e still holds for checks, and CLAUDE.md gains a line pointing at the perf target.
 
 7. **It times a release binary.** The suite uses `BRINDLE_PERF_BIN`, or else `target/release/brindle`, and stops with "run `cargo build --release`" if neither exists.
@@ -96,13 +96,13 @@
    - `latency-tmux`: the same against a throwaway tmux server (`-L brindle-perf-<pid>-<n>`, `-f /dev/null`), which times the `send-keys` → `%output` round trip.
    - Both cases take 500 samples, overridable with `BRINDLE_PERF_SAMPLES`. A sample costs the round trip plus a 25 ms average gap, so about 20 s locally and about 30 s through tmux. That is cheap. With 500 samples, p99 rests on the 5 slowest, which is stable enough to compare runs; at 200 it would rest on 2. Using the same count in both cases keeps their percentiles comparable.
 
-10. **Report.** Each run writes `target/tmp/perf/<UTC timestamp>/`, holding the `.dat` files, the latency logs, `summary.json` and a printed table, and points a `latest` symlink at it.
-    - `BRINDLE_PERF_BASELINE=<dir>` adds a delta column against that run's `summary.json`.
+10. **Report.** Each run writes `target/tmp/perf/<UTC timestamp>/`, holding the `.dat` files, the latency logs, `summary.toml` and a printed table, and points a `latest` symlink at it.
+    - `BRINDLE_PERF_BASELINE=<dir>` adds a delta column against that run's `summary.toml`. It is TOML so the existing `toml` and `serde` dependencies can read it back; adding `serde_json` would have been a new dependency.
     - Throughput per vtebench benchmark is the mean milliseconds parsed from the `.dat` files. The column layout is confirmed against vtebench's `gnuplot/` scripts during implementation.
 
 ## Risks / Trade-offs
 
-- **The I/O thread can race the paint.** The I/O thread can finish parsing, prepaint can draw the new content, and only then the generation increments, so the probe completes one frame late. → The increment happens right after alacritty releases the lock, so the window is tiny, and the bias is at most one frame and always upward. This is noted in the README's description of the numbers.
+- **Could the generation and the grid disagree?** No. Alacritty's `pty_read` sends `Wakeup` while it still holds the `Term` lock, and `feed()` advances inside its own lock, so the generation `prepaint` reads under the lock always matches the grid it snapshots.
 - **Desktop noise** (other apps, compositor effects, CPU frequency scaling) moves the numbers. → The suite prints the CPU governor and display type with each run, and the README recommends repeating runs on an idle machine. Percentiles rather than means keep outliers from dominating the latency numbers.
 - **Opening windows takes focus.** → As with e2e: ask before running, use the same Xwayland display default (`BRINDLE_PERF_DISPLAY`), and never send OS-level input.
 - **The frame stage isn't key-to-photon.** → It is named `frame`, not "presented", and the spec and README say what it covers.

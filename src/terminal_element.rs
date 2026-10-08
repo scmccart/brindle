@@ -19,6 +19,7 @@ use gpui::{
     outline, point, px, relative, size,
 };
 
+use crate::latency::Latency;
 use crate::settings::Settings;
 use crate::terminal::{DIM_FACTOR, GridSize, resolve_color};
 use crate::terminal_view::{GridLayout, TerminalView};
@@ -80,6 +81,9 @@ pub struct Frame {
     preedit: Option<(gpui::Point<Pixels>, ShapedLine, Bounds<Pixels>)>,
     line_height: Pixels,
     arrow_cursor: bool,
+    /// The terminal's output generation and its time when the grid was
+    /// read, for latency probes.
+    output: (u64, std::time::Instant),
 }
 
 fn rgb_hsla(c: Rgb) -> Hsla {
@@ -179,6 +183,8 @@ impl Element for TerminalElement {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         let term = terminal.term().lock();
+        // Read under the lock, so it matches the grid being snapshotted.
+        let output = (terminal.output_marker().generation(), terminal.output_marker().at());
         let content = term.renderable_content();
         let colors = content.colors;
         let display_offset = content.display_offset as i32;
@@ -433,6 +439,7 @@ impl Element for TerminalElement {
             preedit,
             line_height,
             arrow_cursor: mouse_mode,
+            output,
         }
     }
 
@@ -473,6 +480,12 @@ impl Element for TerminalElement {
                 line.paint(*origin, frame.line_height, window, cx).ok();
             }
         });
+
+        if Latency::enabled(cx) {
+            let terminal = self.view.read(cx).terminal.entity_id();
+            let (generation, output_at) = frame.output;
+            Latency::painted(terminal, generation, output_at, window, cx);
+        }
 
         let focus = self.view.read(cx).focus_handle.clone();
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);

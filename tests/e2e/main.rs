@@ -16,6 +16,8 @@
 //! config, dumps, captures and transcripts in `target/tmp/e2e/<case>/`.
 
 mod brindle;
+#[path = "../common/mod.rs"]
+mod common;
 mod capture;
 mod cases;
 mod query;
@@ -24,17 +26,7 @@ mod tmux;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub type Result<T = ()> = std::result::Result<T, String>;
-
-/// Fails the case with a message unless `cond` holds.
-#[macro_export]
-macro_rules! ensure {
-    ($cond:expr, $($msg:tt)+) => {
-        if !$cond {
-            return Err(format!($($msg)+));
-        }
-    };
-}
+pub use common::Result;
 
 pub enum Outcome {
     Pass,

@@ -12,8 +12,9 @@ pub mod mouse;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -29,14 +30,51 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
+use crate::latency::Latency;
 use crate::theme::{Color, Theme};
 
 #[derive(Clone)]
-pub struct Listener(UnboundedSender<AlacEvent>);
+pub struct Listener(UnboundedSender<AlacEvent>, Arc<OutputMarker>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: AlacEvent) {
+        if matches!(event, AlacEvent::Wakeup) {
+            // On alacritty's I/O thread, right after it parsed new output.
+            self.1.advance(Instant::now());
+        }
         self.0.unbounded_send(event).ok();
+    }
+}
+
+/// Counts output reaching a terminal, and when the latest arrived. Latency
+/// probes compare it with the generation a paint showed (see
+/// [`crate::latency`]).
+#[derive(Default)]
+pub struct OutputMarker {
+    generation: AtomicU64,
+    /// Nanoseconds after [`epoch`].
+    at: AtomicU64,
+}
+
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+impl OutputMarker {
+    fn advance(&self, now: Instant) {
+        let nanos = now.saturating_duration_since(epoch()).as_nanos() as u64;
+        self.at.store(nanos, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// When the latest output arrived.
+    pub fn at(&self) -> Instant {
+        epoch() + Duration::from_nanos(self.at.load(Ordering::Relaxed))
     }
 }
 
@@ -102,6 +140,7 @@ enum Backend {
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     backend: Backend,
+    output: Arc<OutputMarker>,
     size: GridSize,
     title: Option<String>,
     exited: bool,
@@ -159,8 +198,10 @@ impl Terminal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
+        output: Arc<OutputMarker>,
         rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
         backend: Backend,
         size: GridSize,
@@ -172,6 +213,7 @@ impl Terminal {
             _events: Self::spawn_events(rx, cx),
             term,
             backend,
+            output,
             size,
             title: None,
             exited: false,
@@ -214,7 +256,8 @@ impl Terminal {
         };
 
         let (tx, rx) = unbounded();
-        let listener = Listener(tx);
+        let output = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, output.clone());
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let spawned = (|| -> anyhow::Result<Backend> {
@@ -229,7 +272,7 @@ impl Terminal {
 
         let theme = config.profile_theme(profile);
         match spawned {
-            Ok(backend) => Self::new(term, rx, backend, size, theme, config, cx),
+            Ok(backend) => Self::new(term, output, rx, backend, size, theme, config, cx),
             Err(err) => {
                 log::error!("failed to launch {program:?}: {err:#}");
                 let text = format!("\x1b[31mBrindle could not start {program:?}:\x1b[0m\r\n{err:#}\r\n");
@@ -248,9 +291,10 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = unbounded();
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx))));
+        let output = Arc::new(OutputMarker::default());
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
         let backend = Backend::Remote { processor: Box::new(Processor::new()), input };
-        Self::new(term, rx, backend, size, theme, config, cx)
+        Self::new(term, output, rx, backend, size, theme, config, cx)
     }
 
     /// A read-only terminal showing `text` (used to report errors in a tab).
@@ -272,8 +316,10 @@ impl Terminal {
         {
             let mut term = self.term.lock();
             processor.advance(&mut *term, bytes);
+            self.output.advance(Instant::now());
         }
         self.last_activity = Instant::now();
+        Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
         // A synchronized update (mode 2026) may be buffering; make sure it is
         // flushed once its timeout passes even if no more output arrives.
         if let Some(deadline) = processor.sync_timeout().sync_timeout()
@@ -296,6 +342,11 @@ impl Terminal {
             processor.stop_sync(&mut *self.term.lock());
             cx.notify();
         }
+    }
+
+    /// How much output has arrived; see [`OutputMarker`].
+    pub fn output_marker(&self) -> &OutputMarker {
+        &self.output
     }
 
     pub fn term(&self) -> &Arc<FairMutex<Term<Listener>>> {
@@ -330,7 +381,10 @@ impl Terminal {
 
     fn handle_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
         match event {
-            AlacEvent::Wakeup => self.last_activity = Instant::now(),
+            AlacEvent::Wakeup => {
+                self.last_activity = Instant::now();
+                Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
+            }
             AlacEvent::Title(title) => self.set_title(Some(title), cx),
             AlacEvent::ResetTitle => self.set_title(None, cx),
             AlacEvent::ClipboardStore(kind, text) => {
@@ -655,6 +709,21 @@ mod tests {
         // Palette entries and the cursor keep the theme's colors.
         assert_eq!(palette_color(&t, tinted, 1), t.ansi[1]);
         assert_eq!(palette_color(&t, tinted, NamedColor::Cursor as usize), t.cursor);
+    }
+
+    #[test]
+    fn only_output_advances_the_marker() {
+        let (tx, _rx) = unbounded();
+        let marker = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, marker.clone());
+        let before = Instant::now();
+        listener.send_event(AlacEvent::Bell);
+        listener.send_event(AlacEvent::Title("t".into()));
+        assert_eq!(marker.generation(), 0);
+        listener.send_event(AlacEvent::Wakeup);
+        listener.send_event(AlacEvent::Wakeup);
+        assert_eq!(marker.generation(), 2);
+        assert!(marker.at() >= before && marker.at() <= Instant::now());
     }
 
     #[test]

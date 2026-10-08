@@ -2,6 +2,7 @@ mod actions;
 mod config;
 mod config_edit;
 mod desktop;
+mod latency;
 mod picker;
 mod settings;
 mod settings_dialog;
@@ -24,6 +25,7 @@ use gpui::{
 
 use crate::actions::{NewWindow, Quit, ReloadConfig};
 use crate::config::Config;
+use crate::latency::Latency;
 use crate::settings::Settings;
 use crate::workspace::{LaunchRequest, Workspace};
 
@@ -54,6 +56,11 @@ DEBUGGING:
         --action <NAME>          Run an action (see --list-actions)
                                  --send/--action steps run in order, 1s apart
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
+        --latency-log <FILE>     Time each keystroke (key to output, paint and next
+                                 frame), append them to FILE as JSON lines, and
+                                 print a summary on exit
+        --latency-bench <N>      After the steps, type N keystrokes into the active
+                                 tab, print latency percentiles and exit
 ";
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,8 @@ struct Args {
     /// `--send` / `--action` steps, run in order one second apart.
     steps: Vec<Step>,
     dump_after: Option<f64>,
+    latency_log: Option<PathBuf>,
+    latency_bench: Option<usize>,
     desktop: Option<desktop::Request>,
 }
 
@@ -116,6 +125,14 @@ fn parse_args() -> Args {
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
+            "--latency-log" => match it.next() {
+                Some(path) => args.latency_log = Some(config::expand_tilde(&path)),
+                None => usage_error("--latency-log needs a file"),
+            },
+            "--latency-bench" => match it.next().and_then(|n| n.parse().ok()) {
+                Some(n) if n > 0 => args.latency_bench = Some(n),
+                _ => usage_error("--latency-bench needs a positive number of keystrokes"),
+            },
             "--install-desktop" => install_desktop = true,
             "--uninstall-desktop" => uninstall_desktop = true,
             "--prefix" => match it.next() {
@@ -243,6 +260,19 @@ fn main() {
             log::debug!("keystroke {} -> {action}", e.keystroke.unparse());
         })
         .detach();
+        if args.latency_log.is_some() || args.latency_bench.is_some() {
+            if let Err(err) = Latency::install(args.latency_log.as_deref(), cx) {
+                eprintln!("brindle: --latency-log: {err}");
+                std::process::exit(1);
+            }
+            cx.on_app_quit(|cx| {
+                if let Some(summary) = Latency::log_summary(cx) {
+                    eprint!("{summary}");
+                }
+                async {}
+            })
+            .detach();
+        }
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         // Global listeners run inside the dispatching window's update, where
@@ -267,6 +297,7 @@ fn main() {
         watch_config(cx);
 
         let steps = args.steps.clone();
+        let latency_bench = args.latency_bench;
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_millis(500)).await;
             for step in steps {
@@ -280,6 +311,14 @@ fn main() {
                         },
                     })
                     .ok();
+            }
+            if let Some(samples) = latency_bench {
+                latency_bench_run(window, samples, cx).await;
+                cx.update(|cx| {
+                    print!("{}", Latency::summary(cx));
+                    cx.quit();
+                })
+                .ok();
             }
         })
         .detach();
@@ -296,4 +335,55 @@ fn main() {
             .detach();
         }
     });
+}
+
+/// `--latency-bench`: types `samples` keystrokes (after a warm-up) into the
+/// active tab through GPUI's own key dispatch, the path real key presses
+/// take, one at a time with a randomized gap so they don't line up with
+/// frames.
+async fn latency_bench_run(window: gpui::WindowHandle<Workspace>, samples: usize, cx: &mut gpui::AsyncApp) {
+    const WARMUP: usize = 10;
+    let mut seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) | 1;
+    let mut gap = move || {
+        // xorshift64
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        Duration::from_millis(10 + seed % 31)
+    };
+    let mut waiting_for_tab = 0;
+    let mut i = 0;
+    while i < WARMUP + samples {
+        if i == WARMUP {
+            cx.update(Latency::reset).ok();
+        }
+        let key = if i % 2 == 0 { "x" } else { "backspace" };
+        let keystroke = gpui::Keystroke::parse(key).expect("valid keystroke");
+        let Ok(before) = cx.update(|cx| Latency::started(cx)) else { return };
+        // Not `window.update`: that holds the Workspace, and a key handled
+        // by the Workspace itself would then panic.
+        if cx.update_window(window.into(), |_, window, cx| window.dispatch_keystroke(keystroke, cx)).is_err() {
+            return;
+        }
+        if cx.update(|cx| Latency::started(cx)).ok() == Some(before) {
+            // No terminal took it: the tab isn't ready yet (tmux attaching).
+            waiting_for_tab += 1;
+            if waiting_for_tab > 50 {
+                log::error!("--latency-bench: the active tab doesn't take keystrokes");
+                return;
+            }
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            continue;
+        }
+        loop {
+            cx.background_executor().timer(Duration::from_millis(1)).await;
+            match cx.update(Latency::poll) {
+                Ok(Some((_, true))) => break,
+                Ok(Some(_)) => {}
+                _ => return,
+            }
+        }
+        cx.background_executor().timer(gap()).await;
+        i += 1;
+    }
 }

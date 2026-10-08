@@ -1,0 +1,24 @@
+[meta]
+brindle = "brindle 0.1.0"
+
+[latency.latency-shell]
+samples = 500
+timeouts = 1
+output = [0.3, 0.4, 0.8, 1.2, 2.0]
+paint = [1.0, 2.5, 3.0, 4.0, 5.0]
+frame = [5.0, 9.0, 15.0, 16.0, 17.0]
+
+[latency.latency-tmux]
+samples = 500
+timeouts = 0
+output = [2.0, 3.0, 4.0, 5.0, 6.0]
+paint = [3.0, 4.0, 5.0, 6.0, 7.0]
+frame = [8.0, 12.0, 18.0, 20.0, 22.0]
+
+[throughput.throughput-brindle]
+grid = "118x33"
+mean_ms = { dense_cells = 210.0, unicode = 90.0 }
+
+[throughput.throughput-tmux]
+grid = "118x33"
+mean_ms = { dense_cells = 900.0 }

@@ -71,6 +71,43 @@ Xwayland, display `:0` unless `BRINDLE_E2E_DISPLAY` says otherwise) and needs
 Each case keeps its logs, screen dumps and window captures in
 `target/tmp/e2e/<case>/`.
 
+### Performance
+
+```sh
+cargo build --release                               # the suite times the release build
+BRINDLE_PERF=1 cargo test --test perf               # every case (opens windows)
+BRINDLE_PERF=1 cargo test --test perf -- latency    # only cases matching "latency"
+BRINDLE_PERF=1 cargo test --test perf -- --list     # list the cases
+BRINDLE_PERF_BASELINE=target/tmp/perf/latest BRINDLE_PERF=1 cargo test --test perf
+                                                    # show changes against the last run
+```
+
+The performance suite in `tests/perf/` measures two things, each in a local
+shell tab and in a tmux control-mode tab on a throwaway server:
+
+- **Throughput:** how fast Brindle drains output, measured with
+  [vtebench](https://github.com/alacritty/vtebench), the same method other
+  terminals publish numbers with. On first use the suite clones a pinned commit
+  into `target/perf-tools/vtebench` and builds it there, which needs network
+  access. Set `BRINDLE_PERF_VTEBENCH` to use your own checkout instead.
+- **Keystroke latency:** `brindle --latency-bench N` types N keystrokes through
+  GPUI's own key handling (no synthetic OS input), then prints percentiles for
+  three stages, each measured from when Brindle received the key:
+  - `output`: the program's echo arrived;
+  - `paint`: the terminal painted it;
+  - `frame`: the next frame began.
+
+  This is not key-to-photon latency: GPU, compositor and display time are not
+  included. `brindle --latency-log FILE` records the same timings for real
+  typing, as JSON lines, and prints a summary on exit.
+
+The suite reports numbers and never fails on them. Run it on an idle machine and
+compare runs made on the same machine. Each run is kept in
+`target/tmp/perf/<UTC time>/` (`latest` points at the newest) with a
+`summary.toml`, and the CPU governor and display are recorded with it.
+`BRINDLE_PERF_SAMPLES` changes the keystrokes per latency case (500),
+`BRINDLE_PERF_BIN` the binary, and `BRINDLE_PERF_DISPLAY` the X display (`:0`).
+
 ## Installing
 
 From a checkout, after installing the build dependencies above:

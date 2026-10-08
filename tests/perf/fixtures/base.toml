@@ -1,0 +1,13 @@
+[meta]
+brindle = "brindle 0.1.0"
+
+[latency.latency-shell]
+samples = 500
+timeouts = 0
+output = [0.3, 0.5, 0.8, 1.0, 2.0]
+paint = [1.0, 2.0, 3.0, 4.0, 5.0]
+frame = [5.0, 9.0, 15.0, 16.0, 17.0]
+
+[throughput.throughput-brindle]
+grid = "118x33"
+mean_ms = { dense_cells = 200.0, unicode = 100.0 }
