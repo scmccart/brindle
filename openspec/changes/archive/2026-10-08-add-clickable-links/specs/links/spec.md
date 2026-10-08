@@ -7,7 +7,7 @@ Make links in terminal output usable: find URLs and OSC 8 hyperlinks under the m
 ## ADDED Requirements
 
 ### Requirement: URL detection
-Text under the mouse SHALL be recognised as a link when it is a URL with one of the schemes `http`, `https`, `ftp`, `file`, `ssh`, `git`, `gemini`, `gopher`, `ipfs`, `ipns` (each followed by `://`) or `mailto`, `news`, `magnet` (followed by `:`), with at least one character after the scheme. The scheme SHALL start at the beginning of a word. The URL SHALL end at whitespace, a control character, one of `<>"`{}|\^`, or a box-drawing character.
+Text under the mouse SHALL be recognised as a link when it is a URL with one of the schemes `http`, `https`, `ftp`, `file`, `ssh`, `git`, `gemini`, `gopher`, `ipfs`, `ipns` (each followed by `://`) or `mailto`, `news`, `magnet` (followed by `:`), with at least one character after the scheme. The scheme SHALL start at the beginning of a word. The URL SHALL end at whitespace, a control character, one of `<`, `>`, `"`, `` ` ``, `{`, `}`, `|`, `\`, `^`, or a box-drawing character.
 
 #### Scenario: URL in a sentence
 - **WHEN** the screen shows `see https://example.com/docs for details` and the mouse is over `example`
