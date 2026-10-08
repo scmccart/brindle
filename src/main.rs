@@ -2,6 +2,7 @@ mod actions;
 mod config;
 mod config_edit;
 mod desktop;
+mod find_bar;
 mod latency;
 mod picker;
 mod settings;
@@ -54,7 +55,8 @@ DEBUGGING:
         --send <TEXT>            Type TEXT into the focused text field, else
                                  the active tab (\\r = Enter)
         --action <NAME>          Run an action (see --list-actions)
-                                 --send/--action steps run in order, 1s apart
+        --find <TEXT>            Open the find bar on the active terminal and search for TEXT
+                                 --send/--action/--find steps run in order, 1s apart
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
         --latency-log <FILE>     Time each keystroke (key to output, paint and next
                                  frame), append them to FILE as JSON lines, and
@@ -67,6 +69,7 @@ DEBUGGING:
 enum Step {
     Send(String),
     Action(String),
+    Find(String),
 }
 
 #[derive(Default, Debug)]
@@ -74,7 +77,7 @@ struct Args {
     command: Option<(String, Vec<String>)>,
     profile: Option<String>,
     cwd: Option<PathBuf>,
-    /// `--send` / `--action` steps, run in order one second apart.
+    /// `--send` / `--action` / `--find` steps, run in order one second apart.
     steps: Vec<Step>,
     dump_after: Option<f64>,
     latency_log: Option<PathBuf>,
@@ -124,6 +127,7 @@ fn parse_args() -> Args {
             }
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
+            "--find" => args.steps.extend(it.next().map(Step::Find)),
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
             "--latency-log" => match it.next() {
                 Some(path) => args.latency_log = Some(config::expand_tilde(&path)),
@@ -305,6 +309,7 @@ fn main() {
                 window
                     .update(cx, |ws, window, cx| match &step {
                         Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
+                        Step::Find(text) => ws.find_in_active(text, window, cx),
                         Step::Action(name) => match actions::action_by_name(name) {
                             Some(action) => window.dispatch_action(action, cx),
                             None => log::error!("--action: unknown action {name:?}"),

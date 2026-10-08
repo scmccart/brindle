@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use crate::actions::*;
+use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
 use crate::terminal::mouse::{self, Button};
 use crate::terminal::{Terminal, keys, report_focus};
@@ -91,6 +92,10 @@ pub struct TerminalView {
     pub layout: Rc<Cell<Option<GridLayout>>>,
     pub blink_visible: bool,
     pub marked_text: Option<String>,
+    /// The open find bar, if any (see `find_bar.rs`).
+    pub find: Option<FindBar>,
+    /// The last search, restored when the bar opens again.
+    pub last_find: Option<LastFind>,
     mouse: MouseState,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
@@ -115,7 +120,10 @@ impl TerminalView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
-            cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&terminal, |this, _, cx| {
+                this.find_terminal_changed(cx);
+                cx.notify()
+            }),
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
                 this.blink_visible = true;
                 this.start_blinking(window, cx);
@@ -144,6 +152,8 @@ impl TerminalView {
             layout: Rc::new(Cell::new(None)),
             blink_visible: true,
             marked_text: None,
+            find: None,
+            last_find: None,
             mouse: MouseState::default(),
             window_active: true,
             _blink: None,
@@ -190,7 +200,11 @@ impl TerminalView {
 
     // ---- keyboard -------------------------------------------------------------
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys bubbling up from the find bar never reach the program.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let mode = self.mode(cx);
         log::debug!("key {} reached the terminal unbound", event.keystroke.unparse());
         if let Some(bytes) = keys::to_esc_str(&event.keystroke, mode) {
@@ -375,7 +389,8 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let find_bar = self.render_find_bar(window, cx);
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -392,8 +407,16 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &ScrollToTop, _, cx| this.scroll(Scroll::Top, cx)))
             .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll(Scroll::Bottom, cx)))
             .on_action(cx.listener(Self::clear_scrollback))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(Self::find_close))
+            .on_action(cx.listener(Self::find_toggle_case))
+            .on_action(cx.listener(Self::find_toggle_regex))
+            .relative()
             .size_full()
             .child(TerminalElement::new(cx.entity()))
+            .children(find_bar)
     }
 }
 
