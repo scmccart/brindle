@@ -14,6 +14,12 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 /// a wrapped line.
 const MAX_EXTRA_LINES: i32 = 100;
 
+/// How far up from the origin a search looks while the query is being
+/// typed. A full-buffer scan for a query with no match takes tens of
+/// milliseconds with 10,000 lines of history, too slow for every keystroke;
+/// the debounced count does the full search afterwards (as alacritty does).
+pub const MAX_LINES_WHILE_TYPING: usize = 1000;
+
 /// Counting stops after this many matches.
 pub const COUNT_CAP: usize = 1000;
 
@@ -62,8 +68,10 @@ pub enum Step {
 }
 
 /// The nearest match starting at or above `origin`, wrapping to the bottom.
-pub fn find_from<T>(term: &Term<T>, regex: &mut RegexSearch, origin: Point) -> Option<Match> {
-    term.search_next(regex, origin, Direction::Left, Side::Left, None)
+/// With `max_lines`, only that many lines up from `origin` are searched,
+/// with no wrapping.
+pub fn find_from<T>(term: &Term<T>, regex: &mut RegexSearch, origin: Point, max_lines: Option<usize>) -> Option<Match> {
+    term.search_next(regex, origin, Direction::Left, Side::Left, max_lines)
 }
 
 /// The next match after `current` in direction `step`, wrapping around.
@@ -227,7 +235,7 @@ mod tests {
         let t = term_with(20, 6, "x1\nneedle a\nx2\nneedle b\nx3\nneedle c");
         let mut r = regex("needle", SearchOptions::default());
         let line = |m: &Match| m.start().line.0;
-        let first = find_from(&t, &mut r, view_bottom(&t)).unwrap();
+        let first = find_from(&t, &mut r, view_bottom(&t), None).unwrap();
         assert_eq!(line(&first), 5, "nearest above the bottom");
         let up = step(&t, &mut r, &first, Step::Up).unwrap();
         assert_eq!(line(&up), 3);
@@ -239,9 +247,19 @@ mod tests {
         assert_eq!(line(&down), 1, "wraps to the oldest");
         assert_eq!(line(&step(&t, &mut r, &down, Step::Down).unwrap()), 3);
         // The origin's own line counts as "at or above".
-        let at = find_from(&t, &mut r, Point::new(Line(3), Column(10))).unwrap();
+        let at = find_from(&t, &mut r, Point::new(Line(3), Column(10)), None).unwrap();
         assert_eq!(line(&at), 3);
-        assert!(find_from(&t, &mut regex("zzz", SearchOptions::default()), view_bottom(&t)).is_none());
+        assert!(find_from(&t, &mut regex("zzz", SearchOptions::default()), view_bottom(&t), None).is_none());
+    }
+
+    #[test]
+    fn limited_search_stops_short() {
+        let text: String = (1..=60).map(|i| format!("row {i}\n")).collect();
+        let t = term_with(20, 10, &format!("needle\n{text}"));
+        let mut r = regex("needle", SearchOptions::default());
+        assert!(find_from(&t, &mut r, view_bottom(&t), Some(20)).is_none());
+        assert!(find_from(&t, &mut r, view_bottom(&t), Some(100)).is_some());
+        assert!(find_from(&t, &mut r, view_bottom(&t), None).is_some());
     }
 
     #[test]
@@ -249,7 +267,7 @@ mod tests {
         let text: String = (1..=200).map(|i| format!("line-{i}\n")).collect();
         let t = term_with(20, 10, &text);
         let mut r = regex("line-17", SearchOptions::default());
-        let newest = find_from(&t, &mut r, view_bottom(&t)).unwrap();
+        let newest = find_from(&t, &mut r, view_bottom(&t), None).unwrap();
         assert_eq!(text_at(&t, &newest), "line-17");
         // line-17 and line-170..=179: 11 matches; the newest is line-179's prefix.
         let c = count(&t, &mut r, Some(&newest), COUNT_CAP);
@@ -306,7 +324,7 @@ mod tests {
         let mut t = term_with(20, 10, &text);
         // Rows 92-100 are on screen; the nearest "row 7" is row 79, in history.
         let mut r = regex("row 7", SearchOptions::default());
-        let m = find_from(&t, &mut r, view_bottom(&t)).unwrap();
+        let m = find_from(&t, &mut r, view_bottom(&t), None).unwrap();
         assert_eq!(t.bounds_to_string(*m.start(), Point::new(m.start().line, Column(5))), "row 79");
         scroll_to(&mut t, &m);
         let offset = t.grid().display_offset();

@@ -4,6 +4,7 @@ mod colors;
 mod dump;
 mod geometry;
 mod input;
+mod search;
 mod settings;
 mod styles;
 mod titles;
@@ -55,6 +56,9 @@ pub fn all() -> Vec<Case> {
         display("input-palette-run", input::palette_run),
         display("input-settings-tab", input::settings_tab),
         display("input-prompt-preselected", input::prompt_preselected),
+        display("search-local", search::local),
+        display("search-close-restores", search::close_restores),
+        display("search-tmux-pane", search::tmux_pane),
     ]
 }
 
