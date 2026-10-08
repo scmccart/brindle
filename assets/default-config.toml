@@ -15,6 +15,10 @@ copy_on_select = false
 # Let programs read your clipboard through OSC 52. Writing is always allowed
 # (that is what tmux `set-clipboard on` uses).
 osc52_paste = false
+# With shell integration loaded (see the README, or run
+# `brindle --shell-integration bash|zsh|fish`), draw a red bar beside prompts
+# whose command exited non-zero.
+mark_failed_commands = true
 
 [font]
 # First installed family wins.

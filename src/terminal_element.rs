@@ -73,6 +73,8 @@ impl IntoElement for TerminalElement {
 
 pub struct Frame {
     hitbox: Hitbox,
+    /// Failed-command bars (shell integration), painted over everything.
+    marks: Vec<(Bounds<Pixels>, Hsla)>,
     background: Hsla,
     rects: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(gpui::Point<Pixels>, ShapedLine)>,
@@ -158,6 +160,7 @@ impl Element for TerminalElement {
         let focused = view.focus_handle.is_focused(window) && window.is_window_active();
         let blink_visible = view.blink_visible;
         let marked_text = view.marked_text.clone();
+        let mark_failed = Settings::get(cx).config.mark_failed_commands;
         let layout_cell = view.layout.clone();
 
         if !fixed {
@@ -370,6 +373,26 @@ impl Element for TerminalElement {
             let (line, col) = cursor_cell;
             cell_bounds(line.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)), 1)
         };
+
+        // Failed commands get a thin bar at the grid's left edge: in the
+        // padding when there is room, else over the first column's edge.
+        let mut marks = Vec::new();
+        if mark_failed {
+            let top = -(display_offset as i64);
+            let spans = terminal.marks().lock().failed_spans(top, top + rows as i64 - 1);
+            if !spans.is_empty() {
+                let width = if f32::from(padding) >= 6.0 { px(3.0) } else { px(2.0) };
+                let x = if padding >= width + px(1.0) { origin.x - width - px(1.0) } else { origin.x };
+                let color = rgb_hsla(resolve_color(ansi::Color::Named(NamedColor::Red), colors, terminal));
+                for (first, last) in spans {
+                    let first = (first - top).max(0) as usize;
+                    let last = ((last - top) as usize).min(rows.saturating_sub(1));
+                    let y0 = cell_y(first).round();
+                    let y1 = cell_y(last + 1).round();
+                    marks.push((Bounds::new(point(x.round(), y0), size(width, y1 - y0)), color));
+                }
+            }
+        }
         drop(term);
 
         // Shape text.
@@ -426,6 +449,7 @@ impl Element for TerminalElement {
 
         Frame {
             hitbox,
+            marks,
             background: rgb_hsla(default_bg),
             rects,
             lines,
@@ -471,6 +495,9 @@ impl Element for TerminalElement {
             if let Some((origin, line, b)) = &frame.preedit {
                 window.paint_quad(fill(*b, frame.background));
                 line.paint(*origin, frame.line_height, window, cx).ok();
+            }
+            for (b, color) in &frame.marks {
+                window.paint_quad(fill(*b, *color));
             }
         });
 

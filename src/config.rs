@@ -29,6 +29,9 @@ pub struct Config {
     pub copy_on_select: bool,
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
+    /// Draw a red bar beside prompts whose command failed (needs shell
+    /// integration; see `shell-integration/`).
+    pub mark_failed_commands: bool,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
     /// Extra keybindings: `"ctrl-shift-x" = "action_name"`.
@@ -46,6 +49,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             copy_on_select: false,
             osc52_paste: false,
+            mark_failed_commands: true,
             profiles: Vec::new(),
             themes: BTreeMap::new(),
             keybindings: BTreeMap::new(),

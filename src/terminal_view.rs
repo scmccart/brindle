@@ -233,6 +233,25 @@ impl TerminalView {
         self.terminal.update(cx, |t, cx| t.clear_scrollback(cx));
     }
 
+    /// Jumps between shell-integration prompts, or scrolls one line when
+    /// the terminal has none (the keys used to scroll by line).
+    fn jump_to_prompt(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let jumped = self.terminal.update(cx, |t, cx| t.jump_to_prompt(previous, cx));
+        if !jumped {
+            self.scroll(Scroll::Delta(if previous { 1 } else { -1 }), cx);
+        }
+    }
+
+    fn select_last_output(&mut self, _: &SelectLastOutput, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |t, cx| t.select_last_output(cx));
+    }
+
+    fn copy_last_output(&mut self, _: &CopyLastOutput, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal.read(cx).last_output_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     // ---- mouse ----------------------------------------------------------------
 
     /// Whether mouse events go to the application rather than to selection.
@@ -381,6 +400,10 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &ScrollToTop, _, cx| this.scroll(Scroll::Top, cx)))
             .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll(Scroll::Bottom, cx)))
             .on_action(cx.listener(Self::clear_scrollback))
+            .on_action(cx.listener(|this, _: &JumpToPreviousPrompt, _, cx| this.jump_to_prompt(true, cx)))
+            .on_action(cx.listener(|this, _: &JumpToNextPrompt, _, cx| this.jump_to_prompt(false, cx)))
+            .on_action(cx.listener(Self::select_last_output))
+            .on_action(cx.listener(Self::copy_last_output))
             .size_full()
             .child(TerminalElement::new(cx.entity()))
     }
