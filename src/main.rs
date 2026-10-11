@@ -47,6 +47,10 @@ OPTIONS:
                                  (with restore_session = true in the config)
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
+        --shell-integration <SHELL>
+                                 Print the bash, zsh or fish integration script
+                                 (OSC 133 prompt marks) and exit, e.g. in
+                                 ~/.bashrc: eval \"$(brindle --shell-integration bash)\"
         --install-desktop        Add Brindle to the desktop's launcher, then exit
         --uninstall-desktop      Remove it from the launcher, then exit
         --prefix <DIR>           With the two above: use DIR/share instead of
@@ -69,6 +73,13 @@ DEBUGGING:
         --latency-bench <N>      After the steps, type N keystrokes into the active
                                  tab, print latency percentiles and exit
 ";
+
+/// Shell integration scripts, by shell (`--shell-integration`).
+const SHELL_SCRIPTS: &[(&str, &str)] = &[
+    ("bash", include_str!("../shell-integration/brindle.bash")),
+    ("zsh", include_str!("../shell-integration/brindle.zsh")),
+    ("fish", include_str!("../shell-integration/brindle.fish")),
+];
 
 #[derive(Debug, Clone)]
 enum Step {
@@ -125,6 +136,22 @@ fn parse_args() -> Args {
                     println!("{name}");
                 }
                 std::process::exit(0);
+            }
+            "--shell-integration" => {
+                let shell = it.next().unwrap_or_default();
+                match SHELL_SCRIPTS.iter().find(|(name, _)| *name == shell) {
+                    Some((_, script)) => {
+                        print!("{script}");
+                        std::process::exit(0);
+                    }
+                    None => {
+                        let names: Vec<&str> = SHELL_SCRIPTS.iter().map(|(name, _)| *name).collect();
+                        usage_error(&format!(
+                            "--shell-integration needs a shell: {} (got {shell:?})",
+                            names.join(", ")
+                        ))
+                    }
+                }
             }
             "-e" | "--command" => {
                 let rest: Vec<String> = it.by_ref().collect();

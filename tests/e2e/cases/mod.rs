@@ -7,6 +7,7 @@ mod input;
 mod links;
 mod restore;
 mod settings;
+mod shell;
 mod styles;
 mod titles;
 mod tmux;
@@ -24,6 +25,7 @@ pub fn all() -> Vec<Case> {
         headless("tmux-border-status-no-layout-change", tmux::border_status_no_layout_change),
         headless("tmux-rotate-no-layout-change", tmux::rotate_no_layout_change),
         headless("tmux-color-report-precedence", tmux::color_report_precedence),
+        headless("tmux-osc133-passthrough", shell::tmux_passthrough),
         display("tmux-subscriptions-removed", tmux::subscriptions_removed),
         display("dump-grid-geometry", dump::grid_geometry),
         display("geometry-plain", geometry::plain),
@@ -66,6 +68,13 @@ pub fn all() -> Vec<Case> {
         display("restore-forget-on-exit", restore::forget_on_exit),
         display("restore-close-window", restore::close_window),
         display("restore-second-instance", restore::second_instance),
+        display("shell-prompt-jump", shell::prompt_jump),
+        display("shell-no-marks-scroll-line", shell::no_marks_scroll_line),
+        display("shell-failed-mark", shell::failed_mark),
+        display("shell-select-output", shell::select_output),
+        display("shell-tmux-prompt-jump", shell::tmux_prompt_jump),
+        display("shell-clear-up-down", shell::clear_up_down),
+        display("shell-tmux-clear-up-down", shell::tmux_clear_up_down),
     ]
 }
 

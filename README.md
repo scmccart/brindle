@@ -12,6 +12,8 @@ while sessions stay in tmux, persistent and detachable.
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
+- **Shell integration** (OSC 133): jump between prompts, select or copy the last
+  command's output, and see failed commands marked in the gutter.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **tmux**, both ways:
@@ -141,7 +143,7 @@ in `~/.config/brindle` is kept either way.
 
 ```
 brindle [-p PROFILE] [-d DIR] [--no-restore] [-e COMMAND ARGS...]
-brindle --list-actions | --list-themes
+brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish
 brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
 
@@ -159,6 +161,7 @@ On first launch Brindle writes a commented config to
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
 | ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
 | shift-pageup/down, shift-home/end | scrollback |
+| ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-n | new window |
 | ctrl-shift-, | settings (theme picker with live preview, custom theme editor, profiles) |
@@ -229,6 +232,41 @@ that no longer exists is created again. Closing a window's last tab forgets
 that window, and quitting keeps everything that is open. While one Brindle is
 running, launching another one opens a normal window and doesn't touch the
 saved session.
+
+### Shell integration
+
+Shells can mark their prompts and command output with OSC 133 sequences. Brindle
+ships scripts that do this for bash, zsh and fish. Load one at the **end** of
+your shell's startup file, after your prompt theme and anything that sets
+`PROMPT_COMMAND`:
+
+```sh
+eval "$(brindle --shell-integration bash)"    # ~/.bashrc
+eval "$(brindle --shell-integration zsh)"     # ~/.zshrc
+brindle --shell-integration fish | source     # ~/.config/fish/config.fish
+```
+
+The same scripts are in [`shell-integration/`](shell-integration/) if you'd rather
+`source` a file. Brindle never edits your startup files or injects the scripts
+itself. They only emit escape sequences, and terminals that don't understand
+them ignore them. With a script loaded:
+
+- **ctrl-shift-up / ctrl-shift-down** scroll so the previous or next prompt is at
+  the top of the view. In a terminal without marks they still scroll one line.
+  To keep line scrolling on those keys, bind `"ctrl-shift-up" = "scroll_line_up"`
+  and `"ctrl-shift-down" = "scroll_line_down"`.
+- **Select Last Command Output** and **Copy Last Command Output** are in the
+  command palette. They have no default key; bind `select_last_output` or
+  `copy_last_output`. Copy leaves your selection alone.
+- A thin red bar (the theme's red) marks prompts whose command exited non-zero.
+  Turn it off with `mark_failed_commands = false`.
+
+Marks follow their text as it scrolls, reflows on resize, and is cleared. They
+work the same in tmux control-mode panes, because tmux passes pane output to
+control clients unchanged; output restored on attach has no marks. Classic tmux
+keeps OSC 133 to itself, so Brindle sees no marks there. bash needs 4.4 or newer
+for output marks. fish's script doesn't mark where the command line starts, so a
+failure bar covers only the first line of a multi-line fish prompt.
 
 ### tmux control mode
 
