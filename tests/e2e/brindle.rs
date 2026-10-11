@@ -107,6 +107,8 @@ pub struct Run<'a> {
     server: &'a TmuxServer,
     label: &'static str,
     profile: &'static str,
+    /// Appended to the test config (after its tables).
+    extra_config: String,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     timeline: Vec<(f64, Event)>,
@@ -132,6 +134,7 @@ impl<'a> Run<'a> {
             server,
             label,
             profile: "tmux",
+            extra_config: String::new(),
             steps: Vec::new(),
             env: Vec::new(),
             timeline: Vec::new(),
@@ -194,6 +197,12 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Adds TOML to the test config, e.g. a `[notifications]` table.
+    pub fn config(mut self, text: &str) -> Self {
+        self.extra_config.push_str(text);
+        self
+    }
+
     pub fn action(mut self, name: &str) -> Self {
         self.steps.extend(["--action".to_string(), name.to_string()]);
         self
@@ -226,7 +235,7 @@ impl<'a> Run<'a> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
         let top = if self.restore { "restore_session = true\n" } else { "" };
-        let text = config_with(&self.server.socket, "e2e", self.default_profile, top);
+        let text = config_with(&self.server.socket, "e2e", self.default_profile, top) + &self.extra_config;
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 

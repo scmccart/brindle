@@ -11,6 +11,7 @@ pub mod links;
 pub mod mouse;
 mod pty;
 pub mod shell_integration;
+mod scan;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -37,10 +38,18 @@ use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
+use crate::notify::osc::{Notice, Scanner};
 use crate::theme::{Color, Theme};
 
+/// What reaches the UI thread from the emulator and the output scanner.
+pub enum ChannelEvent {
+    Alac(AlacEvent),
+    /// A notification found in PTY output (on alacritty's I/O thread).
+    Notice(Notice),
+}
+
 #[derive(Clone)]
-pub struct Listener(UnboundedSender<AlacEvent>, Arc<OutputMarker>);
+pub struct Listener(UnboundedSender<ChannelEvent>, Arc<OutputMarker>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: AlacEvent) {
@@ -48,7 +57,7 @@ impl EventListener for Listener {
             // On alacritty's I/O thread, right after it parsed new output.
             self.1.advance(Instant::now());
         }
-        self.0.unbounded_send(event).ok();
+        self.0.unbounded_send(ChannelEvent::Alac(event)).ok();
     }
 }
 
@@ -127,6 +136,8 @@ impl From<GridSize> for WindowSize {
 pub enum TerminalEvent {
     TitleChanged,
     Bell,
+    /// A program asked for a desktop notification (OSC 9 / OSC 777).
+    Notify(Notice),
     /// The child process exited (PTY) or the pane closed (remote).
     Exited,
 }
@@ -138,6 +149,7 @@ enum Backend {
         master_fd: i32,
     },
     Remote {
+        scanner: Scanner,
         input: Rc<dyn Fn(&[u8])>,
     },
 }
@@ -189,7 +201,7 @@ fn term_config(config: &Config) -> term::Config {
 
 impl Terminal {
     fn spawn_events(
-        rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
+        rx: futures::channel::mpsc::UnboundedReceiver<ChannelEvent>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -197,7 +209,10 @@ impl Terminal {
             while let Some(events) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
                     for event in events {
-                        this.handle_event(event, cx);
+                        match event {
+                            ChannelEvent::Alac(event) => this.handle_event(event, cx),
+                            ChannelEvent::Notice(notice) => cx.emit(TerminalEvent::Notify(notice)),
+                        }
                     }
                     cx.notify();
                 });
@@ -212,7 +227,7 @@ impl Terminal {
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
         output: Arc<OutputMarker>,
-        rx: futures::channel::mpsc::UnboundedReceiver<AlacEvent>,
+        rx: futures::channel::mpsc::UnboundedReceiver<ChannelEvent>,
         backend: Backend,
         parser: Arc<Mutex<Parser>>,
         marks: Arc<Mutex<Marks>>,
@@ -271,7 +286,7 @@ impl Terminal {
 
         let (tx, rx) = unbounded();
         let output = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, output.clone());
+        let listener = Listener(tx.clone(), output.clone());
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
@@ -280,7 +295,7 @@ impl Terminal {
             let pty = tty::new(&options, size.into(), 0)?;
             let child_pid = pty.child().id();
             let master_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
-            let pty = pty::MarkedPty::new(pty, term.clone(), parser.clone(), marks.clone(), listener.clone())?;
+            let pty = pty::MarkedPty::new(pty, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx)?;
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
@@ -310,7 +325,7 @@ impl Terminal {
         let (tx, rx) = unbounded();
         let output = Arc::new(OutputMarker::default());
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
-        let backend = Backend::Remote { input };
+        let backend = Backend::Remote { scanner: Scanner::new(), input };
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
         Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
@@ -329,14 +344,18 @@ impl Terminal {
 
     /// Feeds output into a remote terminal.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if !self.is_remote() {
+        let Backend::Remote { scanner, .. } = &mut self.backend else {
             return;
-        }
+        };
+        let notices = scanner.scan(bytes);
         {
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
             parser.advance(&mut *term, &self.marks, bytes);
             self.output.advance(Instant::now());
+        }
+        for notice in notices {
+            cx.emit(TerminalEvent::Notify(notice));
         }
         self.last_activity = Instant::now();
         Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);

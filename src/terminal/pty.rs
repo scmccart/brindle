@@ -20,14 +20,18 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite};
 use parking_lot::Mutex;
 use polling::{Event, PollMode, Poller};
 
-use super::Listener;
+use futures::channel::mpsc::UnboundedSender;
+
+use super::scan::ScanReader;
+use super::{ChannelEvent, Listener};
 use super::shell_integration::{Marks, Parser};
 
 /// Bytes read from the PTY per call (alacritty locks for up to 64 KiB too).
 const READ_SIZE: usize = 0x1_0000;
 
 pub struct ParsingReader {
-    file: File,
+    /// The PTY, scanned for OSC 9/777 notifications as it is read.
+    file: ScanReader<File>,
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Parser>>,
     marks: Arc<Mutex<Marks>>,
@@ -69,9 +73,10 @@ impl MarkedPty {
         parser: Arc<Mutex<Parser>>,
         marks: Arc<Mutex<Marks>>,
         listener: Listener,
+        tx: UnboundedSender<ChannelEvent>,
     ) -> io::Result<Self> {
         // Same open file description, so the same non-blocking flag.
-        let file = pty.file().try_clone()?;
+        let file = ScanReader::new(pty.file().try_clone()?, tx);
         let reader =
             ParsingReader { file, term, parser, marks, listener, buf: vec![0; READ_SIZE].into_boxed_slice() };
         Ok(Self { pty, reader })
