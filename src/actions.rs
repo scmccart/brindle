@@ -34,6 +34,12 @@ actions!(
         JumpToNextPrompt,
         SelectLastOutput,
         CopyLastOutput,
+        Find,
+        FindNext,
+        FindPrevious,
+        FindClose,
+        FindToggleCase,
+        FindToggleRegex,
         OpenProfilePicker,
         OpenCommandPalette,
         ReloadConfig,
@@ -149,6 +155,14 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("jump_to_next_prompt", Some("Jump to Next Prompt"), || Box::new(JumpToNextPrompt)),
     ("select_last_output", Some("Select Last Command Output"), || Box::new(SelectLastOutput)),
     ("copy_last_output", Some("Copy Last Command Output"), || Box::new(CopyLastOutput)),
+    ("find", Some("Find"), || Box::new(Find)),
+    // The find bar's own actions act on an open bar, so they stay out of
+    // the palette.
+    ("find_next", None, || Box::new(FindNext)),
+    ("find_previous", None, || Box::new(FindPrevious)),
+    ("find_close", None, || Box::new(FindClose)),
+    ("find_toggle_case", None, || Box::new(FindToggleCase)),
+    ("find_toggle_regex", None, || Box::new(FindToggleRegex)),
     ("open_profile_picker", Some("New Tab from Profile"), || Box::new(OpenProfilePicker)),
     ("open_command_palette", None, || Box::new(OpenCommandPalette)),
     ("reload_config", Some("Reload Config"), || Box::new(ReloadConfig)),
@@ -264,6 +278,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let s = Some("SettingsDialog");
     let i = Some("TextInput");
     let c = Some("SettingsChoice");
+    let f = Some("FindBar");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -308,6 +323,12 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-home", ScrollToTop, t),
         KeyBinding::new("shift-end", ScrollToBottom, t),
         KeyBinding::new("ctrl-shift-k", ClearScrollback, t),
+        KeyBinding::new("ctrl-shift-f", Find, t),
+        KeyBinding::new("enter", FindNext, f),
+        KeyBinding::new("shift-enter", FindPrevious, f),
+        KeyBinding::new("escape", FindClose, f),
+        KeyBinding::new("alt-c", FindToggleCase, f),
+        KeyBinding::new("alt-r", FindToggleRegex, f),
         KeyBinding::new("ctrl-shift-e", TmuxSplitRight, x),
         KeyBinding::new("ctrl-shift-o", TmuxSplitDown, x),
         KeyBinding::new("ctrl-shift-x", TmuxClosePane, x),
@@ -447,6 +468,14 @@ mod tests {
         let bindings = default_bindings();
         let settings = bindings.iter().filter(|b| b.action().partial_eq(&OpenSettings)).count();
         assert_eq!(settings, 2);
+        let find: Vec<String> = bindings
+            .iter()
+            .filter(|b| b.action().name().starts_with("brindle::Find"))
+            .map(|b| format!("{:?}", b.keystrokes()))
+            .collect();
+        assert_eq!(find.len(), 6, "{find:?}");
+        assert!(action_by_name("find").is_some_and(|a| a.partial_eq(&Find)));
+        assert!(action_by_name("find_toggle_regex").is_some_and(|a| a.partial_eq(&FindToggleRegex)));
     }
 
     #[test]

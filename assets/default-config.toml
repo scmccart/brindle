@@ -82,6 +82,12 @@ tmux_session = "main"
 # background = "#101010"
 # cursor = "#ffcc00"
 # selection_background = "#404040"
+# Find bar (ctrl-shift-f) highlights. Left out, they come from the theme's
+# own yellow: dim marks for every match, solid for the current one.
+# search_match_background = "#625a20"
+# search_match_foreground = "#d0d0d0"
+# search_focused_match_background = "#c4a000"
+# search_focused_match_foreground = "#101010"
 # ansi = ["#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
 #         "#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"]
 

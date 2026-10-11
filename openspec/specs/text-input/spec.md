@@ -1,7 +1,7 @@
 # text-input Specification
 
 ## Purpose
-Give every place Brindle asks for typed text (palettes, prompts and the settings dialog) the same single-line text entry, with a cursor, selection, mouse positioning, clipboard and input-method support.
+Give every place Brindle asks for typed text (palettes, prompts, the settings dialog and the find bar) the same single-line text entry, with a cursor, selection, mouse positioning, clipboard and input-method support.
 
 ## Requirements
 
