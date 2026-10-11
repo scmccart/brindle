@@ -4,6 +4,7 @@ mod config_edit;
 mod desktop;
 mod latency;
 mod picker;
+mod session;
 mod settings;
 mod settings_dialog;
 mod terminal;
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, WindowBackgroundAppearance, WindowBounds,
+    App, AppContext as _, Application, BorrowAppContext as _, Bounds, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, px, size,
 };
 
@@ -27,7 +28,8 @@ use crate::actions::{NewWindow, Quit, ReloadConfig};
 use crate::config::Config;
 use crate::latency::Latency;
 use crate::settings::Settings;
-use crate::workspace::{LaunchRequest, Workspace};
+use crate::session::{SessionStore, WindowState};
+use crate::workspace::{Launch, LaunchRequest, Workspace};
 
 const HELP: &str = "\
 Brindle — a GPU-accelerated terminal
@@ -41,6 +43,8 @@ OPTIONS:
     -d, --working-directory <DIR>
                                  Start in DIR
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
+        --no-restore             Don't reopen the last session this time
+                                 (with restore_session = true in the config)
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
         --install-desktop        Add Brindle to the desktop's launcher, then exit
@@ -85,6 +89,15 @@ struct Args {
     latency_log: Option<PathBuf>,
     latency_bench: Option<usize>,
     desktop: Option<desktop::Request>,
+    no_restore: bool,
+}
+
+impl Args {
+    /// A launch that may restore the session: no profile, directory or
+    /// command was asked for. Debug steps don't count.
+    fn is_plain(&self) -> bool {
+        self.profile.is_none() && self.cwd.is_none() && self.command.is_none() && !self.no_restore
+    }
 }
 
 fn parse_args() -> Args {
@@ -127,6 +140,7 @@ fn parse_args() -> Args {
                     unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
                 }
             }
+            "--no-restore" => args.no_restore = true,
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
             "--hover" | "--click" => {
@@ -168,10 +182,16 @@ fn unescape(s: &str) -> String {
     s.replace("\\r", "\r").replace("\\n", "\n").replace("\\e", "\x1b").replace("\\t", "\t")
 }
 
-pub fn open_window(launch: LaunchRequest, cx: &mut App) -> Option<gpui::WindowHandle<Workspace>> {
-    let bounds = Bounds::centered(None, size(px(1000.0), px(660.0)), cx);
+pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Workspace>> {
+    let (mut width, mut height, mut maximized) = (1000.0, 660.0, false);
+    if let Launch::Restore(state) = &launch {
+        width = state.width.unwrap_or(width).max(session::MIN_SIZE.0);
+        height = state.height.unwrap_or(height).max(session::MIN_SIZE.1);
+        maximized = state.maximized;
+    }
+    let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(if maximized { WindowBounds::Maximized(bounds) } else { WindowBounds::Windowed(bounds) }),
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("Brindle".into()),
             appears_transparent: true,
@@ -239,6 +259,64 @@ fn watch_config(cx: &mut App) {
     .detach();
 }
 
+/// The windows to restore, if session restore is on, this process owns the
+/// state and the state file is usable. Problems are logged and ignored.
+fn restorable_windows(cx: &mut App) -> Vec<WindowState> {
+    let enabled = Settings::get(cx).config.restore_session;
+    if !cx.update_global(|store: &mut SessionStore, _| store.is_owner(enabled)) {
+        return Vec::new();
+    }
+    match session::load(&session::state_dir()) {
+        Ok(Some(state)) => state.windows,
+        Ok(None) => Vec::new(),
+        Err(why) => {
+            log::warn!("{why}");
+            Vec::new()
+        }
+    }
+}
+
+/// Writes the session state when it changes (off the UI thread), and once
+/// more, synchronously, when Brindle quits.
+fn record_session(cx: &mut App) {
+    fn pending(cx: &mut App) -> Option<String> {
+        let enabled = Settings::get(cx).config.restore_session;
+        cx.update_global(|store: &mut SessionStore, _| {
+            if store.is_owner(enabled) { store.pending_write() } else { None }
+        })
+    }
+    fn write(text: &str, generation: u64) {
+        let dir = session::state_dir();
+        if let Err(err) = session::write_atomic(&dir, text, generation) {
+            log::warn!("could not write session state to {}: {err}", session::state_path(&dir).display());
+        }
+    }
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let Ok(text) = cx.update(pending) else { break };
+            if let Some(text) = text {
+                let generation = session::next_generation();
+                cx.background_executor().spawn(async move { write(&text, generation) }).detach();
+            }
+        }
+    })
+    .detach();
+    cx.on_app_quit(|cx| {
+        // The windows still open now are the ones to keep.
+        for window in cx.windows() {
+            if let Some(window) = window.downcast::<Workspace>() {
+                window.update(cx, |ws, window, cx| ws.record_session(window, cx)).ok();
+            }
+        }
+        if let Some(text) = pending(cx) {
+            write(&text, session::next_generation());
+        }
+        async {}
+    })
+    .detach();
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
         .init();
@@ -290,21 +368,36 @@ fn main() {
         cx.on_action(|_: &ReloadConfig, cx| cx.defer(reload_config));
         cx.on_action(|_: &NewWindow, cx| {
             let profile = Settings::get(cx).config.default_profile_index();
-            open_window(LaunchRequest::profile(profile), cx);
+            open_window(Launch::Request(LaunchRequest::profile(profile)), cx);
         });
         cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+            let live: Vec<u64> = cx.windows().iter().map(|w| w.window_id().as_u64()).collect();
+            cx.update_global(|store: &mut SessionStore, _| store.prune(&live));
+            if live.is_empty() {
                 cx.quit();
             }
         })
         .detach();
 
-        let launch = LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() };
-        let Some(window) = open_window(launch, cx) else {
+        cx.set_global(SessionStore::default());
+        let restored = if args.is_plain() { restorable_windows(cx) } else { Vec::new() };
+        let mut windows = Vec::new();
+        if restored.is_empty() {
+            let launch = LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() };
+            windows.extend(open_window(Launch::Request(launch), cx));
+        } else {
+            log::info!("restoring {} window(s) from {}", restored.len(), session::state_path(&session::state_dir()).display());
+            for state in restored {
+                windows.extend(open_window(Launch::Restore(state), cx));
+            }
+        }
+        // Debug steps and the dump act on the first window.
+        let Some(&window) = windows.first() else {
             cx.quit();
             return;
         };
         watch_config(cx);
+        record_session(cx);
 
         let steps = args.steps.clone();
         let latency_bench = args.latency_bench;
