@@ -18,6 +18,7 @@ use gpui::{
 };
 
 use crate::actions::*;
+use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
 use crate::terminal::mouse::{self, Button};
 use crate::terminal::{Link, Terminal, keys, links, report_focus};
@@ -152,6 +153,10 @@ pub struct TerminalView {
     pub marked_text: Option<String>,
     /// The link under the mouse while ctrl is held; underlined when painted.
     pub hovered_link: Option<Link>,
+    /// The open find bar, if any (see `find_bar.rs`).
+    pub find: Option<FindBar>,
+    /// The last search, restored when the bar opens again.
+    pub last_find: Option<LastFind>,
     mouse: MouseState,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
@@ -181,6 +186,7 @@ impl TerminalView {
                 if this.hovered_link.is_some() {
                     this.refresh_hover(cx);
                 }
+                this.find_terminal_changed(cx);
                 cx.notify()
             }),
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
@@ -216,6 +222,8 @@ impl TerminalView {
             blink_visible: true,
             marked_text: None,
             hovered_link: None,
+            find: None,
+            last_find: None,
             mouse: MouseState::default(),
             window_active: true,
             _blink: None,
@@ -262,7 +270,11 @@ impl TerminalView {
 
     // ---- keyboard -------------------------------------------------------------
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys bubbling up from the find bar never reach the program.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let mode = self.mode(cx);
         log::debug!("key {} reached the terminal unbound", event.keystroke.unparse());
         if let Some(bytes) = keys::to_esc_str(&event.keystroke, mode) {
@@ -579,7 +591,8 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let find_bar = self.render_find_bar(window, cx);
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -601,8 +614,16 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &JumpToNextPrompt, _, cx| this.jump_to_prompt(false, cx)))
             .on_action(cx.listener(Self::select_last_output))
             .on_action(cx.listener(Self::copy_last_output))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(Self::find_close))
+            .on_action(cx.listener(Self::find_toggle_case))
+            .on_action(cx.listener(Self::find_toggle_regex))
+            .relative()
             .size_full()
             .child(TerminalElement::new(cx.entity()))
+            .children(find_bar)
     }
 }
 

@@ -41,6 +41,12 @@ pub mod theme {
     pub const BLUE: Rgb = ANSI[4];
     pub const MAGENTA: Rgb = ANSI[5];
 
+    /// Find bar highlights in the `e2e` theme.
+    pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
+    pub const SEARCH_MATCH_FG: Rgb = Rgb(0xf0, 0xf0, 0xf0);
+    pub const SEARCH_FOCUSED_BG: Rgb = Rgb(0xff, 0x00, 0xa0);
+    pub const SEARCH_FOCUSED_FG: Rgb = Rgb(0x00, 0x00, 0x00);
+
     /// The second theme, for reload checks.
     pub const ALT_FOREGROUND: Rgb = Rgb(0xa0, 0xa0, 0xa0);
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
@@ -79,6 +85,10 @@ foreground = "{fg}"
 background = "{bg}"
 accent = "{accent}"
 ansi = [{ansi}]
+search_match_background = "{match_bg}"
+search_match_foreground = "{match_fg}"
+search_focused_match_background = "{focused_bg}"
+search_focused_match_foreground = "{focused_fg}"
 
 [themes.e2e-alt]
 foreground = "{alt_fg}"
@@ -92,6 +102,10 @@ ansi = [{ansi}]
         alt_fg = ALT_FOREGROUND.hex(),
         alt_bg = ALT_BACKGROUND.hex(),
         ansi = ansi.join(", "),
+        match_bg = SEARCH_MATCH_BG.hex(),
+        match_fg = SEARCH_MATCH_FG.hex(),
+        focused_bg = SEARCH_FOCUSED_BG.hex(),
+        focused_fg = SEARCH_FOCUSED_FG.hex(),
     )
 }
 
@@ -200,6 +214,12 @@ impl<'a> Run<'a> {
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
+        self
+    }
+
+    /// Opens the find bar on the active terminal and searches for `text`.
+    pub fn find(mut self, text: &str) -> Self {
+        self.steps.extend(["--find".to_string(), text.to_string()]);
         self
     }
 
@@ -355,10 +375,13 @@ pub struct Dump {
     pub settings: Option<String>,
     /// The palette's lines (its header first), when it is open.
     pub palette: Vec<String>,
-    /// The focused text input, in a palette or the settings dialog.
+    /// The focused text input, in a palette, the settings dialog or the
+    /// find bar.
     pub input: Option<Input>,
     /// The active terminal's selected text, when there is a selection.
     pub selection: Option<String>,
+    /// The active terminal's find bar line, when it is open.
+    pub find: Option<String>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -409,6 +432,9 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- input ") {
                 dump.input = parse_input(rest);
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- find ") {
+                dump.find = Some(rest.to_string());
+                in_screen = false;
             } else if !dump.palette.is_empty() && dump.input.is_none() && !in_screen {
                 dump.palette.push(line.to_string());
             } else if in_screen {
@@ -417,6 +443,12 @@ impl Dump {
         }
         dump.screen = trim_screen(screen.into_iter());
         dump
+    }
+
+    /// A `key=value` field of the find line (values without spaces).
+    pub fn find_field(&self, key: &str) -> Option<&str> {
+        let line = self.find.as_deref()?;
+        line.split(' ').find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
     }
 
     pub fn grid(&self) -> Result<Grid> {
@@ -525,5 +557,13 @@ pub fn self_test_dump() -> Result {
     let settings = dump.settings.as_deref().unwrap_or("");
     ensure!(settings.starts_with("section=Profiles mode=editor") && settings.contains("theme=\"e2e-alt\""), "settings {settings:?}");
     ensure!(Dump::parse("nothing").size.is_none(), "size from nothing");
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n\
+         --- find query=\"x\" case=false regex=false count=11 index=1 focused=10,0 invalid=false\n",
+    );
+    ensure!(dump.screen == ["hi"], "screen before find {:?}", dump.screen);
+    ensure!(dump.find_field("count") == Some("11"), "count {:?}", dump.find_field("count"));
+    ensure!(dump.find_field("focused") == Some("10,0"), "focused {:?}", dump.find_field("focused"));
+    ensure!(dump.find_field("nope").is_none(), "missing field");
     Ok(())
 }

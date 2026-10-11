@@ -12,6 +12,7 @@ pub mod mouse;
 mod pty;
 pub mod shell_integration;
 mod scan;
+pub mod search;
 
 use std::borrow::Cow;
 use std::collections::HashMap;

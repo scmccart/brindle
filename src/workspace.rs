@@ -127,17 +127,17 @@ impl Tab {
         }
     }
 
-    /// Where the active terminal was last painted.
-    fn active_grid(&self, cx: &App) -> Option<GridLayout> {
-        self.active_view(cx)?.read(cx).layout.get()
-    }
-
-    /// The terminal view that has (or last had) focus in this tab.
+    /// The view of the terminal that has (or last had) focus in this tab.
     fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
         match &self.content {
             TabContent::Terminal(view) => Some(view.clone()),
             TabContent::Tmux { view, .. } => view.read(cx).active_view(),
         }
+    }
+
+    /// Where the active terminal was last painted.
+    fn active_grid(&self, cx: &App) -> Option<GridLayout> {
+        self.active_view(cx)?.read(cx).layout.get()
     }
 
     fn is_tmux(&self) -> bool {
@@ -1090,7 +1090,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The overlay's text input that has keyboard focus, if any.
+    /// The text input that has keyboard focus, if any: the overlay's, or
+    /// the find bar's in the active terminal.
     fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
         match &self.overlay {
             Some(Overlay::Palette(open)) => {
@@ -1098,7 +1099,10 @@ impl Workspace {
                 input.read(cx).is_focused(window).then(|| input.clone())
             }
             Some(Overlay::Settings { dialog, .. }) => dialog.read(cx).focused_input(window, cx),
-            None => None,
+            None => {
+                let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
+                input.read(cx).is_focused(window).then_some(input)
+            }
         }
     }
 
@@ -1122,6 +1126,13 @@ impl Workspace {
         match self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
             Some(view) => view.update(cx, |view, cx| view.debug_pointer(step, window, cx)),
             None => log::error!("--hover/--click: no active terminal"),
+        }
+    }
+
+    /// Debug hook for `--find`: searches the active terminal for `query`.
+    pub fn find_in_active(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
+            view.update(cx, |view, cx| view.find_text(query, window, cx));
         }
     }
 
@@ -1152,6 +1163,9 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.screen_text());
+        }
+        if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
+            out.push_str(&find);
         }
         match &self.overlay {
             Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe(cx)),

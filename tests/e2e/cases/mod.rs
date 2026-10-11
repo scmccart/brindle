@@ -7,6 +7,7 @@ mod input;
 mod links;
 mod restore;
 mod notify;
+mod search;
 mod settings;
 mod shell;
 mod styles;
@@ -79,6 +80,12 @@ pub fn all() -> Vec<Case> {
         display("shell-tmux-clear-up-down", shell::tmux_clear_up_down),
         display("notify-osc-local", notify::osc_local),
         display("notify-tmux-background", notify::tmux_background),
+        display("search-local", search::local),
+        display("search-step", search::step),
+        display("search-long-query", search::long_query),
+        display("search-input-selection", search::input_selection),
+        display("search-close-restores", search::close_restores),
+        display("search-tmux-pane", search::tmux_pane),
     ]
 }
 

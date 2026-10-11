@@ -64,6 +64,12 @@ pub fn upsert_theme(doc: &mut DocumentMut, name: &str, theme: &Theme) {
         None => _ = table.remove("selection_foreground"),
     }
     set_value(table, "accent", color(theme.accent()));
+    let (match_bg, match_fg) = theme.search_match();
+    let (focused_bg, focused_fg) = theme.search_focused_match();
+    set_value(table, "search_match_background", color(match_bg));
+    set_value(table, "search_match_foreground", color(match_fg));
+    set_value(table, "search_focused_match_background", color(focused_bg));
+    set_value(table, "search_focused_match_foreground", color(focused_fg));
     let mut ansi = Array::new();
     for (ix, c) in theme.ansi.iter().enumerate() {
         let mut v = color(*c);

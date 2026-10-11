@@ -31,12 +31,13 @@ An unknown argument SHALL print usage and exit with status 2.
 - **THEN** the zsh integration script is printed and the process exits 0 without opening a window
 
 ### Requirement: Debug automation hooks
-For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>` and `--click <POS>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab:
-- `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette or the settings dialog), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
+For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>` and `--find <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab:
+- `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette, the settings dialog or the find bar), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
 - `--action` runs a named action;
-- `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step.
+- `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
+- `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -69,6 +70,10 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 #### Scenario: Selection in the dump
 - **WHEN** Brindle runs with `--action select_all --dump-screen-after 3`
 - **THEN** the dump contains a selection line with the selected text, escaped onto one line
+
+#### Scenario: Scripted search
+- **WHEN** Brindle runs with `--send 'echo needle\r' --find needle --dump-screen-after 4`
+- **THEN** stdout contains a find line with query `needle`, a match count of at least one, and the current match's row and column
 
 ### Requirement: Latency log
 `--latency-log <FILE>` SHALL time every keystroke a terminal tab receives, whether typed or from `--latency-bench`, and append one JSON line per keystroke to FILE: the key, and the milliseconds until the program's output arrived, until that output was painted, and until the next frame began. On quit, Brindle SHALL print a summary to stderr. Without the option, no timing SHALL be recorded.

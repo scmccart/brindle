@@ -94,6 +94,11 @@ pub struct Theme {
     pub ansi: [Color; 16],
     /// Accent used for the active tab marker and focus rings.
     pub accent: Option<Color>,
+    /// Find bar highlights; see [`Theme::search_match`] for the defaults.
+    pub search_match_background: Option<Color>,
+    pub search_match_foreground: Option<Color>,
+    pub search_focused_match_background: Option<Color>,
+    pub search_focused_match_foreground: Option<Color>,
 }
 
 impl Default for Theme {
@@ -125,11 +130,40 @@ impl Theme {
         }
     }
 
-    /// This theme with `cursor_text` and `accent` filled in with the colors
-    /// they fall back to, so they survive being written to a config (where
-    /// an omitted key means brindle-dark's color instead).
+    /// Search match colors as (background, foreground). Without theme
+    /// colors: yellow halfway towards the background, in the foreground.
+    pub fn search_match(&self) -> (Color, Color) {
+        (
+            self.search_match_background.unwrap_or(self.ansi[3].mix(self.background, 0.5)),
+            self.search_match_foreground.unwrap_or(self.foreground),
+        )
+    }
+
+    /// The current search match's (background, foreground). Without theme
+    /// colors: the background color on yellow.
+    pub fn search_focused_match(&self) -> (Color, Color) {
+        (
+            self.search_focused_match_background.unwrap_or(self.ansi[3]),
+            self.search_focused_match_foreground.unwrap_or(self.background),
+        )
+    }
+
+    /// This theme with `cursor_text`, `accent` and the search colors filled
+    /// in with the colors they fall back to, so they survive being written
+    /// to a config (where an omitted key means brindle-dark's color, or one
+    /// derived from the new theme's palette, instead).
     pub fn with_effective_colors(&self) -> Theme {
-        Theme { cursor_text: Some(self.cursor_text.unwrap_or(self.background)), accent: Some(self.accent()), ..self.clone() }
+        let (match_bg, match_fg) = self.search_match();
+        let (focused_bg, focused_fg) = self.search_focused_match();
+        Theme {
+            cursor_text: Some(self.cursor_text.unwrap_or(self.background)),
+            accent: Some(self.accent()),
+            search_match_background: Some(match_bg),
+            search_match_foreground: Some(match_fg),
+            search_focused_match_background: Some(focused_bg),
+            search_focused_match_foreground: Some(focused_fg),
+            ..self.clone()
+        }
     }
 
     pub fn is_dark(&self) -> bool {
@@ -182,6 +216,10 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
                 0x5c5853, 0xf2847c, 0xb7d685, 0xf2c96e, 0x8cbbe8, 0xd6a5e0, 0x8ad6cc, 0xf2eee6,
             ]),
             accent: Some(Color::hex(0xe6a756)),
+            search_match_background: None,
+            search_match_foreground: None,
+            search_focused_match_background: None,
+            search_focused_match_foreground: None,
         },
         "brindle-light" => Theme {
             foreground: Color::hex(0x2e2b27),
@@ -195,6 +233,10 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
                 0x6b665f, 0xd9534a, 0x5f9a2a, 0xb8860b, 0x3d7fd1, 0xa55dc2, 0x1fa39a, 0xffffff,
             ]),
             accent: Some(Color::hex(0xb56a12)),
+            search_match_background: None,
+            search_match_foreground: None,
+            search_focused_match_background: None,
+            search_focused_match_foreground: None,
         },
         "tokyo-night" => Theme {
             foreground: Color::hex(0xc0caf5),
@@ -208,6 +250,10 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
                 0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
             ]),
             accent: Some(Color::hex(0x7aa2f7)),
+            search_match_background: None,
+            search_match_foreground: None,
+            search_focused_match_background: None,
+            search_focused_match_foreground: None,
         },
         "gruvbox-dark" => Theme {
             foreground: Color::hex(0xebdbb2),
@@ -221,6 +267,10 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
                 0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
             ]),
             accent: Some(Color::hex(0xfabd2f)),
+            search_match_background: None,
+            search_match_foreground: None,
+            search_focused_match_background: None,
+            search_focused_match_foreground: None,
         },
         "solarized-dark" => Theme {
             foreground: Color::hex(0x839496),
@@ -234,6 +284,10 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
                 0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
             ]),
             accent: Some(Color::hex(0x268bd2)),
+            search_match_background: None,
+            search_match_foreground: None,
+            search_focused_match_background: None,
+            search_focused_match_foreground: None,
         },
         _ => return None,
     };
@@ -259,6 +313,21 @@ mod tests {
         }
         assert!(builtin_theme("brindle-dark").unwrap().is_dark());
         assert!(!builtin_theme("brindle-light").unwrap().is_dark());
+    }
+
+    #[test]
+    fn search_colors_derive_from_the_theme() {
+        let dark = builtin_theme("brindle-dark").unwrap();
+        assert_eq!(dark.search_focused_match(), (dark.ansi[3], dark.background));
+        assert_eq!(dark.search_match(), (dark.ansi[3].mix(dark.background, 0.5), dark.foreground));
+        // A partial custom theme derives from its own palette, not brindle-dark's.
+        let custom: Theme = toml::from_str("background = \"#000000\"\nsearch_match_foreground = \"#ff0000\"").unwrap();
+        assert_eq!(custom.search_focused_match().1, Color::hex(0));
+        assert_eq!(custom.search_match(), (custom.ansi[3].mix(Color::hex(0), 0.5), Color::hex(0xff0000)));
+        let effective = custom.with_effective_colors();
+        assert_eq!(effective.search_match_foreground, Some(Color::hex(0xff0000)));
+        assert_eq!(effective.search_focused_match_background, Some(custom.ansi[3]));
+        assert_eq!(effective.search_match(), custom.search_match());
     }
 
     #[test]
