@@ -36,6 +36,22 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// ctrl-a's action selects the whole filter, and typing replaces it.
+pub fn select_all(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let out = Run::new(ctx, &server, "run")
+        .action("open_command_palette")
+        .send("splt")
+        .action("text_input_left")
+        .action("text_input_select_all")
+        .send("tab")
+        .dump_at(6.5)
+        .run()?;
+    let want = Input { text: "tab".into(), cursor: 3, selection: (3, 3) };
+    ensure!(out.dump.input.as_ref() == Some(&want), "input {:?}, want {want:?}", out.dump.input);
+    Ok(Outcome::Pass)
+}
+
 pub fn palette_run(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let before = Run::new(ctx, &server, "before").dump_at(3.0).run()?;

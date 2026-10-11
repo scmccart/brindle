@@ -19,7 +19,7 @@ use gpui::{
 
 use crate::actions::{
     TextInputBackspace, TextInputCopy, TextInputCut, TextInputDelete, TextInputDeleteWordBack, TextInputEnd,
-    TextInputHome, TextInputLeft, TextInputPaste, TextInputRight, TextInputSelectEnd, TextInputSelectHome,
+    TextInputHome, TextInputLeft, TextInputPaste, TextInputRight, TextInputSelectAll, TextInputSelectEnd, TextInputSelectHome,
     TextInputSelectLeft, TextInputSelectRight, TextInputSelectWordLeft, TextInputSelectWordRight, TextInputWordLeft,
     TextInputWordRight,
 };
@@ -436,6 +436,9 @@ impl TextInput {
     fn select_end(&mut self, _: &TextInputSelectEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.motion(Motion::End, true, cx);
     }
+    fn select_all_action(&mut self, _: &TextInputSelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all(cx);
+    }
 
     fn backspace(&mut self, _: &TextInputBackspace, _: &mut Window, cx: &mut Context<Self>) {
         self.edit(cx, EditState::backspace);
@@ -615,6 +618,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::select_all_action))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_word_back))
@@ -847,6 +851,16 @@ mod tests {
         assert_eq!(show(&s), "x|abc");
         s.motion(Motion::End, false);
         assert_eq!(show(&s), "xabc|");
+    }
+
+    #[test]
+    fn select_all_then_type() {
+        let mut s = at("ma|in");
+        s.select_all();
+        assert_eq!(show(&s), "[main]");
+        assert!(!s.reversed());
+        s.insert("work");
+        assert_eq!(show(&s), "work|");
     }
 
     #[test]

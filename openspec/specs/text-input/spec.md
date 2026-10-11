@@ -17,15 +17,15 @@ A focused text input SHALL show a caret at its cursor. Typed text SHALL be inser
 - **THEN** the input holds `caé`
 
 ### Requirement: Cursor movement
-Left and right SHALL move the cursor by one character. Home and ctrl-a SHALL move it to the start, and end and ctrl-e to the end. ctrl-left and ctrl-right SHALL move it to the previous and next word boundary, where a word is a run of letters, digits or underscores.
+Left and right SHALL move the cursor by one character. Home SHALL move it to the start, and end and ctrl-e to the end. ctrl-left and ctrl-right SHALL move it to the previous and next word boundary, where a word is a run of letters, digits or underscores.
 
 #### Scenario: Word movement
 - **WHEN** an input holds `tmux -L work` with the cursor at the end, and the user presses ctrl-left twice
 - **THEN** the cursor is before `L`
 
 #### Scenario: Readline ends
-- **WHEN** the user presses ctrl-a and then types `x`
-- **THEN** `x` is inserted at the start of the text
+- **WHEN** an input holds `abc` with the cursor at the start, and the user presses ctrl-e and then types `x`
+- **THEN** the input holds `abcx`
 
 ### Requirement: Deleting text
 Backspace SHALL delete the character before the cursor, and delete SHALL delete the character after it. ctrl-backspace and ctrl-w SHALL delete back to the previous word boundary. When there is a selection, each of these SHALL delete the selection instead.
@@ -75,3 +75,14 @@ A text input SHALL NOT consume enter, escape, tab, shift-tab, up, down, ctrl-p o
 #### Scenario: Navigate while typing
 - **WHEN** the command palette's filter has focus and the user presses down and then enter
 - **THEN** the selection moves down one command and that command runs
+
+### Requirement: Select all
+ctrl-a and ctrl-shift-a SHALL select all of the input's text, with the cursor at the end. In a terminal, ctrl-a SHALL still reach the program.
+
+#### Scenario: Retype the whole text
+- **WHEN** an input holds `main`, and the user presses ctrl-a and types `work`
+- **THEN** the input holds `work`
+
+#### Scenario: Terminals keep ctrl-a
+- **WHEN** a terminal has focus and the user presses ctrl-a
+- **THEN** the program receives `^A`

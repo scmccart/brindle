@@ -60,6 +60,7 @@ pub fn all() -> Vec<Case> {
         display("settings-profile-rename", settings::profile_rename),
         display("input-palette", input::palette),
         display("input-palette-run", input::palette_run),
+        display("input-select-all", input::select_all),
         display("input-settings-tab", input::settings_tab),
         display("input-prompt-preselected", input::prompt_preselected),
         display("links-local-click", links::local_click),
