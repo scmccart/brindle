@@ -5,6 +5,7 @@ mod dump;
 mod geometry;
 mod input;
 mod links;
+mod restore;
 mod settings;
 mod styles;
 mod titles;
@@ -59,6 +60,12 @@ pub fn all() -> Vec<Case> {
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
         display("links-tmux", links::tmux),
+        display("restore-local-tabs", restore::local_tabs),
+        display("restore-fallbacks", restore::fallbacks),
+        display("restore-tmux-session", restore::tmux_session),
+        display("restore-forget-on-exit", restore::forget_on_exit),
+        display("restore-close-window", restore::close_window),
+        display("restore-second-instance", restore::second_instance),
     ]
 }
 
