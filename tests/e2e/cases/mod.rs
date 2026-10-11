@@ -58,6 +58,8 @@ pub fn all() -> Vec<Case> {
         display("input-prompt-preselected", input::prompt_preselected),
         display("search-local", search::local),
         display("search-step", search::step),
+        display("search-long-query", search::long_query),
+        display("search-input-selection", search::input_selection),
         display("search-close-restores", search::close_restores),
         display("search-tmux-pane", search::tmux_pane),
     ]

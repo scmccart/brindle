@@ -11,14 +11,14 @@ use alacritty_terminal::index::Point;
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, Context, FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, px, relative,
+    AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px, relative,
 };
 
 use crate::actions::*;
-use crate::picker::TextField;
 use crate::terminal::search::{self, COUNT_CAP, Count, SearchOptions, Step};
 use crate::terminal_view::TerminalView;
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 /// Delay before counting after the query changes, so fast typing scans once.
@@ -27,11 +27,11 @@ const COUNT_AFTER_EDIT: Duration = Duration::from_millis(100);
 const COUNT_AFTER_OUTPUT: Duration = Duration::from_millis(300);
 
 pub struct FindBar {
-    pub focus: FocusHandle,
-    query: TextField,
-    /// The query was restored when the bar opened and is shown selected:
-    /// the next edit replaces it.
-    selected: bool,
+    /// The query. The bar's focus is the input's, so the bar's own actions
+    /// (`FindBar` context) bubble up from it, as the palette's do. A query
+    /// restored when the bar opens is selected, so typing replaces it.
+    query: Entity<TextInput>,
+    _query_changed: Subscription,
     options: SearchOptions,
     /// `None` for an empty query or an invalid regex.
     regex: Option<RegexSearch>,
@@ -67,8 +67,8 @@ impl TerminalView {
     /// `Find`: opens the bar, or focuses it if it is open.
     pub fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         self.open_find_bar(window, cx);
-        if let Some(bar) = &mut self.find {
-            bar.selected = !bar.query.text.is_empty();
+        if let Some(bar) = &self.find {
+            bar.query.update(cx, |input, cx| input.select_all(cx));
         }
         cx.notify();
     }
@@ -80,10 +80,11 @@ impl TerminalView {
                 (search::view_bottom(&term), term.grid().display_offset())
             };
             let last = self.last_find.clone().unwrap_or_default();
+            let query = cx.new(|cx| TextInput::new(&last.query, cx).with_placeholder("Find"));
+            let changed = cx.subscribe(&query, |this, _, _: &TextInputEvent, cx| this.research(cx));
             self.find = Some(FindBar {
-                focus: cx.focus_handle(),
-                query: TextField::new(&last.query),
-                selected: false,
+                query,
+                _query_changed: changed,
                 options: last.options,
                 regex: None,
                 invalid: false,
@@ -97,31 +98,28 @@ impl TerminalView {
             self.research(cx);
         }
         if let Some(bar) = &self.find {
-            window.focus(&bar.focus);
+            window.focus(&bar.query.focus_handle(cx));
         }
     }
 
     /// Debug hook for `--find`: opens the bar with `query`, as if typed.
     pub fn find_text(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open_find_bar(window, cx);
-        self.edit_query(|field| *field = TextField::new(query), cx);
+        if let Some(bar) = &self.find {
+            bar.query.update(cx, |input, cx| input.set_text(query, cx));
+        }
+        self.research(cx);
     }
 
-    /// Applies an edit to the query (replacing a restored query) and searches again.
-    fn edit_query(&mut self, f: impl FnOnce(&mut TextField), cx: &mut Context<Self>) {
-        let Some(bar) = &mut self.find else { return };
-        if bar.selected {
-            bar.query.text.clear();
-            bar.selected = false;
-        }
-        f(&mut bar.query);
-        self.research(cx);
+    /// The find bar's query input, while the bar is open.
+    pub fn find_input(&self) -> Option<Entity<TextInput>> {
+        self.find.as_ref().map(|bar| bar.query.clone())
     }
 
     /// Recompiles the query and finds the first match from the origin.
     fn research(&mut self, cx: &mut Context<Self>) {
         let Some(bar) = &mut self.find else { return };
-        let compiled = search::compile(&bar.query.text, bar.options);
+        let compiled = search::compile(bar.query.read(cx).text(), bar.options);
         bar.invalid = matches!(compiled, Some(Err(_)));
         bar.regex = compiled.and_then(Result::ok);
         bar.focused = None;
@@ -231,7 +229,9 @@ impl TerminalView {
     /// and gives focus back to the terminal if the bar had it.
     fn close_find_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(bar) = self.find.take() else { return };
-        self.last_find = Some(LastFind { query: bar.query.text.clone(), options: bar.options });
+        let query = bar.query.read(cx);
+        self.last_find = Some(LastFind { query: query.text().to_string(), options: bar.options });
+        let had_focus = query.is_focused(window);
         {
             let mut term = self.terminal.read(cx).term().lock();
             let grid = term.grid();
@@ -242,25 +242,10 @@ impl TerminalView {
                 term.scroll_display(Scroll::Delta(delta));
             }
         }
-        if bar.focus.is_focused(window) {
+        if had_focus {
             window.focus(&self.focus_handle);
         }
         cx.notify();
-    }
-
-    fn find_key_down(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let ks = &e.keystroke;
-        if !TextField::is_edit_key(ks) {
-            return;
-        }
-        self.edit_query(|field| field.apply_key(ks), cx);
-        cx.stop_propagation();
-    }
-
-    fn find_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit_query(|field| field.paste(&text), cx);
-        }
     }
 
     /// The matches to draw this frame. Called from prepaint; the work is
@@ -294,7 +279,10 @@ impl TerminalView {
         };
         Some(format!(
             "--- find query={:?} case={} regex={} count={count} index={index} focused={focused} invalid={}\n",
-            bar.query.text, bar.options.case_sensitive, bar.options.regex, bar.invalid
+            bar.query.read(cx).text(),
+            bar.options.case_sensitive,
+            bar.options.regex,
+            bar.invalid
         ))
     }
 
@@ -307,7 +295,7 @@ impl TerminalView {
         let muted = t.muted_foreground().hsla();
         let accent = t.accent();
         let panel = t.chrome_background();
-        let bar_focused = bar.focus.is_focused(window);
+        let bar_focused = bar.query.read(cx).is_focused(window);
 
         let status: (SharedString, Hsla) = if bar.invalid {
             ("Invalid regex".into(), t.ansi[1].hsla())
@@ -323,24 +311,9 @@ impl TerminalView {
             }
         };
 
-        let query = &bar.query.text;
-        let query_text = div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .items_center()
-            .when(query.is_empty(), |d| d.text_color(muted).child("Find"))
-            .when(!query.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_color(fg)
-                        .when(bar.selected, |d| d.bg(t.selection_background.hsla()))
-                        .child(SharedString::from(query.clone())),
-                )
-            })
-            .when(bar_focused, |d| d.child(div().flex_none().w(px(1.5)).h(px(15.0)).bg(accent.hsla())));
+        // The input draws in the inherited text color, which it also uses
+        // for its caret and selection.
+        let query_text = div().flex().flex_1().min_w_0().overflow_hidden().text_color(fg).child(bar.query.clone());
 
         let toggle = |id: &'static str, label: &'static str, on: bool| {
             div()
@@ -369,15 +342,16 @@ impl TerminalView {
             div()
                 .id("find-bar")
                 .key_context("FindBar")
-                .track_focus(&bar.focus)
-                .on_key_down(cx.listener(Self::find_key_down))
-                .on_action(cx.listener(Self::find_paste))
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
-                        if let Some(bar) = &this.find {
-                            window.focus(&bar.focus);
+                        // A click on the bar outside the query still focuses it;
+                        // the input handles clicks in its own text.
+                        if let Some(bar) = &this.find
+                            && !bar.query.read(cx).is_focused(window)
+                        {
+                            window.focus(&bar.query.focus_handle(cx));
                         }
                         cx.stop_propagation();
                     }),
