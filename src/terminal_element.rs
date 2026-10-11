@@ -14,7 +14,7 @@ use alacritty_terminal::vte::ansi::{self, CursorShape, NamedColor, Rgb};
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
     Entity, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
+    IntoElement, LayoutId, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent,
     ShapedLine, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill,
     outline, point, px, relative, size,
 };
@@ -84,6 +84,8 @@ pub struct Frame {
     /// The terminal's output generation and its time when the grid was
     /// read, for latency probes.
     output: (u64, std::time::Instant),
+    /// A ctrl-hovered link is under the mouse.
+    pointing_hand: bool,
 }
 
 fn rgb_hsla(c: Rgb) -> Hsla {
@@ -163,6 +165,7 @@ impl Element for TerminalElement {
         let blink_visible = view.blink_visible;
         let marked_text = view.marked_text.clone();
         let layout_cell = view.layout.clone();
+        let hovered_link = view.hovered_link.clone();
 
         if !fixed {
             terminal_entity.update(cx, |t, _| {
@@ -310,7 +313,10 @@ impl Element for TerminalElement {
                 .underline_color()
                 .map(|c| rgb_hsla(resolve_color(c, colors, terminal)))
                 .unwrap_or(fg_hsla);
-            let underline = if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+            let in_link = hovered_link.as_ref().is_some_and(|l| l.contains(indexed.point));
+            let underline = if in_link {
+                Some(UnderlineStyle { thickness: px(1.0), color: Some(fg_hsla), wavy: false })
+            } else if cell.flags.intersects(Flags::ALL_UNDERLINES) {
                 Some(UnderlineStyle {
                     thickness: if cell.flags.contains(Flags::DOUBLE_UNDERLINE) { px(2.0) } else { px(1.0) },
                     color: Some(underline_color),
@@ -440,6 +446,7 @@ impl Element for TerminalElement {
             line_height,
             arrow_cursor: mouse_mode,
             output,
+            pointing_hand: hovered_link.is_some(),
         }
     }
 
@@ -489,10 +496,14 @@ impl Element for TerminalElement {
 
         let focus = self.view.read(cx).focus_handle.clone();
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
-        window.set_cursor_style(
-            if frame.arrow_cursor { CursorStyle::Arrow } else { CursorStyle::IBeam },
-            &frame.hitbox,
-        );
+        let cursor_style = if frame.pointing_hand {
+            CursorStyle::PointingHand
+        } else if frame.arrow_cursor {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::IBeam
+        };
+        window.set_cursor_style(cursor_style, &frame.hitbox);
 
         // Down and wheel only count over this terminal; move and up are
         // global so drags keep tracking outside it.
@@ -515,8 +526,25 @@ impl Element for TerminalElement {
         let view = self.view.clone();
         let hitbox = frame.hitbox.clone();
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && (hitbox.is_hovered(window) || view.read(cx).is_dragging()) {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            if hitbox.is_hovered(window) || view.read(cx).is_dragging() {
                 view.update(cx, |view, cx| view.mouse_move(e, window, cx));
+            } else if view.read(cx).hovered_link.is_some() {
+                // The pointer left with a link underlined.
+                view.update(cx, |view, cx| view.clear_hover(cx));
+            }
+        });
+        // Ctrl pressed or released (delivered while this terminal has focus).
+        let view = self.view.clone();
+        let hitbox = frame.hitbox.clone();
+        window.on_modifiers_changed(move |e: &ModifiersChangedEvent, window, cx| {
+            if hitbox.is_hovered(window) {
+                let position = window.mouse_position();
+                view.update(cx, |view, cx| view.modifiers_changed(position, e.modifiers, cx));
+            } else if view.read(cx).hovered_link.is_some() {
+                view.update(cx, |view, cx| view.clear_hover(cx));
             }
         });
         let view = self.view.clone();

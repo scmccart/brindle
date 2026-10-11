@@ -101,6 +101,7 @@ pub struct Run<'a> {
     ctx: &'a Ctx,
     server: &'a TmuxServer,
     label: &'static str,
+    profile: &'static str,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     timeline: Vec<(f64, Event)>,
@@ -120,6 +121,7 @@ impl<'a> Run<'a> {
             ctx,
             server,
             label,
+            profile: "tmux",
             steps: Vec::new(),
             env: Vec::new(),
             timeline: Vec::new(),
@@ -138,6 +140,26 @@ impl<'a> Run<'a> {
     /// is `<label>.log`).
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Starts with another profile of the test config (default `tmux`;
+    /// `Shell` is a local bash).
+    pub fn profile(mut self, name: &'static str) -> Self {
+        self.profile = name;
+        self
+    }
+
+    /// Moves the mouse over a cell of the active terminal, e.g. `ctrl-3,0`
+    /// (Brindle's `--hover`, which uses no OS input).
+    pub fn hover(mut self, pos: &str) -> Self {
+        self.steps.extend(["--hover".to_string(), pos.to_string()]);
+        self
+    }
+
+    /// Clicks a cell of the active terminal, e.g. `ctrl-3,0` (`--click`).
+    pub fn click(mut self, pos: &str) -> Self {
+        self.steps.extend(["--click".to_string(), pos.to_string()]);
         self
     }
 
@@ -176,7 +198,7 @@ impl<'a> Run<'a> {
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
         let mut child = Command::new(&ctx.bin)
-            .args(["-p", "tmux"])
+            .args(["-p", self.profile])
             .args(&self.steps)
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
@@ -270,7 +292,11 @@ pub struct Dump {
     /// Tab titles, and which tab is active.
     pub tabs: Vec<(String, bool)>,
     pub size: Option<(u16, u16)>,
+    /// The active terminal's `TermMode(...)` flags, as printed.
+    pub mode: String,
     pub grid: Option<Grid>,
+    /// The link under the mouse while hover feedback shows (`--- link`).
+    pub link: Option<String>,
     pub screen: Vec<String>,
     /// The settings dialog's line, when it is open.
     pub settings: Option<String>,
@@ -310,10 +336,13 @@ impl Dump {
                 dump.tabs.push((title, active));
             } else if let Some(rest) = line.strip_prefix("--- screen ") {
                 let size = rest.split(' ').next().unwrap_or("");
+                dump.mode = rest.split_once(" mode ").map(|(_, m)| m.to_string()).unwrap_or_default();
                 dump.size = size.split_once('x').and_then(|(c, r)| Some((c.parse().ok()?, r.parse().ok()?)));
                 in_screen = true;
             } else if let Some(rest) = line.strip_prefix("--- grid ") {
                 dump.grid = parse_grid(rest);
+            } else if let Some(rest) = line.strip_prefix("--- link ") {
+                dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
@@ -379,10 +408,18 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.tabs == [("bash".into(), true), ("vi".into(), false)], "tabs {:?}", dump.tabs);
     ensure!(dump.size == Some((56, 32)), "size {:?}", dump.size);
+    ensure!(dump.mode == "TermMode(SHOW_CURSOR)", "mode {:?}", dump.mode);
     let grid = Grid { x: 6.0, y: 51.5, cell_width: 8.4, line_height: 18.0, scale: 2.0 };
     ensure!(dump.grid == Some(grid), "grid {:?}", dump.grid);
     ensure!(dump.screen == ["hello", "", "world"], "screen {:?}", dump.screen);
     ensure!(dump.settings.is_none(), "settings {:?}", dump.settings);
+    ensure!(dump.link.is_none(), "link {:?}", dump.link);
+    let dump = Dump::parse(
+        "--- screen 20x2 mode TermMode(SHOW_CURSOR)\n--- grid origin=0,0 cell=8x16 scale=1\n\
+         --- link https://example.com/a\nsee https://example.com/a\n",
+    );
+    ensure!(dump.link.as_deref() == Some("https://example.com/a"), "link {:?}", dump.link);
+    ensure!(dump.screen == ["see https://example.com/a"], "screen with a link {:?}", dump.screen);
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);

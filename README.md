@@ -181,6 +181,26 @@ a profile keeps its open tabs linked to it and updates `default_profile`.
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
 
+### Links
+
+Hold ctrl over a URL (`http`, `https`, `file`, `mailto`, `ftp`, `ssh`, `git`, …)
+or over text a program marked as an OSC 8 hyperlink: the link is underlined
+and the pointer becomes a hand. Ctrl-click opens it with `xdg-open`, even in
+programs that use the mouse themselves (vim, htop, tmux with `mouse on`).
+Ctrl-clicks elsewhere still reach those programs. Trailing punctuation and
+enclosing brackets aren't part of a link, and a URL that wraps onto the next
+row is still one link. Ctrl-drag no longer block-selects when it starts on a
+link; alt-drag still does.
+
+To open links with something other than `xdg-open`, set
+`BRINDLE_LINK_OPENER` to a program; it gets the link as its only argument.
+"Copy Link Under Mouse" (`copy_link`) in the command palette copies the link
+under the mouse; it has no default key, so bind one if you want it.
+
+Links work the same in control-mode panes. In classic tmux, tmux passes OSC 8
+hyperlinks on only if it knows the terminal supports them:
+`set -as terminal-features ',xterm-256color:hyperlinks'`.
+
 **Breaking change:** ctrl-shift-p used to open the profile list and now opens the
 command palette. The profile list is on ctrl-shift-space and the `⌄` button; to
 get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.

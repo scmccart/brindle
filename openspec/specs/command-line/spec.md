@@ -26,11 +26,12 @@ An unknown argument SHALL print usage and exit with status 2.
 - **THEN** each bindable action name is printed, including `activate_tab_<N>` and `new_tab_with_profile_<N>`
 
 ### Requirement: Debug automation hooks
-For automated testing, Brindle SHALL support repeatable `--send <TEXT>` and `--action <NAME>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab:
+For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>` and `--click <POS>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab:
 - `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette or the settings dialog), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
-- `--action` runs a named action.
+- `--action` runs a named action;
+- `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -47,6 +48,18 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>` and `--a
 #### Scenario: Typing into the palette
 - **WHEN** Brindle runs with `--action open_command_palette --send 'splt' --action text_input_left --send 'i' --dump-screen-after 5`
 - **THEN** the dump shows the focused input holding `split` with the cursor after `i`, and nothing was typed into the terminal
+
+#### Scenario: Hovering a link
+- **WHEN** the screen shows `https://example.com` at row 0 and Brindle runs with `--hover ctrl-3,0 --dump-screen-after 3`
+- **THEN** the dump has a line `--- link https://example.com`
+
+#### Scenario: Clicking a link
+- **WHEN** `BRINDLE_LINK_OPENER` names a script that records its argument and Brindle runs with `--click ctrl-3,0` over that URL
+- **THEN** the script records `https://example.com`
+
+#### Scenario: Malformed position
+- **WHEN** a `--hover` or `--click` step's position cannot be parsed
+- **THEN** an error is logged and the remaining steps still run
 
 ### Requirement: Latency log
 `--latency-log <FILE>` SHALL time every keystroke a terminal tab receives, whether typed or from `--latency-bench`, and append one JSON line per keystroke to FILE: the key, and the milliseconds until the program's output arrived, until that output was painted, and until the next frame began. On quit, Brindle SHALL print a summary to stderr. Without the option, no timing SHALL be recorded.
