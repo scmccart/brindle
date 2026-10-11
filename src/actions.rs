@@ -367,6 +367,32 @@ mod tests {
         assert!(matched.iter().any(|(_, m)| *m == Some(false)), "{matched:#?}");
     }
 
+    /// Real ctrl-shift-up/down presses (as GPUI reports them on Linux)
+    /// resolve to the prompt jumps in a local tab and in a tmux pane alike;
+    /// `--action` in the e2e cases skips the keymap, so this covers it.
+    #[test]
+    fn prompt_jump_keys_resolve_in_local_and_tmux_terminals() {
+        use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+        let keymap = Keymap::new(default_bindings());
+        let press = |key: &str| Keystroke {
+            modifiers: Modifiers { control: true, shift: true, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        let stacks = [vec!["Workspace", "Terminal"], vec!["Workspace", "TmuxWindow", "Terminal"]];
+        for stack in stacks {
+            let contexts: Vec<KeyContext> = stack.iter().map(|c| KeyContext::parse(c).unwrap()).collect();
+            for (key, expected) in
+                [("up", &JumpToPreviousPrompt as &dyn Action), ("down", &JumpToNextPrompt as &dyn Action)]
+            {
+                let (bindings, pending) = keymap.bindings_for_input(&[press(key)], &contexts);
+                assert!(!pending, "{stack:?} {key}");
+                let first = bindings.first().unwrap_or_else(|| panic!("{stack:?}: ctrl-shift-{key} is unbound"));
+                assert!(first.action().partial_eq(expected), "{stack:?}: ctrl-shift-{key} -> {}", first.action().name());
+            }
+        }
+    }
+
     #[test]
     fn palette_lists_only_available_actions() {
         use std::any::TypeId;

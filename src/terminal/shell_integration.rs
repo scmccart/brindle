@@ -1068,4 +1068,49 @@ mod tests {
         h.command("true", 0, 0).feed(b"\x1b]133;A\x07$ ");
         assert!(h.marks.lock().last_output(&h.term).is_none());
     }
+
+    /// The byte pattern a real interactive bash sends with oh-my-posh and
+    /// `brindle --shell-integration bash` loaded, as captured from a pty
+    /// (user name and paths replaced): a two-line powerline prompt in
+    /// truecolor, A right after bracketed paste is turned on, B before
+    /// readline's `CSI K`, and C after `CSI ? 2004 l` and a carriage return.
+    fn omp_prompt() -> Vec<u8> {
+        let mut p = b"\x1b[?2004h\x1b]133;A\x07\x1b[0m\x1b[38;2;255;255;255;49m\x1b[7m\xee\x82\xb0\x1b[0m".to_vec();
+        p.extend_from_slice(b"\x1b[48;2;255;255;255m\x1b[38;2;16;14;35m user@host \x1b[0m\x1b[48;2;145;221;255m");
+        p.extend_from_slice(b"\x1b[38;2;16;14;35m ~ \xee\x82\xb1 src \x1b[0m\x1b[38;2;149;255;164m\xee\x82\xb0\x1b[0m\r\n");
+        p.extend_from_slice(b"\x1b[38;2;0;122;204m\xe2\x9d\xaf \x1b[0m\x1b]133;B\x07");
+        p
+    }
+
+    fn omp_command(cmd: &str, output: &str, exit: i32) -> Vec<u8> {
+        let mut out = omp_prompt();
+        out.extend_from_slice(format!("\x1b[K{cmd}\r\n\x1b[?2004l\r\x1b]133;C\x07{output}\x1b]133;D;{exit}\x07").as_bytes());
+        out
+    }
+
+    /// Regression for a report that prompt jumps fell back to line
+    /// scrolling in a local tab running this prompt: the marks must be
+    /// recorded, survive a resize, and drive up then down.
+    #[test]
+    fn oh_my_posh_bash_prompts() {
+        let mut h = Harness::new(80, 30, 10_000);
+        let seq: String = (1..=60).map(|i| format!("{i}\r\n")).collect();
+        let mut bytes = omp_command("seq 1 60", &seq, 0);
+        bytes.extend(omp_command("false", "", 1));
+        bytes.extend(omp_prompt());
+        // Delivered in small reads, as a PTY does.
+        for chunk in bytes.chunks(37) {
+            h.feed(chunk);
+        }
+        h.resize(90, 32);
+        let marks = h.marks.lock();
+        let lines: Vec<i64> = marks.prompt_lines().collect();
+        assert_eq!(lines.len(), 3, "{:?}", marks.commands());
+        assert!(h.text(lines[0]).contains("user@host"));
+        assert_eq!(h.text(lines[1] + 1), "\u{276f} false");
+        assert!(marks.commands()[1].failed() && !marks.commands()[0].failed());
+        let up = marks.jump_target(0, true).expect("a prompt above the bottom view");
+        assert_eq!(up, lines[0]);
+        assert_eq!(marks.jump_target(up, false), Some(lines[1]));
+    }
 }
