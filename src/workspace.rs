@@ -15,6 +15,8 @@ use gpui::EntityId;
 
 use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode};
+use crate::notify::osc::Source;
+use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
 use crate::text_input::TextInput;
 use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
@@ -532,6 +534,15 @@ impl Workspace {
                     cx.subscribe_in(&view, window, |this, _, request: &PromptRequest, window, cx| {
                         this.open_prompt(request.clone(), window, cx)
                     }),
+                    // Bells and notifications from the window's panes.
+                    cx.subscribe_in(&view, window, |this, view, event: &TerminalEvent, window, cx| {
+                        let tab = this.tabs.iter().position(|t| {
+                            matches!(&t.content, TabContent::Tmux { view: v, .. } if v == view)
+                        });
+                        if let Some(ix) = tab {
+                            this.on_attention(ix, event, window, cx);
+                        }
+                    }),
                 ];
                 let tab = Tab::new(
                     profile,
@@ -626,17 +637,49 @@ impl Workspace {
         };
         match event {
             TerminalEvent::Exited => self.remove_tab(ix, window, cx),
-            TerminalEvent::Bell => {
-                if ix != self.active || !window.is_window_active() {
-                    self.tabs[ix].bell = true;
-                }
-                cx.notify();
-            }
+            TerminalEvent::Bell | TerminalEvent::Notify(_) => self.on_attention(ix, event, window, cx),
             TerminalEvent::TitleChanged => {
                 if self.tabs[ix].refresh_title(cx) {
                     cx.notify();
                 }
             }
+        }
+    }
+
+    /// A bell or a notification request from tab `ix`, local or tmux: marks
+    /// the tab for a bell, and raises a desktop notification if the tab
+    /// isn't in front of the user (or the settings say always).
+    fn on_attention(&mut self, ix: usize, event: &TerminalEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        let visible = ix == self.active && window.is_window_active();
+        let (source, title, body) = match event {
+            TerminalEvent::Bell => {
+                if !visible {
+                    self.tabs[ix].bell = true;
+                    cx.notify();
+                }
+                (Source::Bell, "", "")
+            }
+            TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str()),
+            _ => return,
+        };
+        if !notify::policy::wanted(&Self::settings(cx).notifications, source, visible) {
+            return;
+        }
+        let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
+        let tab = &self.tabs[ix];
+        let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
+        let request = notify::Request { source, summary, body, window: handle, tab: tab.id };
+        Notifier::send(request, cx);
+    }
+
+    /// Activates the tab with this id, if it is still open (a notification
+    /// for it was clicked).
+    pub fn show_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.id == tab_id) {
+            self.activate(ix, window, cx);
         }
     }
 

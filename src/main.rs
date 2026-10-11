@@ -3,6 +3,7 @@ mod config;
 mod config_edit;
 mod desktop;
 mod latency;
+mod notify;
 mod picker;
 mod session;
 mod settings;
@@ -368,6 +369,7 @@ fn main() {
             None => settings.config.default_profile_index(),
         };
         cx.set_global(settings);
+        notify::Notifier::init(cx);
         actions::bind_keys(cx);
         // RUST_LOG=brindle=debug shows every keystroke and what it ran.
         cx.observe_keystrokes(|e, _, _| {

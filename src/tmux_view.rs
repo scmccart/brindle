@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthChar as _;
 use crate::actions::*;
 use crate::picker::{PromptRequest, ready};
 use crate::settings::Settings;
-use crate::terminal::Terminal;
+use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::{CellMetrics, cell_metrics, fit_grid};
 use crate::terminal_view::TerminalView;
 use crate::theme::{Color, Theme};
@@ -29,7 +29,8 @@ pub struct TmuxWindowView {
     pub window_id: WindowId,
     pub theme: Theme,
     font_size_override: Option<f32>,
-    views: HashMap<PaneId, (Entity<TerminalView>, Subscription)>,
+    /// Each pane's view, with its focus and terminal-event subscriptions.
+    views: HashMap<PaneId, (Entity<TerminalView>, [Subscription; 2])>,
     /// Pane cells and dividers from the window's layout, refreshed whenever
     /// the session changes rather than on every frame.
     panes: Vec<(PaneId, Rect)>,
@@ -52,6 +53,9 @@ pub struct TmuxWindowView {
 
 /// Prompted commands ask the workspace to show the prompt.
 impl EventEmitter<PromptRequest> for TmuxWindowView {}
+
+/// Bells and notifications from the window's panes, for the workspace.
+impl EventEmitter<TerminalEvent> for TmuxWindowView {}
 
 impl TmuxWindowView {
     pub fn new(
@@ -154,16 +158,21 @@ impl TmuxWindowView {
             terminal.update(cx, |t, _| t.theme = theme);
             let font_size = self.font_size_override;
             let view = cx.new(|cx| {
-                let mut view = TerminalView::new(terminal, font_size, window, cx);
+                let mut view = TerminalView::new(terminal.clone(), font_size, window, cx);
                 view.fixed_size = true;
                 view
             });
             let focus = view.read(cx).focus_handle.clone();
             let session = self.session.clone();
-            let subscription = cx.on_focus_in(&focus, window, move |_, _, cx| {
+            let focus_in = cx.on_focus_in(&focus, window, move |_, _, cx| {
                 session.update(cx, |s, cx| s.select_pane(id, cx));
             });
-            self.views.insert(id, (view, subscription));
+            let forward = cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
+                if matches!(event, TerminalEvent::Bell | TerminalEvent::Notify(_)) {
+                    cx.emit(event.clone());
+                }
+            });
+            self.views.insert(id, (view, [focus_in, forward]));
         }
 
         // Follow tmux-driven focus changes (select-pane, a pane closing, …)

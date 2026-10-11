@@ -6,6 +6,7 @@ mod geometry;
 mod input;
 mod links;
 mod restore;
+mod notify;
 mod settings;
 mod shell;
 mod styles;
@@ -26,6 +27,7 @@ pub fn all() -> Vec<Case> {
         headless("tmux-rotate-no-layout-change", tmux::rotate_no_layout_change),
         headless("tmux-color-report-precedence", tmux::color_report_precedence),
         headless("tmux-osc133-passthrough", shell::tmux_passthrough),
+        headless("tmux-osc-in-output", notify::tmux_osc_in_output),
         display("tmux-subscriptions-removed", tmux::subscriptions_removed),
         display("dump-grid-geometry", dump::grid_geometry),
         display("geometry-plain", geometry::plain),
@@ -75,6 +77,8 @@ pub fn all() -> Vec<Case> {
         display("shell-tmux-prompt-jump", shell::tmux_prompt_jump),
         display("shell-clear-up-down", shell::clear_up_down),
         display("shell-tmux-clear-up-down", shell::tmux_clear_up_down),
+        display("notify-osc-local", notify::osc_local),
+        display("notify-tmux-background", notify::tmux_background),
     ]
 }
 

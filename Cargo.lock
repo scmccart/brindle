@@ -686,13 +686,18 @@ dependencies = [
  "log",
  "parking_lot",
  "polling",
+ "raw-window-handle",
  "serde",
  "shlex",
  "smallvec",
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "unicode-width",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols 0.31.2",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

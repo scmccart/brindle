@@ -26,6 +26,14 @@ libc = "0.2"
 # Names the types in alacritty's `EventedReadWrite` trait (shell integration
 # wraps its PTY); the version alacritty_terminal already uses.
 polling = "=3.11.0"
+# Desktop notifications over D-Bus, and raising a window with the
+# notification server's activation token on Wayland. All of these are
+# already built for gpui, at these versions and with these features.
+zbus = { version = "5.12", default-features = false, features = ["async-io"] }
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.31.2", features = ["client", "staging"] }
 
 [dev-dependencies]
 # Window captures for the end-to-end suite; the version GPUI already uses.
