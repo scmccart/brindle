@@ -317,9 +317,6 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", FindClose, f),
         KeyBinding::new("alt-c", FindToggleCase, f),
         KeyBinding::new("alt-r", FindToggleRegex, f),
-        // Pasting goes into the query, not to the program.
-        KeyBinding::new("ctrl-shift-v", Paste, f),
-        KeyBinding::new("shift-insert", Paste, f),
         KeyBinding::new("ctrl-shift-e", TmuxSplitRight, x),
         KeyBinding::new("ctrl-shift-o", TmuxSplitDown, x),
         KeyBinding::new("ctrl-shift-x", TmuxClosePane, x),

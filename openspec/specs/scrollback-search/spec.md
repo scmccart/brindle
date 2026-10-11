@@ -89,7 +89,7 @@ A query that is not a valid regular expression, while regex is on, SHALL be repo
 - **THEN** the bar reports an invalid expression and nothing is highlighted
 
 ### Requirement: Editing the query
-Typing SHALL append to the query and backspace SHALL delete its last character. ctrl-shift-v and shift-insert SHALL paste into the query, with line breaks replaced by spaces, and SHALL NOT paste into the terminal. A query restored when the bar opens SHALL be shown selected, so that typing replaces it.
+The query SHALL be a text input as specified by `text-input`: cursor, selection, mouse positioning, clipboard and input methods. Pasting with the bar focused SHALL go into the query and SHALL NOT reach the terminal. A query restored when the bar opens SHALL be shown selected, so typing replaces it and backspace or delete removes it. The bar's own keys (enter, shift-enter, escape, alt-c, alt-r) SHALL keep working while the query has focus.
 
 #### Scenario: Paste goes to the bar
 - **WHEN** the bar has focus and the user presses ctrl-shift-v
@@ -98,6 +98,10 @@ Typing SHALL append to the query and backspace SHALL delete its last character. 
 #### Scenario: Restored query is replaced
 - **WHEN** the user reopens the bar after searching `foo` and types `b`
 - **THEN** the query is `b`
+
+#### Scenario: Restored query is deleted
+- **WHEN** the user reopens the bar after searching `foo` and presses delete
+- **THEN** the query is empty and nothing is highlighted
 
 ### Requirement: Closing the find bar
 Escape in the bar, the bar's close button, and `find_close` SHALL close the bar, remove every highlight, put the view back at the scroll position it had when the bar opened, and return focus to the terminal. Clicking the terminal SHALL move focus to it and leave the bar open with its highlights.

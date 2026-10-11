@@ -851,7 +851,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The overlay's text input that has keyboard focus, if any.
+    /// The text input that has keyboard focus, if any: the overlay's, or
+    /// the find bar's in the active terminal.
     fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
         match &self.overlay {
             Some(Overlay::Palette(open)) => {
@@ -859,7 +860,10 @@ impl Workspace {
                 input.read(cx).is_focused(window).then(|| input.clone())
             }
             Some(Overlay::Settings { dialog, .. }) => dialog.read(cx).focused_input(window, cx),
-            None => None,
+            None => {
+                let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
+                input.read(cx).is_focused(window).then_some(input)
+            }
         }
     }
 

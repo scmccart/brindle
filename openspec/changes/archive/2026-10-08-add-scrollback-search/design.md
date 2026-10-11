@@ -18,14 +18,14 @@
 
 **Non-Goals:**
 - Tracking matches exactly while output streams in (see Risks).
-- IME composition in the query field (the palette's text field has none either).
+- ~~IME composition in the query field.~~ *Amended after rebasing onto `main`, which had added `src/text_input.rs`:* the query is main's `TextInput`, which supports input methods.
 - Searching more than one terminal at once.
 
 ## Decisions
 
 ### 1. The find bar belongs to `TerminalView`
 
-Each `TerminalView` holds `find: Option<FindBar>` and renders the bar as an absolutely positioned child at its top-right corner, *inside* the div that tracks the terminal's focus handle. The bar has its own `FocusHandle` and the key context `FindBar`.
+Each `TerminalView` holds `find: Option<FindBar>` and renders the bar as an absolutely positioned child at its top-right corner, *inside* the div that tracks the terminal's focus handle. The bar has the key context `FindBar`. *Amended after rebasing onto `main`, which had added `src/text_input.rs`:* its focus is that of its query, a `TextInput` (decision 11), as the palette's is.
 
 Consequences:
 - Control-mode panes get a bar per pane for free, scoped to that pane's `Terminal`, as the spec requires.
@@ -50,11 +50,10 @@ The bar `occlude`s the mouse so clicks on it don't start a selection in the term
 | `FindClose` (`find_close`) | escape | FindBar | none |
 | `FindToggleCase` (`find_toggle_case`) | alt-c | FindBar | none |
 | `FindToggleRegex` (`find_toggle_regex`) | alt-r | FindBar | none |
-| `Paste` | ctrl-shift-v, shift-insert | FindBar | (existing) |
 
 - ctrl-shift-f follows the ctrl-shift-* convention for app shortcuts (GNOME Terminal, kitty and Konsole use it for find), and it is free.
 - alt-c and alt-r are VS Code's find-widget toggles.
-- `Paste` is bound in `FindBar` and handled by the bar. Otherwise ctrl-shift-v would bubble to the terminal's `Paste` handler and paste into the program.
+- *Amended after rebasing onto `main`, which had added `src/text_input.rs`:* paste needs no `FindBar` binding: the query's `TextInput` context binds ctrl-shift-v, shift-insert and ctrl-v to its own paste, and it is deeper than `Terminal`, so pasting never reaches the program.
 - Only `Find` gets a palette label. The others mean nothing until a bar is open and act on the bar.
 - All handlers are registered on the `Terminal` div, so `find_next`/`find_previous` bound by the user (in `Terminal`) also work with focus in the terminal. With no bar open they do nothing.
 - Escape is bound only in `FindBar`, so with focus in the terminal it still reaches the program (vim, less).
@@ -167,7 +166,14 @@ A query with no match scans the whole buffer, at most 10,000 lines by default. M
 
 ### 11. Editing and the restored query
 
-The bar reuses `picker::TextField` (append, backspace, paste with line breaks replaced by spaces). It adds a `selected` flag: a query restored when the bar opens is drawn highlighted, and the first edit key or paste replaces it instead of appending.
+*Amended after rebasing onto `main`, which had added `src/text_input.rs`:* the query is main's `TextInput` entity, the same input as the palettes and the settings dialog, so cursor movement, selection, mouse positioning, clipboard and input methods behave as specified by `text-input`. The bar:
+- subscribes to `TextInputEvent::Changed` and searches again on every change of text (not on cursor moves);
+- uses `set_text` for `--find`, which emits nothing, and searches itself;
+- calls `select_all` on a restored query, so it is drawn selected and the next edit replaces or removes it.
+
+Enter, shift-enter, escape, alt-c and alt-r stay in the `FindBar` context around the input; the `TextInput` context doesn't bind them, so they reach the bar, as they reach the palette. Main's input binds ctrl-a to the start of the line (readline) and has no select-all key; double-click selects a word.
+
+Before the rebase, the bar used `picker::TextField` with a `selected` flag. A follow-up change, `edit-text-fields`, had given that field a cursor and selection, but its highlight and click positioning failed hand-testing, and it was dropped in favour of main's input.
 
 The last query and options are remembered per `TerminalView` when the bar closes.
 
@@ -196,7 +202,7 @@ Clicking the terminal focuses it through the existing `mouse_down` and leaves th
 - **[The current match drifts under live output]** alacritty grid points are relative to the bottom of the screen, so every new line shifts them. → Mitigation: all-match highlights are recomputed every frame and stay right. The current match is re-validated by the debounced count pass and cleared if it no longer matches. A match that still matches after a shift stays highlighted at the shifted text, which is harmless.
 - **[Pathological regex]** For example `.`, which matches every cell. → Mitigation: the count stops at 1000. Visible matches are bounded by the viewport. alacritty's lazy DFA gives up on runaway state growth, which reads as no match.
 - **[The bar covers the top-right of the terminal]** → Mitigation: matches scrolled into view land mid-screen (decision 6). The bar is narrow, and shrinks to the pane width in small tmux panes.
-- **[No IME in the query]** → Accepted. The same holds for the palette, and it is recorded in the spec's scope.
+- ~~**[No IME in the query]**~~ *Amended after rebasing onto `main`, which had added `src/text_input.rs`:* resolved: main's `TextInput` supports input methods.
 - **[Restored offset can be off after output while scrolled up]** → Accepted (decision 12).
 
 ## Migration Plan
