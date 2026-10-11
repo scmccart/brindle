@@ -7,6 +7,7 @@
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
 
 pub mod keys;
+pub mod links;
 pub mod mouse;
 
 use std::borrow::Cow;
@@ -495,6 +496,13 @@ impl Terminal {
         term::viewport_to_point(offset, GridPoint::new(line, Column(col)))
     }
 
+    /// The link at a viewport cell, if any (see [`link_at`]).
+    pub fn link_at_viewport(&self, col: usize, line: usize) -> Option<Link> {
+        let term = self.term.lock();
+        let point = term::viewport_to_point(term.grid().display_offset(), GridPoint::new(line, Column(col)));
+        link_at(&*term, point)
+    }
+
     pub fn start_selection(&mut self, col: usize, line: usize, side: Side, ty: SelectionType, cx: &mut Context<Self>) {
         let point = self.viewport_to_grid(col, line);
         let mut term = self.term.lock();
@@ -607,6 +615,105 @@ pub fn screen_text<T>(term: &Term<T>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// A link found in a terminal: its URI and the cells it covers, as
+/// inclusive column ranges per row in grid coordinates (scrollback lines are
+/// negative), so it stays on its text while the view scrolls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub uri: String,
+    pub spans: Vec<(Line, Column, Column)>,
+}
+
+impl Link {
+    pub fn contains(&self, point: GridPoint) -> bool {
+        self.spans.iter().any(|&(line, first, last)| line == point.line && (first..=last).contains(&point.column))
+    }
+}
+
+/// How many wrapped rows above and below the pointer are joined when looking
+/// for a URL, so a pathological line can't stall the UI.
+const MAX_WRAPPED_ROWS: i32 = 32;
+
+/// The link at `point`: the cell's OSC 8 hyperlink if it has one, otherwise
+/// a URL detected in the logical line (rows joined where the terminal
+/// wrapped them).
+pub fn link_at<T>(term: &Term<T>, point: GridPoint) -> Option<Link> {
+    use term::cell::Flags;
+    let grid = term.grid();
+    let cols = grid.columns();
+    if point.line < grid.topmost_line() || point.line > grid.bottommost_line() || point.column.0 >= cols {
+        return None;
+    }
+    let mut point = point;
+    // The spacer after a wide character belongs to that character.
+    if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
+        point.column -= 1;
+    }
+
+    // OSC 8: every visible cell carrying the same hyperlink.
+    if let Some(hyperlink) = grid[point].hyperlink() {
+        let offset = grid.display_offset() as i32;
+        let mut spans = Vec::new();
+        for row in 0..grid.screen_lines() as i32 {
+            let line = Line(row - offset);
+            let mut first = None;
+            for col in 0..=cols {
+                let linked = col < cols && grid[line][Column(col)].hyperlink().as_ref() == Some(&hyperlink);
+                match (linked, first) {
+                    (true, None) => first = Some(col),
+                    (false, Some(start)) => {
+                        spans.push((line, Column(start), Column(col - 1)));
+                        first = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Some(Link { uri: hyperlink.uri().to_string(), spans });
+    }
+
+    // Detection over the logical line around `point`.
+    let wraps = |line: Line| grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    let mut top = point.line;
+    while top > grid.topmost_line() && point.line.0 - top.0 < MAX_WRAPPED_ROWS && wraps(Line(top.0 - 1)) {
+        top = Line(top.0 - 1);
+    }
+    let mut bottom = point.line;
+    while bottom < grid.bottommost_line() && bottom.0 - point.line.0 < MAX_WRAPPED_ROWS && wraps(bottom) {
+        bottom = Line(bottom.0 + 1);
+    }
+    let mut chars = Vec::new();
+    let mut cells = Vec::new();
+    let mut at = None;
+    for line in top.0..=bottom.0 {
+        let row = &grid[Line(line)];
+        for col in 0..cols {
+            let cell = &row[Column(col)];
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let here = GridPoint::new(Line(line), Column(col));
+            if here == point {
+                at = Some(chars.len());
+            }
+            chars.push(cell.c);
+            let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            cells.push((here, width));
+        }
+    }
+    let range = links::find_url(&chars, at?)?;
+    let uri: String = chars[range.clone()].iter().collect();
+    let mut spans: Vec<(Line, Column, Column)> = Vec::new();
+    for &(p, width) in &cells[range] {
+        let last = Column(p.column.0 + width - 1);
+        match spans.last_mut() {
+            Some((line, _, end)) if *line == p.line => *end = last,
+            _ => spans.push((p.line, p.column, last)),
+        }
+    }
+    Some(Link { uri, spans })
 }
 
 /// Default foreground and background that replace the theme's for one
@@ -734,6 +841,82 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_and_sanitizes() {
         assert_eq!(paste_bytes("x\x1b[201~y", true), b"\x1b[200~x[201~y\x1b[201~");
+    }
+
+    fn term_with(cols: usize, rows: usize, bytes: &[u8]) -> Term<alacritty_terminal::event::VoidListener> {
+        let size = GridSize { cols: cols as u16, rows: rows as u16, ..Default::default() };
+        let mut term = Term::new(term::Config::default(), &size, alacritty_terminal::event::VoidListener);
+        let mut processor: Processor<StdSyncHandler> = Processor::new();
+        processor.advance(&mut term, bytes);
+        term
+    }
+
+    fn at(line: i32, col: usize) -> GridPoint {
+        GridPoint::new(Line(line), Column(col))
+    }
+
+    #[test]
+    fn detected_link_on_one_row() {
+        let term = term_with(40, 3, b"see https://example.com/a. ok");
+        let link = link_at(&term, at(0, 10)).unwrap();
+        assert_eq!(link.uri, "https://example.com/a");
+        assert_eq!(link.spans, vec![(Line(0), Column(4), Column(24))]);
+        assert!(link.contains(at(0, 4)) && !link.contains(at(0, 25)));
+        assert_eq!(link_at(&term, at(0, 1)), None);
+        assert_eq!(link_at(&term, at(0, 25)), None);
+    }
+
+    #[test]
+    fn wrapped_link_is_joined() {
+        // A 28-character URL from column 3 of a 20-column terminal wraps onto row 1.
+        let term = term_with(20, 4, b"xx https://example.com/abcdefgh end");
+        for point in [at(0, 5), at(1, 3)] {
+            let link = link_at(&term, point).unwrap();
+            assert_eq!(link.uri, "https://example.com/abcdefgh");
+            assert_eq!(link.spans, vec![(Line(0), Column(3), Column(19)), (Line(1), Column(0), Column(10))]);
+        }
+    }
+
+    #[test]
+    fn hard_line_breaks_are_not_joined() {
+        let term = term_with(40, 3, b"https://example.com/a\r\nbc");
+        assert_eq!(link_at(&term, at(0, 3)).unwrap().uri, "https://example.com/a");
+        assert_eq!(link_at(&term, at(1, 0)), None);
+    }
+
+    #[test]
+    fn wide_characters_keep_columns_right() {
+        let term = term_with(40, 2, "漢字 https://example.com/漢 x".as_bytes());
+        let link = link_at(&term, at(0, 8)).unwrap();
+        assert_eq!(link.uri, "https://example.com/漢");
+        // 漢字 and a space take columns 0..=4; the URL's last char is wide.
+        assert_eq!(link.spans, vec![(Line(0), Column(5), Column(26))]);
+        // The spacer half of the wide char belongs to the link too.
+        assert_eq!(link_at(&term, at(0, 26)).unwrap().uri, "https://example.com/漢");
+    }
+
+    #[test]
+    fn osc8_link_wins_and_covers_its_cells() {
+        let term = term_with(
+            40,
+            3,
+            b"\x1b]8;id=a;https://a.example\x1b\\https://b.example\x1b]8;;\x1b\\ x\r\n\x1b]8;id=a;https://a.example\x1b\\more\x1b]8;;\x1b\\",
+        );
+        let link = link_at(&term, at(0, 3)).unwrap();
+        assert_eq!(link.uri, "https://a.example");
+        assert_eq!(link.spans, vec![(Line(0), Column(0), Column(16)), (Line(1), Column(0), Column(3))]);
+        assert_eq!(link_at(&term, at(0, 18)), None);
+    }
+
+    #[test]
+    fn osc8_links_without_ids_are_separate() {
+        let term = term_with(
+            40,
+            2,
+            b"\x1b]8;;https://a.example\x1b\\one\x1b]8;;\x1b\\ \x1b]8;;https://a.example\x1b\\two\x1b]8;;\x1b\\",
+        );
+        let link = link_at(&term, at(0, 1)).unwrap();
+        assert_eq!(link.spans, vec![(Line(0), Column(0), Column(2))]);
     }
 
     #[test]
