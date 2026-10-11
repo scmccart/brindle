@@ -348,6 +348,8 @@ pub struct Dump {
     pub palette: Vec<String>,
     /// The focused text input, in a palette or the settings dialog.
     pub input: Option<Input>,
+    /// The active terminal's selected text, when there is a selection.
+    pub selection: Option<String>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -387,6 +389,8 @@ impl Dump {
                 dump.grid = parse_grid(rest);
             } else if let Some(rest) = line.strip_prefix("--- link ") {
                 dump.link = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- selection ") {
+                dump.selection = unquote(rest);
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
@@ -409,6 +413,32 @@ impl Dump {
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
+}
+
+/// Undoes the Rust `{:?}` quoting of a string (the escapes it produces
+/// for ordinary text).
+fn unquote(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            '0' => out.push('\0'),
+            'u' => {
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 /// `origin=6,51 cell=8.4x18 scale=1`
@@ -464,6 +494,12 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.link.as_deref() == Some("https://example.com/a"), "link {:?}", dump.link);
     ensure!(dump.screen == ["see https://example.com/a"], "screen with a link {:?}", dump.screen);
+    ensure!(dump.selection.is_none(), "selection {:?}", dump.selection);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- selection \"one\\ntwo \\\"q\\\" \\u{1b}\"\nhi\n",
+    );
+    ensure!(dump.selection.as_deref() == Some("one\ntwo \"q\" \x1b"), "selection {:?}", dump.selection);
+    ensure!(dump.screen == ["hi"], "screen after selection {:?}", dump.screen);
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);

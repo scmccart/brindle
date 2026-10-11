@@ -30,6 +30,10 @@ actions!(
         ScrollToTop,
         ScrollToBottom,
         ClearScrollback,
+        JumpToPreviousPrompt,
+        JumpToNextPrompt,
+        SelectLastOutput,
+        CopyLastOutput,
         OpenProfilePicker,
         OpenCommandPalette,
         ReloadConfig,
@@ -141,6 +145,10 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("scroll_to_top", Some("Scroll to Top"), || Box::new(ScrollToTop)),
     ("scroll_to_bottom", Some("Scroll to Bottom"), || Box::new(ScrollToBottom)),
     ("clear_scrollback", Some("Clear Scrollback"), || Box::new(ClearScrollback)),
+    ("jump_to_previous_prompt", Some("Jump to Previous Prompt"), || Box::new(JumpToPreviousPrompt)),
+    ("jump_to_next_prompt", Some("Jump to Next Prompt"), || Box::new(JumpToNextPrompt)),
+    ("select_last_output", Some("Select Last Command Output"), || Box::new(SelectLastOutput)),
+    ("copy_last_output", Some("Copy Last Command Output"), || Box::new(CopyLastOutput)),
     ("open_profile_picker", Some("New Tab from Profile"), || Box::new(OpenProfilePicker)),
     ("open_command_palette", None, || Box::new(OpenCommandPalette)),
     ("reload_config", Some("Reload Config"), || Box::new(ReloadConfig)),
@@ -293,8 +301,10 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-a", SelectAll, t),
         KeyBinding::new("shift-pageup", ScrollPageUp, t),
         KeyBinding::new("shift-pagedown", ScrollPageDown, t),
-        KeyBinding::new("ctrl-shift-up", ScrollLineUp, t),
-        KeyBinding::new("ctrl-shift-down", ScrollLineDown, t),
+        // Prompt jumps fall back to scrolling one line in a terminal with
+        // no shell-integration marks.
+        KeyBinding::new("ctrl-shift-up", JumpToPreviousPrompt, t),
+        KeyBinding::new("ctrl-shift-down", JumpToNextPrompt, t),
         KeyBinding::new("shift-home", ScrollToTop, t),
         KeyBinding::new("shift-end", ScrollToBottom, t),
         KeyBinding::new("ctrl-shift-k", ClearScrollback, t),
@@ -454,6 +464,32 @@ mod tests {
             .map(|b| (format!("{:?}", b.keystrokes()), b.match_keystrokes(&[typed.clone()])))
             .collect::<Vec<_>>();
         assert!(matched.iter().any(|(_, m)| *m == Some(false)), "{matched:#?}");
+    }
+
+    /// Real ctrl-shift-up/down presses (as GPUI reports them on Linux)
+    /// resolve to the prompt jumps in a local tab and in a tmux pane alike;
+    /// `--action` in the e2e cases skips the keymap, so this covers it.
+    #[test]
+    fn prompt_jump_keys_resolve_in_local_and_tmux_terminals() {
+        use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+        let keymap = Keymap::new(default_bindings());
+        let press = |key: &str| Keystroke {
+            modifiers: Modifiers { control: true, shift: true, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        let stacks = [vec!["Workspace", "Terminal"], vec!["Workspace", "TmuxWindow", "Terminal"]];
+        for stack in stacks {
+            let contexts: Vec<KeyContext> = stack.iter().map(|c| KeyContext::parse(c).unwrap()).collect();
+            for (key, expected) in
+                [("up", &JumpToPreviousPrompt as &dyn Action), ("down", &JumpToNextPrompt as &dyn Action)]
+            {
+                let (bindings, pending) = keymap.bindings_for_input(&[press(key)], &contexts);
+                assert!(!pending, "{stack:?} {key}");
+                let first = bindings.first().unwrap_or_else(|| panic!("{stack:?}: ctrl-shift-{key} is unbound"));
+                assert!(first.action().partial_eq(expected), "{stack:?}: ctrl-shift-{key} -> {}", first.action().name());
+            }
+        }
     }
 
     #[test]

@@ -1105,6 +1105,9 @@ impl Workspace {
             if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
                 out.push_str(&format!("--- link {}\n", link.uri));
             }
+            if let Some(text) = terminal.selection_text() {
+                out.push_str(&format!("--- selection {text:?}\n"));
+            }
             out.push_str(&terminal.screen_text());
         }
         match &self.overlay {

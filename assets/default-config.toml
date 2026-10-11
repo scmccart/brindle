@@ -19,6 +19,10 @@ osc52_paste = false
 # sessions) when Brindle is launched without -p/-d/-e. Scrollback is not kept.
 # `brindle --no-restore` skips it once.
 restore_session = false
+# With shell integration loaded (see the README, or run
+# `brindle --shell-integration bash|zsh|fish`), draw a red bar beside prompts
+# whose command exited non-zero.
+mark_failed_commands = true
 
 [font]
 # First installed family wins.

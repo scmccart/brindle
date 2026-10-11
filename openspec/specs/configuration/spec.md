@@ -46,7 +46,8 @@ The config SHALL control:
 - cursor shape and blinking;
 - `copy_on_select`;
 - `osc52_paste` (whether programs may read the clipboard);
-- `restore_session` (whether a plain launch reopens the last session's windows and tabs, as defined by the `session-restore` capability; default off).
+- `restore_session` (whether a plain launch reopens the last session's windows and tabs, as defined by the `session-restore` capability; default off);
+- `mark_failed_commands` (whether failed commands get a gutter mark; on by default).
 
 #### Scenario: Blinking disabled
 - **WHEN** `cursor.blink = false`
@@ -55,6 +56,10 @@ The config SHALL control:
 #### Scenario: Session restore enabled
 - **WHEN** `restore_session = true`
 - **THEN** a plain launch reopens the windows and tabs open when Brindle last quit
+
+#### Scenario: Failed-command marks disabled
+- **WHEN** `mark_failed_commands = false` and the config is reloaded
+- **THEN** existing failed-command marks disappear from every terminal
 
 ### Requirement: Keybinding overrides
 `[keybindings]` SHALL map key combinations to named actions. User bindings SHALL take precedence over the defaults, and binding a key to `"none"` SHALL disable the default binding so the key reaches the program. Unknown action names and invalid keys SHALL be logged and ignored. The set of bindable actions SHALL be listable.

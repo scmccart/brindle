@@ -31,6 +31,9 @@ pub struct Config {
     pub osc52_paste: bool,
     /// Reopen the last session's windows and tabs on a plain launch.
     pub restore_session: bool,
+    /// Draw a red bar beside prompts whose command failed (needs shell
+    /// integration; see `shell-integration/`).
+    pub mark_failed_commands: bool,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
     /// Extra keybindings: `"ctrl-shift-x" = "action_name"`.
@@ -49,6 +52,7 @@ impl Default for Config {
             copy_on_select: false,
             osc52_paste: false,
             restore_session: false,
+            mark_failed_commands: true,
             profiles: Vec::new(),
             themes: BTreeMap::new(),
             keybindings: BTreeMap::new(),
