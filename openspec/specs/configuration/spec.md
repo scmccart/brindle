@@ -47,7 +47,8 @@ The config SHALL control:
 - `copy_on_select`;
 - `osc52_paste` (whether programs may read the clipboard);
 - `restore_session` (whether a plain launch reopens the last session's windows and tabs, as defined by the `session-restore` capability; default off);
-- `mark_failed_commands` (whether failed commands get a gutter mark; on by default).
+- `mark_failed_commands` (whether failed commands get a gutter mark; on by default);
+- `tmux_session_end` (what happens when a control-mode session leaves a window that showed only its tabs: `close_window`, `new_tab` or `ask`, as defined by the `tmux-control-mode` capability; default `close_window`).
 
 #### Scenario: Blinking disabled
 - **WHEN** `cursor.blink = false`
@@ -60,6 +61,10 @@ The config SHALL control:
 #### Scenario: Failed-command marks disabled
 - **WHEN** `mark_failed_commands = false` and the config is reloaded
 - **THEN** existing failed-command marks disappear from every terminal
+
+#### Scenario: Unknown session-end value
+- **WHEN** the config contains `tmux_session_end = "shell"`
+- **THEN** Brindle starts with defaults and shows a config error banner naming the problem
 
 ### Requirement: Keybinding overrides
 `[keybindings]` SHALL map key combinations to named actions. User bindings SHALL take precedence over the defaults, and binding a key to `"none"` SHALL disable the default binding so the key reaches the program. Unknown action names and invalid keys SHALL be logged and ignored. The set of bindable actions SHALL be listable.

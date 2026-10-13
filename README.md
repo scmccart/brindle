@@ -167,18 +167,22 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-n | new window |
-| ctrl-shift-, | settings (theme picker with live preview, custom theme editor, profiles) |
+| ctrl-shift-, | settings (general options, profiles, theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
 
-In the settings dialog, up/down previews a theme and enter applies it as the
+The settings dialog has three sections: General, Profiles and Theme; ctrl-tab
+moves between them. It opens on General, which holds what a window does when
+its tmux session ends ([tmux control mode](#tmux-control-mode)); left/right
+changes it, and the change is saved at once.
+
+In the Theme section, up/down previews a theme and enter applies it as the
 default; escape puts the previous theme back. `n` makes a new theme (a copy of
 the selected one), `e` edits a custom theme and `d` deletes one. Built-in themes
 can't be changed, so editing one starts from a copy. In the editor, tab moves
 between fields and every valid color shows on the tabs as you type. Saving
 updates `config.toml` in place: your comments and the rest of the file are kept.
 
-ctrl-tab switches to the Profiles section, which lists your profiles with their
-ctrl-alt-N numbers. Enter or `e` edits one, `n` makes a new one, `c` duplicates
+The Profiles section lists your profiles with their ctrl-alt-N numbers. Enter or `e` edits one, `n` makes a new one, `c` duplicates
 the selected one, `d` deletes it, and alt-up/alt-down reorder the list. The
 editor covers every profile setting; arguments, environment (`KEY=value`) and
 tmux arguments are written as shell words. A profile's theme and font size show
@@ -339,6 +343,19 @@ bindings instead:
 | ctrl-shift-z | zoom pane |
 | alt-arrows | move between panes |
 | ctrl-shift-d | detach (the session keeps running) |
+
+When a session goes away, by detaching, closing its last tab, or its last shell
+exiting, its tabs close. If they were all the window had, `tmux_session_end`
+decides what happens next:
+
+- `"close_window"` (the default): the window closes, as when a local tab's shell
+  exits. Closing the last window quits Brindle.
+- `"new_tab"`: a tab with your default profile opens in their place, or with the
+  first non-tmux profile if the default is a control-mode one.
+- `"ask"`: a palette offers "Close window", or a new tab with any profile.
+  Escape closes the window.
+
+It can also be changed in the settings dialog's General section.
 
 More tmux commands have no default key and are run from the command palette
 (ctrl-shift-p): layouts (even horizontal/vertical, main vertical, tiled, next),

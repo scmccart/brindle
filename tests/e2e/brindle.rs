@@ -123,6 +123,10 @@ pub struct Run<'a> {
     profile: &'static str,
     /// Appended to the test config (after its tables).
     extra_config: String,
+    /// Top-level keys, placed before the test config's tables.
+    top: String,
+    /// Brindle should quit by itself (its window closed) before the dump.
+    expect_exit: bool,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     timeline: Vec<(f64, Event)>,
@@ -149,6 +153,8 @@ impl<'a> Run<'a> {
             label,
             profile: "tmux",
             extra_config: String::new(),
+            top: String::new(),
+            expect_exit: false,
             steps: Vec::new(),
             env: Vec::new(),
             timeline: Vec::new(),
@@ -217,6 +223,23 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Adds top-level keys to the test config, e.g. `tmux_session_end = "ask"`.
+    pub fn top(mut self, text: &str) -> Self {
+        self.top.push_str(text);
+        if !text.ends_with('\n') {
+            self.top.push('\n');
+        }
+        self
+    }
+
+    /// Expects Brindle to quit by itself before the dump is due (its only
+    /// window closed): the run fails if a dump is printed instead. The
+    /// returned dump is empty.
+    pub fn expect_exit(mut self) -> Self {
+        self.expect_exit = true;
+        self
+    }
+
     /// Opens the find bar on the active terminal and searches for `text`.
     pub fn find(mut self, text: &str) -> Self {
         self.steps.extend(["--find".to_string(), text.to_string()]);
@@ -254,8 +277,11 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        let top = if self.restore { "restore_session = true\n" } else { "" };
-        let text = config_with(&self.server.socket, "e2e", self.default_profile, top) + &self.extra_config;
+        let mut top = self.top.clone();
+        if self.restore {
+            top.push_str("restore_session = true\n");
+        }
+        let text = config_with(&self.server.socket, "e2e", self.default_profile, &top) + &self.extra_config;
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
@@ -323,22 +349,31 @@ impl<'a> Run<'a> {
         }
 
         let deadline = started + Duration::from_secs_f64(ctx.secs(self.dump_at) + 30.0);
-        loop {
-            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                break;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
             }
             if Instant::now() > deadline {
                 child.kill().ok();
                 return Err(format!("Brindle didn't exit; see {}.log", self.label));
             }
             std::thread::sleep(Duration::from_millis(100));
-        }
+        };
         let mut stdout = String::new();
         child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
         ctx.save(&format!("{}.dump", self.label), &stdout);
         let errors = events.join().unwrap_or_default();
         ensure!(errors.is_empty(), "timeline: {}", errors.join("; "));
         let dump = Dump::parse(&stdout);
+        if self.expect_exit {
+            ensure!(
+                dump.tabs.is_empty() && dump.size.is_none(),
+                "Brindle was still open at the dump; see {}.dump",
+                self.label
+            );
+            ensure!(status.success(), "Brindle exited with {status}; see {}.log", self.label);
+            return Ok(Output { dump, image });
+        }
         ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
     }
