@@ -10,7 +10,7 @@ ctrl-shift-, and the "Open Settings" command SHALL open the settings dialog as a
 
 #### Scenario: Open from the shortcut
 - **WHEN** the user presses ctrl-shift-, in a tab
-- **THEN** the settings dialog opens over the window, with the Theme section showing
+- **THEN** the settings dialog opens over the window, with the General section showing
 
 #### Scenario: Open from the command palette
 - **WHEN** the user runs "Open Settings" from the command palette
@@ -28,11 +28,15 @@ At most one overlay, the settings dialog or a palette, SHALL be open at a time. 
 - **THEN** no tab is opened
 
 ### Requirement: Sections
-The dialog SHALL show a list of sections beside the selected section's content. The sections SHALL be "Theme" and "Profiles", in that order. Leaving the Theme section SHALL drop an unapplied theme preview and select the active theme again. The section SHALL NOT change while an editor has unsaved edits.
+The dialog SHALL show a list of sections beside the selected section's content. The sections SHALL be "General", "Profiles" and "Theme", in that order, and the dialog SHALL open on "General". Leaving the Theme section SHALL drop an unapplied theme preview and select the active theme again. The section SHALL NOT change while an editor has unsaved edits.
+
+#### Scenario: General section first
+- **WHEN** the dialog opens
+- **THEN** the section list shows "General", "Profiles" and "Theme", and "General" is selected
 
 #### Scenario: Theme section
-- **WHEN** the dialog opens
-- **THEN** the section list shows "Theme" and "Profiles", and "Theme" is selected
+- **WHEN** the dialog opens and the user selects "Theme"
+- **THEN** the theme list is shown with the active theme selected
 
 #### Scenario: Switch to Profiles
 - **WHEN** the user previews `tokyo-night` in the theme list and then selects "Profiles"
@@ -43,10 +47,10 @@ The dialog SHALL show a list of sections beside the selected section's content. 
 - **THEN** the profile editor stays open with its edits
 
 ### Requirement: Theme list
-The Theme section SHALL list every built-in theme followed by the user's custom themes, in a stable order. The active global theme SHALL be marked and selected when the dialog opens, and custom themes SHALL be marked as custom. The custom themes SHALL be read from the config file even when another part of the file has an error. A custom theme that cannot be read SHALL be listed with its error and SHALL NOT be selectable.
+The Theme section SHALL list every built-in theme followed by the user's custom themes, in a stable order. The active global theme SHALL be marked, and selected whenever the Theme section is shown, and custom themes SHALL be marked as custom. The custom themes SHALL be read from the config file even when another part of the file has an error. A custom theme that cannot be read SHALL be listed with its error and SHALL NOT be selectable.
 
 #### Scenario: Custom theme listed
-- **WHEN** the config defines `[themes.mine]` and `theme = "mine"`, and the user opens the dialog
+- **WHEN** the config defines `[themes.mine]` and `theme = "mine"`, and the user opens the dialog and selects "Theme"
 - **THEN** "mine" is listed after the built-ins, marked custom and active, and is selected
 
 #### Scenario: Error elsewhere in the config
@@ -168,14 +172,14 @@ The dialog SHALL be fully operable from the keyboard:
 - up and down (also ctrl-p and ctrl-n) move through the theme list and the profile list;
 - alt-up and alt-down move the selected profile up or down in the profile list;
 - tab and shift-tab move keyboard focus between an editor's fields;
-- left and right change the focused choice field (theme, tmux mode), and space toggles the focused checkbox;
-- enter applies in the theme list, edits in the profile list, and saves in an editor;
-- escape cancels in a list and discards in an editor.
+- left and right change the focused choice field (the General section's settings, theme, tmux mode), and space toggles the focused checkbox;
+- enter applies in the theme list, edits in the profile list, saves in an editor, and closes the dialog in the General section;
+- escape cancels in a list and in the General section, and discards in an editor.
 
 The editors' text fields SHALL be text inputs, as defined by the `text-input` capability, including input-method support. Every list entry, button and field SHALL also work with the mouse, and clicking a field SHALL focus it.
 
 #### Scenario: Keyboard only
-- **WHEN** the user opens the dialog, presses down twice and then enter
+- **WHEN** the user opens the dialog, selects "Theme", presses down twice and then enter
 - **THEN** the theme two places below the active one becomes the global theme
 
 #### Scenario: Fix one digit of a color
@@ -189,6 +193,10 @@ The editors' text fields SHALL be text inputs, as defined by the `text-input` ca
 #### Scenario: Profile editing by keyboard
 - **WHEN** the user selects "Profiles", moves to `Work`, presses enter, tabs to the theme field, presses right and then enter
 - **THEN** `Work`'s theme is saved as the theme after its previous one in the choice list, and the profile list is shown
+
+#### Scenario: General setting by keyboard
+- **WHEN** the user opens the dialog and presses right
+- **THEN** the session-end setting shows "Open a new tab" and the config has `tmux_session_end = "new_tab"`
 
 ### Requirement: Profile list
 The Profiles section SHALL list every profile in config order, each with its ctrl-alt-N number (for the first nine), a short description of what it runs, and a marker on the default profile. When the config defines no profiles, the implicit "Shell" profile SHALL be listed. The profiles SHALL be read from the config file even when another part of the file has an error. A profile that cannot be read SHALL be listed with its error and SHALL NOT be editable.
@@ -304,3 +312,18 @@ alt-up and alt-down, and the move buttons, SHALL move the selected profile one p
 #### Scenario: Move up
 - **WHEN** the list is `Shell`, `tmux`, `Work` and the user selects `Work` and presses alt-up
 - **THEN** the config order is `Shell`, `Work`, `tmux`, and ctrl-alt-2 opens `Work`
+
+### Requirement: General section
+The General section SHALL show the `tmux_session_end` setting as a choice field: "Close window", "Open a new tab" or "Ask". It SHALL be focused when the section is shown, and labelled with what it governs. Changing the choice SHALL write the key to the config at once, keeping the rest of the file, and SHALL apply it without waiting for the file watcher. Cancel SHALL NOT revert a change already written. A failed write SHALL show the reason and keep the previous value.
+
+#### Scenario: Current value shown
+- **WHEN** the config has `tmux_session_end = "ask"` and the user opens the dialog
+- **THEN** the General section shows "Ask"
+
+#### Scenario: Change is saved at once
+- **WHEN** the config has comments and no `tmux_session_end`, and the user changes the choice to "Ask" and closes the dialog
+- **THEN** the config has `tmux_session_end = "ask"` and its comments, and a session ending in this window then asks
+
+#### Scenario: Malformed config file
+- **WHEN** the config file has a TOML syntax error and the user changes the choice
+- **THEN** the section shows that the config file must be fixed first, the choice stays as it was, and the file is unchanged

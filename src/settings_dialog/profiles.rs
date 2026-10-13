@@ -688,7 +688,7 @@ impl ProfilesState {
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AppContext as _, Context, CursorStyle, Focusable as _, Hsla, InteractiveElement, IntoElement,
+    AnyElement, AppContext as _, Context, Focusable as _, Hsla, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
@@ -984,29 +984,6 @@ impl SettingsDialog {
             .into_any_element()
     }
 
-    fn field_box(&self, focused: bool, invalid: bool) -> gpui::Div {
-        let t = &self.theme;
-        let border = if invalid {
-            t.ansi[1].hsla()
-        } else if focused {
-            t.accent().hsla()
-        } else {
-            t.chrome_border().mix(t.foreground, 0.15).hsla()
-        };
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .h(px(26.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(t.background.hsla())
-            .text_color(t.foreground.hsla())
-    }
-
     fn render_profile_editor(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
         let t = &self.theme;
         let muted = t.muted_foreground().hsla();
@@ -1105,18 +1082,10 @@ impl SettingsDialog {
 
     /// The focusable box around a choice or checkbox, with its keys.
     fn choice_box(&self, field: Field, focused: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let mut d = self
-            .field_box(focused, false)
-            .id(field.label())
-            .key_context("SettingsChoice")
-            .cursor(CursorStyle::PointingHand)
+        self.choice_frame(field.label(), focused, self.choice_handle(field).as_ref())
             .on_action(cx.listener(Self::choice_next))
             .on_action(cx.listener(Self::choice_prev))
-            .on_action(cx.listener(Self::toggle));
-        if let Some(handle) = self.choice_handle(field) {
-            d = d.track_focus(&handle);
-        }
-        d
+            .on_action(cx.listener(Self::toggle))
     }
 
     fn render_theme_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {

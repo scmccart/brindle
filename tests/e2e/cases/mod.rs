@@ -8,6 +8,7 @@ mod links;
 mod restore;
 mod notify;
 mod search;
+mod session_end;
 mod settings;
 mod shell;
 mod styles;
@@ -58,6 +59,12 @@ pub fn all() -> Vec<Case> {
         display("settings-profile-preview", settings::profile_preview),
         display("settings-profile-save", settings::profile_save),
         display("settings-profile-rename", settings::profile_rename),
+        display("settings-general", settings::general),
+        display("session-end-close", session_end::close),
+        display("session-end-detach-close", session_end::detach_close),
+        display("session-end-new-tab", session_end::new_tab),
+        display("session-end-ask", session_end::ask),
+        display("session-end-close-tab", session_end::close_tab),
         display("input-palette", input::palette),
         display("input-palette-run", input::palette_run),
         display("input-select-all", input::select_all),

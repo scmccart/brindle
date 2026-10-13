@@ -34,6 +34,9 @@ pub struct Config {
     /// Draw a red bar beside prompts whose command failed (needs shell
     /// integration; see `shell-integration/`).
     pub mark_failed_commands: bool,
+    /// What happens when a tmux control-mode session leaves a window that
+    /// showed only its tabs.
+    pub tmux_session_end: TmuxSessionEnd,
     /// Desktop notifications from bells and OSC 9/777.
     pub notifications: NotificationConfig,
     pub profiles: Vec<Profile>,
@@ -55,6 +58,7 @@ impl Default for Config {
             osc52_paste: false,
             restore_session: false,
             mark_failed_commands: true,
+            tmux_session_end: TmuxSessionEnd::default(),
             notifications: NotificationConfig::default(),
             profiles: Vec::new(),
             themes: BTreeMap::new(),
@@ -110,6 +114,33 @@ pub struct CursorConfig {
 impl Default for CursorConfig {
     fn default() -> Self {
         Self { shape: CursorShapeConfig::Block, blink: true }
+    }
+}
+
+/// What a window does when a tmux session that was all it showed detaches or
+/// ends.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxSessionEnd {
+    /// Close the window, as when a local tab's shell exits.
+    #[default]
+    CloseWindow,
+    /// Open a tab with the default profile (or the first non-tmux one).
+    NewTab,
+    /// Ask: close the window, or open a tab with a chosen profile.
+    Ask,
+}
+
+impl TmuxSessionEnd {
+    pub const ALL: [TmuxSessionEnd; 3] = [TmuxSessionEnd::CloseWindow, TmuxSessionEnd::NewTab, TmuxSessionEnd::Ask];
+
+    /// The value as written in the config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TmuxSessionEnd::CloseWindow => "close_window",
+            TmuxSessionEnd::NewTab => "new_tab",
+            TmuxSessionEnd::Ask => "ask",
+        }
     }
 }
 
@@ -376,6 +407,17 @@ mod tests {
         assert!(!Config::parse("").unwrap().restore_session);
         assert!(!Config::parse(DEFAULT_CONFIG).unwrap().restore_session);
         assert!(Config::parse("restore_session = true").unwrap().restore_session);
+    }
+
+    #[test]
+    fn tmux_session_end_setting() {
+        assert_eq!(Config::parse("").unwrap().tmux_session_end, TmuxSessionEnd::CloseWindow);
+        assert_eq!(Config::parse(DEFAULT_CONFIG).unwrap().tmux_session_end, TmuxSessionEnd::CloseWindow);
+        for value in TmuxSessionEnd::ALL {
+            let config = Config::parse(&format!("tmux_session_end = \"{}\"", value.as_str())).unwrap();
+            assert_eq!(config.tmux_session_end, value);
+        }
+        assert!(Config::parse("tmux_session_end = \"shell\"").is_err());
     }
 
     #[test]

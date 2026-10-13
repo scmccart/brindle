@@ -14,7 +14,7 @@ use gpui::{
 use gpui::EntityId;
 
 use crate::actions::*;
-use crate::config::{Config, Profile, TmuxMode};
+use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest};
@@ -171,6 +171,9 @@ enum PaletteKind {
     /// when it opened, which they run in.
     Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
     Prompt,
+    /// Asks what to do after a session that was all the window showed
+    /// ended: row 0 closes the window, row n opens profile n - 1.
+    SessionEnded { session: Entity<TmuxSession> },
 }
 
 /// What is shown over the tabs; at most one at a time.
@@ -232,6 +235,9 @@ pub struct Workspace {
     /// Restored tmux sessions without tabs yet: their first tab goes after
     /// this tab (`None`: at the front).
     anchors: HashMap<EntityId, Option<u64>>,
+    /// Sessions attached from the "session ended" palette, keyed by the new
+    /// session, with the ended session whose tabs stay until it shows up.
+    replacing: HashMap<EntityId, Entity<TmuxSession>>,
     /// The window's size as recorded for restore: the size it opened
     /// with, until the user resizes it (see [`recorded_size`]).
     windowed_size: std::cell::Cell<Size<Pixels>>,
@@ -254,6 +260,7 @@ impl Workspace {
             order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             quiet_sessions: HashSet::new(),
             anchors: HashMap::new(),
+            replacing: HashMap::new(),
             windowed_size: std::cell::Cell::new(window.bounds().size),
         };
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
@@ -563,8 +570,14 @@ impl Workspace {
                     },
                 };
                 self.insert_tab_inactive(tab, index, cx);
+                self.finish_replacing(&session, window, cx);
             }
             TmuxEvent::WindowClosed(window_id) => {
+                // The window's last tab, for the session's last window: the
+                // session is ending, and `Detached` decides what follows.
+                if self.tabs.len() == 1 && self.tabs[0].shows_tmux(&session, Some(*window_id), cx) {
+                    return;
+                }
                 if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
                     self.remove_tab(ix, window, cx);
                 }
@@ -591,30 +604,72 @@ impl Workspace {
                     profile.name
                 );
                 self.open_message_tab(profile, &text, window, cx);
+                self.finish_replacing(&session, window, cx);
             }
             TmuxEvent::Detached(reason) => {
                 log::info!("tmux session detached: {reason}");
+                self.finish_replacing(&session, window, cx);
+                if self.tabs.is_empty() {
+                    return;
+                }
                 self.tmux_sessions.retain(|(s, _)| *s != session);
                 self.forget_restore(&session);
                 if self.tabs.iter().all(|t| t.shows_tmux(&session, None, cx)) {
-                    // Nothing else would be left: open a plain shell first so
-                    // the window doesn't vanish when tmux goes away.
-                    let config = Self::settings(cx);
-                    let default = config.default_profile_index();
-                    let fallback = if config.profiles[default].tmux == TmuxMode::Control {
-                        config.profiles.iter().position(|p| p.tmux == TmuxMode::None)
-                    } else {
-                        Some(default)
-                    };
-                    if let Some(profile) = fallback {
-                        self.launch(LaunchRequest::profile(profile), window, cx);
+                    // Nothing else would be left: the setting decides.
+                    match Self::settings(cx).tmux_session_end {
+                        TmuxSessionEnd::CloseWindow => {}
+                        TmuxSessionEnd::NewTab => {
+                            if let Some(profile) = Self::fallback_profile(Self::settings(cx)) {
+                                self.launch(LaunchRequest::profile(profile), window, cx);
+                            }
+                        }
+                        TmuxSessionEnd::Ask => {
+                            // The ended tabs stay until the user chooses.
+                            self.ask_session_ended(session, window, cx);
+                            return;
+                        }
                     }
                 }
-                // Removing the last tab closes the window, as for any tab.
-                while let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, None, cx)) {
-                    self.remove_tab(ix, window, cx);
-                }
+                self.remove_session_tabs(&session, window, cx);
             }
+        }
+    }
+
+    /// The profile a window falls back to when tmux leaves it empty: the
+    /// default, or the first non-tmux profile when the default would attach
+    /// a control-mode session again.
+    fn fallback_profile(config: &Config) -> Option<usize> {
+        let default = config.default_profile_index();
+        if config.profiles[default].tmux == TmuxMode::Control {
+            config.profiles.iter().position(|p| p.tmux == TmuxMode::None)
+        } else {
+            Some(default)
+        }
+    }
+
+    /// Closes every tab of `session`. Removing the last tab closes the
+    /// window, as for any tab.
+    fn remove_session_tabs(&mut self, session: &Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(session, None, cx)) {
+            self.remove_tab(ix, window, cx);
+            if self.tabs.is_empty() {
+                return;
+            }
+        }
+    }
+
+    fn ask_session_ended(&mut self, session: Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = session_ended_rows(&Self::settings(cx).profiles);
+        let placeholder = format!("tmux session \"{}\" ended", session.read(cx).session_name);
+        let theme = self.active_theme(cx);
+        let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx).modal());
+        self.show_palette(palette, PaletteKind::SessionEnded { session }, window, cx);
+    }
+
+    /// `session` showed up (or failed): the ended session it replaces goes.
+    fn finish_replacing(&mut self, session: &Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ended) = self.replacing.remove(&session.entity_id()) {
+            self.remove_session_tabs(&ended, window, cx);
         }
     }
 
@@ -757,7 +812,9 @@ impl Workspace {
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix) else { return };
-        if let TabContent::Tmux { session, view } = &tab.content {
+        if let TabContent::Tmux { session, view } = &tab.content
+            && !session.read(cx).is_detached()
+        {
             // Closing a tmux tab closes that tmux window; tmux tells us when
             // it is gone and the tab is removed then.
             let window_id = view.read(cx).window_id;
@@ -897,12 +954,27 @@ impl Workspace {
     ) {
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
             PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
-            PaletteEvent::Dismissed => this.dismiss_overlay(window, cx),
+            PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
         self.close_overlay(cx);
         window.focus(&palette.focus_handle(cx));
         self.overlay = Some(Overlay::Palette(OpenPalette { palette, kind, _subscription: subscription }));
         cx.notify();
+    }
+
+    /// Escape (or a click outside) on a palette. After a session ended,
+    /// that closes the window.
+    fn palette_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ended = match &self.overlay {
+            Some(Overlay::Palette(OpenPalette { kind: PaletteKind::SessionEnded { session }, .. })) => {
+                Some(session.clone())
+            }
+            _ => None,
+        };
+        self.dismiss_overlay(window, cx);
+        if let Some(session) = ended {
+            self.remove_session_tabs(&session, window, cx);
+        }
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -922,6 +994,23 @@ impl Workspace {
             }
             // A prompt has no rows to confirm.
             PaletteKind::Prompt => {}
+            PaletteKind::SessionEnded { session } => {
+                self.dismiss_overlay(window, cx);
+                let profile = ix.checked_sub(1).and_then(|p| Self::settings(cx).profiles.get(p).cloned());
+                match profile {
+                    // A control-mode session's tabs arrive later; keep the
+                    // window open with the ended tabs until they do.
+                    Some(profile) if profile.tmux == TmuxMode::Control => {
+                        if let Some(new) = self.attach_tmux(profile, None, window, cx) {
+                            self.replacing.insert(new.entity_id(), session);
+                            return;
+                        }
+                    }
+                    Some(_) => self.launch(LaunchRequest::profile(ix - 1), window, cx),
+                    None => {}
+                }
+                self.remove_session_tabs(&session, window, cx);
+            }
         }
     }
 
@@ -937,6 +1026,7 @@ impl Workspace {
             config.themes.clone(),
             config.profiles.clone(),
             config.default_profile.clone(),
+            config.tmux_session_end,
         );
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, cx));
@@ -1394,6 +1484,18 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
 }
 
 /// The keys that run `action` in the element `focus`, as the palettes show them.
+/// The rows of the palette shown after a session that was all the window
+/// showed ended: "Close window", then a new tab with each profile.
+fn session_ended_rows(profiles: &[Profile]) -> Vec<PaletteRow> {
+    std::iter::once(PaletteRow { label: "Close window".into(), detail: None, shortcut: None })
+        .chain(profiles.iter().map(|profile| PaletteRow {
+            label: format!("New tab: {}", profile.name).into(),
+            detail: Some(profile.description().into()),
+            shortcut: None,
+        }))
+        .collect()
+}
+
 fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
     Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
@@ -1572,6 +1674,19 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::size;
+
+    #[test]
+    fn session_ended_rows_offer_closing_first_then_each_profile() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n[[profiles]]\nname = \"Shell\"\n",
+        )
+        .unwrap();
+        let rows = session_ended_rows(&config.profiles);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
+        assert_eq!(labels, ["Close window", "New tab: tmux", "New tab: Shell"]);
+        assert!(rows[0].detail.is_none());
+        assert_eq!(rows[1].detail.as_ref().map(|d| d.to_string()), Some(config.profiles[0].description().to_string()));
+    }
 
     #[test]
     fn resize_edges() {

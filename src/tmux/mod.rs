@@ -247,6 +247,9 @@ pub struct TmuxSession {
     subscribed: bool,
     /// `release` has run: the session is being left.
     released: bool,
+    /// Brindle is quitting: leaving the session must not change the window,
+    /// so session restore still records its tabs.
+    quitting: bool,
     _reader: Task<()>,
     _quit: Option<Subscription>,
 }
@@ -376,12 +379,14 @@ impl TmuxSession {
             detached: false,
             subscribed: false,
             released: false,
+            quitting: false,
             _reader: reader,
             _quit: None,
         };
         // Quitting may not leave time for `Drop`'s commands to be written, so
         // leave the session here and wait (briefly) until tmux has them.
         let quit = cx.on_app_quit(|this: &mut TmuxSession, cx| {
+            this.quitting = true;
             this.release();
             let written = this.io.borrow_mut().flush();
             let timeout = cx.background_executor().timer(std::time::Duration::from_millis(50));
@@ -554,6 +559,11 @@ impl TmuxSession {
             );
         }
         result
+    }
+
+    /// tmux has gone: the session detached or ended.
+    pub fn is_detached(&self) -> bool {
+        self.detached
     }
 
     pub fn detach(&mut self) {
@@ -973,6 +983,9 @@ impl TmuxSession {
         self.io.borrow_mut().pending.clear();
         for pane in self.panes.values() {
             pane.terminal.update(cx, |t, cx| t.mark_exited(cx));
+        }
+        if self.quitting {
+            return;
         }
         cx.emit(if self.attached { TmuxEvent::Detached(reason) } else { TmuxEvent::Failed(reason) });
     }
