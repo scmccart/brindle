@@ -25,12 +25,18 @@ fn config_text(ctx: &Ctx) -> Result<String> {
     std::fs::read_to_string(ctx.dir.join("config.toml")).map_err(|e| e.to_string())
 }
 
+/// Opens the dialog (on General) and goes to the Theme section, the last
+/// one, which sections wrap around to.
+pub fn open_theme(run: Run) -> Run {
+    run.action("open_settings").action("settings_section_prev")
+}
+
 pub fn preview(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     server.type_line("%0", "clear")?;
     ctx.sleep(0.5);
     let out =
-        Run::new(ctx, &server, "run").action("open_settings").action("settings_down").capture_at(3.3).dump_at(3.8).run()?;
+        open_theme(Run::new(ctx, &server, "run")).action("settings_down").capture_at(4.3).dump_at(4.8).run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(
         settings.contains("mode=list selected=\"e2e-alt\" active=\"e2e\""),
@@ -45,12 +51,11 @@ pub fn cancel(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     server.type_line("%0", "clear")?;
     ctx.sleep(0.5);
-    let out = Run::new(ctx, &server, "run")
-        .action("open_settings")
+    let out = open_theme(Run::new(ctx, &server, "run"))
         .action("settings_down")
         .action("settings_cancel")
-        .capture_at(4.3)
-        .dump_at(4.8)
+        .capture_at(5.3)
+        .dump_at(5.8)
         .run()?;
     ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
     expect_background("background after cancel", &server, &out, theme::BACKGROUND)?;
@@ -62,12 +67,11 @@ pub fn apply(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     server.type_line("%0", "clear")?;
     ctx.sleep(0.5);
-    let out = Run::new(ctx, &server, "run")
-        .action("open_settings")
+    let out = open_theme(Run::new(ctx, &server, "run"))
         .action("settings_down")
         .action("settings_confirm")
-        .capture_at(4.5)
-        .dump_at(5.0)
+        .capture_at(5.5)
+        .dump_at(6.0)
         .run()?;
     ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
     expect_background("background after apply", &server, &out, theme::ALT_BACKGROUND)?;
@@ -166,5 +170,18 @@ pub fn profile_rename(ctx: &Ctx) -> Result<Outcome> {
         "config after rename:\n{config}"
     );
     expect_background("renamed profile's theme", &server, &out, theme::ALT_BACKGROUND)?;
+    Ok(Outcome::Pass)
+}
+
+/// The dialog opens on General; right changes `tmux_session_end` and writes
+/// it at once, before the first table.
+pub fn general(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let out = Run::new(ctx, &server, "run").action("open_settings").action("settings_choice_next").dump_at(3.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings == "section=General tmux_session_end=\"new_tab\" error=None", "dialog state: {settings:?}");
+    let config = config_text(ctx)?;
+    let want = brindle::config(&server.socket, "e2e").replacen("padding = 6\n", "padding = 6\ntmux_session_end = \"new_tab\"\n", 1);
+    ensure!(config == want, "config after the change:\n{config}");
     Ok(Outcome::Pass)
 }

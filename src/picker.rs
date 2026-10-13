@@ -73,6 +73,8 @@ pub struct Palette {
     scroll: ScrollHandle,
     mode: Mode,
     theme: Theme,
+    /// A click outside dismisses the palette (unless made modal).
+    dismiss_on_click_outside: bool,
     _input_subscription: Subscription,
 }
 
@@ -125,7 +127,13 @@ impl Palette {
             }
         });
         let list = List { rows, query, matches, selected: 0 };
-        Self { scroll: ScrollHandle::new(), mode: Mode::List(list), theme, _input_subscription: subscription }
+        Self {
+            scroll: ScrollHandle::new(),
+            mode: Mode::List(list),
+            theme,
+            dismiss_on_click_outside: true,
+            _input_subscription: subscription,
+        }
     }
 
     pub fn prompt(request: PromptRequest, theme: Theme, cx: &mut Context<Self>) -> Self {
@@ -142,7 +150,20 @@ impl Palette {
             }
         });
         let prompt = Prompt { label: request.label, input, error: None, submit: request.submit, running: None };
-        Self { scroll: ScrollHandle::new(), mode: Mode::Prompt(prompt), theme, _input_subscription: subscription }
+        Self {
+            scroll: ScrollHandle::new(),
+            mode: Mode::Prompt(prompt),
+            theme,
+            dismiss_on_click_outside: true,
+            _input_subscription: subscription,
+        }
+    }
+
+    /// Keeps the palette open on a click outside it; only escape or a
+    /// choice closes it.
+    pub fn modal(mut self) -> Self {
+        self.dismiss_on_click_outside = false;
+        self
     }
 
     /// The filter or prompt input.
@@ -336,7 +357,11 @@ impl Render for Palette {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismissed)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.dismiss_on_click_outside {
+                    cx.emit(PaletteEvent::Dismissed);
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // Hide the terminal behind from the mouse, so its I-beam cursor
             // doesn't show over the palette.

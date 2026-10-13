@@ -77,10 +77,11 @@ pub fn settings_tab(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let out = Run::new(ctx, &server, "run")
         .action("open_settings")
+        .action("settings_section_prev")
         .action("settings_new")
         .action("settings_next_field")
         .send("zz")
-        .dump_at(5.5)
+        .dump_at(6.5)
         .run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(settings.contains("mode=editor") && settings.contains("field=\"Foreground\""), "dialog: {settings:?}");

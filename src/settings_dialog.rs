@@ -17,8 +17,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    SettingsCancel, SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit, SettingsNew, SettingsNextField,
-    SettingsPrevField, SettingsUp,
+    SettingsCancel, SettingsChoiceNext, SettingsChoicePrev, SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit,
+    SettingsNew, SettingsNextField, SettingsPrevField, SettingsUp,
 };
 use crate::config_edit;
 use crate::text_input::{TextInput, TextInputEvent};
@@ -26,24 +26,34 @@ use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 mod profiles;
 
-use crate::config::Profile;
+use crate::config::{Profile, TmuxSessionEnd};
 use profiles::ProfilesState;
 
 /// The dialog's sections, in the order they are listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
-    Theme,
+    General,
     Profiles,
+    Theme,
 }
 
-const SECTIONS: [Section; 2] = [Section::Theme, Section::Profiles];
+const SECTIONS: [Section; 3] = [Section::General, Section::Profiles, Section::Theme];
 
 impl Section {
     fn label(self) -> &'static str {
         match self {
-            Section::Theme => "Theme",
+            Section::General => "General",
             Section::Profiles => "Profiles",
+            Section::Theme => "Theme",
         }
+    }
+}
+
+fn session_end_label(value: TmuxSessionEnd) -> &'static str {
+    match value {
+        TmuxSessionEnd::CloseWindow => "Close window",
+        TmuxSessionEnd::NewTab => "Open a new tab",
+        TmuxSessionEnd::Ask => "Ask",
     }
 }
 
@@ -287,6 +297,8 @@ pub enum Outcome {
     Written,
     /// The config file changed and the dialog is done.
     Applied,
+    /// The dialog is done; nothing to write.
+    Close,
 }
 
 pub struct Model {
@@ -304,6 +316,8 @@ pub struct Model {
     profiles: ProfilesState,
     /// Profiles to list (read-only) when the file can't be parsed.
     fallback_profiles: Vec<Profile>,
+    /// The General section's `tmux_session_end`, as last written.
+    session_end: TmuxSessionEnd,
 }
 
 impl Model {
@@ -313,6 +327,7 @@ impl Model {
         fallback: BTreeMap<String, Theme>,
         fallback_profiles: Vec<Profile>,
         fallback_default: Option<String>,
+        session_end: TmuxSessionEnd,
     ) -> Self {
         let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
         let mut model = Self {
@@ -323,9 +338,10 @@ impl Model {
             mode: Mode::List,
             error: None,
             fallback,
-            section: Section::Theme,
+            section: Section::General,
             profiles,
             fallback_profiles,
+            session_end,
         };
         model.reload_entries();
         let active = model.active.clone();
@@ -370,6 +386,9 @@ impl Model {
     }
 
     pub fn move_selection(&mut self, forward: bool) {
+        if self.section == Section::General {
+            return;
+        }
         if self.section == Section::Profiles {
             self.profiles.move_selection(forward);
             self.error = None;
@@ -394,6 +413,9 @@ impl Model {
     }
 
     pub fn select(&mut self, ix: usize) {
+        if self.section == Section::General {
+            return;
+        }
         if self.section == Section::Profiles {
             self.profiles.select(ix);
             self.error = None;
@@ -420,6 +442,9 @@ impl Model {
 
     /// Enter: apply in the list, save in the editor, delete when confirming.
     pub fn confirm(&mut self) -> Outcome {
+        if self.section == Section::General {
+            return Outcome::Close;
+        }
         if self.section == Section::Profiles {
             let result = match &self.profiles.mode {
                 profiles::Mode::List => {
@@ -440,6 +465,9 @@ impl Model {
 
     /// Escape: `true` when the whole dialog should close (cancel).
     pub fn cancel(&mut self) -> bool {
+        if self.section == Section::General {
+            return true;
+        }
         if self.section == Section::Profiles {
             self.error = None;
             return match self.profiles.mode {
@@ -479,6 +507,9 @@ impl Model {
 
     /// New: a copy of the selected theme under an unused name.
     pub fn start_new(&mut self) {
+        if self.section == Section::General {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -498,6 +529,9 @@ impl Model {
 
     /// Edit: a custom theme in place; a built-in is copied first.
     pub fn start_edit(&mut self) {
+        if self.section == Section::General {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -565,6 +599,9 @@ impl Model {
 
     /// Delete: asks for confirmation, or explains why the theme can't go.
     pub fn request_delete(&mut self) {
+        if self.section == Section::General {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let result = self.profiles.request_delete().map(|()| profiles::Done::Nothing);
@@ -614,6 +651,9 @@ impl Model {
 
     /// List shortcuts. In the editor, keys belong to the text inputs.
     pub fn key(&mut self, ks: &Keystroke) -> bool {
+        if self.section == Section::General {
+            return false;
+        }
         if self.section == Section::Profiles {
             let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
             if !plain || !matches!(self.profiles.mode, profiles::Mode::List) {
@@ -682,6 +722,7 @@ impl Model {
 
     pub fn in_list(&self) -> bool {
         match self.section {
+            Section::General => true,
             Section::Theme => matches!(self.mode, Mode::List),
             Section::Profiles => matches!(self.profiles.mode, profiles::Mode::List),
         }
@@ -699,6 +740,7 @@ impl Model {
             return true;
         }
         let dirty = match self.section {
+            Section::General => false,
             Section::Theme => matches!(&self.mode, Mode::Editor(e) if e.dirty()),
             Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
         };
@@ -707,6 +749,7 @@ impl Model {
             return false;
         }
         match self.section {
+            Section::General => {}
             Section::Theme => {
                 self.mode = Mode::List;
                 let active = self.active.clone();
@@ -793,8 +836,41 @@ impl Model {
         self.profiles.take_renames()
     }
 
+    pub fn session_end(&self) -> TmuxSessionEnd {
+        self.session_end
+    }
+
+    /// left/right on the General section's choice: writes the next value.
+    pub fn step_session_end(&mut self, forward: bool) -> Outcome {
+        let all = TmuxSessionEnd::ALL;
+        let ix = all.iter().position(|v| *v == self.session_end).unwrap_or(0);
+        let n = all.len();
+        self.set_session_end(all[if forward { (ix + 1) % n } else { (ix + n - 1) % n }])
+    }
+
+    /// Writes `tmux_session_end`; the value changes only if the write did.
+    pub fn set_session_end(&mut self, value: TmuxSessionEnd) -> Outcome {
+        if self.section != Section::General || value == self.session_end {
+            return Outcome::Nothing;
+        }
+        match self.save(|doc| Ok(config_edit::set_tmux_session_end(doc, value))) {
+            Ok(()) => {
+                self.session_end = value;
+                Outcome::Written
+            }
+            Err(()) => Outcome::Nothing,
+        }
+    }
+
     /// Debug description for `--dump-screen-after`.
     pub fn describe(&self) -> String {
+        if self.section == Section::General {
+            return format!(
+                "--- settings section=General tmux_session_end={:?} error={:?}\n",
+                self.session_end.as_str(),
+                self.error
+            );
+        }
         if self.section == Section::Profiles {
             return self.profiles.describe(&self.error);
         }
@@ -855,13 +931,20 @@ pub struct SettingsDialog {
     choice_handles: Vec<(profiles::Field, FocusHandle)>,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
+    /// The General section's choice field.
+    session_end_handle: FocusHandle,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsDialog {}
 
+/// The General section opens with its choice focused, so left and right
+/// work at once.
 impl Focusable for SettingsDialog {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+        match self.model.section() {
+            Section::General => self.session_end_handle.clone(),
+            _ => self.focus_handle.clone(),
+        }
     }
 }
 
@@ -883,6 +966,7 @@ impl SettingsDialog {
             choice_handles: Vec::new(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
+            session_end_handle: cx.focus_handle(),
         }
     }
 
@@ -901,7 +985,15 @@ impl SettingsDialog {
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview(cx);
         self.sync_fields(window, cx);
+        if self.model.section() != Section::General && self.session_end_handle.is_focused(window) {
+            window.focus(&self.focus_handle);
+        }
         match self.model.section() {
+            Section::General => {
+                if !self.session_end_handle.is_focused(window) {
+                    window.focus(&self.session_end_handle);
+                }
+            }
             Section::Theme => match &self.model.mode {
                 Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
                 Mode::Editor(editor) => self.scroll_to_field(editor.focused),
@@ -996,6 +1088,7 @@ impl SettingsDialog {
                 cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
                 cx.emit(SettingsEvent::Close);
             }
+            Outcome::Close => cx.emit(SettingsEvent::Close),
         }
     }
 
@@ -1055,6 +1148,16 @@ impl SettingsDialog {
         self.changed(window, cx);
     }
 
+    fn session_end_next(&mut self, _: &SettingsChoiceNext, window: &mut Window, cx: &mut Context<Self>) {
+        let outcome = self.model.step_session_end(true);
+        self.outcome(outcome, window, cx);
+    }
+
+    fn session_end_prev(&mut self, _: &SettingsChoicePrev, window: &mut Window, cx: &mut Context<Self>) {
+        let outcome = self.model.step_session_end(false);
+        self.outcome(outcome, window, cx);
+    }
+
     fn key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.key(&e.keystroke) {
             cx.stop_propagation();
@@ -1063,6 +1166,87 @@ impl SettingsDialog {
     }
 
     // ---- rendering ----
+
+    fn field_box(&self, focused: bool, invalid: bool) -> gpui::Div {
+        let t = &self.theme;
+        let border = if invalid {
+            t.ansi[1].hsla()
+        } else if focused {
+            t.accent().hsla()
+        } else {
+            t.chrome_border().mix(t.foreground, 0.15).hsla()
+        };
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .h(px(26.0))
+            .px_2()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(t.background.hsla())
+            .text_color(t.foreground.hsla())
+    }
+
+    /// The focusable box around a choice field, in the `SettingsChoice` key
+    /// context (left/right, space); the caller adds the actions.
+    fn choice_frame(
+        &self,
+        id: &'static str,
+        focused: bool,
+        handle: Option<&FocusHandle>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.field_box(focused, false)
+            .id(id)
+            .key_context("SettingsChoice")
+            .cursor(CursorStyle::PointingHand)
+            .when_some(handle, |d, handle| d.track_focus(handle))
+    }
+
+    fn render_general(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = &self.theme;
+        let panel = t.chrome_background();
+        let current = self.model.session_end();
+        let segments = TmuxSessionEnd::ALL
+            .iter()
+            .map(|&value| {
+                div()
+                    .id(session_end_label(value))
+                    .px_3()
+                    .rounded_sm()
+                    .when(value == current, |d| d.bg(panel.mix(t.accent(), 0.3).hsla()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let outcome = this.model.set_session_end(value);
+                        this.outcome(outcome, window, cx);
+                    }))
+                    .child(session_end_label(value))
+            })
+            .collect::<Vec<_>>();
+        let focused = self.session_end_handle.is_focused(window);
+        let choice = self
+            .choice_frame("tmux-session-end", focused, Some(&self.session_end_handle))
+            .flex_none()
+            .gap_1()
+            .on_action(cx.listener(Self::session_end_next))
+            .on_action(cx.listener(Self::session_end_prev))
+            .on_click(cx.listener(|this, _, window, _| window.focus(&this.session_end_handle)))
+            .children(segments);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_color(t.foreground.hsla()).child("When a tmux session ends and its tabs were the window's only tabs"))
+            .child(div().flex().child(choice))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(t.muted_foreground().hsla())
+                    .child("Applies to detaching (ctrl-shift-d), closing the last tab, and the last shell exiting. Saved at once."),
+            )
+            .into_any_element()
+    }
 
     fn button(
         &self,
@@ -1352,6 +1536,7 @@ impl Render for SettingsDialog {
         self.sync_focus_from_window(window, cx);
         let t = self.theme.clone();
         let content = match (self.model.section(), &self.model.mode) {
+            (Section::General, _) => self.render_general(window, cx),
             (Section::Profiles, _) => self.render_profiles(cx),
             (Section::Theme, Mode::Editor(editor)) => {
                 let editor = editor.clone();
@@ -1499,8 +1684,16 @@ background = "nope"
             Self { dir, path }
         }
 
+        /// A model on the Theme section, where most tests start.
         fn model(&self, active: &str) -> Model {
-            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None)
+            let mut model = self.general(active);
+            model.select_section(Section::Theme);
+            model
+        }
+
+        /// A model as the dialog opens: on the General section.
+        fn general(&self, active: &str) -> Model {
+            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None, TmuxSessionEnd::default())
         }
 
         fn text(&self) -> String {
@@ -1577,7 +1770,15 @@ background = "nope"
     #[test]
     fn apply_on_a_malformed_file_keeps_the_dialog() {
         let f = Fixture::new("malformed", "theme = \"mine\"\n[oops\n");
-        let mut model = Model::new(f.path.clone(), "mine".into(), BTreeMap::from([("mine".into(), Theme::default())]), Vec::new(), None);
+        let mut model = Model::new(
+            f.path.clone(),
+            "mine".into(),
+            BTreeMap::from([("mine".into(), Theme::default())]),
+            Vec::new(),
+            None,
+            TmuxSessionEnd::default(),
+        );
+        model.select_section(Section::Theme);
         // The fallback themes are still listed.
         assert_eq!(model.selected_entry().unwrap().name, "mine");
         model.move_selection(false);
@@ -1737,7 +1938,7 @@ background = "nope"
         // An unapplied preview is dropped on leaving Theme.
         model.move_selection(true);
         assert_eq!(model.selected_entry().unwrap().name, "spare");
-        assert!(model.next_section(true));
+        assert!(model.next_section(false));
         assert_eq!(model.section(), Section::Profiles);
         assert_eq!(model.selected_entry().unwrap().name, "mine");
         assert!(model.describe().starts_with("--- settings section=Profiles mode=list selected=\"Shell\""), "{}", model.describe());
@@ -1761,6 +1962,69 @@ background = "nope"
         type_into(&mut model, 2, "#123456");
         assert!(!model.next_section(true));
         assert_eq!(f.text(), CONFIG);
+    }
+
+    #[test]
+    fn opens_on_general_and_sections_wrap() {
+        let f = Fixture::new("general-order", CONFIG);
+        let mut model = f.general("mine");
+        assert_eq!(model.section(), Section::General);
+        assert_eq!(SECTIONS.map(Section::label), ["General", "Profiles", "Theme"]);
+        assert!(model.in_list());
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Profiles);
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Theme);
+        // The theme list shows the active theme.
+        assert_eq!(model.selected_entry().unwrap().name, "mine");
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::General);
+        assert!(model.next_section(false));
+        assert_eq!(model.section(), Section::Theme);
+        // In General, up/down and list keys do nothing; enter and escape close.
+        model.select_section(Section::General);
+        model.move_selection(true);
+        assert!(!model.key(&Keystroke::parse("n").unwrap()));
+        assert_eq!(model.confirm(), Outcome::Close);
+        assert!(model.cancel());
+        assert_eq!(f.text(), CONFIG);
+    }
+
+    #[test]
+    fn general_steps_write_tmux_session_end() {
+        let f = Fixture::new("general-write", CONFIG);
+        let mut model = f.general("mine");
+        assert_eq!(
+            model.describe(),
+            "--- settings section=General tmux_session_end=\"close_window\" error=None\n"
+        );
+        assert_eq!(model.step_session_end(true), Outcome::Written);
+        assert_eq!(model.session_end(), TmuxSessionEnd::NewTab);
+        assert!(f.text().starts_with("# test config\ntheme = \"mine\"\ntmux_session_end = \"new_tab\"\n"), "{}", f.text());
+        assert_eq!(model.step_session_end(true), Outcome::Written);
+        assert_eq!(model.step_session_end(true), Outcome::Written);
+        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
+        assert_eq!(model.step_session_end(false), Outcome::Written);
+        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
+        assert!(f.text().contains("tmux_session_end = \"ask\""));
+        // Choosing the current value writes nothing.
+        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Nothing);
+        // Only from the General section.
+        model.select_section(Section::Theme);
+        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
+        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
+    }
+
+    #[test]
+    fn general_on_a_malformed_file_keeps_the_value() {
+        let text = "theme = \"mine\"\n[oops\n";
+        let f = Fixture::new("general-malformed", text);
+        let mut model = f.general("mine");
+        assert_eq!(model.step_session_end(true), Outcome::Nothing);
+        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
+        assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
+        assert!(model.describe().contains("error=Some("));
+        assert_eq!(f.text(), text);
     }
 
     #[test]

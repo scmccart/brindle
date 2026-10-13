@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::{DEFAULT_CONFIG, Profile, TmuxMode};
+use crate::config::{DEFAULT_CONFIG, Profile, TmuxMode, TmuxSessionEnd};
 use crate::theme::{BUILTIN_THEMES, Theme};
 
 pub fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -43,6 +43,11 @@ pub fn save(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(), Strin
 /// Sets the top-level `theme`.
 pub fn set_global_theme(doc: &mut DocumentMut, name: &str) {
     set_value(doc.as_table_mut(), "theme", Value::from(name));
+}
+
+/// Sets the top-level `tmux_session_end`.
+pub fn set_tmux_session_end(doc: &mut DocumentMut, value: TmuxSessionEnd) {
+    set_value(doc.as_table_mut(), "tmux_session_end", Value::from(value.as_str()));
 }
 
 /// Writes `[themes.<name>]` with every color of `theme`. An existing table
@@ -652,6 +657,38 @@ background = "nope"
         save(&path, |doc| Ok(set_global_theme(doc, "gruvbox-dark"))).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, DEFAULT_CONFIG.replace("theme = \"brindle-dark\"", "theme = \"gruvbox-dark\""));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tmux_session_end_changes_only_its_line() {
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        set_tmux_session_end(&mut doc, TmuxSessionEnd::Ask);
+        assert_eq!(
+            doc.to_string(),
+            DEFAULT_CONFIG.replace("tmux_session_end = \"close_window\"", "tmux_session_end = \"ask\"")
+        );
+    }
+
+    #[test]
+    fn tmux_session_end_goes_before_the_first_table() {
+        let mut doc = parse("# top\ntheme = \"x\"\n\n[font]\nsize = 12\n").unwrap();
+        set_tmux_session_end(&mut doc, TmuxSessionEnd::NewTab);
+        assert_eq!(doc.to_string(), "# top\ntheme = \"x\"\ntmux_session_end = \"new_tab\"\n\n[font]\nsize = 12\n");
+        let config = crate::config::Config::parse(&doc.to_string()).unwrap();
+        assert_eq!(config.tmux_session_end, TmuxSessionEnd::NewTab);
+        assert_eq!(config.font.size, 12.0);
+    }
+
+    #[test]
+    fn tmux_session_end_refused_on_malformed_file() {
+        let dir = temp_dir("session-end-malformed");
+        let path = dir.join("config.toml");
+        let text = "theme = \"x\n";
+        std::fs::write(&path, text).unwrap();
+        let err = save(&path, |doc| Ok(set_tmux_session_end(doc, TmuxSessionEnd::Ask))).unwrap_err();
+        assert!(err.contains("not valid TOML"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::remove_dir_all(dir).ok();
     }
 
