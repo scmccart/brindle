@@ -138,7 +138,9 @@ pub fn subscriptions_removed(ctx: &Ctx) -> Result<Outcome> {
     removed_before(&log(ctx, "quit")?, "detach-client").map_err(|e| format!("quit: {e}"))?;
     server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after quitting: {e}"))?;
 
-    Run::new(ctx, &server, "detach").env(DEBUG.0, DEBUG.1).action("tmux_detach").dump_at(4.0).run()?;
+    // `new_tab` keeps the window (and the dump) after the session goes.
+    const NEW_TAB: &str = "tmux_session_end = \"new_tab\"";
+    Run::new(ctx, &server, "detach").env(DEBUG.0, DEBUG.1).top(NEW_TAB).action("tmux_detach").dump_at(4.0).run()?;
     removed_before(&log(ctx, "detach")?, "detach-client").map_err(|e| format!("detach: {e}"))?;
     server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after detaching: {e}"))?;
 
@@ -148,7 +150,7 @@ pub fn subscriptions_removed(ctx: &Ctx) -> Result<Outcome> {
     }
 
     // Closing the only window's tab ends the session (and the server).
-    Run::new(ctx, &server, "close").env(DEBUG.0, DEBUG.1).action("close_tab").dump_at(4.0).run()?;
+    Run::new(ctx, &server, "close").env(DEBUG.0, DEBUG.1).top(NEW_TAB).action("close_tab").dump_at(4.0).run()?;
     removed_before(&log(ctx, "close")?, "kill-window").map_err(|e| format!("closing the last tab: {e}"))?;
     Ok(Outcome::Pass)
 }

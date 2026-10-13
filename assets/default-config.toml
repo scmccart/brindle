@@ -23,6 +23,10 @@ restore_session = false
 # `brindle --shell-integration bash|zsh|fish`), draw a red bar beside prompts
 # whose command exited non-zero.
 mark_failed_commands = true
+# When a tmux control-mode session detaches or ends (its last shell exits)
+# and its tabs were all the window had: "close_window", "new_tab" (open the
+# default profile, or the first non-tmux one), or "ask".
+tmux_session_end = "close_window"
 
 [font]
 # First installed family wins.
@@ -61,7 +65,8 @@ name = "Shell"
 # font_size = 13
 
 # tmux in control mode: each tmux window becomes a Brindle tab and panes are
-# drawn natively. Detaching (ctrl-shift-d) keeps the session running.
+# drawn natively. Detaching (ctrl-shift-d) keeps the session running; what the
+# window does afterwards is set by tmux_session_end above.
 [[profiles]]
 name = "tmux"
 tmux = "control"
