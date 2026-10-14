@@ -166,7 +166,7 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
-| ctrl-shift-n | new window |
+| ctrl-shift-n | new window (asks first if it would show a tmux session another window shows) |
 | ctrl-shift-, | settings (general options, profiles, theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
 
@@ -247,6 +247,8 @@ when it last quit:
 - classic tmux tabs, which reattach to their session;
 - control-mode sessions, attached once each. Their windows come back as tabs
   where they were, and tmux's current window and panes are left as they are.
+  A session recorded in more than one window comes back in the first of them
+  only, and a window left with nothing else isn't reopened.
 
 Scrollback and running programs are not restored: shells start fresh in
 their directory. `brindle --no-restore` skips restoring once.
@@ -353,9 +355,40 @@ decides what happens next:
 - `"new_tab"`: a tab with your default profile opens in their place, or with the
   first non-tmux profile if the default is a control-mode one.
 - `"ask"`: a palette offers "Close window", or a new tab with any profile.
-  Escape closes the window.
+  Escape closes the window. A control-mode profile whose session another
+  window shows is offered as "Go to <session>" instead.
 
 It can also be changed in the settings dialog's General section.
+
+Each session is shown by one window at most. Picking a control-mode profile
+whose session this window shows just switches to its tab. The new-tab palette
+marks a control-mode profile whose session is open with "open in this window"
+or "in another window (switches)", and picking the latter switches
+to that window's tab and brings the window up. Anywhere you can't see that
+note, Brindle doesn't attach the session a second time or switch windows by
+itself: a palette asks what to do instead. That happens with the profile's
+ctrl-alt-N, when ctrl-shift-t would open it as the default profile, and when
+ctrl-shift-n would (for a new window, a session shown in any window counts).
+Its rows are:
+
+- "Go to <session>": switch to that session's tab and bring its window up
+  (on Wayland the desktop may only flag the window instead, when the
+  switch didn't come from a key press or click);
+- "New tmux session…": create a new session instead (see below);
+- "New tab: <profile>" for your other profiles ("New window: …" after
+  ctrl-shift-n).
+
+Escape or a click outside does nothing. Profiles with the same `command`,
+`tmux_args` and `tmux_session` count as the same session.
+
+**tmux: New Session** (command palette, from any tab while you have a
+control-mode profile) asks for a name and creates that session, showing it in
+the current window next to your other tabs. Leave the name empty to let tmux
+pick one. It starts in the current directory, on the server of the active
+tab's session, or else of your default (or first) control-mode profile. If
+tmux refuses the name, e.g. `duplicate session: work`, the prompt stays open
+with that message. It has no default key; bind `tmux_new_session` if you want
+one.
 
 More tmux commands have no default key and are run from the command palette
 (ctrl-shift-p): layouts (even horizontal/vertical, main vertical, tiled, next),
