@@ -38,6 +38,7 @@ pub fn all() -> Vec<Case> {
         headless("tmux-osc133-passthrough", shell::tmux_passthrough),
         headless("tmux-osc-in-output", notify::tmux_osc_in_output),
         display("tmux-subscriptions-removed", tmux::subscriptions_removed),
+        display("tmux-poll-session-end-inside", tmux::poll_session_end_inside),
         display("dump-grid-geometry", dump::grid_geometry),
         display("geometry-plain", geometry::plain),
         display("geometry-top-before-attach", geometry::top_before_attach),
