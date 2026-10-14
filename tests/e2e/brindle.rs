@@ -111,6 +111,8 @@ ansi = [{ansi}]
 
 enum Event {
     Tmux(Vec<String>),
+    /// Runs a tmux command and saves its output as `<label>-<name>.txt`.
+    Record(Vec<String>, String),
     /// Rewrites the config with another theme (Brindle reloads it).
     Theme(&'static str),
 }
@@ -257,6 +259,19 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Runs a tmux command `secs` after Brindle starts and keeps its output,
+    /// read back with [`Run::recorded`].
+    pub fn record_at(mut self, secs: f64, name: &str, args: &[&str]) -> Self {
+        self.timeline.push((secs, Event::Record(args.iter().map(|a| a.to_string()).collect(), name.to_string())));
+        self
+    }
+
+    /// The output of a [`Run::record_at`] command of a run labelled `label`.
+    pub fn recorded(ctx: &Ctx, label: &str, name: &str) -> Result<String> {
+        let path = ctx.dir.join(format!("{label}-{name}.txt"));
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
+    }
+
     /// Switches the config to another theme `secs` after Brindle starts.
     pub fn theme_at(mut self, secs: f64, theme: &'static str) -> Self {
         self.timeline.push((secs, Event::Theme(theme)));
@@ -311,6 +326,7 @@ impl<'a> Run<'a> {
         let socket = self.server.socket.clone();
         let slow = ctx.secs(1.0);
         let config_for_reload = config_path.clone();
+        let (case_dir, label) = (ctx.dir.clone(), self.label);
         let events = std::thread::spawn(move || -> Vec<String> {
             let mut errors = Vec::new();
             for (secs, event) in timeline {
@@ -327,6 +343,19 @@ impl<'a> Run<'a> {
                                 String::from_utf8_lossy(&o.stderr).trim()
                             )),
                             Err(e) => errors.push(format!("tmux: {e}")),
+                        }
+                    }
+                    Event::Record(args, name) => {
+                        let out = Command::new("tmux").args(["-L", &socket, "-f", "/dev/null"]).args(&args).output();
+                        let text = match out {
+                            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+                            Err(e) => {
+                                errors.push(format!("tmux: {e}"));
+                                String::new()
+                            }
+                        };
+                        if let Err(e) = std::fs::write(case_dir.join(format!("{label}-{name}.txt")), text) {
+                            errors.push(format!("saving {name}: {e}"));
                         }
                     }
                     Event::Theme(theme) => {
@@ -417,6 +446,9 @@ pub struct Dump {
     pub selection: Option<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
+    /// The tab titles of the other windows (`--- window N tabs=[…]`), by
+    /// window number.
+    pub windows: Vec<(usize, Vec<String>)>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -467,6 +499,11 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- input ") {
                 dump.input = parse_input(rest);
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- window ") {
+                if let Some(window) = parse_window(rest) {
+                    dump.windows.push(window);
+                }
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- find ") {
                 dump.find = Some(rest.to_string());
                 in_screen = false;
@@ -489,6 +526,14 @@ impl Dump {
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
+}
+
+/// `2 tabs=["bash", "w0"]` (titles without commas or quotes).
+fn parse_window(text: &str) -> Option<(usize, Vec<String>)> {
+    let (number, tabs) = text.split_once(" tabs=")?;
+    let inner = tabs.strip_prefix('[')?.strip_suffix(']')?;
+    let titles = inner.split(", ").filter(|t| !t.is_empty()).map(|t| t.trim_matches('"').to_string()).collect();
+    Some((number.parse().ok()?, titles))
 }
 
 /// Undoes the Rust `{:?}` quoting of a string (the escapes it produces
@@ -600,5 +645,8 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.find_field("count") == Some("11"), "count {:?}", dump.find_field("count"));
     ensure!(dump.find_field("focused") == Some("10,0"), "focused {:?}", dump.find_field("focused"));
     ensure!(dump.find_field("nope").is_none(), "missing field");
+    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- window 2 tabs=[\"bash\", \"w0\"]\n--- window 3 tabs=[]\n");
+    ensure!(dump.screen == ["hi"], "screen before windows {:?}", dump.screen);
+    ensure!(dump.windows == [(2, vec!["bash".to_string(), "w0".to_string()]), (3, vec![])], "windows {:?}", dump.windows);
     Ok(())
 }

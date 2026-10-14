@@ -50,20 +50,26 @@ To focus a session open in another window, `cx.defer` a `handle.update(...)` tha
 
 The deferred update runs after the current window's update has finished, the same reason `ReloadConfig` is deferred.
 
-**Raising on Wayland** uses `notify::activation`. GPUI's `activate_window` requests a token for the *target* surface, which is unfocused, so GNOME refuses it and shows "Brindle is ready". `activation.rs` gets a second entry point that requests an `xdg_activation_v1` token on its own queue for the *focused* window's surface, which is the window where the user just pressed the key or clicked. It then activates the target surface with that token. If anything fails (X11, the protocol missing, the token refused), it falls back to `activate_window`. The tab is activated either way, so the worst case is the existing "is ready" notification. The spec says only that Brindle *asks* the desktop to raise the window.
+**Raising on Wayland** uses `notify::activation`. GPUI's `activate_window` requests a token for the *target* surface, which is unfocused, so GNOME refuses it and shows "Brindle is ready". `activation.rs` gets a second entry point that requests an `xdg_activation_v1` token on its own queue for the *focused* window's surface, which is the window where the user just pressed the key or clicked. It then activates the target surface with that token.
+
+GNOME (Mutter) only honours a token whose request names the serial of the latest key or button press on the focused surface; a request without one gets a token that activates nothing, so GNOME shows "Brindle is ready" (seen in the manual check). GPUI tracks those serials but keeps them private. So `activation.rs` attaches to GPUI's display as soon as a Wayland window opens, binds its own `wl_seat`, and creates its own `wl_keyboard` and `wl_pointer` on its queue. The compositor sends input events, with their serials, to every keyboard and pointer object of the client, so ours see the same serials as GPUI's. It keeps the serial of the latest key or button press (a release read in the same batch as its press would not match), and `request_token` sends it with `set_serial`. A 1 s timer drains the queue, so pointer motion and keymap fds don't pile up between requests. A switch with no input behind it (e2e's `--action`) still gets the fallback.
+
+If anything fails (X11, the protocol missing, the token refused), it falls back to `activate_window`. The tab is activated either way, so the worst case is the existing "is ready" notification. The spec says only that Brindle *asks* the desktop to raise the window.
 
 ### Asking when a session is open elsewhere
 
-There is one entry point, `Workspace::open_profile(ix, target, window, cx)`, where `target` is `Tab` or `Window`. The new-tab palette, ctrl-alt-N, `new_tab` (non-tmux tab) and `NewWindow` all go through it:
+There is one entry point, `Workspace::open_profile(ix, target, window, cx)`, where `target` is `Tab` or `Window`. ctrl-alt-N, `new_tab` (non-tmux tab) and `NewWindow` all go through it:
 - **Not a control-mode profile, or the session isn't open:** it launches as today, as a tab, or as a new window via `open_window`.
 - **The session is open in this window and `target` is `Tab`:** it activates the session's tab, as today.
 - **Otherwise:** it shows `PaletteKind::SessionOpenElsewhere { profile, location, target }`. A new window counts as "elsewhere" even from the window showing the session.
+
+The new-tab palette doesn't ask: its row already says "in another window (switches)", so confirming that row calls `go_to_session` directly, and asking again was a redundant second prompt (found in the manual check). Other rows go through `open_profile` with `Target::Tab`.
 
 How the palette works:
 - It's an ordinary dismissible `Palette::list` (not `modal()`), so escape and a click outside both cancel through the normal `Dismissed` path with nothing to undo.
 - `session_open_rows(config, picked, open_keys, target)` builds the rows. It's a pure function, unit-tested like `session_ended_rows`. It returns "Go to <session>", "New tmux session…", then `New tab:`/`New window:` rows for each profile other than the picked one, skipping control-mode profiles whose key is open anywhere. Each row maps to an enum, so confirming doesn't rely on row arithmetic.
 
-`NewWindow` is a global action (`main.rs`). It now dispatches to the active `Workspace` when there is one (`cx.active_window()` downcast) so the palette can show there. With no window (the first launch), it opens the window directly as before.
+`NewWindow` is now handled by each window's `Workspace` (registered whether or not the settings dialog is open), so the palette shows in the window where it was pressed. Looking up `cx.active_window()` from the global handler was considered, but it is `None` whenever no Brindle window has platform focus (for example, unfocused e2e runs). The global handler in `main.rs` stays for a dispatch no window takes.
 
 **The session-ended palette:** `session_ended_rows` takes the open keys too, and labels such a profile "Go to <session>". Its confirm goes to the session's window and then removes the ended tabs, which closes this window.
 
@@ -85,7 +91,7 @@ The palette's "New tmux session…" row runs the same flow with the picked profi
 
 ### Profile palette detail
 
-`open_profile_picker` appends ` · open in this window` or ` · open in another window` to a control-mode profile's description, using `find_session` with the profile's key. That's a snapshot taken when the palette opens. Classic tmux profiles get no state, because Brindle can't know it.
+`open_profile_picker` appends ` · open in this window` or ` · in another window (switches)` to a control-mode profile's description, using `find_session` with the profile's key. That's a snapshot taken when the palette opens. Classic tmux profiles get no state, because Brindle can't know it.
 
 For e2e, `Palette::describe` prints a row's detail as `label  detail  [shortcut]`. Existing parsers split rows on two spaces and take the first field, so they keep working.
 

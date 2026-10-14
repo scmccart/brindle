@@ -237,6 +237,7 @@ pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Wo
     };
     match cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(launch, window, cx))) {
         Ok(handle) => {
+            handle.update(cx, |_, window, cx| notify::activation::track_input(window, cx)).ok();
             cx.activate(true);
             Some(handle)
         }
@@ -291,6 +292,28 @@ fn watch_config(cx: &mut App) {
     .detach();
 }
 
+/// `--- window N tabs=[…]` for each window but `dumped`, in creation order
+/// (N counts all windows from 1).
+fn dump_other_windows(dumped: gpui::WindowHandle<Workspace>, cx: &mut App) -> String {
+    let mut windows: Vec<(u64, gpui::WindowHandle<Workspace>)> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|w| w.downcast::<Workspace>())
+        .filter_map(|w| Some((w.read(cx).ok()?.creation_order(), w)))
+        .collect();
+    windows.sort_by_key(|(order, _)| *order);
+    let mut out = String::new();
+    for (n, (_, handle)) in windows.into_iter().enumerate() {
+        if handle.window_id() == dumped.window_id() {
+            continue;
+        }
+        if let Ok(ws) = handle.read(cx) {
+            out.push_str(&format!("--- window {} tabs={:?}\n", n + 1, ws.tab_titles()));
+        }
+    }
+    out
+}
+
 /// The windows to restore, if session restore is on, this process owns the
 /// state and the state file is usable. Problems are logged and ignored.
 fn restorable_windows(cx: &mut App) -> Vec<WindowState> {
@@ -299,7 +322,7 @@ fn restorable_windows(cx: &mut App) -> Vec<WindowState> {
         return Vec::new();
     }
     match session::load(&session::state_dir()) {
-        Ok(Some(state)) => state.windows,
+        Ok(Some(state)) => session::dedupe_windows(state.windows, &Settings::get(cx).config),
         Ok(None) => Vec::new(),
         Err(why) => {
             log::warn!("{why}");
@@ -399,6 +422,8 @@ fn main() {
         // Global listeners run inside the dispatching window's update, where
         // `reload_config` couldn't update that window; defer until it's back.
         cx.on_action(|_: &ReloadConfig, cx| cx.defer(reload_config));
+        // Windows handle NewWindow themselves (it may ask first); this is
+        // for a dispatch no window took.
         cx.on_action(|_: &NewWindow, cx| {
             let profile = Settings::get(cx).config.default_profile_index();
             open_window(Launch::Request(LaunchRequest::profile(profile)), cx);
@@ -469,6 +494,7 @@ fn main() {
                         print!("{}", ws.dump_active_screen(window, cx));
                     })
                     .ok();
+                cx.update(|cx| print!("{}", dump_other_windows(window, cx))).ok();
                 cx.update(|cx| cx.quit()).ok();
             })
             .detach();

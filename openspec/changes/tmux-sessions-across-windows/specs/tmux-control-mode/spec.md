@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Attach to a session
-Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux [tmux_args] -C new-session -A -s <session>`, creating the session if needed. Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown by at most one Brindle window. Opening a control profile whose session is already attached in the current window SHALL make one of its tabs active. When it is attached in another window, Brindle SHALL NOT attach it again and SHALL ask what to do, as defined by "Choosing when a session is open elsewhere". Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
+Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux [tmux_args] -C new-session -A -s <session>`, creating the session if needed. Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown by at most one Brindle window. Opening a control profile whose session is already attached in the current window SHALL make one of its tabs active. When it is attached in another window, Brindle SHALL NOT attach it again. Picking the profile in the new-tab palette, which says beforehand that the session is open in another window, SHALL go to that session as "Go to <session>" does, without asking. The other ways of opening it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere". Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
 
 #### Scenario: Existing session with two windows
 - **WHEN** the user opens a control profile whose session has windows 0 and 1
@@ -15,6 +15,10 @@ Opening a profile with `tmux = "control"` SHALL attach to the profile's session 
 
 #### Scenario: Session open in another window
 - **WHEN** window A shows session `main`, and the user picks the profile for `main` from the new-tab palette in window B
+- **THEN** nothing is asked, window A's tab for tmux's current window of `main` becomes active, Brindle asks the desktop to raise window A, and `tmux list-clients` shows one Brindle client for `main`
+
+#### Scenario: Session open in another window, opened by shortcut
+- **WHEN** window A shows session `main`, and the user presses the ctrl-alt-N shortcut of the profile for `main` in window B
 - **THEN** window B asks what to do, window A is not raised, and `tmux list-clients` shows one Brindle client for `main`
 
 ### Requirement: Asking when a session leaves
@@ -43,15 +47,15 @@ With `tmux_session_end = "ask"`, the session's tabs SHALL stay in the window, wi
 ## ADDED Requirements
 
 ### Requirement: Choosing when a session is open elsewhere
-When an action would attach a control-mode session that another window shows, Brindle SHALL show a palette in the current window instead, with the placeholder `tmux session "<session>" is open in another window`. The actions are: picking the profile in the new-tab palette, ctrl-alt-N, and opening the default profile with ctrl-shift-t, the `+` button or ctrl-shift-n (see `tabs`). The rows SHALL be, in order, with the first selected:
+When an action would attach a control-mode session that another window shows, Brindle SHALL show a palette in the current window instead, with the placeholder `tmux session "<session>" is open in another window` (`is open in this window` when ctrl-shift-n is pressed in the window that shows it). The actions are ctrl-alt-N, and opening the default profile with ctrl-shift-t, the `+` button or ctrl-shift-n (see `tabs`). The rows SHALL be, in order, with the first selected:
 - "Go to <session>": make that session's tab active in its window and ask the desktop to raise that window;
 - "New tmux session…": ask for a name, as "Create a new session" does, with the same profile;
-- "New tab: <profile>" for each other profile in config order, or "New window: <profile>" when the action was ctrl-shift-n. The profile that was picked, and control-mode profiles whose session is open in any window, SHALL NOT be listed.
+- "New tab: <profile>" for each other profile in config order, or "New window: <profile>" when the action was ctrl-shift-n. The profile the action opened, and control-mode profiles whose session is open in any window, SHALL NOT be listed.
 
 What a row opens SHALL go where the action would have opened the profile: a tab in the current window, or a new window for ctrl-shift-n. Escape or a click outside SHALL dismiss the palette without opening anything or raising any window.
 
 #### Scenario: Go to the session
-- **WHEN** window A shows session `main`, the user picks `tmux` in window B's new-tab palette, and presses enter in the palette that appears
+- **WHEN** window A shows session `main`, the user presses `tmux`'s ctrl-alt-N shortcut in window B, and presses enter in the palette that appears
 - **THEN** window A's tab for tmux's current window of `main` becomes active, Brindle asks the desktop to raise window A, and window B has no new tab
 
 #### Scenario: Another profile instead
