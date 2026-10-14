@@ -107,6 +107,72 @@ impl Image {
     }
 }
 
+/// One arm of a divider junction: the line running from the crossing point
+/// to the edge of the sampled rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// No line pixels at all.
+    None,
+    /// Line pixels that don't run unbroken from the crossing to the edge.
+    Gap,
+    /// An unbroken line that changes color along the way.
+    Mixed,
+    Color(Rgb),
+}
+
+/// The four arms of a junction, from the crossing point outwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Junction {
+    pub up: Arm,
+    pub down: Arm,
+    pub left: Arm,
+    pub right: Arm,
+}
+
+impl Image {
+    /// Reads the divider junction in `r`. Line pixels are those near one of
+    /// `colors`. The crossing is where the row and the column with the most
+    /// line pixels meet; lines several pixels thick (scaled windows) count
+    /// as one band each.
+    pub fn junction(&self, r: PxRect, colors: &[Rgb]) -> Result<Junction> {
+        let (x1, y1) = (r.x1.min(self.width), r.y1.min(self.height));
+        ensure!(r.x0 < x1 && r.y0 < y1, "empty junction rectangle {r:?}");
+        let line = |x: u32, y: u32| colors.iter().position(|&c| self.pixel(x, y).near(c, 24));
+        // The band of rows (or columns) around the busiest one.
+        let band = |counts: Vec<usize>, start: u32| -> Result<(u32, u32)> {
+            let max = counts.iter().copied().max().unwrap_or(0);
+            ensure!(max > 0, "no line pixels in {r:?}");
+            let peak = counts.iter().position(|&n| n == max).unwrap();
+            let thick = |i: usize| counts[i] * 2 >= max;
+            let lo = (0..=peak).rev().take_while(|&i| thick(i)).last().unwrap_or(peak);
+            let hi = (peak..counts.len()).take_while(|&i| thick(i)).last().unwrap_or(peak);
+            Ok((start + lo as u32, start + hi as u32))
+        };
+        let rows = (r.y0..y1).map(|y| (r.x0..x1).filter(|&x| line(x, y).is_some()).count()).collect();
+        let cols = (r.x0..x1).map(|x| (r.y0..y1).filter(|&y| line(x, y).is_some()).count()).collect();
+        let (top, bottom) = band(rows, r.y0)?;
+        let (left, right) = band(cols, r.x0)?;
+        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+        // An arm's pixels, from the crossing band outwards.
+        let arm = |pixels: Vec<Option<usize>>| -> Arm {
+            if pixels.iter().all(Option::is_none) {
+                return Arm::None;
+            }
+            if pixels.iter().any(Option::is_none) {
+                return Arm::Gap;
+            }
+            let first = pixels[0].unwrap();
+            if pixels.iter().all(|&p| p == Some(first)) { Arm::Color(colors[first]) } else { Arm::Mixed }
+        };
+        Ok(Junction {
+            up: arm((r.y0..top).rev().map(|y| line(cx, y)).collect()),
+            down: arm((bottom + 1..y1).map(|y| line(cx, y)).collect()),
+            left: arm((r.x0..left).rev().map(|x| line(x, cy)).collect()),
+            right: arm((right + 1..x1).map(|x| line(x, cy)).collect()),
+        })
+    }
+}
+
 /// The cell grid of a whole tab, in device pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct Cells {
@@ -199,5 +265,54 @@ pub fn self_test() -> Result {
     ensure!(cells.rect(51, 1, 2, 1) == PxRect { x0: 879, y0: 138, x1: 913, y1: 174 }, "{:?}", cells.rect(51, 1, 2, 1));
     ensure!(Rgb(0x10, 0x20, 0x30).report() == "rgb:1010/2020/3030", "report");
     ensure!(Rgb(100, 100, 100).near(Rgb(120, 90, 100), 24) && !Rgb(0, 0, 0).near(Rgb(30, 0, 0), 24), "near");
+    Ok(())
+}
+
+pub fn self_test_junction() -> Result {
+    const BG: Rgb = Rgb(0x10, 0x14, 0x18);
+    const A: Rgb = Rgb(0xff, 0xff, 0x00);
+    const B: Rgb = Rgb(0xff, 0x00, 0xff);
+    let colors = [A, B];
+    // A 20x20 image, lines 2 pixels thick at rows/columns 9-10.
+    let image = |paint: &dyn Fn(u32, u32) -> Option<Rgb>| {
+        let mut data = Vec::new();
+        for y in 0..20 {
+            for x in 0..20 {
+                let c = paint(x, y).unwrap_or(BG);
+                data.extend_from_slice(&[c.0, c.1, c.2]);
+            }
+        }
+        Image { width: 20, height: 20, data }
+    };
+    let on = |v: u32| (9..=10).contains(&v);
+    let all = PxRect { x0: 0, y0: 0, x1: 20, y1: 20 };
+
+    // A cross whose highlight (A) turns from up to left on the lines.
+    let cross = image(&|x, y| match (on(x), on(y)) {
+        (true, _) if y <= 10 => Some(A),
+        (true, _) => Some(B),
+        (_, true) if x <= 10 => Some(A),
+        (_, true) => Some(B),
+        _ => None,
+    });
+    let got = cross.junction(all, &colors)?;
+    let want = Junction { up: Arm::Color(A), down: Arm::Color(B), left: Arm::Color(A), right: Arm::Color(B) };
+    ensure!(got == want, "cross: {got:?}");
+
+    // A T: the vertical line, and a horizontal one going right only.
+    let tee = image(&|x, y| (on(x) || (on(y) && x > 10)).then_some(A));
+    let got = tee.junction(all, &colors)?;
+    let want = Junction { up: Arm::Color(A), down: Arm::Color(A), left: Arm::None, right: Arm::Color(A) };
+    ensure!(got == want, "tee: {got:?}");
+
+    // The horizontal line stops a pixel short of the vertical one.
+    let gap = image(&|x, y| (on(x) || (on(y) && x != 11)).then_some(A));
+    let got = gap.junction(all, &colors)?;
+    ensure!(got.right == Arm::Gap && got.left == Arm::Color(A), "gap: {got:?}");
+
+    // The color changes partway along an arm.
+    let mixed = image(&|x, y| (on(x) || on(y)).then_some(if y < 4 { B } else { A }));
+    let got = mixed.junction(all, &colors)?;
+    ensure!(got.up == Arm::Mixed && got.down == Arm::Color(A), "mixed: {got:?}");
     Ok(())
 }
