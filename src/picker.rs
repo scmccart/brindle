@@ -182,6 +182,9 @@ impl Palette {
                 for &ix in &list.matches {
                     let row = &list.rows[ix];
                     out.push_str(&format!("{}", row.label));
+                    if let Some(detail) = &row.detail {
+                        out.push_str(&format!("  {detail}"));
+                    }
                     if let Some(shortcut) = &row.shortcut {
                         out.push_str(&format!("  [{shortcut}]"));
                     }

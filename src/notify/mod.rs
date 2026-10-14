@@ -7,7 +7,7 @@
 //! tests read. It remembers which window and tab each notification came
 //! from, so a click can show that tab.
 
-mod activation;
+pub mod activation;
 mod dbus;
 pub mod osc;
 pub mod policy;

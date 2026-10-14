@@ -14,6 +14,7 @@ mod shell;
 mod styles;
 mod titles;
 mod tmux;
+mod windows;
 
 use crate::capture::Cells;
 use crate::brindle::Output;
@@ -65,6 +66,15 @@ pub fn all() -> Vec<Case> {
         display("session-end-new-tab", session_end::new_tab),
         display("session-end-ask", session_end::ask),
         display("session-end-close-tab", session_end::close_tab),
+        display("session-open-elsewhere-goto", windows::open_elsewhere_goto),
+        display("session-open-elsewhere-dismiss", windows::open_elsewhere_dismiss),
+        display("new-window-asks", windows::new_window_asks),
+        display("new-window-new-session", windows::new_window_new_session),
+        display("profile-picker-open-state", windows::profile_picker_state),
+        display("profile-picker-goes-to-session", windows::picker_goes_to_session),
+        display("tmux-new-session", windows::new_session),
+        display("tmux-new-session-duplicate", windows::new_session_duplicate),
+        display("restore-dedupe", windows::restore_dedupe),
         display("input-palette", input::palette),
         display("input-palette-run", input::palette_run),
         display("input-select-all", input::select_all),

@@ -6,7 +6,7 @@
 //! holding `session.lock` reads or writes it, so a second Brindle never
 //! duplicates the first one's tabs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, TmuxMode};
+use crate::tmux::SessionKey;
 
 /// The state file format this build reads and writes.
 pub const VERSION: u32 = 1;
@@ -192,30 +193,77 @@ pub enum RestoredTab {
 /// becomes the default one, a vanished directory the profile's own (or
 /// home), and the profile's current tmux mode decides how it opens.
 pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab {
-    let (name, cwd, session) = match tab {
-        TabState::Local { profile, cwd } => (profile, cwd.as_deref(), None),
-        TabState::Tmux { profile, session } => (profile, None, Some(session)),
+    let (name, cwd) = match tab {
+        TabState::Local { profile, cwd } => (profile, cwd.as_deref()),
+        TabState::Tmux { profile, .. } => (profile, None),
     };
-    let index = config.profile_index(name).unwrap_or_else(|| {
+    if config.profile_index(name).is_none() {
         log::warn!("session restore: no profile named {name:?}, using the default profile");
-        config.default_profile_index()
-    });
-    let profile = &config.profiles[index];
-    if profile.tmux == TmuxMode::Control {
-        // Only a recorded session of this same profile keeps its name;
-        // otherwise the profile's own session is used.
-        let session = session
-            .filter(|_| profile.name.eq_ignore_ascii_case(name))
-            .cloned()
-            .unwrap_or_else(|| profile.tmux_session_name().to_string());
-        return RestoredTab::Tmux { profile: index, session };
     }
+    if let Some((profile, session)) = tmux_target(tab, config) {
+        return RestoredTab::Tmux { profile, session };
+    }
+    let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
+    let profile = &config.profiles[index];
     let cwd = cwd
         .filter(|d| d.is_dir())
         .map(Path::to_path_buf)
         .or_else(|| profile.working_directory().filter(|d| d.is_dir()))
         .unwrap_or_else(|| home.to_path_buf());
     RestoredTab::Local { profile: index, cwd }
+}
+
+/// The control-mode profile and session a recorded tab attaches, if its
+/// profile (or the default one, for an unknown profile) is control mode.
+fn tmux_target(tab: &TabState, config: &Config) -> Option<(usize, String)> {
+    let (name, session) = match tab {
+        TabState::Local { profile, .. } => (profile, None),
+        TabState::Tmux { profile, session } => (profile, Some(session)),
+    };
+    let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
+    let profile = &config.profiles[index];
+    if profile.tmux != TmuxMode::Control {
+        return None;
+    }
+    // Only a recorded session of this same profile keeps its name;
+    // otherwise the profile's own session is used.
+    let session = session
+        .filter(|_| profile.name.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| profile.tmux_session_name().to_string());
+    Some((index, session))
+}
+
+/// Keeps each tmux session in the first window (and at the first tab) that
+/// records it, so restoring attaches it once. Windows left with nothing to
+/// restore are dropped; `active` follows its entry, or resets to the first
+/// when that entry was dropped.
+pub fn dedupe_windows(windows: Vec<WindowState>, config: &Config) -> Vec<WindowState> {
+    let mut seen = HashSet::new();
+    windows
+        .into_iter()
+        .filter_map(|mut window| {
+            let mut active = None;
+            let mut tabs = Vec::new();
+            for (ix, tab) in std::mem::take(&mut window.tabs).into_iter().enumerate() {
+                if let Some((profile, session)) = tmux_target(&tab, config)
+                    && !seen.insert(SessionKey::new(&config.profiles[profile], &session))
+                {
+                    continue;
+                }
+                if ix == window.active {
+                    active = Some(tabs.len());
+                }
+                tabs.push(tab);
+            }
+            if tabs.is_empty() {
+                return None;
+            }
+            window.tabs = tabs;
+            window.active = active.unwrap_or(0);
+            Some(window)
+        })
+        .collect()
 }
 
 // ---- recording --------------------------------------------------------------------
@@ -479,6 +527,47 @@ mod tests {
         assert_eq!(resolve_tab(&tmux("Shell", "x"), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
         // A local entry whose profile is now control mode attaches its session.
         assert_eq!(resolve_tab(&local("tmux", Some("/tmp")), &config, home), RestoredTab::Tmux { profile: 2, session: "work".into() });
+    }
+
+    #[test]
+    fn dedupe_keeps_each_session_once() {
+        let config = config();
+        let tmux = |session: &str| TabState::Tmux { profile: "tmux".into(), session: session.into() };
+        let local = || TabState::Local { profile: "Shell".into(), cwd: None };
+        let window = |active: usize, tabs: Vec<TabState>| WindowState { width: None, height: None, maximized: false, active, tabs };
+        let windows = vec![
+            window(0, vec![tmux("main")]),
+            // A duplicate before the active tab: `active` follows its entry.
+            window(2, vec![tmux("main"), local(), local()]),
+            // Only a duplicate: the window goes.
+            window(0, vec![tmux("main")]),
+            // The active entry is the duplicate: the first tab becomes active.
+            window(1, vec![local(), tmux("main"), tmux("other")]),
+        ];
+        let deduped = dedupe_windows(windows, &config);
+        assert_eq!(
+            deduped,
+            vec![
+                window(0, vec![tmux("main")]),
+                window(1, vec![local(), local()]),
+                window(0, vec![local(), tmux("other")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_matches_profiles_on_the_same_server() {
+        let mut config = config();
+        // A second control profile for the same server and session.
+        let mut alias = config.profiles[2].clone();
+        alias.name = "alias".into();
+        alias.tmux_session = Some("main".into());
+        config.profiles.push(alias);
+        let windows = vec![
+            WindowState { width: None, height: None, maximized: false, active: 0, tabs: vec![TabState::Tmux { profile: "tmux".into(), session: "main".into() }] },
+            WindowState { width: None, height: None, maximized: false, active: 0, tabs: vec![TabState::Tmux { profile: "alias".into(), session: "main".into() }] },
+        ];
+        assert_eq!(dedupe_windows(windows, &config).len(), 1);
     }
 
     #[test]

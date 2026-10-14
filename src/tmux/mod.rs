@@ -19,7 +19,7 @@ use futures::StreamExt as _;
 use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
-use crate::config::{Config, Profile};
+use crate::config::{Config, Profile, TmuxMode};
 use crate::terminal::{DefaultColors, GridSize, Terminal};
 use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
@@ -218,7 +218,9 @@ pub struct Pane {
 
 pub struct TmuxSession {
     pub profile: Profile,
-    pub session_name: String,
+    /// The session's name as tmux reports it; `None` until a session
+    /// created without a name has attached.
+    pub session_name: Option<String>,
     config: Config,
     io: Rc<RefCell<Io>>,
     pub windows: BTreeMap<WindowId, TmuxWindow>,
@@ -242,6 +244,8 @@ pub struct TmuxSession {
     user_commands: u64,
     /// A window list has been received, i.e. the session really attached.
     attached: bool,
+    /// What tmux printed when it refused to attach (`duplicate session`).
+    attach_error: Option<String>,
     detached: bool,
     /// Subscriptions are registered (see `unsubscribe_commands`).
     subscribed: bool,
@@ -256,23 +260,98 @@ pub struct TmuxSession {
 
 impl EventEmitter<TmuxEvent> for TmuxSession {}
 
-/// The tmux command line for attaching to (or creating) `profile`'s session.
-pub fn command_line(profile: &Profile, cwd: Option<&PathBuf>) -> (String, Vec<String>) {
-    let program = profile.command.clone().unwrap_or_else(|| "tmux".into());
+/// Which session a control client attaches to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachSpec {
+    /// The profile's session, created if it doesn't exist (`-A`).
+    Named,
+    /// A new session, named by tmux when the name is `None`. Never
+    /// attaches to an existing session.
+    New(Option<String>),
+}
+
+/// The tmux program a profile runs.
+fn tmux_program(profile: &Profile) -> String {
+    profile.command.clone().unwrap_or_else(|| "tmux".into())
+}
+
+/// The tmux command line for attaching to (or creating) a session.
+pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>) -> (String, Vec<String>) {
     let mut args = profile.tmux_args.clone();
-    args.extend(["-C".into(), "new-session".into(), "-A".into(), "-s".into()]);
-    args.push(profile.tmux_session_name().to_string());
+    args.extend(["-C".into(), "new-session".into()]);
+    match spec {
+        AttachSpec::Named => {
+            args.extend(["-A".into(), "-s".into(), profile.tmux_session_name().to_string()]);
+        }
+        AttachSpec::New(Some(name)) => args.extend(["-s".into(), name.clone()]),
+        AttachSpec::New(None) => {}
+    }
     if let Some(dir) = cwd {
         args.push("-c".into());
         args.push(dir.to_string_lossy().into_owned());
     }
-    (program, args)
+    (tmux_program(profile), args)
+}
+
+/// The command that succeeds when session `name` exists on `profile`'s
+/// server (an exact match, not a prefix).
+pub fn has_session_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
+    let mut args = profile.tmux_args.clone();
+    args.extend(["has-session".into(), "-t".into(), format!("={name}")]);
+    (tmux_program(profile), args)
+}
+
+/// Identifies a tmux session: the server (the program and its arguments,
+/// which pick the socket) and the session's name. Profiles that share all
+/// three show the same session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    program: String,
+    tmux_args: Vec<String>,
+    name: String,
+}
+
+impl SessionKey {
+    /// The session `profile` attaches to, if it is a control-mode profile.
+    pub fn for_profile(profile: &Profile) -> Option<Self> {
+        (profile.tmux == TmuxMode::Control).then(|| Self::new(profile, profile.tmux_session_name()))
+    }
+
+    /// Session `name` on `profile`'s server.
+    pub fn new(profile: &Profile, name: &str) -> Self {
+        Self { program: tmux_program(profile), tmux_args: profile.tmux_args.clone(), name: name.to_string() }
+    }
+}
+
+/// The session's name as a notification reports it: the session the
+/// client is attached to (`%session-changed`), or its new name.
+fn session_name_update(notification: &Notification) -> Option<String> {
+    match notification {
+        Notification::SessionChanged { name } | Notification::SessionRenamed { name } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The reason given when tmux refuses to attach: the error it printed.
+fn attach_error(body: &[Vec<u8>]) -> Option<String> {
+    let text = body.iter().map(|l| String::from_utf8_lossy(l).trim().to_string()).collect::<Vec<_>>().join("; ");
+    (!text.is_empty()).then_some(text)
 }
 
 impl TmuxSession {
-    pub fn attach(profile: Profile, cwd: Option<PathBuf>, config: &Config, cx: &mut Context<Self>) -> Self {
-        let session_name = profile.tmux_session_name().to_string();
-        let (program, args) = command_line(&profile, cwd.as_ref().filter(|d| d.is_dir()));
+    pub fn attach(
+        profile: Profile,
+        spec: AttachSpec,
+        cwd: Option<PathBuf>,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let session_name = match &spec {
+            AttachSpec::Named => Some(profile.tmux_session_name().to_string()),
+            // tmux may change the name (`.` and `:`); `%session-changed` says.
+            AttachSpec::New(_) => None,
+        };
+        let (program, args) = command_line(&profile, &spec, cwd.as_ref().filter(|d| d.is_dir()));
         let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<Option<Event>>();
         let (writer_tx, writer_rx) = std::sync::mpsc::channel::<WriterMessage>();
 
@@ -376,6 +455,7 @@ impl TmuxSession {
             child,
             user_commands: 0,
             attached: false,
+            attach_error: None,
             detached: false,
             subscribed: false,
             released: false,
@@ -566,6 +646,13 @@ impl TmuxSession {
         self.detached
     }
 
+    /// The session this client shows, while it is attached (or attaching)
+    /// and its name is known.
+    pub fn key(&self) -> Option<SessionKey> {
+        let name = self.session_name.as_deref().filter(|_| !self.detached)?;
+        Some(SessionKey::new(&self.profile, name))
+    }
+
     pub fn detach(&mut self) {
         self.release();
     }
@@ -624,6 +711,9 @@ impl TmuxSession {
 
     fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
+            Event::Response { ours: false, ok: false, body } if !self.attached => {
+                self.attach_error = attach_error(&body);
+            }
             Event::Response { ours: false, .. } => {}
             Event::Response { ours: true, ok, body } => {
                 let pending = match_reply(&mut self.io.borrow_mut().pending, ok, &body);
@@ -686,7 +776,12 @@ impl TmuxSession {
                     self.list_windows();
                 }
             }
-            Notification::WindowAdd(_) | Notification::SessionChanged { .. } => self.list_windows(),
+            Notification::WindowAdd(_) => self.list_windows(),
+            Notification::SessionChanged { .. } => {
+                self.session_name = session_name_update(&notification).or(self.session_name.take());
+                self.list_windows();
+                cx.notify();
+            }
             Notification::WindowClose(window) => {
                 if self.windows.remove(&window).is_some() {
                     self.sync_panes(cx);
@@ -717,8 +812,8 @@ impl TmuxSession {
                     cx.emit(TmuxEvent::WindowActivated(window));
                 }
             }
-            Notification::SessionRenamed { name } => {
-                self.session_name = name;
+            Notification::SessionRenamed { .. } => {
+                self.session_name = session_name_update(&notification).or(self.session_name.take());
                 cx.notify();
             }
             Notification::SubscriptionChanged { name, window, pane, value } => match (name.as_str(), window, pane) {
@@ -987,7 +1082,11 @@ impl TmuxSession {
         if self.quitting {
             return;
         }
-        cx.emit(if self.attached { TmuxEvent::Detached(reason) } else { TmuxEvent::Failed(reason) });
+        cx.emit(if self.attached {
+            TmuxEvent::Detached(reason)
+        } else {
+            TmuxEvent::Failed(self.attach_error.take().unwrap_or(reason))
+        });
     }
 
     /// Picks up a reloaded config for panes created from now on, and reports
@@ -1218,9 +1317,66 @@ mod tests {
             tmux_args: vec!["-L".into(), "x".into()],
             ..Default::default()
         };
-        let (program, args) = command_line(&profile, Some(&PathBuf::from("/tmp")));
+        let (program, args) = command_line(&profile, &AttachSpec::Named, Some(&PathBuf::from("/tmp")));
         assert_eq!(program, "tmux");
         assert_eq!(args, ["-L", "x", "-C", "new-session", "-A", "-s", "work", "-c", "/tmp"]);
+    }
+
+    #[test]
+    fn command_line_for_new_sessions() {
+        let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
+        let named = AttachSpec::New(Some("logs".into()));
+        assert_eq!(command_line(&profile, &named, None).1, ["-L", "x", "-C", "new-session", "-s", "logs"]);
+        let (_, args) = command_line(&profile, &AttachSpec::New(None), Some(&PathBuf::from("/tmp")));
+        assert_eq!(args, ["-L", "x", "-C", "new-session", "-c", "/tmp"]);
+    }
+
+    #[test]
+    fn has_session_matches_exactly() {
+        let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
+        assert_eq!(has_session_command(&profile, "work"), ("tmux".into(), vec!["-L".into(), "x".into(), "has-session".into(), "-t".into(), "=work".into()]));
+    }
+
+    #[test]
+    fn session_keys_name_the_server_and_session() {
+        let control = |name: &str, args: &[&str], session: &str| Profile {
+            name: name.into(),
+            tmux: TmuxMode::Control,
+            tmux_session: Some(session.into()),
+            tmux_args: args.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        };
+        let a = SessionKey::for_profile(&control("a", &["-L", "x"], "main"));
+        assert!(a.is_some());
+        assert_eq!(a, SessionKey::for_profile(&control("b", &["-L", "x"], "main")));
+        assert_ne!(a, SessionKey::for_profile(&control("a", &["-L", "y"], "main")));
+        assert_ne!(a, SessionKey::for_profile(&control("a", &["-L", "x"], "work")));
+        assert_eq!(SessionKey::for_profile(&Profile { name: "shell".into(), ..Default::default() }), None);
+    }
+
+    #[test]
+    fn session_name_follows_tmux() {
+        // tmux 3.6, `tmux -C new-session` with no name.
+        let changed = protocol::parse_line(b"%session-changed $1 1");
+        assert_eq!(session_name_update(&changed).as_deref(), Some("1"));
+        let renamed = Notification::SessionRenamed { name: "work".into() };
+        assert_eq!(session_name_update(&renamed).as_deref(), Some("work"));
+        assert_eq!(session_name_update(&Notification::WindowAdd(3)), None);
+    }
+
+    #[test]
+    fn refused_attach_reports_tmux_error() {
+        // tmux 3.6, `tmux -C new-session -s work` while `work` exists.
+        let mut collector = Collector::default();
+        let mut events = Vec::new();
+        for line in ["%begin 1791985003 277 0", "duplicate session: work", "%error 1791985003 277 0", "%exit"] {
+            events.extend(collector.feed_line(line.as_bytes()));
+        }
+        let Some(Event::Response { ours: false, ok: false, body }) = events.first() else {
+            panic!("expected an unflagged error response: {events:?}");
+        };
+        assert_eq!(attach_error(body).as_deref(), Some("duplicate session: work"));
+        assert_eq!(attach_error(&[]), None);
     }
 
     #[test]
