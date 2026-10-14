@@ -2,16 +2,20 @@
 
 ## Why
 
-Programs in control-mode tmux panes get no reply when they query a palette color with OSC 4 (`ESC ] 4 ; <n> ; ? BEL`). This was seen while testing `report-pane-colors-to-tmux`. tmux answers OSC 4 from the pane's palette and the outer terminal's colors, and a control client has neither. Programs that adapt their colors to the terminal's palette time out waiting and fall back to guesses. In a local Brindle tab, they get the theme's colors.
+Programs in control-mode tmux panes get no reply when they query a palette color with OSC 4 (`ESC ] 4 ; <n> ; ? BEL`). This was seen while testing `report-pane-colors-to-tmux`. tmux 3.6 answers OSC 4 from the pane's palette, or else by asking an attached terminal client's terminal. A control client has no palette and no terminal to ask. Programs that adapt their colors to the terminal's palette time out waiting and fall back to guesses. In a local Brindle tab, they get the theme's colors.
 
 ## What Changes
 
-To be decided in design. The options found so far:
-- **Report the palette to tmux.** `refresh-client -r` is documented for OSC 10-style reports. Check whether tmux 3.6, or newer, accepts OSC 4 reports from a control client.
-- **Set the pane palette.** tmux's `pane-colours` option holds a palette that OSC 4 queries are answered from. Setting it per pane to the theme's palette would answer queries. But it is visible state on the user's server, so other terminal clients would render with Brindle's palette, and it would have to be removed on detach.
-- **Ask upstream.** Propose that tmux forward unanswered queries to control clients, or accept OSC 4 reports.
+- Brindle answers OSC 4 queries in tmux panes itself, with the theme's palette, by sending the reply into the pane as input (`send-keys -H`). The query reaches control clients in `%output`, even when tmux answers it.
+- Brindle stays silent when tmux will answer, so a program never gets two replies:
+  - the pane's palette has the index (a program set it with OSC 4, or the `pane-colours` option sets it);
+  - a terminal client is attached to the pane's session, since tmux forwards the query to its terminal and relays the answer.
+- OSC 10/11 queries are unchanged: tmux keeps answering them from Brindle's color reports.
 
-If none is acceptable, record the limitation in the `tmux-control-mode` spec and in `CLAUDE.md` instead.
+Options considered and rejected (see design.md):
+- **Report the palette to tmux.** tmux 3.6 ignores OSC 4 reports sent with `refresh-client -r`; it reads only OSC 10/11 from them.
+- **Set the pane palette.** tmux answers OSC 4 from `pane-colours`, but it is state other clients see and render with, and it would have to be removed on detach.
+- **Ask upstream.** Not needed for the answer itself. It remains an option if tmux ever lets a control client answer queries.
 
 ## Capabilities
 
@@ -21,10 +25,10 @@ None.
 
 ### Modified Capabilities
 
-- `tmux-control-mode`: depending on the outcome, either a requirement that programs in panes get the theme's palette colors from OSC 4 queries, or a documented limitation.
+- `tmux-control-mode`: programs in panes get the theme's palette colors from OSC 4 queries, with one reply.
 
 ## Impact
 
-- **Code:** `src/tmux/mod.rs`, next to the color reports, if Brindle can supply the palette.
-- **Tests:** an end-to-end color-query case for OSC 4, like the OSC 10/11 ones.
-- **Risk:** the `pane-colours` option changes state other clients see; design must weigh that against the benefit.
+- **Code:** `src/terminal/mod.rs` (color requests in remote terminals go to a pane-supplied handler instead of being dropped), and `src/tmux/mod.rs` (the checks with tmux and the reply through `send-keys -H`).
+- **Tests:** unit tests for the checks; end-to-end cases for the reply, for the cases where tmux answers, and a headless case pinning the tmux behaviour this relies on.
+- **Risk:** a duplicate reply in the cases Brindle can't see. Those are listed in design.md.

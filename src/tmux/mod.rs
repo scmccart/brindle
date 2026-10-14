@@ -20,7 +20,7 @@ use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
 use crate::config::{Config, Profile, TmuxMode};
-use crate::terminal::{DefaultColors, GridSize, Terminal};
+use crate::terminal::{DefaultColors, GridSize, PaletteHandler, Terminal};
 use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
@@ -61,6 +61,11 @@ enum Pending {
     /// commands each reply with their own block, so every block up to the
     /// token's belongs to it.
     UserCommand { token: String, first_error: Option<String>, reply: oneshot::Sender<Result<(), String>> },
+    /// The session's clients, asked before answering a palette query in
+    /// `pane` (see `palette_handler`).
+    PaletteClients { pane: PaneId, index: usize, reply: Vec<u8> },
+    /// `#{pane-colours[index]}` for the same query.
+    PaletteOption { pane: PaneId, reply: Vec<u8> },
 }
 
 /// What the writer thread is asked to do.
@@ -887,6 +892,19 @@ impl TmuxSession {
                     }
                     // Fails quietly when the session ends with a poll in flight.
                     Some(Pending::Poll) => self.on_poll(ok, &body, cx),
+                    Some(Pending::PaletteClients { pane, index, reply }) => {
+                        if ok && palette_clients_allow(&body) {
+                            self.io.borrow_mut().send(pane_colour_command(pane, index), Pending::PaletteOption { pane, reply });
+                        }
+                    }
+                    Some(Pending::PaletteOption { pane, reply }) => {
+                        if ok && body.iter().all(|l| l.is_empty()) {
+                            let mut io = self.io.borrow_mut();
+                            for command in protocol::send_keys_commands(pane, &reply) {
+                                io.send(command, Pending::Ignore);
+                            }
+                        }
+                    }
                     Some(Pending::ListWindows) | Some(Pending::Ignore) | None => {
                         if !ok {
                             log::warn!("tmux command failed: {}", join_body(&body));
@@ -1173,10 +1191,11 @@ impl TmuxSession {
                     io.send(command, Pending::Ignore);
                 }
             });
+            let palette = palette_handler(id, self.io.clone());
             let theme = self.config.profile_theme(&self.profile);
             let reports = color_report_commands(id, theme.foreground, theme.background);
             let config = &self.config;
-            let terminal = cx.new(|cx| Terminal::remote(size, theme, config, input, cx));
+            let terminal = cx.new(|cx| Terminal::remote(size, theme, config, input, Some(palette), cx));
             self.panes.insert(id, Pane { terminal, restoring: None });
 
             let mut io = self.io.borrow_mut();
@@ -1401,6 +1420,32 @@ fn color_report_commands(pane: PaneId, foreground: Color, background: Color) -> 
     [report(10, foreground), report(11, background)]
 }
 
+/// Answers a pane's palette queries (OSC 4), which tmux leaves unanswered
+/// for control clients. tmux answers itself when a terminal client is
+/// attached to the session (it asks that client's terminal) or when
+/// `pane-colours` sets the index, so both are checked first; the reply goes
+/// in only if neither holds.
+fn palette_handler(pane: PaneId, io: Rc<RefCell<Io>>) -> PaletteHandler {
+    Rc::new(move |index, reply| {
+        io.borrow_mut().send(
+            format!("list-clients -t %{pane} -F {}", protocol::quote("#{client_control_mode}")),
+            Pending::PaletteClients { pane, index, reply },
+        );
+    })
+}
+
+/// Whether a `list-clients -F '#{client_control_mode}'` reply leaves a
+/// palette query to us: no terminal client (`0`) is attached.
+fn palette_clients_allow(lines: &[Vec<u8>]) -> bool {
+    lines.iter().all(|l| l.as_slice() != b"0")
+}
+
+/// The command printing the `pane-colours` entry for `index` in `pane`,
+/// inherited values included; empty when unset.
+fn pane_colour_command(pane: PaneId, index: usize) -> String {
+    format!("display-message -p -t %{pane} {}", protocol::quote(&format!("#{{pane-colours[{index}]}}")))
+}
+
 fn join_lines(lines: &[Vec<u8>], out: &mut Vec<u8>) {
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
@@ -1605,6 +1650,20 @@ mod tests {
         let [fg, bg] = color_report_commands(0, Color::hex(0x00ff7f), Color::hex(0x1a1b26));
         assert_eq!(fg, r#"refresh-client -r "%0:\033]10;rgb:0000/ffff/7f7f\033\\""#);
         assert_eq!(bg, r#"refresh-client -r "%0:\033]11;rgb:1a1a/1b1b/2626\033\\""#);
+    }
+
+    #[test]
+    fn palette_queries_are_ours_only_without_terminal_clients() {
+        let lines = |ls: &[&str]| ls.iter().map(|l| l.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert!(palette_clients_allow(&lines(&["1"])));
+        assert!(palette_clients_allow(&lines(&["1", "1"])));
+        assert!(!palette_clients_allow(&lines(&["1", "0"])));
+        assert!(palette_clients_allow(&lines(&[])));
+    }
+
+    #[test]
+    fn pane_colour_command_asks_for_one_index() {
+        assert_eq!(pane_colour_command(3, 196), r##"display-message -p -t %3 "#{pane-colours[196]}""##);
     }
 
     #[test]
