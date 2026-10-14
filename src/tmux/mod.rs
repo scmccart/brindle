@@ -49,7 +49,11 @@ pub enum Direction {
 #[derive(Debug)]
 enum Pending {
     Ignore,
+    /// `#{version}`, asked before the first window list.
+    Version,
     ListWindows,
+    /// A `poll_command` reply.
+    Poll,
     PaneState(PaneId),
     CaptureAlternate(PaneId),
     Capture(PaneId),
@@ -174,14 +178,28 @@ const BORDER_STYLE_SUBSCRIPTION: &str = "brindle-border-style";
 const BORDER_STYLE_FORMAT: &str =
     "#{pane-border-style}|#{T:pane-border-style}|#{pane-active-border-style}|#{T:pane-active-border-style}";
 
-/// Every subscription Brindle registers: name, scope and format.
+/// Every subscription Brindle registers: name, scope and format. The poll
+/// (`poll_command`) asks for the same formats in this order, so the title,
+/// which is free text, comes last.
 const SUBSCRIPTIONS: [(&str, &str, &str); 5] = [
     (GEOMETRY_SUBSCRIPTION, "%*", GEOMETRY_FORMAT),
-    (TITLE_SUBSCRIPTION, "%*", TITLE_FORMAT),
     (BORDER_STATUS_SUBSCRIPTION, "@*", BORDER_STATUS_FORMAT),
     (PANE_STYLE_SUBSCRIPTION, "%*", PANE_STYLE_FORMAT),
     (BORDER_STYLE_SUBSCRIPTION, "@*", BORDER_STYLE_FORMAT),
+    (TITLE_SUBSCRIPTION, "%*", TITLE_FORMAT),
 ];
+
+/// Asks for every subscription's value at once, one line per pane of the
+/// session, for tmux whose subscriptions aren't safe (`subscriptions_safe`).
+/// In list-panes, window formats refer to the pane's window.
+fn poll_command() -> String {
+    let mut format = String::from("#{window_id}\t#{pane_id}\t#{pane_active}");
+    for (_, _, field) in SUBSCRIPTIONS {
+        format.push('\t');
+        format.push_str(field);
+    }
+    format!("list-panes -s -F {}", protocol::quote(&format))
+}
 
 fn subscribe_commands() -> Vec<String> {
     SUBSCRIPTIONS
@@ -196,6 +214,101 @@ fn subscribe_commands() -> Vec<String> {
 /// these are sent before Brindle detaches, quits or ends the session.
 fn unsubscribe_commands() -> Vec<String> {
     SUBSCRIPTIONS.iter().map(|(name, _, _)| format!("refresh-client -B {}", protocol::quote(name))).collect()
+}
+
+/// Whether tmux `version` (`#{version}`) has the subscription timer fix:
+/// 3.7 returns from the timer when the client has lost its session. Builds
+/// from git (`next-3.8`) come just before the release they name; anything
+/// else, such as OpenBSD's `openbsd-7.6`, is assumed to lack the fix.
+fn subscriptions_safe(version: &str) -> bool {
+    let (release, next) = match version.trim().strip_prefix("next-") {
+        Some(release) => (release, true),
+        None => (version.trim(), false),
+    };
+    let Some((major, minor)) = release.split_once('.') else { return false };
+    let minor = minor.trim_end_matches(|c: char| c.is_ascii_lowercase());
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else { return false };
+    if next { (major, minor) > (3, 7) } else { (major, minor) >= (3, 7) }
+}
+
+/// How Brindle follows pane geometry, titles and styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateSource {
+    /// tmux reports changes through format subscriptions.
+    Subscribe,
+    /// Brindle asks with `list-panes` every second (see `subscriptions_safe`).
+    Poll,
+}
+
+impl StateSource {
+    /// The source for tmux `version` (`None` if tmux didn't say), unless
+    /// `BRINDLE_TMUX_STATE` (`poll` or `subscribe`) picks one.
+    fn choose(version: Option<&str>) -> StateSource {
+        match std::env::var("BRINDLE_TMUX_STATE").as_deref() {
+            Ok("poll") => StateSource::Poll,
+            Ok("subscribe") => StateSource::Subscribe,
+            _ if version.is_some_and(subscriptions_safe) => StateSource::Subscribe,
+            _ => StateSource::Poll,
+        }
+    }
+}
+
+/// What a polled value belongs to: window-scoped subscriptions (`@*`) are
+/// per window, the others per pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PollTarget {
+    Window(WindowId),
+    Pane(PaneId),
+}
+
+/// Turns `poll_command` replies into the changes tmux's subscriptions would
+/// have reported: only values that differ from the last one seen.
+#[derive(Default)]
+struct PollState {
+    seen: HashMap<(&'static str, PollTarget), String>,
+}
+
+impl PollState {
+    /// The changed values in a reply, as subscription notifications. Values
+    /// for targets that aren't `known` yet are left unrecorded, so they are
+    /// reported again by the next poll rather than lost.
+    fn changes(&mut self, body: &[Vec<u8>], known: impl Fn(PollTarget) -> bool) -> Vec<Notification> {
+        let mut changes = Vec::new();
+        for line in body {
+            let line = String::from_utf8_lossy(line);
+            let fields: Vec<&str> = line.splitn(3 + SUBSCRIPTIONS.len(), '\t').collect();
+            let [window, pane, active, values @ ..] = &fields[..] else { continue };
+            let (Some(window), Some(pane)) = (protocol::id(window, '@'), protocol::id(pane, '%')) else { continue };
+            if values.len() != SUBSCRIPTIONS.len() {
+                continue;
+            }
+            for ((name, scope, _), value) in SUBSCRIPTIONS.iter().zip(values) {
+                // Like tmux's `@*` subscriptions, window values are the
+                // window's active pane's.
+                let (target, notification_pane) = match *scope {
+                    "@*" if *active != "1" => continue,
+                    "@*" => (PollTarget::Window(window), None),
+                    _ => (PollTarget::Pane(pane), Some(pane)),
+                };
+                if !known(target) || self.seen.get(&(*name, target)).is_some_and(|seen| seen == value) {
+                    continue;
+                }
+                self.seen.insert((name, target), value.to_string());
+                changes.push(Notification::SubscriptionChanged {
+                    name: name.to_string(),
+                    window: Some(window),
+                    pane: notification_pane,
+                    value: value.to_string(),
+                });
+            }
+        }
+        changes
+    }
+
+    /// Forgets windows and panes that are gone.
+    fn retain(&mut self, live: impl Fn(PollTarget) -> bool) {
+        self.seen.retain(|(_, target), _| live(*target));
+    }
 }
 
 /// Snapshot pieces collected while restoring a pane's existing contents.
@@ -247,8 +360,19 @@ pub struct TmuxSession {
     /// What tmux printed when it refused to attach (`duplicate session`).
     attach_error: Option<String>,
     detached: bool,
+    /// How pane geometry, titles and styles are followed; chosen from
+    /// tmux's version, which arrives before the first window list.
+    state_source: Option<StateSource>,
     /// Subscriptions are registered (see `unsubscribe_commands`).
     subscribed: bool,
+    /// The values the last polls returned (`StateSource::Poll`).
+    poll_state: PollState,
+    /// A poll is waiting for its reply; at most one is in flight.
+    polling: bool,
+    /// Another poll was asked for meanwhile, so send one when it's answered.
+    poll_again: bool,
+    /// Polls every second while attached on `StateSource::Poll`.
+    poll_timer: Option<Task<()>>,
     /// `release` has run: the session is being left.
     released: bool,
     /// Brindle is quitting: leaving the session must not change the window,
@@ -457,7 +581,12 @@ impl TmuxSession {
             attached: false,
             attach_error: None,
             detached: false,
+            state_source: None,
             subscribed: false,
+            poll_state: PollState::default(),
+            polling: false,
+            poll_again: false,
+            poll_timer: None,
             released: false,
             quitting: false,
             _reader: reader,
@@ -484,6 +613,7 @@ impl TmuxSession {
             })
             .detach();
         } else {
+            this.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
             this.list_windows();
         }
         this
@@ -663,6 +793,7 @@ impl TmuxSession {
             return;
         }
         self.released = true;
+        self.stop_polling();
         self.unsubscribe();
         self.send("detach-client");
     }
@@ -718,6 +849,12 @@ impl TmuxSession {
             Event::Response { ours: true, ok, body } => {
                 let pending = match_reply(&mut self.io.borrow_mut().pending, ok, &body);
                 match pending {
+                    Some(Pending::Version) => {
+                        let version = body.first().filter(|_| ok).map(|l| String::from_utf8_lossy(l).into_owned());
+                        let source = StateSource::choose(version.as_deref());
+                        log::debug!("tmux version {version:?}: following pane state by {source:?}");
+                        self.state_source = Some(source);
+                    }
                     Some(Pending::ListWindows) if ok => self.on_window_list(body, cx),
                     Some(Pending::PaneState(pane)) => {
                         let state: Vec<u32> = body
@@ -745,7 +882,11 @@ impl TmuxSession {
                     Some(Pending::Capture(pane)) => self.finish_restore(pane, if ok { body } else { Vec::new() }, cx),
                     Some(Pending::UserCommand { first_error, reply, .. }) => {
                         reply.send(first_error.map_or(Ok(()), Err)).ok();
+                        // The command may have set an option the poll follows.
+                        self.poll();
                     }
+                    // Fails quietly when the session ends with a poll in flight.
+                    Some(Pending::Poll) => self.on_poll(ok, &body, cx),
                     Some(Pending::ListWindows) | Some(Pending::Ignore) | None => {
                         if !ok {
                             log::warn!("tmux command failed: {}", join_body(&body));
@@ -863,7 +1004,9 @@ impl TmuxSession {
     }
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
-        if !self.attached && !self.released {
+        let source = *self.state_source.get_or_insert_with(|| StateSource::choose(None));
+        let first = !self.attached && !self.released;
+        if first && source == StateSource::Subscribe {
             for command in subscribe_commands() {
                 self.send(command);
             }
@@ -925,7 +1068,62 @@ impl TmuxSession {
         if let Some(active) = activated {
             cx.emit(TmuxEvent::WindowActivated(active));
         }
+        if first && source == StateSource::Poll {
+            self.start_polling(cx);
+        }
         cx.notify();
+    }
+
+    /// Polls now (the panes have just been created) and then every second.
+    fn start_polling(&mut self, cx: &mut Context<Self>) {
+        self.poll();
+        self.poll_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if this.update(cx, |this, _| this.poll()).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Asks tmux for the values subscriptions would report, when following
+    /// pane state by polling.
+    fn poll(&mut self) {
+        if self.state_source != Some(StateSource::Poll) || !self.attached || self.released || self.detached {
+            return;
+        }
+        if std::mem::replace(&mut self.polling, true) {
+            self.poll_again = true;
+            return;
+        }
+        self.io.borrow_mut().send(poll_command(), Pending::Poll);
+    }
+
+    /// Handles a poll's changed values as subscription changes.
+    fn on_poll(&mut self, ok: bool, body: &[Vec<u8>], cx: &mut Context<Self>) {
+        self.polling = false;
+        let again = std::mem::take(&mut self.poll_again);
+        if ok && !self.released && !self.detached {
+            let (windows, panes) = (&self.windows, &self.panes);
+            let changes = self.poll_state.changes(body, |target| match target {
+                PollTarget::Window(window) => windows.contains_key(&window),
+                PollTarget::Pane(pane) => panes.contains_key(&pane),
+            });
+            for change in changes {
+                self.on_notification(change, cx);
+            }
+        }
+        if again {
+            self.poll();
+        }
+    }
+
+    /// Stops polling: the session is being left or has gone.
+    fn stop_polling(&mut self) {
+        self.poll_timer = None;
+        self.polling = false;
+        self.poll_again = false;
     }
 
     /// Creates terminals for new panes, resizes existing ones to the
@@ -945,6 +1143,11 @@ impl TmuxSession {
         self.titles.retain(|id, _| live.contains_key(id));
         self.pane_styles.retain(|id, _| live.contains_key(id));
         self.stale.retain(|id| live.contains_key(id));
+        let windows = &self.windows;
+        self.poll_state.retain(|target| match target {
+            PollTarget::Window(window) => windows.contains_key(&window),
+            PollTarget::Pane(pane) => live.contains_key(&pane),
+        });
 
         for (&id, &cell) in &live {
             // A report that fits the new cell is current; otherwise the
@@ -1073,6 +1276,7 @@ impl TmuxSession {
             return;
         }
         self.detached = true;
+        self.stop_polling();
         // Nothing more will be answered; dropping waiting user commands
         // closes their prompts.
         self.io.borrow_mut().pending.clear();
@@ -1280,6 +1484,100 @@ mod tests {
             assert!(on.starts_with(&format!("refresh-client -B \"{name}:")), "{on} vs {off}");
         }
         assert_eq!(subscribe[0], r#"refresh-client -B "brindle-geometry:%*:#{pane_left} #{pane_top} #{pane_width} #{pane_height}""#);
+    }
+
+    #[test]
+    fn poll_asks_for_every_subscription() {
+        let command = poll_command();
+        let format = command.strip_prefix("list-panes -s -F \"").and_then(|f| f.strip_suffix('"')).unwrap();
+        let fields: Vec<&str> = format.split('\t').collect();
+        assert_eq!(fields[..3], ["#{window_id}", "#{pane_id}", "#{pane_active}"]);
+        let formats: Vec<&str> = SUBSCRIPTIONS.iter().map(|(_, _, f)| *f).collect();
+        assert_eq!(fields[3..], formats[..]);
+        assert_eq!(fields.last(), Some(&TITLE_FORMAT), "the free-text title is last");
+    }
+
+    /// A `poll_command` reply line.
+    fn poll_line(window: u32, pane: u32, active: bool, height: u16, status: &str, title: &str) -> Vec<u8> {
+        let active = if active { "1" } else { "0" };
+        format!("@{window}\t%{pane}\t{active}\t0 1 80 {height}\t{status}\tdefault|default\tsingle|single|single|single\t{title}")
+            .into_bytes()
+    }
+
+    fn changed(notifications: &[Notification]) -> Vec<(String, Option<u32>, Option<u32>, String)> {
+        notifications
+            .iter()
+            .map(|n| match n {
+                Notification::SubscriptionChanged { name, window, pane, value } => {
+                    (name.clone(), *window, *pane, value.clone())
+                }
+                other => panic!("not a subscription change: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn polls_report_only_changes() {
+        let mut state = PollState::default();
+        let all = |_| true;
+        let reply = vec![poll_line(0, 0, false, 11, "top", "zero"), poll_line(0, 1, true, 11, "top", "one")];
+
+        // The first poll reports everything: four pane values per pane and
+        // the window's two, once (from its active pane).
+        let first = changed(&state.changes(&reply, all));
+        assert_eq!(first.len(), 2 * 3 + 2, "{first:?}");
+        let status: Vec<_> = first.iter().filter(|c| c.0 == BORDER_STATUS_SUBSCRIPTION).collect();
+        assert_eq!(status, [&(BORDER_STATUS_SUBSCRIPTION.to_string(), Some(0), None, "top".to_string())]);
+        assert!(first.contains(&(TITLE_SUBSCRIPTION.into(), Some(0), Some(1), "one".into())));
+        assert!(first.contains(&(GEOMETRY_SUBSCRIPTION.into(), Some(0), Some(0), "0 1 80 11".into())));
+
+        // The same reply again reports nothing.
+        assert!(state.changes(&reply, all).is_empty());
+
+        // One title changes.
+        let renamed = vec![poll_line(0, 0, false, 11, "top", "zero"), poll_line(0, 1, true, 11, "top", "uno")];
+        assert_eq!(changed(&state.changes(&renamed, all)), [(TITLE_SUBSCRIPTION.into(), Some(0), Some(1), "uno".into())]);
+
+        // A window value changes, along with the geometry it causes.
+        let off = vec![poll_line(0, 0, false, 12, "off", "zero"), poll_line(0, 1, true, 12, "off", "uno")];
+        let changes = changed(&state.changes(&off, all));
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        assert!(changes.contains(&(BORDER_STATUS_SUBSCRIPTION.into(), Some(0), None, "off".into())));
+    }
+
+    #[test]
+    fn polled_titles_keep_tabs() {
+        let mut state = PollState::default();
+        let changes = changed(&state.changes(&[poll_line(2, 5, true, 10, "top", "a\tb")], |_| true));
+        assert!(changes.contains(&(TITLE_SUBSCRIPTION.into(), Some(2), Some(5), "a\tb".into())), "{changes:?}");
+        // Lines that aren't poll lines are skipped.
+        assert!(state.changes(&[b"garbage".to_vec(), b"@1\t%1\t1\tshort".to_vec()], |_| true).is_empty());
+    }
+
+    #[test]
+    fn unknown_panes_are_reported_again() {
+        let mut state = PollState::default();
+        let reply = vec![poll_line(0, 7, true, 11, "top", "new")];
+        let window_only = |t| matches!(t, PollTarget::Window(_));
+        assert_eq!(state.changes(&reply, window_only).len(), 2, "only the window's values");
+        // Once the pane is known, its values arrive, and the window's don't repeat.
+        let changes = changed(&state.changes(&reply, |_| true));
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        assert!(changes.iter().all(|c| c.2 == Some(7)));
+
+        // A pane that went away is forgotten, so it would be reported afresh.
+        state.retain(|t| t != PollTarget::Pane(7));
+        assert_eq!(state.changes(&reply, |_| true).len(), 3);
+    }
+
+    #[test]
+    fn subscriptions_need_tmux_3_7() {
+        for version in ["3.7", "3.7c", "3.8", "4.0", "next-3.8", "next-3.9", " 3.7\n"] {
+            assert!(subscriptions_safe(version), "{version}");
+        }
+        for version in ["3.6", "3.6a", "3.6b", "3.2", "next-3.7", "openbsd-7.6", "", "3", "x.y"] {
+            assert!(!subscriptions_safe(version), "{version}");
+        }
     }
 
     #[test]
