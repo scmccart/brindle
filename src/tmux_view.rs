@@ -95,7 +95,7 @@ impl TmuxWindowView {
         session
             .window(self.window_id)
             .map(|w| w.name.clone())
-            .unwrap_or_else(|| session.session_name.clone())
+            .unwrap_or_else(|| session.session_name.clone().unwrap_or_default())
     }
 
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {

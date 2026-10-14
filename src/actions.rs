@@ -66,6 +66,7 @@ actions!(
         TmuxBreakPane,
         TmuxRenameWindow,
         TmuxCommand,
+        TmuxNewSession,
         Quit,
         /// Consumes a key without doing anything (see the ctrl-shift-d guard).
         Swallow,
@@ -190,6 +191,7 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("tmux_break_pane", Some("tmux: Break Pane to New Tab"), || Box::new(TmuxBreakPane)),
     ("tmux_rename_window", Some("tmux: Rename Window"), || Box::new(TmuxRenameWindow)),
     ("tmux_command", Some("tmux: Run Command"), || Box::new(TmuxCommand)),
+    ("tmux_new_session", Some("tmux: New Session"), || Box::new(TmuxNewSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
     // The settings dialog's own actions: unlabelled, so they stay out of the
     // command palette, but `--action` and user bindings can reach them.
