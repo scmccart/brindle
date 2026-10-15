@@ -52,6 +52,16 @@ BRINDLE_E2E=1 cargo test --test e2e -- --self-test   # the harness's own parser 
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
 
+### Manual checks
+
+The suite never sends real keys, so these stay manual. Hand them to the user:
+- ctrl-shift-d in a local tab does nothing and sends no `^D` (the `Swallow` binding; `commands-detach-beside-local` only checks the action);
+- IME composition: with IBus, ctrl-shift-u `e9` space gives `é`, in a terminal and in a palette;
+- wheel scrolling in local tabs and tmux panes;
+- classic (`plain`) tmux profiles with the prefix keys;
+- dragging tabs to reorder them;
+- the palette shortcuts toggling (ctrl-shift-p, ctrl-shift-space and the `⌄` button).
+
 ### Performance suite
 
 `tests/perf/` is a separate opt-in target that reports numbers rather than pass/fail, so it isn't part of e2e:
