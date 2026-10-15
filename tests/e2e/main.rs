@@ -136,6 +136,7 @@ fn self_test() -> i32 {
         ("dump parsing", brindle::self_test_dump),
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),
+        ("divider junctions", capture::self_test_junction),
     ];
     let mut failed = 0;
     for (name, test) in tests {

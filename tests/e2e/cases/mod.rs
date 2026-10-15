@@ -1,12 +1,18 @@
 //! The cases. Each is one function; `all` lists them in run order.
 
 mod colors;
+mod commands;
+mod dividers;
 mod dump;
 mod geometry;
 mod input;
 mod links;
 mod restore;
 mod notify;
+mod palette;
+mod reattach;
+mod reload;
+mod selection;
 mod search;
 mod session_end;
 mod settings;
@@ -104,6 +110,21 @@ pub fn all() -> Vec<Case> {
         display("search-input-selection", search::input_selection),
         display("search-close-restores", search::close_restores),
         display("search-tmux-pane", search::tmux_pane),
+        display("reattach-alt-screen", reattach::alt_screen),
+        display("reattach-mouse-modes", reattach::mouse_modes),
+        display("selection-current-window", selection::current_window),
+        display("selection-active-pane", selection::active_pane),
+        display("selection-split-active-pane", selection::split_active_pane),
+        display("selection-background-window", selection::background_window),
+        display("palette-tmux-action", palette::tmux_action),
+        display("palette-lists-for-tab", palette::lists_for_tab),
+        display("commands-break-pane", commands::break_pane),
+        display("commands-layouts", commands::layouts),
+        display("commands-rotate-swap", commands::rotate_swap),
+        display("commands-detach-beside-local", commands::detach_beside_local),
+        display("dividers-tiled", dividers::tiled),
+        display("dividers-t-junction", dividers::t_junction),
+        display("reload-theme-attached", reload::theme_attached),
     ]
 }
 

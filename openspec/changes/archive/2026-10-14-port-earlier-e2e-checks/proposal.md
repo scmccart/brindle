@@ -11,10 +11,10 @@ The end-to-end suite (`tests/e2e/`) covers the tmux work from `match-tmux-pane-g
 ## What Changes
 
 - Port each of those checks to a named case, grouped by area:
-  - `restore-*`: reattach to `vi` with modes 1002/1006, and the alternate screen;
+  - `reattach-*` (`restore-*` is taken by session restore): reattach to a program with modes 1002/1006, and the alternate screen;
   - `selection-*`: the current window, the active pane, `new-window -d` staying in the background, and a split acting on tmux's active pane;
-  - `palette-*`: running an action through the palette, and the palette's dump description;
-  - `commands-*`: break pane, the layouts, rotate and swap, and the detach key in a local tab;
+  - `palette-*`: running a tmux action through the palette, and which commands it lists in local and tmux tabs (running a general action and the palette's dump description are already covered; see design.md);
+  - `commands-*`: break pane, the layouts, rotate and swap, and detach beside a local tab;
   - `dividers-*`: pixel checks at T-junctions and crosses in a 2x2 tiled window;
   - `reload-*`: a theme change while attached.
 - Where a check needs Brindle to open a local shell tab, use the `Shell` profile the test config already has.
