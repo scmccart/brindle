@@ -50,6 +50,8 @@ pub mod theme {
     /// The second theme, for reload checks.
     pub const ALT_FOREGROUND: Rgb = Rgb(0xa0, 0xa0, 0xa0);
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
+    /// The second theme's blue; its other ANSI colors are the first's.
+    pub const ALT_BLUE: Rgb = Rgb(0x30, 0x60, 0xc0);
 }
 
 /// The test config, with `theme_name` as the global theme.
@@ -61,6 +63,8 @@ pub fn config(socket: &str, theme_name: &str) -> String {
 pub fn config_with(socket: &str, theme_name: &str, default_profile: &str, top: &str) -> String {
     use theme::*;
     let ansi: Vec<String> = ANSI.iter().map(|c| format!("\"{}\"", c.hex())).collect();
+    let mut alt_ansi = ansi.clone();
+    alt_ansi[4] = format!("\"{}\"", ALT_BLUE.hex());
     format!(
         r#"default_profile = "{default_profile}"
 theme = "{theme_name}"
@@ -94,7 +98,7 @@ search_focused_match_foreground = "{focused_fg}"
 foreground = "{alt_fg}"
 background = "{alt_bg}"
 accent = "{accent}"
-ansi = [{ansi}]
+ansi = [{alt_ansi}]
 "#,
         fg = FOREGROUND.hex(),
         bg = BACKGROUND.hex(),
@@ -102,6 +106,7 @@ ansi = [{ansi}]
         alt_fg = ALT_FOREGROUND.hex(),
         alt_bg = ALT_BACKGROUND.hex(),
         ansi = ansi.join(", "),
+        alt_ansi = alt_ansi.join(", "),
         match_bg = SEARCH_MATCH_BG.hex(),
         match_fg = SEARCH_MATCH_FG.hex(),
         focused_bg = SEARCH_FOCUSED_BG.hex(),

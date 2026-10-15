@@ -195,3 +195,26 @@ pub fn poll_session_end_inside(ctx: &Ctx) -> Result<Outcome> {
     }
     Ok(Outcome::Pass)
 }
+
+/// An OSC 4 query reaches control clients in `%output`, and tmux leaves it
+/// unanswered when the pane's palette doesn't set the index and no terminal
+/// client is attached. Brindle answers such queries itself
+/// (`palette_handler`); if tmux starts answering, it would answer twice.
+pub fn osc4_unanswered(ctx: &Ctx) -> Result<Outcome> {
+    let (server, client) = attach(ctx)?;
+    let result = (|| {
+        let script = query::palette_script(ctx)?;
+        let mark = client.mark();
+        server.type_line("%0", &format!("clear; {} 4", script.display()))?;
+        client.wait_for(ctx, mark, 3.0, |l| l.starts_with("%output %0 ") && l.contains(r"\033]4;4;?")).ok_or(
+            "the OSC 4 query didn't appear in %output within 3 s",
+        )?;
+        ctx.sleep(2.0);
+        let screen = server.capture("%0")?;
+        ensure!(screen.iter().any(|l| l.starts_with("p4=")), "the query script didn't finish: {screen:?}");
+        let (first, extra) = query::palette_reply(&screen, 4);
+        ensure!(first.is_empty() && extra.is_empty(), "tmux now answers OSC 4 for a control client: {first:?} {extra:?}");
+        Ok(())
+    })();
+    check(ctx, &client, result)
+}
