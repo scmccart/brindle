@@ -19,19 +19,19 @@
   - `cargo test --locked`, then the e2e and perf `--self-test` runs.
 
   Verify: pushing a branch starts one run (not two), `rustc -V` in the log is 1.99.0, and `test` passes with the self-tests' `ok` lines in its log.
-- [ ] 2.2 Add the `release` job (`cargo build --release --locked`, its own cache key). Verify: it passes in parallel with `test`, and a second push shows cache hits and a shorter build.
-- [ ] 2.3 Verify `--locked` bites: on a scratch commit, add an unused dependency to `Cargo.toml` without updating `Cargo.lock`, push, and check that `test` fails on the lockfile rather than updating it. Drop the commit.
+- [x] 2.2 Add the `release` job (`cargo build --release --locked`, its own cache key). Verify: it passes in parallel with `test`, and a second push shows cache hits and a shorter build.
+- [x] 2.3 Verify `--locked` bites: on a scratch commit, add an unused dependency to `Cargo.toml` without updating `Cargo.lock`, push, and check that `test` fails on the lockfile rather than updating it. Drop the commit.
 
 ## 3. Workflow: end-to-end jobs
 
-- [ ] 3.1 Add the `e2e` job with a `tmux: ["3.6a", "3.8"]` matrix (`fail-fast: false`):
+- [x] 3.1 Add the `e2e` job with a `tmux: ["3.6a", "3.8"]` matrix (`fail-fast: false`):
   - apt build, display and test packages from design.md;
   - for 3.8: `actions/cache` for `~/tmux-3.8` keyed on version and runner OS, and on a miss, download, check the pinned sha256, build, and add `~/tmux-3.8/bin` to `GITHUB_PATH`;
   - a step that fails unless `tmux -V` prints `tmux 3.6` or `tmux 3.8`.
 
   Verify: each entry's log shows the right version, and a re-run restores 3.8 from cache without building.
 - [x] 3.2 In the same job: Rust as in `test`, rust-cache with `shared-key: dev`, `timeout-minutes: 60`, and `BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 scripts/with-xvfb cargo test --locked --test e2e`. Verify: both entries run every case, with none skipped for "no X display" and `geometry-fullscreen-less` not skipped. Record each entry's suite time in the commit message.
-- [ ] 3.3 Add an `if: failure()` step uploading `target/tmp/e2e/` as `e2e-tmux-<v>` with 14-day retention. Verify: make one case fail on a scratch commit (for example a wrong expected color), push, and download the artifact (it holds that case's dump, log and capture). Drop the commit.
+- [x] 3.3 Add an `if: failure()` step uploading `target/tmp/e2e/` as `e2e-tmux-<v>` with 14-day retention. Verify: make one case fail on a scratch commit (for example a wrong expected color), push, and download the artifact (it holds that case's dump, log and capture). Drop the commit.
 - [ ] 3.4 Fix what the first runner runs turn up, mostly timing. For a flake, rerun the case alone; fix it to wait for state if it keeps failing. Tune `BRINDLE_E2E_SLOW` and `timeout-minutes` from the recorded times. Verify: three consecutive pushes pass on both tmux versions.
 
 ## 4. Docs
