@@ -111,7 +111,7 @@ const SUBSCRIPTIONS: [&str; 5] =
 /// From a Brindle debug log: every subscription was removed after it was
 /// registered and before `last`, the command that leaves the session.
 fn removed_before(log: &str, last: &str) -> Result {
-    let sent: Vec<&str> = log.lines().filter_map(|l| l.split_once("tmux <- ").map(|(_, c)| c)).collect();
+    let sent = sent(log);
     let end = sent.iter().rposition(|c| c.starts_with(last)).ok_or(format!("Brindle never sent {last:?}"))?;
     for name in SUBSCRIPTIONS {
         let on = sent.iter().position(|c| c.starts_with(&format!("refresh-client -B \"{name}:")));
@@ -123,6 +123,15 @@ fn removed_before(log: &str, last: &str) -> Result {
     Ok(())
 }
 
+const DEBUG: (&str, &str) = ("RUST_LOG", "brindle::tmux=debug");
+/// Overrides how Brindle follows pane state (`poll` or `subscribe`).
+const STATE: &str = "BRINDLE_TMUX_STATE";
+
+/// The commands Brindle sent, from its debug log.
+fn sent(log: &str) -> Vec<&str> {
+    log.lines().filter_map(|l| l.split_once("tmux <- ").map(|(_, c)| c)).collect()
+}
+
 fn log(ctx: &Ctx, label: &str) -> Result<String> {
     std::fs::read_to_string(ctx.dir.join(format!("{label}.log"))).map_err(|e| format!("{label}.log: {e}"))
 }
@@ -131,26 +140,58 @@ fn log(ctx: &Ctx, label: &str) -> Result<String> {
 /// session, and the server survives repeated quits.
 pub fn subscriptions_removed(ctx: &Ctx) -> Result<Outcome> {
     use crate::brindle::Run;
-    const DEBUG: (&str, &str) = ("RUST_LOG", "brindle::tmux=debug");
 
     let server = TmuxServer::new(113, 33)?;
-    Run::new(ctx, &server, "quit").env(DEBUG.0, DEBUG.1).dump_at(3.0).run()?;
+    // tmux before 3.7 gets no subscriptions unless asked for.
+    let run = |label| Run::new(ctx, &server, label).env(DEBUG.0, DEBUG.1).env(STATE, "subscribe");
+    run("quit").dump_at(3.0).run()?;
     removed_before(&log(ctx, "quit")?, "detach-client").map_err(|e| format!("quit: {e}"))?;
     server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after quitting: {e}"))?;
 
     // `new_tab` keeps the window (and the dump) after the session goes.
     const NEW_TAB: &str = "tmux_session_end = \"new_tab\"";
-    Run::new(ctx, &server, "detach").env(DEBUG.0, DEBUG.1).top(NEW_TAB).action("tmux_detach").dump_at(4.0).run()?;
+    run("detach").top(NEW_TAB).action("tmux_detach").dump_at(4.0).run()?;
     removed_before(&log(ctx, "detach")?, "detach-client").map_err(|e| format!("detach: {e}"))?;
     server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after detaching: {e}"))?;
 
     for i in 0..10 {
-        Run::new(ctx, &server, "repeat").dump_at(2.0).run()?;
+        run("repeat").dump_at(2.0).run()?;
         server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after quit {}: {e}", i + 1))?;
     }
 
     // Closing the only window's tab ends the session (and the server).
-    Run::new(ctx, &server, "close").env(DEBUG.0, DEBUG.1).top(NEW_TAB).action("close_tab").dump_at(4.0).run()?;
+    run("close").top(NEW_TAB).action("close_tab").dump_at(4.0).run()?;
     removed_before(&log(ctx, "close")?, "kill-window").map_err(|e| format!("closing the last tab: {e}"))?;
+    Ok(Outcome::Pass)
+}
+
+/// Polling Brindle (tmux before 3.7) registers no subscriptions, so a session
+/// ended from inside tmux can't crash the server: the last shell exits ten
+/// times while another session keeps the server alive.
+pub fn poll_session_end_inside(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::Run;
+
+    let server = TmuxServer::new(113, 33)?;
+    server.run(&["new-session", "-d", "-s", "other"])?;
+    // Something for the poll to follow.
+    server.run(&["set", "-g", "pane-border-status", "top"])?;
+    for i in 1..=10 {
+        let label = "run";
+        Run::new(ctx, &server, label)
+            .env(DEBUG.0, DEBUG.1)
+            .env(STATE, "poll")
+            .send("exit\r")
+            .dump_at(6.0)
+            .expect_exit()
+            .run()
+            .map_err(|e| format!("run {i}: {e}"))?;
+        let log = log(ctx, label)?;
+        let sent = sent(&log);
+        ensure!(sent.iter().any(|c| c.starts_with("list-panes -s")), "run {i}: Brindle never polled");
+        ensure!(!sent.iter().any(|c| c.starts_with("refresh-client -B")), "run {i}: Brindle subscribed");
+        server.run(&["has-session", "-t", "other"]).map_err(|e| format!("after run {i}: {e}"))?;
+        ensure!(server.run(&["has-session", "-t", "e2e"]).is_err(), "run {i}: the session survived exit");
+        server.run(&["new-session", "-d", "-s", "e2e", "-x", "113", "-y", "33"])?;
+    }
     Ok(Outcome::Pass)
 }
