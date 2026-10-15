@@ -1,6 +1,6 @@
 # Brindle
 
-[![CI](https://github.com/scmccart/brindle/actions/workflows/ci.yml/badge.svg)](https://github.com/scmccart/brindle/actions/workflows/ci.yml)
+[![CI](https://github.com/scmccart/brindle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/scmccart/brindle/actions/workflows/ci.yml)
 
 A GPU-accelerated terminal emulator for Linux, written in Rust on
 [GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
