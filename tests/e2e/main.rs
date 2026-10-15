@@ -56,6 +56,12 @@ impl Ctx {
         secs * self.slow
     }
 
+    /// Brindle's arguments that stretch its step spacing the same way. None
+    /// at the normal speed, so `BRINDLE_E2E_BIN` can name an older build.
+    pub fn step_interval(&self) -> Vec<String> {
+        if self.slow == 1.0 { Vec::new() } else { vec!["--step-interval".to_string(), self.secs(1.0).to_string()] }
+    }
+
     pub fn sleep(&self, secs: f64) {
         std::thread::sleep(Duration::from_secs_f64(self.secs(secs)));
     }

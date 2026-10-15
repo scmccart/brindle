@@ -123,6 +123,7 @@ fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
     let mut child = std::process::Command::new(&ctx.bin)
         .args(steps)
+        .args(ctx.step_interval())
         // Only reached if the window doesn't close.
         .args(["--dump-screen-after", &ctx.secs(20.0).to_string()])
         .env("BRINDLE_CONFIG", &config)

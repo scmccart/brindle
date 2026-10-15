@@ -1,0 +1,136 @@
+# Unit tests, a release build, and the end-to-end suite on two tmux versions.
+# The e2e jobs are advisory: they go red on failure but aren't required checks.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The desktop's toolchain; the runner image's own lags behind.
+  RUST_VERSION: "1.99.0"
+  CARGO_TERM_COLOR: always
+  BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
+
+jobs:
+  test:
+    # A branch in this repository already ran on push; PRs only run for forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+      - run: cargo test --locked
+      - name: e2e harness self-test
+        run: BRINDLE_E2E=1 cargo test --locked --test e2e -- --self-test
+      - name: perf harness self-test
+        run: BRINDLE_PERF=1 cargo test --locked --test perf -- --self-test
+
+  release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - run: cargo build --release --locked
+
+  e2e:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu's package, the desktop's version.
+          - tmux: "3.6a"
+            reports: tmux 3.6
+          # The latest release, built from source. tmux publishes no
+          # checksums, so the tarball's is pinned here.
+          - tmux: "3.8"
+            reports: tmux 3.8
+            sha256: e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
+            xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus tmux less \
+            ${{ matrix.sha256 && 'libevent-dev libncurses-dev bison' || '' }}
+      - name: Cache tmux ${{ matrix.tmux }}
+        if: matrix.sha256
+        id: tmux-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/tmux-${{ matrix.tmux }}
+          key: tmux-${{ matrix.tmux }}-${{ matrix.sha256 }}-ubuntu-26.04
+      - name: Build tmux ${{ matrix.tmux }}
+        if: matrix.sha256 && steps.tmux-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSLO "https://github.com/tmux/tmux/releases/download/${{ matrix.tmux }}/tmux-${{ matrix.tmux }}.tar.gz"
+          echo "${{ matrix.sha256 }}  tmux-${{ matrix.tmux }}.tar.gz" | sha256sum -c
+          tar xzf "tmux-${{ matrix.tmux }}.tar.gz"
+          cd "tmux-${{ matrix.tmux }}"
+          ./configure --prefix="$HOME/tmux-${{ matrix.tmux }}"
+          make -j"$(nproc)"
+          make install
+      - name: Put tmux ${{ matrix.tmux }} first on PATH
+        if: matrix.sha256
+        run: echo "$HOME/tmux-${{ matrix.tmux }}/bin" >> "$GITHUB_PATH"
+      - name: Check the tmux version
+        run: |
+          tmux -V
+          test "$(tmux -V)" = "${{ matrix.reports }}"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+      - name: Build
+        run: cargo test --locked --test e2e --no-run
+      - name: End-to-end suite
+        run: scripts/with-xvfb cargo test --locked --test e2e
+        env:
+          BRINDLE_E2E: "1"
+          # lavapipe and shared runners are slower than a desktop.
+          BRINDLE_E2E_SLOW: "2"
+      - name: Upload the suite's output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-tmux-${{ matrix.tmux }}
+          path: target/tmp/e2e/
+          retention-days: 14

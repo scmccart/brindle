@@ -1,5 +1,7 @@
 # Brindle
 
+[![CI](https://github.com/scmccart/brindle/actions/workflows/ci.yml/badge.svg)](https://github.com/scmccart/brindle/actions/workflows/ci.yml)
+
 A GPU-accelerated terminal emulator for Linux, written in Rust on
 [GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
 Terminal emulation comes from `alacritty_terminal`; rendering goes through
@@ -74,6 +76,22 @@ Xwayland, display `:0` unless `BRINDLE_E2E_DISPLAY` says otherwise) and needs
 `tmux`, `bash` and `less`. Without `BRINDLE_E2E=1`, `cargo test` skips it.
 Each case keeps its logs, screen dumps and window captures in
 `target/tmp/e2e/<case>/`.
+
+To run the suite headless, the way CI does, wrap it in `scripts/with-xvfb`
+(after `sudo apt install xvfb x11-utils openbox mesa-vulkan-drivers dbus`):
+
+```sh
+BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e
+```
+
+It starts a private X server with a window manager, renders with Mesa's
+software Vulkan driver, sets a UTF-8 locale and gives the run its own session
+bus, so nothing opens on the desktop.
+
+CI (`.github/workflows/ci.yml`) runs the unit tests, a release build, and the
+end-to-end suite that way on Ubuntu 26.04, against tmux 3.6a (Ubuntu's) and
+3.8 (built from source). A failed end-to-end job uploads `target/tmp/e2e/` as
+an artifact.
 
 ### Performance
 
