@@ -12,7 +12,7 @@
 
 ## 2. Workflow: unit tests and release build
 
-- [ ] 2.1 Add `.github/workflows/ci.yml` with the triggers from design.md (push to any branch, `pull_request` with a job-level `if` that runs only for fork PRs, `workflow_dispatch`), a per-ref `concurrency` group with `cancel-in-progress`, `RUST_VERSION: 1.99.0` in the workflow `env`, and the `test` job on `ubuntu-26.04`:
+- [x] 2.1 Add `.github/workflows/ci.yml` with the triggers from design.md (push to any branch, `pull_request` with a job-level `if` that runs only for fork PRs, `workflow_dispatch`), a per-ref `concurrency` group with `cancel-in-progress`, `RUST_VERSION: 1.99.0` in the workflow `env`, and the `test` job on `ubuntu-26.04`:
   - apt build packages;
   - `dtolnay/rust-toolchain` at `RUST_VERSION`;
   - `Swatinem/rust-cache` with `shared-key: dev`;
@@ -30,7 +30,7 @@
   - a step that fails unless `tmux -V` prints `tmux 3.6` or `tmux 3.8`.
 
   Verify: each entry's log shows the right version, and a re-run restores 3.8 from cache without building.
-- [ ] 3.2 In the same job: Rust as in `test`, rust-cache with `shared-key: dev`, `timeout-minutes: 60`, and `BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 scripts/with-xvfb cargo test --locked --test e2e`. Verify: both entries run every case, with none skipped for "no X display" and `geometry-fullscreen-less` not skipped. Record each entry's suite time in the commit message.
+- [x] 3.2 In the same job: Rust as in `test`, rust-cache with `shared-key: dev`, `timeout-minutes: 60`, and `BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 scripts/with-xvfb cargo test --locked --test e2e`. Verify: both entries run every case, with none skipped for "no X display" and `geometry-fullscreen-less` not skipped. Record each entry's suite time in the commit message.
 - [ ] 3.3 Add an `if: failure()` step uploading `target/tmp/e2e/` as `e2e-tmux-<v>` with 14-day retention. Verify: make one case fail on a scratch commit (for example a wrong expected color), push, and download the artifact (it holds that case's dump, log and capture). Drop the commit.
 - [ ] 3.4 Fix what the first runner runs turn up, mostly timing. For a flake, rerun the case alone; fix it to wait for state if it keeps failing. Tune `BRINDLE_E2E_SLOW` and `timeout-minutes` from the recorded times. Verify: three consecutive pushes pass on both tmux versions.
 
