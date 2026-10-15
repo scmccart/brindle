@@ -152,8 +152,13 @@ enum Backend {
     Remote {
         scanner: Scanner,
         input: Rc<dyn Fn(&[u8])>,
+        palette: Option<PaletteHandler>,
     },
 }
+
+/// Answers a remote terminal's palette query (OSC 4): given the index and
+/// the formatted reply, it decides whether to send it.
+pub type PaletteHandler = Rc<dyn Fn(usize, Vec<u8>)>;
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
@@ -315,18 +320,19 @@ impl Terminal {
     }
 
     /// A terminal whose output is supplied via [`Terminal::feed`] and whose
-    /// input is handed to `input`.
+    /// input is handed to `input`. Palette queries go to `palette`, if any.
     pub fn remote(
         size: GridSize,
         theme: Theme,
         config: &Config,
         input: Rc<dyn Fn(&[u8])>,
+        palette: Option<PaletteHandler>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = unbounded();
         let output = Arc::new(OutputMarker::default());
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
-        let backend = Backend::Remote { scanner: Scanner::new(), input };
+        let backend = Backend::Remote { scanner: Scanner::new(), input, palette };
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
         Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
@@ -334,7 +340,7 @@ impl Terminal {
 
     /// A read-only terminal showing `text` (used to report errors in a tab).
     pub fn message(text: &str, theme: Theme, config: &Config, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::remote(GridSize::default(), theme, config, Rc::new(|_| {}), cx);
+        let mut this = Self::remote(GridSize::default(), theme, config, Rc::new(|_| {}), None, cx);
         this.feed(text.as_bytes(), cx);
         this
     }
@@ -458,8 +464,16 @@ impl Terminal {
                 self.reply(format(&text).into_bytes());
             }
             AlacEvent::ColorRequest(index, format) => {
-                let color = self.term.lock().colors()[index].unwrap_or_else(|| self.default_color(index));
-                self.reply(format(color).into_bytes());
+                let set = self.term.lock().colors()[index];
+                let reply = format(set.unwrap_or_else(|| self.default_color(index))).into_bytes();
+                // A palette index the program set is in tmux's pane palette
+                // too, and tmux answers it.
+                match &self.backend {
+                    Backend::Remote { palette: Some(palette), .. } if index < 256 && set.is_none() => {
+                        palette(index, reply)
+                    }
+                    _ => self.reply(reply),
+                }
             }
             AlacEvent::PtyWrite(text) => self.reply(text.into_bytes()),
             AlacEvent::TextAreaSizeRequest(format) => self.reply(format(self.size.into()).into_bytes()),
@@ -477,7 +491,8 @@ impl Terminal {
 
     /// Sends a reply the emulator generated (device/color/size reports).
     /// Remote panes drop these: tmux answers such queries itself, and
-    /// forwarding them would inject garbage into the pane's input.
+    /// forwarding them would inject garbage into the pane's input. Palette
+    /// queries, which tmux leaves to us, go to the pane's `PaletteHandler`.
     fn reply(&self, bytes: Vec<u8>) {
         if !self.is_remote() {
             self.write(bytes);
