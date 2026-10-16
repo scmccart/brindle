@@ -2,9 +2,9 @@
 
 ## 1. CI on every pull request
 
-- [ ] 1.1 In `.github/workflows/ci.yml`, set `push` to `branches-ignore: ["dependabot/**"]`, keep `pull_request` and `workflow_dispatch`, and remove the three jobs' fork-only `if:` conditions. Update the comment above the triggers. Verify: actionlint passes, ignoring only the unknown `ubuntu-26.04` label.
+- [x] 1.1 In `.github/workflows/ci.yml`, set `push` to `branches-ignore: ["dependabot/**"]`, keep `pull_request` and `workflow_dispatch`, and remove the three jobs' fork-only `if:` conditions. Update the comment above the triggers. Verify: actionlint passes, ignoring only the unknown `ubuntu-26.04` label.
 - [ ] 1.2 Add `.github/dependabot.yml` with monthly `github-actions` version updates and no Cargo entry, as in design.md. Verify: it parses as YAML, and after the merge, GitHub's Dependabot page (Insights → Dependency graph → Dependabot) lists the `github-actions` ecosystem without errors.
-- [ ] 1.3 Update README.md's and CLAUDE.md's CI notes: CI runs on every push except to Dependabot's branches, and on every PR. Dependabot opens monthly PRs for Actions; Cargo gets security PRs only. Verify: neither file still says PRs only run for forks.
+- [x] 1.3 Update README.md's and CLAUDE.md's CI notes: CI runs on every push except to Dependabot's branches, and on every PR. Dependabot opens monthly PRs for Actions; Cargo gets security PRs only. Verify: neither file still says PRs only run for forks.
 
 ## 2. Dependency updates
 
