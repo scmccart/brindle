@@ -12,12 +12,12 @@
   - `git diff main -- Cargo.lock` changes only the packages listed in design.md, and `libc` is untouched;
   - `cargo build --locked` and `cargo test --locked` pass.
 - [x] 2.2 Run `cargo update -p rand@0.9.2 --precise 0.9.3`. Verify: the lock diff for this step is only `rand` 0.9's version and checksum, and `cargo test --locked` passes.
-- [ ] 2.3 Set `RUST_VERSION: "1.99.1"` in the workflow. Ask the user before running `rustup update stable` on the desktop. Verify: `rustc -V` prints 1.99.1, and `cargo build --release --locked` and `cargo test --locked` pass with it.
-- [ ] 2.4 Run the e2e suite headless on the desktop: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --locked --test e2e` (the desktop has Xvfb, openbox and lavapipe, and nothing opens on its display). Verify: 100 of 100 pass.
+- [x] 2.3 Set `RUST_VERSION: "1.99.1"` in the workflow. Ask the user before running `rustup update stable` on the desktop. Verify: `rustc -V` prints 1.99.1, and `cargo build --release --locked` and `cargo test --locked` pass with it.
+- [x] 2.4 Run the e2e suite headless on the desktop: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --locked --test e2e` (the desktop has Xvfb, openbox and lavapipe, and nothing opens on its display). Verify: 100 of 100 pass.
 
 ## 3. Verify on GitHub and land
 
-- [ ] 3.1 Push the branch, and open a PR from it to `main`. Verify:
+- [x] 3.1 Push the branch, and open a PR from it to `main`. Verify:
   - the push starts one `push` run;
   - the PR starts one `pull_request` run with all four jobs (the PR's checks list them);
   - both runs pass, with `rustc 1.99.1` in their logs.
