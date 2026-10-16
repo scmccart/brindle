@@ -227,11 +227,20 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
         std::thread::sleep(Duration::from_millis(100));
     };
     let geometry = conn.get_geometry(window).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
-    let image = conn
-        .get_image(ImageFormat::Z_PIXMAP, window, 0, 0, geometry.width, geometry.height, !0)
-        .map_err(|e| e.to_string())?
-        .reply()
-        .map_err(|e| format!("GetImage: {e}"))?;
+    // A window that hasn't presented a frame yet reads back as all zeros,
+    // which no theme paints; a loaded machine (lavapipe on CI) can get there.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let image = loop {
+        let image = conn
+            .get_image(ImageFormat::Z_PIXMAP, window, 0, 0, geometry.width, geometry.height, !0)
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| format!("GetImage: {e}"))?;
+        if image.data.chunks_exact(4).any(|px| px[..3] != [0, 0, 0]) || Instant::now() >= deadline {
+            break image;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     ensure!(image.depth >= 24, "unexpected window depth {}", image.depth);
     let mut data = Vec::with_capacity(geometry.width as usize * geometry.height as usize * 3);
     for px in image.data.chunks_exact(4) {
