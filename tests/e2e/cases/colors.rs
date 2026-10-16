@@ -127,8 +127,10 @@ pub fn palette_tty_client(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let script = query::palette_script(ctx)?;
     let attach = format!("tmux -L {} -f /dev/null attach -t e2e", server.socket);
+    // tmux won't attach a terminal client without TERM, which CI doesn't set.
     let mut tty = std::process::Command::new("script")
         .args(["-qfc", &attach, "/dev/null"])
+        .env("TERM", "xterm-256color")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()

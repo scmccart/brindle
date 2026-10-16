@@ -1,0 +1,81 @@
+#!/bin/sh
+# Runs a command against a private, headless X server, the way CI runs the
+# end-to-end suite:
+#
+#   scripts/with-xvfb cargo test --test e2e            # with BRINDLE_E2E=1
+#   scripts/with-xvfb cargo test --test e2e -- titles
+#
+# It starts Xvfb on a free display with openbox (the palette and
+# multi-window cases need a window manager), forces Mesa's lavapipe so a GPU
+# renders the way CI does, sets a UTF-8 locale (without one, tmux mangles
+# the tabs in its control-mode replies), and runs the command under a
+# private session bus. Nothing opens on the desktop.
+#
+# Needs: xvfb x11-utils openbox mesa-vulkan-drivers dbus
+set -eu
+
+if [ $# -eq 0 ]; then
+    echo "usage: scripts/with-xvfb <command> [args...]" >&2
+    exit 2
+fi
+for program in Xvfb xprop openbox dbus-run-session; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        echo "with-xvfb: $program is missing (apt install xvfb x11-utils openbox dbus)" >&2
+        exit 1
+    fi
+done
+lavapipe=
+for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+    [ -e "$icd" ] && lavapipe=$icd && break
+done
+if [ -z "$lavapipe" ]; then
+    echo "with-xvfb: lavapipe is missing (apt install mesa-vulkan-drivers)" >&2
+    exit 1
+fi
+
+tmp=$(mktemp -d)
+xvfb=
+wm=
+cleanup() {
+    [ -n "$wm" ] && kill "$wm" 2>/dev/null
+    [ -n "$xvfb" ] && kill "$xvfb" 2>/dev/null
+    wait 2>/dev/null
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Xvfb picks a free display and writes its number to fd 3.
+Xvfb -displayfd 3 -screen 0 1920x1080x24 -nolisten tcp 3>"$tmp/display" >"$tmp/xvfb.log" 2>&1 &
+xvfb=$!
+i=0
+until grep -q '^[0-9]' "$tmp/display" 2>/dev/null; do
+    i=$((i + 1))
+    if [ $i -gt 100 ] || ! kill -0 "$xvfb" 2>/dev/null; then
+        echo "with-xvfb: Xvfb didn't start" >&2
+        cat "$tmp/xvfb.log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+display=:$(head -n 1 "$tmp/display")
+
+DISPLAY=$display openbox >"$tmp/openbox.log" 2>&1 &
+wm=$!
+i=0
+until DISPLAY=$display xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; do
+    i=$((i + 1))
+    if [ $i -gt 100 ] || ! kill -0 "$wm" 2>/dev/null; then
+        echo "with-xvfb: openbox didn't start" >&2
+        cat "$tmp/openbox.log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+export DISPLAY="$display" BRINDLE_E2E_DISPLAY="$display" VK_DRIVER_FILES="$lavapipe" LC_ALL=C.UTF-8
+unset WAYLAND_DISPLAY
+status=0
+dbus-run-session -- "$@" || status=$?
+exit $status
