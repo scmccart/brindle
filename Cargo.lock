@@ -198,7 +198,7 @@ dependencies = [
  "enumflags2",
  "futures-channel",
  "futures-util",
- "rand 0.9.2",
+ "rand 0.9.3",
  "serde",
  "serde_repr",
  "url",
@@ -219,7 +219,7 @@ dependencies = [
  "enumflags2",
  "futures-channel",
  "futures-util",
- "rand 0.9.2",
+ "rand 0.9.3",
  "serde",
  "serde_repr",
  "url",
@@ -2196,7 +2196,7 @@ dependencies = [
  "pin-project",
  "postage",
  "profiling",
- "rand 0.9.2",
+ "rand 0.9.3",
  "raw-window-handle",
  "resvg",
  "schemars",
@@ -3644,7 +3644,7 @@ dependencies = [
  "num",
  "num-bigint-dig",
  "pbkdf2",
- "rand 0.9.2",
+ "rand 0.9.3",
  "serde",
  "sha2",
  "subtle",
@@ -4124,9 +4124,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.3",
