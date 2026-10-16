@@ -8,10 +8,10 @@
 
 ## 2. Dependency updates
 
-- [ ] 2.1 Merge `origin/dependabot/cargo/{bytes-1.12.1,quinn-proto-0.11.19,rand-0.8.8,rustls-webpki-0.103.15,rustls-0.23.45}` in that order with `git merge --no-edit`. On a conflict, follow design.md: keep `main`'s `Cargo.lock` and apply the PR's `cargo update -p <pkg> --precise <version>`. Verify:
+- [x] 2.1 Merge `origin/dependabot/cargo/{bytes-1.12.1,quinn-proto-0.11.19,rand-0.8.8,rustls-webpki-0.103.15,rustls-0.23.45}` in that order with `git merge --no-edit`. On a conflict, follow design.md: keep `main`'s `Cargo.lock` and apply the PR's `cargo update -p <pkg> --precise <version>`. Verify:
   - `git diff main -- Cargo.lock` changes only the packages listed in design.md, and `libc` is untouched;
   - `cargo build --locked` and `cargo test --locked` pass.
-- [ ] 2.2 Run `cargo update -p rand@0.9.2 --precise 0.9.3`. Verify: the lock diff for this step is only `rand` 0.9's version and checksum, and `cargo test --locked` passes.
+- [x] 2.2 Run `cargo update -p rand@0.9.2 --precise 0.9.3`. Verify: the lock diff for this step is only `rand` 0.9's version and checksum, and `cargo test --locked` passes.
 - [ ] 2.3 Set `RUST_VERSION: "1.99.1"` in the workflow. Ask the user before running `rustup update stable` on the desktop. Verify: `rustc -V` prints 1.99.1, and `cargo build --release --locked` and `cargo test --locked` pass with it.
 - [ ] 2.4 Run the e2e suite headless on the desktop: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --locked --test e2e` (the desktop has Xvfb, openbox and lavapipe, and nothing opens on its display). Verify: 100 of 100 pass.
 
