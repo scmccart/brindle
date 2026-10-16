@@ -21,7 +21,7 @@ concurrency:
 
 env:
   # The desktop's toolchain; the runner image's own lags behind.
-  RUST_VERSION: "1.99.0"
+  RUST_VERSION: "1.99.1"
   CARGO_TERM_COLOR: always
   BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
 
