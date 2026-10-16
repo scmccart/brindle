@@ -36,7 +36,7 @@
 
 ## 4. Docs
 
-- [ ] 4.1 Document CI:
+- [x] 4.1 Document CI:
   - README.md's Testing section: what CI runs, the status badge, and `scripts/with-xvfb cargo test --test e2e` (after `apt install xvfb openbox`) as the way to run the suite headless, as CI does.
   - CLAUDE.md's "End-to-end suite" section:
     - the CI jobs, and that e2e is advisory;
@@ -46,4 +46,4 @@
 
   Verify: the badge renders on GitHub, and every documented command runs as written.
 - [x] 4.2 Record the locale bug as a follow-up OpenSpec change (proposal only): Brindle should pass `-u` to tmux, because without a UTF-8 locale tmux replaces the tabs in its control-mode replies with `_` and tmux tabs never appear. Verify: `openspec list` shows it.
-- [ ] 4.3 Final check on `main` after the merge is pushed. Verify: the Actions page for the merge commit shows `test`, `release` and both `e2e` entries green.
+- [x] 4.3 Final check on `main` after the merge is pushed. Verify: the Actions page for the merge commit shows `test`, `release` and both `e2e` entries green.
