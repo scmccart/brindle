@@ -29,7 +29,7 @@ BRINDLE_CONFIG=/tmp/test-config.toml ./target/release/brindle -p tmux \
   --send 'echo hi\r' --action tmux_split_right --dump-screen-after 5
 ```
 
-- `--send` and `--action` steps run in order, one second apart, against the active tab. Action names are listed by `--list-actions`. While a palette or the settings dialog has a text input focused, `--send` types into that input (control characters dropped) instead of the terminal; use `--action` (`picker_confirm`, `text_input_left`, …) for keys.
+- `--send` and `--action` steps run in order, one second apart (`--step-interval S` changes that), against the active tab. Action names are listed by `--list-actions`. While a palette or the settings dialog has a text input focused, `--send` types into that input (control characters dropped) instead of the terminal; use `--action` (`picker_confirm`, `text_input_left`, …) for keys.
 - `BRINDLE_NOTIFY_LOG=<file>` appends each desktop notification to the file (`source<TAB>title<TAB>body`) instead of sending it over D-Bus.
 - `BRINDLE_TMUX_STATE=poll|subscribe` overrides how control-mode sessions follow pane state (see "Subscriptions or polling" below). The e2e suite passes it through, so `BRINDLE_TMUX_STATE=subscribe BRINDLE_E2E=1 cargo test --test e2e` runs the subscription path on any tmux.
 - `--dump-screen-after N` prints the tab titles, the active terminal's size and `TermMode`, its grid geometry (`--- grid origin=X,Y cell=WxH scale=S`, logical window pixels), and its screen text, then exits. An open overlay adds its `--- palette` or `--- settings` line (palette rows print as `label  detail  [shortcut]`), and a focused text input adds `--- input text=… cursor=N selection=A..B`. Steps and the dump act on the first window; each other window adds `--- window N tabs=[…]`.
@@ -49,9 +49,11 @@ BRINDLE_E2E=1 cargo test --test e2e -- --self-test   # the harness's own parser 
 
 - Each case starts its own throwaway tmux server (`brindle-e2e-<pid>-<n>`) and runs Brindle against it with the debug hooks. Cases compare the dump with `capture-pane`, sample colors in window captures, or read OSC 10/11 replies. `tmux-*` cases check tmux behaviour Brindle relies on, over a raw `tmux -C` client, with no display.
 - Expected colors come from the `e2e` theme in the generated test config (`tests/e2e/brindle.rs`), not from built-in themes.
-- `BRINDLE_E2E_BIN` tests another binary (default: this build's). `BRINDLE_E2E_SLOW=2` doubles every delay. `BRINDLE_E2E_DISPLAY` picks the X display (default `:0`).
+- `BRINDLE_E2E_BIN` tests another binary (default: this build's). `BRINDLE_E2E_SLOW=2` doubles every delay, Brindle's step spacing included (through `--step-interval`). `BRINDLE_E2E_DISPLAY` picks the X display (default `:0`).
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
+- `scripts/with-xvfb <command>` runs it headless: a private Xvfb on a free display, openbox, lavapipe (`VK_DRIVER_FILES`), `LC_ALL=C.UTF-8` and a private session bus (`dbus-run-session`). Runs under it open no windows on the desktop, so they don't need asking first, unlike runs on `:0`. The suite needs both the window manager (palette and multi-window cases) and the UTF-8 locale (without one, tmux replaces the tabs in its control-mode replies with `_`).
+- CI (`.github/workflows/ci.yml`, `ubuntu-26.04` runners, no containers): `test` (`cargo test` and both harness self-tests), `release`, and `e2e` (the suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`) once per tmux version. e2e is advisory: red on failure, not a required check. A failed e2e job uploads `target/tmp/e2e/` as `e2e-tmux-<v>`. Move the pins in the workflow: `RUST_VERSION`, and the e2e matrix (a tmux version, what `tmux -V` reports, and the tarball's sha256 when it's built from source).
 
 ### Manual checks
 

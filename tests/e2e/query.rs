@@ -9,7 +9,7 @@ use crate::{Ctx, Result, ensure};
 const SCRIPT: &str = r#"#!/bin/bash
 # Queries the default background (OSC 11) and foreground (OSC 10) and
 # prints the replies as bg=... and fg=... lines.
-q() { printf '\033]%s;?\a' "$1"; read -t1 -rsd $'\a' r; printf '%s=%s\n' "$2" "${r#*;}"; }
+q() { printf '\033]%s;?\a' "$1"; read -t{T} -rsd $'\a' r; printf '%s=%s\n' "$2" "${r#*;}"; }
 q 11 bg; q 10 fg
 "#;
 
@@ -18,12 +18,14 @@ const PALETTE_SCRIPT: &str = r#"#!/bin/bash
 # extra=<a second reply arriving within half a second>, colors only.
 for i in "$@"; do
   printf '\033]4;%s;?\a' "$i"
-  r=; read -t1 -rsd $'\a' r; e=; read -t0.5 -rsd $'\a' e
+  r=; read -t{T} -rsd $'\a' r; e=; read -t{E} -rsd $'\a' e
   printf 'p%s=%s extra=%s\n' "$i" "${r##*;}" "${e##*;}"
 done
 "#;
 
 /// Writes the query script into the case directory; type its path into a pane.
+/// Its reply timeouts (`{T}`, and `{E}` for a second reply) are 1 s and
+/// 0.5 s, stretched by `BRINDLE_E2E_SLOW`.
 pub fn script(ctx: &Ctx) -> Result<PathBuf> {
     write_script(ctx, "query.sh", SCRIPT)
 }
@@ -35,6 +37,7 @@ pub fn palette_script(ctx: &Ctx) -> Result<PathBuf> {
 
 fn write_script(ctx: &Ctx, name: &str, text: &str) -> Result<PathBuf> {
     let path = ctx.dir.join(name);
+    let text = text.replace("{T}", &ctx.secs(1.0).to_string()).replace("{E}", &ctx.secs(0.5).to_string());
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     let status = std::process::Command::new("chmod").arg("+x").arg(&path).status().map_err(|e| e.to_string())?;
     ensure!(status.success(), "chmod {name}");

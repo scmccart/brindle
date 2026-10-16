@@ -69,6 +69,7 @@ DEBUGGING:
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
                                  Steps run in order, 1s apart
+        --step-interval <S>      Run the steps S seconds apart instead (default 1)
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
         --latency-log <FILE>     Time each keystroke (key to output, paint and next
                                  frame), append them to FILE as JSON lines, and
@@ -100,6 +101,8 @@ struct Args {
     cwd: Option<PathBuf>,
     /// `--send` / `--action` / `--find` steps, run in order one second apart.
     steps: Vec<Step>,
+    /// `--step-interval`: the steps' spacing in seconds, when not one.
+    step_interval: Option<f64>,
     dump_after: Option<f64>,
     latency_log: Option<PathBuf>,
     latency_bench: Option<usize>,
@@ -180,6 +183,10 @@ fn parse_args() -> Args {
                 args.steps.push(Step::Pointer(terminal_view::PointerStep::parse(&pos, click)));
             }
             "--find" => args.steps.extend(it.next().map(Step::Find)),
+            "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
+                Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
+                _ => usage_error("--step-interval needs a positive number of seconds"),
+            },
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
             "--latency-log" => match it.next() {
                 Some(path) => args.latency_log = Some(config::expand_tilde(&path)),
@@ -459,10 +466,11 @@ fn main() {
 
         let steps = args.steps.clone();
         let latency_bench = args.latency_bench;
+        let interval = Duration::from_secs_f64(args.step_interval.unwrap_or(1.0));
         cx.spawn(async move |cx| {
-            cx.background_executor().timer(Duration::from_millis(500)).await;
+            cx.background_executor().timer(interval / 2).await;
             for step in steps {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor().timer(interval).await;
                 window
                     .update(cx, |ws, window, cx| match &step {
                         Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),

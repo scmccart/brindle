@@ -314,6 +314,7 @@ impl<'a> Run<'a> {
         let mut child = command
             .args(&self.args)
             .args(&self.steps)
+            .args(ctx.step_interval())
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
             .env("DISPLAY", &ctx.display)
