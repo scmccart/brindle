@@ -1,0 +1,9 @@
+# Version updates for the workflow's actions. Cargo gets security updates
+# only (they need no entry here): Cargo.lock came from GPUI's own lockfile,
+# and broad updates break it (see CLAUDE.md).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
