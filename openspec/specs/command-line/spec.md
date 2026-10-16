@@ -31,7 +31,7 @@ An unknown argument SHALL print usage and exit with status 2.
 - **THEN** the zsh integration script is printed and the process exits 0 without opening a window
 
 ### Requirement: Debug automation hooks
-For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>` and `--find <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab:
+For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>` and `--find <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab. `--step-interval <SECONDS>` SHALL space them that many seconds apart instead, with half that interval before the first step, and SHALL be rejected with a usage error unless it is a positive number:
 - `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette, the settings dialog or the find bar), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
 - `--action` runs a named action;
 - `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
@@ -74,6 +74,14 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 #### Scenario: Scripted search
 - **WHEN** Brindle runs with `--send 'echo needle\r' --find needle --dump-screen-after 4`
 - **THEN** stdout contains a find line with query `needle`, a match count of at least one, and the current match's row and column
+
+#### Scenario: Stretched steps
+- **WHEN** Brindle runs with `--step-interval 2 --send 'a' --send 'b' --dump-screen-after 4`
+- **THEN** the dump shows `a` typed but not `b`, because the steps are due about 3 and 5 seconds after launch
+
+#### Scenario: Invalid interval
+- **WHEN** Brindle runs with `--step-interval 0`
+- **THEN** it prints a usage error and exits without opening a window
 
 ### Requirement: Latency log
 `--latency-log <FILE>` SHALL time every keystroke a terminal tab receives, whether typed or from `--latency-bench`, and append one JSON line per keystroke to FILE: the key, and the milliseconds until the program's output arrived, until that output was painted, and until the next frame began. On quit, Brindle SHALL print a summary to stderr. Without the option, no timing SHALL be recorded.
