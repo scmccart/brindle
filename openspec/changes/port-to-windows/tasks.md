@@ -114,7 +114,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - `brindle --install-desktop`, run as the installed command, makes a shortcut whose target exists;
   - upgrading to a zip built with a bumped version in a scratch worktree leaves one Installed apps entry, `brindle --version` prints the new version, and the shortcut still points at an existing exe (if not, make `--install-desktop` target the stable path and check again);
   - `winget uninstall` removes the command and leaves `%APPDATA%\brindle`.
-- [ ] 8.7 Document installing in README.md: the release zip; WinGet once published (`winget install scmccart.brindle`); `brindle --install-desktop` for a Start Menu entry, and `--uninstall-desktop` before uninstalling; `cargo install` with `scripts/fetch-conpty.ps1`; the SmartScreen warning for unsigned builds; uninstall leaving config. Verify that each command matches the code and the CI workflow.
+- [x] 8.7 Document installing in README.md: the release zip; WinGet once published (`winget install scmccart.brindle`); `brindle --install-desktop` for a Start Menu entry, and `--uninstall-desktop` before uninstalling; `cargo install` with `scripts/fetch-conpty.ps1`; the SmartScreen warning for unsigned builds; uninstall leaving config. Verify that each command matches the code and the CI workflow.
 
 ## 9. CI completeness
 
