@@ -185,6 +185,7 @@ jobs:
       - name: Release zip and WinGet manifest
         shell: pwsh
         run: |
+          winget --version
           $zip = scripts/package-windows.ps1
           $manifest = scripts/winget-manifest.ps1 -Zip $zip
           winget validate --disable-interactivity --manifest $manifest

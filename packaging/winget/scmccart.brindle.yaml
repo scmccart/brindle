@@ -1,8 +1,8 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
 # The version manifest. scripts/winget-manifest.ps1 fills in {{version}},
 # {{url}} and {{sha256}} across these three files.
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
 PackageIdentifier: scmccart.brindle
 PackageVersion: "{{version}}"
 DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
