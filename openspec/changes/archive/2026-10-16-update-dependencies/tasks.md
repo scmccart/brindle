@@ -3,7 +3,7 @@
 ## 1. CI on every pull request
 
 - [x] 1.1 In `.github/workflows/ci.yml`, set `push` to `branches-ignore: ["dependabot/**"]`, keep `pull_request` and `workflow_dispatch`, and remove the three jobs' fork-only `if:` conditions. Update the comment above the triggers. Verify: actionlint passes, ignoring only the unknown `ubuntu-26.04` label.
-- [ ] 1.2 Add `.github/dependabot.yml` with monthly `github-actions` version updates and no Cargo entry, as in design.md. Verify: it parses as YAML, and after the merge, GitHub's Dependabot page (Insights → Dependency graph → Dependabot) lists the `github-actions` ecosystem without errors.
+- [x] 1.2 Add `.github/dependabot.yml` with monthly `github-actions` version updates and no Cargo entry, as in design.md. Verify: it parses as YAML, and after the merge, GitHub's Dependabot page (Insights → Dependency graph → Dependabot) lists the `github-actions` ecosystem without errors.
 - [x] 1.3 Update README.md's and CLAUDE.md's CI notes: CI runs on every push except to Dependabot's branches, and on every PR. Dependabot opens monthly PRs for Actions; Cargo gets security PRs only. Verify: neither file still says PRs only run for forks.
 
 ## 2. Dependency updates
@@ -21,9 +21,9 @@
   - the push starts one `push` run;
   - the PR starts one `pull_request` run with all four jobs (the PR's checks list them);
   - both runs pass, with `rustc 1.99.1` in their logs.
-- [ ] 3.2 Land the usual way: archive commit, rebase on `main`, `--no-ff` merge "Merge updating dependencies and running CI on every PR", push `main` (ask first). Verify:
+- [x] 3.2 Land the usual way: archive commit, rebase on `main`, `--no-ff` merge "Merge updating dependencies and running CI on every PR", push `main` (ask first). Verify:
   - PRs #1–#5 and the PR from 3.1 show as merged;
   - `gh api repos/scmccart/brindle/dependabot/alerts` shows only alert #2 (`grid`) open;
   - the run on `main` passes.
-- [ ] 3.3 Ask whether to dismiss the `grid` alert (#2) as "tolerable risk", with design.md's reasoning as the comment, or to leave it open. Do what the user decides. Delete the merged branches on GitHub. Verify: `git ls-remote --heads origin` lists only `main`.
-- [ ] 3.4 Offer to reinstall the dogfooding build (`scripts/install.sh`), now built with Rust 1.99.1 and the updated lock.
+- [x] 3.3 Ask whether to dismiss the `grid` alert (#2) as "tolerable risk", with design.md's reasoning as the comment, or to leave it open. Do what the user decides. Delete the merged branches on GitHub. Verify: `git ls-remote --heads origin` lists only `main`.
+- [x] 3.4 Offer to reinstall the dogfooding build (`scripts/install.sh`), now built with Rust 1.99.1 and the updated lock.
