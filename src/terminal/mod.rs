@@ -9,6 +9,8 @@
 pub mod keys;
 pub mod links;
 pub mod mouse;
+mod process;
+#[cfg(unix)]
 mod pty;
 pub mod shell_integration;
 mod scan;
@@ -146,8 +148,7 @@ pub enum TerminalEvent {
 enum Backend {
     Pty {
         sender: EventLoopSender,
-        child_pid: u32,
-        master_fd: i32,
+        process: process::PtyProcess,
     },
     Remote {
         scanner: Scanner,
@@ -288,6 +289,10 @@ impl Terminal {
             working_directory,
             drain_on_exit: true,
             env: child_env(profile),
+            // Quote each argument with the C runtime's rules, so TOML
+            // `args` arrive as written.
+            #[cfg(windows)]
+            escape_args: true,
         };
 
         let (tx, rx) = unbounded();
@@ -297,6 +302,7 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
+        #[cfg(unix)]
         let spawned = (|| -> anyhow::Result<Backend> {
             let pty = tty::new(&options, size.into(), 0)?;
             let child_pid = pty.child().id();
@@ -305,7 +311,20 @@ impl Terminal {
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
-            Ok(Backend::Pty { sender, child_pid, master_fd })
+            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid, master_fd) })
+        })();
+        // TEMPORARY until Brindle hosts its own pseudoconsole: alacritty's
+        // ConPTY, parsed by alacritty itself, so shell-integration marks and
+        // notifications are not seen in local Windows tabs yet.
+        #[cfg(windows)]
+        let spawned = (|| -> anyhow::Result<Backend> {
+            drop(tx);
+            let pty = tty::new(&options, size.into(), 0)?;
+            let child_pid = pty.child_watcher().pid().map_or(0, |pid| pid.get());
+            let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
+            let sender = event_loop.channel();
+            event_loop.spawn();
+            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid) })
         })();
 
         let theme = config.profile_theme(profile);
@@ -451,14 +470,14 @@ impl Terminal {
                 let item = ClipboardItem::new_string(text);
                 match kind {
                     ClipboardType::Clipboard => cx.write_to_clipboard(item),
-                    ClipboardType::Selection => cx.write_to_primary(item),
+                    ClipboardType::Selection => crate::primary::write_primary(cx, item),
                 }
             }
             // Only sent when the config allows OSC 52 reads (see `term_config`).
             AlacEvent::ClipboardLoad(kind, format) => {
                 let item = match kind {
                     ClipboardType::Clipboard => cx.read_from_clipboard(),
-                    ClipboardType::Selection => cx.read_from_primary(),
+                    ClipboardType::Selection => crate::primary::read_primary(cx),
                 };
                 let text = item.and_then(|i| i.text()).unwrap_or_default();
                 self.reply(format(&text).into_bytes());
@@ -668,7 +687,7 @@ impl Terminal {
     /// Called when a mouse selection is finished.
     pub fn finish_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.selection_text() {
-            cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+            crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
             if self.copy_on_select {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
@@ -679,30 +698,18 @@ impl Terminal {
 
     /// Name of the foreground process on the PTY (e.g. `vim`), for tab titles.
     pub fn foreground_process_name(&self) -> Option<String> {
-        let pid = self.foreground_pid()?;
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        Some(comm.trim().to_string())
-    }
-
-    fn foreground_pid(&self) -> Option<i32> {
-        let Backend::Pty { master_fd, .. } = &self.backend else {
+        let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
-        // SAFETY: the fd stays open for as long as the event loop owns the PTY,
-        // and tcgetpgrp has no memory-safety preconditions.
-        let pgrp = unsafe { libc::tcgetpgrp(*master_fd) };
-        (pgrp > 0).then_some(pgrp)
+        process.foreground_name()
     }
 
     /// Current working directory of the foreground process (falls back to the shell).
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
-        let Backend::Pty { child_pid, .. } = &self.backend else {
+        let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
-        let pid = self.foreground_pid().map(|p| p as u32).unwrap_or(*child_pid);
-        std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .or_else(|_| std::fs::read_link(format!("/proc/{child_pid}/cwd")))
-            .ok()
+        process.working_directory()
     }
 
     /// The visible screen as plain text (used by `--dump-screen` and tests).

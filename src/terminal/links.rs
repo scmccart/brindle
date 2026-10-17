@@ -119,15 +119,12 @@ fn open_with(program: String, uri: String) -> Option<std::thread::JoinHandle<()>
         return None;
     }
     let spawned = std::thread::Builder::new().name("link-opener".into()).spawn(move || {
-        use std::os::unix::process::CommandExt as _;
         log::info!("opening {uri} with {program}");
-        let child = Command::new(&program)
-            .arg(&uri)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn();
+        let mut command = Command::new(&program);
+        command.arg(&uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn();
         match child.and_then(|mut child| child.wait()) {
             Ok(status) if !status.success() => log::warn!("{program} {uri}: {status}"),
             Ok(_) => {}
@@ -250,6 +247,7 @@ mod tests {
         assert!(!has_scheme("https://example.com/\nrm"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn opener_gets_the_uri_as_one_argument() {
         let dir = std::env::temp_dir().join(format!("brindle-opener-test-{}", std::process::id()));

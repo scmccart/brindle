@@ -311,7 +311,7 @@ impl TerminalView {
     }
 
     fn paste_primary_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+        if let Some(text) = crate::primary::read_primary(cx).and_then(|item| item.text()) {
             self.terminal.update(cx, |t, cx| t.paste(&text, cx));
         }
     }

@@ -36,27 +36,35 @@ impl<R: Read> Read for ScanReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-    use std::os::unix::net::UnixStream;
+    use std::collections::VecDeque;
 
     use futures::channel::mpsc::unbounded;
 
     use super::*;
     use crate::notify::osc::Source;
 
+    /// Returns one chunk per read, like a PTY delivering output in pieces.
+    struct Chunks(VecDeque<&'static [u8]>);
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.0.pop_front() else { return Ok(0) };
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
     #[test]
     fn reports_a_notice_split_across_reads() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let chunks = Chunks(VecDeque::from([&b"out\x1b]777;noti"[..], &b"fy;T;B\x07more"[..]]));
         let (tx, mut rx) = unbounded();
-        let mut reader = ScanReader::new(reader, tx);
+        let mut reader = ScanReader::new(chunks, tx);
         let mut buf = [0u8; 64];
 
-        writer.write_all(b"out\x1b]777;noti").unwrap();
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"out\x1b]777;noti", "bytes pass through unchanged");
         assert!(rx.try_next().is_err(), "nothing yet");
 
-        writer.write_all(b"fy;T;B\x07more").unwrap();
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"fy;T;B\x07more");
         match rx.try_next() {

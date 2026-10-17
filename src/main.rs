@@ -6,6 +6,7 @@ mod find_bar;
 mod latency;
 mod notify;
 mod picker;
+mod primary;
 mod session;
 mod settings;
 mod settings_dialog;

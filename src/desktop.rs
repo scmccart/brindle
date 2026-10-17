@@ -294,6 +294,8 @@ mod tests {
         std::fs::remove_dir_all(&data).ok();
     }
 
+    // `/proc` refuses new files on Linux; elsewhere it is an ordinary path.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unwritable_target_names_the_path() {
         let err = install(Path::new("/proc/brindle"), Path::new("/usr/bin/brindle")).unwrap_err();

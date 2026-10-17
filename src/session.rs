@@ -2,7 +2,8 @@
 //! state file they are written to, and how a recorded tab is reopened.
 //!
 //! The state lives in `session.toml` under `$BRINDLE_STATE_DIR`, else
-//! `$XDG_STATE_HOME/brindle` (`~/.local/state/brindle`). Only the process
+//! `$XDG_STATE_HOME/brindle` (`~/.local/state/brindle`), or
+//! `%LOCALAPPDATA%\brindle` on Windows. Only the process
 //! holding `session.lock` reads or writes it, so a second Brindle never
 //! duplicates the first one's tabs.
 
@@ -101,10 +102,13 @@ pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("BRINDLE_STATE_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
-    dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("brindle")
+    // `dirs::state_dir()` is Linux-only; Windows keeps state in %LOCALAPPDATA%.
+    let base = if cfg!(windows) {
+        dirs::data_local_dir()
+    } else {
+        dirs::state_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+    };
+    base.unwrap_or_else(|| PathBuf::from(".")).join("brindle")
 }
 
 pub fn state_path(dir: &Path) -> PathBuf {
@@ -140,14 +144,13 @@ pub fn next_generation() -> u64 {
 /// Replaces `dir/session.toml` with `text` in one step (temp file + rename),
 /// readable only by the user.
 pub fn write_atomic(dir: &Path, text: &str, generation: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let mut last = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if generation < *last {
         return Ok(());
     }
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    private_dir().create(dir)?;
     let tmp = dir.join(format!("{FILE_NAME}.tmp"));
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut file = private_file().truncate(true).open(&tmp)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(&tmp, state_path(dir))?;
@@ -165,17 +168,35 @@ impl Lock {
     /// Takes the lock without waiting. Fails if another process (or another
     /// open of the lock file) holds it.
     pub fn acquire(dir: &Path) -> std::io::Result<Lock> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        let file =
-            std::fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(dir.join(LOCK_NAME))?;
-        // SAFETY: flock only takes a valid descriptor, which `file` owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        private_dir().create(dir)?;
+        let file = private_file().truncate(false).open(dir.join(LOCK_NAME))?;
+        // flock(LOCK_EX | LOCK_NB) on Unix, LockFileEx on Windows.
+        file.try_lock().map_err(|err| match err {
+            std::fs::TryLockError::Error(err) => err,
+            std::fs::TryLockError::WouldBlock => std::io::ErrorKind::WouldBlock.into(),
+        })?;
         Ok(Lock { _file: file })
     }
+}
+
+/// A builder for the state directory: readable only by the user on Unix.
+/// On Windows, `%LOCALAPPDATA%` is already per-user.
+fn private_dir() -> std::fs::DirBuilder {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+}
+
+/// Options for writing a state file, created readable only by the user on
+/// Unix.
+fn private_file() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
 }
 
 // ---- restoring ------------------------------------------------------------------
@@ -456,9 +477,12 @@ mod tests {
         write_atomic(&dir, &sample().to_text(), next_generation()).unwrap();
         assert_eq!(load(&dir), Ok(Some(sample())));
         assert!(!dir.join("session.toml.tmp").exists());
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(state_path(&dir)).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(state_path(&dir)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         // An older write that lands late doesn't replace a newer one.
         let old = next_generation();
         let new = next_generation();
@@ -509,17 +533,19 @@ mod tests {
         let config = config();
         let home = Path::new("/home/nobody");
         let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), cwd: cwd.map(PathBuf::from) };
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_str().unwrap();
         // Recorded directory kept.
-        assert_eq!(resolve_tab(&local("Shell", Some("/tmp")), &config, home), RestoredTab::Local { profile: 0, cwd: "/tmp".into() });
+        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into() });
         // Missing profile: the default one.
-        assert_eq!(resolve_tab(&local("Gone", Some("/tmp")), &config, home), RestoredTab::Local { profile: 0, cwd: "/tmp".into() });
+        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into() });
         // Deleted directory: home, or the profile's own directory.
         let gone = "/nonexistent/brindle-dir";
         assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
         assert_eq!(resolve_tab(&local("shell", None), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
         assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), RestoredTab::Local { profile: 1, cwd: "/".into() });
         // Classic tmux is a local tab.
-        assert_eq!(resolve_tab(&local("classic", Some("/tmp")), &config, home), RestoredTab::Local { profile: 3, cwd: "/tmp".into() });
+        assert_eq!(resolve_tab(&local("classic", Some(tmp)), &config, home), RestoredTab::Local { profile: 3, cwd: tmp.into() });
         // Control mode keeps the recorded (possibly renamed) session.
         let tmux = |profile: &str, session: &str| TabState::Tmux { profile: profile.into(), session: session.into() };
         assert_eq!(resolve_tab(&tmux("TMUX", "renamed"), &config, home), RestoredTab::Tmux { profile: 2, session: "renamed".into() });
