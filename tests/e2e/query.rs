@@ -8,14 +8,19 @@ use crate::{Ctx, Result, ensure};
 
 const SCRIPT: &str = r#"#!/bin/bash
 # Queries the default background (OSC 11) and foreground (OSC 10) and
-# prints the replies as bg=... and fg=... lines.
+# prints the replies as bg=... and fg=... lines. Echo is off throughout: a
+# reply that arrives before `read -s` starts would otherwise be echoed onto
+# the line it prints.
+stty -echo; trap 'stty echo' EXIT
 q() { printf '\033]%s;?\a' "$1"; read -t{T} -rsd $'\a' r; printf '%s=%s\n' "$2" "${r#*;}"; }
 q 11 bg; q 10 fg
 "#;
 
 const PALETTE_SCRIPT: &str = r#"#!/bin/bash
 # Queries each palette index given (OSC 4) and prints p<index>=<first reply>
-# extra=<a second reply arriving within half a second>, colors only.
+# extra=<a second reply arriving within half a second>, colors only. Echo
+# is off throughout, as in the default-color script.
+stty -echo; trap 'stty echo' EXIT
 for i in "$@"; do
   printf '\033]4;%s;?\a' "$i"
   r=; read -t{T} -rsd $'\a' r; e=; read -t{E} -rsd $'\a' e
