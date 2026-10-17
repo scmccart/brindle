@@ -12,6 +12,9 @@ inside the terminal: tmux windows become tabs and panes are drawn natively,
 while sessions stay in tmux, persistent and detachable.
 
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
+  A new tab starts in the active tab's directory: on Linux the foreground
+  program's, on Windows the one its shell last reported (see
+  [Shell integration](#shell-integration)).
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
 - **Shell integration** (OSC 133): jump between prompts, select or copy the last
@@ -328,15 +331,26 @@ saved session.
 ### Shell integration
 
 Shells can mark their prompts and command output with OSC 133 sequences. Brindle
-ships scripts that do this for bash, zsh and fish. Load one at the **end** of
-your shell's startup file, after your prompt theme and anything that sets
-`PROMPT_COMMAND`:
+ships scripts that do this for bash, zsh, fish and PowerShell. Load one at the
+**end** of your shell's startup file, after your prompt theme and anything that
+sets `PROMPT_COMMAND` or defines `prompt`:
 
 ```sh
 eval "$(brindle --shell-integration bash)"    # ~/.bashrc
 eval "$(brindle --shell-integration zsh)"     # ~/.zshrc
 brindle --shell-integration fish | source     # ~/.config/fish/config.fish
 ```
+
+```powershell
+brindle --shell-integration pwsh | Out-String | Invoke-Expression   # $PROFILE
+```
+
+The PowerShell script works in PowerShell 7 and Windows PowerShell 5.1, and also
+reports the current directory (OSC 7). On Windows, where Brindle can't read
+another program's directory, that report is what a new tab and a restored tab
+start in; without it they start in your home directory. Tools that report the
+directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
+the like, when configured to) work the same way.
 
 The same scripts are in [`shell-integration/`](shell-integration/) if you'd rather
 `source` a file. Brindle never edits your startup files or injects the scripts
