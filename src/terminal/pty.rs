@@ -145,8 +145,9 @@ impl OnResize for MarkedPty {
 /// Brindle's pseudoconsole with a [`ParsingReader`] on its output.
 #[cfg(windows)]
 pub struct MarkedPty {
-    // First, so it is released and closed before the pipes drop.
-    console: super::conpty::Pseudoconsole,
+    // First, so it is released and closed (if the tab is done with it too)
+    // before the pipes drop.
+    console: Arc<super::conpty::Pseudoconsole>,
     reader: ParsingReader<super::conpty::PipeReader>,
     writer: super::conpty::PipeWriter,
     child: super::conpty::ChildWatcher,

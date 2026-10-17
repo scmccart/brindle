@@ -179,6 +179,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(windows)]
+        terminal.read(cx).parent_console_to(window);
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
             cx.observe(&terminal, |this, _, cx| {

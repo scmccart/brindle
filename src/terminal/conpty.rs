@@ -214,8 +214,10 @@ pub struct Pseudoconsole {
     handle: HPCON,
 }
 
-// SAFETY: a pseudoconsole handle may be used from any thread.
+// SAFETY: a pseudoconsole handle may be used from any thread: the event
+// loop resizes it while the UI reparents it.
 unsafe impl Send for Pseudoconsole {}
+unsafe impl Sync for Pseudoconsole {}
 
 impl Pseudoconsole {
     pub fn resize(&self, size: WindowSize) {
@@ -229,11 +231,13 @@ impl Pseudoconsole {
     /// Parents the console window programs can ask for (`GetConsoleWindow`)
     /// to `window`, so their dialogs belong to Brindle's window. Only the
     /// packaged host supports it.
-    #[allow(dead_code)]
     pub fn reparent(&self, window: HWND) {
         if let Some(reparent) = api().reparent {
             // SAFETY: `handle` is open until drop; any HWND is accepted.
-            unsafe { reparent(self.handle, window) }.ok().ok();
+            match unsafe { reparent(self.handle, window) }.ok() {
+                Ok(()) => log::debug!("pseudoconsole parented to window {:?}", window.0),
+                Err(err) => log::warn!("parenting the pseudoconsole to Brindle's window: {err}"),
+            }
         }
     }
 }
@@ -627,7 +631,9 @@ pub struct Command {
 
 /// A program running on its pseudoconsole.
 pub struct Spawned {
-    pub console: Pseudoconsole,
+    /// Shared by the event loop (resizes) and the tab (reparenting); closed
+    /// when both are done with it.
+    pub console: Arc<Pseudoconsole>,
     pub reader: PipeReader,
     pub writer: PipeWriter,
     pub child: ChildWatcher,
@@ -650,7 +656,7 @@ pub fn spawn(command: &Command, size: WindowSize) -> io::Result<Spawned> {
         )
     }
     .ok()?;
-    let console = Pseudoconsole { handle };
+    let console = Arc::new(Pseudoconsole { handle });
     drop((input_read, output_write));
 
     let pid = start(command, console.handle)?;

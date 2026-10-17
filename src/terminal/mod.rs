@@ -154,6 +154,8 @@ enum Backend {
     Pty {
         sender: EventLoopSender,
         process: process::PtyProcess,
+        #[cfg(windows)]
+        console: Arc<conpty::Pseudoconsole>,
     },
     Remote {
         scanner: Scanner,
@@ -324,12 +326,12 @@ impl Terminal {
         #[cfg(windows)]
         let spawned = (|| -> anyhow::Result<Backend> {
             let spawned = conpty::spawn(&command, size.into())?;
-            let child_pid = spawned.pid;
+            let (child_pid, console) = (spawned.pid, spawned.console.clone());
             let pty = pty::MarkedPty::new(spawned, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx);
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
-            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid) })
+            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid), console })
         })();
 
         let theme = config.profile_theme(profile);
@@ -707,6 +709,23 @@ impl Terminal {
             return None;
         };
         process.foreground_name()
+    }
+
+    /// Parents the tab's console window to `window`, so dialogs that console
+    /// programs open (credential prompts, for one) belong to Brindle's
+    /// window. Local tabs never move between windows, so once is enough.
+    #[cfg(windows)]
+    pub fn parent_console_to(&self, window: &gpui::Window) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Backend::Pty { console, .. } = &self.backend else {
+            return;
+        };
+        // GPUI's own `window_handle` is another thing.
+        if let Ok(handle) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(win32) = handle.as_raw()
+        {
+            console.reparent(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut std::ffi::c_void));
+        }
     }
 
     /// Current working directory of the foreground process (falls back to the shell).
