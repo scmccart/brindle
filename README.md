@@ -90,8 +90,8 @@ bus, so nothing opens on the desktop.
 
 CI (`.github/workflows/ci.yml`) runs the unit tests, a release build, and the
 end-to-end suite that way on Ubuntu 26.04, against tmux 3.6a (Ubuntu's) and
-3.8 (built from source). A failed end-to-end job uploads `target/tmp/e2e/` as
-an artifact.
+3.8 (built from source), for every push and every pull request. A failed
+end-to-end job uploads `target/tmp/e2e/` as an artifact.
 
 ### Performance
 

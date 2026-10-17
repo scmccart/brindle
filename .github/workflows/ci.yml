@@ -1,10 +1,14 @@
 # Unit tests, a release build, and the end-to-end suite on two tmux versions.
 # The e2e jobs are advisory: they go red on failure but aren't required checks.
+#
+# Every push and every pull request runs it. Dependabot's branches always
+# have a PR, so their pushes are skipped instead of running twice.
 
 name: CI
 
 on:
   push:
+    branches-ignore: ["dependabot/**"]
   pull_request:
   workflow_dispatch:
 
@@ -17,14 +21,12 @@ concurrency:
 
 env:
   # The desktop's toolchain; the runner image's own lags behind.
-  RUST_VERSION: "1.99.0"
+  RUST_VERSION: "1.99.1"
   CARGO_TERM_COLOR: always
   BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
 
 jobs:
   test:
-    # A branch in this repository already ran on push; PRs only run for forks.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -46,7 +48,6 @@ jobs:
         run: BRINDLE_PERF=1 cargo test --locked --test perf -- --self-test
 
   release:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -64,7 +65,6 @@ jobs:
       - run: cargo build --release --locked
 
   e2e:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:

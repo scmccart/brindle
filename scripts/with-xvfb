@@ -12,6 +12,10 @@
 # private session bus. Nothing opens on the desktop.
 #
 # Needs: xvfb x11-utils openbox mesa-vulkan-drivers dbus
+#
+# A cargo packaged as a snap can't run under it: snap tracks its processes
+# through the user's session bus, which the private bus replaces. Install
+# Rust with rustup.rs instead.
 set -eu
 
 if [ $# -eq 0 ]; then
