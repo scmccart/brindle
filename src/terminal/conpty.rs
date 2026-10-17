@@ -133,7 +133,7 @@ fn shipped_dir(exe_dir: Option<&Path>, extract_dir: Option<&Path>, (dll, host): 
     if !matches(dir) {
         std::fs::create_dir_all(dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
         for (name, bytes) in [(DLL, dll), (HOST, host)] {
-            write_replacing(&dir.join(name), bytes).map_err(|err| format!("writing {}: {err}", dir.join(name).display()))?;
+            crate::win::write_replacing(&dir.join(name), bytes).map_err(|err| format!("writing {}: {err}", dir.join(name).display()))?;
         }
     }
     Ok(dir.to_path_buf())
@@ -141,16 +141,6 @@ fn shipped_dir(exe_dir: Option<&Path>, extract_dir: Option<&Path>, (dll, host): 
 
 fn same(path: &Path, bytes: &[u8]) -> bool {
     std::fs::read(path).is_ok_and(|on_disk| on_disk == bytes)
-}
-
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`, so a concurrent Brindle never loads half a file.
-fn write_replacing(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        std::fs::remove_file(&tmp).ok();
-    })
 }
 
 /// Loads `dir\conpty.dll` by absolute path. It finds `OpenConsole.exe`

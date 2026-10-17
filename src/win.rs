@@ -20,6 +20,16 @@ pub const APP_ID: &str = "Brindle.Terminal";
 /// Where an app with no shortcut registers its toast name and icon.
 const APP_ID_KEY: &str = r"Software\Classes\AppUserModelId\Brindle.Terminal";
 
+/// Writes `bytes` to a temporary file beside `path`, then renames it over
+/// `path`, so a concurrent Brindle never reads half a file.
+pub fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        std::fs::remove_file(&tmp).ok();
+    })
+}
+
 /// Gives this process Brindle's AppUserModelID. Called before any window
 /// opens.
 pub fn set_app_id() {

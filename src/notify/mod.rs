@@ -355,10 +355,23 @@ fn toast_xml(title: &str, body: &str) -> String {
     )
 }
 
-/// The PNG toasts show for Brindle, once one is written out.
+/// The PNG toasts show for Brindle (the AUMID's `IconUri`), written to
+/// `%LOCALAPPDATA%rindle` when the file there differs.
 #[cfg(windows)]
 fn icon_path() -> Option<PathBuf> {
-    None
+    const ICON: &[u8] = include_bytes!("../../assets/windows/brindle-256.png");
+    let dir = dirs::data_local_dir()?.join("brindle");
+    let path = dir.join("brindle-256.png");
+    if std::fs::read(&path).is_ok_and(|on_disk| on_disk == ICON) {
+        return Some(path);
+    }
+    match std::fs::create_dir_all(&dir).and_then(|()| crate::win::write_replacing(&path, ICON)) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            log::warn!("writing the notification icon to {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 /// One line of the test log: source, title and body, separated by tabs.
