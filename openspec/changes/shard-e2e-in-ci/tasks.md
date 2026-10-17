@@ -2,13 +2,13 @@
 
 ## 1. Harness
 
-- [ ] 1.1 In `tests/e2e/main.rs`, parse `--shard K/N` (one argument after it), and after filtering keep the cases at 0-based positions i with `i % N == K - 1`. Print `e2e: shard K/N, M of T cases` before running. Exit 2 with a usage message for a missing or malformed value, `N = 0`, or `K` outside 1..=N. Put the selection in a function with a self-test (`--self-test`): 10 cases at 3 shards give 4, 3 and 3 cases, which together are all 10, each exactly once. Verify: the self-test passes; `--shard 0/4`, `--shard 5/4` and `--shard x` exit 2; `-- --list --shard 2/4` is unaffected (`--list` lists every case).
-- [ ] 1.2 Run all four shards headless (`BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- --shard K/4` for K = 1–4). Verify: together they report 100 passed, every case exactly once (compare the `ok` lines with `--list`).
+- [x] 1.1 In `tests/e2e/main.rs`, parse `--shard K/N` (one argument after it), and after filtering keep the cases at 0-based positions i with `i % N == K - 1`. Print `e2e: shard K/N, M of T cases` before running. Exit 2 with a usage message for a missing or malformed value, `N = 0`, or `K` outside 1..=N. Put the selection in a function with a self-test (`--self-test`): 10 cases at 3 shards give 4, 3 and 3 cases, which together are all 10, each exactly once. Verify: the self-test passes; `--shard 0/4`, `--shard 5/4` and `--shard x` exit 2; `-- --list --shard 2/4` is unaffected (`--list` lists every case).
+- [x] 1.2 Run all four shards headless (`BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- --shard K/4` for K = 1–4). Verify: together they report 100 passed, every case exactly once (compare the `ok` lines with `--list`).
 
 ## 2. CI
 
-- [ ] 2.1 In `.github/workflows/ci.yml`, cross the `e2e` job's tmux entries with `shard: [1, 2, 3, 4]` as in design.md, pass `-- --shard ${{ matrix.shard }}/4` to the suite, name jobs `e2e (tmux <v>, <k>/4)`, and name the artifact `e2e-tmux-<v>-shard-<k>`. Verify: actionlint passes, ignoring only the unknown `ubuntu-26.04` label.
-- [ ] 2.2 Update README.md's and CLAUDE.md's CI and e2e notes: `--shard K/N`, CI's 4 shards per tmux version, where the shard count lives, and the artifact names.
+- [x] 2.1 In `.github/workflows/ci.yml`, cross the `e2e` job's tmux entries with `shard: [1, 2, 3, 4]` as in design.md, pass `-- --shard ${{ matrix.shard }}/4` to the suite, name jobs `e2e (tmux <v>, <k>/4)`, and name the artifact `e2e-tmux-<v>-shard-<k>`. Verify: actionlint passes, ignoring only the unknown `ubuntu-26.04` label.
+- [x] 2.2 Update README.md's and CLAUDE.md's CI and e2e notes: `--shard K/N`, CI's 4 shards per tmux version, where the shard count lives, and the artifact names.
 
 ## 3. Verify on GitHub and land
 

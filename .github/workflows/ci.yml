@@ -65,20 +65,24 @@ jobs:
       - run: cargo build --release --locked
 
   e2e:
+    name: e2e (tmux ${{ matrix.tmux.version }}, ${{ matrix.shard }}/4)
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
+        tmux:
           # Ubuntu's package, the desktop's version.
-          - tmux: "3.6a"
+          - version: "3.6a"
             reports: tmux 3.6
           # The latest release, built from source. tmux publishes no
           # checksums, so the tarball's is pinned here.
-          - tmux: "3.8"
+          - version: "3.8"
             reports: tmux 3.8
             sha256: e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e
+        # Each tmux version's suite runs in 4 shards (every 4th case). The
+        # count is here, in the job name and in the suite's --shard.
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
       - name: Install packages
@@ -87,32 +91,32 @@ jobs:
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
             xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus tmux less \
-            ${{ matrix.sha256 && 'libevent-dev libncurses-dev bison' || '' }}
-      - name: Cache tmux ${{ matrix.tmux }}
-        if: matrix.sha256
+            ${{ matrix.tmux.sha256 && 'libevent-dev libncurses-dev bison' || '' }}
+      - name: Cache tmux ${{ matrix.tmux.version }}
+        if: matrix.tmux.sha256
         id: tmux-cache
         uses: actions/cache@v6
         with:
-          path: ~/tmux-${{ matrix.tmux }}
-          key: tmux-${{ matrix.tmux }}-${{ matrix.sha256 }}-ubuntu-26.04
-      - name: Build tmux ${{ matrix.tmux }}
-        if: matrix.sha256 && steps.tmux-cache.outputs.cache-hit != 'true'
+          path: ~/tmux-${{ matrix.tmux.version }}
+          key: tmux-${{ matrix.tmux.version }}-${{ matrix.tmux.sha256 }}-ubuntu-26.04
+      - name: Build tmux ${{ matrix.tmux.version }}
+        if: matrix.tmux.sha256 && steps.tmux-cache.outputs.cache-hit != 'true'
         working-directory: ${{ runner.temp }}
         run: |
-          curl -fsSLO "https://github.com/tmux/tmux/releases/download/${{ matrix.tmux }}/tmux-${{ matrix.tmux }}.tar.gz"
-          echo "${{ matrix.sha256 }}  tmux-${{ matrix.tmux }}.tar.gz" | sha256sum -c
-          tar xzf "tmux-${{ matrix.tmux }}.tar.gz"
-          cd "tmux-${{ matrix.tmux }}"
-          ./configure --prefix="$HOME/tmux-${{ matrix.tmux }}"
+          curl -fsSLO "https://github.com/tmux/tmux/releases/download/${{ matrix.tmux.version }}/tmux-${{ matrix.tmux.version }}.tar.gz"
+          echo "${{ matrix.tmux.sha256 }}  tmux-${{ matrix.tmux.version }}.tar.gz" | sha256sum -c
+          tar xzf "tmux-${{ matrix.tmux.version }}.tar.gz"
+          cd "tmux-${{ matrix.tmux.version }}"
+          ./configure --prefix="$HOME/tmux-${{ matrix.tmux.version }}"
           make -j"$(nproc)"
           make install
-      - name: Put tmux ${{ matrix.tmux }} first on PATH
-        if: matrix.sha256
-        run: echo "$HOME/tmux-${{ matrix.tmux }}/bin" >> "$GITHUB_PATH"
+      - name: Put tmux ${{ matrix.tmux.version }} first on PATH
+        if: matrix.tmux.sha256
+        run: echo "$HOME/tmux-${{ matrix.tmux.version }}/bin" >> "$GITHUB_PATH"
       - name: Check the tmux version
         run: |
           tmux -V
-          test "$(tmux -V)" = "${{ matrix.reports }}"
+          test "$(tmux -V)" = "${{ matrix.tmux.reports }}"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -122,7 +126,7 @@ jobs:
       - name: Build
         run: cargo test --locked --test e2e --no-run
       - name: End-to-end suite
-        run: scripts/with-xvfb cargo test --locked --test e2e
+        run: scripts/with-xvfb cargo test --locked --test e2e -- --shard ${{ matrix.shard }}/4
         env:
           BRINDLE_E2E: "1"
           # lavapipe and shared runners are slower than a desktop.
@@ -131,6 +135,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-tmux-${{ matrix.tmux }}
+          name: e2e-tmux-${{ matrix.tmux.version }}-shard-${{ matrix.shard }}
           path: target/tmp/e2e/
           retention-days: 14

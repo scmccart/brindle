@@ -67,6 +67,7 @@ cargo test                                      # unit tests; no display needed
 BRINDLE_E2E=1 cargo test --test e2e             # end-to-end suite
 BRINDLE_E2E=1 cargo test --test e2e -- titles   # only cases whose names contain "titles"
 BRINDLE_E2E=1 cargo test --test e2e -- --list   # list the cases
+BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/4  # every 4th case, from the 2nd
 ```
 
 The end-to-end suite in `tests/e2e/` runs Brindle against throwaway tmux
@@ -90,8 +91,9 @@ bus, so nothing opens on the desktop.
 
 CI (`.github/workflows/ci.yml`) runs the unit tests, a release build, and the
 end-to-end suite that way on Ubuntu 26.04, against tmux 3.6a (Ubuntu's) and
-3.8 (built from source), for every push and every pull request. A failed
-end-to-end job uploads `target/tmp/e2e/` as an artifact.
+3.8 (built from source), for every push and every pull request. Each tmux
+version's suite is split into 4 shards that run as separate jobs. A failed
+shard uploads its `target/tmp/e2e/` as an artifact.
 
 ### Performance
 
