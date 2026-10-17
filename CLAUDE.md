@@ -20,6 +20,17 @@ cargo test collector_matches_the_spike_transcript   # one test
 - The GPUI and alacritty sources to read for API questions are in `~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2` and `.../alacritty_terminal-0.26.0`.
 - Zed's `terminal`/`terminal_view` crates are GPL-3.0. Use them only to learn the API shape and never copy code from them: Brindle is MIT OR Apache-2.0.
 
+## Commit messages
+
+Commits follow Conventional Commits, checked by commitlint (`commitlint.config.mjs`):
+- Subject is `type(scope)!: subject`. Types: `feat`, `fix`, `docs`, `test`, `ci`, `build`, `refactor`, `perf`, `style`, `chore`, `revert`.
+- Scopes are lower-case and name the area: `tmux`, `e2e`, `settings`, `shell-integration`, `deps`.
+- The subject starts lowercase, except for an acronym (`docs: README, …`). Headers are at most 100 characters.
+- `!` marks a breaking change (a changed key, config or default).
+- OpenSpec propose, archive and check-off commits are `docs(openspec): …`. Merges keep `Merge …`, which the linter skips.
+- `git config core.hooksPath scripts/hooks` (set in this clone) runs `scripts/lint-commits --edit` as a `commit-msg` hook. `scripts/lint-commits` alone checks the commits not on `origin/main`; `scripts/lint-commits BASE` checks `BASE..HEAD`.
+- It runs commitlint through `npx` (Node ≥ 22.12), with `COMMITLINT_VERSION` pinned in the script and moved by hand. To vet a bump, run `scripts/lint-commits 7157fba` (the root commit) over the whole history.
+
 ## Verifying GUI behaviour
 
 **Never inject synthetic input (XTest, xdotool) on this desktop.** It goes to the user's focused window, not Brindle. Opening a window can also steal focus while the user is typing, so ask before GUI runs unless they've said they're away. Use the built-in debug hooks instead:
@@ -54,7 +65,7 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/4   # every 4th selected case, 
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
 - `scripts/with-xvfb <command>` runs it headless: a private Xvfb on a free display, openbox, lavapipe (`VK_DRIVER_FILES`), `LC_ALL=C.UTF-8` and a private session bus (`dbus-run-session`). Runs under it open no windows on the desktop, so they don't need asking first, unlike runs on `:0`. The suite needs both the window manager (palette and multi-window cases) and the UTF-8 locale (without one, tmux replaces the tabs in its control-mode replies with `_`).
-- CI (`.github/workflows/ci.yml`, `ubuntu-26.04` runners, no containers) runs on every pull request and on pushes to every branch except Dependabot's (those always have a PR): `test` (`cargo test` and both harness self-tests), `release`, and `e2e` (the suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`) per tmux version in 4 shards (`--shard K/4`, round-robin after filters; the count is in the matrix, the job name and the command). e2e is advisory: red on failure, not a required check. A failed shard uploads `target/tmp/e2e/` as `e2e-tmux-<v>-shard-<k>`; rerun it locally with the same `--shard`. Move the pins in the workflow: `RUST_VERSION`, and the e2e matrix (a tmux version, what `tmux -V` reports, and the tarball's sha256 when it's built from source). `RUST_VERSION` matches the desktop's toolchain. Dependabot (`.github/dependabot.yml`) opens monthly PRs for the actions; Cargo gets security PRs only, which are lockfile bumps to review against the `Cargo.lock` rule above.
+- CI (`.github/workflows/ci.yml`, `ubuntu-26.04` runners, no containers) runs on every pull request and on pushes to every branch except Dependabot's (those always have a PR): `commits` (`scripts/lint-commits` from the PR's base or the push's `before`, else from `origin/main`), `test` (`cargo test` and both harness self-tests), `release`, and `e2e` (the suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`) per tmux version in 4 shards (`--shard K/4`, round-robin after filters; the count is in the matrix, the job name and the command). e2e is advisory: red on failure, not a required check. A failed shard uploads `target/tmp/e2e/` as `e2e-tmux-<v>-shard-<k>`; rerun it locally with the same `--shard`. Move the pins by hand: `COMMITLINT_VERSION` in `scripts/lint-commits`, and in the workflow `RUST_VERSION`, and the e2e matrix (a tmux version, what `tmux -V` reports, and the tarball's sha256 when it's built from source). `RUST_VERSION` matches the desktop's toolchain. Dependabot (`.github/dependabot.yml`) opens monthly PRs for the actions; Cargo gets security PRs only (its entry sets `open-pull-requests-limit: 0`), which are lockfile bumps to review against the `Cargo.lock` rule above. Both entries set `commit-message` so subjects read `chore(deps): bump …`.
 
 ### Manual checks
 
