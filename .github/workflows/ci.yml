@@ -113,6 +113,9 @@ jobs:
             Sort-Object FullName | Select-Object -Last 1
           if (-not $fxc) { throw "no fxc.exe in the Windows SDK" }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      # The packaged ConPTY that build.rs embeds.
+      - run: scripts/fetch-conpty.ps1
+        shell: pwsh
       - run: cargo build --release --locked
       - run: cargo test --locked
       - name: e2e harness self-test
@@ -123,6 +126,36 @@ jobs:
         run: cargo test --locked --test perf -- --self-test
         env:
           BRINDLE_PERF: "1"
+
+  # The Windows cases of the end-to-end suite, on the runner's desktop.
+  # Advisory, like the Linux e2e jobs.
+  windows-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      - run: scripts/fetch-conpty.ps1
+        shell: pwsh
+      - name: Build
+        run: cargo test --locked --test e2e --no-run
+      - name: End-to-end suite
+        run: cargo test --locked --test e2e
+        env:
+          BRINDLE_E2E: "1"
+          BRINDLE_E2E_SLOW: "2"
+      - name: Upload the suite's output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-windows
+          path: target/tmp/e2e/
+          retention-days: 14
 
   e2e:
     name: e2e (tmux ${{ matrix.tmux.version }}, ${{ matrix.shard }}/4)
