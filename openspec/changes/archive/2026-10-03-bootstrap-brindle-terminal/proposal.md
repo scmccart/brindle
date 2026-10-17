@@ -1,7 +1,7 @@
 # Proposal
 
 > **Backfilled record.** This change describes work that was already built and
-> committed (commits `a87eb34` through `488ca95`, 2026-10-03) before the
+> committed (commits `7157fba` through `407d91c`, 2026-10-03) before the
 > project used OpenSpec. It is written after the fact to give later changes a
 > baseline and a record of why things are the way they are.
 
