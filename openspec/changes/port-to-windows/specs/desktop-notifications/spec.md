@@ -28,6 +28,6 @@ Notifications SHALL be sent without blocking the window: on Linux to the desktop
 - **WHEN** the user has turned off notifications for Brindle in Windows Settings and a background tab rings the bell
 - **THEN** no toast appears, the tab shows its bell dot, and Brindle stays responsive
 
-#### Scenario: Toasts without the installer
-- **WHEN** Brindle was installed with `cargo install`, with no Start Menu shortcut, and a background tab sends an OSC 9 notification
+#### Scenario: Toasts without a Start Menu shortcut
+- **WHEN** Brindle was installed with WinGet or `cargo install`, with no Start Menu shortcut, and a background tab sends an OSC 9 notification
 - **THEN** a toast attributed to Brindle appears

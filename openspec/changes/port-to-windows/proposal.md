@@ -2,7 +2,7 @@
 
 ## Why
 
-Brindle only builds and runs on Linux. GPUI 0.2.2 already renders with Direct3D 11 on Windows, and alacritty_terminal 0.26 has a ConPTY backend. That backend, though, uses only the original 2018 pseudoconsole API. Windows' built-in ConPTY re-renders program output instead of passing it through. In a spike on Windows 11 build 26200 it dropped mouse-mode requests, emptied synchronized updates, answered OSC 11 itself, and moved OSC 0/7/9/52 ahead of the text they belong to. Microsoft's current ConPTY (the one Windows Terminal ships, MIT-licensed on NuGet) passed every test sequence through byte for byte. Windows 11 users also expect an MSI, a Start Menu entry, toasts and a native-feeling title bar. Brindle itself has Unix-only code in about a dozen places (PTY spawn, `/proc`, `flock`, D-Bus, Wayland, `xdg-open`, `/bin/sh`), and a Windows `cargo check` stops on all of them.
+Brindle only builds and runs on Linux. GPUI 0.2.2 already renders with Direct3D 11 on Windows, and alacritty_terminal 0.26 has a ConPTY backend. That backend, though, uses only the original 2018 pseudoconsole API. Windows' built-in ConPTY re-renders program output instead of passing it through. In a spike on Windows 11 build 26200 it dropped mouse-mode requests, emptied synchronized updates, answered OSC 11 itself, and moved OSC 0/7/9/52 ahead of the text they belong to. Microsoft's current ConPTY (the one Windows Terminal ships, MIT-licensed on NuGet) passed every test sequence through byte for byte. Windows 11 users also expect to install with WinGet, a Start Menu entry, toasts and a native-feeling title bar. Brindle itself has Unix-only code in about a dozen places (PTY spawn, `/proc`, `flock`, D-Bus, Wayland, `xdg-open`, `/bin/sh`), and a Windows `cargo check` stops on all of them.
 
 ## What Changes
 
@@ -39,8 +39,9 @@ Brindle only builds and runs on Linux. GPUI 0.2.2 already renders with Direct3D 
   - No Windows directory is passed as `-c`.
 - **Install experience:**
   - Icon and version resources in `brindle.exe`.
-  - A WiX MSI, installed per-machine with the packaged ConPTY next to the executable. It has a stable UpgradeCode, a Start Menu shortcut carrying the AppUserModelID, an optional `PATH` feature, and an uninstall that leaves `%APPDATA%\brindle` alone.
-  - `--install-desktop` / `--uninstall-desktop` create and remove a per-user Start Menu shortcut. `--prefix` is rejected on Windows.
+  - No installer. `brindle.exe` embeds the packaged ConPTY and runs from any directory, so a release is a zip: `brindle.exe` and the licence texts, built and uploaded by CI.
+  - A WinGet manifest for that zip, installing `brindle.exe` as a portable `brindle` command. WinGet gives install, upgrade, uninstall, an Installed apps entry and the command on `PATH`, and leaves `%APPDATA%\brindle` alone.
+  - `--install-desktop` / `--uninstall-desktop` create and remove a per-user Start Menu shortcut, which WinGet's portable installs don't create. `--prefix` is rejected on Windows.
 - **Verification.**
   - Windows builds, unit tests and Windows e2e cases run on this Windows machine and in a Windows CI job.
   - Linux regressions are checked on the Linux machine (via its Claude session) and by the existing Linux CI.
@@ -65,7 +66,7 @@ None. Windows behaviour extends existing capabilities.
 - `session-restore`: the state directory on Windows.
 - `links`: the Windows opener.
 - `desktop-notifications`: toast delivery and click-to-tab on Windows.
-- `desktop-integration`: the Windows icon resource, MSI, upgrade and uninstall, the per-user shortcut and the `--prefix` rejection.
+- `desktop-integration`: the Windows icon resource, the release zip, the WinGet package with its upgrade and uninstall, the per-user shortcut and the `--prefix` rejection.
 - `tmux-control-mode`: attaching through WSL.
 
 ## Impact
@@ -75,21 +76,22 @@ None. Windows behaviour extends existing capabilities.
   - Also changed: `src/terminal/{mod,links,scan}.rs`, `src/terminal/shell_integration.rs` (OSC 7 / 9;9), `src/session.rs`, `src/notify/` (a toast sink beside D-Bus), `src/workspace.rs` (caption controls, `open_config`), `src/config.rs`, `src/settings.rs`, `src/tmux/mod.rs`, `src/desktop.rs` and `src/main.rs`.
 - **New files:**
   - `build.rs`;
-  - `assets/windows/{brindle.rc,brindle.ico}`;
-  - `scripts/render-icons.sh` and `scripts/fetch-conpty.ps1`;
+  - `assets/windows/{brindle.rc,brindle.ico,brindle-256.png}`;
+  - `scripts/render-icons.sh`, `scripts/fetch-conpty.ps1`, `scripts/package-windows.ps1` and `scripts/winget-manifest.ps1`;
   - `shell-integration/brindle.ps1`;
-  - `packaging/windows/brindle.wxs`;
+  - `packaging/windows/THIRD-PARTY-NOTICES.txt` and the WinGet manifest templates in `packaging/winget/`;
   - Windows e2e cases;
   - Windows sections in README.md and CLAUDE.md.
 - **Dependencies:**
   - `windows` 0.61 (Windows-only) and `embed-resource` 3 (Windows-only build dependency). Both are already locked, so `Cargo.lock` gains only the two dependency edges, as checked in a scratch copy.
   - The packaged ConPTY is fetched by a pinned script (NuGet `Microsoft.Windows.Console.ConPTY`, version and sha256 pinned) and embedded at build time. It isn't committed to git.
-- **Build prerequisites on Windows:** MSVC, the Windows 11 SDK (`fxc.exe`, `rc.exe`), and the WiX CLI for the MSI.
+- **Build prerequisites on Windows:** MSVC and the Windows 11 SDK (`fxc.exe`, `rc.exe`).
 - **Out of scope:**
   - Windows 10;
   - ARM64;
   - code signing;
-  - MSIX and the Store;
+  - an MSI or other installer, MSIX and the Store;
+  - publishing GitHub Releases and submitting the manifest to `microsoft/winget-pkgs`, which come with the first release;
   - win32-input-mode key encoding, because GPUI 0.2.2 doesn't expose virtual-key codes, scan codes or key-ups;
   - native (non-WSL) tmux;
   - translating paths between Windows and WSL.

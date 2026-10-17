@@ -108,9 +108,13 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 - [x] 8.2 Add a CI check that fails when `assets/brindle.svg` is newer in git history than `assets/windows/brindle.ico`. Verify by touching the SVG on a scratch branch, and then reverting.
 - [ ] 8.3 Add `assets/windows/brindle.rc` (`1 ICON`, `VERSIONINFO` from `/D` macros) to `build.rs`. Verify locally that `(Get-Item target\release\brindle.exe).VersionInfo` shows Brindle and the crate version, that `[System.Drawing.Icon]::ExtractAssociatedIcon` returns the icon, and that `mt.exe -inputresource:brindle.exe;#1 -out:m.xml` contains `PerMonitorV2`. If it doesn't, apply the design §12 fallback and check again. Add the same checks to the CI job, and verify that they pass there.
 - [x] 8.4 Add the Windows `--install-desktop` / `--uninstall-desktop` (design §13): the `.lnk` with the AUMID property; removing the shortcut and the HKCU key; `--prefix` rejected with exit status 2. Unit-test the argument handling, cfg-free. Verify locally (no window opens): the `.lnk` exists, and its `System.AppUserModel.ID` reads `Brindle.Terminal` through `Shell.Application`; uninstall removes both the shortcut and the key; uninstalling twice exits 0; `--prefix C:\Tools` exits 2. Run the same checks in CI.
-- [ ] 8.5 Add `packaging/windows/brindle.wxs` (design §13), with the WiX CLI version pinned. Installing the WiX dotnet tool on this machine changes it, so ask the user first. Build the MSI locally and in CI, and upload it from CI. In CI, after a quiet install, check that `brindle.exe`, `conpty.dll`, `OpenConsole.exe`, the shortcut (with the AUMID) and the uninstall key exist. After uninstall, check that they are all gone and `%APPDATA%\brindle` is untouched. Verify that the CI step passes.
-- [ ] 8.6 Add a CI upgrade check: build `0.0.1-ci` and the real version, install the first and then the second, and assert that exactly one Brindle uninstall key remains and `brindle --version` prints the real version. Verify that the step passes.
-- [ ] 8.7 Document installing in README.md: the MSI; `cargo install` plus `--install-desktop` (and not to use both); the SmartScreen warning for unsigned builds; uninstall leaving config. Verify that each command matches the code and the CI workflow.
+- [ ] 8.5 Add `scripts/package-windows.ps1` and `packaging/windows/THIRD-PARTY-NOTICES.txt` (design §13): the zip holds `brindle.exe`, `LICENSE-MIT`, `LICENSE-APACHE` and the notice, and the script refuses to run without the fetched ConPTY. Run it in the CI `windows` job after the release build and upload the zip. Point the `--prefix` message at WinGet. Verify locally that the zip lists exactly those four files, and that its `brindle.exe`, unpacked into a scratch directory, prints the crate version with `--version`. Verify that the CI step passes and the artifact is there.
+- [ ] 8.6 Add the WinGet manifest templates in `packaging/winget/` and `scripts/winget-manifest.ps1` (design §13), and a CI step that writes the manifest for the built zip and runs `winget validate` on it. Verify with `winget validate` locally and in CI. Then, after asking the user (it needs `winget settings --enable LocalManifestFiles` as admin; nothing opens a window), install from a local manifest whose `InstallerUrl` serves the zip from localhost, and check against the `desktop-integration` delta:
+  - a new console runs `brindle --version`, and Brindle is in Installed apps;
+  - `brindle --install-desktop`, run as the installed command, makes a shortcut whose target exists;
+  - upgrading to a zip built with a bumped version in a scratch worktree leaves one Installed apps entry, `brindle --version` prints the new version, and the shortcut still points at an existing exe (if not, make `--install-desktop` target the stable path and check again);
+  - `winget uninstall` removes the command and leaves `%APPDATA%\brindle`.
+- [ ] 8.7 Document installing in README.md: the release zip; WinGet once published (`winget install scmccart.brindle`); `brindle --install-desktop` for a Start Menu entry, and `--uninstall-desktop` before uninstalling; `cargo install` with `scripts/fetch-conpty.ps1`; the SmartScreen warning for unsigned builds; uninstall leaving config. Verify that each command matches the code and the CI workflow.
 
 ## 9. CI completeness
 
@@ -118,9 +122,9 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
 ## 10. Manual verification on Windows 11 (this machine)
 
-These are integration checks on real hardware, using the CI MSI artifact. Ask the user before each GUI step, and report the results. Add the steps that stay manual to CLAUDE.md's "Manual checks".
+These are integration checks on real hardware, using the CI zip artifact. Ask the user before each GUI step, and report the results. Add the steps that stay manual to CLAUDE.md's "Manual checks".
 
-- [ ] 10.1 Install the MSI and launch Brindle from the Start Menu. Check that:
+- [ ] 10.1 Install the CI zip with the local WinGet manifest from 8.6, run `brindle --install-desktop`, and launch Brindle from the Start Menu. Check that:
   - the taskbar, Alt-Tab and title area show the icon;
   - pinning to the taskbar and then launching from the pin gives one button;
   - the window is sharp at 150% scaling and when moved to a monitor with another scale;
@@ -143,7 +147,7 @@ These are integration checks on real hardware, using the CI MSI artifact. Ask th
   - a credential prompt from `git` in a tab centers on Brindle;
   - IME composition works in a terminal and in a palette;
   - wheel scrolling works in a local tab and in a WSL tmux pane.
-- [ ] 10.4 Without the MSI: `scripts/fetch-conpty.ps1`, `cargo install --path .` and `brindle --install-desktop`. Check that the Start Menu entry launches `%USERPROFILE%\.cargo\bin\brindle.exe`, the tab host is the extracted `OpenConsole.exe`, toasts appear, and `--uninstall-desktop` removes the entry. Uninstalling the MSI leaves `%APPDATA%\brindle\config.toml` in place.
+- [ ] 10.4 Without WinGet: `scripts/fetch-conpty.ps1`, `cargo install --path .` and `brindle --install-desktop`. Check that the Start Menu entry launches `%USERPROFILE%\.cargo\bin\brindle.exe`, the tab host is the extracted `OpenConsole.exe`, toasts appear, and `--uninstall-desktop` removes the entry.
 - [ ] 10.5 Run `openspec validate port-to-windows --strict` on Windows. Have the Linux session run `cargo test --locked`, `cargo build --release --locked` and the full with-xvfb e2e suite on the branch head. Check that both CI workflows are green. Report each result.
 
 ## Workflow follow-up

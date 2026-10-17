@@ -90,7 +90,7 @@ See proposal.md for the motivation. These facts were checked on this Windows 11 
 Brindle implements `EventedReadWrite + EventedPty + OnResize` itself and hands that to alacritty's `EventLoop`. alacritty's Windows `Pty` is not used.
 
 - **Which ConPTY.** `ConptyApi` resolves once per process. Every candidate is compared byte for byte with the copy embedded in the binary (§3), so only that exact build is ever loaded. A build without an embedded copy goes straight to the inbox functions.
-  1. `<exe dir>\conpty.dll` and `OpenConsole.exe`, when both match. The MSI installs them there, and dev builds copy them there. A `cargo install`ed exe in `~\.cargo\bin` (user-writable, and on `PATH`) is protected by the same check.
+  1. `<exe dir>\conpty.dll` and `OpenConsole.exe`, when both match. Dev builds copy them there. A `cargo install`ed exe in `~\.cargo\bin` (user-writable, and on `PATH`) is protected by the same check.
   2. Else the embedded copy, extracted to `%LOCALAPPDATA%\brindle\conpty\<version>\`. The extraction is reused when the bytes on disk match, and rewritten when they don't.
   3. Else the inbox `kernel32` functions, logging one warning that names the paths tried.
   - `BRINDLE_CONPTY=inbox` forces step 3. It is a test hook in the same pattern as `BRINDLE_TMUX_STATE`.
@@ -132,7 +132,7 @@ Brindle implements `EventedReadWrite + EventedPty + OnResize` itself and hands t
 - **Build:** on Windows, `build.rs` looks for `.conpty/<version>/` via `CARGO_MANIFEST_DIR`, which also works for `cargo install --path .` with its temporary target dir.
   - When the files are present, it `include_bytes!`s them through a generated file, and copies them next to the build's output exe so `cargo run` uses path 1.
   - When they are absent, it prints a `cargo:warning` that names the script, and the binary falls back as in §2.
-- **Install:** the MSI installs both files beside `brindle.exe`, which is path 1 in admin-protected Program Files. `cargo install` users get path 2 automatically if they ran the script first.
+- **Install:** the release zip holds only `brindle.exe`, which embeds both files. Run from wherever it was unpacked, or from WinGet's package directory, it uses path 2. `cargo install` users get path 2 too if they ran the script first.
 
 *Alternatives:*
 - Commit the binaries (2.3 MB of third-party executables in git history).
@@ -198,7 +198,7 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
 - **The identity:**
   - The AUMID is `Brindle.Terminal`. `main` calls `SetCurrentProcessExplicitAppUserModelID` before any window opens.
   - Brindle registers the AUMID under `HKCU\Software\Classes\AppUserModelId\Brindle.Terminal` (`DisplayName`, `IconUri` pointing to a PNG extracted beside the ConPTY copy). That way toasts work for `cargo install` and dev builds, which have no shortcut.
-  - Both Start Menu shortcuts (MSI and `--install-desktop`) set `System.AppUserModel.ID` to the same value, which gives the taskbar grouping the spec requires.
+  - The `--install-desktop` shortcut sets `System.AppUserModel.ID` to the same value, which gives the taskbar grouping the spec requires.
 - **Click handling:** a click runs `Workspace::show_tab`, then a Windows `activation::raise`. That restores the window if it is minimized and calls `SetForegroundWindow`. If Windows refuses foreground, it calls `FlashWindowEx` so the taskbar button flashes.
 - **Unchanged:** the rate limits, the focus rule and `BRINDLE_NOTIFY_LOG` (which wins over every sink).
 
@@ -232,20 +232,27 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
 - **Icons:** `scripts/render-icons.sh` renders `assets/brindle.svg` to 16–256 px PNGs with `rsvg-convert`, `resvg` or `magick`, packs `assets/windows/brindle.ico` (the 256 px image PNG-compressed), and also writes `assets/windows/brindle-256.png` for the toast `IconUri`. Both are committed. CI fails if the SVG is newer in git history than the `.ico`.
 - **Where it runs:** the script runs under Git Bash on Windows, or on Linux.
 
-### 13. MSI and `--install-desktop`
+### 13. Release zip, WinGet and `--install-desktop`
 
-- **The MSI:** `packaging/windows/brindle.wxs` is written for the WiX CLI (`wix build`, version pinned).
-  - A per-machine `Package` installs to `ProgramFiles64Folder\Brindle`, containing `brindle.exe`, `conpty.dll` and `OpenConsole.exe`.
-  - It has a stable `UpgradeCode` and `MajorUpgrade`.
-  - The Start Menu shortcut carries `ShortcutProperty System.AppUserModel.ID=Brindle.Terminal`.
-  - `ARPPRODUCTICON` is set.
-  - A `LICENSE` RTF includes Brindle's MIT and Apache-2.0 texts and the ConPTY MIT notice.
-  - `PathFeature` is `Level 2`, off by default.
-  - Uninstall removes only what it installed.
-  - If the pinned WiX version needs a EULA flag on the command line, the workflow states it. MSI beats Inno Setup (wrappers needed for enterprise deploys) and MSIX (signing mandatory, plus filesystem virtualisation inside a terminal).
+- **No installer:** `brindle.exe` is self-contained (§3), so it needs no install step and no files beside it.
+- **The zip:** `scripts/package-windows.ps1` writes `target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip`.
+  - It holds `brindle.exe`, `LICENSE-MIT`, `LICENSE-APACHE` and `THIRD-PARTY-NOTICES.txt`, which carries the ConPTY's MIT notice (committed in `packaging/windows/`).
+  - It refuses to package when `.conpty/<version>/` is missing, so a release never falls back to the inbox ConPTY.
+  - The CI `windows` job runs it after the release build and uploads the zip as an artifact.
+- **WinGet:** `packaging/winget/` holds the manifest templates (version, installer and default-locale files) at the newest schema the runner's `winget` validates.
+  - The identifier is `scmccart.brindle`.
+  - The installer is `InstallerType: zip` with `NestedInstallerType: portable`, `brindle.exe` as the nested file and `PortableCommandAlias: brindle`, for x64 and Windows 11 (`MinimumOSVersion: 10.0.22000.0`).
+  - `scripts/winget-manifest.ps1` fills in the version, the GitHub Release asset URL for it and the zip's sha256, writing to `target/dist/winget/`. CI runs it on the built zip and runs `winget validate` on the result.
+  - WinGet installs portable packages per user, links `brindle` into a directory on `PATH`, and adds an Installed apps entry. Its uninstall removes those and nothing in `%APPDATA%\brindle` or `%LOCALAPPDATA%\brindle`.
+  - Publishing the zip to a GitHub Release and submitting the manifest to `microsoft/winget-pkgs` happen at the first release, outside this change.
+- *Alternatives:*
+  - An MSI built with WiX: per-machine installs, its own shortcut and Group Policy deployment, none of which are needed yet. WiX v6 and later also carry the Open Source Maintenance Fee EULA. It can be added later around the same exe.
+  - Inno Setup, which needs wrappers for enterprise deploys.
+  - MSIX, where signing is mandatory, plus filesystem virtualisation inside a terminal.
 - **`--install-desktop`:** it finds `FOLDERID_Programs`, then creates `Brindle.lnk` through `IShellLinkW`, with the path and icon set to `current_exe`, `IPropertyStore` setting `PKEY_AppUserModel_ID`, and `IPersistFile::Save`.
 - **`--uninstall-desktop`:** it deletes the shortcut and the HKCU AUMID key, and treats both being missing as success.
-- **`--prefix`:** rejected with exit status 2. The argument handling is cfg-free and unit-tested.
+- **The shortcut and WinGet:** WinGet doesn't create Start Menu shortcuts for portable packages, so the README points to `brindle --install-desktop`, and to `brindle --uninstall-desktop` before `winget uninstall`, which doesn't know about the shortcut. The shortcut has to keep working across `winget upgrade`. If running through WinGet's `brindle` link makes `current_exe` a path an upgrade breaks, `--install-desktop` resolves it to the stable one.
+- **`--prefix`:** rejected with exit status 2, with a message pointing to WinGet. The argument handling is cfg-free and unit-tested.
 
 ### 14. Verification
 
@@ -262,18 +269,19 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
   - The Linux CI jobs run on the same push.
 - **CI:**
   - A `windows` job is added to `ci.yml`, sharing `RUST_VERSION`, on `windows-latest`.
-  - It runs fetch-conpty, `cargo build --release --locked`, `cargo test --locked`, the resource and manifest checks, the Windows e2e cases, and the MSI build, install, upgrade and uninstall.
-  - It uploads the MSI.
+  - It runs fetch-conpty, `cargo build --release --locked`, `cargo test --locked`, the resource and manifest checks, the Windows e2e cases, the zip, and the WinGet manifest with `winget validate`.
+  - It uploads the zip.
   - Like `e2e`, the Windows e2e step is advisory.
 
 ## Risks / Trade-offs
 
 - **[Writing our own ConPTY pipes and threads]** Event-loop wake-ups or drop order could be wrong (hangs on close, lost output). → Unit tests run the pipe reader against a pipe pair. A Windows e2e case closes a tab mid-output. The spike already exercises Release→Close.
-- **[Packaged ConPTY absent in some builds]** Users of a plain `cargo install`, without the fetch script, get the inbox fallback and its fidelity loss. → A logged warning, the README, and the MSI always including it.
-- **[Extracted DLL in `%LOCALAPPDATA%`]** It is writable by the user who runs Brindle, the same trust level as `~/.cargo/bin\brindle.exe` itself. It is rewritten whenever its bytes don't match the embedded copy, so tampering is undone at the next launch. MSI installs never use it.
+- **[Packaged ConPTY absent in some builds]** Users of a plain `cargo install`, without the fetch script, get the inbox fallback and its fidelity loss. → A logged warning, the README, and release zips always including it (the packaging script refuses otherwise).
+- **[Extracted DLL in `%LOCALAPPDATA%`]** It is writable by the user who runs Brindle, the same trust level as `~/.cargo/bin\brindle.exe` itself. It is rewritten whenever its bytes don't match the embedded copy, so tampering is undone at the next launch. Release zips and WinGet installs use it too: their `brindle.exe` sits in a per-user directory at the same trust level.
 - **[Toast foreground activation]** Windows may refuse `SetForegroundWindow` from a toast `Activated` callback. → `FlashWindowEx` fallback, and a manual check in group 9.
 - **[Toasts from an AUMID registered only in HKCU]** The registry route, with no shortcut, is what the Windows App SDK uses for unpackaged apps, but it hasn't been probed here, and `IconUri` support varies by build. → Task 7.1 starts with a probe, after asking, since it shows a toast. If toasts need a shortcut, the delta's "Toasts without the installer" scenario changes to "after `brindle --install-desktop`", and Brindle logs a hint pointing to it.
 - **[GUI subsystem and stdio]** If `AttachConsole` behaves differently under some hosts (Windows Terminal versus conhost), CLI output could be lost. → An e2e test uses redirection, and the CLI options are covered by a manual check from PowerShell in Windows Terminal.
+- **[No installer]** WinGet installs give no Start Menu entry, and `winget uninstall` leaves a shortcut made by `--install-desktop` behind. → The README covers both commands. An installer can be added later without changing the exe.
 - **[Newest-pid title heuristic]** It can pick a background job. → OSC titles win, and this is specified as "most recently started".
 - **[CI runs Windows Server 2025, not 11]** This affects the inbox ConPTY build and Snap. → Interactive checks are manual on this Windows 11 machine. The packaged ConPTY is the same binary everywhere.
 - **[Shared MODIFIED blocks with `port-to-macos`]** configuration, profiles, tabs (titles) and terminal-rendering are modified by both changes. → Whichever change archives second rebases its blocks onto the first's.
@@ -281,12 +289,12 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
 ## Migration Plan
 
 - **Linux:** code moves behind `cfg` without behaviour changes, except that `flock` moves to `File::try_lock`, which has the same semantics. `cargo test` and the Linux e2e suite must pass before and after, on the Linux machine.
-- **Windows:** new. Releases attach the MSI to GitHub Releases.
-- **Rollback:** don't publish the MSI. The Windows code is inert on Linux.
+- **Windows:** new. Releases attach the zip to GitHub Releases, and the manifest goes to `microsoft/winget-pkgs`; both start with the first release.
+- **Rollback:** don't publish the zip. The Windows code is inert on Linux.
 
 ## Open Questions
 
 - **Code signing** (an OV certificate, EV, or Azure Trusted Signing): this affects only a post-build release step.
-- **winget:** who submits and maintains the manifest once releases exist.
+- **winget:** who submits the manifest at the first release and keeps it current, by hand or with a release workflow (wingetcreate or Komac).
 - **ARM64:** GPUI's D3D11 path and the package's ARM64 binaries should work. This is a follow-up once x64 is stable.
 - **`--prefix` meaning across platforms:** `<dir>/share` on Linux, `<dir>/Applications` in `port-to-macos`, and rejected here. Settle it before both ports are archived.

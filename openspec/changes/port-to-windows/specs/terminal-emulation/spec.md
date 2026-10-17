@@ -61,7 +61,7 @@ On platforms without a system primary selection, such as Windows, the primary se
 On Windows, Brindle SHALL host each local tab with the ConPTY build that ships with Brindle (`conpty.dll` and `OpenConsole.exe`). It SHALL load only that exact build, never a different `conpty.dll` found beside the executable, on `PATH` or in the current directory. When it can't, it SHALL use the ConPTY built into Windows and log a warning naming what was missing. `BRINDLE_CONPTY=inbox` SHALL force the built-in ConPTY, for tests.
 
 #### Scenario: Shipped host
-- **WHEN** a tab opens in Brindle installed from the MSI
+- **WHEN** a tab opens in Brindle run from the release zip or installed with WinGet
 - **THEN** the tab's console host process is the shipped `OpenConsole.exe`, not `conhost.exe`
 
 #### Scenario: Planted DLL is ignored
