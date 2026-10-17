@@ -12,6 +12,6 @@
 
 ## 3. Verify on GitHub and land
 
-- [ ] 3.1 Push the branch. Verify: the run has 8 e2e jobs plus `test` and `release`, all passing; each e2e job's log shows its `e2e: shard K/4` line, and the shards' counts add up to 100 per tmux version; the longest e2e job takes under 10 minutes. Record the shard times in the commit message.
-- [ ] 3.2 Verify artifacts on a scratch branch: make one case fail (as in run-tests-in-ci's 3.3), push, and check that only that case's shard uploads `e2e-tmux-<v>-shard-<k>`, for both tmux versions. Delete the scratch branch.
+- [x] 3.1 Push the branch. Verify: the run has 8 e2e jobs plus `test` and `release`, all passing; each e2e job's log shows its `e2e: shard K/4` line, and the shards' counts add up to 100 per tmux version; the longest e2e job takes under 10 minutes. Record the shard times in the commit message.
+- [x] 3.2 Verify artifacts on a scratch branch: make one case fail (as in run-tests-in-ci's 3.3), push, and check that only that case's shard uploads `e2e-tmux-<v>-shard-<k>`, for both tmux versions. Delete the scratch branch.
 - [ ] 3.3 Land the usual way (archive, `--no-ff` merge "Merge sharding the e2e suite in CI"; rebase only if `main` moved), and ask before pushing `main`. Verify: the run on `main` passes.
