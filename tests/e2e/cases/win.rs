@@ -23,6 +23,7 @@ pub fn all() -> Vec<Case> {
         display("windows-glyph-width", glyph_width),
         display("windows-close-mid-output", close_mid_output),
         display("windows-title-child", title_child),
+        display("windows-pwsh-integration", pwsh_integration),
     ]
 }
 
@@ -61,16 +62,24 @@ struct Ran {
 
 /// Runs Brindle with `args` (and `--dump-screen-after dump_at`), calling
 /// `during` with its pid after `during_at` seconds.
-fn run(
+fn run(ctx: &Ctx, label: &str, args: &[&str], env: &[(&str, &str)], dump_at: f64, during: During) -> Result<Ran> {
+    run_with(ctx, CONFIG, label, args, env, dump_at, during)
+}
+
+type During<'a> = Option<(f64, &'a dyn Fn(u32) -> String)>;
+
+/// [`run`] with another config.
+fn run_with(
     ctx: &Ctx,
+    config_text: &str,
     label: &str,
     args: &[&str],
     env: &[(&str, &str)],
     dump_at: f64,
-    during: Option<(f64, &dyn Fn(u32) -> String)>,
+    during: During,
 ) -> Result<Ran> {
     let config = ctx.dir.join("config.toml");
-    std::fs::write(&config, CONFIG).map_err(|e| e.to_string())?;
+    std::fs::write(&config, config_text).map_err(|e| e.to_string())?;
     let log_path = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let mut child = Command::new(&ctx.bin)
@@ -214,16 +223,60 @@ fn glyph_width(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// PowerShell sets no title of its own while a native program runs, so its
-/// tab is named after the newest process under it: `PING`, as `PING.EXE` is
-/// named on disk. Once ping exits, PowerShell reports its console title
-/// again, and the name is gone.
+/// With no title set (elevated PowerShell sets one, so it is cleared first),
+/// the tab is named after the newest process under its program: `PING`, as
+/// `PING.EXE` is named on disk. Once ping exits, the name is gone.
 fn title_child(ctx: &Ctx) -> Result<Outcome> {
     let title = |dump: &Dump| dump.tabs.first().map(|(t, _)| t.clone()).unwrap_or_default();
-    let during = run(ctx, "during", &["-p", "pwsh", "--send", "ping -n 8 127.0.0.1\r"], &[], 4.0, None)?;
+    let ping = |count: u32| format!("[Console]::Title = ''; ping -n {count} 127.0.0.1\r");
+    let during = run(ctx, "during", &["-p", "pwsh", "--send", &ping(8)], &[], 4.0, None)?;
     ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
-    let after = run(ctx, "after", &["-p", "pwsh", "--send", "ping -n 1 127.0.0.1\r"], &[], 5.0, None)?;
+    let after = run(ctx, "after", &["-p", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
     ensure!(!title(&after.dump).is_empty() && title(&after.dump) != "PING", "title after ping: {:?}", title(&after.dump));
+    Ok(Outcome::Pass)
+}
+
+/// Brindle's PowerShell script in PowerShell 7 and 5.1, under a prompt the
+/// user defined: the prompt still draws, and the directory the script
+/// reports is where a new tab, and a restored one, starts. (The marks and
+/// `$LASTEXITCODE` are checked byte for byte by a unit test in conpty.rs.)
+fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
+    // The README's line, run by the brindle.exe under test.
+    let bin = ctx.bin.display().to_string().replace('\\', "/");
+    let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
+    for shell in ["pwsh.exe", "powershell.exe"] {
+        let config = format!(
+            "default_profile = \"si\"\nrestore_session = true\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+             args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
+        );
+        let label = shell.trim_end_matches(".exe");
+        // New tab: inherits the reported directory.
+        let ran = run_with(
+            ctx,
+            &config,
+            label,
+            &[
+                "--send",
+                "cd C:\\Windows\r",
+                "--action",
+                "new_tab",
+                "--send",
+                "\"dir=$PWD\"\r",
+            ],
+            &[],
+            9.0,
+            None,
+        )?;
+        let text = screen(&ran.dump);
+        ensure!(ran.dump.tabs.len() == 2, "{shell}: tabs {:?}", ran.dump.tabs);
+        ensure!(text.contains("MYPROMPT> "), "{shell}: the user's prompt is gone:\n{text}");
+        ensure!(text.contains("dir=C:\\Windows"), "{shell}: the new tab's directory:\n{text}");
+        // Restore: the session written on quit reopens both tabs in C:\Windows.
+        let restored = run_with(ctx, &config, &format!("{label}-restored"), &["--send", "\"dir=$PWD\"\r"], &[], 5.0, None)?;
+        let text = screen(&restored.dump);
+        ensure!(text.contains("dir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
+        std::fs::remove_dir_all(ctx.dir.join("state")).ok();
+    }
     Ok(Outcome::Pass)
 }
 
