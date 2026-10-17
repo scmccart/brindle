@@ -32,6 +32,7 @@ The Windows port (OpenSpec change `port-to-windows`) builds on `x86_64-pc-window
   - `brindle.exe` is a GUI program: PowerShell doesn't wait for it unless its output is piped, or it is run with `Start-Process -Wait`.
   - Elevated PowerShell (as on CI) sets its own console title.
   - GPUI answers `WM_NCHITTEST` for the last mouse position, so probes send a `WM_MOUSEMOVE` to the window first. That is a message, not input.
+  - Test processes aren't DPI-aware, so Windows scales down the window rectangles they read. Probes call `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` first to work in Brindle's physical pixels.
   - Pure helpers that read Windows paths and are tested on Linux can't use `Path` (it splits only on `/` there); see `cmdline::program_stem`.
   - Commit subjects must start lowercase, so not with "Windows" or "PowerShell".
 - **Linux checks from a Windows machine:** push the branch, then ask the Linux machine's Claude session, reachable over Remote Control, to fetch it and run `cargo test --locked`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Its user approves each run. The Linux CI jobs run the same commands on every push.

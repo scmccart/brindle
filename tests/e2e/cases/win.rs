@@ -65,6 +65,7 @@ fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
 /// cursor and other windows are untouched.
 fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
     use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SendMessageW, WM_MOUSEMOVE,
         WM_NCHITTEST,
@@ -89,6 +90,10 @@ fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
         }
         BOOL(1)
     }
+    // Physical pixels, as Brindle's window sees them: a DPI-unaware thread
+    // gets its window rectangles scaled down.
+    // SAFETY: changes only this thread's DPI awareness.
+    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let mut found = Found { pid, hwnd: None };
     // SAFETY: `found` outlives the enumeration.
     unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
@@ -124,10 +129,15 @@ fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// caption (drag, double-click, menu, Snap), the three buttons are Windows'
 /// own, and tabs stay client area.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels from the right edge, at the strip's middle (it is 38
-    // high), measured by sampling: close spans about -6..-26, maximize
-    // -30..-46, minimize -54..-74, then the strip. Tabs sit at the bottom.
-    let points = [("close", -16.0, 19.0), ("max", -38.0, 19.0), ("min", -64.0, 19.0), ("strip", -140.0, 19.0), ("tab", 48.0, 23.0)];
+    // Logical pixels: the strip is 38 high; the buttons are 26 wide, 4 apart,
+    // 8 from the right edge, and centered in it; tabs sit at the bottom.
+    let points = [
+        ("close", -(8.0 + 13.0), 19.0),
+        ("max", -(8.0 + 26.0 + 4.0 + 13.0), 19.0),
+        ("min", -(8.0 + 2.0 * (26.0 + 4.0) + 13.0), 19.0),
+        ("strip", -(8.0 + 3.0 * 26.0 + 2.0 * 4.0 + 60.0), 19.0),
+        ("tab", 48.0, 23.0),
+    ];
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;

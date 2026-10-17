@@ -8,12 +8,16 @@ use std::path::{Path, PathBuf};
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         conpty();
+        // embed-resource (a Windows-only build dependency) is only there
+        // when building on Windows, the only host Brindle builds Windows on.
+        #[cfg(windows)]
         resources();
     }
 }
 
 /// Compiles `assets/windows/brindle.rc` into the exe, with the crate's
 /// version and, once rendered, the icon.
+#[cfg(windows)]
 fn resources() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let dir = manifest.join("assets").join("windows");
