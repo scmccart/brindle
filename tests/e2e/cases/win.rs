@@ -24,7 +24,90 @@ pub fn all() -> Vec<Case> {
         display("windows-close-mid-output", close_mid_output),
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
+        display("windows-caption", caption),
     ]
+}
+
+/// What Windows' hit test (`WM_NCHITTEST`) reports at points of the tab
+/// strip, given in logical pixels from the client area's top-left (negative
+/// x from its right) and the window's `scale`. GPUI answers for the last
+/// mouse position, so each point is first sent to the window as a
+/// `WM_MOUSEMOVE`: a message to Brindle's own window, not input, so the
+/// cursor and other windows are untouched.
+fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SendMessageW, WM_MOUSEMOVE,
+        WM_NCHITTEST,
+    };
+    use windows::core::BOOL;
+
+    struct Found {
+        pid: u32,
+        hwnd: Option<HWND>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
+        // SAFETY: `found` is the `Found` passed to EnumWindows below.
+        let found = unsafe { &mut *(found.0 as *mut Found) };
+        let mut pid = 0;
+        // SAFETY: plain queries about a window that exists.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == found.pid && IsWindowVisible(hwnd).as_bool() {
+                found.hwnd = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut found = Found { pid, hwnd: None };
+    // SAFETY: `found` outlives the enumeration.
+    unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
+    let Some(hwnd) = found.hwnd else { return "no window".into() };
+    let (mut window, mut client) = (RECT::default(), RECT::default());
+    // SAFETY: plain queries.
+    unsafe {
+        GetWindowRect(hwnd, &mut window).ok();
+        GetClientRect(hwnd, &mut client).ok();
+    }
+    // Any frame around the client area is equal at the sides and bottom.
+    let side = ((window.right - window.left) - client.right) / 2;
+    let top = (window.bottom - window.top) - client.bottom - side;
+    let (left, top) = (window.left + side, window.top + top);
+    points
+        .iter()
+        .map(|&(name, x, y)| {
+            let x = if x < 0.0 { client.right as f32 + x * scale } else { x * scale };
+            let (cx, cy) = (x as i32, (y * scale) as i32);
+            let pack = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
+            // SAFETY: messages to Brindle's own window, with plain values.
+            let hit = unsafe {
+                SendMessageW(hwnd, WM_MOUSEMOVE, Some(WPARAM(0)), Some(pack(cx, cy)));
+                SendMessageW(hwnd, WM_NCHITTEST, Some(WPARAM(0)), Some(pack(left + cx, top + cy)))
+            };
+            format!("{name}={}", hit.0)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The tab strip hit-tests as a native caption: the empty strip is the
+/// caption (drag, double-click, menu, Snap), the three buttons are Windows'
+/// own, and tabs stay client area.
+fn caption(ctx: &Ctx) -> Result<Outcome> {
+    // Logical pixels from the right edge, at the strip's middle (it is 38
+    // high), measured by sampling: close spans about -6..-26, maximize
+    // -30..-46, minimize -54..-74, then the strip. Tabs sit at the bottom.
+    let points = [("close", -16.0, 19.0), ("max", -38.0, 19.0), ("min", -64.0, 19.0), ("strip", -140.0, 19.0), ("tab", 48.0, 23.0)];
+    // The scale comes from a first run's dump.
+    let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
+    let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
+    let probe = move |pid| hit_tests(pid, scale, &points);
+    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 4.0, Some((2.5, &probe)))?;
+    // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT.
+    let expected = "close=20 max=9 min=8 strip=2 tab=1";
+    ensure!(ran.during == expected, "hit tests at scale {scale}: {} (want {expected})", ran.during);
+    Ok(Outcome::Pass)
 }
 
 const CONFIG: &str = r##"default_profile = "cmd"
