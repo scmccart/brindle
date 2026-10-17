@@ -19,14 +19,18 @@ The window title SHALL match the active tab's title.
 - **THEN** within about a second the tab is titled `python`, and after Python exits it is titled `cmd`
 
 ### Requirement: Working directory inheritance
-On Linux, a new tab whose profile sets no working directory SHALL start in the working directory of the active tab's foreground process. On Windows, where another process's working directory can't be read, such a tab SHALL start in the home directory.
+A new tab whose profile sets no working directory SHALL start in the working directory of the active tab's foreground process. On Windows, where another process's working directory can't be read, it SHALL start in the directory the active tab's program last reported, as defined under "Working directory reports" in `shell-integration`, if that directory exists. Otherwise it SHALL start in the home directory.
 
 #### Scenario: New tab in same directory
 - **WHEN** the active tab's shell is in `~/src/brindle` and the user opens a new tab
 - **THEN** the new shell starts in `~/src/brindle`
 
-#### Scenario: New tab on Windows
-- **WHEN** the active tab's shell on Windows has changed to `C:\src` and the user opens a new tab with a profile that sets no directory
+#### Scenario: Reported directory on Windows
+- **WHEN** the active tab's PowerShell, with Brindle's integration script loaded, has changed to `C:\src` and the user opens a new tab with a profile that sets no directory
+- **THEN** the new shell starts in `C:\src`
+
+#### Scenario: Nothing reported on Windows
+- **WHEN** the active tab runs `cmd.exe`, which reports no directory, and the user opens a new tab with a profile that sets no directory
 - **THEN** the new shell starts in the user's home directory
 
 ### Requirement: Title bar behaviour
@@ -37,7 +41,7 @@ When the window draws its own decorations, as it always does on Windows:
 - minimize, maximize and close buttons SHALL be shown;
 - the window edges SHALL resize the window.
 
-On Windows, these SHALL behave like a native caption, including Snap when the window is dragged to a screen edge and the Snap Layouts flyout when the pointer hovers the maximize button.
+On Windows these areas SHALL behave like a native caption. This includes Snap when the window is dragged to a screen edge, and the Snap Layouts flyout when the pointer hovers the maximize button.
 
 #### Scenario: Drag to move
 - **WHEN** the user drags empty space in the tab strip
@@ -50,3 +54,7 @@ On Windows, these SHALL behave like a native caption, including Snap when the wi
 #### Scenario: Close button on Windows
 - **WHEN** the user clicks the close button of the only window
 - **THEN** the window closes and Brindle exits
+
+#### Scenario: Tabs stay clickable on Windows
+- **WHEN** the user clicks a tab, the new-tab button or the profile chevron in the strip on Windows
+- **THEN** that control responds as it does on Linux, and the window does not start moving

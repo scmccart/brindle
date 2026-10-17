@@ -2,194 +2,291 @@
 
 ## Context
 
-See proposal.md for the motivation. These facts from the dependency sources shape the approach:
+See proposal.md for the motivation. These facts were checked on this Windows 11 machine (build 26200, SDK 10.0.26100.0, rustc 1.99.1 msvc). They shape the approach:
 
-- **GPUI 0.2.2 on Windows**:
-  - **Renderer:** Direct3D 11, accepting feature level 10.1 or higher. It supports Windows 10 and 11.
-  - **Shaders:** `build.rs` compiles the HLSL shaders with `fxc.exe` in release builds. It finds `fxc.exe` through `GPUI_FXC_PATH`, then `PATH`, then the Windows SDK 10.0.26100.0 directory, and panics if none has it.
-  - **Manifest:** with the default `windows-manifest` feature, GPUI embeds a manifest for PerMonitorV2 DPI awareness and Common Controls v6. It does this with `embed-resource`. Because the GPUI package has no binaries, `embed-resource` emits `rustc-link-lib` for the compiled resource rather than `rustc-link-arg-bins`.
-  - **Icon:** `register_window_class` uses `load_icon()`, which is `LoadImageW(GetModuleHandleW(None), MAKEINTRESOURCE(1), IMAGE_ICON)`. **An icon resource with id 1 in our `.exe` therefore becomes the window and taskbar icon without any API call.**
-  - **Decorations:** the Windows window doesn't override `window_decorations()`, so it returns `Decorations::Server`. `start_window_move`, `show_window_menu` and `start_window_resize` are the trait's no-op defaults.
-  - **Hidden caption:** when `TitlebarOptions::appears_transparent` is set, which Brindle does, GPUI hides the native caption. Its `WM_NCHITTEST` handler then asks the element tree for a `WindowControlArea` and maps it as follows: `Drag` to `HTCAPTION`, `Min`/`Max`/`Close` to the matching `HT*BUTTON`. It falls back to the native resize borders. On button release, GPUI itself minimizes, maximizes or restores, or posts `WM_CLOSE`.
-  - **Primary selection:** `App::write_to_primary` and `App::read_from_primary` exist only with `cfg(any(target_os = "linux", target_os = "freebsd"))`.
-  - **AltGr:** GPUI treats right Alt plus left Ctrl as AltGr, not as ctrl-alt, on layouts that use AltGr. So Brindle's `ctrl-alt-1…9` bindings don't swallow AltGr characters.
-- **alacritty_terminal 0.26 on Windows**:
-  - The PTY is ConPTY, and `Pty::child_watcher().pid()` gives the child's process id.
-  - There is no `child()`/`file()` and no notion of a foreground process.
-  - `tty::Options` has a Windows-only `escape_args` field.
-  - vte 0.15 doesn't handle OSC 7; it logs it as unhandled.
-- **Brindle's Unix-only code**:
-  - `Backend::Pty { child_pid, master_fd }` is filled from `pty.child().id()` and `AsRawFd`, in `src/terminal/mod.rs` around line 218.
-  - `foreground_pid` uses `libc::tcgetpgrp`, and the name and working directory come from `/proc/<pid>/{comm,cwd}`, around lines 511–540.
-  - Selection, OSC 52 and middle click call the primary-selection API.
-  - `Workspace::open_config` runs `/bin/sh -c "$EDITOR <path>"`.
-  - The default program falls back from `$SHELL` to `/bin/sh`.
-  - Font fallbacks list only Linux fonts.
-- **The lockfile already has the Windows crates**: `windows` 0.57 and 0.61.3, `windows-sys` 0.48 to 0.61, and `embed-resource` 3.0.6. Per CLAUDE.md, `Cargo.lock` must not be regenerated.
-- **This machine** has only the `x86_64-unknown-linux-gnu` Rust target. Brindle can't be built, type-checked or run for Windows here.
+- **What doesn't compile today.** A `cargo check --all-targets` of a scratch copy with the Linux-only crates gated stops on the following. More type errors will surface once these resolve, for example the missing `escape_args` in the `tty::Options` literal.
+  - `src/terminal/mod.rs`: `pty.child()`, `std::os::fd` and `libc::tcgetpgrp`.
+  - `src/terminal/pty.rs`: `pty.file()`.
+  - `src/session.rs`: `flock`, Unix modes, `std::os::unix`.
+  - `src/terminal/links.rs`: `process_group`.
+  - `src/notify/{dbus,activation}.rs`: zbus, wayland-*, `raw_window_handle`, `gpui::guess_compositor`.
+  - Unix-only tests in `scan.rs`, `links.rs`, `config_edit.rs`, `session.rs`, `tests/e2e` and `tests/perf`.
+- **alacritty_terminal 0.26 on Windows.**
+  - Its `conpty.rs` calls `CreatePseudoConsole(…, dwFlags = 0, …)` and opens two anonymous pipes.
+  - It looks for `conpty.dll` with a bare `LoadLibraryW` (the standard search path, `PATH` included), and then asks for the unprefixed export names.
+  - Its pipe reader/writer (`blocking.rs`) and `ChildExitWatcher` are in private modules.
+  - What is public: the traits `EventedReadWrite`, `EventedPty` and `OnResize`, `tty::PTY_READ_WRITE_TOKEN`/`PTY_CHILD_EVENT_TOKEN`, and `EventLoop`. The loop is woken through `polling`'s public IOCP extension, `PollerIocpExt::post(CompletionPacket)`.
+  - `Pty` has no `file()`, so `MarkedPty` (`src/terminal/pty.rs`), which clones the Unix master fd to parse output itself, can't be built on top of it.
+- **ConPTY behaviour.** A spike in scratch hosted a pseudoconsole and had its child write test sequences, recording the raw bytes that came out.
+  - **Inbox ConPTY** (`conhost.exe`):
+    - repaints the screen and moves OSC 0/7/9/9;9/777/52 ahead of their text;
+    - drops `?1000h`/`?1006h`, emits `?2026h…l` empty with the content outside it, and swallows the OSC 11 query (answering it itself);
+    - rewrites OSC 8 with an `id=`.
+  - **Packaged ConPTY** (NuGet `Microsoft.Windows.Console.ConPTY` 1.25.260930003, MIT; `conpty.dll` 119,608 bytes and `OpenConsole.exe` 1,089,376 bytes, x64) passed every sequence byte for byte and in order. It begins with `\e[1t\e[c\e[?1004h\e[?9001h` (it asks for DA1) and ends with `\e[?1004l\e[?9001l`.
+  - **Both** request win32-input-mode (`?9001h`) and focus events (`?1004h`) at startup. Both accept the flags `0x10` (`PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH`) and `0x20`. Both exit at once after `ReleasePseudoConsole` followed by `ClosePseudoConsole`.
+  - **Input on both hosts:** the terminal wrote an SGR click and release, `ESC [ I`, a bracketed paste, `ESC [ 1 ; 5 A` and `x`.
+    - A child reading with `ENABLE_VIRTUAL_TERMINAL_INPUT` got those exact bytes.
+    - A child reading `ReadConsoleInputW` got mouse press and release records at (4,9), a focus event, the paste as key events, and ctrl+up with `LEFT_CTRL_PRESSED | ENHANCED_KEY`.
+    - Input therefore needs no special handling. The inbox host's loss is on the output side: a program's `?1000h` never reaches Brindle, so Brindle never starts reporting.
+  - **Glyph widths:** a child wrote strings with `WriteConsoleW` and read back its cursor column.
+    - The inbox host ignores the flags and gives e+U+0301 two cells.
+    - The packaged host's default (graphemes) gives ❤️ (U+2764 U+FE0F) two cells.
+    - Only the packaged host with `0x10` gives 表 2, 😀 2, e+U+0301 1 and ❤️ 1. That matches alacritty's per-code-point `unicode-width` grid.
+- **Exports and flags.**
+  - The package's `inc/conpty.h` defines `INHERIT_CURSOR 0x1`, `GLYPH_WIDTH_GRAPHEMES 0x08`, `GLYPH_WIDTH_WCSWIDTH 0x10`, `GLYPH_WIDTH_CONSOLE 0x18` and `AMBIGUOUS_IS_WIDE 0x20`. There is no resize-quirk, passthrough or win32-input flag.
+  - `conpty.dll` exports the unprefixed names plus `Conpty{Create,Resize,Close,Clear,ShowHide,Reparent,Release,Pack}PseudoConsole`.
+  - Inbox `kernel32.dll` on build 26200 exports `Create/Resize/Close/ReleasePseudoConsole`.
+  - `conpty.dll` finds `OpenConsole.exe` either next to itself or in an `x64\` subdirectory; both layouts were tested.
+- **GPUI 0.2.2 on Windows.**
+  - It renders with Direct3D 11. In release builds `build.rs` compiles the HLSL shaders with `fxc.exe`, found via `GPUI_FXC_PATH`, then `PATH`, then SDK 10.0.26100.0.
+  - The `windows-manifest` feature (a default) embeds PerMonitorV2 DPI awareness with `embed-resource`.
+  - The window class loads icon resource 1 from the `.exe`.
+  - `window_decorations()` returns `Server`. With `appears_transparent` set, `WM_NCHITTEST` maps `WindowControlArea::{Drag,Min,Max,Close}` to the native caption hit codes.
+  - `write_to_primary`/`read_from_primary` exist only on Linux and FreeBSD.
+  - `KeyDownEvent` carries only a `Keystroke` (key name, `key_char`, modifiers), with no virtual-key code or scan code.
+  - It sets no AppUserModelID.
+  - `HasWindowHandle` gives the HWND.
+- **Lockfile.** Adding `windows` 0.61 (with the features below) and `embed-resource` 3 to a scratch copy changed `Cargo.lock` by exactly two dependency edges in `brindle`'s entry, with no new packages or versions.
+- **Linux side.**
+  - A Claude session on the Linux machine (`/home/scmccart/src/brindle`, Ubuntu, rustc 1.99.1, tmux 3.6) runs checks when its user approves them. It fetches from origin.
+  - `scripts/with-xvfb` runs there headless.
+- **`port-to-macos`** is active and puts process info behind `terminal/process.rs`. This design uses the same seam, so the two ports don't diverge.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Build with `cargo build --release` on `x86_64-pc-windows-msvc`, and keep the Linux build and tests unchanged.
-- Keep platform differences in a small number of `cfg` modules, so the rest of the code stays platform-neutral.
-- Install the way Windows apps install: an MSI, the icon in the `.exe`, a Start Menu shortcut and an uninstall entry. Also give `cargo install` users a one-command shortcut.
+- One codebase that builds and tests on `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`, with Linux behaviour unchanged.
+- Local tabs on Windows get the same VT fidelity as on Linux, through a ConPTY Brindle controls.
+- Platform code sits in a few `cfg`-split modules shared with the macOS port. Pure logic (process-tree walks, command lines, path decoding, argument quoting) is cfg-free and unit-tested on both platforms.
 
 **Non-Goals:**
-- ARM64 Windows, Windows 7/8, and the MinGW (`-gnu`) target as a supported release target.
-- Reading another process's working directory through `NtQueryInformationProcess` and the PEB, which is undocumented and fragile.
-- OSC 7 directory tracking. It would need Brindle to see PTY output before alacritty parses it, which is a separate change for all platforms.
-- Running tmux natively on Windows, or translating paths for WSL.
+- **win32-input-mode encoding.** GPUI doesn't expose virtual-key codes, scan codes or key-ups. Brindle ignores `?9001h`, and ConPTY then falls back to translating VT input, which is the documented behaviour when the terminal doesn't answer.
+- **`ConptyShowHidePseudoConsole` and `ConptyClearPseudoConsole`.** No requirement needs them: with passthrough, the host has no screen of its own to repaint.
+- Translating paths between Windows and WSL, and reading other processes' working directories through the PEB.
+- Isolating Windows GUI e2e runs from the desktop the way `scripts/with-xvfb` does. Local GUI runs ask first, and CI runs them on its own desktop.
 
 ## Decisions
 
-### 1. Platform code lives in `src/platform/{unix,windows}.rs`
+### 1. Seams: `cfg` by module, shared with the macOS port
 
-A new `src/platform/mod.rs` re-exports one implementation through `#[cfg(unix)]` or `#[cfg(windows)]`:
-- `struct PtyHandle` replaces `child_pid` and `master_fd`. On Unix it holds the pid and fd, and on Windows it holds the pid.
-- `fn pty_handle(&Pty) -> PtyHandle`.
-- `fn foreground_process_name(&PtyHandle) -> Option<String>`.
-- `fn working_directory(&PtyHandle) -> Option<PathBuf>`, which always returns `None` on Windows.
-- `fn default_program() -> (String, Vec<String>)`.
-- `fn editor_command(editor: Option<String>, path: &Path) -> (String, Vec<String>)`.
+- **Dependencies:**
+  - `zbus`, `wayland-*` and dev-dependency `x11rb` move to `[target.'cfg(target_os = "linux")'.…]`.
+  - `libc` moves to `cfg(unix)`.
+  - `raw-window-handle` stays unconditional, because Windows needs the HWND.
+  - `windows` 0.61 goes under `cfg(windows)` with `Win32_Foundation`, `Win32_Security`, `Win32_Storage_FileSystem`, `Win32_System_{Com,Console,Diagnostics_ToolHelp,LibraryLoader,Pipes,Threading,IO,Registry}`, `Win32_UI_{Shell,Shell_PropertiesSystem,WindowsAndMessaging}`, `Win32_Storage_EnhancedStorage`, `Foundation`, `Data_Xml_Dom` and `UI_Notifications`. The exact list is trimmed to what compiles.
+- **Modules:**
+  - `notify/{dbus,activation}.rs` become `cfg(target_os = "linux")`.
+  - `terminal/process.rs` (the macOS seam) holds process name and cwd: `/proc` on Linux, Toolhelp on Windows (§4).
+  - `terminal/conpty.rs` is the Windows PTY (§2).
+  - `src/primary.rs` is the primary selection (§6).
+  - `notify/toast.rs` is the Windows sink (§9).
+  - `src/win.rs` collects small Windows helpers: console attach, `CREATE_NO_WINDOW` spawns, AUMID, known folders.
+- **Tests:** Unix-only tests get `#[cfg(unix)]`. Where the property matters on both platforms, they get a portable twin; for example, `scan.rs`'s split-read test uses an in-memory reader instead of `UnixStream`.
 
-The Unix module is the current code, moved without changes. `libc` becomes a `cfg(unix)` dependency.
+*Alternative:* a `src/platform/{unix,windows}.rs` facade, which the old version of this change proposed. Rejected, because `port-to-macos` already chose `terminal/process.rs`. Two parallel seams for the same thing would conflict when both changes land.
 
-*Alternative:* `cfg` attributes scattered through `terminal/mod.rs`, `workspace.rs` and `config.rs`. That was rejected because the next platform, macOS, needs the same seams, and the macOS port can add `platform/macos.rs` alongside.
+### 2. Brindle owns the Windows pseudoconsole (`terminal/conpty.rs`)
 
-### 2. Windows tab titles come from a Toolhelp process snapshot
+Brindle implements `EventedReadWrite + EventedPty + OnResize` itself and hands that to alacritty's `EventLoop`. alacritty's Windows `Pty` is not used.
 
-ConPTY has no foreground process group. `foreground_process_name` therefore:
-1. takes one `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`;
-2. builds a parent-to-children map;
-3. walks down from the tab's pid, choosing the child with the highest pid at each level as a proxy for "most recently started";
-4. returns that process's `szExeFile` without `.exe`.
-
-The 1 s title poll would take one snapshot per tab. To avoid that, `Workspace`'s poll takes **one snapshot per tick** and passes it to every tab, so the cost is about one syscall per second no matter how many tabs are open.
-
-The tree walk is a pure function over `(pid, parent_pid, name)` rows and is unit-tested on every platform. Using the highest pid as "newest" is a heuristic, because pids are reused. Process creation times, read with `GetProcessTimes`, would be exact but need an `OpenProcess` per candidate. The heuristic is good enough for a title, and the tab's OSC title still takes precedence.
-
-Uses `windows` 0.61, `Win32_System_Diagnostics_ToolHelp`.
+- **Which ConPTY.** `ConptyApi` resolves once per process. Every candidate is compared byte for byte with the copy embedded in the binary (§3), so only that exact build is ever loaded. A build without an embedded copy goes straight to the inbox functions.
+  1. `<exe dir>\conpty.dll` and `OpenConsole.exe`, when both match. The MSI installs them there, and dev builds copy them there. A `cargo install`ed exe in `~\.cargo\bin` (user-writable, and on `PATH`) is protected by the same check.
+  2. Else the embedded copy, extracted to `%LOCALAPPDATA%\brindle\conpty\<version>\`. The extraction is reused when the bytes on disk match, and rewritten when they don't.
+  3. Else the inbox `kernel32` functions, logging one warning that names the paths tried.
+  - `BRINDLE_CONPTY=inbox` forces step 3. It is a test hook in the same pattern as `BRINDLE_TMUX_STATE`.
+  - The DLL is loaded with `LoadLibraryExW(<absolute path>, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`. It never goes through `PATH` or the current directory.
+  - From the DLL Brindle takes the `Conpty*` exports, which are the names `conpty.h` documents. From kernel32 it takes the unprefixed ones.
+  - `ReleasePseudoConsole` is resolved as optional. It was confirmed only on build 26200, and the Windows 11 floor includes older builds. When it is missing, close relies on the detached-thread `Close` alone.
+- **Creation.**
+  - Two anonymous pipes.
+  - `CreatePseudoConsole(size, in_read, out_write, PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH, &hpc)`. The flag makes the packaged host count cells per code point, as alacritty's `unicode-width` grid does; the measurements are in Context. The host's grapheme default would put ❤️ in two cells where Brindle draws one. The inbox host accepts the flag and ignores it.
+  - Then the pseudoconsole side of each pipe is closed.
+  - `STARTUPINFOEXW` with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, `STARTF_USESTDHANDLES` with null handles so nothing leaks, and `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT`.
+  - The environment block merges the profile's env over Brindle's environment case-insensitively, then sorts it case-insensitively, as `CreateProcessW` requires.
+- **Command line.** Built with the MSVC `CommandLineToArgvW` rules, written fresh and unit-tested on all platforms, so TOML `args` arrive as written. A raw tail is allowed for the `cmd.exe /S /C` editor launch (§7), because `cmd` doesn't understand backslash escapes.
+- **I/O threads.**
+  - A reader thread does blocking `ReadFile` into a bounded buffer. When data arrives while the loop has read interest, it posts `CompletionPacket(PTY_READ_WRITE_TOKEN)`.
+  - `Read` on the Brindle side drains the buffer or returns `WouldBlock`.
+  - A writer thread does the same for writes, so a full input pipe never blocks the loop.
+  - The child exit is watched with `RegisterWaitForSingleObject`, which sends `ChildEvent::Exited(code)` and posts `PTY_CHILD_EVENT_TOKEN`.
+  - This is the contract alacritty's own Windows pipes meet. It is written from the trait docs and `polling`'s API, not copied: alacritty_terminal is Apache-2.0, Brindle is MIT OR Apache-2.0.
+- **Shell integration.** `ParsingReader` becomes `ParsingReader<R: Read>`. On Unix it wraps `ScanReader<File>` (the cloned master, unchanged). On Windows it wraps `ScanReader<PipeReader>` and owns the reader end directly, so no clone is needed. `MarkedPty` becomes cfg-split: on Unix it is today's wrapper; on Windows it is the ConPTY plus a `ParsingReader`.
+- **Close.**
+  - `Drop` calls `ReleasePseudoConsole` and then `ClosePseudoConsole` on a short-lived detached thread.
+  - The reader thread keeps draining until EOF, so even an older host that blocks in `Close` until output is drained finishes, and neither the event-loop thread nor the UI thread waits.
+  - Field order puts the pseudoconsole before the pipes.
+- **Reparenting.** With the packaged host, `ConptyReparentPseudoConsole(hpc, hwnd)` is called when the tab's view is first placed in a window, and again if it moves to another window. Console programs that parent dialogs to `GetConsoleWindow()` (credential prompts, `git` GUI helpers) then center on Brindle.
+- **Startup requests from the host.**
+  - DA1 is answered by alacritty's `Term` through `Terminal::reply()`, which writes to the PTY for local tabs.
+  - `?1004h` turns on focus reports, which ConPTY forwards to programs that ask for them.
+  - `?9001h` is ignored, since alacritty treats unknown private modes as no-ops (see Non-Goals).
 
 *Alternatives:*
-- Only the shell's name, which would always say `pwsh` and is useless.
-- `conhost`-style console process lists (`GetConsoleProcessList`), which need Brindle to attach to the pseudoconsole. Rejected as fragile.
+- Ship `conpty.dll` next to the exe and keep alacritty's backend: no flags, `PATH` lookup, no Release.
+- Patch alacritty_terminal: Brindle avoids forks, and the change would still need a release.
+- Inbox ConPTY only: the spike shows it loses mouse modes and reorders OSCs.
 
-### 3. The title bar uses GPUI's window-control areas on Windows
+### 3. Getting the packaged ConPTY into every build
 
-The tab strip's render code in `src/workspace.rs` currently gates its controls on `Decorations::Client`, which GPUI never reports on Windows. The change:
+- **Fetch:** `scripts/fetch-conpty.ps1` downloads `Microsoft.Windows.Console.ConPTY` at a pinned version, checks the `.nupkg` against a pinned sha256, and extracts the x64 `conpty.dll` and `OpenConsole.exe` plus the licence into `.conpty/<version>/` (gitignored). The version and hash are moved by hand, like the other pins. Today they are `1.25.260930003` and `02B07B349AF66D801159BDF9E440D4A1CE78BB951F37FC8609731665AFDAE7EE`.
+- **Build:** on Windows, `build.rs` looks for `.conpty/<version>/` via `CARGO_MANIFEST_DIR`, which also works for `cargo install --path .` with its temporary target dir.
+  - When the files are present, it `include_bytes!`s them through a generated file, and copies them next to the build's output exe so `cargo run` uses path 1.
+  - When they are absent, it prints a `cargo:warning` that names the script, and the binary falls back as in §2.
+- **Install:** the MSI installs both files beside `brindle.exe`, which is path 1 in admin-protected Program Files. `cargo install` users get path 2 automatically if they ran the script first.
+
+*Alternatives:*
+- Commit the binaries (2.3 MB of third-party executables in git history).
+- Download from `build.rs` (no network in builds).
+- Rely on `PATH` (planting risk, and it is the thing the spec forbids).
+
+### 4. Tab titles from one Toolhelp snapshot per tick
+
+- `process::Snapshot::take()` returns, on Windows, the `(pid, parent_pid, exe)` rows from one `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`. On Linux it is empty, and the `/proc` path stays as it is.
+- The workspace's 1 s title poll takes one snapshot per tick and passes it to each tab. A pure `newest_descendant(rows, root)` then:
+  1. walks down from the tab's child pid, picking the highest pid at each level, since pids only approximate creation order;
+  2. skips `conhost.exe` and `OpenConsole.exe`;
+  3. strips `.exe`.
+- An OSC title still takes precedence, and most Windows TUIs and PowerShell set one.
+
+### 5. Working directory from OSC 7 and OSC 9;9
+
+- **Parser:** Brindle's `Parser` already scans OSC sequences for OSC 133 before alacritty sees them. It gains a cwd decoder (pure and unit-tested):
+  - `7;file://<host>/<path>` is percent-decoded. On Windows a leading `/C:/` becomes `C:\`.
+  - `9;9;<path>` has optional double quotes, which are stripped.
+- **Rule:** a path that isn't `Path::is_absolute()` for the build's platform is ignored. A Linux path from a WSL shell in a Windows tab is ignored that way.
+- **Storage:** the result lands in a `Arc<Mutex<Option<PathBuf>>>` beside `Marks`. It is locked after `Marks`, which keeps the lock order "parser, then term, then marks".
+- **Use:**
+  - `Terminal::working_directory()` on Windows returns the report when it `is_dir()`, and otherwise `None` (the home directory).
+  - On Linux it is unchanged (`/proc`), and the report is recorded but unused.
+  - Session restore already records `working_directory()`, so restore follows without extra code.
+- **No collision with notifications:** `notify/osc.rs` already treats ConEmu `9;1`–`9;12` as non-notifications.
+
+### 6. Primary selection
+
+`src/primary.rs` provides `write_primary(cx, item)` and `read_primary(cx)`:
+- on Linux and FreeBSD they forward to GPUI;
+- elsewhere they read and write a GPUI global holding a `PrimaryBuffer`, a cfg-free type that is unit-tested everywhere.
+
+The three call sites go through it: OSC 52 `Selection` in both directions, `finish_selection`, and middle click / `PastePrimary`.
+
+### 7. Default program, editor and environment on Windows
+
+- **`default_program(path, comspec)`** is pure:
+  1. `pwsh.exe` on `PATH`, with `-NoLogo`;
+  2. else `powershell.exe` on `PATH`, with `-NoLogo`;
+  3. else `%COMSPEC%`;
+  4. else `cmd.exe`.
+- **`editor_command(visual, editor, path)`** gives `cmd.exe /D /S /C "<editor> "<path>""`, the raw tail from §2, using `%VISUAL%`, then `%EDITOR%`, then `notepad.exe`. This way values like `code -w` work, and paths with spaces stay quoted. It runs in a new tab, as the configuration spec says.
+- **Environment:** `child_env` keeps `TERM` and the other variables, which helps WSL and ssh started from the tab.
+
+### 8. tmux through WSL
+
+- **Splitting the arguments:** `tmux_command(profile)` returns the program and an argument prefix. For a program whose file stem is `wsl` (case-insensitive), `tmux_args` is split at the first element equal to `tmux` into WSL options and tmux options.
+- **The prefix:** WSL options, then `--exec` unless they already end in `--exec`/`-e`, then `tmux`. `-u` follows only on attach command lines.
+- **Callers:** `command_line` and `has_session_command` both use it, so `-u` is never handed to `wsl.exe`, which would read it as `--user`.
+- **No `-c`:** `command_line` drops `-c` for WSL profiles. Other paths already drop it, since a tmux pane directory like `/home/x` fails `is_dir()` on Windows.
+- **`--exec`** runs tmux without a Linux shell, so session names pass verbatim.
+- **Spawning:** every tmux spawn gets `CREATE_NO_WINDOW`, so `wsl.exe` (a console program) opens no console window.
+
+### 9. Toast notifications
+
+- **The sink:** `Notifier` gains `Sink::Toast`, which is `notify/toast.rs` running on its own thread with `RoInitialize(MTA)`.
+  - Each request becomes a `ToastGeneric` toast whose title and body are text nodes (no XML injection, since they are set as node text).
+  - The `Tag` is Brindle's notification id, and bells reuse their tab's id, which is how the "replaces" rule maps onto toasts.
+  - `Activated` sends `Reply::Action { id, "default" }`, and `Dismissed` sends `Reply::Closed`.
+  - If the notifier's `Setting` isn't `Enabled`, the request is dropped with a warning.
+- **The identity:**
+  - The AUMID is `Brindle.Terminal`. `main` calls `SetCurrentProcessExplicitAppUserModelID` before any window opens.
+  - Brindle registers the AUMID under `HKCU\Software\Classes\AppUserModelId\Brindle.Terminal` (`DisplayName`, `IconUri` pointing to a PNG extracted beside the ConPTY copy). That way toasts work for `cargo install` and dev builds, which have no shortcut.
+  - Both Start Menu shortcuts (MSI and `--install-desktop`) set `System.AppUserModel.ID` to the same value, which gives the taskbar grouping the spec requires.
+- **Click handling:** a click runs `Workspace::show_tab`, then a Windows `activation::raise`. That restores the window if it is minimized and calls `SetForegroundWindow`. If Windows refuses foreground, it calls `FlashWindowEx` so the taskbar button flashes.
+- **Unchanged:** the rate limits, the focus rule and `BRINDLE_NOTIFY_LOG` (which wins over every sink).
+
+### 10. Title bar
+
 - **Show controls:** `csd` becomes `matches!(decorations, Decorations::Client { .. }) || cfg!(windows)`.
-- **Mark areas:** on Windows, the strip's empty-space div gets `.window_control_area(WindowControlArea::Drag)`, and the three buttons get `Min`, `Max` and `Close`. The tabs, new-tab button and profile chevron are not marked, so they get `HTCLIENT` and keep their own handlers.
-- **Native caption behaviour:** because Windows hit-tests these regions, it provides drag-to-move, double-click maximize, the right-click system menu, Aero Snap and Snap Layouts natively. The existing `on_mouse_down` handlers that call `start_window_move`, `zoom_window` and `show_window_menu` are harmless no-ops on Windows.
-- **Button clicks:** GPUI performs the button action on release, so the buttons' `on_click` handlers won't fire on Windows. Close posts `WM_CLOSE`, which ends in the existing `on_window_closed` hook, and that quits after the last window.
-- **Resizing:** borders come from GPUI's default hit-test, so the Linux `resize_edge` code stays Linux-only.
+- **Mark areas:** on Windows, the strip's empty space gets `window_control_area(Drag)`, and the three buttons get `Min`, `Max` and `Close`. Tabs, the new-tab button and the chevron stay unmarked, so they are `HTCLIENT`.
+- **Actions:** GPUI performs Min/Max/Close on release. Close posts `WM_CLOSE` into the existing close path.
+- **Linux-only:** the `start_window_move`, `zoom_window` and `show_window_menu` handlers are no-ops on Windows and stay for Linux. So does the `resize_edge` code, since Windows uses GPUI's default border hit-testing.
 
-*Alternative:* turn `appears_transparent` off on Windows and keep the native caption above the tab strip. That's simpler but costs a second 30 px bar and breaks the "tab strip is the title bar" design in the `tabs` spec.
+### 11. Process, console and paths
 
-### 4. The primary selection is an app-global buffer on Windows
+- **GUI subsystem:** `#![cfg_attr(windows, windows_subsystem = "windows")]`.
+- **Console attach:** Brindle attaches to its parent's console only around writing output, and only when stdout is not already a valid handle (a redirect or pipe gives one).
+  - It uses `AttachConsole(ATTACH_PARENT_PROCESS)`, writes, then calls `FreeConsole`.
+  - This covers informational options, usage errors, `--install-desktop`/`--uninstall-desktop` messages and the `--dump-screen-after` dump.
+  - A plain GUI launch never stays attached. If it did, ctrl-c in that console (`CTRL_C_EVENT`) or closing it (`CTRL_CLOSE_EVENT`) would end Brindle.
+- **No console windows:** spawns outside tabs get `CREATE_NO_WINDOW`: tmux, `has-session` and `BRINDLE_LINK_OPENER`.
+- **Links:** without an override, links are opened with `ShellExecuteW("open", uri)` on the existing opener thread, which keeps `&` and spaces intact. `process_group(0)` stays Unix-only.
+- **Session state:**
+  - The directory is `dirs::data_local_dir()` (`%LOCALAPPDATA%`) on Windows.
+  - The lock moves from `libc::flock` to `std::fs::File::try_lock` on every platform. On Linux that is `flock(LOCK_EX | LOCK_NB)`, the same semantics; on Windows it is `LockFileEx`.
+  - The Unix `0o700`/`0o600` modes stay `cfg(unix)`; `%LOCALAPPDATA%` is per-user by ACL.
+  - The write stays temp file plus `rename` (`MoveFileExW` with replace on Windows).
+- **Fonts:** `Cascadia Mono` and `Consolas` are appended to the terminal fallbacks and to the default `font.family`; `Segoe UI Variable Text` and `Segoe UI` go into the UI list. Linux resolution is unchanged, because they come last.
 
-`src/platform/windows.rs` provides `write_primary(cx, item)` and `read_primary(cx)`, backed by a GPUI global `PrimarySelection(Option<ClipboardItem>)`. On Unix these forward to `cx.write_to_primary` and `cx.read_from_primary`. All three call sites (OSC 52 `ClipboardType::Selection` in both directions, `finish_selection`, and middle click / `PastePrimary`) go through the wrapper. The behaviour matches X11 within Brindle, and other applications never see the buffer. That's acceptable, because Windows has no such convention.
+### 12. Executable resources and icons
 
-*Alternative:* on Windows, treat the primary selection as the clipboard. Rejected, because every selection would overwrite the clipboard, which is what the `copy_on_select = false` default is there to prevent.
+- **`build.rs`** (Windows target only) compiles `assets/windows/brindle.rc` with `embed-resource`. The `.rc` holds `1 ICON "brindle.ico"` and a `VERSIONINFO` block fed from `CARGO_PKG_VERSION`. It also handles the ConPTY embedding from §3.
+- **No manifest in our `.rc`:** GPUI's `windows-manifest` already supplies one, and CI checks that it reaches the exe. If it doesn't, the fallback is to turn off that feature, list the remaining defaults (`font-kit`, `wayland`, `x11`) explicitly, and put GPUI's Apache-2.0 manifest XML in our `.rc`.
+- **Icons:** `scripts/render-icons.sh` renders `assets/brindle.svg` to 16–256 px PNGs with `rsvg-convert`, `resvg` or `magick`, packs `assets/windows/brindle.ico` (the 256 px image PNG-compressed), and also writes `assets/windows/brindle-256.png` for the toast `IconUri`. Both are committed. CI fails if the SVG is newer in git history than the `.ico`.
+- **Where it runs:** the script runs under Git Bash on Windows, or on Linux.
 
-### 5. Default shell and editor
+### 13. MSI and `--install-desktop`
 
-`default_program()` on Windows searches `PATH` for `pwsh.exe`, then `powershell.exe`, then uses `%COMSPEC%`, then `cmd.exe`. The search is a plain loop over `std::env::split_paths`, with no new dependency. The `-NoLogo` argument is added for the two PowerShells. `escape_args: true` is set, so profile `args` are quoted with the C runtime rules, which is what users writing TOML arrays expect.
+- **The MSI:** `packaging/windows/brindle.wxs` is written for the WiX CLI (`wix build`, version pinned).
+  - A per-machine `Package` installs to `ProgramFiles64Folder\Brindle`, containing `brindle.exe`, `conpty.dll` and `OpenConsole.exe`.
+  - It has a stable `UpgradeCode` and `MajorUpgrade`.
+  - The Start Menu shortcut carries `ShortcutProperty System.AppUserModel.ID=Brindle.Terminal`.
+  - `ARPPRODUCTICON` is set.
+  - A `LICENSE` RTF includes Brindle's MIT and Apache-2.0 texts and the ConPTY MIT notice.
+  - `PathFeature` is `Level 2`, off by default.
+  - Uninstall removes only what it installed.
+  - If the pinned WiX version needs a EULA flag on the command line, the workflow states it. MSI beats Inno Setup (wrappers needed for enterprise deploys) and MSIX (signing mandatory, plus filesystem virtualisation inside a terminal).
+- **`--install-desktop`:** it finds `FOLDERID_Programs`, then creates `Brindle.lnk` through `IShellLinkW`, with the path and icon set to `current_exe`, `IPropertyStore` setting `PKEY_AppUserModel_ID`, and `IPersistFile::Save`.
+- **`--uninstall-desktop`:** it deletes the shortcut and the HKCU AUMID key, and treats both being missing as success.
+- **`--prefix`:** rejected with exit status 2. The argument handling is cfg-free and unit-tested.
 
-`editor_command` on Windows uses `%VISUAL%` or `%EDITOR%` through `cmd.exe /C`, so values like `code -w` work, and defaults to `notepad.exe`. On Unix it is the current `/bin/sh -c` with `nano`.
+### 14. Verification
 
-`child_env` keeps setting `TERM`, `COLORTERM` and so on. The values are harmless on Windows, and they help WSL and ssh sessions started from the tab.
-
-### 6. Fonts
-
-The terminal fallback list in `resolve_family` gains `Cascadia Mono` and `Consolas` after the Linux entries. `Cascadia Mono` ships with Windows Terminal and is standard on Windows 11. The config's default `font.family` gains `Cascadia Mono` and `Consolas` at the end, after the existing entries, so nothing changes on Linux machines that have one of those. The UI font list gains `Segoe UI Variable Text` and `Segoe UI`. DirectWrite does the glyph fallback for symbols, emoji and CJK, so the font-selection requirement holds without more code.
-
-### 7. tmux through WSL
-
-`tmux::command_line` already runs `profile.command` with `tmux_args` placed before `-C new-session -A -s <name>`. So `command = "wsl"` with `tmux_args = ["tmux"]` produces `wsl tmux -C new-session -A -s main`. Control mode runs over stdin and stdout pipes, which `wsl.exe` passes through.
-
-The only change is that `command_line` omits `-c <dir>` when the program's file stem is `wsl`, compared case-insensitively. The directory would be a Windows path, which tmux inside WSL can't use. This is unit-tested on every platform. The default config gains a commented WSL control-mode profile.
-
-### 8. Icon resource and version info: `build.rs` with `embed-resource`
-
-The new `build.rs` acts only when `CARGO_CFG_TARGET_OS == "windows"`. It compiles `assets/windows/brindle.rc`, which holds:
-- `1 ICON "brindle.ico"`, at id 1 because that's the id GPUI loads;
-- a `VERSIONINFO` block whose `ProductVersion` and `FileVersion` come from `CARGO_PKG_VERSION`, passed as `/D` macros.
-
-It uses `embed-resource` 3, declared under `[target.'cfg(target_os = "windows")'.build-dependencies]`, which is the same form GPUI uses. That version is already locked, so `winresource`, a new crate, isn't needed.
-
-**No manifest in our `.rc`.** GPUI's `windows-manifest` feature already supplies RT_MANIFEST id 1, and a second one fails linking with a duplicate-resource error. Task 4.3 checks that GPUI's manifest really reaches `brindle.exe`. If it doesn't, Brindle would turn off GPUI's `windows-manifest` feature and put GPUI's manifest XML into `brindle.rc`. GPUI is Apache-2.0, so copying that XML is allowed. Turning the feature off means listing the other default features (`font-kit`, `wayland`, `x11`) explicitly. Feature changes don't change locked versions.
-
-### 9. Icons are rendered by a script and committed
-
-There is no SVG rasterizer in the dependency tree, and adding `resvg` as a build dependency would pull in a dozen new crates. Instead, `scripts/render-icons.sh` renders `assets/brindle.svg` to PNGs at 16, 20, 24, 32, 40, 48, 64 and 256 px with `rsvg-convert`, or with `resvg` or `magick` if that's what is installed. It then packs them into `assets/windows/brindle.ico`. The 256 px image is PNG-compressed inside the ICO, and the smaller ones are BMP for compatibility with older shells. The `.ico` is committed and rebuilt only when the SVG changes. A CI step checks that it is newer than the SVG. The macOS port can reuse the script's PNG output for its `.icns`.
-
-### 10. Installer: MSI built with the WiX Toolset CLI
-
-`packaging/windows/brindle.wxs` is authored by hand for the WiX v4+ `wix build` CLI and builds `Brindle-<version>-x86_64.msi`. It defines:
-- a per-machine `Package` in `ProgramFiles64Folder\Brindle`;
-- a stable `UpgradeCode` and a `MajorUpgrade` element, so newer versions replace older ones;
-- a Start Menu shortcut;
-- an optional `PathFeature` (Level 2, off by default) that adds the install directory to the system `PATH` through an `Environment` element;
-- `ARPPRODUCTICON` set to `brindle.ico`;
-- the MIT and Apache-2.0 licence text in the `LICENSE` dialog, as RTF.
-
-Uninstall removes exactly what the MSI installed. `%APPDATA%\brindle` is never touched.
-
-Alternatives compared:
-
-| | MSI (WiX CLI) | Inno Setup | MSIX |
-|---|---|---|---|
-| Enterprise deploy (Intune, GPO, `msiexec /qn`) | native | needs wrappers | yes, but signing is mandatory |
-| Upgrade and uninstall bookkeeping | Windows Installer does it | script-defined | OS-managed |
-| Unsigned sideloading | works, with a SmartScreen warning | works, with a SmartScreen warning | **impossible**: the package must be signed by a trusted certificate |
-| Effect on a terminal | none | none | File-system and registry virtualization of `%APPDATA%` writes, and a container identity that leaks into the shells it starts |
-| winget support | yes | yes | yes |
-| Toolchain | `dotnet tool install wix`, scriptable in CI | Windows-only `ISCC.exe` | `makeappx`, signing |
-| Precedent | Alacritty ships an MSI built with WiX | – | Windows Terminal, which is Microsoft-signed |
-
-MSI wins on deployability and on needing no signing. *cargo-wix* was considered, but its generated template and driver target the WiX v3 `candle`/`light` toolset. A hand-written `.wxs` for the current CLI is small, about 80 lines, and keeps the toolchain current.
-
-### 11. `--install-desktop` on Windows creates a Start Menu shortcut
-
-`src/desktop.rs`, from the Linux change, gains a `#[cfg(windows)]` implementation:
-1. find the per-user Programs folder with `SHGetKnownFolderPath(FOLDERID_Programs)`;
-2. create `Brindle.lnk` through COM, using `IShellLinkW` with `SetPath(current_exe)`, `SetIconLocation(current_exe, 0)` and `SetDescription`, saved with `IPersistFile::Save`;
-3. print the path.
-
-`--uninstall-desktop` deletes that file and treats a missing file as success. `--prefix` is rejected with exit status 2, as `desktop-integration` specifies. The code uses `windows` 0.61 with the `Win32_UI_Shell` and `Win32_System_Com` features, which GPUI already enables on the same locked version. No AppUserModelID is set on the shortcut or the process, so Windows groups taskbar buttons by executable path, which matches the shortcut.
-
-The MSI doesn't call `--install-desktop`, because it owns its own shortcut. If a user has both, the per-user `.lnk` and the MSI's all-users shortcut show up as two Start Menu entries. The README says to use one or the other.
-
-### 12. CI is the Windows verification
-
-`.github/workflows/windows.yml` runs on `windows-latest`, which has MSVC and the Windows SDK, so `fxc.exe` and `rc.exe` are available. The job:
-1. installs the WiX CLI with `dotnet tool install --global wix` (version pinned) and adds the UI extension;
-2. runs `cargo build --release --locked` and `cargo test --locked`;
-3. builds the MSI;
-4. installs and uninstalls the MSI quietly with `msiexec /i … /qn` and `/x`, checking the installed file, the shortcut and the uninstall registry key;
-5. uploads the MSI as an artifact.
-
-`--locked` enforces the "never regenerate `Cargo.lock`" rule. Interactive checks (title bar, Snap Layouts, icon, IME, fonts) are manual steps on a real Windows 11 machine, listed in tasks.md.
+- **This Windows machine:**
+  - `cargo build`, `cargo test` and the Windows e2e cases.
+  - GUI runs here steal focus like on Linux `:0`, so they are announced and asked for first.
+- **Windows e2e cases:**
+  - `tests/e2e` compiles on Windows. X11 captures and tmux cases are `cfg(target_os = "linux")`.
+  - New `windows-*` cases drive Brindle with the existing `--send`/`--dump-screen-after` hooks, `BRINDLE_NOTIFY_LOG` and a Toolhelp check. They cover the ConPTY host, passthrough order, titles, the OSC 7 new tab and the PowerShell marks.
+  - `windows-wsl-tmux` skips itself when WSL or tmux is missing, and uses the `-L brindle-e2e-…` throwaway server rule.
+- **The Linux machine:**
+  - Each group that touches shared code is pushed to the `port-to-windows` branch on origin.
+  - The Linux Claude session runs `cargo test --locked`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`, each when its user approves.
+  - The Linux CI jobs run on the same push.
+- **CI:**
+  - A `windows` job is added to `ci.yml`, sharing `RUST_VERSION`, on `windows-latest`.
+  - It runs fetch-conpty, `cargo build --release --locked`, `cargo test --locked`, the resource and manifest checks, the Windows e2e cases, and the MSI build, install, upgrade and uninstall.
+  - It uploads the MSI.
+  - Like `e2e`, the Windows e2e step is advisory.
 
 ## Risks / Trade-offs
 
-- **[Code that has never been compiled for Windows]** The first CI run may find more Unix-only code than the review above found. → Task 1.1 makes the Windows job the first thing landed, before any behaviour work, and the remaining errors are fixed in groups 1–2.
-- **[GPUI's manifest may not reach the `.exe`]** If it doesn't, the window isn't DPI-aware and renders blurry at scales above 100%. → Task 4.3 checks for it explicitly. The fallback is decision 8.
-- **[Tab titles from the newest-pid heuristic can be wrong]** For example, with a background job started after the foreground one. → It only applies when the program sets no title. PowerShell and most TUIs set one.
-- **[No working directory inheritance on Windows]** This is a visible gap compared with Linux. → It is specified as such. OSC 7 support is a future cross-platform change.
-- **[Unsigned binaries]** SmartScreen warns on the first download, and some antivirus tools flag new unsigned executables. → Signing is an open question. Until it's decided, the README explains the warning.
-- **[A `fxc.exe` path tied to SDK 10.0.26100.0]** GPUI's build script panics if neither `PATH` nor that SDK path has it. → CI runners have it, and the README tells local builders to set `GPUI_FXC_PATH`.
-- **[Lockfile drift]** Adding direct dependencies on locked crates updates `Cargo.lock`'s dependency lists. → Run plain `cargo build` once to add the edges, without `cargo update`. Check that `git diff Cargo.lock` only adds dependency edges and no new versions, then use `--locked` from then on.
+- **[Writing our own ConPTY pipes and threads]** Event-loop wake-ups or drop order could be wrong (hangs on close, lost output). → Unit tests run the pipe reader against a pipe pair. A Windows e2e case closes a tab mid-output. The spike already exercises Release→Close.
+- **[Packaged ConPTY absent in some builds]** Users of a plain `cargo install`, without the fetch script, get the inbox fallback and its fidelity loss. → A logged warning, the README, and the MSI always including it.
+- **[Extracted DLL in `%LOCALAPPDATA%`]** It is writable by the user who runs Brindle, the same trust level as `~/.cargo/bin\brindle.exe` itself. It is rewritten whenever its bytes don't match the embedded copy, so tampering is undone at the next launch. MSI installs never use it.
+- **[Toast foreground activation]** Windows may refuse `SetForegroundWindow` from a toast `Activated` callback. → `FlashWindowEx` fallback, and a manual check in group 9.
+- **[Toasts from an AUMID registered only in HKCU]** The registry route, with no shortcut, is what the Windows App SDK uses for unpackaged apps, but it hasn't been probed here, and `IconUri` support varies by build. → Task 7.1 starts with a probe, after asking, since it shows a toast. If toasts need a shortcut, the delta's "Toasts without the installer" scenario changes to "after `brindle --install-desktop`", and Brindle logs a hint pointing to it.
+- **[GUI subsystem and stdio]** If `AttachConsole` behaves differently under some hosts (Windows Terminal versus conhost), CLI output could be lost. → An e2e test uses redirection, and the CLI options are covered by a manual check from PowerShell in Windows Terminal.
+- **[Newest-pid title heuristic]** It can pick a background job. → OSC titles win, and this is specified as "most recently started".
+- **[CI runs Windows Server 2025, not 11]** This affects the inbox ConPTY build and Snap. → Interactive checks are manual on this Windows 11 machine. The packaged ConPTY is the same binary everywhere.
+- **[Shared MODIFIED blocks with `port-to-macos`]** configuration, profiles, tabs (titles) and terminal-rendering are modified by both changes. → Whichever change archives second rebases its blocks onto the first's.
 
 ## Migration Plan
 
-Nothing changes on Linux: the code moves into `platform/unix.rs` without behaviour changes, and `cargo test` must pass before and after the move. Windows is new. Releases attach the MSI to GitHub Releases. The winget manifest is submitted once there is a stable download URL. Rolling back means not publishing the MSI. The Windows code is inert on Linux.
+- **Linux:** code moves behind `cfg` without behaviour changes, except that `flock` moves to `File::try_lock`, which has the same semantics. `cargo test` and the Linux e2e suite must pass before and after, on the Linux machine.
+- **Windows:** new. Releases attach the MSI to GitHub Releases.
+- **Rollback:** don't publish the MSI. The Windows code is inert on Linux.
 
 ## Open Questions
 
-- **Code signing.** Should Brindle buy an Authenticode certificate? An OV certificate costs roughly $200–400 a year and still builds SmartScreen reputation slowly. EV is more expensive and needs hardware tokens. Azure Trusted Signing is cheaper, but its eligibility is limited. This affects only the release pipeline, not the specs or tasks, since the MSI and the `.exe` are signed as a post-build step.
-- **winget publishing ownership.** Who submits and maintains the `microsoft/winget-pkgs` manifest? `wingetcreate` can automate it from the release workflow once releases exist.
-- **ARM64.** GPUI's D3D11 path should work on ARM64. Adding `aarch64-pc-windows-msvc` to CI and the MSI is a follow-up once x64 is stable.
-- **`--prefix` meaning across platforms:** it is `<dir>/share` on Linux (`add-linux-desktop-install`), `<dir>/Applications` in `port-to-macos`, and rejected with exit 2 here. Decide whether to keep one flag with per-platform meaning or rename it, before either port is applied.
-- **Archive order:** this change adds to `desktop-integration`, so `add-linux-desktop-install` must be archived first. MODIFIED blocks shared with `port-to-macos` (configuration, profiles, tabs, terminal-rendering) need rebasing onto whichever change archives first.
+- **Code signing** (an OV certificate, EV, or Azure Trusted Signing): this affects only a post-build release step.
+- **winget:** who submits and maintains the manifest once releases exist.
+- **ARM64:** GPUI's D3D11 path and the package's ARM64 binaries should work. This is a follow-up once x64 is stable.
+- **`--prefix` meaning across platforms:** `<dir>/share` on Linux, `<dir>/Applications` in `port-to-macos`, and rejected here. Settle it before both ports are archived.

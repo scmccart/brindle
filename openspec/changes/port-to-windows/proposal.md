@@ -2,74 +2,94 @@
 
 ## Why
 
-Brindle only builds on Linux, but its foundations already run on Windows. GPUI 0.2.2 has a Direct3D 11 renderer and native window handling for Windows 10 and 11, alacritty_terminal 0.26 has a ConPTY backend, and `Cargo.lock` already contains the Windows-only crates (`windows` 0.61, `windows-sys` 0.59, `embed-resource` 3). What stops Brindle is a handful of Unix-only code paths in Brindle itself, plus the lack of any way to install it. Windows users expect an installer, a Start Menu entry, an uninstall entry and an icon in the `.exe`.
+Brindle only builds and runs on Linux. GPUI 0.2.2 already renders with Direct3D 11 on Windows, and alacritty_terminal 0.26 has a ConPTY backend. That backend, though, uses only the original 2018 pseudoconsole API. Windows' built-in ConPTY re-renders program output instead of passing it through. In a spike on Windows 11 build 26200 it dropped mouse-mode requests, emptied synchronized updates, answered OSC 11 itself, and moved OSC 0/7/9/52 ahead of the text they belong to. Microsoft's current ConPTY (the one Windows Terminal ships, MIT-licensed on NuGet) passed every test sequence through byte for byte. Windows 11 users also expect an MSI, a Start Menu entry, toasts and a native-feeling title bar. Brindle itself has Unix-only code in about a dozen places (PTY spawn, `/proc`, `flock`, D-Bus, Wayland, `xdg-open`, `/bin/sh`), and a Windows `cargo check` stops on all of them.
 
 ## What Changes
 
-- **Build on Windows (`x86_64-pc-windows-msvc`).** Move the Unix-only code behind `cfg`:
-  - PTY spawn: today it reads `pty.child().id()` and `pty.file()`. On Windows, the child pid comes from `pty.child_watcher().pid()`, and there is no master fd. The `tty::Options` struct also gains the Windows-only `escape_args` field.
-  - Foreground process and working directory: today they use `/proc` and `libc::tcgetpgrp`.
-  - Primary selection: GPUI only defines `write_to_primary`/`read_from_primary` on Linux and FreeBSD.
-  - `open_config`: today it runs the editor through `/bin/sh -c`.
-- **Tab titles on Windows.** ConPTY has no foreground process group. The process-name step of the title order uses the newest descendant of the tab's shell, found with a Toolhelp snapshot, and falls back to the shell's own name.
-- **Working directory inheritance is unavailable on Windows.** No supported API reads another process's current directory, and alacritty's parser ignores OSC 7. New tabs start in the profile's directory or the home directory.
-- **Title bar on Windows.** GPUI reports server-side decorations on Windows, and `start_window_move`/`show_window_menu` do nothing there. Meanwhile `appears_transparent` hides the native caption. So today a Windows window would have no way to move, minimize or close it with the mouse. Brindle will draw minimize, maximize and close buttons itself and mark them, and the empty strip, with GPUI's `window_control_area`. Windows then provides native drag, double-click-to-maximize, the system menu, Snap, and Snap Layouts on the maximize button.
-- **Default shell on Windows:** `pwsh.exe` if it is on `PATH`, otherwise `powershell.exe`, otherwise `%COMSPEC%`, otherwise `cmd.exe`.
-- **Config location:** `%APPDATA%\brindle\config.toml`, which is `dirs::config_dir()` and so is what the code already resolves to.
-- **Primary selection is emulated inside Brindle on Windows.** Finishing a selection stores it in an app-wide buffer. Middle click and OSC 52 `p` use that buffer.
-- **tmux on Windows goes through WSL.** A control-mode profile with `command = "wsl"` and `tmux_args = ["tmux"]` runs `wsl tmux -C new-session …` over pipes, unchanged. Brindle omits the Windows-only `-c <dir>` argument for that command. A missing tmux is already explained by the existing attach-failure tab.
-- **Icon in the executable.** A `build.rs` step compiles `assets/windows/brindle.rc`, which holds the icon as resource 1 plus version info, with the already-locked `embed-resource`. GPUI's window class loads icon resource 1 from the `.exe`, so the title bar, taskbar and Alt-Tab all show it without further code. The multi-size `brindle.ico` is generated from `assets/brindle.svg` by a script and committed.
-- **Installer: an MSI built with the WiX Toolset CLI from `packaging/windows/brindle.wxs`.** It installs per-machine to `Program Files\Brindle`, adds a Start Menu shortcut and an Apps & Features uninstall entry, and can optionally add Brindle to `PATH`. A stable UpgradeCode makes newer versions upgrade in place. A winget manifest is an optional follow-up once releases are published. design.md compares this with Inno Setup and MSIX.
-- **Parity for `cargo install` users.** `brindle --install-desktop` and `--uninstall-desktop`, which the Linux change introduces, create and remove a per-user Start Menu shortcut to the running executable on Windows. `--prefix` is rejected on Windows, because machine-wide installs are the MSI's job.
-- **CI.** Add a GitHub Actions `windows-latest` job that runs `cargo build --release` and `cargo test` and builds the MSI. This is the only automated Windows verification. Interactive checks run on a real Windows machine.
+- **Build and run on Windows 11 (`x86_64-pc-windows-msvc`).**
+  - Linux-only crates (zbus, wayland-*, x11rb) and `libc` move behind `cfg`.
+  - Unix-only code paths get Windows implementations next to the macOS port's seams.
+  - The executable uses the GUI subsystem, so launching it opens no console window, and the child processes it starts don't flash console windows either. Informational options still print to the console they were run from.
+- **Brindle hosts its own pseudoconsole on Windows.**
+  - A new Windows PTY backend creates the pseudoconsole itself. alacritty's event loop drives it through alacritty's public PTY traits.
+  - It loads Microsoft's packaged ConPTY (`conpty.dll` with `OpenConsole.exe`, pinned version) from Brindle's own install, never from `PATH`. If that isn't present, it falls back to the inbox ConPTY, logs a warning and accepts the documented loss of fidelity.
+  - It requests wcwidth glyph widths, so ConPTY's idea of character width matches Brindle's grid.
+  - It releases the pseudoconsole before closing it, so closing a tab never deadlocks or blocks the UI.
+  - It parents the console window to Brindle's window.
+  - With the packaged host, mouse reporting, synchronized updates, the alternate screen, OSC 8/52/133/9/777 and color queries reach Brindle exactly as the program wrote them.
+- **Working directory on Windows comes from the shell.**
+  - Brindle recognizes OSC 7 (`file://` URIs) and ConEmu's OSC 9;9.
+  - On Windows, a new tab and a restored tab start in the directory the active tab last reported, and in the home directory when it reported none.
+  - Linux keeps reading `/proc`.
+- **PowerShell shell integration:** `brindle --shell-integration pwsh` prints a script for PowerShell 7 and Windows PowerShell 5.1. It emits OSC 133 marks and OSC 7.
+- **Tab titles on Windows.** ConPTY has no foreground process group, so the process-name step uses the newest descendant of the tab's program. It is found with one Toolhelp snapshot per title tick, shared by all tabs.
+- **Title bar on Windows.** Brindle draws minimize, maximize and close buttons and marks them, and the empty strip, as caption areas. Windows then provides drag, double-click maximize, the system menu, Snap and Snap Layouts.
+- **Windows toasts.** OSC 9/777 and bell notifications become toast notifications under Brindle's AppUserModelID. Clicking one activates its tab and window. The focus rule, rate limits and the `BRINDLE_NOTIFY_LOG` test sink are unchanged.
+- **Other Windows behaviour:**
+  - **Primary selection:** an in-app buffer shared by Brindle's windows.
+  - **Links:** opened with the shell's default handler. `BRINDLE_LINK_OPENER` still overrides it.
+  - **Default program:** `pwsh.exe`, then `powershell.exe`, then `%COMSPEC%`, then `cmd.exe`.
+  - **Config editor:** `%VISUAL%`, then `%EDITOR%`, then Notepad.
+  - **Fonts:** Cascadia Mono, Consolas and Segoe UI fallbacks.
+  - **Paths:** config in `%APPDATA%\brindle`, session state in `%LOCALAPPDATA%\brindle`.
+  - **Single owner of the session state:** a file lock instead of `flock`.
+- **tmux through WSL.**
+  - A control-mode profile with `command = "wsl"` runs `wsl [wsl options] --exec tmux -u [tmux options] -C …`.
+  - **This fixes the old plan:** the `-u` that the UTF-8 change put first would have reached `wsl.exe` as `--user`.
+  - No Windows directory is passed as `-c`.
+- **Install experience:**
+  - Icon and version resources in `brindle.exe`.
+  - A WiX MSI, installed per-machine with the packaged ConPTY next to the executable. It has a stable UpgradeCode, a Start Menu shortcut carrying the AppUserModelID, an optional `PATH` feature, and an uninstall that leaves `%APPDATA%\brindle` alone.
+  - `--install-desktop` / `--uninstall-desktop` create and remove a per-user Start Menu shortcut. `--prefix` is rejected on Windows.
+- **Verification.**
+  - Windows builds, unit tests and Windows e2e cases run on this Windows machine and in a Windows CI job.
+  - Linux regressions are checked on the Linux machine (via its Claude session) and by the existing Linux CI.
+  - Interactive checks are listed as manual steps.
+- **Supported Windows:** Windows 11 only.
 
 ## Capabilities
 
 ### New Capabilities
 
-None. The Windows install requirements go into `desktop-integration`, which `add-linux-desktop-install` introduces and which its proposal reserves for platform ports. This change should therefore be archived after that one.
+None. Windows behaviour extends existing capabilities.
 
 ### Modified Capabilities
 
-- `configuration`: the config location names the platform's config directory, not only `$XDG_CONFIG_HOME`.
-- `profiles`: the default program on Windows is PowerShell or `%COMSPEC%`, not `$SHELL` and `/bin/sh`.
-- `tabs`:
-  - The tab title's process-name step is defined for Windows.
-  - Working directory inheritance is Linux-only.
-  - The title bar behaviour covers Windows' native caption hit-testing.
-- `terminal-emulation`: Selection and copy and OSC 52 define a primary selection on platforms that have none.
-- `terminal-rendering`: GPU rendering names Direct3D 11 on Windows.
-- `tmux-control-mode`: a requirement for attaching through WSL on Windows.
-- `desktop-integration` (added by `add-linux-desktop-install`): Windows icon resource, MSI installer, and `--install-desktop` / `--uninstall-desktop` on Windows.
+- `configuration`: the config location names `%APPDATA%` on Windows.
+- `profiles`: the default program on Windows.
+- `tabs`: the process-name title step on Windows, directory inheritance from shell reports on Windows, and native caption behaviour on Windows.
+- `terminal-emulation`: the pseudoconsole host on Windows and what passes through it, the launch environment wording, and the in-app primary selection for OSC 52 and selection.
+- `terminal-rendering`: Direct3D 11 on Windows 11.
+- `shell-integration`: the PowerShell script, and recognising OSC 7 and OSC 9;9 working-directory reports.
+- `command-line`: `pwsh` for `--shell-integration`, and no console window on Windows.
+- `session-restore`: the state directory on Windows.
+- `links`: the Windows opener.
+- `desktop-notifications`: toast delivery and click-to-tab on Windows.
+- `desktop-integration`: the Windows icon resource, MSI, upgrade and uninstall, the per-user shortcut and the `--prefix` rejection.
+- `tmux-control-mode`: attaching through WSL.
 
 ## Impact
 
 - **Code:**
-  - `src/terminal/mod.rs`: `Backend::Pty` fields are behind `cfg`, and the process info code moves into a per-platform module.
-  - `src/workspace.rs`: the title bar gets caption controls on Windows, and `open_config` gets a Windows editor command.
-  - `src/config.rs`: the default shell.
-  - `src/settings.rs`: Windows font fallbacks, Cascadia Mono, Consolas and Segoe UI.
-  - `src/tmux/mod.rs`: the `-c` rule for `wsl`.
-  - `src/terminal_view.rs` and `src/terminal/mod.rs`: the primary-selection shim.
-  - `src/main.rs` and the Linux change's `src/desktop.rs`: the Windows `--install-desktop` path.
+  - `src/terminal/` gains a Windows PTY backend (`pty_windows.rs`). `ParsingReader` becomes generic over its reader, and process info moves into `terminal/process.rs`, the seam `port-to-macos` also uses.
+  - Also changed: `src/terminal/{mod,links,scan}.rs`, `src/terminal/shell_integration.rs` (OSC 7 / 9;9), `src/session.rs`, `src/notify/` (a toast sink beside D-Bus), `src/workspace.rs` (caption controls, `open_config`), `src/config.rs`, `src/settings.rs`, `src/tmux/mod.rs`, `src/desktop.rs` and `src/main.rs`.
 - **New files:**
   - `build.rs`;
-  - `assets/windows/brindle.rc` and `assets/windows/brindle.ico`;
-  - `scripts/render-icons.sh`;
+  - `assets/windows/{brindle.rc,brindle.ico}`;
+  - `scripts/render-icons.sh` and `scripts/fetch-conpty.ps1`;
+  - `shell-integration/brindle.ps1`;
   - `packaging/windows/brindle.wxs`;
-  - `.github/workflows/windows.yml`;
-  - a README section on Windows.
-- **Dependencies:** each of these crates is already in `Cargo.lock` at the version shown, so the lockfile only gains edges to them and no crate versions change.
-  - `windows` 0.61 as a Windows-only dependency, for Toolhelp, the `IShellLinkW` shortcut and `SHGetKnownFolderPath`.
-  - `embed-resource` 3 as a Windows-only build dependency.
-- **Build prerequisites on Windows:**
-  - the MSVC toolchain;
-  - the Windows 10/11 SDK, because GPUI's build script needs `fxc.exe` for release builds and `rc.exe` compiles resources;
-  - the WiX Toolset CLI, to build the MSI.
-- **Not verifiable on this Linux machine:** there is no Windows target or SDK here. Verification is the CI job plus manual steps on Windows hardware.
+  - Windows e2e cases;
+  - Windows sections in README.md and CLAUDE.md.
+- **Dependencies:**
+  - `windows` 0.61 (Windows-only) and `embed-resource` 3 (Windows-only build dependency). Both are already locked, so `Cargo.lock` gains only the two dependency edges, as checked in a scratch copy.
+  - The packaged ConPTY is fetched by a pinned script (NuGet `Microsoft.Windows.Console.ConPTY`, version and sha256 pinned) and embedded at build time. It isn't committed to git.
+- **Build prerequisites on Windows:** MSVC, the Windows 11 SDK (`fxc.exe`, `rc.exe`), and the WiX CLI for the MSI.
 - **Out of scope:**
-  - ARM64 Windows;
-  - code signing, which is an open question in design.md;
-  - the Microsoft Store and MSIX;
-  - OSC 7 working-directory tracking;
-  - native (non-WSL) tmux.
+  - Windows 10;
+  - ARM64;
+  - code signing;
+  - MSIX and the Store;
+  - win32-input-mode key encoding, because GPUI 0.2.2 doesn't expose virtual-key codes, scan codes or key-ups;
+  - native (non-WSL) tmux;
+  - translating paths between Windows and WSL.

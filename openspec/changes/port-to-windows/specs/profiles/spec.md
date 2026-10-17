@@ -25,3 +25,7 @@ There SHALL always be at least one profile; a "Shell" profile is created when th
 #### Scenario: Windows without PowerShell 7
 - **WHEN** a profile sets no command and `pwsh.exe` is not on `PATH`
 - **THEN** its tabs run `powershell.exe`
+
+#### Scenario: Arguments with spaces on Windows
+- **WHEN** a Windows profile sets `command = "pwsh.exe"` and `args = ["-NoExit", "-Command", "Set-Location 'C:\My Files'"]`
+- **THEN** the program receives exactly three arguments, the last one with its spaces intact

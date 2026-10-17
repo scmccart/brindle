@@ -14,18 +14,25 @@ The Windows `brindle.exe` SHALL contain Brindle's icon as icon resource 1, in si
 - **THEN** the file shows Brindle's icon, and the Details tab shows the product name Brindle and the crate version
 
 ### Requirement: Windows installer
-Brindle SHALL be distributed on Windows as an MSI that installs per-machine to `%ProgramFiles%\Brindle`. It SHALL add a Start Menu shortcut named Brindle and an entry in Apps & Features (Installed apps). An installer feature, off by default, SHALL add the install directory to the system `PATH`.
+Brindle SHALL be distributed on Windows as an MSI that installs per-machine to `%ProgramFiles%\Brindle`, with the ConPTY host it ships beside `brindle.exe`. It SHALL add a Start Menu shortcut named Brindle and an entry in Installed apps. An installer feature, off by default, SHALL add the install directory to the system `PATH`. The installer SHALL show the licences of Brindle and of the ConPTY host.
 
 #### Scenario: Install with the MSI
 - **WHEN** the user runs the Brindle MSI and accepts the defaults
-- **THEN** `%ProgramFiles%\Brindle\brindle.exe` exists, Brindle appears in the Start Menu with its icon, and Brindle is listed in Installed apps
+- **THEN** `%ProgramFiles%\Brindle\brindle.exe`, `conpty.dll` and `OpenConsole.exe` exist, Brindle appears in the Start Menu with its icon, and Brindle is listed in Installed apps
 
 #### Scenario: Add to PATH
 - **WHEN** the user enables the PATH feature during install
 - **THEN** a new console can run `brindle --version`
 
+### Requirement: Windows taskbar identity
+On Windows, Brindle's windows, its Start Menu shortcuts and its toasts SHALL share one application identity. A window opened from a shortcut SHALL group with that shortcut's pinned taskbar button instead of adding a second button.
+
+#### Scenario: Pinned shortcut
+- **WHEN** the user pins Brindle to the taskbar from the Start Menu and then starts it from the pin
+- **THEN** its window appears under the pinned button, with no second Brindle button
+
 ### Requirement: Windows upgrade and uninstall
-Installing a newer Brindle MSI SHALL replace an installed older version in place, leaving one entry in Installed apps. Uninstalling SHALL remove the installed files, the Start Menu shortcut and any `PATH` entry it added. It SHALL leave the user's `%APPDATA%\brindle` configuration in place.
+Installing a newer Brindle MSI SHALL replace an installed older version in place, leaving one entry in Installed apps. Uninstalling SHALL remove the installed files, the Start Menu shortcut and any `PATH` entry it added. It SHALL leave the user's `%APPDATA%\brindle` configuration and `%LOCALAPPDATA%\brindle` state in place.
 
 #### Scenario: Upgrade
 - **WHEN** version 0.2.0's MSI is run where 0.1.0 is installed
@@ -36,7 +43,7 @@ Installing a newer Brindle MSI SHALL replace an installed older version in place
 - **THEN** the program files and Start Menu shortcut are gone, and `%APPDATA%\brindle\config.toml` remains
 
 ### Requirement: Start Menu shortcut without the installer
-On Windows, `brindle --install-desktop` SHALL create a per-user Start Menu shortcut `Brindle.lnk` in the user's Start Menu Programs folder, and `brindle --uninstall-desktop` SHALL remove it. Both SHALL exit without opening a window. The shortcut SHALL target the absolute path of the executable that ran the command and SHALL use that executable's icon. This replaces the desktop entry and icon files that these options install on Linux.
+On Windows, `brindle --install-desktop` SHALL create a per-user Start Menu shortcut `Brindle.lnk` in the user's Start Menu Programs folder, and `brindle --uninstall-desktop` SHALL remove it. Both SHALL exit without opening a window. The shortcut SHALL target the absolute path of the executable that ran the command, and SHALL use that executable's icon and Brindle's application identity. This replaces the desktop entry and icon files that these options install on Linux.
 
 #### Scenario: Shortcut after cargo install
 - **WHEN** a user who ran `cargo install` runs `brindle --install-desktop` on Windows
