@@ -61,18 +61,18 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
 ## 3. Tab titles on Windows
 
-- [ ] 3.1 Write `newest_descendant(rows, root)` (design §4), cfg-free. Unit-test no children, a chain, siblings picking the highest pid, skipping `conhost.exe`/`OpenConsole.exe`, and stripping `.exe`. Wire `process::Snapshot::take()` into the 1 s title poll, once per tick for all tabs. Add the e2e case `windows-title-child`: in `pwsh` (which sets no title, unlike `cmd.exe`), `ping -n 6 127.0.0.1` titles the tab `PING` (its executable name as on disk), and afterwards it no longer is. Verify with `cargo test` on Windows and Linux, and with the case locally (after asking) and in CI.
+- [x] 3.1 Write `newest_descendant(rows, root)` (design §4), cfg-free. Unit-test no children, a chain, siblings picking the highest pid, skipping `conhost.exe`/`OpenConsole.exe`, and stripping `.exe`. Wire `process::Snapshot::take()` into the 1 s title poll, once per tick for all tabs. Add the e2e case `windows-title-child`: in `pwsh` (which sets no title, unlike `cmd.exe`), `ping -n 6 127.0.0.1` titles the tab `PING` (its executable name as on disk), and afterwards it no longer is. Verify with `cargo test` on Windows and Linux, and with the case locally (after asking) and in CI.
 
 ## 4. Working directory and PowerShell integration
 
-- [ ] 4.1 Add the OSC 7 and OSC 9;9 decoder to `Parser` (design §5), cfg-free. Unit-test percent-decoding, `file://host/C:/x`, quoted and unquoted 9;9, a relative path ignored, and a POSIX path ignored on Windows. Store the report beside `Marks` (lock order parser, term, marks, cwd), and return it from `working_directory()` on Windows. Verify with `cargo test` on both platforms, and the Linux session's e2e `restore` and `shell` cases.
-- [ ] 4.2 Add `shell-integration/brindle.ps1` and `brindle --shell-integration pwsh`. The script emits A, B, C, D;status and OSC 7. It keeps a user's `prompt`, and `$?`/`$LASTEXITCODE`. It does nothing when non-interactive and is safe to load twice. The error for an unknown shell lists `pwsh`. Add the e2e case `windows-pwsh-integration`, run under `pwsh` and `powershell.exe`:
+- [x] 4.1 Add the OSC 7 and OSC 9;9 decoder to `Parser` (design §5), cfg-free. Unit-test percent-decoding, `file://host/C:/x`, quoted and unquoted 9;9, a relative path ignored, and a POSIX path ignored on Windows. Store the report beside `Marks` (lock order parser, term, marks, cwd), and return it from `working_directory()` on Windows. Verify with `cargo test` on both platforms, and the Linux session's e2e `restore` and `shell` cases.
+- [x] 4.2 Add `shell-integration/brindle.ps1` and `brindle --shell-integration pwsh`. The script emits A, B, C, D;status and OSC 7. It keeps a user's `prompt`, and `$?`/`$LASTEXITCODE`. It does nothing when non-interactive and is safe to load twice. The error for an unknown shell lists `pwsh`. Add the e2e case `windows-pwsh-integration`, run under `pwsh` and `powershell.exe`:
   - `cmd /c exit 3` records status 3;
   - after `cd C:\Windows`, a new tab starts in `C:\Windows`;
   - session restore brings that directory back.
 
   Verify that the cases pass locally (after asking) and in CI, and that `cargo test` covers the shell list.
-- [ ] 4.3 Document the PowerShell opt-in line in README.md's shell integration section, and the Windows directory rule in the tabs docs. Verify that the documented `$PROFILE` line works in `pwsh` and Windows PowerShell 5.1 on this machine.
+- [x] 4.3 Document the PowerShell opt-in line in README.md's shell integration section, and the Windows directory rule in the tabs docs. Verify that the documented `$PROFILE` line works in `pwsh` and Windows PowerShell 5.1 on this machine.
 
 ## 5. Windows defaults and chrome
 
