@@ -8,31 +8,31 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
 ## 1. A Windows build that compiles and runs
 
-- [ ] 1.1 Gate the Linux-only code (design §1):
+- [x] 1.1 Gate the Linux-only code (design §1):
   - `zbus`, `wayland-*` and dev-dependency `x11rb` move to `cfg(target_os = "linux")`, and `libc` to `cfg(unix)`;
   - `notify/{dbus,activation}.rs` become Linux-only, and on other platforms `Notifier` drops requests with one logged warning until group 7;
   - `tests/e2e` captures and `tests/perf` become Linux-only.
 
   Verify that `cargo check --all-targets` on Windows no longer reports unresolved crates, and that the Linux session's `cargo test --locked` passes.
 - [x] 1.2 Add `windows` 0.61 (`cfg(windows)`, the features from design §1) and `embed-resource` 3 (Windows build-dependency). Run one plain `cargo check`. Verify that `git diff Cargo.lock` shows only the two new edges in `brindle`'s entry, and no added or changed `[[package]]` blocks.
-- [ ] 1.3 Move process info into `terminal/process.rs` (design §1, the `port-to-macos` seam). The Linux `/proc` and `tcgetpgrp` code moves unchanged, and Windows returns `None` for now.
+- [x] 1.3 Move process info into `terminal/process.rs` (design §1, the `port-to-macos` seam). The Linux `/proc` and `tcgetpgrp` code moves unchanged, and Windows returns `None` for now.
   - `session.rs`: the state dir becomes `dirs::data_local_dir()` on Windows, the lock moves to `File::try_lock` on all platforms, and the Unix modes become `cfg(unix)`.
   - `links.rs`: `process_group` becomes `cfg(unix)`.
   - Unix-only tests get `#[cfg(unix)]`, with a portable twin where the property is cross-platform. `scan.rs`'s split read uses an in-memory reader.
 
   Verify `cargo test` on Windows for the touched modules, and the Linux session's `cargo test --locked` (the lock tests included).
-- [ ] 1.4 Temporary scaffolding, removed in 2.4: on Windows, spawn local tabs through alacritty's `tty::Pty` (`escape_args: true`, the pid from `child_watcher().pid()`), without `MarkedPty`. Verify that `cargo build` and `cargo test` pass on Windows.
+- [x] 1.4 Temporary scaffolding, removed in 2.4: on Windows, spawn local tabs through alacritty's `tty::Pty` (`escape_args: true`, the pid from `child_watcher().pid()`), without `MarkedPty`. Verify that `cargo build` and `cargo test` pass on Windows.
 - [ ] 1.5 Switch to the GUI subsystem, attaching to the parent console only around output (design §11). Verify:
   - `brindle --version` and `brindle --list-actions` print in PowerShell inside Windows Terminal;
   - `brindle --bogus` prints usage with exit status 2;
   - after asking the user, `brindle --send "echo hi\r" --dump-screen-after 3 > dump.txt` produces a dump containing `hi`, and no console window opens;
   - after asking, `brindle` started from a PowerShell window survives ctrl-c in that window and its closing.
-- [ ] 1.6 Add a `windows` job to `.github/workflows/ci.yml` on `windows-latest`, using the shared `RUST_VERSION`, that runs `cargo build --release --locked` and `cargo test --locked`. Verify that the job is green on the pushed branch.
-- [ ] 1.7 Document the Windows build in README.md (MSVC, Windows SDK, `GPUI_FXC_PATH`, Windows 11 only) and in CLAUDE.md (the build and test commands on Windows; the Linux session and `scripts/with-xvfb` for Linux checks; "Linux terminal" becomes "Linux and Windows"). Verify that each documented command runs as written on this machine.
+- [x] 1.6 Add a `windows` job to `.github/workflows/ci.yml` on `windows-latest`, using the shared `RUST_VERSION`, that runs `cargo build --release --locked` and `cargo test --locked`. Verify that the job is green on the pushed branch.
+- [x] 1.7 Document the Windows build in README.md (MSVC, Windows SDK, `GPUI_FXC_PATH`, Windows 11 only) and in CLAUDE.md (the build and test commands on Windows; the Linux session and `scripts/with-xvfb` for Linux checks; "Linux terminal" becomes "Linux and Windows"). Verify that each documented command runs as written on this machine.
 
 ## 2. Brindle's own pseudoconsole
 
-- [ ] 2.1 Add `scripts/fetch-conpty.ps1` (design §3), pinned to `1.25.260930003` and sha256 `02B07B34…AE7EE`, extracting into `.conpty/<version>/`, which is gitignored. Make `build.rs` embed the files and copy them next to the output exe when they are present, and print a `cargo:warning` otherwise. Verify:
+- [x] 2.1 Add `scripts/fetch-conpty.ps1` (design §3), pinned to `1.25.260930003` and sha256 `02B07B34…AE7EE`, extracting into `.conpty/<version>/`, which is gitignored. Make `build.rs` embed the files and copy them next to the output exe when they are present, and print a `cargo:warning` otherwise. Verify:
   - the script fails on a wrong hash;
   - a build with the files embeds them (the exe grows by about 1.2 MB, and `target\debug\conpty.dll` exists);
   - a build without them warns and still builds.
@@ -41,7 +41,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - the case-insensitive, sorted environment block, where the profile entry wins and `path` replaces `Path`.
 
   Verify with `cargo test` on Windows and on the Linux session.
-- [ ] 2.3 Implement `terminal/conpty.rs` (design §2):
+- [x] 2.3 Implement `terminal/conpty.rs` (design §2):
   - the `ConptyApi` resolution order: exe dir and then the extracted copy, both only when byte-identical to the embedded copy, then kernel32. Use `LoadLibraryExW` with the safe search flags, and honour `BRINDLE_CONPTY=inbox`;
   - `PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH`;
   - the pipe reader and writer threads posting IOCP completions, and the child watcher;
@@ -76,7 +76,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
 ## 5. Windows defaults and chrome
 
-- [ ] 5.1 Add `src/primary.rs` (design §6), with the cfg-free `PrimaryBuffer` unit-tested. Route OSC 52 `Selection` in both directions, `finish_selection` and `PastePrimary` through it. Verify with `cargo test` on both platforms, and the Linux session's `selection` e2e cases.
+- [x] 5.1 Add `src/primary.rs` (design §6), with the cfg-free `PrimaryBuffer` unit-tested. Route OSC 52 `Selection` in both directions, `finish_selection` and `PastePrimary` through it. Verify with `cargo test` on both platforms, and the Linux session's `selection` e2e cases.
 - [ ] 5.2 Write `default_program(path, comspec)` (design §7) as a pure function. Unit-test the four steps and `-NoLogo`. Update the `Profile::command` doc and the default config comments. Verify with `cargo test`, and the config-defaults test.
 - [ ] 5.3 Write `editor_command` (the `cmd.exe /D /S /C` raw tail; `%VISUAL%`, then `%EDITOR%`, then Notepad). Unit-test the generated command line for `code -w` and for a config path with spaces. Verify with `cargo test`, and by opening the config with ctrl-, locally (after asking).
 - [ ] 5.4 Add the font fallbacks (design §11). Verify with `cargo test` (the config defaults), and that the Linux session's e2e cases are unchanged.
