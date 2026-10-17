@@ -1227,15 +1227,18 @@ impl SettingsDialog {
         let focused = self.session_end_handle.is_focused(window);
         let choice = self
             .choice_frame("tmux-session-end", focused, Some(&self.session_end_handle))
+            // The frame's own `flex_1` sets a zero basis; size it to its options.
             .flex_none()
+            .flex_basis(gpui::Length::Auto)
             .gap_1()
             .on_action(cx.listener(Self::session_end_next))
             .on_action(cx.listener(Self::session_end_prev))
             .on_click(cx.listener(|this, _, window, _| window.focus(&this.session_end_handle)))
             .children(segments);
-        div()
+        let body = div()
             .flex()
             .flex_col()
+            .flex_1()
             .gap_2()
             .child(div().text_color(t.foreground.hsla()).child("When a tmux session ends and its tabs were the window's only tabs"))
             .child(div().flex().child(choice))
@@ -1244,8 +1247,14 @@ impl SettingsDialog {
                     .text_xs()
                     .text_color(t.muted_foreground().hsla())
                     .child("Applies to detaching (ctrl-shift-d), closing the last tab, and the last shell exiting. Saved at once."),
-            )
-            .into_any_element()
+            );
+        // Changes are already saved, so Close is all the footer needs.
+        let footer = div()
+            .flex()
+            .items_center()
+            .child(div().flex_1())
+            .child(self.button("general-close", "Close", false, true, cx, |_, _, cx| cx.emit(SettingsEvent::Close)));
+        div().flex().flex_col().flex_1().min_h_0().gap_2().child(body).child(footer).into_any_element()
     }
 
     fn button(

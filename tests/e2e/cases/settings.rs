@@ -6,7 +6,7 @@
 
 use super::{cells, server};
 use crate::brindle::{self, Output, Run, theme};
-use crate::capture::Rgb;
+use crate::capture::{PxRect, Rgb};
 use crate::tmux::TmuxServer;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -174,14 +174,53 @@ pub fn profile_rename(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// The dialog opens on General; right changes `tmux_session_end` and writes
-/// it at once, before the first table.
+/// it at once, before the first table. The focused choice field's outline
+/// encloses its three options.
 pub fn general(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
-    let out = Run::new(ctx, &server, "run").action("open_settings").action("settings_choice_next").dump_at(3.8).run()?;
+    let out = Run::new(ctx, &server, "run")
+        .action("open_settings")
+        .action("settings_choice_next")
+        .capture_at(3.3)
+        .dump_at(3.8)
+        .run()?;
+    expect_choice_outline(&out)?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(settings == "section=General tmux_session_end=\"new_tab\" error=None", "dialog state: {settings:?}");
     let config = config_text(ctx)?;
     let want = brindle::config(&server.socket, "e2e").replacen("padding = 6\n", "padding = 6\ntmux_session_end = \"new_tab\"\n", 1);
     ensure!(config == want, "config after the change:\n{config}");
     Ok(Outcome::Pass)
+}
+
+/// The focused choice field's accent outline: its top edge is the longest
+/// accent run in the capture (the active tab's marker is far shorter), and
+/// it is wide enough for "Close window", "Open a new tab" and "Ask", with no
+/// label text just past its right edge.
+fn expect_choice_outline(out: &Output) -> Result {
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = out.dump.grid()?.scale;
+    let px = |v: f32| (v * scale).round() as u32;
+    let mut top = (0, 0, 0);
+    for y in 0..image.height {
+        let mut x = 0;
+        while x < image.width {
+            let start = x;
+            while x < image.width && image.pixel(x, y).near(theme::ACCENT, 8) {
+                x += 1;
+            }
+            if x - start > top.2 - top.1 {
+                top = (y, start, x);
+            }
+            x += 1;
+        }
+    }
+    let (y0, x0, x1) = top;
+    ensure!(x1 - x0 >= px(250.0), "choice outline is {} px wide at y={y0}, want at least {}", x1 - x0, px(250.0));
+    // The frame is 26 logical pixels tall; its labels sit inside it.
+    let rows = |a: u32, b: u32| PxRect { x0: a, y0: y0 + px(4.0), x1: b, y1: y0 + px(22.0) };
+    ensure!(image.count(rows(x0, x1), theme::FOREGROUND) > 0, "no label text inside the choice outline");
+    let outside = image.count(rows(x1 + px(2.0), (x1 + px(80.0)).min(image.width)), theme::FOREGROUND);
+    ensure!(outside == 0, "{outside} label pixels just right of the choice outline");
+    Ok(())
 }
