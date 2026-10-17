@@ -66,7 +66,8 @@ pub fn local_click(ctx: &Ctx) -> Result<Outcome> {
         .click("ctrl-5,4")
         .click("10,0")
         .hover("ctrl-0,1")
-        .capture_at(6.6)
+        // Late in the hover step, so the repaint has landed even under load.
+        .capture_at(6.9)
         .dump_at(7.2)
         .run()?;
 
