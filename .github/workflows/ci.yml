@@ -126,6 +126,19 @@ jobs:
         run: cargo test --locked --test perf -- --self-test
         env:
           BRINDLE_PERF: "1"
+      - name: Version resource and DPI manifest in brindle.exe
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $info = (Get-Item $exe).VersionInfo
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version) {
+            throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)', expected Brindle $version"
+          }
+          # GPUI embeds the manifest; without it the window renders blurry above 100% scale.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
+          if (-not (Select-String -Path manifest.xml -Pattern 'PerMonitorV2' -Quiet)) { throw 'no PerMonitorV2 in the manifest' }
       # brindle.exe is a GUI program, so PowerShell waits for it only
       # through Start-Process -Wait.
       - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)

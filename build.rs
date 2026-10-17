@@ -1,13 +1,40 @@
 //! Windows builds embed the packaged ConPTY that `scripts/fetch-conpty.ps1`
 //! fetches into `.conpty/<version>/`, and copy it next to the built exe so
-//! `cargo run` loads it from there. Other targets do nothing here.
+//! `cargo run` loads it from there. They also compile the icon and version
+//! resources. Other targets do nothing here.
 
 use std::path::{Path, PathBuf};
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         conpty();
+        resources();
     }
+}
+
+/// Compiles `assets/windows/brindle.rc` into the exe, with the crate's
+/// version and, once rendered, the icon.
+fn resources() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let dir = manifest.join("assets").join("windows");
+    let (rc, ico) = (dir.join("brindle.rc"), dir.join("brindle.ico"));
+    println!("cargo:rerun-if-changed={}", rc.display());
+    println!("cargo:rerun-if-changed={}", ico.display());
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let number = |name: &str| std::env::var(name).unwrap();
+    let mut macros = vec![
+        format!("BRINDLE_VERSION=\"{version}\""),
+        format!("BRINDLE_MAJOR={}", number("CARGO_PKG_VERSION_MAJOR")),
+        format!("BRINDLE_MINOR={}", number("CARGO_PKG_VERSION_MINOR")),
+        format!("BRINDLE_PATCH={}", number("CARGO_PKG_VERSION_PATCH")),
+    ];
+    if ico.is_file() {
+        // rc.exe reads the path as a C string, so its backslashes are doubled.
+        macros.push(format!("BRINDLE_ICON=\"{}\"", ico.display().to_string().replace('\\', "\\\\")));
+    } else {
+        println!("cargo:warning=no {}: brindle.exe gets no icon (run scripts/render-icons.sh)", ico.display());
+    }
+    embed_resource::compile(&rc, &macros).manifest_optional().expect("compiling assets/windows/brindle.rc");
 }
 
 /// Writes `$OUT_DIR/conpty.rs`: the pinned version and, when it has been
