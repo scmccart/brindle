@@ -22,6 +22,11 @@ impl<R> ScanReader<R> {
     pub fn new(inner: R, tx: UnboundedSender<ChannelEvent>) -> Self {
         Self { inner, scanner: Scanner::new(), tx }
     }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
 }
 
 impl<R: Read> Read for ScanReader<R> {

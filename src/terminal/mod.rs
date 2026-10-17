@@ -6,11 +6,15 @@
 //! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
 
+// Used by the Windows PTY; tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod cmdline;
+#[cfg(windows)]
+mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
 mod process;
-#[cfg(unix)]
 mod pty;
 pub mod shell_integration;
 mod scan;
@@ -30,6 +34,7 @@ use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
+#[cfg(unix)]
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::StreamExt as _;
@@ -284,15 +289,18 @@ impl Terminal {
             .or_else(dirs::home_dir)
             .filter(|dir| dir.is_dir());
 
+        #[cfg(unix)]
         let options = tty::Options {
             shell: Some(tty::Shell::new(program.clone(), args)),
             working_directory,
             drain_on_exit: true,
             env: child_env(profile),
-            // Quote each argument with the C runtime's rules, so TOML
-            // `args` arrive as written.
-            #[cfg(windows)]
-            escape_args: true,
+        };
+        #[cfg(windows)]
+        let command = conpty::Command {
+            line: cmdline::command_line(&program, &args),
+            cwd: working_directory,
+            env: child_env(profile).into_iter().collect(),
         };
 
         let (tx, rx) = unbounded();
@@ -313,14 +321,11 @@ impl Terminal {
             event_loop.spawn();
             Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid, master_fd) })
         })();
-        // TEMPORARY until Brindle hosts its own pseudoconsole: alacritty's
-        // ConPTY, parsed by alacritty itself, so shell-integration marks and
-        // notifications are not seen in local Windows tabs yet.
         #[cfg(windows)]
         let spawned = (|| -> anyhow::Result<Backend> {
-            drop(tx);
-            let pty = tty::new(&options, size.into(), 0)?;
-            let child_pid = pty.child_watcher().pid().map_or(0, |pid| pid.get());
+            let spawned = conpty::spawn(&command, size.into())?;
+            let child_pid = spawned.pid;
+            let pty = pty::MarkedPty::new(spawned, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx);
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
