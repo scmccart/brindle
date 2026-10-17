@@ -1,0 +1,7 @@
+# Text files are LF in every checkout, Windows included: assets and shell
+# scripts are embedded in the binary with include_str!, and printed scripts
+# must run in bash, zsh and fish.
+* text=auto eol=lf
+
+*.ico binary
+*.png binary
