@@ -62,9 +62,19 @@ Windows 11 SDK (Visual Studio Build Tools with "Desktop development with C++"),
 then, in PowerShell:
 
 ```powershell
+scripts/fetch-conpty.ps1
 cargo build --release
 .\target\release\brindle.exe
 ```
+
+`scripts/fetch-conpty.ps1` downloads Microsoft's packaged ConPTY (the console
+host Windows Terminal ships, MIT-licensed), checked against a pinned hash, and
+the build embeds it in `brindle.exe`. Brindle hosts each tab with it, so what
+programs write reaches the terminal unchanged: mouse modes, synchronized
+updates, hyperlinks, notifications and color queries. A build made without it
+warns, and its tabs fall back to the ConPTY built into Windows, which repaints
+output instead of passing it through and drops mouse modes. Brindle logs a
+warning when it falls back. Run the script before `cargo install --path .` too.
 
 GPUI's release build compiles its shaders with the SDK's `fxc.exe`, which it
 looks for on `PATH` and in SDK 10.0.26100.0. With another SDK version, point
