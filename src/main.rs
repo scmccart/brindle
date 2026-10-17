@@ -1,3 +1,7 @@
+// A GUI program on Windows, so launching it opens no console window (see
+// `console_output`). Test builds keep the console subsystem.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod actions;
 mod config;
 mod config_edit;
@@ -17,6 +21,8 @@ mod text_input;
 mod theme;
 mod tmux;
 mod tmux_view;
+#[cfg(windows)]
+mod win;
 mod workspace;
 
 use std::path::PathBuf;
@@ -126,20 +132,24 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
+                console_output();
                 print!("{HELP}");
                 std::process::exit(0);
             }
             "-V" | "--version" => {
+                console_output();
                 println!("brindle {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--list-actions" => {
+                console_output();
                 for name in actions::action_names() {
                     println!("{name}");
                 }
                 std::process::exit(0);
             }
             "--list-themes" => {
+                console_output();
                 for name in theme::BUILTIN_THEMES {
                     println!("{name}");
                 }
@@ -149,6 +159,7 @@ fn parse_args() -> Args {
                 let shell = it.next().unwrap_or_default();
                 match SHELL_SCRIPTS.iter().find(|(name, _)| *name == shell) {
                     Some((_, script)) => {
+                        console_output();
                         print!("{script}");
                         std::process::exit(0);
                     }
@@ -214,8 +225,18 @@ fn parse_args() -> Args {
 }
 
 fn usage_error(message: &str) -> ! {
+    console_output();
     eprintln!("brindle: {message}\n\n{HELP}");
     std::process::exit(2);
+}
+
+/// Called before printing on a path that exits right after. On Windows,
+/// where Brindle is a GUI program with no console of its own, it attaches
+/// to the console Brindle was started from. A GUI session never attaches
+/// while it runs, so ctrl-c in that console, or closing it, can't end it.
+fn console_output() {
+    #[cfg(windows)]
+    win::attach_parent_console();
 }
 
 fn unescape(s: &str) -> String {
@@ -386,6 +407,7 @@ fn main() {
     let args = parse_args();
     // Desktop registration needs no display, so it runs before GPUI starts.
     if let Some(request) = &args.desktop {
+        console_output();
         if let Err(err) = desktop::run(request) {
             eprintln!("brindle: {err:#}");
             std::process::exit(1);
@@ -414,11 +436,13 @@ fn main() {
         .detach();
         if args.latency_log.is_some() || args.latency_bench.is_some() {
             if let Err(err) = Latency::install(args.latency_log.as_deref(), cx) {
+                console_output();
                 eprintln!("brindle: --latency-log: {err}");
                 std::process::exit(1);
             }
             cx.on_app_quit(|cx| {
                 if let Some(summary) = Latency::log_summary(cx) {
+                    console_output();
                     eprint!("{summary}");
                 }
                 async {}
@@ -488,6 +512,7 @@ fn main() {
             if let Some(samples) = latency_bench {
                 latency_bench_run(window, samples, cx).await;
                 cx.update(|cx| {
+                    console_output();
                     print!("{}", Latency::summary(cx));
                     cx.quit();
                 })
@@ -498,6 +523,7 @@ fn main() {
         if let Some(secs) = args.dump_after {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
+                console_output();
                 window
                     .update(cx, |ws, window, cx| {
                         print!("{}", ws.dump_active_screen(window, cx));
