@@ -1,8 +1,8 @@
 //! Registers Brindle with freedesktop launchers: `--install-desktop` writes a
 //! desktop entry and the scalable icon into the XDG data directory, and
 //! `--uninstall-desktop` removes them. On Windows they create and remove a
-//! per-user Start Menu shortcut instead (`start_menu` below); machine-wide
-//! installs there are the MSI's job.
+//! per-user Start Menu shortcut instead (`start_menu` below); installing
+//! itself there is WinGet's job.
 //!
 //! Linux finds an app's icon through its desktop entry and the icon theme,
 //! never through the executable, so this is what puts Brindle in launchers and
@@ -57,7 +57,7 @@ fn request_on(
     windows: bool,
 ) -> Result<Option<Request>, &'static str> {
     if windows && prefix.is_some() && (install || uninstall) {
-        return Err("--prefix isn't used on Windows: machine-wide installs use the Brindle MSI");
+        return Err("--prefix isn't used on Windows: install Brindle with WinGet (winget install scmccart.brindle), or run brindle.exe from anywhere");
     }
     let command = match (install, uninstall) {
         (true, true) => return Err("--install-desktop and --uninstall-desktop are exclusive"),
@@ -339,7 +339,7 @@ mod tests {
     fn prefix_is_rejected_on_windows() {
         let prefix = Some(PathBuf::from(r"C:\Tools"));
         let err = request_on(true, false, prefix.clone(), true).unwrap_err();
-        assert!(err.contains("MSI"), "{err}");
+        assert!(err.contains("winget install"), "{err}");
         assert!(request_on(false, true, prefix.clone(), true).is_err());
         // Without a desktop command it is the usual stray-prefix error.
         assert_eq!(request_on(false, false, prefix.clone(), true), request_on(false, false, prefix, false));
