@@ -126,6 +126,23 @@ jobs:
         run: cargo test --locked --test perf -- --self-test
         env:
           BRINDLE_PERF: "1"
+      # brindle.exe is a GUI program, so PowerShell waits for it only
+      # through Start-Process -Wait.
+      - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Brindle.lnk'
+          function Run($arguments) { (Start-Process $exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow).ExitCode }
+          if ((Run '--install-desktop') -ne 0 -or -not (Test-Path $lnk)) { throw 'install failed' }
+          $item = (New-Object -ComObject Shell.Application).Namespace((Split-Path $lnk)).ParseName('Brindle.lnk')
+          $id = $item.ExtendedProperty('System.AppUserModel.ID')
+          if ($id -ne 'Brindle.Terminal') { throw "AppUserModelID is '$id'" }
+          $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          if ($target -ne $exe) { throw "target is '$target'" }
+          if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
+          if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
+          if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
 
   # The Windows cases of the end-to-end suite, on the runner's desktop.
   # Advisory, like the Linux e2e jobs.
