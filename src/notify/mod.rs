@@ -2,26 +2,47 @@
 //! deciding whether to show them ([`policy`]), and showing them.
 //!
 //! [`Notifier`] is a GPUI global. It rate-limits, then hands each
-//! notification to a sink: normally a D-Bus worker on the background
-//! executor ([`dbus`]), or, when `BRINDLE_NOTIFY_LOG` is set, a file that
+//! notification to a sink: on Linux a D-Bus worker on the background
+//! executor (`dbus`), or, when `BRINDLE_NOTIFY_LOG` is set, a file that
 //! tests read. It remembers which window and tab each notification came
 //! from, so a click can show that tab.
 
+#[cfg(target_os = "linux")]
 pub mod activation;
+#[cfg(target_os = "linux")]
 mod dbus;
 pub mod osc;
 pub mod policy;
+
+/// Raising a window outside Linux: plain activation, with no tokens.
+#[cfg(not(target_os = "linux"))]
+pub mod activation {
+    use gpui::{App, Window};
+
+    pub fn raise(window: &mut Window, _token: Option<&str>) {
+        window.activate_window();
+    }
+
+    pub fn request_token(_window: &Window) -> Option<String> {
+        None
+    }
+
+    pub fn track_input(_window: &Window, _cx: &mut App) {}
+}
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
 use futures::StreamExt as _;
+#[cfg(target_os = "linux")]
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gpui::{App, AppContext as _, BorrowAppContext as _, Global, WindowHandle};
+#[cfg(target_os = "linux")]
+use gpui::AppContext as _;
+use gpui::{App, BorrowAppContext as _, Global, WindowHandle};
 
-use self::dbus::{Command, Reply};
 use self::osc::Source;
 use self::policy::RateLimiter;
 use crate::workspace::Workspace;
@@ -49,9 +70,36 @@ struct Target {
     source: Source,
 }
 
+/// What [`Notifier`] asks a desktop sink to do.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum Command {
+    Notify {
+        /// Ours, echoed in [`Reply::Shown`].
+        key: u64,
+        /// The sink's id of a notification this one replaces, or 0.
+        replaces: u32,
+        summary: String,
+        body: String,
+    },
+}
+
+/// What a desktop sink reports back.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum Reply {
+    Shown { key: u64, id: u32 },
+    Action { id: u32, action: String },
+    Token { id: u32, token: String },
+    Closed { id: u32 },
+}
+
 enum Sink {
     Log { path: PathBuf, next_id: u32 },
+    #[cfg(target_os = "linux")]
     Bus(UnboundedSender<Command>),
+    /// No desktop sink on this platform: requests are dropped, with one
+    /// warning.
+    #[cfg(not(target_os = "linux"))]
+    Off { warned: bool },
 }
 
 pub struct Notifier {
@@ -73,10 +121,14 @@ impl Global for Notifier {}
 
 impl Notifier {
     /// Installs the global and, unless notifications go to a log file,
-    /// starts the D-Bus worker (which connects on first use).
+    /// starts the platform's sink (on Linux a D-Bus worker, which connects
+    /// on first use).
     pub fn init(cx: &mut App) {
         let sink = match std::env::var_os(LOG_ENV).filter(|p| !p.is_empty()) {
             Some(path) => Sink::Log { path: PathBuf::from(path), next_id: 1 },
+            #[cfg(not(target_os = "linux"))]
+            None => Sink::Off { warned: false },
+            #[cfg(target_os = "linux")]
             None => {
                 let (commands, command_rx) = unbounded();
                 let (reply_tx, mut replies) = unbounded();
@@ -138,12 +190,19 @@ impl Notifier {
                 let id = if replaces != 0 { replaces } else { std::mem::replace(next_id, *next_id + 1) };
                 self.remember(id, target);
             }
+            #[cfg(target_os = "linux")]
             Sink::Bus(commands) => {
                 let key = self.next_key;
                 self.next_key += 1;
                 self.pending.insert(key, target);
                 let command = Command::Notify { key, replaces, summary: request.summary, body: request.body };
                 commands.unbounded_send(command).ok();
+            }
+            #[cfg(not(target_os = "linux"))]
+            Sink::Off { warned } => {
+                if !std::mem::replace(warned, true) {
+                    log::warn!("desktop notifications aren't supported on this platform yet; dropping them");
+                }
             }
         }
     }
