@@ -244,16 +244,17 @@ impl Pseudoconsole {
 
 impl Drop for Pseudoconsole {
     fn drop(&mut self) {
-        let api = api();
-        if let Some(release) = api.release {
-            // SAFETY: `handle` is still open.
-            unsafe { release(self.handle) }.ok().ok();
-        }
-        // An older host blocks in Close until its output is read, and the
-        // reader thread may still be reading it, so close elsewhere.
+        // Both calls can wait on a busy host (an older one blocks in Close
+        // until its output is read, while the reader thread may still be
+        // reading it), and the last owner may be the UI thread, so they run
+        // elsewhere.
+        let (release, close) = (api().release, api().close);
         let handle = self.handle.0;
-        let close = api.close;
         let closed = std::thread::Builder::new().name("conpty-close".into()).spawn(move || {
+            if let Some(release) = release {
+                // SAFETY: the handle is still open.
+                unsafe { release(HPCON(handle)) }.ok().ok();
+            }
             // SAFETY: the handle is closed exactly once, here.
             unsafe { close(HPCON(handle)) }
         });
@@ -839,9 +840,19 @@ mod tests {
         }
         assert_eq!(got, b"hello world");
 
+        // EOF once the writer closes. Events posted for the reads above may
+        // still be queued, so wait until one reports it.
         drop(raw);
-        wait_for(&poller, 7);
-        assert_eq!(reader.read(&mut buf).unwrap(), 0, "EOF once the writer closes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    wait_for(&poller, 7);
+                }
+                other => panic!("expected EOF, got {other:?}"),
+            }
+        }
     }
 
     #[test]
