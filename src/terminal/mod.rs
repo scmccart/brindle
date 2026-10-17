@@ -14,7 +14,7 @@ mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
-mod process;
+pub mod process;
 mod pty;
 pub mod shell_integration;
 mod scan;
@@ -703,12 +703,13 @@ impl Terminal {
 
     // ---- process info -------------------------------------------------------
 
-    /// Name of the foreground process on the PTY (e.g. `vim`), for tab titles.
-    pub fn foreground_process_name(&self) -> Option<String> {
+    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
+    /// titles. `snapshot` is the title tick's look at all processes.
+    pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
         let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
-        process.foreground_name()
+        process.foreground_name(snapshot)
     }
 
     /// Parents the tab's console window to `window`, so dialogs that console

@@ -25,6 +25,7 @@ use crate::text_input::TextInput;
 use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
+use crate::terminal::process::Snapshot;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
@@ -80,19 +81,24 @@ impl Tab {
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
-        tab.refresh_title(cx);
+        tab.refresh_title(&mut None, cx);
         tab
     }
 
     /// Recomputes the title: the program's OSC title, else the foreground
     /// process name, else the profile name. Returns whether it changed.
-    fn refresh_title(&mut self, cx: &App) -> bool {
+    /// `snapshot` is the processes running, for the foreground name, taken
+    /// only when a title needs it (a program's own title, which can change
+    /// thousands of times a second, never does).
+    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
         let title: SharedString = match &self.content {
             TabContent::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
                 match terminal.title().filter(|t| !t.trim().is_empty()) {
                     Some(title) => title.to_string(),
-                    None => terminal.foreground_process_name().unwrap_or_else(|| self.profile.name.clone()),
+                    None => terminal
+                        .foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
+                        .unwrap_or_else(|| self.profile.name.clone()),
                 }
             }
             TabContent::Tmux { view, .. } => view.read(cx).title(cx),
@@ -305,8 +311,10 @@ impl Workspace {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let alive = this.update_in(cx, |this, window, cx| {
                     let mut changed = false;
+                    // At most one look at the processes for every tab.
+                    let mut snapshot = None;
                     for tab in &mut this.tabs {
-                        changed |= tab.refresh_title(cx);
+                        changed |= tab.refresh_title(&mut snapshot, cx);
                     }
                     if changed {
                         cx.notify();
@@ -772,7 +780,7 @@ impl Workspace {
                     cx.observe(&view, |this, _, cx| {
                         // Window renames arrive through the view.
                         for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
-                            tab.refresh_title(cx);
+                            tab.refresh_title(&mut None, cx);
                         }
                         cx.notify();
                     }),
@@ -945,7 +953,7 @@ impl Workspace {
             TerminalEvent::Exited => self.remove_tab(ix, window, cx),
             TerminalEvent::Bell | TerminalEvent::Notify(_) => self.on_attention(ix, event, window, cx),
             TerminalEvent::TitleChanged => {
-                if self.tabs[ix].refresh_title(cx) {
+                if self.tabs[ix].refresh_title(&mut None, cx) {
                     cx.notify();
                 }
             }
