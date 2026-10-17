@@ -15,6 +15,7 @@
 //! `openspec/changes/archive/2026-10-08-add-shell-integration/design.md`.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use alacritty_terminal::event::EventListener;
@@ -51,6 +52,9 @@ enum Split {
     Erase { above: bool },
     /// After `ESC c`.
     Reset,
+    /// After an OSC 7 or OSC 9;9 working-directory report, which the
+    /// scanner holds in `cwd`.
+    Cwd,
 }
 
 impl Split {
@@ -73,7 +77,8 @@ enum State {
     String,
 }
 
-const OSC_KEEP: usize = 64;
+// Enough for a working-directory report's percent-encoded path.
+const OSC_KEEP: usize = 4096;
 const CSI_KEEP: usize = 32;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
@@ -89,6 +94,8 @@ pub struct Scanner {
     buf: Vec<u8>,
     overflow: bool,
     intermediate: bool,
+    /// The directory the last [`Split::Cwd`] reported.
+    cwd: Option<PathBuf>,
 }
 
 impl Scanner {
@@ -237,9 +244,64 @@ impl Scanner {
         }
     }
 
-    fn osc_split(&self) -> Option<Split> {
-        parse_osc133(&self.buf).map(Split::Mark)
+    fn osc_split(&mut self) -> Option<Split> {
+        if let Some(mark) = parse_osc133(&self.buf) {
+            return Some(Split::Mark(mark));
+        }
+        // A cut-off path would name the wrong directory.
+        let dir = (!self.overflow).then(|| reported_dir(&self.buf, cfg!(windows))).flatten()?;
+        self.cwd = Some(PathBuf::from(dir));
+        Some(Split::Cwd)
     }
+}
+
+/// The directory an OSC body reports, if it is absolute on the platform
+/// (`windows` or not): OSC 7's `7;file://<host>/<percent-encoded path>`, or
+/// ConEmu's `9;9;<path>`, the path optionally in double quotes. On Windows
+/// OSC 7's `/C:/src` means `C:\src`.
+fn reported_dir(body: &[u8], windows: bool) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    let path = if let Some(uri) = body.strip_prefix("7;") {
+        let rest = uri.strip_prefix("file://")?;
+        let path = percent_decode(&rest[rest.find('/')?..])?;
+        if windows {
+            // `/C:/x`: drop the slash before the drive letter.
+            let path = match path.as_bytes() {
+                [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+                _ => &path,
+            };
+            path.replace('/', "\\")
+        } else {
+            path
+        }
+    } else {
+        let path = body.strip_prefix("9;9;")?.trim();
+        path.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(path).to_string()
+    };
+    let absolute = if windows {
+        let b = path.as_bytes();
+        matches!(b, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()) || path.starts_with("\\\\")
+    } else {
+        path.starts_with('/')
+    };
+    absolute.then_some(path)
+}
+
+/// `%XX` escapes decoded, as UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(b);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Parses the body of an OSC (`133;D;1`) into a mark.
@@ -389,6 +451,9 @@ pub struct Marks {
     alt_resized: bool,
     /// Absolute line of the top of the history, as of the last prune.
     top: i64,
+    /// The working directory the program last reported (OSC 7 or 9;9). A
+    /// reset keeps it: the shell is still there.
+    reported_dir: Option<PathBuf>,
 }
 
 impl Marks {
@@ -410,6 +475,11 @@ impl Marks {
     pub fn clear(&mut self) {
         self.commands.clear();
         self.alt_snapshot = None;
+    }
+
+    /// The working directory the program last reported (OSC 7 or 9;9).
+    pub fn reported_dir(&self) -> Option<&Path> {
+        self.reported_dir.as_deref()
     }
 
     /// Records `mark` at the cursor.
@@ -719,6 +789,7 @@ impl Parser {
                         marks.lock().record(term, mark);
                     }
                     Split::Reset => marks.lock().clear(),
+                    Split::Cwd => marks.lock().reported_dir = self.scanner.cwd.take(),
                     Split::AltScreen | Split::ClearHistory | Split::Erase { .. } => {}
                 }
             }
@@ -831,6 +902,52 @@ mod tests {
             let (a, b) = input.split_at(cut);
             assert_eq!(scan_all(&[a, b]), [Split::Mark(Mark::CommandEnd(Some(42)))], "cut at {cut}");
         }
+    }
+
+    // ---- working-directory reports ----------------------------------------------
+
+    #[test]
+    fn osc7_paths_are_percent_decoded() {
+        assert_eq!(reported_dir(b"7;file://host/home/u/My%20Dir", false).as_deref(), Some("/home/u/My Dir"));
+        assert_eq!(reported_dir(b"7;file:///srv/www", false).as_deref(), Some("/srv/www"));
+        assert_eq!(reported_dir(b"7;file://host/caf%C3%A9", false).as_deref(), Some("/café"));
+        assert_eq!(reported_dir(b"7;file://host/bad%2", false), None);
+        assert_eq!(reported_dir(b"7;http://host/x", false), None);
+    }
+
+    #[test]
+    fn osc7_drive_paths_on_windows() {
+        assert_eq!(reported_dir(b"7;file://pc/C:/My%20Files", true).as_deref(), Some("C:\\My Files"));
+        assert_eq!(reported_dir(b"7;file://pc/d:/src/", true).as_deref(), Some("d:\\src\\"));
+        // A WSL shell's Linux path means nothing to Windows.
+        assert_eq!(reported_dir(b"7;file://pc/home/user", true), None);
+    }
+
+    #[test]
+    fn conemu_osc9_9() {
+        assert_eq!(reported_dir(br#"9;9;"C:\src""#, true).as_deref(), Some("C:\\src"));
+        assert_eq!(reported_dir(br"9;9;C:\src", true).as_deref(), Some("C:\\src"));
+        assert_eq!(reported_dir(br"9;9;\\server\share", true).as_deref(), Some("\\\\server\\share"));
+        assert_eq!(reported_dir(b"9;9;/srv/www", false).as_deref(), Some("/srv/www"));
+        // Relative paths and other ConEmu commands are not reports.
+        assert_eq!(reported_dir(b"9;9;src", true), None);
+        assert_eq!(reported_dir(b"9;4;1;50", true), None);
+        assert_eq!(reported_dir(b"9;done", true), None);
+    }
+
+    #[test]
+    fn the_latest_report_is_kept() {
+        let (first, second) = if cfg!(windows) { ("C:/one", "C:\\two") } else { ("/one", "/two") };
+        let mut h = Harness::new(20, 5, 100);
+        h.feed(format!("\x1b]7;file://host/{}\x1b\\", first.trim_start_matches('/')).as_bytes());
+        let expect_first = if cfg!(windows) { "C:\\one" } else { "/one" };
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(expect_first)));
+        h.feed(format!("text\x1b]9;9;\"{second}\"\x07more").as_bytes());
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(second)));
+        assert_eq!(h.text(0), "textmore", "the reports print nothing");
+        // A reset clears marks, not the directory.
+        h.feed(b"\x1bc");
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(second)));
     }
 
     // ---- against a real Term ------------------------------------------------------

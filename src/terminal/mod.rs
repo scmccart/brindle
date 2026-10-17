@@ -729,11 +729,17 @@ impl Terminal {
         }
     }
 
-    /// Current working directory of the foreground process (falls back to the shell).
+    /// Current working directory of the foreground process (falls back to
+    /// the shell). On Windows, where no other process's directory can be
+    /// read, it is the directory the program last reported (OSC 7 or 9;9),
+    /// if it still exists.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
+        if cfg!(windows) {
+            return self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into);
+        }
         process.working_directory()
     }
 
