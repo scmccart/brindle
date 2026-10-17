@@ -206,6 +206,43 @@ To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
 `brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
 in `~/.config/brindle` is kept either way.
 
+### On Windows
+
+There's no installer: `brindle.exe` carries everything it needs, including the
+packaged ConPTY, which it unpacks to `%LOCALAPPDATA%\brindle\conpty` on first
+run. Each release has a zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`,
+with the exe and the licences; unpack it anywhere and run `brindle.exe`. Once
+releases are published to WinGet, it installs as a `brindle` command on `PATH`:
+
+```powershell
+winget install scmccart.brindle
+winget upgrade scmccart.brindle
+```
+
+WinGet doesn't add Start Menu entries for programs like this, so add one
+yourself, and remove it before uninstalling (WinGet doesn't know about it):
+
+```powershell
+brindle --install-desktop     # a Start Menu shortcut for this brindle.exe
+brindle --uninstall-desktop
+winget uninstall scmccart.brindle
+```
+
+From a checkout, fetch the packaged ConPTY first, so the build embeds it:
+
+```powershell
+scripts/fetch-conpty.ps1
+cargo install --locked --path .
+brindle --install-desktop
+```
+
+Releases aren't code-signed yet, so SmartScreen may stop the first start of a
+downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
+Run anyway. Uninstalling either way keeps your config in `%APPDATA%\brindle`
+and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
+builds the release zip from a release build, and `scripts/winget-manifest.ps1`
+writes its WinGet manifest.
+
 ## Usage
 
 ```
@@ -409,7 +446,7 @@ get through.
 On Windows, notifications are toasts from "Brindle". Brindle registers that name
 for your user account the first time it shows one (under
 `HKCU\Software\Classes\AppUserModelId\Brindle.Terminal`), so toasts work without
-the installer's shortcut too; `brindle --uninstall-desktop` removes the entry.
+a Start Menu shortcut too; `brindle --uninstall-desktop` removes the entry.
 Clicking a toast brings its window to the front with its tab active. If Windows
 won't hand Brindle the foreground, the taskbar button flashes instead. Turn
 Brindle's toasts off or on under Settings > System > Notifications; while they're
