@@ -160,6 +160,7 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn process_name(_pid: u32) -> Option<String> {
     None
 }

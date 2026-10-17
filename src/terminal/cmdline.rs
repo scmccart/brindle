@@ -26,6 +26,29 @@ pub fn command_line_raw(program: &str, tail: &str) -> String {
     line
 }
 
+/// The command line for a launch: [`command_line`], except that `cmd.exe`
+/// given `/S` gets its arguments as written ([`command_line_raw`]), since in
+/// that mode cmd takes the rest of its line literally, minus the outer
+/// quotes, and never reads backslash escapes.
+pub fn launch_line(program: &str, args: &[String]) -> String {
+    let stem = std::path::Path::new(program).file_stem().and_then(|s| s.to_str()).unwrap_or(program);
+    if stem.eq_ignore_ascii_case("cmd") && args.iter().any(|a| a.eq_ignore_ascii_case("/S")) {
+        command_line_raw(program, &args.join(" "))
+    } else {
+        command_line(program, args)
+    }
+}
+
+/// `cmd.exe /D /S /C "<editor> "<path>""`: the editor command (from
+/// `%VISUAL%`, else `%EDITOR%`, else Notepad) run by cmd so values like
+/// `code -w` work, with `path` quoted. `editor` is used as written, so it
+/// can quote a program path with spaces itself.
+pub fn windows_editor_command(visual: Option<&str>, editor: Option<&str>, path: &str) -> (String, Vec<String>) {
+    let editor = [visual, editor].into_iter().flatten().map(str::trim).find(|e| !e.is_empty()).unwrap_or("notepad.exe");
+    let tail = format!("\"{editor} \"{path}\"\"");
+    ("cmd.exe".into(), vec!["/D".into(), "/S".into(), "/C".into(), tail])
+}
+
 /// `CreateProcessW` reads the program token itself: quotes delimit it and
 /// backslashes are literal (a path can't contain `"`).
 fn program_token(program: &str) -> String {
@@ -58,6 +81,24 @@ fn push_arg(line: &mut String, arg: &str) {
     // Doubled, so the closing quote isn't escaped.
     line.extend(std::iter::repeat_n('\\', backslashes * 2));
     line.push('"');
+}
+
+/// The program a Windows tab runs when its profile names none: `pwsh.exe`
+/// in one of `path_dirs` (the `PATH` entries), then `powershell.exe`, then
+/// `comspec` (`%COMSPEC%`), then `cmd.exe`. PowerShell starts without its
+/// logo.
+pub fn windows_default_program(
+    path_dirs: impl IntoIterator<Item = std::path::PathBuf>,
+    comspec: Option<&str>,
+) -> (String, Vec<String>) {
+    let dirs: Vec<std::path::PathBuf> = path_dirs.into_iter().collect();
+    for exe in ["pwsh.exe", "powershell.exe"] {
+        if let Some(found) = dirs.iter().map(|dir| dir.join(exe)).find(|path| path.is_file()) {
+            return (found.display().to_string(), vec!["-NoLogo".to_string()]);
+        }
+    }
+    let program = comspec.filter(|c| !c.trim().is_empty()).unwrap_or("cmd.exe");
+    (program.to_string(), Vec::new())
 }
 
 /// The variables for a child: `overrides` (the profile's, which win) and
@@ -198,6 +239,69 @@ mod tests {
         let line = command_line_raw("cmd.exe", r#"/D /S /C "code -w "C:\a b\config.toml"""#);
         assert_eq!(line, r#"cmd.exe /D /S /C "code -w "C:\a b\config.toml"""#);
         assert_eq!(command_line_raw("cmd.exe", ""), "cmd.exe");
+    }
+
+    #[test]
+    fn editor_runs_through_cmd_with_the_path_quoted() {
+        let path = r"C:\Users\me\App Data\brindle\config.toml";
+        let (program, args) = windows_editor_command(None, Some("code -w"), path);
+        assert_eq!(launch_line(&program, &args), r#"cmd.exe /D /S /C "code -w "C:\Users\me\App Data\brindle\config.toml"""#);
+        let (program, args) = windows_editor_command(Some(r#""C:\Program Files\Vim\gvim.exe""#), Some("code -w"), path);
+        assert_eq!(
+            launch_line(&program, &args),
+            r#"cmd.exe /D /S /C ""C:\Program Files\Vim\gvim.exe" "C:\Users\me\App Data\brindle\config.toml"""#
+        );
+        let (program, args) = windows_editor_command(Some(" "), None, r"C:\c.toml");
+        assert_eq!(launch_line(&program, &args), r#"cmd.exe /D /S /C "notepad.exe "C:\c.toml"""#);
+    }
+
+    #[test]
+    fn only_cmd_with_s_is_passed_raw() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(launch_line("cmd.exe", &args(&["/C", "dir C:\\a b"])), r#"cmd.exe /C "dir C:\a b""#);
+        assert_eq!(launch_line(r"C:\Windows\System32\CMD.EXE", &args(&["/s", "/c", "\"x\""])), r#"C:\Windows\System32\CMD.EXE /s /c "x""#);
+        assert_eq!(launch_line("pwsh.exe", &args(&["/S", "a b"])), r#"pwsh.exe /S "a b""#);
+    }
+
+    fn bin_dirs(name: &str, exes: &[&[&str]]) -> Vec<std::path::PathBuf> {
+        let root = std::env::temp_dir().join(format!("brindle-default-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        exes.iter()
+            .enumerate()
+            .map(|(i, files)| {
+                let dir = root.join(i.to_string());
+                std::fs::create_dir_all(&dir).unwrap();
+                for file in *files {
+                    std::fs::write(dir.join(file), b"").unwrap();
+                }
+                dir
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_program_prefers_pwsh_then_powershell() {
+        let dirs = bin_dirs("both", &[&["powershell.exe"], &["pwsh.exe"]]);
+        let (program, args) = windows_default_program(dirs.clone(), Some("C:\\Windows\\system32\\cmd.exe"));
+        assert_eq!(program, dirs[1].join("pwsh.exe").display().to_string());
+        assert_eq!(args, ["-NoLogo"]);
+
+        let dirs = bin_dirs("ps51", &[&["notepad.exe"], &["powershell.exe"]]);
+        let (program, args) = windows_default_program(dirs.clone(), None);
+        assert_eq!(program, dirs[1].join("powershell.exe").display().to_string());
+        assert_eq!(args, ["-NoLogo"]);
+    }
+
+    #[test]
+    fn default_program_falls_back_to_comspec_then_cmd() {
+        let dirs = bin_dirs("none", &[&["notepad.exe"]]);
+        assert_eq!(windows_default_program(dirs.clone(), Some("C:\\tcc\\tcc.exe")), ("C:\\tcc\\tcc.exe".to_string(), vec![]));
+        assert_eq!(windows_default_program(dirs.clone(), Some(" ")), ("cmd.exe".to_string(), vec![]));
+        assert_eq!(windows_default_program(dirs, None), ("cmd.exe".to_string(), vec![]));
+        // A directory named like the program doesn't count.
+        let dirs = bin_dirs("dir-named", &[&[]]);
+        std::fs::create_dir_all(dirs[0].join("pwsh.exe")).unwrap();
+        assert_eq!(windows_default_program(dirs, None).0, "cmd.exe");
     }
 
     #[test]

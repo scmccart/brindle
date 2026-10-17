@@ -12,7 +12,7 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowHandle, canvas, div, point, px,
+    Task, Window, WindowBounds, WindowControlArea, WindowHandle, canvas, div, point, px,
 };
 use gpui::EntityId;
 
@@ -1391,18 +1391,9 @@ impl Workspace {
     }
 
     fn open_config(&mut self, _: &OpenConfig, window: &mut Window, cx: &mut Context<Self>) {
-        let path = Config::path();
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "nano".into());
-        // Run through the shell so EDITOR values like "code -w" work.
-        let command = format!("{editor} {}", shell_quote(&path.to_string_lossy()));
+        let command = editor_command(&Config::path().to_string_lossy());
         let profile = Self::settings(cx).default_profile_index();
-        self.launch(
-            LaunchRequest { profile, command: Some(("/bin/sh".into(), vec!["-c".into(), command])), cwd: None },
-            window,
-            cx,
-        );
+        self.launch(LaunchRequest { profile, command: Some(command), cwd: None }, window, cx);
     }
 
     /// The theme a tab with `profile` shows: the preview for tabs that
@@ -1590,7 +1581,9 @@ impl Workspace {
         let accent = t.accent().hsla();
         let border = t.chrome_border().hsla();
         let decorations = window.window_decorations();
-        let csd = matches!(decorations, Decorations::Client { .. });
+        // Windows always shows Brindle's own caption (see `window_control_area`
+        // below); GPUI reports server decorations there.
+        let csd = matches!(decorations, Decorations::Client { .. }) || cfg!(windows);
 
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let active = ix == self.active;
@@ -1684,13 +1677,28 @@ impl Workspace {
                 .items_center()
                 .gap_1()
                 .pr_2()
+                // On Windows the marked areas are native caption buttons:
+                // Windows acts on them (and shows Snap Layouts on maximize),
+                // so the click handlers only run elsewhere.
                 .when(controls.minimize, |d| {
-                    d.child(button("minimize", "–").on_click(|_, window, _| window.minimize_window()))
+                    d.child(
+                        button("minimize", "–")
+                            .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Min))
+                            .on_click(|_, window, _| window.minimize_window()),
+                    )
                 })
                 .when(controls.maximize, |d| {
-                    d.child(button("maximize", if window.is_maximized() { "❐" } else { "□" }).on_click(|_, window, _| window.zoom_window()))
+                    d.child(
+                        button("maximize", if window.is_maximized() { "❐" } else { "□" })
+                            .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Max))
+                            .on_click(|_, window, _| window.zoom_window()),
+                    )
                 })
-                .child(button("close-window", "×").on_click(|_, window, _| window.remove_window()))
+                .child(
+                    button("close-window", "×")
+                        .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Close))
+                        .on_click(|_, window, _| window.remove_window()),
+                )
         });
 
         div()
@@ -1731,7 +1739,10 @@ impl Workspace {
                         this.open_profile_picker(&OpenProfilePicker, window, cx)
                     }))),
             )
-            .child(div().flex_1().h_full())
+            // Windows hit-tests this as the caption: drag, double-click,
+            // the system menu and Snap. Only empty space is marked, since a
+            // marked area wins over everything inside it.
+            .child(div().id("caption").flex_1().h_full().when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag)))
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
     }
 
@@ -1849,6 +1860,23 @@ fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option
     Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
 }
 
+/// The command that opens `path` in `$VISUAL`, else `$EDITOR`, else nano,
+/// through the shell so values like `code -w` work.
+#[cfg(unix)]
+fn editor_command(path: &str) -> (String, Vec<String>) {
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "nano".into());
+    ("/bin/sh".into(), vec!["-c".into(), format!("{editor} {}", shell_quote(path))])
+}
+
+/// The command that opens `path` in `%VISUAL%`, else `%EDITOR%`, else
+/// Notepad, through cmd so values like `code -w` work.
+#[cfg(windows)]
+fn editor_command(path: &str) -> (String, Vec<String>) {
+    let (visual, editor) = (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
+    crate::terminal::cmdline::windows_editor_command(visual.as_deref(), editor.as_deref(), path)
+}
+
+#[cfg(unix)]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -2109,6 +2137,7 @@ mod tests {
         assert_eq!(recorded_size(known, size(px(1200.0), px(760.0)), inner), inner);
     }
 
+    #[cfg(unix)]
     #[test]
     fn quoting() {
         assert_eq!(shell_quote("/a b/c'd"), "'/a b/c'\\''d'");

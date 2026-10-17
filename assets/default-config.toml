@@ -30,7 +30,7 @@ tmux_session_end = "close_window"
 
 [font]
 # First installed family wins.
-family = ["JetBrains Mono", "FiraCode Nerd Font Mono", "Hack Nerd Font Mono", "DejaVu Sans Mono", "Liberation Mono"]
+family = ["JetBrains Mono", "FiraCode Nerd Font Mono", "Hack Nerd Font Mono", "DejaVu Sans Mono", "Liberation Mono", "Cascadia Mono", "Consolas"]
 size = 14
 line_height = 1.25
 
@@ -57,6 +57,8 @@ when = "unfocused"
 
 [[profiles]]
 name = "Shell"
+# Without a command: $SHELL, else /bin/sh. On Windows: pwsh.exe, else
+# powershell.exe, else %COMSPEC% (cmd.exe).
 # command = "/bin/zsh"
 # args = ["-l"]
 # cwd = "~"

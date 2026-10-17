@@ -8,7 +8,7 @@
 
 // Used by the Windows PTY; tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
-mod cmdline;
+pub mod cmdline;
 #[cfg(windows)]
 mod conpty;
 pub mod keys;
@@ -277,13 +277,9 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (program, args) = command_override.unwrap_or_else(|| {
-            let program = profile
-                .command
-                .clone()
-                .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "/bin/sh".into());
-            (program, profile.args.clone())
+        let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
+            Some(program) => (program.clone(), profile.args.clone()),
+            None => default_program(&profile.args),
         });
 
         let working_directory = cwd_override
@@ -300,7 +296,7 @@ impl Terminal {
         };
         #[cfg(windows)]
         let command = conpty::Command {
-            line: cmdline::command_line(&program, &args),
+            line: cmdline::launch_line(&program, &args),
             cwd: working_directory,
             env: child_env(profile).into_iter().collect(),
         };
@@ -907,6 +903,25 @@ fn palette_color(t: &Theme, defaults: DefaultColors, index: usize) -> Color {
 
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
+
+/// The program a profile with no `command` runs, with the profile's `args`:
+/// `$SHELL`, then `/bin/sh`.
+#[cfg(unix)]
+fn default_program(args: &[String]) -> (String, Vec<String>) {
+    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    (program, args.to_vec())
+}
+
+/// The program a profile with no `command` runs, with the profile's `args`
+/// after its own: PowerShell 7, Windows PowerShell, `%COMSPEC%` or `cmd.exe`.
+#[cfg(windows)]
+fn default_program(args: &[String]) -> (String, Vec<String>) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let comspec = std::env::var("COMSPEC").ok();
+    let (program, mut own) = cmdline::windows_default_program(std::env::split_paths(&path), comspec.as_deref());
+    own.extend_from_slice(args);
+    (program, own)
+}
 
 /// Environment for programs started by Brindle (shells and tmux alike).
 pub fn child_env(profile: &Profile) -> HashMap<String, String> {

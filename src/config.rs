@@ -88,6 +88,8 @@ impl Default for FontConfig {
                 "Liberation Mono".into(),
                 "Noto Sans Mono".into(),
                 "Ubuntu Mono".into(),
+                "Cascadia Mono".into(),
+                "Consolas".into(),
             ],
             size: 14.0,
             line_height: 1.25,
@@ -192,7 +194,9 @@ pub enum TmuxMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
     pub name: String,
-    /// Program to run. Defaults to `$SHELL`, then `/bin/sh`.
+    /// Program to run. Defaults to `$SHELL`, then `/bin/sh`; on Windows to
+    /// `pwsh.exe` on `PATH`, then `powershell.exe`, then `%COMSPEC%`, then
+    /// `cmd.exe`.
     pub command: Option<String>,
     pub args: Vec<String>,
     /// Working directory. `~` is expanded. Defaults to the home directory.
