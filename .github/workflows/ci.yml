@@ -180,6 +180,20 @@ jobs:
           if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
           if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
           if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
+      # A Windows release is one zip (brindle.exe needs nothing beside it),
+      # plus the WinGet manifest for it. Publishing both is a release step.
+      - name: Release zip and WinGet manifest
+        shell: pwsh
+        run: |
+          $zip = scripts/package-windows.ps1
+          $manifest = scripts/winget-manifest.ps1 -Zip $zip
+          winget validate --disable-interactivity --manifest $manifest
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed for $manifest" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: target/dist/*.zip
+          retention-days: 14
 
   # The Windows cases of the end-to-end suite, on the runner's desktop.
   # Advisory, like the Linux e2e jobs.
