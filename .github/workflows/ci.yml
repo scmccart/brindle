@@ -1,5 +1,6 @@
-# Unit tests, a release build, and the end-to-end suite on two tmux versions.
-# The e2e jobs are advisory: they go red on failure but aren't required checks.
+# Unit tests, a release build, and the end-to-end suite on two tmux versions,
+# plus a Windows build and tests. The e2e jobs are advisory: they go red on
+# failure but aren't required checks.
 #
 # Every push and every pull request runs it. Dependabot's branches always
 # have a PR, so their pushes are skipped instead of running twice.
@@ -92,6 +93,36 @@ jobs:
         with:
           shared-key: release
       - run: cargo build --release --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      # GPUI's release build compiles its shaders with fxc.exe, which it
+      # otherwise looks for only on PATH and in one SDK version's directory.
+      - name: Find fxc.exe
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $fxc) { throw "no fxc.exe in the Windows SDK" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+      - name: e2e harness self-test
+        run: cargo test --locked --test e2e -- --self-test
+        env:
+          BRINDLE_E2E: "1"
+      - name: perf harness self-test
+        run: cargo test --locked --test perf -- --self-test
+        env:
+          BRINDLE_PERF: "1"
 
   e2e:
     name: e2e (tmux ${{ matrix.tmux.version }}, ${{ matrix.shard }}/4)
