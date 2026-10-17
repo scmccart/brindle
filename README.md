@@ -406,6 +406,15 @@ work the same way. In classic tmux, tmux itself swallows OSC 9 and 777 unless th
 program wraps them in tmux's passthrough (`set -g allow-passthrough on`); bells
 get through.
 
+On Windows, notifications are toasts from "Brindle". Brindle registers that name
+for your user account the first time it shows one (under
+`HKCU\Software\Classes\AppUserModelId\Brindle.Terminal`), so toasts work without
+the installer's shortcut too; `brindle --uninstall-desktop` removes the entry.
+Clicking a toast brings its window to the front with its tab active. If Windows
+won't hand Brindle the foreground, the taskbar button flashes instead. Turn
+Brindle's toasts off or on under Settings > System > Notifications; while they're
+off, Brindle logs one warning and carries on.
+
 ### tmux control mode
 
 In control mode, keys reach panes through `send-keys`, which skips tmux's own key
