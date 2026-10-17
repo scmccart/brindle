@@ -31,8 +31,7 @@ pub fn command_line_raw(program: &str, tail: &str) -> String {
 /// that mode cmd takes the rest of its line literally, minus the outer
 /// quotes, and never reads backslash escapes.
 pub fn launch_line(program: &str, args: &[String]) -> String {
-    let stem = std::path::Path::new(program).file_stem().and_then(|s| s.to_str()).unwrap_or(program);
-    if stem.eq_ignore_ascii_case("cmd") && args.iter().any(|a| a.eq_ignore_ascii_case("/S")) {
+    if program_stem(program).eq_ignore_ascii_case("cmd") && args.iter().any(|a| a.eq_ignore_ascii_case("/S")) {
         command_line_raw(program, &args.join(" "))
     } else {
         command_line(program, args)
@@ -47,6 +46,17 @@ pub fn windows_editor_command(visual: Option<&str>, editor: Option<&str>, path: 
     let editor = [visual, editor].into_iter().flatten().map(str::trim).find(|e| !e.is_empty()).unwrap_or("notepad.exe");
     let tail = format!("\"{editor} \"{path}\"\"");
     ("cmd.exe".into(), vec!["/D".into(), "/S".into(), "/C".into(), tail])
+}
+
+/// A Windows program's name without its directory or extension:
+/// `C:\Windows\System32\CMD.EXE` is `CMD`. Both `\` and `/` separate
+/// directories, on any platform.
+pub fn program_stem(program: &str) -> &str {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => name,
+    }
 }
 
 /// `CreateProcessW` reads the program token itself: quotes delimit it and
@@ -253,6 +263,14 @@ mod tests {
         );
         let (program, args) = windows_editor_command(Some(" "), None, r"C:\c.toml");
         assert_eq!(launch_line(&program, &args), r#"cmd.exe /D /S /C "notepad.exe "C:\c.toml"""#);
+    }
+
+    #[test]
+    fn program_stems() {
+        assert_eq!(program_stem(r"C:\Windows\System32\CMD.EXE"), "CMD");
+        assert_eq!(program_stem("C:/tools/wsl.exe"), "wsl");
+        assert_eq!(program_stem("wsl"), "wsl");
+        assert_eq!(program_stem(".hidden"), ".hidden");
     }
 
     #[test]

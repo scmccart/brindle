@@ -415,10 +415,7 @@ struct TmuxCommand {
 /// session names reach it verbatim.
 fn tmux_command(profile: &Profile) -> TmuxCommand {
     let program = profile.command.clone().unwrap_or_else(|| "tmux".into());
-    let wsl = std::path::Path::new(&program)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("wsl"));
+    let wsl = crate::terminal::cmdline::program_stem(&program).eq_ignore_ascii_case("wsl");
     if !wsl {
         return TmuxCommand { program, prefix: Vec::new(), options: profile.tmux_args.clone(), wsl };
     }
