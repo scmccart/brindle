@@ -14,7 +14,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - `tests/e2e` captures and `tests/perf` become Linux-only.
 
   Verify that `cargo check --all-targets` on Windows no longer reports unresolved crates, and that the Linux session's `cargo test --locked` passes.
-- [ ] 1.2 Add `windows` 0.61 (`cfg(windows)`, the features from design §1) and `embed-resource` 3 (Windows build-dependency). Run one plain `cargo check`. Verify that `git diff Cargo.lock` shows only the two new edges in `brindle`'s entry, and no added or changed `[[package]]` blocks.
+- [x] 1.2 Add `windows` 0.61 (`cfg(windows)`, the features from design §1) and `embed-resource` 3 (Windows build-dependency). Run one plain `cargo check`. Verify that `git diff Cargo.lock` shows only the two new edges in `brindle`'s entry, and no added or changed `[[package]]` blocks.
 - [ ] 1.3 Move process info into `terminal/process.rs` (design §1, the `port-to-macos` seam). The Linux `/proc` and `tcgetpgrp` code moves unchanged, and Windows returns `None` for now.
   - `session.rs`: the state dir becomes `dirs::data_local_dir()` on Windows, the lock moves to `File::try_lock` on all platforms, and the Unix modes become `cfg(unix)`.
   - `links.rs`: `process_group` becomes `cfg(unix)`.
