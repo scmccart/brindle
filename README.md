@@ -89,9 +89,10 @@ It starts a private X server with a window manager, renders with Mesa's
 software Vulkan driver, sets a UTF-8 locale and gives the run its own session
 bus, so nothing opens on the desktop.
 
-CI (`.github/workflows/ci.yml`) runs the unit tests, a release build, and the
-end-to-end suite that way on Ubuntu 26.04, against tmux 3.6a (Ubuntu's) and
-3.8 (built from source), for every push and every pull request. Each tmux
+CI (`.github/workflows/ci.yml`) checks the new commits' messages, and runs the
+unit tests, a release build, and the end-to-end suite that way on Ubuntu
+26.04, against tmux 3.6a (Ubuntu's) and 3.8 (built from source), for every
+push and every pull request. Each tmux
 version's suite is split into 4 shards that run as separate jobs. A failed
 shard uploads its `target/tmp/e2e/` as an artifact.
 
@@ -131,6 +132,22 @@ compare runs made on the same machine. Each run is kept in
 `summary.toml`, and the CPU governor and display are recorded with it.
 `BRINDLE_PERF_SAMPLES` changes the keystrokes per latency case (500),
 `BRINDLE_PERF_BIN` the binary, and `BRINDLE_PERF_DISPLAY` the X display (`:0`).
+
+## Commit messages
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope): subject`, with a lower-case scope, a subject that starts
+lowercase (acronyms such as README are fine), and `!` after the scope for a
+breaking change, as in `feat(tmux): draw pane title lines`. Merges keep their
+`Merge …` subjects.
+
+[commitlint](https://commitlint.js.org/) checks them, with the rules in
+`commitlint.config.mjs`. It needs Node 22.12 or later:
+
+```sh
+git config core.hooksPath scripts/hooks   # once per clone: check each new commit
+scripts/lint-commits                      # check the commits not on origin/main
+```
 
 ## Installing
 

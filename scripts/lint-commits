@@ -1,0 +1,55 @@
+#!/bin/sh
+# Checks commit messages against commitlint.config.mjs, the repo's
+# Conventional Commits rules (see CLAUDE.md):
+#
+#   scripts/lint-commits                # the commits not on origin/main
+#   scripts/lint-commits BASE           # BASE..HEAD
+#   scripts/lint-commits --edit FILE    # one message (the commit-msg hook)
+#
+# Merges (`Merge …`) are skipped. commitlint runs through npx, which needs
+# Node 22.12 or later; the first run downloads it. Its version is pinned
+# here and moved by hand.
+set -eu
+
+COMMITLINT_VERSION=21.2.3
+
+usage() {
+    echo "usage: scripts/lint-commits [BASE | --edit FILE]" >&2
+    exit 2
+}
+if ! command -v npx >/dev/null 2>&1; then
+    echo "lint-commits: npx is missing (install Node 22.12 or later)" >&2
+    exit 1
+fi
+commitlint() {
+    npx --yes -p "@commitlint/cli@$COMMITLINT_VERSION" \
+        -p "@commitlint/config-conventional@$COMMITLINT_VERSION" commitlint "$@"
+}
+
+root=$(git rev-parse --show-toplevel)
+case $# in
+0) base=$(git merge-base origin/main HEAD) ;;
+1)
+    case $1 in -*) usage ;; esac
+    base=$1
+    ;;
+2)
+    [ "$1" = --edit ] || usage
+    file=$(realpath "$2")
+    cd "$root"
+    commitlint --edit "$file"
+    exit
+    ;;
+*) usage ;;
+esac
+
+if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    echo "lint-commits: $base is not a commit" >&2
+    exit 2
+fi
+count=$(git rev-list --count "$base..HEAD")
+echo "lint-commits: $(git rev-parse --short "$base")..HEAD, $count commits"
+[ "$count" -gt 0 ] || exit 0
+cd "$root"
+commitlint --from "$base" --to HEAD
+echo "lint-commits: ok"

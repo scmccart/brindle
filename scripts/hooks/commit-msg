@@ -1,0 +1,8 @@
+#!/bin/sh
+# Checks the new commit's message with scripts/lint-commits. Enable it once
+# per clone with:
+#
+#   git config core.hooksPath scripts/hooks
+#
+# `git commit --no-verify` skips it; CI's `commits` job still checks.
+exec "$(git rev-parse --show-toplevel)/scripts/lint-commits" --edit "$1"

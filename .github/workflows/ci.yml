@@ -26,6 +26,35 @@ env:
   BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
 
 jobs:
+  # Checks the commit messages a push or pull request adds (see CLAUDE.md).
+  # A pull request is checked from its base. A push is checked from
+  # `before`, unless that isn't an ancestor of HEAD: a new branch (all
+  # zeros) or a force-push. Those and workflow_dispatch check the commits
+  # not on origin/main, which on main itself is nothing.
+  commits:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          # commitlint 21 needs 22.12 or later.
+          node-version: 24
+      - name: Check commit messages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=
+          if [ "$EVENT" = pull_request ]; then
+            base=$PR_BASE
+          elif [ "$EVENT" = push ] && git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
+            base=$BEFORE
+          fi
+          scripts/lint-commits ${base:+"$base"}
+
   test:
     runs-on: ubuntu-26.04
     steps:
