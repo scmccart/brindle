@@ -13,6 +13,71 @@ use windows::core::w;
 /// them to share, so a console program would otherwise get a window.
 pub const CREATE_NO_WINDOW: u32 = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
 
+/// Brindle's AppUserModelID. Its windows, its Start Menu shortcuts and its
+/// toasts all carry it, so Windows treats them as one app.
+pub const APP_ID: &str = "Brindle.Terminal";
+
+/// Where an app with no shortcut registers its toast name and icon.
+const APP_ID_KEY: &str = r"Software\Classes\AppUserModelId\Brindle.Terminal";
+
+/// Gives this process Brindle's AppUserModelID. Called before any window
+/// opens.
+pub fn set_app_id() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    // SAFETY: sets a process-wide string; nothing else is borrowed.
+    if let Err(err) = unsafe { SetCurrentProcessExplicitAppUserModelID(&windows::core::HSTRING::from(APP_ID)) } {
+        log::warn!("setting the AppUserModelID: {err}");
+    }
+}
+
+/// Registers [`APP_ID`] for the current user, so toasts work without a
+/// Start Menu shortcut: `DisplayName` Brindle, and `IconUri` when given.
+pub fn register_app_id(icon: Option<&std::path::Path>) -> windows::core::Result<()> {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    };
+    use windows::core::HSTRING;
+    let mut key = HKEY::default();
+    // SAFETY: creates or opens a key under HKCU; closed below.
+    unsafe {
+        RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(APP_ID_KEY), None, None, REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut key, None)
+    }
+    .ok()?;
+    let set = |name: &str, value: &str| {
+        let data: Vec<u8> = value.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect();
+        // SAFETY: `key` is open; `data` is a NUL-terminated UTF-16 string.
+        unsafe { RegSetValueExW(key, &HSTRING::from(name), None, REG_SZ, Some(&data)) }.ok()
+    };
+    let result = set("DisplayName", "Brindle").and_then(|()| match icon {
+        Some(icon) => set("IconUri", &icon.display().to_string()),
+        None => Ok(()),
+    });
+    // SAFETY: closes the key opened above.
+    unsafe { RegCloseKey(key) }.ok().ok();
+    result
+}
+
+/// Removes what [`register_app_id`] wrote. A missing key is fine.
+pub fn unregister_app_id() -> windows::core::Result<()> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+    // SAFETY: deletes Brindle's own key under HKCU.
+    match unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &windows::core::HSTRING::from(APP_ID_KEY)) } {
+        ERROR_FILE_NOT_FOUND => Ok(()),
+        status => status.ok(),
+    }
+}
+
+/// The window's HWND.
+pub fn hwnd(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // GPUI's own `window_handle` is another thing.
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut std::ffi::c_void)),
+        _ => None,
+    }
+}
+
 /// Points stdout and stderr at the console Brindle was started from, for
 /// output printed just before exiting.
 ///

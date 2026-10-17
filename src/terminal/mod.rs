@@ -713,15 +713,11 @@ impl Terminal {
     /// window. Local tabs never move between windows, so once is enough.
     #[cfg(windows)]
     pub fn parent_console_to(&self, window: &gpui::Window) {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Backend::Pty { console, .. } = &self.backend else {
             return;
         };
-        // GPUI's own `window_handle` is another thing.
-        if let Ok(handle) = HasWindowHandle::window_handle(window)
-            && let RawWindowHandle::Win32(win32) = handle.as_raw()
-        {
-            console.reparent(windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut std::ffi::c_void));
+        if let Some(hwnd) = crate::win::hwnd(window) {
+            console.reparent(hwnd);
         }
     }
 

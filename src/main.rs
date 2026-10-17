@@ -417,6 +417,10 @@ fn main() {
         return;
     }
 
+    // Before any window: windows, shortcuts and toasts share one identity.
+    #[cfg(windows)]
+    win::set_app_id();
+
     Application::new().run(move |cx: &mut App| {
         let (config, error) = Config::load_or_default();
         let settings = Settings::new(config, error, cx);

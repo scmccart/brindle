@@ -3,8 +3,8 @@
 //!
 //! [`Notifier`] is a GPUI global. It rate-limits, then hands each
 //! notification to a sink: on Linux a D-Bus worker on the background
-//! executor (`dbus`), or, when `BRINDLE_NOTIFY_LOG` is set, a file that
-//! tests read. It remembers which window and tab each notification came
+//! executor (`dbus`), on Windows a toast worker thread (`toast`), or, when
+//! `BRINDLE_NOTIFY_LOG` is set, a file that tests read. It remembers which window and tab each notification came
 //! from, so a click can show that tab.
 
 #[cfg(target_os = "linux")]
@@ -13,9 +13,50 @@ pub mod activation;
 mod dbus;
 pub mod osc;
 pub mod policy;
+#[cfg(windows)]
+mod toast;
 
-/// Raising a window outside Linux: plain activation, with no tokens.
-#[cfg(not(target_os = "linux"))]
+/// Raising a window on Windows for a notification click: restore it if
+/// minimized and bring it to the front, or, when Windows refuses that,
+/// flash its taskbar button. (GPUI's own activation fakes a key press to
+/// get the foreground, which Brindle doesn't do.)
+#[cfg(windows)]
+pub mod activation {
+    use gpui::{App, Window};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    pub fn raise(window: &mut Window, _token: Option<&str>) {
+        let Some(hwnd) = crate::win::hwnd(window) else { return };
+        // SAFETY: plain window-manager calls on Brindle's own window.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                ShowWindow(hwnd, SW_RESTORE).ok().ok();
+            }
+            if !SetForegroundWindow(hwnd).as_bool() {
+                log::debug!("Windows kept the foreground; flashing the window instead");
+                let info = FLASHWINFO {
+                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                    hwnd,
+                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                    uCount: 0,
+                    dwTimeout: 0,
+                };
+                FlashWindowEx(&info).ok().ok();
+            }
+        }
+    }
+
+    pub fn request_token(_window: &Window) -> Option<String> {
+        None
+    }
+
+    pub fn track_input(_window: &Window, _cx: &mut App) {}
+}
+
+/// Raising a window elsewhere: plain activation, with no tokens.
+#[cfg(not(any(target_os = "linux", windows)))]
 pub mod activation {
     use gpui::{App, Window};
 
@@ -35,10 +76,12 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use futures::StreamExt as _;
 #[cfg(target_os = "linux")]
-use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::mpsc::UnboundedSender;
+#[cfg(any(target_os = "linux", windows))]
+use futures::channel::mpsc::unbounded;
 #[cfg(target_os = "linux")]
 use gpui::AppContext as _;
 use gpui::{App, BorrowAppContext as _, Global, WindowHandle};
@@ -71,7 +114,7 @@ struct Target {
 }
 
 /// What [`Notifier`] asks a desktop sink to do.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) enum Command {
     Notify {
         /// Ours, echoed in [`Reply::Shown`].
@@ -84,10 +127,12 @@ pub(crate) enum Command {
 }
 
 /// What a desktop sink reports back.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) enum Reply {
     Shown { key: u64, id: u32 },
     Action { id: u32, action: String },
+    /// Wayland's activation token, for raising the window on a click.
+    #[cfg_attr(windows, allow(dead_code))]
     Token { id: u32, token: String },
     Closed { id: u32 },
 }
@@ -96,9 +141,11 @@ enum Sink {
     Log { path: PathBuf, next_id: u32 },
     #[cfg(target_os = "linux")]
     Bus(UnboundedSender<Command>),
+    #[cfg(windows)]
+    Toast(std::sync::mpsc::Sender<Command>),
     /// No desktop sink on this platform: requests are dropped, with one
     /// warning.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     Off { warned: bool },
 }
 
@@ -126,7 +173,21 @@ impl Notifier {
     pub fn init(cx: &mut App) {
         let sink = match std::env::var_os(LOG_ENV).filter(|p| !p.is_empty()) {
             Some(path) => Sink::Log { path: PathBuf::from(path), next_id: 1 },
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            None => {
+                let (reply_tx, mut replies) = unbounded();
+                let commands = toast::spawn(reply_tx);
+                cx.spawn(async move |cx| {
+                    while let Some(reply) = replies.next().await {
+                        if cx.update(|cx| Self::on_reply(reply, cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+                Sink::Toast(commands)
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             None => Sink::Off { warned: false },
             #[cfg(target_os = "linux")]
             None => {
@@ -198,7 +259,15 @@ impl Notifier {
                 let command = Command::Notify { key, replaces, summary: request.summary, body: request.body };
                 commands.unbounded_send(command).ok();
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            Sink::Toast(commands) => {
+                let key = self.next_key;
+                self.next_key += 1;
+                self.pending.insert(key, target);
+                let command = Command::Notify { key, replaces, summary: request.summary, body: request.body };
+                commands.send(command).ok();
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             Sink::Off { warned } => {
                 if !std::mem::replace(warned, true) {
                     log::warn!("desktop notifications aren't supported on this platform yet; dropping them");
@@ -272,6 +341,26 @@ impl Notifier {
     }
 }
 
+/// A `ToastGeneric` toast with `title` and `body`, escaped so markup in them
+/// stays text.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn toast_xml(title: &str, body: &str) -> String {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+    };
+    format!(
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+        escape(title),
+        escape(body)
+    )
+}
+
+/// The PNG toasts show for Brindle, once one is written out.
+#[cfg(windows)]
+fn icon_path() -> Option<PathBuf> {
+    None
+}
+
 /// One line of the test log: source, title and body, separated by tabs.
 pub fn log_line(source: Source, summary: &str, body: &str) -> String {
     let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
@@ -281,6 +370,16 @@ pub fn log_line(source: Source, summary: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toast_markup_stays_text() {
+        let xml = toast_xml("make <all> & \"go\"", "it's </text><text>done");
+        assert_eq!(
+            xml,
+            "<toast><visual><binding template=\"ToastGeneric\"><text>make &lt;all&gt; &amp; &quot;go&quot;</text>\
+             <text>it&apos;s &lt;/text&gt;&lt;text&gt;done</text></binding></visual></toast>"
+        );
+    }
 
     #[test]
     fn log_lines() {
