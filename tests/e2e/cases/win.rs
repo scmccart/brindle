@@ -22,6 +22,7 @@ pub fn all() -> Vec<Case> {
         display("windows-passthrough", passthrough),
         display("windows-glyph-width", glyph_width),
         display("windows-close-mid-output", close_mid_output),
+        display("windows-title-child", title_child),
     ]
 }
 
@@ -210,6 +211,19 @@ fn glyph_width(ctx: &Ctx) -> Result<Outcome> {
     let ran = run(ctx, "width", &["-p", "pwsh", "--send", &send], &[], 5.0, None)?;
     let text = screen(&ran.dump);
     ensure!(text.contains("widths=1,1"), "screen:\n{text}");
+    Ok(Outcome::Pass)
+}
+
+/// PowerShell sets no title of its own while a native program runs, so its
+/// tab is named after the newest process under it: `PING`, as `PING.EXE` is
+/// named on disk. Once ping exits, PowerShell reports its console title
+/// again, and the name is gone.
+fn title_child(ctx: &Ctx) -> Result<Outcome> {
+    let title = |dump: &Dump| dump.tabs.first().map(|(t, _)| t.clone()).unwrap_or_default();
+    let during = run(ctx, "during", &["-p", "pwsh", "--send", "ping -n 8 127.0.0.1\r"], &[], 4.0, None)?;
+    ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
+    let after = run(ctx, "after", &["-p", "pwsh", "--send", "ping -n 1 127.0.0.1\r"], &[], 5.0, None)?;
+    ensure!(!title(&after.dump).is_empty() && title(&after.dump) != "PING", "title after ping: {:?}", title(&after.dump));
     Ok(Outcome::Pass)
 }
 
