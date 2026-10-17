@@ -719,14 +719,19 @@ impl Workspace {
                             let taken = cx
                                 .background_executor()
                                 .spawn(async move {
-                                    std::process::Command::new(program)
+                                    let mut command = std::process::Command::new(program);
+                                    command
                                         .args(args)
                                         .envs(env)
                                         .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .status()
-                                        .is_ok_and(|s| s.success())
+                                        .stderr(std::process::Stdio::null());
+                                    #[cfg(windows)]
+                                    std::os::windows::process::CommandExt::creation_flags(
+                                        &mut command,
+                                        crate::win::CREATE_NO_WINDOW,
+                                    );
+                                    command.status().is_ok_and(|s| s.success())
                                 })
                                 .await;
                             if taken {
