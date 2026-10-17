@@ -77,21 +77,21 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 ## 5. Windows defaults and chrome
 
 - [x] 5.1 Add `src/primary.rs` (design §6), with the cfg-free `PrimaryBuffer` unit-tested. Route OSC 52 `Selection` in both directions, `finish_selection` and `PastePrimary` through it. Verify with `cargo test` on both platforms, and the Linux session's `selection` e2e cases.
-- [ ] 5.2 Write `default_program(path, comspec)` (design §7) as a pure function. Unit-test the four steps and `-NoLogo`. Update the `Profile::command` doc and the default config comments. Verify with `cargo test`, and the config-defaults test.
-- [ ] 5.3 Write `editor_command` (the `cmd.exe /D /S /C` raw tail; `%VISUAL%`, then `%EDITOR%`, then Notepad). Unit-test the generated command line for `code -w` and for a config path with spaces. Verify with `cargo test`, and by opening the config with ctrl-, locally (after asking).
-- [ ] 5.4 Add the font fallbacks (design §11). Verify with `cargo test` (the config defaults), and that the Linux session's e2e cases are unchanged.
-- [ ] 5.5 Open links with `ShellExecuteW` on Windows, with `BRINDLE_LINK_OPENER` spawned with `CREATE_NO_WINDOW`. Unit-test that the override gets the URI as one argument on Windows, using a test helper that records its argv. Verify with `cargo test` on Windows, and the manual check in 10.3.
-- [ ] 5.6 Add the Windows caption controls and `window_control_area` marks (design §10). Verify that the CI build compiles, and that the Linux session's with-xvfb `titles`, `windows` and `palette` e2e cases still pass. The Windows behaviour is checked in 10.2.
+- [x] 5.2 Write `default_program(path, comspec)` (design §7) as a pure function. Unit-test the four steps and `-NoLogo`. Update the `Profile::command` doc and the default config comments. Verify with `cargo test`, and the config-defaults test.
+- [x] 5.3 Write `editor_command` (the `cmd.exe /D /S /C` raw tail; `%VISUAL%`, then `%EDITOR%`, then Notepad). Unit-test the generated command line for `code -w` and for a config path with spaces. Verify with `cargo test`, and by opening the config with ctrl-, locally (after asking).
+- [x] 5.4 Add the font fallbacks (design §11). Verify with `cargo test` (the config defaults), and that the Linux session's e2e cases are unchanged.
+- [x] 5.5 Open links with `ShellExecuteW` on Windows, with `BRINDLE_LINK_OPENER` spawned with `CREATE_NO_WINDOW`. Unit-test that the override gets the URI as one argument on Windows, using a test helper that records its argv. Verify with `cargo test` on Windows, and the manual check in 10.3.
+- [x] 5.6 Add the Windows caption controls and `window_control_area` marks (design §10). Verify that the CI build compiles, and that the Linux session's with-xvfb `titles`, `windows` and `palette` e2e cases still pass. The Windows behaviour is checked in 10.2.
 
 ## 6. tmux through WSL
 
-- [ ] 6.1 Split WSL arguments in a `tmux_command` used by `command_line` and `has_session_command` (design §8). `-u` and `--exec` go in the right places, there is no `-c` for WSL, and tmux spawns get `CREATE_NO_WINDOW`. Unit-test every scenario in the `tmux-control-mode` delta (`wsl`, `WSL.EXE`, `-d Ubuntu tmux -L work`, no `tmux` element, an explicit `-e`, has-session, no `-c`), and that non-WSL command lines are unchanged. Verify with `cargo test tmux` on both platforms.
+- [x] 6.1 Split WSL arguments in a `tmux_command` used by `command_line` and `has_session_command` (design §8). `-u` and `--exec` go in the right places, there is no `-c` for WSL, and tmux spawns get `CREATE_NO_WINDOW`. Unit-test every scenario in the `tmux-control-mode` delta (`wsl`, `WSL.EXE`, `-d Ubuntu tmux -L work`, no `tmux` element, an explicit `-e`, has-session, no `-c`), and that non-WSL command lines are unchanged. Verify with `cargo test tmux` on both platforms.
 - [ ] 6.2 Add a commented WSL control-mode profile to `assets/default-config.toml`, and a README section. Add the e2e case `windows-wsl-tmux` with `tmux_args = ["tmux", "-L", "brindle-e2e-<pid>", "-f", "/dev/null"]`, which skips when `wsl --exec tmux -V` fails, and kill its server afterwards. Verify locally (after asking; first check that a WSL distribution with tmux is installed, and ask the user to install one if it isn't).
 
 ## 7. Toast notifications
 
 - [ ] 7.1 First, probe in scratch, after asking the user, because a toast appears on screen: register `HKCU\Software\Classes\AppUserModelId\Brindle.Terminal` with no shortcut, then show a toast through `CreateToastNotifierWithId`. Record whether it appears and whether its icon is shown. If it doesn't appear, update the `desktop-notifications` delta's "Toasts without the installer" scenario and design §9 as the design's risk entry says, before going on. Then set the process AUMID before any window opens, and register the key with `DisplayName` and an `IconUri` pointing to the extracted `brindle-256.png`. Verify with `reg query` after a local run (after asking).
-- [ ] 7.2 Add `notify/toast.rs` (design §9):
+- [x] 7.2 Add `notify/toast.rs` (design §9):
   - an MTA worker;
   - `ToastGeneric` XML built from text nodes, with a cfg-free unit test that markup in titles and bodies stays literal;
   - the tag and replace rule for bells;
@@ -100,14 +100,14 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
   Verify with `cargo test`, and that the existing `notify` e2e cases pass on Windows with `BRINDLE_NOTIFY_LOG`.
 - [ ] 7.3 Add the Windows `activation::raise`: restore if minimized, `SetForegroundWindow`, and `FlashWindowEx` when refused. Verify with the manual check in 10.3.
-- [ ] 7.4 Document toasts in README.md: the AUMID registration and the Windows Settings switch. Verify that the text matches 7.1–7.3.
+- [x] 7.4 Document toasts in README.md: the AUMID registration and the Windows Settings switch. Verify that the text matches 7.1–7.3.
 
 ## 8. Icons, resources and installers
 
 - [ ] 8.1 Add `scripts/render-icons.sh` (design §12). It writes `assets/windows/brindle.ico`, with 8 sizes and a PNG-compressed 256 px image, and `assets/windows/brindle-256.png`. If neither `rsvg-convert`, `resvg` nor `magick` is installed, ask the user to install one. Commit the outputs. Verify that the `.ico` header lists 8 images, and view the 16 and 32 px renders.
 - [ ] 8.2 Add a CI check that fails when `assets/brindle.svg` is newer in git history than `assets/windows/brindle.ico`. Verify by touching the SVG on a scratch branch, and then reverting.
 - [ ] 8.3 Add `assets/windows/brindle.rc` (`1 ICON`, `VERSIONINFO` from `/D` macros) to `build.rs`. Verify locally that `(Get-Item target\release\brindle.exe).VersionInfo` shows Brindle and the crate version, that `[System.Drawing.Icon]::ExtractAssociatedIcon` returns the icon, and that `mt.exe -inputresource:brindle.exe;#1 -out:m.xml` contains `PerMonitorV2`. If it doesn't, apply the design §12 fallback and check again. Add the same checks to the CI job, and verify that they pass there.
-- [ ] 8.4 Add the Windows `--install-desktop` / `--uninstall-desktop` (design §13): the `.lnk` with the AUMID property; removing the shortcut and the HKCU key; `--prefix` rejected with exit status 2. Unit-test the argument handling, cfg-free. Verify locally (no window opens): the `.lnk` exists, and its `System.AppUserModel.ID` reads `Brindle.Terminal` through `Shell.Application`; uninstall removes both the shortcut and the key; uninstalling twice exits 0; `--prefix C:\Tools` exits 2. Run the same checks in CI.
+- [x] 8.4 Add the Windows `--install-desktop` / `--uninstall-desktop` (design §13): the `.lnk` with the AUMID property; removing the shortcut and the HKCU key; `--prefix` rejected with exit status 2. Unit-test the argument handling, cfg-free. Verify locally (no window opens): the `.lnk` exists, and its `System.AppUserModel.ID` reads `Brindle.Terminal` through `Shell.Application`; uninstall removes both the shortcut and the key; uninstalling twice exits 0; `--prefix C:\Tools` exits 2. Run the same checks in CI.
 - [ ] 8.5 Add `packaging/windows/brindle.wxs` (design §13), with the WiX CLI version pinned. Installing the WiX dotnet tool on this machine changes it, so ask the user first. Build the MSI locally and in CI, and upload it from CI. In CI, after a quiet install, check that `brindle.exe`, `conpty.dll`, `OpenConsole.exe`, the shortcut (with the AUMID) and the uninstall key exist. After uninstall, check that they are all gone and `%APPDATA%\brindle` is untouched. Verify that the CI step passes.
 - [ ] 8.6 Add a CI upgrade check: build `0.0.1-ci` and the real version, install the first and then the second, and assert that exactly one Brindle uninstall key remains and `brindle --version` prints the real version. Verify that the step passes.
 - [ ] 8.7 Document installing in README.md: the MSI; `cargo install` plus `--install-desktop` (and not to use both); the SmartScreen warning for unsigned builds; uninstall leaving config. Verify that each command matches the code and the CI workflow.
