@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/scmccart/brindle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/scmccart/brindle/actions/workflows/ci.yml)
 
-A GPU-accelerated terminal emulator for Linux, written in Rust on
-[GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
+A GPU-accelerated terminal emulator for Linux and Windows 11, written in Rust
+on [GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
 Terminal emulation comes from `alacritty_terminal`; rendering goes through
-GPUI's Vulkan renderer.
+GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 
 Brindle treats tmux as a native windowing layer, not just a program running
 inside the terminal: tmux windows become tabs and panes are drawn natively,
@@ -57,6 +57,20 @@ Wayland, fontconfig and Vulkan are loaded at runtime (dlopen), so only their
 runtime libraries are needed, and every desktop install has them. `tmux` is
 only needed for the tmux profiles.
 
+On Windows 11 (Windows 10 isn't supported), install the MSVC toolchain and the
+Windows 11 SDK (Visual Studio Build Tools with "Desktop development with C++"),
+then, in PowerShell:
+
+```powershell
+cargo build --release
+.\target\release\brindle.exe
+```
+
+GPUI's release build compiles its shaders with the SDK's `fxc.exe`, which it
+looks for on `PATH` and in SDK 10.0.26100.0. With another SDK version, point
+`GPUI_FXC_PATH` at it, for example
+`$env:GPUI_FXC_PATH = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\<version>\x64\fxc.exe"`.
+
 `Cargo.lock` starts from gpui 0.2.2's own lockfile; newer transitive versions
 (e.g. `libc`) break its dependencies.
 
@@ -94,7 +108,8 @@ unit tests, a release build, and the end-to-end suite that way on Ubuntu
 26.04, against tmux 3.6a (Ubuntu's) and 3.8 (built from source), for every
 push and every pull request. Each tmux
 version's suite is split into 4 shards that run as separate jobs. A failed
-shard uploads its `target/tmp/e2e/` as an artifact.
+shard uploads its `target/tmp/e2e/` as an artifact. A Windows job runs the
+release build, the unit tests and the harness self-tests on `windows-latest`.
 
 ### Performance
 

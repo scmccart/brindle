@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Brindle is a GPU-accelerated Linux terminal emulator in Rust. It is built on GPUI 0.2.2 (Zed's toolkit, from crates.io) and `alacritty_terminal` 0.26, with tabs, profiles, and tmux in two modes: classic, and control mode (`tmux -C`). See README.md for user-facing behaviour and keybindings.
+Brindle is a GPU-accelerated terminal emulator for Linux and Windows 11, in Rust. It is built on GPUI 0.2.2 (Zed's toolkit, from crates.io) and `alacritty_terminal` 0.26, with tabs, profiles, and tmux in two modes: classic, and control mode (`tmux -C`). See README.md for user-facing behaviour and keybindings.
 
 ## Build and test
 
@@ -19,6 +19,16 @@ cargo test collector_matches_the_spike_transcript   # one test
 - **`Cargo.lock` was seeded from gpui 0.2.2's own lockfile.** Do not regenerate it, and avoid broad `cargo update`: a newer `libc` breaks `xattr`. Add new dependencies with care.
 - The GPUI and alacritty sources to read for API questions are in `~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2` and `.../alacritty_terminal-0.26.0`.
 - Zed's `terminal`/`terminal_view` crates are GPL-3.0. Use them only to learn the API shape and never copy code from them: Brindle is MIT OR Apache-2.0.
+
+### Windows
+
+The Windows port (OpenSpec change `port-to-windows`) builds on `x86_64-pc-windows-msvc` with the MSVC toolchain and the Windows 11 SDK.
+- The same `cargo build`, `cargo build --release` and `cargo test` commands work in PowerShell or Git Bash. The release build needs the SDK's `fxc.exe`: on `PATH`, in SDK 10.0.26100.0, or named by `GPUI_FXC_PATH`.
+- Platform code is behind `cfg`: `target_os = "linux"` for D-Bus, Wayland and X11 captures, `unix` for `libc`, `windows` for the `windows` crate. `src/win.rs` holds small Windows helpers. Process info is in `terminal/process.rs` (the seam `port-to-macos` uses), and the primary selection is in `src/primary.rs`.
+- `.gitattributes` keeps every text file LF, because `include_str!` embeds assets and shell scripts.
+- On Windows the e2e cases that need X11 or tmux skip themselves, and `tests/perf` runs only its self-test.
+- **Linux checks from a Windows machine:** push the branch, then ask the Linux machine's Claude session, reachable over Remote Control, to fetch it and run `cargo test --locked`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Its user approves each run. The Linux CI jobs run the same commands on every push.
+- GUI runs on a Windows desktop (any Brindle window, `--dump-screen-after` included) steal focus as on Linux `:0`, so ask first. There is no `scripts/with-xvfb` equivalent on Windows.
 
 ## Commit messages
 
@@ -65,7 +75,7 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/4   # every 4th selected case, 
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
 - `scripts/with-xvfb <command>` runs it headless: a private Xvfb on a free display, openbox, lavapipe (`VK_DRIVER_FILES`), `LC_ALL=C.UTF-8` and a private session bus (`dbus-run-session`). Runs under it open no windows on the desktop, so they don't need asking first, unlike runs on `:0`. The suite needs the window manager (palette and multi-window cases). The locale keeps programs in panes consistent; tmux doesn't need it, since control clients run with `-u`.
-- CI (`.github/workflows/ci.yml`, `ubuntu-26.04` runners, no containers) runs on every pull request and on pushes to every branch except Dependabot's (those always have a PR): `commits` (`scripts/lint-commits` from the PR's base or the push's `before`, else from `origin/main`), `test` (`cargo test` and both harness self-tests), `release`, and `e2e` (the suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`) per tmux version in 4 shards (`--shard K/4`, round-robin after filters; the count is in the matrix, the job name and the command). e2e is advisory: red on failure, not a required check. A failed shard uploads `target/tmp/e2e/` as `e2e-tmux-<v>-shard-<k>`; rerun it locally with the same `--shard`. Move the pins by hand: `COMMITLINT_VERSION` in `scripts/lint-commits`, and in the workflow `RUST_VERSION`, and the e2e matrix (a tmux version, what `tmux -V` reports, and the tarball's sha256 when it's built from source). `RUST_VERSION` matches the desktop's toolchain. Dependabot (`.github/dependabot.yml`) opens monthly PRs for the actions; Cargo gets security PRs only (its entry sets `open-pull-requests-limit: 0`), which are lockfile bumps to review against the `Cargo.lock` rule above. Both entries set `commit-message` so subjects read `chore(deps): bump …`.
+- CI (`.github/workflows/ci.yml`, `ubuntu-26.04` runners, no containers) runs on every pull request and on pushes to every branch except Dependabot's (those always have a PR): `commits` (`scripts/lint-commits` from the PR's base or the push's `before`, else from `origin/main`), `test` (`cargo test` and both harness self-tests), `release`, `windows` (on `windows-latest`: the release build, `cargo test` and both self-tests, with `GPUI_FXC_PATH` set from the runner's newest SDK), and `e2e` (the suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`) per tmux version in 4 shards (`--shard K/4`, round-robin after filters; the count is in the matrix, the job name and the command). e2e is advisory: red on failure, not a required check. A failed shard uploads `target/tmp/e2e/` as `e2e-tmux-<v>-shard-<k>`; rerun it locally with the same `--shard`. Move the pins by hand: `COMMITLINT_VERSION` in `scripts/lint-commits`, and in the workflow `RUST_VERSION`, and the e2e matrix (a tmux version, what `tmux -V` reports, and the tarball's sha256 when it's built from source). `RUST_VERSION` matches the desktop's toolchain. Dependabot (`.github/dependabot.yml`) opens monthly PRs for the actions; Cargo gets security PRs only (its entry sets `open-pull-requests-limit: 0`), which are lockfile bumps to review against the `Cargo.lock` rule above. Both entries set `commit-message` so subjects read `chore(deps): bump …`.
 
 ### Manual checks
 
