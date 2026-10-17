@@ -196,6 +196,26 @@ pub fn poll_session_end_inside(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// With no locale, a control client that isn't marked UTF-8 (`-u`) gets
+/// `_` for the tabs in Brindle's `-F` formats and for non-ASCII text, so
+/// the window list can't be parsed and no tab appears. `TMUX` would mark
+/// the client UTF-8 by itself, so it goes too.
+pub fn attach_without_locale(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::Run;
+
+    let server = TmuxServer::new(113, 33)?;
+    server.run(&["rename-window", "-t", "e2e", "café"])?;
+    server.run(&["new-window", "-d", "-t", "e2e", "-n", "logs"])?;
+    let mut run = Run::new(ctx, &server, "run");
+    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TMUX"] {
+        run = run.env_remove(key);
+    }
+    let out = run.dump_at(3.0).run()?;
+    let titles: Vec<&str> = out.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
+    ensure!(titles == ["café", "logs"], "tabs {titles:?}");
+    Ok(Outcome::Pass)
+}
+
 /// An OSC 4 query reaches control clients in `%output`, and tmux leaves it
 /// unanswered when the pane's palette doesn't set the index and no terminal
 /// client is attached. Brindle answers such queries itself

@@ -136,6 +136,7 @@ pub struct Run<'a> {
     expect_exit: bool,
     steps: Vec<String>,
     env: Vec<(String, String)>,
+    env_remove: Vec<String>,
     timeline: Vec<(f64, Event)>,
     dump_at: f64,
     capture_at: Option<f64>,
@@ -164,6 +165,7 @@ impl<'a> Run<'a> {
             expect_exit: false,
             steps: Vec::new(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             timeline: Vec::new(),
             dump_at: 4.0,
             capture_at: None,
@@ -201,6 +203,12 @@ impl<'a> Run<'a> {
     /// is `<label>.log`).
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Removes an environment variable from Brindle's (e.g. `LANG`).
+    pub fn env_remove(mut self, key: &str) -> Self {
+        self.env_remove.push(key.to_string());
         self
     }
 
@@ -310,6 +318,9 @@ impl<'a> Run<'a> {
             command.env("BRINDLE_STATE_DIR", state_dir(ctx));
         } else {
             command.args(["-p", self.profile]);
+        }
+        for key in &self.env_remove {
+            command.env_remove(key);
         }
         let mut child = command
             .args(&self.args)

@@ -7,9 +7,9 @@
 #
 # It starts Xvfb on a free display with openbox (the palette and
 # multi-window cases need a window manager), forces Mesa's lavapipe so a GPU
-# renders the way CI does, sets a UTF-8 locale (without one, tmux mangles
-# the tabs in its control-mode replies), and runs the command under a
-# private session bus. Nothing opens on the desktop.
+# renders the way CI does, sets a UTF-8 locale (so programs in panes behave
+# the same everywhere), and runs the command under a private session bus.
+# Nothing opens on the desktop.
 #
 # Needs: xvfb x11-utils openbox mesa-vulkan-drivers dbus
 #
