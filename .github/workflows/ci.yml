@@ -55,6 +55,17 @@ jobs:
             base=$BEFORE
           fi
           scripts/lint-commits ${base:+"$base"}
+      # The Windows icons are rendered from the SVG and committed
+      # (scripts/render-icons.sh), so the SVG's last change must be in or
+      # before the .ico's.
+      - name: Check the Windows icons are rendered from the current SVG
+        run: |
+          svg=$(git log -1 --format=%H -- assets/brindle.svg)
+          ico=$(git log -1 --format=%H -- assets/windows/brindle.ico)
+          if [ -z "$ico" ] || ! git merge-base --is-ancestor "$svg" "$ico"; then
+            echo "assets/brindle.svg changed after assets/windows/brindle.ico: run scripts/render-icons.sh and commit its output" >&2
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-26.04
@@ -126,7 +137,7 @@ jobs:
         run: cargo test --locked --test perf -- --self-test
         env:
           BRINDLE_PERF: "1"
-      - name: Version resource and DPI manifest in brindle.exe
+      - name: Version resource, icon and DPI manifest in brindle.exe
         shell: pwsh
         run: |
           $exe = (Resolve-Path target/release/brindle.exe).Path
@@ -135,6 +146,19 @@ jobs:
           if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version) {
             throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)', expected Brindle $version"
           }
+          # Icon group 1 (RT_GROUP_ICON is 14) with all 8 sizes. Extracting
+          # the icon proves nothing: Windows supplies a default one.
+          Add-Type -Namespace Res -Name Api -MemberDefinition @'
+          [DllImport("kernel32", CharSet = CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
+          [DllImport("kernel32")] public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+          [DllImport("kernel32")] public static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+          [DllImport("kernel32")] public static extern IntPtr LockResource(IntPtr data);
+          '@
+          $module = [Res.Api]::LoadLibraryExW($exe, 0, 2) # LOAD_LIBRARY_AS_DATAFILE
+          $group = [Res.Api]::FindResourceW($module, 1, 14)
+          if ($group -eq 0) { throw 'no icon in brindle.exe' }
+          $count = [Runtime.InteropServices.Marshal]::ReadInt16([Res.Api]::LockResource([Res.Api]::LoadResource($module, $group)), 4)
+          if ($count -ne 8) { throw "the icon has $count sizes, expected 8" }
           # GPUI embeds the manifest; without it the window renders blurry above 100% scale.
           $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
           & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
