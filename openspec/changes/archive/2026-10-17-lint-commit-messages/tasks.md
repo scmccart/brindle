@@ -37,6 +37,6 @@
 
 - [x] 3.1 Push the branch. Verify: the `commits` job passes; its log shows the fallback range (new branch) and the branch's commit count; the other jobs are unaffected. Record the run ID in the commit message. (Run 39039988052 was a force-push, after the first push's run was cancelled, so it showed the force-push fallback, `d989429..HEAD, 2 commits`. The scratch branch in 3.2 showed the new-branch fallback.)
 - [x] 3.2 Push a scratch branch from this one with a commit titled `Add a bad subject`. Verify: the `commits` job fails, and its log names `type-empty` and `subject-empty` for that commit only. Then push a second, well-formed commit to the scratch branch. Verify: that run's range is the first push's head `..HEAD`, so it checks only the new commit and passes. The bad commit stays visible to a PR's `base..head` range. Delete the scratch branch.
-- [ ] 3.3 Land the usual way (archive, `--no-ff` merge "Merge linting commit messages"; rebase only if `main` moved), and ask before pushing `main`. Verify:
+- [x] 3.3 Land the usual way (archive, `--no-ff` merge "Merge linting commit messages"; rebase only if `main` moved), and ask before pushing `main`. Verify:
   - the run on `main` passes, with its `commits` job checking the pushed range;
   - Dependabot reports no config error for the new `dependabot.yml` (repo Insights → Dependency graph → Dependabot, or its "Dependabot Updates" run).
