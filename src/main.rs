@@ -57,9 +57,10 @@ OPTIONS:
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
         --shell-integration <SHELL>
-                                 Print the bash, zsh or fish integration script
-                                 (OSC 133 prompt marks) and exit, e.g. in
-                                 ~/.bashrc: eval \"$(brindle --shell-integration bash)\"
+                                 Print the bash, zsh, fish or pwsh (PowerShell)
+                                 integration script (OSC 133 prompt marks) and
+                                 exit, e.g. in ~/.bashrc:
+                                 eval \"$(brindle --shell-integration bash)\"
         --install-desktop        Add Brindle to the desktop's launcher, then exit
         --uninstall-desktop      Remove it from the launcher, then exit
         --prefix <DIR>           With the two above: use DIR/share instead of
@@ -90,6 +91,7 @@ const SHELL_SCRIPTS: &[(&str, &str)] = &[
     ("bash", include_str!("../shell-integration/brindle.bash")),
     ("zsh", include_str!("../shell-integration/brindle.zsh")),
     ("fish", include_str!("../shell-integration/brindle.fish")),
+    ("pwsh", include_str!("../shell-integration/brindle.ps1")),
 ];
 
 #[derive(Debug, Clone)]

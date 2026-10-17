@@ -912,6 +912,63 @@ mod tests {
         assert_eq!(reading.join().unwrap(), data);
     }
 
+    /// Brindle's PowerShell script, in a real PowerShell 7 and Windows
+    /// PowerShell 5.1 on a pseudoconsole: a failing native command gets
+    /// A, B, C and D;3, the directory is reported, and `$LASTEXITCODE`
+    /// survives the prompt.
+    #[test]
+    fn powershell_script_marks_commands() {
+        let script = std::env::temp_dir().join(format!("brindle-si-{}.ps1", std::process::id()));
+        std::fs::write(&script, include_str!("../../shell-integration/brindle.ps1")).unwrap();
+        let on_path = |exe: &str| {
+            std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
+        };
+        let mut ran = 0;
+        for shell in ["pwsh.exe", "powershell.exe"] {
+            if !on_path(shell) {
+                eprintln!("{shell} isn't on PATH; skipped");
+                continue;
+            }
+            ran += 1;
+            let load = format!(". '{}'", script.display());
+            let args: Vec<String> = ["-NoLogo", "-NoProfile", "-NoExit", "-Command", &load].map(String::from).into();
+            let command = Command { line: super::super::cmdline::command_line(shell, &args), cwd: None, env: Vec::new() };
+            let size = WindowSize { num_lines: 30, num_cols: 120, cell_width: 8, cell_height: 16 };
+            let mut spawned = spawn(&command, size).unwrap();
+            let poller = Arc::new(Poller::new().unwrap());
+            spawned.reader.register(&poller, Event::readable(1));
+            let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+            let mut output = Vec::new();
+            let mut typed = 0;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !text(&output).contains("code=3") {
+                assert!(Instant::now() < deadline, "{shell}: timed out; output: {:?}", text(&output));
+                let mut events = polling::Events::new();
+                poller.wait(&mut events, Some(Duration::from_millis(200))).unwrap();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = spawned.reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    output.extend_from_slice(&buf[..n]);
+                }
+                // Type the next line at each prompt.
+                let prompts = text(&output).matches("\x1b]133;B\x07").count();
+                let lines = ["cmd /c exit 3\r", "\"code=$LASTEXITCODE\"\r"];
+                if prompts > typed && typed < lines.len() {
+                    spawned.writer.write_all(lines[typed].as_bytes()).unwrap();
+                    typed += 1;
+                }
+            }
+            let out = text(&output);
+            for mark in ["\x1b]133;A\x07", "\x1b]133;B\x07", "\x1b]133;C\x07", "\x1b]133;D;3\x07", "\x1b]7;file://"] {
+                assert!(out.contains(mark), "{shell}: no {mark:?} in {out:?}");
+            }
+        }
+        std::fs::remove_file(&script).ok();
+        assert!(ran > 0, "no PowerShell on PATH");
+    }
+
     #[test]
     fn a_program_runs_and_its_exit_is_reported() {
         let command = Command {
