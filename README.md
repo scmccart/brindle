@@ -436,6 +436,23 @@ decides what happens next:
 
 It can also be changed in the settings dialog's General section.
 
+On Windows, control mode runs tmux inside WSL. Install tmux in your
+distribution, then add a profile whose command is `wsl`:
+
+```toml
+[[profiles]]
+name = "tmux (WSL)"
+tmux = "control"
+command = "wsl"
+tmux_args = ["tmux"]
+```
+
+`tmux_args` are WSL's options, then `tmux`, then tmux's own options, for example
+`["-d", "Ubuntu", "tmux", "-L", "work"]`. Brindle runs
+`wsl -d Ubuntu --exec tmux -u -L work -C new-session -A -s main`. New sessions
+start in tmux's default directory, because a Windows tab's directory means
+nothing inside WSL.
+
 Each session is shown by one window at most. Picking a control-mode profile
 whose session this window shows just switches to its tab. The new-tab palette
 marks a control-mode profile whose session is open with "open in this window"

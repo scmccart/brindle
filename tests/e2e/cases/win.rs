@@ -25,7 +25,36 @@ pub fn all() -> Vec<Case> {
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
+        display("windows-wsl-tmux", wsl_tmux),
     ]
+}
+
+/// A control-mode profile through WSL attaches a throwaway tmux server
+/// inside it, with each tmux window a tab. Skipped without tmux in WSL.
+fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
+    let wsl = |args: &[&str]| Command::new("wsl").args(args).stdin(Stdio::null()).output();
+    match wsl(&["--exec", "tmux", "-V"]) {
+        Ok(out) if out.status.success() => {}
+        _ => return Ok(Outcome::Skip("no tmux in WSL (`wsl --exec tmux -V` failed)".into())),
+    }
+    let socket = format!("brindle-e2e-{}", std::process::id());
+    let tmux = |args: &[&str]| {
+        let mut all = vec!["--exec", "tmux", "-L", socket.as_str(), "-f", "/dev/null"];
+        all.extend_from_slice(args);
+        wsl(&all)
+    };
+    tmux(&["new-session", "-d", "-s", "main", "-n", "first"]).map_err(|e| e.to_string())?;
+    tmux(&["new-window", "-d", "-t", "main", "-n", "second"]).map_err(|e| e.to_string())?;
+    let config = format!(
+        "default_profile = \"wsl\"\n\n[[profiles]]\nname = \"wsl\"\ntmux = \"control\"\ncommand = \"wsl\"\n\
+         tmux_args = [\"tmux\", \"-L\", \"{socket}\", \"-f\", \"/dev/null\"]\n"
+    );
+    let ran = run_with(ctx, &config, "attach", &["-p", "wsl"], &[], 6.0, None);
+    tmux(&["kill-server"]).ok();
+    let ran = ran?;
+    let titles: Vec<&str> = ran.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
+    ensure!(titles == ["first", "second"], "tabs: {titles:?}; see attach.log");
+    Ok(Outcome::Pass)
 }
 
 /// What Windows' hit test (`WM_NCHITTEST`) reports at points of the tab

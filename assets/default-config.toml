@@ -81,6 +81,14 @@ name = "tmux (classic)"
 tmux = "plain"
 tmux_session = "main"
 
+# On Windows, tmux in control mode inside WSL. tmux_args are WSL's options
+# (e.g. "-d", "Ubuntu"), then "tmux", then tmux's options.
+# [[profiles]]
+# name = "tmux (WSL)"
+# tmux = "control"
+# command = "wsl"
+# tmux_args = ["tmux"]
+
 # ---------------------------------------------------------------------------
 # Custom themes. Unspecified colors inherit from brindle-dark.
 # ---------------------------------------------------------------------------
