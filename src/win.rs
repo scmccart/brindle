@@ -9,6 +9,10 @@ use windows::Win32::System::Console::{
 };
 use windows::core::w;
 
+/// For processes Brindle starts outside a tab: Brindle has no console for
+/// them to share, so a console program would otherwise get a window.
+pub const CREATE_NO_WINDOW: u32 = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
+
 /// Points stdout and stderr at the console Brindle was started from, for
 /// output printed just before exiting.
 ///

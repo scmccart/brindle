@@ -26,6 +26,7 @@ const SCHEMES: &[(&str, &str)] = &[
 
 /// Environment variable naming the program that opens links.
 pub const OPENER_ENV: &str = "BRINDLE_LINK_OPENER";
+#[cfg(not(windows))]
 const DEFAULT_OPENER: &str = "xdg-open";
 
 /// Characters a URL can't contain. Box drawing and block elements end a
@@ -105,10 +106,49 @@ pub fn has_scheme(uri: &str) -> bool {
         && !uri.chars().any(char::is_control)
 }
 
-/// Opens `uri` with `$BRINDLE_LINK_OPENER`, or `xdg-open`, without waiting.
+/// Opens `uri` with `$BRINDLE_LINK_OPENER`, or else `xdg-open` (on Windows,
+/// the shell's handler for it), without waiting.
 pub fn open(uri: &str) {
-    let program = std::env::var(OPENER_ENV).ok().filter(|p| !p.is_empty()).unwrap_or_else(|| DEFAULT_OPENER.into());
-    open_with(program, uri.to_string());
+    match std::env::var(OPENER_ENV).ok().filter(|p| !p.is_empty()) {
+        Some(program) => drop(open_with(program, uri.to_string())),
+        None => open_default(uri.to_string()),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_default(uri: String) {
+    open_with(DEFAULT_OPENER.into(), uri);
+}
+
+/// Has the shell open `uri` with its default handler (the browser, for a
+/// web link), on its own thread: handlers can take a while to start.
+#[cfg(windows)]
+fn open_default(uri: String) {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+
+    if !has_scheme(&uri) {
+        log::warn!("not opening {uri:?}: it has no URI scheme");
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("link-opener".into()).spawn(move || {
+        log::info!("opening {uri}");
+        // SAFETY: COM is initialized once for this short-lived thread, as
+        // ShellExecute asks of its callers; the strings outlive the call.
+        let result = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok().ok();
+            ShellExecuteW(None, w!("open"), &HSTRING::from(uri.as_str()), None, None, SW_SHOWNORMAL)
+        };
+        // Values up to 32 are errors.
+        if result.0 as usize <= 32 {
+            log::warn!("could not open {uri}: ShellExecute returned {}", result.0 as usize);
+        }
+    });
+    if let Err(err) = spawned {
+        log::warn!("could not start the link opener thread: {err}");
+    }
 }
 
 /// Runs `program uri` on its own thread (spawning and reaping it there), so
@@ -124,6 +164,10 @@ fn open_with(program: String, uri: String) -> Option<std::thread::JoinHandle<()>
         command.arg(&uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // Brindle has no console to share, so a console program would get a
+        // window of its own.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
         let child = command.spawn();
         match child.and_then(|mut child| child.wait()) {
             Ok(status) if !status.success() => log::warn!("{program} {uri}: {status}"),
@@ -245,6 +289,26 @@ mod tests {
         assert!(!has_scheme("1http://x"));
         assert!(!has_scheme(":x"));
         assert!(!has_scheme("https://example.com/\nrm"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opener_gets_the_uri_as_one_argument_on_windows() {
+        let dir = std::env::temp_dir().join(format!("brindle-opener-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("opened");
+        let script = dir.join("record.cmd");
+        // `%1` is the first argument as given (quotes and all), `%2` the second.
+        std::fs::write(&script, format!("@echo %1^|%2> \"{}\"
+", out.display())).unwrap();
+
+        let uri = "https://example.com/a b?c=1&d='e'";
+        open_with(script.display().to_string(), uri.into()).unwrap().join().unwrap();
+        let recorded = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(recorded.trim_end(), format!("\"{uri}\"|"));
+
+        assert!(open_with(script.display().to_string(), "-rf".into()).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
