@@ -251,7 +251,7 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
   - MSIX, where signing is mandatory, plus filesystem virtualisation inside a terminal.
 - **`--install-desktop`:** it finds `FOLDERID_Programs`, then creates `Brindle.lnk` through `IShellLinkW`, with the path and icon set to `current_exe`, `IPropertyStore` setting `PKEY_AppUserModel_ID`, and `IPersistFile::Save`.
 - **`--uninstall-desktop`:** it deletes the shortcut and the HKCU AUMID key, and treats both being missing as success.
-- **The shortcut and WinGet:** WinGet doesn't create Start Menu shortcuts for portable packages, so the README points to `brindle --install-desktop`, and to `brindle --uninstall-desktop` before `winget uninstall`, which doesn't know about the shortcut. The shortcut has to keep working across `winget upgrade`. If running through WinGet's `brindle` link makes `current_exe` a path an upgrade breaks, `--install-desktop` resolves it to the stable one.
+- **The shortcut and WinGet:** WinGet doesn't create Start Menu shortcuts for portable packages, so the README points to `brindle --install-desktop`, and to `brindle --uninstall-desktop` before `winget uninstall`, which doesn't know about the shortcut. The shortcut has to keep working across `winget upgrade`. Run as the installed command, `current_exe` is WinGet's `%LOCALAPPDATA%\Microsoft\WinGet\Links\brindle.exe` symlink, which an upgrade re-points at the new exe, so the shortcut follows it (checked with a local manifest, 0.1.0 to 0.1.1).
 - **`--prefix`:** rejected with exit status 2, with a message pointing to WinGet. The argument handling is cfg-free and unit-tested.
 
 ### 14. Verification
