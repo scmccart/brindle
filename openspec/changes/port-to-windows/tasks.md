@@ -36,7 +36,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - the script fails on a wrong hash;
   - a build with the files embeds them (the exe grows by about 1.2 MB, and `target\debug\conpty.dll` exists);
   - a build without them warns and still builds.
-- [ ] 2.2 Write the pure helpers, cfg-free and unit-tested on both platforms:
+- [x] 2.2 Write the pure helpers, cfg-free and unit-tested on both platforms:
   - MSVC command-line quoting (the spaces, quotes and trailing-backslash cases), and the raw tail;
   - the case-insensitive, sorted environment block, where the profile entry wins and `path` replaces `Path`.
 
@@ -48,7 +48,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - an optional `ReleasePseudoConsole`, then a non-blocking `ClosePseudoConsole` on drop.
 
   Unit-test the reader and writer against an anonymous pipe pair. Test the resolution order with a temp directory: a mismatched `conpty.dll` beside the exe is ignored, a stale extraction is rewritten, and a `conpty.dll` in the current directory is never considered. Verify with `cargo test` on Windows.
-- [ ] 2.4 Make `ParsingReader` generic over its reader. Add the Windows `MarkedPty` over `conpty.rs` and remove 1.4's scaffolding. Add Windows e2e cases:
+- [x] 2.4 Make `ParsingReader` generic over its reader. Add the Windows `MarkedPty` over `conpty.rs` and remove 1.4's scaffolding. Add Windows e2e cases:
   - `windows-conpty-host`: a Toolhelp check that the tab's host is the shipped `OpenConsole.exe`;
   - `windows-passthrough`: PowerShell writes OSC 9, OSC 133, an SGR mouse mode and OSC 11, and the notify log, the dump and the reply show them in order;
   - `windows-glyph-width`: PowerShell writes `❤️`, and then e plus U+0301, each at column 0, and `[Console]::CursorLeft` prints 1 for each;
@@ -56,12 +56,12 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - `windows-close-mid-output`: a tab printing in a loop closes at once.
 
   Verify that the cases pass locally (after asking) and in CI, and that the Linux session's `cargo test --locked` and with-xvfb e2e pass.
-- [ ] 2.5 Call `ConptyReparentPseudoConsole` with the window's HWND when a tab's view is placed in a window, and when it moves to another one, with the packaged host only. Verify with a debug log line in a local run (after asking), and with the manual check in 10.3.
-- [ ] 2.6 Document the ConPTY host: in README.md, the fetch script before `cargo build`/`cargo install` and the inbox fallback warning; in CLAUDE.md, the architecture entry for `terminal/conpty.rs`, the resolution order and the drop order. Verify that the README commands work from a clean clone on this machine.
+- [x] 2.5 Call `ConptyReparentPseudoConsole` with the window's HWND when a tab's view is placed in a window, and when it moves to another one, with the packaged host only. Verify with a debug log line in a local run (after asking), and with the manual check in 10.3.
+- [x] 2.6 Document the ConPTY host: in README.md, the fetch script before `cargo build`/`cargo install` and the inbox fallback warning; in CLAUDE.md, the architecture entry for `terminal/conpty.rs`, the resolution order and the drop order. Verify that the README commands work from a clean clone on this machine.
 
 ## 3. Tab titles on Windows
 
-- [ ] 3.1 Write `newest_descendant(rows, root)` (design §4), cfg-free. Unit-test no children, a chain, siblings picking the highest pid, skipping `conhost.exe`/`OpenConsole.exe`, and stripping `.exe`. Wire `process::Snapshot::take()` into the 1 s title poll, once per tick for all tabs. Add the e2e case `windows-title-child`: in `cmd.exe`, `timeout /t 5` titles the tab `timeout`, and afterwards it is `cmd`. Verify with `cargo test` on Windows and Linux, and with the case locally (after asking) and in CI.
+- [ ] 3.1 Write `newest_descendant(rows, root)` (design §4), cfg-free. Unit-test no children, a chain, siblings picking the highest pid, skipping `conhost.exe`/`OpenConsole.exe`, and stripping `.exe`. Wire `process::Snapshot::take()` into the 1 s title poll, once per tick for all tabs. Add the e2e case `windows-title-child`: in `pwsh` (which sets no title, unlike `cmd.exe`), `ping -n 6 127.0.0.1` titles the tab `PING` (its executable name as on disk), and afterwards it no longer is. Verify with `cargo test` on Windows and Linux, and with the case locally (after asking) and in CI.
 
 ## 4. Working directory and PowerShell integration
 
@@ -135,7 +135,7 @@ These are integration checks on real hardware, using the CI MSI artifact. Ask th
   - edge resizing works;
   - tabs, the new-tab button and the chevron still respond to clicks.
 - [ ] 10.3 Behaviour:
-  - `python` from `cmd` titles the tab `python`;
+  - `python` from `pwsh` titles the tab `python` (and stops once it exits), and from `cmd` the tab shows cmd's own title;
   - middle-click pastes the in-app selection without changing the clipboard, and ctrl-shift-c/v use the clipboard;
   - AltGr+7 on a German layout types `{` and doesn't open profile 7;
   - ctrl-clicking `https://example.com/a?b=1&c=2` opens that exact URL;

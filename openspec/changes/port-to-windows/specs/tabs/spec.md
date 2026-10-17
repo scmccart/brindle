@@ -15,8 +15,12 @@ The window title SHALL match the active tab's title.
 - **THEN** within about a second the tab is titled `htop`
 
 #### Scenario: Child process on Windows
-- **WHEN** the user runs `python` from `cmd.exe`, which sets no title, in a Windows tab
-- **THEN** within about a second the tab is titled `python`, and after Python exits it is titled `cmd`
+- **WHEN** the user runs `python` from PowerShell 7, which sets no title, in a Windows tab
+- **THEN** within about a second the tab is titled `python`, and after Python exits it no longer is
+
+#### Scenario: cmd sets its own title
+- **WHEN** the user runs `python` from `cmd.exe`
+- **THEN** the tab shows the title cmd sets (`C:\WINDOWS\system32\cmd.exe - python`), because a program's own title comes first
 
 ### Requirement: Working directory inheritance
 A new tab whose profile sets no working directory SHALL start in the working directory of the active tab's foreground process. On Windows, where another process's working directory can't be read, it SHALL start in the directory the active tab's program last reported, as defined under "Working directory reports" in `shell-integration`, if that directory exists. Otherwise it SHALL start in the home directory.
