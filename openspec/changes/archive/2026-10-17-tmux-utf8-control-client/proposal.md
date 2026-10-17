@@ -25,5 +25,5 @@ None.
 ## Impact
 
 - `src/tmux/mod.rs` (`command_line` and its unit tests).
-- `tests/e2e/`: one new case.
-- `scripts/with-xvfb` can keep `LC_ALL=C.UTF-8`, which still keeps runs consistent, but the suite no longer depends on it for tmux.
+- `tests/e2e/`: one new case, `Run::env_remove`, and `-u` for the suite's raw control client (`ControlClient`), so the `tmux-*` cases don't depend on the locale either.
+- `scripts/with-xvfb` can keep `LC_ALL=C.UTF-8`, which still keeps runs consistent, but the suite no longer depends on it for tmux. Its comment and `CLAUDE.md` stop giving tmux as the reason.

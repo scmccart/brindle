@@ -9,7 +9,8 @@ use crate::{Ctx, Result};
 
 pub use crate::common::tmux::{TmuxServer, trim_screen};
 
-/// A raw `tmux -C` client, recording everything tmux sends.
+/// A raw `tmux -u -C` client, recording everything tmux sends. `-u` marks
+/// it UTF-8 whatever the locale, as Brindle's client is.
 pub struct ControlClient {
     child: Child,
     stdin: ChildStdin,
@@ -23,7 +24,7 @@ impl ControlClient {
     pub fn attach(server: &TmuxServer, cols: u16, rows: u16) -> Result<ControlClient> {
         let mut child = server
             .command()
-            .args(["-C", "attach", "-t", "e2e"])
+            .args(["-u", "-C", "attach", "-t", "e2e"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

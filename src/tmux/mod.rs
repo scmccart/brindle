@@ -404,9 +404,12 @@ fn tmux_program(profile: &Profile) -> String {
     profile.command.clone().unwrap_or_else(|| "tmux".into())
 }
 
-/// The tmux command line for attaching to (or creating) a session.
+/// The tmux command line for attaching to (or creating) a session. `-u`
+/// marks the client UTF-8 whatever the locale: otherwise tmux replaces the
+/// tabs in our `-F` formats, and non-ASCII text, with `_`.
 pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>) -> (String, Vec<String>) {
-    let mut args = profile.tmux_args.clone();
+    let mut args = vec!["-u".to_string()];
+    args.extend(profile.tmux_args.iter().cloned());
     args.extend(["-C".into(), "new-session".into()]);
     match spec {
         AttachSpec::Named => {
@@ -1676,16 +1679,16 @@ mod tests {
         };
         let (program, args) = command_line(&profile, &AttachSpec::Named, Some(&PathBuf::from("/tmp")));
         assert_eq!(program, "tmux");
-        assert_eq!(args, ["-L", "x", "-C", "new-session", "-A", "-s", "work", "-c", "/tmp"]);
+        assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-A", "-s", "work", "-c", "/tmp"]);
     }
 
     #[test]
     fn command_line_for_new_sessions() {
         let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
         let named = AttachSpec::New(Some("logs".into()));
-        assert_eq!(command_line(&profile, &named, None).1, ["-L", "x", "-C", "new-session", "-s", "logs"]);
+        assert_eq!(command_line(&profile, &named, None).1, ["-u", "-L", "x", "-C", "new-session", "-s", "logs"]);
         let (_, args) = command_line(&profile, &AttachSpec::New(None), Some(&PathBuf::from("/tmp")));
-        assert_eq!(args, ["-L", "x", "-C", "new-session", "-c", "/tmp"]);
+        assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-c", "/tmp"]);
     }
 
     #[test]
