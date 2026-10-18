@@ -42,6 +42,8 @@ See proposal.md for the motivation. These facts were checked on this Windows 11 
   - The `windows-manifest` feature (a default) embeds PerMonitorV2 DPI awareness with `embed-resource`.
   - The window class loads icon resource 1 from the `.exe`.
   - `window_decorations()` returns `Server`. With `appears_transparent` set, `WM_NCHITTEST` maps `WindowControlArea::{Drag,Min,Max,Close}` to the native caption hit codes.
+  - A press on the caption or a caption button reaches GPUI's listeners first, as a mouse-down at that point. Windows drags, double-clicks, resizes or presses the button only when no listener stops propagation or prevents default. GPUI's own focus transfer prevents default whenever a focusable element is under the mouse. So the tab strip occludes the focusable workspace behind it, and the caption buttons get no handlers on Windows.
+  - `zoom()` only ever maximizes, and `start_window_move` and `show_window_menu` do nothing.
   - `write_to_primary`/`read_from_primary` exist only on Linux and FreeBSD.
   - `KeyDownEvent` carries only a `Keystroke` (key name, `key_char`, modifiers), with no virtual-key code or scan code.
   - It sets no AppUserModelID.
@@ -249,9 +251,9 @@ The three call sites go through it: OSC 52 `Selection` in both directions, `fini
   - An MSI built with WiX: per-machine installs, its own shortcut and Group Policy deployment, none of which are needed yet. WiX v6 and later also carry the Open Source Maintenance Fee EULA. It can be added later around the same exe.
   - Inno Setup, which needs wrappers for enterprise deploys.
   - MSIX, where signing is mandatory, plus filesystem virtualisation inside a terminal.
-- **`--install-desktop`:** it finds `FOLDERID_Programs`, then creates `Brindle.lnk` through `IShellLinkW`, with the path and icon set to `current_exe`, `IPropertyStore` setting `PKEY_AppUserModel_ID`, and `IPersistFile::Save`.
+- **`--install-desktop`:** it finds `FOLDERID_Programs`, then creates `Brindle.lnk` through `IShellLinkW`, with the path set to `current_exe` and the icon to the file it resolves to, `IPropertyStore` setting `PKEY_AppUserModel_ID`, and `IPersistFile::Save`.
 - **`--uninstall-desktop`:** it deletes the shortcut and the HKCU AUMID key, and treats both being missing as success.
-- **The shortcut and WinGet:** WinGet doesn't create Start Menu shortcuts for portable packages, so the README points to `brindle --install-desktop`, and to `brindle --uninstall-desktop` before `winget uninstall`, which doesn't know about the shortcut. The shortcut has to keep working across `winget upgrade`. Run as the installed command, `current_exe` is WinGet's `%LOCALAPPDATA%\Microsoft\WinGet\Links\brindle.exe` symlink, which an upgrade re-points at the new exe, so the shortcut follows it (checked with a local manifest, 0.1.0 to 0.1.1).
+- **The shortcut and WinGet:** WinGet doesn't create Start Menu shortcuts for portable packages, so the README points to `brindle --install-desktop`, and to `brindle --uninstall-desktop` before `winget uninstall`, which doesn't know about the shortcut. The shortcut has to keep working across `winget upgrade`. Run as the installed command, `current_exe` is WinGet's `%LOCALAPPDATA%\Microsoft\WinGet\Links\brindle.exe` symlink, which an upgrade re-points at the new exe, so the shortcut follows it (checked with a local manifest, 0.1.0 to 0.1.1). The shell reads no icon through that symlink: a shortcut whose icon location is the link shows the blank one, and the taskbar, which looks up the shortcut carrying the windows' AUMID, showed none either. The icon location is therefore the exe in WinGet's package directory, whose path doesn't change across upgrades.
 - **`--prefix`:** rejected with exit status 2, with a message pointing to WinGet. The argument handling is cfg-free and unit-tested.
 
 ### 14. Verification

@@ -33,6 +33,8 @@ The Windows port (OpenSpec change `port-to-windows`) builds on `x86_64-pc-window
   - `brindle.exe` is a GUI program: PowerShell doesn't wait for it unless its output is piped, or it is run with `Start-Process -Wait`.
   - Elevated PowerShell (as on CI) sets its own console title.
   - GPUI answers `WM_NCHITTEST` for the last mouse position, so probes send a `WM_MOUSEMOVE` to the window first. That is a message, not input.
+  - Windows acts on a caption press (drag, double-click, the caption buttons) only when GPUI leaves it unhandled, and GPUI's focus transfer counts as handling it. So the tab strip occludes the focusable workspace, and the caption buttons have no handlers there.
+  - The shell reads no icon through a symlink, such as WinGet's `Links\brindle.exe`, so the shortcut's icon location is the resolved exe.
   - Test processes aren't DPI-aware, so Windows scales down the window rectangles they read. Probes call `SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)` first to work in Brindle's physical pixels.
   - Pure helpers that read Windows paths and are tested on Linux can't use `Path` (it splits only on `/` there); see `cmdline::program_stem`.
   - Commit subjects must start lowercase, so not with "Windows" or "PowerShell".
