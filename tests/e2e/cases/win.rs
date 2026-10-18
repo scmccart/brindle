@@ -402,21 +402,31 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
         );
         let label = shell.trim_end_matches(".exe");
-        // New tab: inherits the reported directory.
+        // New tab: inherits the reported directory. The steps wait for the
+        // prompts they need, since Windows PowerShell can take longer than a
+        // step to start and load the script, and the directory is reported
+        // with the prompt after `cd` (`cddone` is split so the typed line
+        // doesn't match).
         let ran = run_with(
             ctx,
             &config,
             label,
             &[
+                "--wait-for",
+                "MYPROMPT>",
                 "--send",
-                "cd C:\\Windows\r",
+                "cd C:\\Windows; 'cd' + 'done'\r",
+                "--wait-for",
+                "cddone\\nMYPROMPT>",
                 "--action",
                 "new_tab",
+                "--wait-for",
+                "MYPROMPT>",
                 "--send",
                 "\"dir=$PWD\"\r",
             ],
             &[],
-            9.0,
+            15.0,
             None,
         )?;
         let text = screen(&ran.dump);
@@ -424,7 +434,15 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         ensure!(text.contains("MYPROMPT> "), "{shell}: the user's prompt is gone:\n{text}");
         ensure!(text.contains("dir=C:\\Windows"), "{shell}: the new tab's directory:\n{text}");
         // Restore: the session written on quit reopens both tabs in C:\Windows.
-        let restored = run_with(ctx, &config, &format!("{label}-restored"), &["--send", "\"dir=$PWD\"\r"], &[], 5.0, None)?;
+        let restored = run_with(
+            ctx,
+            &config,
+            &format!("{label}-restored"),
+            &["--wait-for", "MYPROMPT>", "--send", "\"dir=$PWD\"\r"],
+            &[],
+            8.0,
+            None,
+        )?;
         let text = screen(&restored.dump);
         ensure!(text.contains("dir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
         std::fs::remove_dir_all(ctx.dir.join("state")).ok();
