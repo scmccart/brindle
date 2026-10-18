@@ -20,4 +20,4 @@
 
 - [x] 4.1 Run `cargo test` and the whole e2e suite under `scripts/with-xvfb` (no windows on the desktop). Verify everything passes, and report any failures with their `target/tmp/e2e/<case>/` directory
 - [x] 4.2 Run `openspec validate tmux-session-other-process --strict` and verify it reports the change as valid
-- [ ] 4.3 Manual check for the user, on their desktop: launch Brindle twice from the launcher with the default `tmux` profile. The second window asks instead of mirroring the first, and escape closes it
+- [x] 4.3 Manual check for the user, on their desktop: launch Brindle twice from the launcher with the default `tmux` profile. The second window asks instead of mirroring the first, and escape closes it
