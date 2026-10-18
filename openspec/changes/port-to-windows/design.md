@@ -148,7 +148,8 @@ Brindle implements `EventedReadWrite + EventedPty + OnResize` itself and hands t
   1. walks down from the tab's child pid, picking the highest pid at each level, since pids only approximate creation order;
   2. skips `conhost.exe` and `OpenConsole.exe`;
   3. strips `.exe`.
-- An OSC title still takes precedence, and most Windows TUIs and PowerShell set one.
+- An OSC title still takes precedence, and most Windows TUIs set one.
+- **The console's default title.** The console host starts every program with its full path as its title (`C:\Program Files\PowerShell\7\pwsh.exe`), and ConPTY reports it like any other, so it would always win over the process name: the tab showed the path, and `python` run from it never named the tab. A pure `cmdline::console_title` treats a title that is just an absolute `.exe` path as no title, and in a title that starts with one followed by ` - ` (cmd's `C:\WINDOWS\system32\cmd.exe - python`) replaces the path with the program's stem (`cmd - python`). Any other title, including elevated PowerShell's `Administrator: …`, is shown as it is.
 
 ### 5. Working directory from OSC 7 and OSC 9;9
 

@@ -374,16 +374,17 @@ fn glyph_width(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// With no title set (elevated PowerShell sets one, so it is cleared first),
-/// the tab is named after the newest process under its program: `PING`, as
-/// `PING.EXE` is named on disk. Once ping exits, the name is gone.
+/// Under the console's default title, the program's path, the tab is named
+/// after the newest process under its program: `PING`, as `PING.EXE` is
+/// named on disk, then `pwsh` once ping exits. Elevated PowerShell (as on
+/// CI) sets a title of its own, so the default is set first.
 fn title_child(ctx: &Ctx) -> Result<Outcome> {
     let title = |dump: &Dump| dump.tabs.first().map(|(t, _)| t.clone()).unwrap_or_default();
-    let ping = |count: u32| format!("[Console]::Title = ''; ping -n {count} 127.0.0.1\r");
+    let ping = |count: u32| format!("[Console]::Title = (Get-Process -Id $PID).Path; ping -n {count} 127.0.0.1\r");
     let during = run(ctx, "during", &["-p", "pwsh", "--send", &ping(8)], &[], 4.0, None)?;
     ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
     let after = run(ctx, "after", &["-p", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
-    ensure!(!title(&after.dump).is_empty() && title(&after.dump) != "PING", "title after ping: {:?}", title(&after.dump));
+    ensure!(title(&after.dump) == "pwsh", "title after ping: {:?}", title(&after.dump));
     Ok(Outcome::Pass)
 }
 

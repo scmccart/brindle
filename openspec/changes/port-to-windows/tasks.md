@@ -139,7 +139,7 @@ These are integration checks on real hardware, using the CI zip artifact. Ask th
   - edge resizing works;
   - tabs, the new-tab button and the chevron still respond to clicks.
 - [ ] 10.3 Behaviour:
-  - `python` from `pwsh` titles the tab `python` (and stops once it exits), and from `cmd` the tab shows cmd's own title;
+  - a `pwsh` tab is titled `pwsh`, `python` run from it titles the tab `python` (and `pwsh` again once it exits), and from `cmd` the tab shows `cmd - python`;
   - middle-click pastes the in-app selection without changing the clipboard, and ctrl-shift-c/v use the clipboard;
   - AltGr+7 on a German layout types `{` and doesn't open profile 7;
   - ctrl-clicking `https://example.com/a?b=1&c=2` opens that exact URL;

@@ -4,7 +4,7 @@
 
 ### Requirement: Tab titles
 A tab's title SHALL be:
-1. the title the program set (OSC 0/2), when there is one;
+1. the title the program set (OSC 0/2), when there is one. On Windows the console host starts every program with the program's full path as its title, which counts as no title, and a title that starts with that path shows the program's name without directory or `.exe` in its place;
 2. otherwise the name of the terminal's foreground process. Windows has no foreground process group, so there this is the most recently started descendant of the tab's program, or the program itself when it has none, without the `.exe` suffix;
 3. otherwise the profile name.
 
@@ -14,13 +14,17 @@ The window title SHALL match the active tab's title.
 - **WHEN** the user starts `htop` in a tab whose program sets no title
 - **THEN** within about a second the tab is titled `htop`
 
+#### Scenario: Console's default title on Windows
+- **WHEN** a Windows tab runs PowerShell 7, whose title is the console's default `C:\Program Files\PowerShell\7\pwsh.exe`, at its prompt
+- **THEN** the tab is titled `pwsh`
+
 #### Scenario: Child process on Windows
-- **WHEN** the user runs `python` from PowerShell 7, which sets no title, in a Windows tab
-- **THEN** within about a second the tab is titled `python`, and after Python exits it no longer is
+- **WHEN** the user runs `python` from PowerShell 7, which sets no title of its own, in a Windows tab
+- **THEN** within about a second the tab is titled `python`, and after Python exits it is titled `pwsh` again
 
 #### Scenario: cmd sets its own title
-- **WHEN** the user runs `python` from `cmd.exe`
-- **THEN** the tab shows the title cmd sets (`C:\WINDOWS\system32\cmd.exe - python`), because a program's own title comes first
+- **WHEN** the user runs `python` from `cmd.exe`, which sets the title `C:\WINDOWS\system32\cmd.exe - python`
+- **THEN** the tab is titled `cmd - python`, because a program's own title comes first
 
 ### Requirement: Working directory inheritance
 A new tab whose profile sets no working directory SHALL start in the working directory of the active tab's foreground process. On Windows, where another process's working directory can't be read, it SHALL start in the directory the active tab's program last reported, as defined under "Working directory reports" in `shell-integration`, if that directory exists. Otherwise it SHALL start in the home directory.
