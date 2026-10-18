@@ -7,6 +7,7 @@ mod dump;
 mod geometry;
 mod input;
 mod links;
+mod multi_window;
 mod restore;
 mod notify;
 mod palette;
@@ -88,6 +89,17 @@ pub fn all() -> Vec<Case> {
         display("tmux-new-session", windows::new_session),
         display("tmux-new-session-duplicate", windows::new_session_duplicate),
         display("restore-dedupe", windows::restore_dedupe),
+        display("multi-window-local-tabs", multi_window::local_tabs),
+        display("multi-window-tmux-commands", multi_window::tmux_commands),
+        display("multi-process-one-client", multi_window::second_process_one_client),
+        display("multi-process-independent", multi_window::second_process_independent),
+        display("multi-process-local", multi_window::second_process_local),
+        display("multi-process-dismiss", multi_window::second_process_dismiss),
+        display("multi-process-new-session", multi_window::second_process_new_session),
+        display("multi-process-shortcut", multi_window::second_process_shortcut),
+        display("multi-process-new-window", multi_window::second_process_new_window),
+        display("multi-process-other-client", multi_window::other_client),
+        display("multi-process-session-ended", multi_window::second_process_session_ended),
         display("input-palette", input::palette),
         display("input-palette-run", input::palette_run),
         display("input-select-all", input::select_all),

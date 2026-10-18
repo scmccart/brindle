@@ -182,6 +182,9 @@ enum Target {
 enum SessionLocation {
     Here(Entity<TmuxSession>),
     Elsewhere(WindowHandle<Workspace>, Entity<TmuxSession>),
+    /// Another Brindle process shows the session with this name; it can't
+    /// be gone to from here.
+    OtherBrindle(String),
 }
 
 /// A row of the palette that asks about a session open elsewhere.
@@ -540,7 +543,7 @@ impl Workspace {
                     self.show_session(&session, window, cx);
                     return None;
                 }
-                Some(SessionLocation::Elsewhere(..)) => {
+                Some(SessionLocation::Elsewhere(..) | SessionLocation::OtherBrindle(_)) => {
                     log::info!("tmux session {:?} is shown in another window; not attaching it again", profile.tmux_session_name());
                     return None;
                 }
@@ -626,6 +629,7 @@ impl Workspace {
     fn go_to_session(&mut self, location: SessionLocation, window: &mut Window, cx: &mut Context<Self>) {
         match location {
             SessionLocation::Here(session) => self.show_session(&session, window, cx),
+            SessionLocation::OtherBrindle(_) => {}
             SessionLocation::Elsewhere(handle, session) => {
                 // Asked for while this window still has focus.
                 let token = notify::activation::request_token(window);
@@ -665,15 +669,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (SessionLocation::Here(session) | SessionLocation::Elsewhere(_, session)) = &location;
-        let name = session.read(cx).session_name.clone().unwrap_or_default();
+        let name = match &location {
+            SessionLocation::Here(session) | SessionLocation::Elsewhere(_, session) => {
+                session.read(cx).session_name.clone().unwrap_or_default()
+            }
+            SessionLocation::OtherBrindle(name) => name.clone(),
+        };
         let open = self.open_sessions(window, cx);
-        let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &name, &open, target)
+        let go_to = !matches!(location, SessionLocation::OtherBrindle(_));
+        let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &name, &open, target, go_to)
             .into_iter()
             .unzip();
         let placeholder = match location {
             SessionLocation::Here(_) => format!("tmux session \"{name}\" is open in this window"),
             SessionLocation::Elsewhere(..) => format!("tmux session \"{name}\" is open in another window"),
+            SessionLocation::OtherBrindle(_) => format!("tmux session \"{name}\" is open in another Brindle"),
         };
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx));
@@ -855,6 +865,22 @@ impl Workspace {
                 self.open_message_tab(profile, &text, window, cx);
                 self.finish_replacing(&session, window, cx);
             }
+            TmuxEvent::ShownByAnotherBrindle(name) => {
+                self.tmux_sessions.retain(|(s, _)| *s != session);
+                self.forget_restore(&session);
+                self.creating.remove(&session.entity_id());
+                // An ended session it was to replace stays until the user
+                // picks something (see `orphaned_sessions`).
+                self.replacing.remove(&session.entity_id());
+                let profile = session.read(cx).profile.name.clone();
+                match Self::settings(cx).profiles.iter().position(|p| p.name == profile) {
+                    Some(ix) => {
+                        let location = SessionLocation::OtherBrindle(name.clone());
+                        self.ask_session_open(ix, location, Target::Tab, window, cx);
+                    }
+                    None => self.close_orphans(window, cx),
+                }
+            }
             TmuxEvent::Detached(reason) => {
                 log::info!("tmux session detached: {reason}");
                 self.creating.remove(&session.entity_id());
@@ -927,6 +953,60 @@ impl Workspace {
     fn forget_restore(&mut self, session: &Entity<TmuxSession>) {
         self.quiet_sessions.remove(&session.entity_id());
         self.anchors.remove(&session.entity_id());
+    }
+
+    /// Sessions whose tabs are shown but which are no longer attached, and
+    /// that no attaching session waits to replace: a session that ended,
+    /// whose replacement another Brindle turned out to show.
+    fn orphaned_sessions(&self) -> Vec<Entity<TmuxSession>> {
+        let mut orphans: Vec<Entity<TmuxSession>> = Vec::new();
+        for tab in &self.tabs {
+            if let TabContent::Tmux { session, .. } = &tab.content
+                && !self.tmux_sessions.iter().any(|(s, _)| s == session)
+                && !self.replacing.values().any(|ended| ended == session)
+                && !orphans.contains(session)
+            {
+                orphans.push(session.clone());
+            }
+        }
+        orphans
+    }
+
+    /// Closes the tabs of [`orphaned_sessions`], then the window if nothing
+    /// is left in it or on its way (a second Brindle's window that asked
+    /// about a session, and was dismissed).
+    fn close_orphans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for session in self.orphaned_sessions() {
+            self.remove_session_tabs(&session, window, cx);
+            if self.tabs.is_empty() {
+                return;
+            }
+        }
+        if self.tabs.is_empty() && self.tmux_sessions.is_empty() {
+            let id = self.window_id;
+            cx.update_global(|store: &mut SessionStore, _| store.forget(id));
+            window.remove_window();
+        }
+    }
+
+    /// Opens profile `ix` in a tab, in place of any [`orphaned_sessions`]:
+    /// their tabs close once it shows up.
+    fn launch_replacing_orphans(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let orphan = self.orphaned_sessions().into_iter().next();
+        let profile = Self::settings(cx).profiles.get(ix).cloned();
+        match profile {
+            Some(profile) if profile.tmux == TmuxMode::Control => {
+                if let Some(new) = self.attach_tmux(profile, None, window, cx) {
+                    if let Some(orphan) = orphan {
+                        self.replacing.insert(new.entity_id(), orphan);
+                    }
+                    return;
+                }
+            }
+            Some(_) => self.launch(LaunchRequest::profile(ix), window, cx),
+            None => {}
+        }
+        self.close_orphans(window, cx);
     }
 
     fn on_terminal_event(
@@ -1146,7 +1226,7 @@ impl Workspace {
                 let state = match shown {
                     Some(SessionLocation::Here(_)) => " · open in this window",
                     Some(SessionLocation::Elsewhere(..)) => " · in another window (switches)",
-                    None => "",
+                    Some(SessionLocation::OtherBrindle(_)) | None => "",
                 };
                 PaletteRow {
                     label: profile.name.clone().into(),
@@ -1226,17 +1306,26 @@ impl Workspace {
     }
 
     /// Escape (or a click outside) on a palette. After a session ended,
-    /// that closes the window.
+    /// that closes the window. After asking about another Brindle's session
+    /// (or a prompt that followed), tabs nothing replaces close, and so does
+    /// a window left without tabs.
     fn palette_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ended = match &self.overlay {
+        let (ended, orphans) = match &self.overlay {
             Some(Overlay::Palette(OpenPalette { kind: PaletteKind::SessionEnded { session }, .. })) => {
-                Some(session.clone())
+                (Some(session.clone()), false)
             }
-            _ => None,
+            Some(Overlay::Palette(OpenPalette {
+                kind: PaletteKind::SessionOpenElsewhere { .. } | PaletteKind::Prompt,
+                ..
+            })) => (None, true),
+            _ => (None, false),
         };
         self.dismiss_overlay(window, cx);
         if let Some(session) = ended {
             self.remove_session_tabs(&session, window, cx);
+        }
+        if orphans {
+            self.close_orphans(window, cx);
         }
     }
 
@@ -1266,7 +1355,7 @@ impl Workspace {
                         }
                     }
                     Some(&OpenChoice::Profile(other)) => match target {
-                        Target::Tab => self.launch(LaunchRequest::profile(other), window, cx),
+                        Target::Tab => self.launch_replacing_orphans(other, window, cx),
                         Target::Window => {
                             crate::open_window(Launch::Request(LaunchRequest::profile(other)), cx);
                         }
@@ -1805,15 +1894,17 @@ fn session_ended_rows(profiles: &[Profile], open: &[SessionKey]) -> Vec<PaletteR
         .collect()
 }
 
-/// Rows for a profile whose session another window shows: go there, make
-/// a new session instead, or open another profile. Profiles that would ask
-/// the same question again are left out.
+/// Rows for a profile whose session another window shows: go there (when
+/// `go_to`: not for another Brindle's), make a new session instead, or open
+/// another profile. Profiles that would ask the same question again are
+/// left out.
 fn session_open_rows(
     profiles: &[Profile],
     picked: usize,
     session: &str,
     open: &[SessionKey],
     target: Target,
+    go_to: bool,
 ) -> Vec<(PaletteRow, OpenChoice)> {
     let row = |label: String, detail: String| PaletteRow { label: label.into(), detail: Some(detail.into()), shortcut: None };
     let verb = match target {
@@ -1824,6 +1915,9 @@ fn session_open_rows(
         (PaletteRow { label: format!("Go to {session}").into(), detail: None, shortcut: None }, OpenChoice::GoTo),
         (row("New tmux session…".into(), format!("with profile {}", profiles[picked].name)), OpenChoice::NewSession),
     ];
+    if !go_to {
+        rows.remove(0);
+    }
     rows.extend(
         profiles
             .iter()
@@ -2058,7 +2152,7 @@ mod tests {
     fn session_open_rows_offer_going_there_first() {
         let config = open_rows_config();
         let open = [SessionKey::for_profile(&config.profiles[0]).unwrap()];
-        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Tab);
+        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Tab, true);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
         assert_eq!(labels, ["Go to main", "New tmux session…", "New tab: Shell", "New tab: work", "New tab: classic"]);
         let choices: Vec<OpenChoice> = rows.into_iter().map(|(_, c)| c).collect();
@@ -2069,13 +2163,23 @@ mod tests {
     }
 
     #[test]
+    fn session_open_rows_for_another_brindle_cannot_go_there() {
+        let config = open_rows_config();
+        let open = [SessionKey::for_profile(&config.profiles[2]).unwrap()];
+        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Tab, false);
+        let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
+        assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: classic"]);
+        assert_eq!(rows[0].1, OpenChoice::NewSession);
+    }
+
+    #[test]
     fn session_open_rows_for_a_new_window_skip_open_sessions() {
         let config = open_rows_config();
         let open = [
             SessionKey::for_profile(&config.profiles[0]).unwrap(),
             SessionKey::for_profile(&config.profiles[2]).unwrap(),
         ];
-        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Window);
+        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Window, true);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
         assert_eq!(labels, ["Go to main", "New tmux session…", "New window: Shell", "New window: classic"]);
     }
