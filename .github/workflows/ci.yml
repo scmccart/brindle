@@ -177,6 +177,15 @@ jobs:
           if ($id -ne 'Brindle.Terminal') { throw "AppUserModelID is '$id'" }
           $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
           if ($target -ne $exe) { throw "target is '$target'" }
+          # Through a symlink, as WinGet runs it: the shortcut starts the
+          # link, and takes its icon from the exe, since the shell reads no
+          # icon through a link.
+          New-Item -ItemType Directory -Force target/links | Out-Null
+          $link = (New-Item -ItemType SymbolicLink -Force -Path target/links/brindle.exe -Target $exe).FullName
+          $code = (Start-Process $link -ArgumentList '--install-desktop' -Wait -PassThru -NoNewWindow).ExitCode
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          if ($code -ne 0 -or $shortcut.TargetPath -ne $link) { throw "through a link: exit $code, target '$($shortcut.TargetPath)'" }
+          if ($shortcut.IconLocation -ne "$exe,0") { throw "through a link: icon '$($shortcut.IconLocation)'" }
           if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
           if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
           if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }

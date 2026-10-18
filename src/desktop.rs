@@ -394,15 +394,28 @@ mod start_menu {
         }
     }
 
+    /// The file behind `exe`, through any symlinks, without the `\\?\` that
+    /// `canonicalize` adds.
+    fn resolved(exe: &Path) -> PathBuf {
+        let Ok(path) = std::fs::canonicalize(exe) else { return exe.to_path_buf() };
+        match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(unc) if unc.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &unc[4..])),
+            Some(disk) => PathBuf::from(disk),
+            None => path,
+        }
+    }
+
     pub fn install(exe: &Path) -> Result<()> {
         let path = shortcut_path()?;
         // SAFETY: COM calls on objects created here, on this thread.
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok();
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).context("creating a shortcut")?;
-            let target = HSTRING::from(exe.as_os_str());
-            link.SetPath(&target)?;
-            link.SetIconLocation(&target, 0)?;
+            // The shortcut starts `exe` as given, so it follows WinGet's
+            // symlink across upgrades, but the shell reads no icon through a
+            // symlink, so the icon comes from the file it resolves to.
+            link.SetPath(&HSTRING::from(exe.as_os_str()))?;
+            link.SetIconLocation(&HSTRING::from(resolved(exe).as_os_str()), 0)?;
             link.SetDescription(&HSTRING::from("Brindle terminal"))?;
             // The same identity as Brindle's windows and toasts, so the
             // taskbar groups them under this shortcut.
