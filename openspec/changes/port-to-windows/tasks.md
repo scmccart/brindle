@@ -22,7 +22,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
   Verify `cargo test` on Windows for the touched modules, and the Linux session's `cargo test --locked` (the lock tests included).
 - [x] 1.4 Temporary scaffolding, removed in 2.4: on Windows, spawn local tabs through alacritty's `tty::Pty` (`escape_args: true`, the pid from `child_watcher().pid()`), without `MarkedPty`. Verify that `cargo build` and `cargo test` pass on Windows.
-- [ ] 1.5 Switch to the GUI subsystem, attaching to the parent console only around output (design §11). Verify:
+- [x] 1.5 Switch to the GUI subsystem, attaching to the parent console only around output (design §11). Verify:
   - `brindle --version` and `brindle --list-actions` print in PowerShell inside Windows Terminal;
   - `brindle --bogus` prints usage with exit status 2;
   - after asking the user, `brindle --send "echo hi\r" --dump-screen-after 3 > dump.txt` produces a dump containing `hi`, and no console window opens;
@@ -139,7 +139,7 @@ These are integration checks on real hardware, using the CI zip artifact. Ask th
   - edge resizing works;
   - tabs, the new-tab button and the chevron still respond to clicks.
 - [ ] 10.3 Behaviour:
-  - a `pwsh` tab is titled `pwsh`, `python` run from it titles the tab `python` (and `pwsh` again once it exits), and from `cmd` the tab shows `cmd - python`;
+  - a `pwsh` tab is titled `pwsh`, `python` run from it titles the tab `python` (and `pwsh` again once it exits), and from `cmd` (on its own or started from `pwsh`) the tab is titled `python` too;
   - middle-click pastes the in-app selection without changing the clipboard, and ctrl-shift-c/v use the clipboard;
   - AltGr+7 on a German layout types `{` and doesn't open profile 7;
   - ctrl-clicking `https://example.com/a?b=1&c=2` opens that exact URL;
