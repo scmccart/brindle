@@ -76,6 +76,8 @@ DEBUGGING:
                                  (e.g. ctrl-3,0); in-process, not OS input
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
+        --wait-for <TEXT>        Hold the later steps until the active terminal shows
+                                 TEXT (\\n = a line break), for at most 30s
                                  Steps run in order, 1s apart
         --step-interval <S>      Run the steps S seconds apart instead (default 1)
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
@@ -101,14 +103,21 @@ enum Step {
     /// `--hover` / `--click`, or the reason the position didn't parse.
     Pointer(Result<terminal_view::PointerStep, String>),
     Find(String),
+    /// `--wait-for`: the text the active terminal must show before the
+    /// steps after it run.
+    WaitFor(String),
 }
+
+/// How long a `--wait-for` step waits before giving up.
+const WAIT_FOR_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Default, Debug)]
 struct Args {
     command: Option<(String, Vec<String>)>,
     profile: Option<String>,
     cwd: Option<PathBuf>,
-    /// `--send` / `--action` / `--find` steps, run in order one second apart.
+    /// `--send` / `--action` / `--find` / `--wait-for` steps, run in order one
+    /// second apart.
     steps: Vec<Step>,
     /// `--step-interval`: the steps' spacing in seconds, when not one.
     step_interval: Option<f64>,
@@ -197,6 +206,7 @@ fn parse_args() -> Args {
                 args.steps.push(Step::Pointer(terminal_view::PointerStep::parse(&pos, click)));
             }
             "--find" => args.steps.extend(it.next().map(Step::Find)),
+            "--wait-for" => args.steps.extend(it.next().map(|s| Step::WaitFor(unescape(&s)))),
             "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
                 _ => usage_error("--step-interval needs a positive number of seconds"),
@@ -502,6 +512,10 @@ fn main() {
             cx.background_executor().timer(interval / 2).await;
             for step in steps {
                 cx.background_executor().timer(interval).await;
+                if let Step::WaitFor(text) = &step {
+                    wait_for_text(window, text, cx).await;
+                    continue;
+                }
                 window
                     .update(cx, |ws, window, cx| match &step {
                         Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
@@ -512,6 +526,7 @@ fn main() {
                         },
                         Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
                         Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
+                        Step::WaitFor(_) => {}
                     })
                     .ok();
             }
@@ -541,6 +556,24 @@ fn main() {
             .detach();
         }
     });
+}
+
+/// `--wait-for`: polls the active terminal's screen until it shows `text`,
+/// for at most [`WAIT_FOR_LIMIT`].
+async fn wait_for_text(window: gpui::WindowHandle<Workspace>, text: &str, cx: &mut gpui::AsyncApp) {
+    let deadline = std::time::Instant::now() + WAIT_FOR_LIMIT;
+    loop {
+        let shown = window.update(cx, |ws, _, cx| ws.active_screen_text(cx).is_some_and(|screen| screen.contains(text)));
+        match shown {
+            // A closed window has nothing to wait for.
+            Ok(true) | Err(_) => return,
+            Ok(false) if std::time::Instant::now() >= deadline => {
+                log::warn!("--wait-for: {text:?} didn't appear within {}s", WAIT_FOR_LIMIT.as_secs());
+                return;
+            }
+            Ok(false) => cx.background_executor().timer(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// `--latency-bench`: types `samples` keystrokes (after a warm-up) into the

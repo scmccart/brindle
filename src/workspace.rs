@@ -1539,6 +1539,11 @@ impl Workspace {
         self.tabs.iter().map(|t| t.title.to_string()).collect()
     }
 
+    /// The active terminal's visible screen text, for `--wait-for`.
+    pub fn active_screen_text(&self, cx: &App) -> Option<String> {
+        Some(self.tabs.get(self.active)?.active_terminal(cx)?.read(cx).screen_text())
+    }
+
     pub fn dump_active_screen(&self, window: &Window, cx: &App) -> String {
         let scale = window.scale_factor();
         let mut out = String::new();
