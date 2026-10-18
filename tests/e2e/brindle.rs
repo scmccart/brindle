@@ -134,6 +134,8 @@ pub struct Run<'a> {
     top: String,
     /// Brindle should quit by itself (its window closed) before the dump.
     expect_exit: bool,
+    /// The window has no tabs at the dump, only a palette.
+    without_tabs: bool,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     env_remove: Vec<String>,
@@ -163,6 +165,7 @@ impl<'a> Run<'a> {
             extra_config: String::new(),
             top: String::new(),
             expect_exit: false,
+            without_tabs: false,
             steps: Vec::new(),
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -252,6 +255,13 @@ impl<'a> Run<'a> {
     /// returned dump is empty.
     pub fn expect_exit(mut self) -> Self {
         self.expect_exit = true;
+        self
+    }
+
+    /// Expects the dumped window to have no tabs, only an open palette, so
+    /// the dump has no screen.
+    pub fn without_tabs(mut self) -> Self {
+        self.without_tabs = true;
         self
     }
 
@@ -420,7 +430,15 @@ impl<'a> Run<'a> {
             ensure!(status.success(), "Brindle exited with {status}; see {}.log", self.label);
             return Ok(Output { dump, image });
         }
-        ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
+        if self.without_tabs {
+            ensure!(
+                dump.tabs.is_empty() && !dump.palette.is_empty(),
+                "expected a palette and no tabs; see {}.dump",
+                self.label
+            );
+        } else {
+            ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
+        }
         Ok(Output { dump, image })
     }
 }
