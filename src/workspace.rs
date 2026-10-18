@@ -86,8 +86,8 @@ impl Tab {
     }
 
     /// Recomputes the title: the program's OSC title, else the foreground
-    /// process name, else the profile name. On Windows the console's default
-    /// title, the program's path, counts as none (`cmdline::console_title`).
+    /// process name, else the profile name. On Windows a title the console
+    /// built from a program's path counts as none (`cmdline::is_console_title`).
     /// Returns whether it changed.
     /// `snapshot` is the processes running, for the foreground name, taken
     /// only when a title needs it (a program's own title, which can change
@@ -96,11 +96,11 @@ impl Tab {
         let title: SharedString = match &self.content {
             TabContent::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
-                let own = terminal.title().filter(|t| !t.trim().is_empty()).and_then(|title| {
-                    if cfg!(windows) { crate::terminal::cmdline::console_title(title) } else { Some(title.to_string()) }
+                let own = terminal.title().filter(|t| {
+                    !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t))
                 });
                 match own {
-                    Some(title) => title,
+                    Some(title) => title.to_string(),
                     None => terminal
                         .foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
                         .unwrap_or_else(|| self.profile.name.clone()),

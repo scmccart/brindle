@@ -59,33 +59,22 @@ pub fn program_stem(program: &str) -> &str {
     }
 }
 
-/// A program's own title as a tab shows it on Windows, where the console
-/// host starts every program with the program's full path as its title.
-/// `None` for that path alone, which the program didn't choose. A title that
-/// starts with it, like cmd's `C:\WINDOWS\system32\cmd.exe - python`, keeps
-/// the program's name without directory or extension: `cmd - python`.
-pub fn console_title(title: &str) -> Option<String> {
-    let own = || Some(title.to_string());
+/// Whether a Windows title is the console's rather than the program's: the
+/// console host starts every program with the program's full path as its
+/// title, and cmd, while it runs a command, appends ` - <command>` to the
+/// title it started with (`C:\WINDOWS\system32\cmd.exe - python`, or pwsh's
+/// path when started from pwsh). Neither names what's running.
+pub fn is_console_title(title: &str) -> bool {
     let bytes = title.as_bytes();
     let drive = bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
     if !drive && !title.starts_with(r"\\") {
-        return own();
+        return false;
     }
     // The path ends at the first `.exe` that ends a word. Lowercasing ASCII
     // keeps byte offsets.
     let lower = title.to_ascii_lowercase();
-    let Some(end) = lower.match_indices(".exe").map(|(at, _)| at + 4).find(|&end| matches!(bytes.get(end), None | Some(b' ')))
-    else {
-        return own();
-    };
-    let rest = &title[end..];
-    if rest.is_empty() {
-        None
-    } else if rest.starts_with(" - ") {
-        Some(format!("{}{rest}", program_stem(&title[..end])))
-    } else {
-        own()
-    }
+    let end = lower.match_indices(".exe").map(|(at, _)| at + 4).find(|&end| matches!(bytes.get(end), None | Some(b' ')));
+    end.is_some_and(|end| title[end..].is_empty() || title[end..].starts_with(" - "))
 }
 
 /// `CreateProcessW` reads the program token itself: quotes delimit it and
@@ -304,15 +293,19 @@ mod tests {
 
     #[test]
     fn console_default_titles() {
-        let shown = |title| console_title(title);
-        // The console host's default: the program's path, which is no title.
-        assert_eq!(shown(r"C:\Program Files\PowerShell\7\pwsh.exe"), None);
-        assert_eq!(shown(r"C:\WINDOWS\SYSTEM32\CMD.EXE"), None);
-        assert_eq!(shown(r"\\server\tools\make.exe"), None);
-        // cmd's title while it runs a command keeps the name and the command.
-        assert_eq!(shown(r"C:\WINDOWS\system32\cmd.exe - python").as_deref(), Some("cmd - python"));
-        assert_eq!(shown("C:/tools/cmd.exe - ping -n 3 x").as_deref(), Some("cmd - ping -n 3 x"));
-        // Anything else is the program's own and stays as it is.
+        // The console host's default, the program's path, and cmd's title
+        // while it runs a command, built on whatever title it started with.
+        for console in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\WINDOWS\SYSTEM32\CMD.EXE",
+            r"\\server\tools\make.exe",
+            r"C:\WINDOWS\system32\cmd.exe - python",
+            r"C:\Program Files\PowerShell\7\pwsh.exe - python",
+            "C:/tools/cmd.exe - ping -n 3 x",
+        ] {
+            assert!(is_console_title(console), "{console}");
+        }
+        // Anything else is the program's own.
         for own in [
             "vim",
             r"Administrator: C:\Program Files\PowerShell\7\pwsh.exe",
@@ -321,7 +314,7 @@ mod tests {
             r"C:\tools\app.exe --flag",
             "c:",
         ] {
-            assert_eq!(shown(own).as_deref(), Some(own), "{own}");
+            assert!(!is_console_title(own), "{own}");
         }
     }
 
