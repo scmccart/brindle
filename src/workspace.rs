@@ -1658,7 +1658,7 @@ impl Workspace {
                 )
         });
 
-        let button = |id: &'static str, label: &'static str| {
+        let face = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
                 .flex()
@@ -1670,40 +1670,36 @@ impl Workspace {
                 .text_color(muted)
                 .cursor(CursorStyle::Arrow)
                 .hover(|d| d.bg(t.hover_background().hsla()).text_color(fg))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(label)
         };
+        let button = |id, label| face(id, label).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
+        // On Windows the marked areas are native caption buttons: Windows
+        // acts on them (and shows Snap Layouts on maximize), but only on a
+        // press Brindle leaves unhandled, so they get no handlers there.
+        let control = |id, label, area, action: fn(&mut Window)| {
+            if cfg!(windows) {
+                face(id, label).window_control_area(area)
+            } else {
+                button(id, label).on_click(move |_, window, _| action(window))
+            }
+        };
         let window_controls = csd.then(|| {
             let controls = window.window_controls();
+            let maximize = if window.is_maximized() { "❐" } else { "□" };
             div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap_1()
                 .pr_2()
-                // On Windows the marked areas are native caption buttons:
-                // Windows acts on them (and shows Snap Layouts on maximize),
-                // so the click handlers only run elsewhere.
                 .when(controls.minimize, |d| {
-                    d.child(
-                        button("minimize", "–")
-                            .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Min))
-                            .on_click(|_, window, _| window.minimize_window()),
-                    )
+                    d.child(control("minimize", "–", WindowControlArea::Min, |window| window.minimize_window()))
                 })
                 .when(controls.maximize, |d| {
-                    d.child(
-                        button("maximize", if window.is_maximized() { "❐" } else { "□" })
-                            .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Max))
-                            .on_click(|_, window, _| window.zoom_window()),
-                    )
+                    d.child(control("maximize", maximize, WindowControlArea::Max, |window| window.zoom_window()))
                 })
-                .child(
-                    button("close-window", "×")
-                        .when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Close))
-                        .on_click(|_, window, _| window.remove_window()),
-                )
+                .child(control("close-window", "×", WindowControlArea::Close, |window| window.remove_window()))
         });
 
         div()
@@ -1717,8 +1713,15 @@ impl Workspace {
             .bg(chrome.hsla())
             .border_b_1()
             .border_color(border)
-            // Empty space in the strip acts as the title bar.
-            .when(csd, |d| {
+            // On Windows, Windows acts on caption presses only when Brindle
+            // leaves them unhandled, and GPUI counts a press as handled when
+            // it moves focus, which it does for any focusable element under
+            // the mouse. The strip occludes the workspace, so a press here
+            // focuses nothing and Windows drags, double-clicks, shows the
+            // system menu and resizes from the top edge.
+            .when(cfg!(windows), |d| d.occlude())
+            // Elsewhere, empty space in the strip acts as the title bar.
+            .when(csd && !cfg!(windows), |d| {
                 d.on_mouse_down(MouseButton::Left, |e, window, _| {
                     if e.click_count >= 2 {
                         window.zoom_window();

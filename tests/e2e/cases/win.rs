@@ -59,16 +59,17 @@ fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
 
 /// What Windows' hit test (`WM_NCHITTEST`) reports at points of the tab
 /// strip, given in logical pixels from the client area's top-left (negative
-/// x from its right) and the window's `scale`. GPUI answers for the last
-/// mouse position, so each point is first sent to the window as a
-/// `WM_MOUSEMOVE`: a message to Brindle's own window, not input, so the
-/// cursor and other windows are untouched.
-fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
+/// x from its right) and the window's `scale`, then what Windows does with a
+/// double-click on the `strip` point and a press on the `max` point. GPUI
+/// answers for the last mouse position, so each point is first sent to the
+/// window as a `WM_MOUSEMOVE`. These are messages to Brindle's own window,
+/// not input, so the cursor and other windows are untouched.
+fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
     use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SendMessageW, WM_MOUSEMOVE,
-        WM_NCHITTEST,
+        EnumWindows, GetClientRect, GetWindowRect, GetWindowThreadProcessId, HTCAPTION, HTMAXBUTTON, IsWindowVisible,
+        IsZoomed, SendMessageW, WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
     };
     use windows::core::BOOL;
 
@@ -98,36 +99,64 @@ fn hit_tests(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
     // SAFETY: `found` outlives the enumeration.
     unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
     let Some(hwnd) = found.hwnd else { return "no window".into() };
-    let (mut window, mut client) = (RECT::default(), RECT::default());
-    // SAFETY: plain queries.
-    unsafe {
-        GetWindowRect(hwnd, &mut window).ok();
-        GetClientRect(hwnd, &mut client).ok();
-    }
-    // Any frame around the client area is equal at the sides and bottom.
-    let side = ((window.right - window.left) - client.right) / 2;
-    let top = (window.bottom - window.top) - client.bottom - side;
-    let (left, top) = (window.left + side, window.top + top);
-    points
+    let pack = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
+    // A point as the client coordinates WM_MOUSEMOVE takes and the screen
+    // coordinates the caption messages take, from the window as it is now.
+    let at = |name: &str| {
+        let &(_, x, y) = points.iter().find(|p| p.0 == name).expect("a named point");
+        let (mut window, mut client) = (RECT::default(), RECT::default());
+        // SAFETY: plain queries.
+        unsafe {
+            GetWindowRect(hwnd, &mut window).ok();
+            GetClientRect(hwnd, &mut client).ok();
+        }
+        // Any frame around the client area is equal at the sides and bottom
+        // (and at the top too when maximized).
+        let side = ((window.right - window.left) - client.right) / 2;
+        let top = (window.bottom - window.top) - client.bottom - side;
+        let x = (if x < 0.0 { client.right as f32 + x * scale } else { x * scale }) as i32;
+        let y = (y * scale) as i32;
+        (pack(x, y), pack(window.left + side + x, window.top + top + y))
+    };
+    // SAFETY: messages to Brindle's own window, with plain values.
+    let send = |msg, wparam: u32, lparam| unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam as usize)), Some(lparam)) };
+    let mut out: Vec<String> = points
         .iter()
-        .map(|&(name, x, y)| {
-            let x = if x < 0.0 { client.right as f32 + x * scale } else { x * scale };
-            let (cx, cy) = (x as i32, (y * scale) as i32);
-            let pack = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
-            // SAFETY: messages to Brindle's own window, with plain values.
-            let hit = unsafe {
-                SendMessageW(hwnd, WM_MOUSEMOVE, Some(WPARAM(0)), Some(pack(cx, cy)));
-                SendMessageW(hwnd, WM_NCHITTEST, Some(WPARAM(0)), Some(pack(left + cx, top + cy)))
-            };
-            format!("{name}={}", hit.0)
+        .map(|&(name, ..)| {
+            let (client, screen) = at(name);
+            send(WM_MOUSEMOVE, 0, client);
+            format!("{name}={}", send(WM_NCHITTEST, 0, screen).0)
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+    // The caption buttons act through ShowWindowAsync, so wait a little.
+    let zoomed = |want: bool| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: a plain query.
+            let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+            if zoomed == want || Instant::now() > deadline {
+                return if zoomed { "maximized" } else { "windowed" };
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (client, screen) = at("strip");
+    send(WM_MOUSEMOVE, 0, client);
+    send(WM_NCLBUTTONDBLCLK, HTCAPTION, screen);
+    out.push(format!("double-click={}", zoomed(true)));
+    let (client, screen) = at("max");
+    send(WM_MOUSEMOVE, 0, client);
+    send(WM_NCLBUTTONDOWN, HTMAXBUTTON, screen);
+    send(WM_NCLBUTTONUP, HTMAXBUTTON, screen);
+    out.push(format!("maximize={}", zoomed(false)));
+    out.join(" ")
 }
 
-/// The tab strip hit-tests as a native caption: the empty strip is the
-/// caption (drag, double-click, menu, Snap), the three buttons are Windows'
-/// own, and tabs stay client area.
+/// The tab strip acts as a native caption: the empty strip is the caption
+/// (drag, double-click, menu, Snap), the three buttons are Windows' own,
+/// and tabs stay client area. Windows acts on a double-click on the caption
+/// (maximizing) and a press on maximize (restoring), which it does only when
+/// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
     // Logical pixels: the strip is 38 high; the buttons are 26 wide, 4 apart,
     // 8 from the right edge, and centered in it; tabs sit at the bottom.
@@ -141,11 +170,11 @@ fn caption(ctx: &Ctx) -> Result<Outcome> {
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
-    let probe = move |pid| hit_tests(pid, scale, &points);
-    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 4.0, Some((2.5, &probe)))?;
+    let probe = move |pid| caption_probe(pid, scale, &points);
+    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some((2.5, &probe)))?;
     // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT.
-    let expected = "close=20 max=9 min=8 strip=2 tab=1";
-    ensure!(ran.during == expected, "hit tests at scale {scale}: {} (want {expected})", ran.during);
+    let expected = "close=20 max=9 min=8 strip=2 tab=1 double-click=maximized maximize=windowed";
+    ensure!(ran.during == expected, "caption at scale {scale}: {} (want {expected})", ran.during);
     Ok(Outcome::Pass)
 }
 
