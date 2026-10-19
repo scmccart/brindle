@@ -147,7 +147,7 @@ These are integration checks on real hardware, using the CI zip artifact. Ask th
   - a credential prompt from `git` in a tab centers on Brindle;
   - IME composition works in a terminal and in a palette;
   - wheel scrolling works in a local tab and in a WSL tmux pane.
-- [ ] 10.4 Without WinGet: `scripts/fetch-conpty.ps1`, `cargo install --path .` and `brindle --install-desktop`. Check that the Start Menu entry launches `%USERPROFILE%\.cargo\bin\brindle.exe`, the tab host is the extracted `OpenConsole.exe`, toasts appear, and `--uninstall-desktop` removes the entry.
+- [x] 10.4 Without WinGet: `scripts/fetch-conpty.ps1`, `cargo install --path .` and `brindle --install-desktop`. Check that the Start Menu entry launches `%USERPROFILE%\.cargo\bin\brindle.exe`, the tab host is the extracted `OpenConsole.exe`, toasts appear, and `--uninstall-desktop` removes the entry.
 - [ ] 10.5 Run `openspec validate port-to-windows --strict` on Windows. Have the Linux session run `cargo test --locked`, `cargo build --release --locked` and the full with-xvfb e2e suite on the branch head. Check that both CI workflows are green. Report each result.
 
 ## Workflow follow-up
