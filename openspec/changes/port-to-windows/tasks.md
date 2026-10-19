@@ -99,7 +99,7 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
   - the setting check, warning when disabled.
 
   Verify with `cargo test`, and that the existing `notify` e2e cases pass on Windows with `BRINDLE_NOTIFY_LOG`.
-- [ ] 7.3 Add the Windows `activation::raise`: restore if minimized, `SetForegroundWindow`, and `FlashWindowEx` when refused. Verify with the manual check in 10.3.
+- [x] 7.3 Add the Windows `activation::raise`: restore if minimized, `SetForegroundWindow`, and `FlashWindowEx` when refused. Verify with the manual check in 10.3.
 - [x] 7.4 Document toasts in README.md: the AUMID registration and the Windows Settings switch. Verify that the text matches 7.1–7.3.
 
 ## 8. Icons, resources and installers
@@ -124,21 +124,21 @@ Work happens on the Windows machine, on a `port-to-windows` branch pushed to ori
 
 These are integration checks on real hardware, using the CI zip artifact. Ask the user before each GUI step, and report the results. Add the steps that stay manual to CLAUDE.md's "Manual checks".
 
-- [ ] 10.1 Install the CI zip with the local WinGet manifest from 8.6, run `brindle --install-desktop`, and launch Brindle from the Start Menu. Check that:
+- [x] 10.1 Install the CI zip with the local WinGet manifest from 8.6, run `brindle --install-desktop`, and launch Brindle from the Start Menu. Check that:
   - the taskbar, Alt-Tab and title area show the icon;
   - pinning to the taskbar and then launching from the pin gives one button;
   - the window is sharp at 150% scaling and when moved to a monitor with another scale;
   - the default tab runs `pwsh`;
   - no console window appears;
   - started from a PowerShell window instead, Brindle survives ctrl-c in that window and its closing.
-- [ ] 10.2 Title bar against the `tabs` spec:
+- [x] 10.2 Title bar against the `tabs` spec:
   - dragging the strip moves the window, and double-clicking maximizes;
   - right-click opens the system menu;
   - Snap works at the screen edges, and hovering maximize shows Snap Layouts;
   - minimize, maximize and close work, and closing the last window exits;
   - edge resizing works;
   - tabs, the new-tab button and the chevron still respond to clicks.
-- [ ] 10.3 Behaviour:
+- [x] 10.3 Behaviour:
   - a `pwsh` tab is titled `pwsh`, `python` run from it titles the tab `python` (and `pwsh` again once it exits), and from `cmd` (on its own or started from `pwsh`) the tab is titled `python` too;
   - middle-click pastes the in-app selection without changing the clipboard, and ctrl-shift-c/v use the clipboard;
   - AltGr+7 on a German layout types `{` and doesn't open profile 7;
