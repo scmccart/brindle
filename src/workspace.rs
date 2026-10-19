@@ -12,7 +12,7 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowHandle, canvas, div, point, px,
+    Task, Window, WindowBounds, WindowControlArea, WindowHandle, canvas, div, point, px,
 };
 use gpui::EntityId;
 
@@ -25,6 +25,7 @@ use crate::text_input::TextInput;
 use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
+use crate::terminal::process::Snapshot;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
@@ -80,19 +81,29 @@ impl Tab {
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
-        tab.refresh_title(cx);
+        tab.refresh_title(&mut None, cx);
         tab
     }
 
     /// Recomputes the title: the program's OSC title, else the foreground
-    /// process name, else the profile name. Returns whether it changed.
-    fn refresh_title(&mut self, cx: &App) -> bool {
+    /// process name, else the profile name. On Windows a title the console
+    /// built from a program's path counts as none (`cmdline::is_console_title`).
+    /// Returns whether it changed.
+    /// `snapshot` is the processes running, for the foreground name, taken
+    /// only when a title needs it (a program's own title, which can change
+    /// thousands of times a second, never does).
+    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
         let title: SharedString = match &self.content {
             TabContent::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
-                match terminal.title().filter(|t| !t.trim().is_empty()) {
+                let own = terminal.title().filter(|t| {
+                    !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t))
+                });
+                match own {
                     Some(title) => title.to_string(),
-                    None => terminal.foreground_process_name().unwrap_or_else(|| self.profile.name.clone()),
+                    None => terminal
+                        .foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
+                        .unwrap_or_else(|| self.profile.name.clone()),
                 }
             }
             TabContent::Tmux { view, .. } => view.read(cx).title(cx),
@@ -308,8 +319,10 @@ impl Workspace {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                 let alive = this.update_in(cx, |this, window, cx| {
                     let mut changed = false;
+                    // At most one look at the processes for every tab.
+                    let mut snapshot = None;
                     for tab in &mut this.tabs {
-                        changed |= tab.refresh_title(cx);
+                        changed |= tab.refresh_title(&mut snapshot, cx);
                     }
                     if changed {
                         cx.notify();
@@ -721,14 +734,19 @@ impl Workspace {
                             let taken = cx
                                 .background_executor()
                                 .spawn(async move {
-                                    std::process::Command::new(program)
+                                    let mut command = std::process::Command::new(program);
+                                    command
                                         .args(args)
                                         .envs(env)
                                         .stdin(std::process::Stdio::null())
                                         .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .status()
-                                        .is_ok_and(|s| s.success())
+                                        .stderr(std::process::Stdio::null());
+                                    #[cfg(windows)]
+                                    std::os::windows::process::CommandExt::creation_flags(
+                                        &mut command,
+                                        crate::win::CREATE_NO_WINDOW,
+                                    );
+                                    command.status().is_ok_and(|s| s.success())
                                 })
                                 .await;
                             if taken {
@@ -782,7 +800,7 @@ impl Workspace {
                     cx.observe(&view, |this, _, cx| {
                         // Window renames arrive through the view.
                         for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
-                            tab.refresh_title(cx);
+                            tab.refresh_title(&mut None, cx);
                         }
                         cx.notify();
                     }),
@@ -1025,7 +1043,7 @@ impl Workspace {
             TerminalEvent::Exited => self.remove_tab(ix, window, cx),
             TerminalEvent::Bell | TerminalEvent::Notify(_) => self.on_attention(ix, event, window, cx),
             TerminalEvent::TitleChanged => {
-                if self.tabs[ix].refresh_title(cx) {
+                if self.tabs[ix].refresh_title(&mut None, cx) {
                     cx.notify();
                 }
             }
@@ -1472,18 +1490,9 @@ impl Workspace {
     }
 
     fn open_config(&mut self, _: &OpenConfig, window: &mut Window, cx: &mut Context<Self>) {
-        let path = Config::path();
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "nano".into());
-        // Run through the shell so EDITOR values like "code -w" work.
-        let command = format!("{editor} {}", shell_quote(&path.to_string_lossy()));
+        let command = editor_command(&Config::path().to_string_lossy());
         let profile = Self::settings(cx).default_profile_index();
-        self.launch(
-            LaunchRequest { profile, command: Some(("/bin/sh".into(), vec!["-c".into(), command])), cwd: None },
-            window,
-            cx,
-        );
+        self.launch(LaunchRequest { profile, command: Some(command), cwd: None }, window, cx);
     }
 
     /// The theme a tab with `profile` shows: the preview for tabs that
@@ -1619,6 +1628,11 @@ impl Workspace {
         self.tabs.iter().map(|t| t.title.to_string()).collect()
     }
 
+    /// The active terminal's visible screen text, for `--wait-for`.
+    pub fn active_screen_text(&self, cx: &App) -> Option<String> {
+        Some(self.tabs.get(self.active)?.active_terminal(cx)?.read(cx).screen_text())
+    }
+
     pub fn dump_active_screen(&self, window: &Window, cx: &App) -> String {
         let scale = window.scale_factor();
         let mut out = String::new();
@@ -1671,7 +1685,9 @@ impl Workspace {
         let accent = t.accent().hsla();
         let border = t.chrome_border().hsla();
         let decorations = window.window_decorations();
-        let csd = matches!(decorations, Decorations::Client { .. });
+        // Windows always shows Brindle's own caption (see `window_control_area`
+        // below); GPUI reports server decorations there.
+        let csd = matches!(decorations, Decorations::Client { .. }) || cfg!(windows);
 
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let active = ix == self.active;
@@ -1741,7 +1757,7 @@ impl Workspace {
                 )
         });
 
-        let button = |id: &'static str, label: &'static str| {
+        let face = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
                 .flex()
@@ -1753,12 +1769,23 @@ impl Workspace {
                 .text_color(muted)
                 .cursor(CursorStyle::Arrow)
                 .hover(|d| d.bg(t.hover_background().hsla()).text_color(fg))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(label)
         };
+        let button = |id, label| face(id, label).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
+        // On Windows the marked areas are native caption buttons: Windows
+        // acts on them (and shows Snap Layouts on maximize), but only on a
+        // press Brindle leaves unhandled, so they get no handlers there.
+        let control = |id, label, area, action: fn(&mut Window)| {
+            if cfg!(windows) {
+                face(id, label).window_control_area(area)
+            } else {
+                button(id, label).on_click(move |_, window, _| action(window))
+            }
+        };
         let window_controls = csd.then(|| {
             let controls = window.window_controls();
+            let maximize = if window.is_maximized() { "❐" } else { "□" };
             div()
                 .flex()
                 .flex_none()
@@ -1766,12 +1793,12 @@ impl Workspace {
                 .gap_1()
                 .pr_2()
                 .when(controls.minimize, |d| {
-                    d.child(button("minimize", "–").on_click(|_, window, _| window.minimize_window()))
+                    d.child(control("minimize", "–", WindowControlArea::Min, |window| window.minimize_window()))
                 })
                 .when(controls.maximize, |d| {
-                    d.child(button("maximize", if window.is_maximized() { "❐" } else { "□" }).on_click(|_, window, _| window.zoom_window()))
+                    d.child(control("maximize", maximize, WindowControlArea::Max, |window| window.zoom_window()))
                 })
-                .child(button("close-window", "×").on_click(|_, window, _| window.remove_window()))
+                .child(control("close-window", "×", WindowControlArea::Close, |window| window.remove_window()))
         });
 
         div()
@@ -1785,8 +1812,15 @@ impl Workspace {
             .bg(chrome.hsla())
             .border_b_1()
             .border_color(border)
-            // Empty space in the strip acts as the title bar.
-            .when(csd, |d| {
+            // On Windows, Windows acts on caption presses only when Brindle
+            // leaves them unhandled, and GPUI counts a press as handled when
+            // it moves focus, which it does for any focusable element under
+            // the mouse. The strip occludes the workspace, so a press here
+            // focuses nothing and Windows drags, double-clicks, shows the
+            // system menu and resizes from the top edge.
+            .when(cfg!(windows), |d| d.occlude())
+            // Elsewhere, empty space in the strip acts as the title bar.
+            .when(csd && !cfg!(windows), |d| {
                 d.on_mouse_down(MouseButton::Left, |e, window, _| {
                     if e.click_count >= 2 {
                         window.zoom_window();
@@ -1812,7 +1846,10 @@ impl Workspace {
                         this.open_profile_picker(&OpenProfilePicker, window, cx)
                     }))),
             )
-            .child(div().flex_1().h_full())
+            // Windows hit-tests this as the caption: drag, double-click,
+            // the system menu and Snap. Only empty space is marked, since a
+            // marked area wins over everything inside it.
+            .child(div().id("caption").flex_1().h_full().when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag)))
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
     }
 
@@ -1935,6 +1972,23 @@ fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option
     Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
 }
 
+/// The command that opens `path` in `$VISUAL`, else `$EDITOR`, else nano,
+/// through the shell so values like `code -w` work.
+#[cfg(unix)]
+fn editor_command(path: &str) -> (String, Vec<String>) {
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "nano".into());
+    ("/bin/sh".into(), vec!["-c".into(), format!("{editor} {}", shell_quote(path))])
+}
+
+/// The command that opens `path` in `%VISUAL%`, else `%EDITOR%`, else
+/// Notepad, through cmd so values like `code -w` work.
+#[cfg(windows)]
+fn editor_command(path: &str) -> (String, Vec<String>) {
+    let (visual, editor) = (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
+    crate::terminal::cmdline::windows_editor_command(visual.as_deref(), editor.as_deref(), path)
+}
+
+#[cfg(unix)]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -2205,6 +2259,7 @@ mod tests {
         assert_eq!(recorded_size(known, size(px(1200.0), px(760.0)), inner), inner);
     }
 
+    #[cfg(unix)]
     #[test]
     fn quoting() {
         assert_eq!(shell_quote("/a b/c'd"), "'/a b/c'\\''d'");

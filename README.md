@@ -2,16 +2,19 @@
 
 [![CI](https://github.com/scmccart/brindle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/scmccart/brindle/actions/workflows/ci.yml)
 
-A GPU-accelerated terminal emulator for Linux, written in Rust on
-[GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
+A GPU-accelerated terminal emulator for Linux and Windows 11, written in Rust
+on [GPUI](https://crates.io/crates/gpui), the toolkit Zed is built with.
 Terminal emulation comes from `alacritty_terminal`; rendering goes through
-GPUI's Vulkan renderer.
+GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 
 Brindle treats tmux as a native windowing layer, not just a program running
 inside the terminal: tmux windows become tabs and panes are drawn natively,
 while sessions stay in tmux, persistent and detachable.
 
 - **Tabs** in a client-side-decorated title bar: drag to reorder, middle-click to close.
+  A new tab starts in the active tab's directory: on Linux the foreground
+  program's, on Windows the one its shell last reported (see
+  [Shell integration](#shell-integration)).
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
 - **Shell integration** (OSC 133): jump between prompts, select or copy the last
@@ -57,6 +60,30 @@ Wayland, fontconfig and Vulkan are loaded at runtime (dlopen), so only their
 runtime libraries are needed, and every desktop install has them. `tmux` is
 only needed for the tmux profiles.
 
+On Windows 11 (Windows 10 isn't supported), install the MSVC toolchain and the
+Windows 11 SDK (Visual Studio Build Tools with "Desktop development with C++"),
+then, in PowerShell:
+
+```powershell
+scripts/fetch-conpty.ps1
+cargo build --release
+.\target\release\brindle.exe
+```
+
+`scripts/fetch-conpty.ps1` downloads Microsoft's packaged ConPTY (the console
+host Windows Terminal ships, MIT-licensed), checked against a pinned hash, and
+the build embeds it in `brindle.exe`. Brindle hosts each tab with it, so what
+programs write reaches the terminal unchanged: mouse modes, synchronized
+updates, hyperlinks, notifications and color queries. A build made without it
+warns, and its tabs fall back to the ConPTY built into Windows, which repaints
+output instead of passing it through and drops mouse modes. Brindle logs a
+warning when it falls back. Run the script before `cargo install --path .` too.
+
+GPUI's release build compiles its shaders with the SDK's `fxc.exe`, which it
+looks for on `PATH` and in SDK 10.0.26100.0. With another SDK version, point
+`GPUI_FXC_PATH` at it, for example
+`$env:GPUI_FXC_PATH = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\<version>\x64\fxc.exe"`.
+
 `Cargo.lock` starts from gpui 0.2.2's own lockfile; newer transitive versions
 (e.g. `libc`) break its dependencies.
 
@@ -94,7 +121,8 @@ unit tests, a release build, and the end-to-end suite that way on Ubuntu
 26.04, against tmux 3.6a (Ubuntu's) and 3.8 (built from source), for every
 push and every pull request. Each tmux
 version's suite is split into 4 shards that run as separate jobs. A failed
-shard uploads its `target/tmp/e2e/` as an artifact.
+shard uploads its `target/tmp/e2e/` as an artifact. A Windows job runs the
+release build, the unit tests and the harness self-tests on `windows-latest`.
 
 ### Performance
 
@@ -177,6 +205,43 @@ the binary, run `brindle --install-desktop` again so the entry stays current.
 To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
 `brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
 in `~/.config/brindle` is kept either way.
+
+### On Windows
+
+There's no installer: `brindle.exe` carries everything it needs, including the
+packaged ConPTY, which it unpacks to `%LOCALAPPDATA%\brindle\conpty` on first
+run. Each release has a zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`,
+with the exe and the licences; unpack it anywhere and run `brindle.exe`. Once
+releases are published to WinGet, it installs as a `brindle` command on `PATH`:
+
+```powershell
+winget install scmccart.brindle
+winget upgrade scmccart.brindle
+```
+
+WinGet doesn't add Start Menu entries for programs like this, so add one
+yourself, and remove it before uninstalling (WinGet doesn't know about it):
+
+```powershell
+brindle --install-desktop     # a Start Menu shortcut for this brindle.exe
+brindle --uninstall-desktop
+winget uninstall scmccart.brindle
+```
+
+From a checkout, fetch the packaged ConPTY first, so the build embeds it:
+
+```powershell
+scripts/fetch-conpty.ps1
+cargo install --locked --path .
+brindle --install-desktop
+```
+
+Releases aren't code-signed yet, so SmartScreen may stop the first start of a
+downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
+Run anyway. Uninstalling either way keeps your config in `%APPDATA%\brindle`
+and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
+builds the release zip from a release build, and `scripts/winget-manifest.ps1`
+writes its WinGet manifest.
 
 ## Usage
 
@@ -303,15 +368,26 @@ saved session.
 ### Shell integration
 
 Shells can mark their prompts and command output with OSC 133 sequences. Brindle
-ships scripts that do this for bash, zsh and fish. Load one at the **end** of
-your shell's startup file, after your prompt theme and anything that sets
-`PROMPT_COMMAND`:
+ships scripts that do this for bash, zsh, fish and PowerShell. Load one at the
+**end** of your shell's startup file, after your prompt theme and anything that
+sets `PROMPT_COMMAND` or defines `prompt`:
 
 ```sh
 eval "$(brindle --shell-integration bash)"    # ~/.bashrc
 eval "$(brindle --shell-integration zsh)"     # ~/.zshrc
 brindle --shell-integration fish | source     # ~/.config/fish/config.fish
 ```
+
+```powershell
+brindle --shell-integration pwsh | Out-String | Invoke-Expression   # $PROFILE
+```
+
+The PowerShell script works in PowerShell 7 and Windows PowerShell 5.1, and also
+reports the current directory (OSC 7). On Windows, where Brindle can't read
+another program's directory, that report is what a new tab and a restored tab
+start in; without it they start in your home directory. Tools that report the
+directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
+the like, when configured to) work the same way.
 
 The same scripts are in [`shell-integration/`](shell-integration/) if you'd rather
 `source` a file. Brindle never edits your startup files or injects the scripts
@@ -367,6 +443,15 @@ work the same way. In classic tmux, tmux itself swallows OSC 9 and 777 unless th
 program wraps them in tmux's passthrough (`set -g allow-passthrough on`); bells
 get through.
 
+On Windows, notifications are toasts from "Brindle". Brindle registers that name
+for your user account the first time it shows one (under
+`HKCU\Software\Classes\AppUserModelId\Brindle.Terminal`), so toasts work without
+a Start Menu shortcut too; `brindle --uninstall-desktop` removes the entry.
+Clicking a toast brings its window to the front with its tab active. If Windows
+won't hand Brindle the foreground, the taskbar button flashes instead. Turn
+Brindle's toasts off or on under Settings > System > Notifications; while they're
+off, Brindle logs one warning and carries on.
+
 ### tmux control mode
 
 In control mode, keys reach panes through `send-keys`, which skips tmux's own key
@@ -396,6 +481,23 @@ decides what happens next:
   window shows is offered as "Go to <session>" instead.
 
 It can also be changed in the settings dialog's General section.
+
+On Windows, control mode runs tmux inside WSL. Install tmux in your
+distribution, then add a profile whose command is `wsl`:
+
+```toml
+[[profiles]]
+name = "tmux (WSL)"
+tmux = "control"
+command = "wsl"
+tmux_args = ["tmux"]
+```
+
+`tmux_args` are WSL's options, then `tmux`, then tmux's own options, for example
+`["-d", "Ubuntu", "tmux", "-L", "work"]`. Brindle runs
+`wsl -d Ubuntu --exec tmux -u -L work -C new-session -A -s main`. New sessions
+start in tmux's default directory, because a Windows tab's directory means
+nothing inside WSL.
 
 Each session is shown by one window at most. Picking a control-mode profile
 whose session this window shows just switches to its tab. The new-tab palette

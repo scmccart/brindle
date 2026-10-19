@@ -4,9 +4,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, ImageFormat, MapState, Window};
 
 use crate::brindle::Grid;
@@ -208,7 +211,14 @@ impl Cells {
     }
 }
 
+/// Window captures are X11-only; cases that need them run on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn grab(_display: &str, _pid: u32) -> Result<Image> {
+    Err("window captures need X11".into())
+}
+
 /// Captures the viewable X11 window whose `_NET_WM_PID` is `pid`.
+#[cfg(target_os = "linux")]
 pub fn grab(display: &str, pid: u32) -> Result<Image> {
     let (conn, screen) = x11rb::connect(Some(display)).map_err(|e| format!("X display {display}: {e}"))?;
     let root = conn.setup().roots[screen].root;
@@ -249,6 +259,7 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
     Ok(Image { width: geometry.width.into(), height: geometry.height.into(), data })
 }
 
+#[cfg(target_os = "linux")]
 fn find_window(conn: &impl Connection, window: Window, atom: Atom, pid: u32) -> Option<Window> {
     let owned = conn
         .get_property(false, window, atom, AtomEnum::CARDINAL, 0, 1)

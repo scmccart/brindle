@@ -1,12 +1,18 @@
 //! Registers Brindle with freedesktop launchers: `--install-desktop` writes a
 //! desktop entry and the scalable icon into the XDG data directory, and
-//! `--uninstall-desktop` removes them.
+//! `--uninstall-desktop` removes them. On Windows they create and remove a
+//! per-user Start Menu shortcut instead (`start_menu` below); installing
+//! itself there is WinGet's job.
 //!
 //! Linux finds an app's icon through its desktop entry and the icon theme,
 //! never through the executable, so this is what puts Brindle in launchers and
 //! gives its windows an icon. Both files are embedded so that a plain
 //! `cargo install` can register itself. Runs before GPUI starts, so it works
 //! without a display.
+
+// The Linux functions are compiled everywhere so their tests run on every
+// platform; Windows runs its own.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -39,6 +45,20 @@ pub fn request(
     uninstall: bool,
     prefix: Option<PathBuf>,
 ) -> Result<Option<Request>, &'static str> {
+    request_on(install, uninstall, prefix, cfg!(windows))
+}
+
+/// [`request`] for Windows (`windows`) or elsewhere, so both are tested
+/// everywhere.
+fn request_on(
+    install: bool,
+    uninstall: bool,
+    prefix: Option<PathBuf>,
+    windows: bool,
+) -> Result<Option<Request>, &'static str> {
+    if windows && prefix.is_some() && (install || uninstall) {
+        return Err("--prefix isn't used on Windows: install Brindle with WinGet (winget install scmccart.brindle), or run brindle.exe from anywhere");
+    }
     let command = match (install, uninstall) {
         (true, true) => return Err("--install-desktop and --uninstall-desktop are exclusive"),
         (true, false) => DesktopCommand::Install,
@@ -51,7 +71,20 @@ pub fn request(
     Ok(Some(Request { command, prefix }))
 }
 
+/// Runs a validated request: the Start Menu shortcut on Windows.
+#[cfg(windows)]
+pub fn run(request: &Request) -> Result<()> {
+    match request.command {
+        DesktopCommand::Install => {
+            let exe = std::env::current_exe().context("can't locate the running binary")?;
+            start_menu::install(&exe)
+        }
+        DesktopCommand::Uninstall => start_menu::uninstall(),
+    }
+}
+
 /// Runs a validated request against the real data directory.
+#[cfg(not(windows))]
 pub fn run(request: &Request) -> Result<()> {
     let data = data_dir(request.prefix.as_deref())?;
     match request.command {
@@ -294,6 +327,8 @@ mod tests {
         std::fs::remove_dir_all(&data).ok();
     }
 
+    // `/proc` refuses new files on Linux; elsewhere it is an ordinary path.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unwritable_target_names_the_path() {
         let err = install(Path::new("/proc/brindle"), Path::new("/usr/bin/brindle")).unwrap_err();
@@ -301,7 +336,22 @@ mod tests {
     }
 
     #[test]
+    fn prefix_is_rejected_on_windows() {
+        let prefix = Some(PathBuf::from(r"C:\Tools"));
+        let err = request_on(true, false, prefix.clone(), true).unwrap_err();
+        assert!(err.contains("winget install"), "{err}");
+        assert!(request_on(false, true, prefix.clone(), true).is_err());
+        // Without a desktop command it is the usual stray-prefix error.
+        assert_eq!(request_on(false, false, prefix.clone(), true), request_on(false, false, prefix, false));
+        assert_eq!(
+            request_on(true, false, None, true),
+            Ok(Some(Request { command: DesktopCommand::Install, prefix: None }))
+        );
+    }
+
+    #[test]
     fn request_validation() {
+        let request = |install, uninstall, prefix| request_on(install, uninstall, prefix, false);
         assert_eq!(request(false, false, None), Ok(None));
         assert_eq!(
             request(true, false, None),
@@ -314,5 +364,80 @@ mod tests {
         );
         assert!(request(false, false, prefix).is_err());
         assert!(request(true, true, None).is_err());
+    }
+}
+
+/// The per-user Start Menu shortcut that stands in for the desktop entry.
+#[cfg(windows)]
+mod start_menu {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context as _, Result, anyhow};
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile,
+    };
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::UI::Shell::{FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink};
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::core::{HSTRING, Interface as _};
+
+    /// `Brindle.lnk` in the user's Start Menu Programs folder.
+    fn shortcut_path() -> Result<PathBuf> {
+        // SAFETY: the returned string is copied, then freed as documented.
+        unsafe {
+            let path = SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)
+                .context("can't find the Start Menu Programs folder")?;
+            let dir = path.to_string().map_err(|err| anyhow!("Start Menu Programs folder: {err}"));
+            CoTaskMemFree(Some(path.0 as *const _));
+            Ok(PathBuf::from(dir?).join("Brindle.lnk"))
+        }
+    }
+
+    /// The file behind `exe`, through any symlinks, without the `\\?\` that
+    /// `canonicalize` adds.
+    fn resolved(exe: &Path) -> PathBuf {
+        let Ok(path) = std::fs::canonicalize(exe) else { return exe.to_path_buf() };
+        match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(unc) if unc.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &unc[4..])),
+            Some(disk) => PathBuf::from(disk),
+            None => path,
+        }
+    }
+
+    pub fn install(exe: &Path) -> Result<()> {
+        let path = shortcut_path()?;
+        // SAFETY: COM calls on objects created here, on this thread.
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().ok();
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).context("creating a shortcut")?;
+            // The shortcut starts `exe` as given, so it follows WinGet's
+            // symlink across upgrades, but the shell reads no icon through a
+            // symlink, so the icon comes from the file it resolves to.
+            link.SetPath(&HSTRING::from(exe.as_os_str()))?;
+            link.SetIconLocation(&HSTRING::from(resolved(exe).as_os_str()), 0)?;
+            link.SetDescription(&HSTRING::from("Brindle terminal"))?;
+            // The same identity as Brindle's windows and toasts, so the
+            // taskbar groups them under this shortcut.
+            let properties: IPropertyStore = link.cast()?;
+            properties.SetValue(&PKEY_AppUserModel_ID, &PROPVARIANT::from(crate::win::APP_ID))?;
+            properties.Commit()?;
+            let file: IPersistFile = link.cast()?;
+            file.Save(&HSTRING::from(path.as_os_str()), true).with_context(|| format!("can't write {}", path.display()))?;
+        }
+        println!("installed {}", path.display());
+        Ok(())
+    }
+
+    pub fn uninstall() -> Result<()> {
+        let path = shortcut_path()?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("can't remove {}", path.display())),
+        }
+        // What toasts registered for this user (see `notify`).
+        crate::win::unregister_app_id().context("removing Brindle's notification registration")?;
+        Ok(())
     }
 }

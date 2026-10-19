@@ -179,6 +179,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(windows)]
+        terminal.read(cx).parent_console_to(window);
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
             cx.observe(&terminal, |this, _, cx| {
@@ -311,7 +313,7 @@ impl TerminalView {
     }
 
     fn paste_primary_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+        if let Some(text) = crate::primary::read_primary(cx).and_then(|item| item.text()) {
             self.terminal.update(cx, |t, cx| t.paste(&text, cx));
         }
     }

@@ -14,28 +14,12 @@ use gpui::BackgroundExecutor;
 use zbus::zvariant::Value;
 use zbus::{Connection, MatchRule, MessageStream};
 
+use super::{Command, Reply};
+
 const DEST: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
 const IFACE: &str = "org.freedesktop.Notifications";
 const RETRY: Duration = Duration::from_secs(30);
-
-pub enum Command {
-    Notify {
-        /// Ours, echoed in [`Reply::Shown`].
-        key: u64,
-        /// The server's id of a notification this one replaces, or 0.
-        replaces: u32,
-        summary: String,
-        body: String,
-    },
-}
-
-pub enum Reply {
-    Shown { key: u64, id: u32 },
-    Action { id: u32, action: String },
-    Token { id: u32, token: String },
-    Closed { id: u32 },
-}
 
 struct Service {
     connection: Connection,

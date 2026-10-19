@@ -112,7 +112,12 @@ fn main() {
     }
 
     let display = std::env::var("BRINDLE_E2E_DISPLAY").unwrap_or_else(|_| ":0".into());
+    // Cases that open windows need an X display on Linux. On Windows they
+    // open on the desktop the suite runs on.
+    #[cfg(target_os = "linux")]
     let has_display = x11rb::connect(Some(&display)).is_ok();
+    #[cfg(not(target_os = "linux"))]
+    let has_display = true;
     let bin = std::env::var_os("BRINDLE_E2E_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_brindle")));

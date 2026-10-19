@@ -1,0 +1,43 @@
+// Brindle's Windows resources: the icon (resource 1, which GPUI's window
+// class loads, so the title bar, taskbar and Alt-Tab show it) and version
+// information. build.rs compiles this with the version from Cargo.toml as
+// macros: BRINDLE_VERSION (a quoted string), BRINDLE_MAJOR, BRINDLE_MINOR,
+// BRINDLE_PATCH, and BRINDLE_ICON (the .ico, when it has been rendered).
+//
+// No manifest here: GPUI's windows-manifest feature embeds one, and a second
+// would fail to link.
+
+#include <winver.h>
+
+#ifdef BRINDLE_ICON
+1 ICON BRINDLE_ICON
+#endif
+
+1 VERSIONINFO
+FILEVERSION BRINDLE_MAJOR, BRINDLE_MINOR, BRINDLE_PATCH, 0
+PRODUCTVERSION BRINDLE_MAJOR, BRINDLE_MINOR, BRINDLE_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Brindle"
+            VALUE "FileDescription", "Brindle"
+            VALUE "FileVersion", BRINDLE_VERSION
+            VALUE "InternalName", "brindle"
+            VALUE "LegalCopyright", "MIT OR Apache-2.0"
+            VALUE "OriginalFilename", "brindle.exe"
+            VALUE "ProductName", "Brindle"
+            VALUE "ProductVersion", BRINDLE_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

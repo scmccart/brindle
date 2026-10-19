@@ -6,9 +6,15 @@
 //! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
 
+// Used by the Windows PTY; tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod cmdline;
+#[cfg(windows)]
+mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
+pub mod process;
 mod pty;
 pub mod shell_integration;
 mod scan;
@@ -28,6 +34,7 @@ use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
+#[cfg(unix)]
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::StreamExt as _;
@@ -146,8 +153,9 @@ pub enum TerminalEvent {
 enum Backend {
     Pty {
         sender: EventLoopSender,
-        child_pid: u32,
-        master_fd: i32,
+        process: process::PtyProcess,
+        #[cfg(windows)]
+        console: Arc<conpty::Pseudoconsole>,
     },
     Remote {
         scanner: Scanner,
@@ -269,13 +277,9 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (program, args) = command_override.unwrap_or_else(|| {
-            let program = profile
-                .command
-                .clone()
-                .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "/bin/sh".into());
-            (program, profile.args.clone())
+        let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
+            Some(program) => (program.clone(), profile.args.clone()),
+            None => default_program(&profile.args),
         });
 
         let working_directory = cwd_override
@@ -283,11 +287,18 @@ impl Terminal {
             .or_else(dirs::home_dir)
             .filter(|dir| dir.is_dir());
 
+        #[cfg(unix)]
         let options = tty::Options {
             shell: Some(tty::Shell::new(program.clone(), args)),
             working_directory,
             drain_on_exit: true,
             env: child_env(profile),
+        };
+        #[cfg(windows)]
+        let command = conpty::Command {
+            line: cmdline::launch_line(&program, &args),
+            cwd: working_directory,
+            env: child_env(profile).into_iter().collect(),
         };
 
         let (tx, rx) = unbounded();
@@ -297,6 +308,7 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
+        #[cfg(unix)]
         let spawned = (|| -> anyhow::Result<Backend> {
             let pty = tty::new(&options, size.into(), 0)?;
             let child_pid = pty.child().id();
@@ -305,7 +317,17 @@ impl Terminal {
             let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
             let sender = event_loop.channel();
             event_loop.spawn();
-            Ok(Backend::Pty { sender, child_pid, master_fd })
+            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid, master_fd) })
+        })();
+        #[cfg(windows)]
+        let spawned = (|| -> anyhow::Result<Backend> {
+            let spawned = conpty::spawn(&command, size.into())?;
+            let (child_pid, console) = (spawned.pid, spawned.console.clone());
+            let pty = pty::MarkedPty::new(spawned, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx);
+            let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
+            let sender = event_loop.channel();
+            event_loop.spawn();
+            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid), console })
         })();
 
         let theme = config.profile_theme(profile);
@@ -451,14 +473,14 @@ impl Terminal {
                 let item = ClipboardItem::new_string(text);
                 match kind {
                     ClipboardType::Clipboard => cx.write_to_clipboard(item),
-                    ClipboardType::Selection => cx.write_to_primary(item),
+                    ClipboardType::Selection => crate::primary::write_primary(cx, item),
                 }
             }
             // Only sent when the config allows OSC 52 reads (see `term_config`).
             AlacEvent::ClipboardLoad(kind, format) => {
                 let item = match kind {
                     ClipboardType::Clipboard => cx.read_from_clipboard(),
-                    ClipboardType::Selection => cx.read_from_primary(),
+                    ClipboardType::Selection => crate::primary::read_primary(cx),
                 };
                 let text = item.and_then(|i| i.text()).unwrap_or_default();
                 self.reply(format(&text).into_bytes());
@@ -668,7 +690,7 @@ impl Terminal {
     /// Called when a mouse selection is finished.
     pub fn finish_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.selection_text() {
-            cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+            crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
             if self.copy_on_select {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
@@ -677,32 +699,40 @@ impl Terminal {
 
     // ---- process info -------------------------------------------------------
 
-    /// Name of the foreground process on the PTY (e.g. `vim`), for tab titles.
-    pub fn foreground_process_name(&self) -> Option<String> {
-        let pid = self.foreground_pid()?;
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        Some(comm.trim().to_string())
-    }
-
-    fn foreground_pid(&self) -> Option<i32> {
-        let Backend::Pty { master_fd, .. } = &self.backend else {
+    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
+    /// titles. `snapshot` is the title tick's look at all processes.
+    pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
+        let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
-        // SAFETY: the fd stays open for as long as the event loop owns the PTY,
-        // and tcgetpgrp has no memory-safety preconditions.
-        let pgrp = unsafe { libc::tcgetpgrp(*master_fd) };
-        (pgrp > 0).then_some(pgrp)
+        process.foreground_name(snapshot)
     }
 
-    /// Current working directory of the foreground process (falls back to the shell).
+    /// Parents the tab's console window to `window`, so dialogs that console
+    /// programs open (credential prompts, for one) belong to Brindle's
+    /// window. Local tabs never move between windows, so once is enough.
+    #[cfg(windows)]
+    pub fn parent_console_to(&self, window: &gpui::Window) {
+        let Backend::Pty { console, .. } = &self.backend else {
+            return;
+        };
+        if let Some(hwnd) = crate::win::hwnd(window) {
+            console.reparent(hwnd);
+        }
+    }
+
+    /// Current working directory of the foreground process (falls back to
+    /// the shell). On Windows, where no other process's directory can be
+    /// read, it is the directory the program last reported (OSC 7 or 9;9),
+    /// if it still exists.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
-        let Backend::Pty { child_pid, .. } = &self.backend else {
+        let Backend::Pty { process, .. } = &self.backend else {
             return None;
         };
-        let pid = self.foreground_pid().map(|p| p as u32).unwrap_or(*child_pid);
-        std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .or_else(|_| std::fs::read_link(format!("/proc/{child_pid}/cwd")))
-            .ok()
+        if cfg!(windows) {
+            return self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into);
+        }
+        process.working_directory()
     }
 
     /// The visible screen as plain text (used by `--dump-screen` and tests).
@@ -869,6 +899,25 @@ fn palette_color(t: &Theme, defaults: DefaultColors, index: usize) -> Color {
 
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
+
+/// The program a profile with no `command` runs, with the profile's `args`:
+/// `$SHELL`, then `/bin/sh`.
+#[cfg(unix)]
+fn default_program(args: &[String]) -> (String, Vec<String>) {
+    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    (program, args.to_vec())
+}
+
+/// The program a profile with no `command` runs, with the profile's `args`
+/// after its own: PowerShell 7, Windows PowerShell, `%COMSPEC%` or `cmd.exe`.
+#[cfg(windows)]
+fn default_program(args: &[String]) -> (String, Vec<String>) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let comspec = std::env::var("COMSPEC").ok();
+    let (program, mut own) = cmdline::windows_default_program(std::env::split_paths(&path), comspec.as_deref());
+    own.extend_from_slice(args);
+    (program, own)
+}
 
 /// Environment for programs started by Brindle (shells and tmux alike).
 pub fn child_env(profile: &Profile) -> HashMap<String, String> {

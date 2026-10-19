@@ -132,7 +132,12 @@ fn main() {
         println!("perf: {} doesn't exist; run `cargo build --release` (or set BRINDLE_PERF_BIN)", bin.display());
         std::process::exit(1);
     }
+    if cfg!(not(target_os = "linux")) {
+        println!("perf: the cases need X11 and tmux, so they run on Linux only");
+        return;
+    }
     let display = std::env::var("BRINDLE_PERF_DISPLAY").unwrap_or_else(|_| ":0".into());
+    #[cfg(target_os = "linux")]
     if x11rb::connect(Some(&display)).is_err() {
         println!("perf: no X display at {display}");
         std::process::exit(1);
@@ -156,6 +161,7 @@ fn main() {
     std::fs::create_dir_all(&run_dir).expect("run directory");
     let latest = root.join("latest");
     std::fs::remove_file(&latest).ok();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&stamp, &latest).ok();
 
     let mut summary = Summary::default();

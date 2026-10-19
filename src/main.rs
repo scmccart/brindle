@@ -1,3 +1,7 @@
+// A GUI program on Windows, so launching it opens no console window (see
+// `console_output`). Test builds keep the console subsystem.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod actions;
 mod config;
 mod config_edit;
@@ -6,6 +10,7 @@ mod find_bar;
 mod latency;
 mod notify;
 mod picker;
+mod primary;
 mod session;
 mod settings;
 mod settings_dialog;
@@ -16,6 +21,8 @@ mod text_input;
 mod theme;
 mod tmux;
 mod tmux_view;
+#[cfg(windows)]
+mod win;
 mod workspace;
 
 use std::path::PathBuf;
@@ -50,9 +57,10 @@ OPTIONS:
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
         --shell-integration <SHELL>
-                                 Print the bash, zsh or fish integration script
-                                 (OSC 133 prompt marks) and exit, e.g. in
-                                 ~/.bashrc: eval \"$(brindle --shell-integration bash)\"
+                                 Print the bash, zsh, fish or pwsh (PowerShell)
+                                 integration script (OSC 133 prompt marks) and
+                                 exit, e.g. in ~/.bashrc:
+                                 eval \"$(brindle --shell-integration bash)\"
         --install-desktop        Add Brindle to the desktop's launcher, then exit
         --uninstall-desktop      Remove it from the launcher, then exit
         --prefix <DIR>           With the two above: use DIR/share instead of
@@ -68,6 +76,8 @@ DEBUGGING:
                                  (e.g. ctrl-3,0); in-process, not OS input
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
+        --wait-for <TEXT>        Hold the later steps until the active terminal shows
+                                 TEXT (\\n = a line break), for at most 30s
                                  Steps run in order, 1s apart
         --step-interval <S>      Run the steps S seconds apart instead (default 1)
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
@@ -83,6 +93,7 @@ const SHELL_SCRIPTS: &[(&str, &str)] = &[
     ("bash", include_str!("../shell-integration/brindle.bash")),
     ("zsh", include_str!("../shell-integration/brindle.zsh")),
     ("fish", include_str!("../shell-integration/brindle.fish")),
+    ("pwsh", include_str!("../shell-integration/brindle.ps1")),
 ];
 
 #[derive(Debug, Clone)]
@@ -92,14 +103,21 @@ enum Step {
     /// `--hover` / `--click`, or the reason the position didn't parse.
     Pointer(Result<terminal_view::PointerStep, String>),
     Find(String),
+    /// `--wait-for`: the text the active terminal must show before the
+    /// steps after it run.
+    WaitFor(String),
 }
+
+/// How long a `--wait-for` step waits before giving up.
+const WAIT_FOR_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Default, Debug)]
 struct Args {
     command: Option<(String, Vec<String>)>,
     profile: Option<String>,
     cwd: Option<PathBuf>,
-    /// `--send` / `--action` / `--find` steps, run in order one second apart.
+    /// `--send` / `--action` / `--find` / `--wait-for` steps, run in order one
+    /// second apart.
     steps: Vec<Step>,
     /// `--step-interval`: the steps' spacing in seconds, when not one.
     step_interval: Option<f64>,
@@ -125,20 +143,24 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
+                console_output();
                 print!("{HELP}");
                 std::process::exit(0);
             }
             "-V" | "--version" => {
+                console_output();
                 println!("brindle {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--list-actions" => {
+                console_output();
                 for name in actions::action_names() {
                     println!("{name}");
                 }
                 std::process::exit(0);
             }
             "--list-themes" => {
+                console_output();
                 for name in theme::BUILTIN_THEMES {
                     println!("{name}");
                 }
@@ -148,6 +170,7 @@ fn parse_args() -> Args {
                 let shell = it.next().unwrap_or_default();
                 match SHELL_SCRIPTS.iter().find(|(name, _)| *name == shell) {
                     Some((_, script)) => {
+                        console_output();
                         print!("{script}");
                         std::process::exit(0);
                     }
@@ -183,6 +206,7 @@ fn parse_args() -> Args {
                 args.steps.push(Step::Pointer(terminal_view::PointerStep::parse(&pos, click)));
             }
             "--find" => args.steps.extend(it.next().map(Step::Find)),
+            "--wait-for" => args.steps.extend(it.next().map(|s| Step::WaitFor(unescape(&s)))),
             "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
                 _ => usage_error("--step-interval needs a positive number of seconds"),
@@ -213,8 +237,18 @@ fn parse_args() -> Args {
 }
 
 fn usage_error(message: &str) -> ! {
+    console_output();
     eprintln!("brindle: {message}\n\n{HELP}");
     std::process::exit(2);
+}
+
+/// Called before printing on a path that exits right after. On Windows,
+/// where Brindle is a GUI program with no console of its own, it attaches
+/// to the console Brindle was started from. A GUI session never attaches
+/// while it runs, so ctrl-c in that console, or closing it, can't end it.
+fn console_output() {
+    #[cfg(windows)]
+    win::attach_parent_console();
 }
 
 fn unescape(s: &str) -> String {
@@ -385,12 +419,17 @@ fn main() {
     let args = parse_args();
     // Desktop registration needs no display, so it runs before GPUI starts.
     if let Some(request) = &args.desktop {
+        console_output();
         if let Err(err) = desktop::run(request) {
             eprintln!("brindle: {err:#}");
             std::process::exit(1);
         }
         return;
     }
+
+    // Before any window: windows, shortcuts and toasts share one identity.
+    #[cfg(windows)]
+    win::set_app_id();
 
     Application::new().run(move |cx: &mut App| {
         let (config, error) = Config::load_or_default();
@@ -413,11 +452,13 @@ fn main() {
         .detach();
         if args.latency_log.is_some() || args.latency_bench.is_some() {
             if let Err(err) = Latency::install(args.latency_log.as_deref(), cx) {
+                console_output();
                 eprintln!("brindle: --latency-log: {err}");
                 std::process::exit(1);
             }
             cx.on_app_quit(|cx| {
                 if let Some(summary) = Latency::log_summary(cx) {
+                    console_output();
                     eprint!("{summary}");
                 }
                 async {}
@@ -471,6 +512,10 @@ fn main() {
             cx.background_executor().timer(interval / 2).await;
             for step in steps {
                 cx.background_executor().timer(interval).await;
+                if let Step::WaitFor(text) = &step {
+                    wait_for_text(window, text, cx).await;
+                    continue;
+                }
                 window
                     .update(cx, |ws, window, cx| match &step {
                         Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
@@ -481,12 +526,14 @@ fn main() {
                         },
                         Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
                         Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
+                        Step::WaitFor(_) => {}
                     })
                     .ok();
             }
             if let Some(samples) = latency_bench {
                 latency_bench_run(window, samples, cx).await;
                 cx.update(|cx| {
+                    console_output();
                     print!("{}", Latency::summary(cx));
                     cx.quit();
                 })
@@ -497,6 +544,7 @@ fn main() {
         if let Some(secs) = args.dump_after {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
+                console_output();
                 window
                     .update(cx, |ws, window, cx| {
                         print!("{}", ws.dump_active_screen(window, cx));
@@ -508,6 +556,24 @@ fn main() {
             .detach();
         }
     });
+}
+
+/// `--wait-for`: polls the active terminal's screen until it shows `text`,
+/// for at most [`WAIT_FOR_LIMIT`].
+async fn wait_for_text(window: gpui::WindowHandle<Workspace>, text: &str, cx: &mut gpui::AsyncApp) {
+    let deadline = std::time::Instant::now() + WAIT_FOR_LIMIT;
+    loop {
+        let shown = window.update(cx, |ws, _, cx| ws.active_screen_text(cx).is_some_and(|screen| screen.contains(text)));
+        match shown {
+            // A closed window has nothing to wait for.
+            Ok(true) | Err(_) => return,
+            Ok(false) if std::time::Instant::now() >= deadline => {
+                log::warn!("--wait-for: {text:?} didn't appear within {}s", WAIT_FOR_LIMIT.as_secs());
+                return;
+            }
+            Ok(false) => cx.background_executor().timer(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// `--latency-bench`: types `samples` keystrokes (after a warm-up) into the

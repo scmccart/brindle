@@ -1,5 +1,10 @@
 //! The cases. Each is one function; `all` lists them in run order.
+//!
+//! Windows runs only its own cases (`win`): the others need tmux and X11.
+#![cfg_attr(windows, allow(dead_code))]
 
+#[cfg(windows)]
+mod win;
 mod colors;
 mod commands;
 mod dividers;
@@ -29,6 +34,13 @@ use crate::tmux::TmuxServer;
 use crate::{Case, Result};
 
 pub fn all() -> Vec<Case> {
+    #[cfg(windows)]
+    return win::all();
+    #[cfg(not(windows))]
+    unix()
+}
+
+fn unix() -> Vec<Case> {
     let display = |name, run| Case { name, display: true, run };
     let headless = |name, run| Case { name, display: false, run };
     vec![

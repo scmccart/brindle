@@ -1,5 +1,6 @@
-# Unit tests, a release build, and the end-to-end suite on two tmux versions.
-# The e2e jobs are advisory: they go red on failure but aren't required checks.
+# Unit tests, a release build, and the end-to-end suite on two tmux versions,
+# plus a Windows build and tests. The e2e jobs are advisory: they go red on
+# failure but aren't required checks.
 #
 # Every push and every pull request runs it. Dependabot's branches always
 # have a PR, so their pushes are skipped instead of running twice.
@@ -54,6 +55,17 @@ jobs:
             base=$BEFORE
           fi
           scripts/lint-commits ${base:+"$base"}
+      # The Windows icons are rendered from the SVG and committed
+      # (scripts/render-icons.sh), so the SVG's last change must be in or
+      # before the .ico's.
+      - name: Check the Windows icons are rendered from the current SVG
+        run: |
+          svg=$(git log -1 --format=%H -- assets/brindle.svg)
+          ico=$(git log -1 --format=%H -- assets/windows/brindle.ico)
+          if [ -z "$ico" ] || ! git merge-base --is-ancestor "$svg" "$ico"; then
+            echo "assets/brindle.svg changed after assets/windows/brindle.ico: run scripts/render-icons.sh and commit its output" >&2
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-26.04
@@ -92,6 +104,136 @@ jobs:
         with:
           shared-key: release
       - run: cargo build --release --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      # GPUI's release build compiles its shaders with fxc.exe, which it
+      # otherwise looks for only on PATH and in one SDK version's directory.
+      - name: Find fxc.exe
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $fxc) { throw "no fxc.exe in the Windows SDK" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      # The packaged ConPTY that build.rs embeds.
+      - run: scripts/fetch-conpty.ps1
+        shell: pwsh
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+      - name: e2e harness self-test
+        run: cargo test --locked --test e2e -- --self-test
+        env:
+          BRINDLE_E2E: "1"
+      - name: perf harness self-test
+        run: cargo test --locked --test perf -- --self-test
+        env:
+          BRINDLE_PERF: "1"
+      - name: Version resource, icon and DPI manifest in brindle.exe
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $info = (Get-Item $exe).VersionInfo
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version) {
+            throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)', expected Brindle $version"
+          }
+          # Icon group 1 (RT_GROUP_ICON is 14) with all 8 sizes. Extracting
+          # the icon proves nothing: Windows supplies a default one.
+          Add-Type -Namespace Res -Name Api -MemberDefinition @'
+          [DllImport("kernel32", CharSet = CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
+          [DllImport("kernel32")] public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+          [DllImport("kernel32")] public static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+          [DllImport("kernel32")] public static extern IntPtr LockResource(IntPtr data);
+          '@
+          $module = [Res.Api]::LoadLibraryExW($exe, 0, 2) # LOAD_LIBRARY_AS_DATAFILE
+          $group = [Res.Api]::FindResourceW($module, 1, 14)
+          if ($group -eq 0) { throw 'no icon in brindle.exe' }
+          $count = [Runtime.InteropServices.Marshal]::ReadInt16([Res.Api]::LockResource([Res.Api]::LoadResource($module, $group)), 4)
+          if ($count -ne 8) { throw "the icon has $count sizes, expected 8" }
+          # GPUI embeds the manifest; without it the window renders blurry above 100% scale.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
+          if (-not (Select-String -Path manifest.xml -Pattern 'PerMonitorV2' -Quiet)) { throw 'no PerMonitorV2 in the manifest' }
+      # brindle.exe is a GUI program, so PowerShell waits for it only
+      # through Start-Process -Wait.
+      - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Brindle.lnk'
+          function Run($arguments) { (Start-Process $exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow).ExitCode }
+          if ((Run '--install-desktop') -ne 0 -or -not (Test-Path $lnk)) { throw 'install failed' }
+          $item = (New-Object -ComObject Shell.Application).Namespace((Split-Path $lnk)).ParseName('Brindle.lnk')
+          $id = $item.ExtendedProperty('System.AppUserModel.ID')
+          if ($id -ne 'Brindle.Terminal') { throw "AppUserModelID is '$id'" }
+          $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          if ($target -ne $exe) { throw "target is '$target'" }
+          # Through a symlink, as WinGet runs it: the shortcut starts the
+          # link, and takes its icon from the exe, since the shell reads no
+          # icon through a link.
+          New-Item -ItemType Directory -Force target/links | Out-Null
+          $link = (New-Item -ItemType SymbolicLink -Force -Path target/links/brindle.exe -Target $exe).FullName
+          $code = (Start-Process $link -ArgumentList '--install-desktop' -Wait -PassThru -NoNewWindow).ExitCode
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          if ($code -ne 0 -or $shortcut.TargetPath -ne $link) { throw "through a link: exit $code, target '$($shortcut.TargetPath)'" }
+          if ($shortcut.IconLocation -ne "$exe,0") { throw "through a link: icon '$($shortcut.IconLocation)'" }
+          if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
+          if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
+          if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
+      # A Windows release is one zip (brindle.exe needs nothing beside it),
+      # plus the WinGet manifest for it. Publishing both is a release step.
+      - name: Release zip and WinGet manifest
+        shell: pwsh
+        run: |
+          winget --version
+          $zip = scripts/package-windows.ps1
+          $manifest = scripts/winget-manifest.ps1 -Zip $zip
+          winget validate --disable-interactivity --manifest $manifest
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed for $manifest" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: target/dist/*.zip
+          retention-days: 14
+
+  # The Windows cases of the end-to-end suite, on the runner's desktop.
+  # Advisory, like the Linux e2e jobs.
+  windows-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      - run: scripts/fetch-conpty.ps1
+        shell: pwsh
+      - name: Build
+        run: cargo test --locked --test e2e --no-run
+      - name: End-to-end suite
+        run: cargo test --locked --test e2e
+        env:
+          BRINDLE_E2E: "1"
+          BRINDLE_E2E_SLOW: "2"
+      - name: Upload the suite's output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-windows
+          path: target/tmp/e2e/
+          retention-days: 14
 
   e2e:
     name: e2e (tmux ${{ matrix.tmux.version }}, ${{ matrix.shard }}/4)

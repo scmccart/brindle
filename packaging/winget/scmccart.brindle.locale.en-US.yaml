@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: scmccart.brindle
+PackageVersion: "{{version}}"
+PackageLocale: en-US
+Publisher: scmccart
+PublisherUrl: https://github.com/scmccart
+PackageName: Brindle
+PackageUrl: https://github.com/scmccart/brindle
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/scmccart/brindle#license
+ShortDescription: A GPU-accelerated terminal emulator built on GPUI, with tabs, profiles and first-class tmux support
+Moniker: brindle
+Tags:
+  - terminal
+  - terminal-emulator
+  - tmux
+  - conpty
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

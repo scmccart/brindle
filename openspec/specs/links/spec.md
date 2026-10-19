@@ -77,7 +77,7 @@ While ctrl is held (without alt) and the mouse is over a link in a terminal, tha
 - **THEN** the underline goes away and the pointer goes back to the text pointer
 
 ### Requirement: Opening links
-A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. Brindle SHALL pass the link as a single argument to `xdg-open`, or to the program named by the `BRINDLE_LINK_OPENER` environment variable when it is set, without waiting for it to finish. Brindle SHALL NOT open an OSC 8 URI that has no valid scheme. A failure to start the opener SHALL be logged.
+A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. When the `BRINDLE_LINK_OPENER` environment variable is set, Brindle SHALL pass the link as a single argument to the program it names. Otherwise it SHALL pass the link as a single argument to `xdg-open` on Linux, and on Windows have the shell open it with the link's default handler. It SHALL do this without waiting for it to finish. Brindle SHALL NOT open an OSC 8 URI that has no valid scheme. A failure to start the opener SHALL be logged.
 
 #### Scenario: Ctrl-click
 - **WHEN** the user ctrl-clicks `https://example.com` in a shell
@@ -90,6 +90,10 @@ A left click with ctrl held (without alt) on a link SHALL open the link when the
 #### Scenario: Opener override
 - **WHEN** `BRINDLE_LINK_OPENER=/tmp/record` is set and the user ctrl-clicks a link
 - **THEN** `/tmp/record` runs with the link as its only argument
+
+#### Scenario: Ctrl-click on Windows
+- **WHEN** the user ctrl-clicks `https://example.com/a?b=1&c=2` in a Windows tab
+- **THEN** the default browser opens exactly that URL, including the `&c=2`, and no console window appears
 
 ### Requirement: Links take ctrl-clicks from mouse reporting
 When the program has turned on mouse reporting, a ctrl-click on a link SHALL open it and SHALL NOT be reported to the program, neither the press nor the release. A ctrl-click anywhere else SHALL still be reported as before.

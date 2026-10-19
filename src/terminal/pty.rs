@@ -8,8 +8,11 @@
 //! with nothing buffered as "no more for now" and goes back to its
 //! level-triggered poll, so the loop keeps doing everything else (polling,
 //! the write queue, resize, child exit, drain on exit) unchanged.
+//!
+//! On Unix, [`MarkedPty`] wraps alacritty's `Pty` and reads a clone of its
+//! master. On Windows it wraps Brindle's own pseudoconsole
+//! ([`super::conpty`]), whose output pipe it reads directly.
 
-use std::fs::File;
 use std::io::{self, Read};
 use std::sync::Arc;
 
@@ -29,9 +32,9 @@ use super::shell_integration::{Marks, Parser};
 /// Bytes read from the PTY per call (alacritty locks for up to 64 KiB too).
 const READ_SIZE: usize = 0x1_0000;
 
-pub struct ParsingReader {
+pub struct ParsingReader<R> {
     /// The PTY, scanned for OSC 9/777 notifications as it is read.
-    file: ScanReader<File>,
+    file: ScanReader<R>,
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Parser>>,
     marks: Arc<Mutex<Marks>>,
@@ -39,7 +42,21 @@ pub struct ParsingReader {
     buf: Box<[u8]>,
 }
 
-impl Read for ParsingReader {
+impl<R> ParsingReader<R> {
+    fn new(
+        file: R,
+        term: Arc<FairMutex<Term<Listener>>>,
+        parser: Arc<Mutex<Parser>>,
+        marks: Arc<Mutex<Marks>>,
+        listener: Listener,
+        tx: UnboundedSender<ChannelEvent>,
+    ) -> Self {
+        let file = ScanReader::new(file, tx);
+        Self { file, term, parser, marks, listener, buf: vec![0; READ_SIZE].into_boxed_slice() }
+    }
+}
+
+impl<R: Read> Read for ParsingReader<R> {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(&mut self.buf)?;
         if n == 0 {
@@ -61,11 +78,13 @@ impl Read for ParsingReader {
 }
 
 /// alacritty's `Pty` with a [`ParsingReader`].
+#[cfg(unix)]
 pub struct MarkedPty {
     pty: tty::Pty,
-    reader: ParsingReader,
+    reader: ParsingReader<std::fs::File>,
 }
 
+#[cfg(unix)]
 impl MarkedPty {
     pub fn new(
         pty: tty::Pty,
@@ -76,16 +95,15 @@ impl MarkedPty {
         tx: UnboundedSender<ChannelEvent>,
     ) -> io::Result<Self> {
         // Same open file description, so the same non-blocking flag.
-        let file = ScanReader::new(pty.file().try_clone()?, tx);
-        let reader =
-            ParsingReader { file, term, parser, marks, listener, buf: vec![0; READ_SIZE].into_boxed_slice() };
-        Ok(Self { pty, reader })
+        let file = pty.file().try_clone()?;
+        Ok(Self { reader: ParsingReader::new(file, term, parser, marks, listener, tx), pty })
     }
 }
 
+#[cfg(unix)]
 impl EventedReadWrite for MarkedPty {
-    type Reader = ParsingReader;
-    type Writer = File;
+    type Reader = ParsingReader<std::fs::File>;
+    type Writer = std::fs::File;
 
     unsafe fn register(&mut self, poll: &Arc<Poller>, interest: Event, mode: PollMode) -> io::Result<()> {
         // SAFETY: forwarded unchanged; the inner PTY outlives its registration
@@ -101,23 +119,105 @@ impl EventedReadWrite for MarkedPty {
         self.pty.deregister(poll)
     }
 
-    fn reader(&mut self) -> &mut ParsingReader {
+    fn reader(&mut self) -> &mut Self::Reader {
         &mut self.reader
     }
 
-    fn writer(&mut self) -> &mut File {
+    fn writer(&mut self) -> &mut std::fs::File {
         self.pty.writer()
     }
 }
 
+#[cfg(unix)]
 impl EventedPty for MarkedPty {
     fn next_child_event(&mut self) -> Option<ChildEvent> {
         self.pty.next_child_event()
     }
 }
 
+#[cfg(unix)]
 impl OnResize for MarkedPty {
     fn on_resize(&mut self, size: WindowSize) {
         self.pty.on_resize(size)
+    }
+}
+
+/// Brindle's pseudoconsole with a [`ParsingReader`] on its output.
+#[cfg(windows)]
+pub struct MarkedPty {
+    // First, so it is released and closed (if the tab is done with it too)
+    // before the pipes drop.
+    console: Arc<super::conpty::Pseudoconsole>,
+    reader: ParsingReader<super::conpty::PipeReader>,
+    writer: super::conpty::PipeWriter,
+    child: super::conpty::ChildWatcher,
+}
+
+#[cfg(windows)]
+impl MarkedPty {
+    pub fn new(
+        spawned: super::conpty::Spawned,
+        term: Arc<FairMutex<Term<Listener>>>,
+        parser: Arc<Mutex<Parser>>,
+        marks: Arc<Mutex<Marks>>,
+        listener: Listener,
+        tx: UnboundedSender<ChannelEvent>,
+    ) -> Self {
+        let super::conpty::Spawned { console, reader, writer, child, .. } = spawned;
+        Self { console, reader: ParsingReader::new(reader, term, parser, marks, listener, tx), writer, child }
+    }
+
+    /// The event loop wakes on completion packets, so every registration
+    /// just records what to post.
+    fn watch(&mut self, poll: &Arc<Poller>, mut interest: Event) {
+        interest.key = tty::PTY_READ_WRITE_TOKEN;
+        self.reader.file.get_ref().register(poll, interest);
+        self.writer.register(poll, interest);
+        self.child.register(poll, tty::PTY_CHILD_EVENT_TOKEN);
+    }
+}
+
+#[cfg(windows)]
+impl EventedReadWrite for MarkedPty {
+    type Reader = ParsingReader<super::conpty::PipeReader>;
+    type Writer = super::conpty::PipeWriter;
+
+    unsafe fn register(&mut self, poll: &Arc<Poller>, interest: Event, _: PollMode) -> io::Result<()> {
+        self.watch(poll, interest);
+        Ok(())
+    }
+
+    fn reregister(&mut self, poll: &Arc<Poller>, interest: Event, _: PollMode) -> io::Result<()> {
+        self.watch(poll, interest);
+        Ok(())
+    }
+
+    fn deregister(&mut self, _: &Arc<Poller>) -> io::Result<()> {
+        self.reader.file.get_ref().deregister();
+        self.writer.deregister();
+        self.child.deregister();
+        Ok(())
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        &mut self.reader
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        &mut self.writer
+    }
+}
+
+#[cfg(windows)]
+impl EventedPty for MarkedPty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.child.next_event()
+    }
+}
+
+#[cfg(windows)]
+impl OnResize for MarkedPty {
+    fn on_resize(&mut self, size: WindowSize) {
+        self.console.resize(size)
     }
 }

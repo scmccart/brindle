@@ -6,7 +6,7 @@ Attach to a tmux session in control mode and present it natively: each tmux wind
 ## Requirements
 
 ### Requirement: Attach to a session
-Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux -u [tmux_args] -C new-session -A -s <session>`, creating the session if needed. Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown by at most one Brindle window, also when several Brindle processes run (see "Session shown by another Brindle"). Opening a control profile whose session is already attached in the current window SHALL make one of its tabs active. When it is attached in another window, Brindle SHALL NOT attach it again. Picking the profile in the new-tab palette, which says beforehand that the session is open in another window, SHALL go to that session as "Go to <session>" does, without asking. The other ways of opening it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere". Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
+Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux -u [tmux_args] -C new-session -A -s <session>`, creating the session if needed. For a WSL profile on Windows, the command line is the one defined by "Control mode through WSL on Windows". Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown by at most one Brindle window, also when several Brindle processes run (see "Session shown by another Brindle"). Opening a control profile whose session is already attached in the current window SHALL make one of its tabs active. When it is attached in another window, Brindle SHALL NOT attach it again. Picking the profile in the new-tab palette, which says beforehand that the session is open in another window, SHALL go to that session as "Go to <session>" does, without asking. The other ways of opening it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere". Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
 
 #### Scenario: Existing session with two windows
 - **WHEN** the user opens a control profile whose session has windows 0 and 1
@@ -388,7 +388,7 @@ What a row opens SHALL go where the action would have opened the profile: a tab 
 - **THEN** the palette closes, no tab or window opens, and no other window is raised
 
 ### Requirement: Create a new session
-A "tmux: New Session" command SHALL prompt for a session name, then create that session and attach it in the current window, beside the window's other tabs. An empty name SHALL let tmux choose the name. The new session SHALL start in the active tab's directory. It SHALL use, in this order, the active tab's control-mode profile, the default profile if it is a control-mode profile, or the first control-mode profile. The command SHALL be available from every tab when the config has at least one control-mode profile, and SHALL NOT be listed otherwise. It has no default keybinding; its action name is `tmux_new_session`.
+A "tmux: New Session" command SHALL prompt for a session name, then create that session and attach it in the current window, beside the window's other tabs. An empty name SHALL let tmux choose the name. The new session SHALL start in the active tab's directory, except with a WSL profile on Windows, as defined by "No Windows directory reaches tmux in WSL". It SHALL use, in this order, the active tab's control-mode profile, the default profile if it is a control-mode profile, or the first control-mode profile. The command SHALL be available from every tab when the config has at least one control-mode profile, and SHALL NOT be listed otherwise. It has no default keybinding; its action name is `tmux_new_session`.
 
 #### Scenario: Named session
 - **WHEN** the user runs "tmux: New Session" from a local tab and enters `work`
@@ -487,7 +487,7 @@ Brindle's control-mode clients SHALL tell tmux they handle UTF-8, whatever local
 - **THEN** Brindle runs `tmux -u -L work -C new-session -A -s <session>`, attaching on the `work` server
 
 ### Requirement: Session shown by another Brindle
-Before attaching a control-mode profile's session by name, Brindle SHALL ask tmux for the session's clients. When one of them is a control client of another running Brindle, Brindle SHALL NOT attach the session, and the window that would have shown it SHALL ask what to open instead. Clients of other programs, and control clients started from a shell, SHALL NOT count. When tmux can't list the session's clients, Brindle SHALL attach it as before.
+Before attaching a control-mode profile's session by name, Brindle SHALL ask tmux for the session's clients. When one of them is a control client of another running Brindle, Brindle SHALL NOT attach the session, and the window that would have shown it SHALL ask what to open instead. Clients of other programs, and control clients started from a shell, SHALL NOT count. When tmux can't list the session's clients, Brindle SHALL attach it as before. On Windows the check SHALL NOT be made, and Brindle SHALL attach the session as before.
 
 #### Scenario: Second launch
 - **WHEN** one Brindle shows session `main`, and a second Brindle is launched whose default profile attaches `main`
@@ -542,3 +542,29 @@ Escape or a click outside SHALL dismiss the palette without opening anything. Wh
 #### Scenario: Asked after a session ended
 - **WHEN** `tmux_session_end` is `ask`, session `work` ended, the user chooses "New tab: tmux" for session `main`, which another Brindle shows, and then chooses "New tab: Shell"
 - **THEN** a `Shell` tab opens and `work`'s ended tabs close
+
+### Requirement: Control mode through WSL on Windows
+On Windows, a control-mode profile whose command is `wsl` or `wsl.exe` SHALL run tmux inside WSL, with all control-mode behaviour the same as on Linux. Its `tmux_args` are WSL's options, then `tmux`, then tmux's options. If `tmux` is absent, all of them are WSL's options. Brindle SHALL run `wsl <WSL options> --exec tmux -u <tmux options> -C …`, adding `--exec` only when the WSL options don't end with `--exec` or `-e`.
+
+#### Scenario: Attach through WSL
+- **WHEN** a Windows profile sets `tmux = "control"`, `command = "wsl"` and `tmux_args = ["tmux"]`, and the user opens it
+- **THEN** Brindle runs `wsl --exec tmux -u -C new-session -A -s main`, and each window of that WSL session appears as a native tab with its panes drawn natively
+
+#### Scenario: Distribution and server
+- **WHEN** the profile's `tmux_args` are `["-d", "Ubuntu", "tmux", "-L", "work"]`
+- **THEN** Brindle runs `wsl -d Ubuntu --exec tmux -u -L work -C new-session -A -s main`
+
+#### Scenario: No tmux element
+- **WHEN** the profile's `tmux_args` are `["-d", "Debian"]`
+- **THEN** Brindle runs `wsl -d Debian --exec tmux -u -C new-session -A -s main`
+
+#### Scenario: Session checks go through WSL too
+- **WHEN** the user runs "tmux: New Session" with such a profile and enters `logs`
+- **THEN** the name check runs `wsl --exec tmux has-session -t =logs`, and `logs` is created inside WSL
+
+### Requirement: No Windows directory reaches tmux in WSL
+For a WSL control-mode profile, Brindle SHALL NOT pass a start directory to tmux (`-c`), whichever command attaches or creates the session. New sessions start in tmux's default directory inside WSL.
+
+#### Scenario: No Windows path reaches tmux
+- **WHEN** such a profile is opened from a local tab whose reported directory is `C:\src`
+- **THEN** the tmux command line contains no `-c` argument

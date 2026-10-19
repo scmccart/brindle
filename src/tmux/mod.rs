@@ -413,17 +413,48 @@ pub enum AttachSpec {
     New(Option<String>),
 }
 
-/// The tmux program a profile runs.
-fn tmux_program(profile: &Profile) -> String {
-    profile.command.clone().unwrap_or_else(|| "tmux".into())
+/// How a profile starts tmux: the program, what goes before tmux's own
+/// arguments, and the profile's tmux options.
+struct TmuxCommand {
+    program: String,
+    prefix: Vec<String>,
+    options: Vec<String>,
+    /// Through WSL, where the tab's Windows directories mean nothing.
+    wsl: bool,
+}
+
+/// The profile's tmux. A `wsl` program runs it inside WSL: `tmux_args` are
+/// then WSL's options, `tmux`, and tmux's options (all WSL's when there is
+/// no `tmux`), and tmux runs with `--exec`, without a Linux shell, so
+/// session names reach it verbatim.
+fn tmux_command(profile: &Profile) -> TmuxCommand {
+    let program = profile.command.clone().unwrap_or_else(|| "tmux".into());
+    let wsl = crate::terminal::cmdline::program_stem(&program).eq_ignore_ascii_case("wsl");
+    if !wsl {
+        return TmuxCommand { program, prefix: Vec::new(), options: profile.tmux_args.clone(), wsl };
+    }
+    let split = profile.tmux_args.iter().position(|arg| arg == "tmux");
+    let (wsl_options, options) = match split {
+        Some(at) => (&profile.tmux_args[..at], profile.tmux_args[at + 1..].to_vec()),
+        None => (&profile.tmux_args[..], Vec::new()),
+    };
+    let mut prefix = wsl_options.to_vec();
+    if !matches!(prefix.last().map(String::as_str), Some("--exec" | "-e")) {
+        prefix.push("--exec".into());
+    }
+    prefix.push("tmux".into());
+    TmuxCommand { program, prefix, options, wsl }
 }
 
 /// The tmux command line for attaching to (or creating) a session. `-u`
 /// marks the client UTF-8 whatever the locale: otherwise tmux replaces the
-/// tabs in our `-F` formats, and non-ASCII text, with `_`.
+/// tabs in our `-F` formats, and non-ASCII text, with `_`. Through WSL no
+/// start directory is given: the tab's would be a Windows path.
 pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>) -> (String, Vec<String>) {
-    let mut args = vec!["-u".to_string()];
-    args.extend(profile.tmux_args.iter().cloned());
+    let tmux = tmux_command(profile);
+    let mut args = tmux.prefix;
+    args.push("-u".into());
+    args.extend(tmux.options);
     args.extend(["-C".into(), "new-session".into()]);
     match spec {
         AttachSpec::Named => {
@@ -432,19 +463,21 @@ pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>)
         AttachSpec::New(Some(name)) => args.extend(["-s".into(), name.clone()]),
         AttachSpec::New(None) => {}
     }
-    if let Some(dir) = cwd {
+    if let Some(dir) = cwd.filter(|_| !tmux.wsl) {
         args.push("-c".into());
         args.push(dir.to_string_lossy().into_owned());
     }
-    (tmux_program(profile), args)
+    (tmux.program, args)
 }
 
 /// The command that succeeds when session `name` exists on `profile`'s
 /// server (an exact match, not a prefix).
 pub fn has_session_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
-    let mut args = profile.tmux_args.clone();
+    let tmux = tmux_command(profile);
+    let mut args = tmux.prefix;
+    args.extend(tmux.options);
     args.extend(["has-session".into(), "-t".into(), format!("={name}")]);
-    (tmux_program(profile), args)
+    (tmux.program, args)
 }
 
 /// Set on Brindle's control clients to Brindle's pid, so that another
@@ -456,9 +489,11 @@ pub const CONTROL_CLIENT_MARKER: &str = "BRINDLE_CONTROL_CLIENT";
 /// The command that lists the pids of session `name`'s clients (an exact
 /// match). It fails when there is no such session or no server.
 pub fn list_clients_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
-    let mut args = profile.tmux_args.clone();
+    let tmux = tmux_command(profile);
+    let mut args = tmux.prefix;
+    args.extend(tmux.options);
     args.extend(["list-clients".into(), "-t".into(), format!("={name}"), "-F".into(), "#{client_pid}".into()]);
-    (tmux_program(profile), args)
+    (tmux.program, args)
 }
 
 /// Whether one of `pids`, a session's clients, is another Brindle's
@@ -496,6 +531,11 @@ fn read_process(pid: u32) -> Option<(u32, Vec<u8>)> {
 /// Runs tmux, so it belongs off the UI thread. A missing session or server
 /// means no.
 fn shown_by_another_brindle(profile: &Profile, name: &str) -> bool {
+    // Clients are recognised through /proc, and through WSL the marker
+    // doesn't reach them and their parents aren't Brindle's pid.
+    if cfg!(windows) {
+        return false;
+    }
     let (program, args) = list_clients_command(profile, name);
     let output = Command::new(program)
         .args(args)
@@ -529,7 +569,7 @@ impl SessionKey {
 
     /// Session `name` on `profile`'s server.
     pub fn new(profile: &Profile, name: &str) -> Self {
-        Self { program: tmux_program(profile), tmux_args: profile.tmux_args.clone(), name: name.to_string() }
+        Self { program: tmux_command(profile).program, tmux_args: profile.tmux_args.clone(), name: name.to_string() }
     }
 }
 
@@ -573,6 +613,10 @@ impl TmuxSession {
             .stderr(Stdio::null())
             .envs(crate::terminal::child_env(&profile))
             .env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
+        // Brindle has no console to share: without this, `wsl.exe` (a
+        // console program) would open a window of its own.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
         let starter = Starter { program, command, event_tx, writer_rx };
 
         let reader = cx.spawn(async move |this, cx| {
@@ -1785,6 +1829,64 @@ mod tests {
     #[test]
     fn pane_colour_command_asks_for_one_index() {
         assert_eq!(pane_colour_command(3, 196), r##"display-message -p -t %3 "#{pane-colours[196]}""##);
+    }
+
+    fn wsl_profile(command: &str, tmux_args: &[&str]) -> Profile {
+        Profile {
+            name: "w".into(),
+            command: Some(command.into()),
+            tmux_args: tmux_args.iter().map(|a| a.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wsl_runs_tmux_with_exec_and_u_after_it() {
+        let (program, args) = command_line(&wsl_profile("wsl", &["tmux"]), &AttachSpec::Named, None);
+        assert_eq!(program, "wsl");
+        assert_eq!(args, ["--exec", "tmux", "-u", "-C", "new-session", "-A", "-s", "main"]);
+    }
+
+    #[test]
+    fn wsl_options_go_before_tmux_and_tmux_options_after() {
+        let profile = wsl_profile("WSL.EXE", &["-d", "Ubuntu", "tmux", "-L", "work"]);
+        let (_, args) = command_line(&profile, &AttachSpec::Named, None);
+        assert_eq!(args, ["-d", "Ubuntu", "--exec", "tmux", "-u", "-L", "work", "-C", "new-session", "-A", "-s", "main"]);
+    }
+
+    #[test]
+    fn wsl_without_a_tmux_element() {
+        let (_, args) = command_line(&wsl_profile(r"C:\Windows\System32\wsl.exe", &["-d", "Debian"]), &AttachSpec::Named, None);
+        assert_eq!(args, ["-d", "Debian", "--exec", "tmux", "-u", "-C", "new-session", "-A", "-s", "main"]);
+    }
+
+    #[test]
+    fn wsl_keeps_an_explicit_exec() {
+        let (_, args) = command_line(&wsl_profile("wsl", &["-e", "tmux"]), &AttachSpec::Named, None);
+        assert_eq!(args, ["-e", "tmux", "-u", "-C", "new-session", "-A", "-s", "main"]);
+    }
+
+    #[test]
+    fn wsl_gets_no_start_directory() {
+        let profile = wsl_profile("wsl", &["tmux"]);
+        let (_, args) = command_line(&profile, &AttachSpec::New(Some("logs".into())), Some(&PathBuf::from(r"C:\src")));
+        assert!(!args.contains(&"-c".to_string()), "{args:?}");
+        assert_eq!(args, ["--exec", "tmux", "-u", "-C", "new-session", "-s", "logs"]);
+    }
+
+    #[test]
+    fn wsl_session_checks_run_inside_wsl() {
+        let (program, args) = has_session_command(&wsl_profile("wsl", &["tmux"]), "logs");
+        assert_eq!(program, "wsl");
+        assert_eq!(args, ["--exec", "tmux", "has-session", "-t", "=logs"]);
+    }
+
+    #[test]
+    fn a_program_that_isnt_wsl_is_unchanged() {
+        let profile = wsl_profile("/opt/tmux/bin/tmux", &["-L", "x"]);
+        let (_, args) = command_line(&profile, &AttachSpec::Named, Some(&PathBuf::from("/tmp")));
+        assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-A", "-s", "main", "-c", "/tmp"]);
+        assert_eq!(has_session_command(&profile, "s").1, ["-L", "x", "has-session", "-t", "=s"]);
     }
 
     #[test]

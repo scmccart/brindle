@@ -692,6 +692,8 @@ background = "nope"
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // Windows needs Developer Mode or elevation to create symlinks.
+    #[cfg(unix)]
     #[test]
     fn save_writes_through_symlinks() {
         let dir = temp_dir("symlink");

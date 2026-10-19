@@ -12,10 +12,13 @@ use crate::{Ctx, Outcome, Result, ensure};
 
 /// A shell script in the case directory.
 fn script(ctx: &Ctx, name: &str, body: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
     let path = ctx.dir.join(name);
     std::fs::write(&path, format!("#!/bin/sh\n{body}")).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
     Ok(path)
 }
 
@@ -63,7 +66,8 @@ pub fn local_click(ctx: &Ctx) -> Result<Outcome> {
         .click("ctrl-5,4")
         .click("10,0")
         .hover("ctrl-0,1")
-        .capture_at(6.6)
+        // Late in the hover step, so the repaint has landed even under load.
+        .capture_at(6.9)
         .dump_at(7.2)
         .run()?;
 

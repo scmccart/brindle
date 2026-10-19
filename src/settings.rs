@@ -32,9 +32,11 @@ impl Settings {
     pub fn new(config: Config, config_error: Option<String>, cx: &App) -> Self {
         let font_family = resolve_family(&config.font.family, cx);
         log::info!("using font family {font_family:?}");
+        // Only installed ones: GPUI logs an error for each missing family.
+        let installed = cx.text_system().all_font_names();
         let fallbacks = FALLBACK_FAMILIES
             .iter()
-            .filter(|f| **f != font_family)
+            .filter(|f| **f != font_family && installed.iter().any(|have| have == **f))
             .map(|f| f.to_string())
             .collect();
         let font = Font {
@@ -70,7 +72,8 @@ fn resolve_family(preferred: &[String], cx: &App) -> String {
             return found.clone();
         }
     }
-    for fallback in ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Ubuntu Mono"] {
+    // Linux families, then Windows' (Cascadia Mono ships with Windows 11).
+    for fallback in ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Ubuntu Mono", "Cascadia Mono", "Consolas"] {
         if installed.iter().any(|have| have == fallback) {
             return fallback.into();
         }
@@ -83,7 +86,17 @@ fn resolve_family(preferred: &[String], cx: &App) -> String {
 
 fn resolve_ui_family(cx: &App) -> String {
     let installed = cx.text_system().all_font_names();
-    ["Inter", "Cantarell", "Ubuntu Sans", "Ubuntu", "Noto Sans", "DejaVu Sans", "Liberation Sans"]
+    [
+        "Inter",
+        "Cantarell",
+        "Ubuntu Sans",
+        "Ubuntu",
+        "Noto Sans",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Segoe UI Variable Text",
+        "Segoe UI",
+    ]
         .iter()
         .find(|want| installed.iter().any(|have| have == *want))
         .map(|s| s.to_string())
