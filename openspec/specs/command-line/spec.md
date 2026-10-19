@@ -20,7 +20,7 @@ An unknown argument SHALL print usage and exit with status 2.
 - **THEN** a window opens running htop, and closing htop closes the window
 
 ### Requirement: Informational options
-`--help`, `--version`, `--list-actions` (every bindable action name), `--list-themes` (the built-in themes) and `--shell-integration <bash|zsh|fish>` (that shell's integration script) SHALL print their output and exit without opening a window. `--shell-integration` with a missing or unsupported shell SHALL print an error naming the supported shells and exit with status 2.
+`--help`, `--version`, `--list-actions` (every bindable action name), `--list-themes` (the built-in themes) and `--shell-integration <bash|zsh|fish|pwsh>` (that shell's integration script) SHALL print their output and exit without opening a window. `--shell-integration` with a missing or unsupported shell SHALL print an error naming the supported shells and exit with status 2.
 
 #### Scenario: List actions
 - **WHEN** the user runs `brindle --list-actions`
@@ -30,12 +30,17 @@ An unknown argument SHALL print usage and exit with status 2.
 - **WHEN** the user runs `brindle --shell-integration zsh`
 - **THEN** the zsh integration script is printed and the process exits 0 without opening a window
 
+#### Scenario: Print the PowerShell script
+- **WHEN** the user runs `brindle --shell-integration pwsh`
+- **THEN** the PowerShell integration script is printed and the process exits 0 without opening a window
+
 ### Requirement: Debug automation hooks
-For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>` and `--find <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab. `--step-interval <SECONDS>` SHALL space them that many seconds apart instead, with half that interval before the first step, and SHALL be rejected with a usage error unless it is a positive number:
+For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>`, `--find <TEXT>` and `--wait-for <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab. `--step-interval <SECONDS>` SHALL space them that many seconds apart instead, with half that interval before the first step, and SHALL be rejected with a usage error unless it is a positive number:
 - `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette, the settings dialog or the find bar), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
 - `--action` runs a named action;
 - `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
-- `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it.
+- `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it;
+- `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 seconds without it, Brindle SHALL log a warning and run the remaining steps.
 
 `--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
 
@@ -78,6 +83,10 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 #### Scenario: Stretched steps
 - **WHEN** Brindle runs with `--step-interval 2 --send 'a' --send 'b' --dump-screen-after 4`
 - **THEN** the dump shows `a` typed but not `b`, because the steps are due about 3 and 5 seconds after launch
+
+#### Scenario: Waiting for the screen
+- **WHEN** a slow shell shows its first prompt `MYPROMPT>` four seconds after launch, and Brindle runs with `--wait-for 'MYPROMPT>' --send 'cd /tmp\r' --dump-screen-after 8`
+- **THEN** `cd /tmp` is typed at that prompt, about a second after it appears, rather than before the shell is ready
 
 #### Scenario: Invalid interval
 - **WHEN** Brindle runs with `--step-interval 0`
@@ -145,3 +154,29 @@ When the environment variable `BRINDLE_NOTIFY_LOG` names a file, Brindle SHALL a
 #### Scenario: Logged notification
 - **WHEN** Brindle runs with `BRINDLE_NOTIFY_LOG=/tmp/n.log`, `notifications.when = "always"`, and `--send 'printf "\033]9;hi\a"\r'`
 - **THEN** `/tmp/n.log` contains a line `osc9<TAB><tab title><TAB>hi` and no desktop notification appears
+
+### Requirement: No console window on Windows
+On Windows, starting Brindle from the Start Menu, Explorer or a shortcut SHALL NOT open a console window. Programs Brindle starts outside a tab, such as tmux through WSL, the link opener and tmux session checks, SHALL NOT open console windows either.
+
+#### Scenario: Start Menu launch
+- **WHEN** the user starts Brindle from the Start Menu
+- **THEN** only Brindle's window opens, with no console window beside it
+
+#### Scenario: WSL attach opens no console
+- **WHEN** the user opens a control-mode profile whose command is `wsl`
+- **THEN** no console window appears while the session is attached
+
+### Requirement: Console output on Windows
+When Brindle is started from a console on Windows, its informational output, usage errors and `--dump-screen-after` output SHALL appear in that console, or in the file or pipe its output is redirected to. Closing that console, or pressing ctrl-c in it, SHALL NOT close Brindle's windows.
+
+#### Scenario: Version from PowerShell
+- **WHEN** the user runs `brindle --version` in PowerShell
+- **THEN** the version is printed in that PowerShell window
+
+#### Scenario: Launching console closes
+- **WHEN** the user runs `brindle` from PowerShell, then presses ctrl-c in that PowerShell and closes its window
+- **THEN** Brindle's window stays open and keeps working
+
+#### Scenario: Redirected output
+- **WHEN** a test runs `brindle --dump-screen-after 2 > dump.txt` on Windows
+- **THEN** `dump.txt` contains the screen dump

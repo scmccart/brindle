@@ -8,7 +8,7 @@ Let users define named launch configurations (command, directory, environment, l
 ### Requirement: Profile definition
 A profile SHALL be able to set:
 - a name;
-- a command and its arguments (default: `$SHELL`, then `/bin/sh`);
+- a command and its arguments. The default on Linux is `$SHELL`, then `/bin/sh`. On Windows it is `pwsh.exe` when it is on `PATH`, then `powershell.exe`, then `%COMSPEC%`, then `cmd.exe`;
 - a working directory, with `~` expanded;
 - environment variables;
 - a theme;
@@ -20,6 +20,18 @@ There SHALL always be at least one profile; a "Shell" profile is created when th
 #### Scenario: No profiles configured
 - **WHEN** the config defines no profiles
 - **THEN** a single "Shell" profile running the user's shell is available
+
+#### Scenario: Default shell on Windows
+- **WHEN** a profile sets no command on a Windows machine that has PowerShell 7 installed
+- **THEN** its tabs run `pwsh.exe`
+
+#### Scenario: Windows without PowerShell 7
+- **WHEN** a profile sets no command and `pwsh.exe` is not on `PATH`
+- **THEN** its tabs run `powershell.exe`
+
+#### Scenario: Arguments with spaces on Windows
+- **WHEN** a Windows profile sets `command = "pwsh.exe"` and `args = ["-NoExit", "-Command", "Set-Location 'C:\My Files'"]`
+- **THEN** the program receives exactly three arguments, the last one with its spaces intact
 
 ### Requirement: Default profile
 New tabs and windows SHALL use the profile named by `default_profile`, matched case-insensitively. If no profile has that name, the first profile SHALL be used. When that profile is a control-mode profile whose session is already shown in another window (or, for a new window, in any window), Brindle SHALL ask what to open instead, as defined by `tabs`.
