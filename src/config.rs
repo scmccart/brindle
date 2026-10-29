@@ -167,12 +167,15 @@ pub struct NotificationConfig {
     pub osc9: bool,
     /// `OSC 777 ; notify ; title ; body`.
     pub osc777: bool,
+    /// A program status record (OSC 7501) that becomes blocked, done or
+    /// error.
+    pub osc7501: bool,
     pub when: NotifyWhen,
 }
 
 impl Default for NotificationConfig {
     fn default() -> Self {
-        Self { bell: true, osc9: true, osc777: true, when: NotifyWhen::Unfocused }
+        Self { bell: true, osc9: true, osc777: true, osc7501: true, when: NotifyWhen::Unfocused }
     }
 }
 
@@ -429,9 +432,11 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
-        let config = Config::parse("[notifications]\nbell = false\nwhen = \"always\"").unwrap();
+        assert!(config.notifications.osc7501);
+        let config = Config::parse("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
         assert!(!config.notifications.bell);
         assert!(config.notifications.osc9);
+        assert!(!config.notifications.osc7501);
         assert_eq!(config.notifications.when, NotifyWhen::Always);
         assert!(Config::parse("[notifications]\nwhen = \"sometimes\"").is_err());
         assert!(Config::parse("[notifications]\nsound = true").is_err());

@@ -26,6 +26,7 @@ use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
+use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
@@ -58,6 +59,9 @@ pub struct Tab {
     pub content: TabContent,
     pub origin: TabOrigin,
     pub bell: bool,
+    /// The most pressing program status (OSC 7501) in the tab's terminal,
+    /// or in any pane of its tmux window; see [`Workspace::refresh_status`].
+    pub status: Option<State>,
     /// Cached so rendering never probes /proc; see [`Tab::refresh_title`].
     title: SharedString,
     _subscriptions: Vec<Subscription>,
@@ -78,6 +82,7 @@ impl Tab {
             content,
             origin,
             bell: false,
+            status: None,
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
@@ -156,6 +161,14 @@ impl Tab {
 
     fn is_tmux(&self) -> bool {
         matches!(self.content, TabContent::Tmux { .. })
+    }
+
+    /// The most pressing program status across the tab's terminals.
+    fn status_summary(&self, cx: &App) -> Option<State> {
+        match &self.content {
+            TabContent::Terminal(view) => view.read(cx).terminal.read(cx).status().summary(),
+            TabContent::Tmux { view, .. } => view.read(cx).status_summary(cx),
+        }
     }
 }
 
@@ -797,7 +810,7 @@ impl Workspace {
                     cx.subscribe_in(&view, window, |this, _, request: &PromptRequest, window, cx| {
                         this.open_prompt(request.clone(), window, cx)
                     }),
-                    // Bells and notifications from the window's panes.
+                    // Bells, notifications and status from the window's panes.
                     cx.subscribe_in(&view, window, |this, view, event: &TerminalEvent, window, cx| {
                         let tab = this.tabs.iter().position(|t| {
                             matches!(&t.content, TabContent::Tmux { view: v, .. } if v == view)
@@ -961,7 +974,9 @@ impl Workspace {
         };
         match event {
             TerminalEvent::Exited => self.remove_tab(ix, window, cx),
-            TerminalEvent::Bell | TerminalEvent::Notify(_) => self.on_attention(ix, event, window, cx),
+            TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Status(_) => {
+                self.on_attention(ix, event, window, cx)
+            }
             TerminalEvent::TitleChanged => {
                 if self.tabs[ix].refresh_title(&mut None, cx) {
                     cx.notify();
@@ -970,9 +985,10 @@ impl Workspace {
         }
     }
 
-    /// A bell or a notification request from tab `ix`, local or tmux: marks
-    /// the tab for a bell, and raises a desktop notification if the tab
-    /// isn't in front of the user (or the settings say always).
+    /// A bell, a notification request or a program status change from tab
+    /// `ix`, local or tmux: marks the tab (the bell dot, the status dot),
+    /// and raises a desktop notification if the tab isn't in front of the
+    /// user (or the settings say always).
     fn on_attention(&mut self, ix: usize, event: &TerminalEvent, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
@@ -987,6 +1003,11 @@ impl Workspace {
                 (Source::Bell, "", "")
             }
             TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str()),
+            TerminalEvent::Status(notice) => {
+                self.refresh_status(ix, cx);
+                let Some(notice) = notice else { return };
+                (notice.source, notice.title.as_str(), notice.body.as_str())
+            }
             _ => return,
         };
         if !notify::policy::wanted(&Self::settings(cx).notifications, source, visible) {
@@ -997,6 +1018,17 @@ impl Workspace {
         let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
         let request = notify::Request { source, summary, body, window: handle, tab: tab.id };
         Notifier::send(request, cx);
+    }
+
+    /// Recomputes tab `ix`'s status dot from its terminals' records. Unlike
+    /// the bell dot it isn't cleared by activating the tab: it goes when the
+    /// records do (a new report, a new prompt, the user typing).
+    fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let status = self.tabs[ix].status_summary(cx);
+        if self.tabs[ix].status != status {
+            self.tabs[ix].status = status;
+            cx.notify();
+        }
     }
 
     /// Activates the tab with this id, if it is still open (a notification
@@ -1569,6 +1601,7 @@ impl Workspace {
             if let Some(text) = terminal.selection_text() {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
+            out.push_str(&terminal.status().describe());
             out.push_str(&terminal.screen_text());
         }
         if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
@@ -1600,10 +1633,17 @@ impl Workspace {
         // below); GPUI reports server decorations there.
         let csd = matches!(decorations, Decorations::Client { .. }) || cfg!(windows);
 
+        let status_color = |state: State| match state {
+            State::Blocked => t.ansi[3].hsla(),
+            State::Error => t.ansi[1].hsla(),
+            State::Done => t.ansi[2].hsla(),
+            State::Working | State::Idle => muted,
+        };
         let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
             let active = ix == self.active;
             let title = tab.title.clone();
             let bell = tab.bell;
+            let status = tab.status.map(status_color);
             let tmux = tab.is_tmux();
             let dragged = DraggedTab { id: tab.id, title: title.clone(), theme: theme.clone() };
             div()
@@ -1649,6 +1689,7 @@ impl Workspace {
                         .text_ellipsis()
                         .child(title),
                 )
+                .when_some(status, |d, color| d.child(div().size(px(6.0)).rounded_full().bg(color)))
                 .when(bell, |d| d.child(div().size(px(6.0)).rounded_full().bg(accent)))
                 .child(
                     div()

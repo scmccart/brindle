@@ -13,6 +13,7 @@ pub fn wanted(config: &NotificationConfig, source: Source, visible: bool) -> boo
         Source::Bell => config.bell,
         Source::Osc9 => config.osc9,
         Source::Osc777 => config.osc777,
+        Source::Osc7501 => config.osc7501,
     };
     enabled && (config.when == NotifyWhen::Always || !visible)
 }

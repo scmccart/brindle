@@ -461,6 +461,9 @@ pub struct Dump {
     pub input: Option<Input>,
     /// The active terminal's selected text, when there is a selection.
     pub selection: Option<String>,
+    /// The active terminal's program status records (`--- status …`), one
+    /// line each without the prefix.
+    pub status: Vec<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
     /// The tab titles of the other windows (`--- window N tabs=[…]`), by
@@ -507,6 +510,8 @@ impl Dump {
                 dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- selection ") {
                 dump.selection = unquote(rest);
+            } else if let Some(rest) = line.strip_prefix("--- status ") {
+                dump.status.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
@@ -638,6 +643,12 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.selection.as_deref() == Some("one\ntwo \"q\" \x1b"), "selection {:?}", dump.selection);
     ensure!(dump.screen == ["hi"], "screen after selection {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- status state=done app=\"brew\"\n\
+         --- status state=blocked id=\"b\" kind=auth\nhi\n",
+    );
+    ensure!(dump.status == ["state=done app=\"brew\"", "state=blocked id=\"b\" kind=auth"], "status {:?}", dump.status);
+    ensure!(dump.screen == ["hi"], "screen after status {:?}", dump.screen);
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);
