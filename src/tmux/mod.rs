@@ -35,6 +35,8 @@ pub enum TmuxEvent {
     Detached(String),
     /// tmux exited before the session ever attached.
     Failed(String),
+    /// Another Brindle shows the session, so it wasn't attached here.
+    ShownByAnotherBrindle(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,9 +387,21 @@ pub struct TmuxSession {
     quitting: bool,
     _reader: Task<()>,
     _quit: Option<Subscription>,
+    /// Asks tmux whether another Brindle shows the session, before the
+    /// client starts (see [`shown_by_another_brindle`]).
+    _check: Option<Task<()>>,
 }
 
 impl EventEmitter<TmuxEvent> for TmuxSession {}
+
+/// A control client ready to be spawned, kept while the session checks
+/// that no other Brindle shows it.
+struct Starter {
+    program: String,
+    command: Command,
+    event_tx: futures::channel::mpsc::UnboundedSender<Option<Event>>,
+    writer_rx: std::sync::mpsc::Receiver<WriterMessage>,
+}
 
 /// Which session a control client attaches to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,6 +480,77 @@ pub fn has_session_command(profile: &Profile, name: &str) -> (String, Vec<String
     (tmux.program, args)
 }
 
+/// Set on Brindle's control clients to Brindle's pid, so that another
+/// Brindle can tell them from other programs' clients. A server that one of
+/// them starts inherits it, and so do the shells in its panes, which is why
+/// [`other_brindle_client`] also checks the client's parent.
+pub const CONTROL_CLIENT_MARKER: &str = "BRINDLE_CONTROL_CLIENT";
+
+/// The command that lists the pids of session `name`'s clients (an exact
+/// match). It fails when there is no such session or no server.
+pub fn list_clients_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
+    let tmux = tmux_command(profile);
+    let mut args = tmux.prefix;
+    args.extend(tmux.options);
+    args.extend(["list-clients".into(), "-t".into(), format!("={name}"), "-F".into(), "#{client_pid}".into()]);
+    (tmux.program, args)
+}
+
+/// Whether one of `pids`, a session's clients, is another Brindle's
+/// control client: its marker names its parent, which isn't `own`. `read`
+/// gives a process's parent pid and environment. A marker a client
+/// inherited from a pane's shell names a Brindle, but not its parent.
+fn other_brindle_client(pids: &[u32], own: u32, read: impl Fn(u32) -> Option<(u32, Vec<u8>)>) -> bool {
+    pids.iter().any(|&pid| {
+        let Some((parent, environ)) = read(pid) else { return false };
+        parent != own && marker(&environ) == Some(parent)
+    })
+}
+
+/// The pid in a NUL-separated environment's [`CONTROL_CLIENT_MARKER`].
+fn marker(environ: &[u8]) -> Option<u32> {
+    let prefix = format!("{CONTROL_CLIENT_MARKER}=");
+    let value = environ.split(|&b| b == 0).find_map(|var| var.strip_prefix(prefix.as_bytes()))?;
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line. It follows the state, after
+/// the parenthesised name, which may itself hold spaces and `)`.
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A process's parent pid and environment, from `/proc`.
+fn read_process(pid: u32) -> Option<(u32, Vec<u8>)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some((parent_pid(&stat)?, environ))
+}
+
+/// Whether another Brindle shows session `name` of `profile`'s server.
+/// Runs tmux, so it belongs off the UI thread. A missing session or server
+/// means no.
+fn shown_by_another_brindle(profile: &Profile, name: &str) -> bool {
+    // Clients are recognised through /proc, and through WSL the marker
+    // doesn't reach them and their parents aren't Brindle's pid.
+    if cfg!(windows) {
+        return false;
+    }
+    let (program, args) = list_clients_command(profile, name);
+    let output = Command::new(program)
+        .args(args)
+        .envs(crate::terminal::child_env(profile))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output.inspect_err(|e| log::warn!("tmux list-clients: {e}")) else { return false };
+    if !output.status.success() {
+        return false;
+    }
+    let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+    other_brindle_client(&pids, std::process::id(), read_process)
+}
+
 /// Identifies a tmux session: the server (the program and its arguments,
 /// which pick the socket) and the session's name. Profiles that share all
 /// three show the same session.
@@ -526,11 +611,103 @@ impl TmuxSession {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .envs(crate::terminal::child_env(&profile));
+            .envs(crate::terminal::child_env(&profile))
+            .env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
         // Brindle has no console to share: without this, `wsl.exe` (a
         // console program) would open a window of its own.
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
+        let starter = Starter { program, command, event_tx, writer_rx };
+
+        let reader = cx.spawn(async move |this, cx| {
+            let mut events = event_rx.ready_chunks(4096);
+            while let Some(batch) = events.next().await {
+                let alive = this.update(cx, |this, cx| {
+                    for event in batch {
+                        match event {
+                            Some(event) => this.handle_event(event, cx),
+                            None => this.on_detached("tmux exited".into(), cx),
+                        }
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let this = Self {
+            profile,
+            session_name,
+            config: config.clone(),
+            io: Rc::new(RefCell::new(Io { writer: writer_tx, pending: VecDeque::new() })),
+            windows: BTreeMap::new(),
+            panes: HashMap::new(),
+            insets: HashMap::new(),
+            pane_styles: HashMap::new(),
+            titles: HashMap::new(),
+            reported: HashMap::new(),
+            stale: HashSet::new(),
+            active_window: None,
+            client_size: None,
+            child: None,
+            user_commands: 0,
+            attached: false,
+            attach_error: None,
+            detached: false,
+            state_source: None,
+            subscribed: false,
+            poll_state: PollState::default(),
+            polling: false,
+            poll_again: false,
+            poll_timer: None,
+            released: false,
+            quitting: false,
+            _reader: reader,
+            _quit: None,
+            _check: None,
+        };
+        // Quitting may not leave time for `Drop`'s commands to be written, so
+        // leave the session here and wait (briefly) until tmux has them.
+        let quit = cx.on_app_quit(|this: &mut TmuxSession, cx| {
+            this.quitting = true;
+            this.release();
+            let written = this.io.borrow_mut().flush();
+            let timeout = cx.background_executor().timer(std::time::Duration::from_millis(50));
+            async move {
+                futures::future::select(written, timeout).await;
+            }
+        });
+        let mut this = this;
+        this._quit = Some(quit);
+        match (&spec, this.session_name.clone()) {
+            // A session created here can't be shown anywhere else yet.
+            (AttachSpec::New(_), _) | (AttachSpec::Named, None) => this.start(starter, cx),
+            (AttachSpec::Named, Some(name)) => {
+                let profile = this.profile.clone();
+                this._check = Some(cx.spawn(async move |this, cx| {
+                    let check = name.clone();
+                    let shown =
+                        cx.background_executor().spawn(async move { shown_by_another_brindle(&profile, &check) }).await;
+                    this.update(cx, |this, cx| {
+                        if this.quitting {
+                            // Nothing to leave: the client never started.
+                        } else if shown {
+                            this.on_shown_elsewhere(name, cx);
+                        } else {
+                            this.start(starter, cx);
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        }
+        this
+    }
+
+    /// Spawns the control client and asks for the version and the windows.
+    fn start(&mut self, starter: Starter, cx: &mut Context<Self>) {
+        let Starter { program, mut command, event_tx, writer_rx } = starter;
         let mut startup_error = None;
         let child = match command.spawn() {
             Ok(mut child) => {
@@ -590,66 +767,7 @@ impl TmuxSession {
             }
         };
 
-        let reader = cx.spawn(async move |this, cx| {
-            let mut events = event_rx.ready_chunks(4096);
-            while let Some(batch) = events.next().await {
-                let alive = this.update(cx, |this, cx| {
-                    for event in batch {
-                        match event {
-                            Some(event) => this.handle_event(event, cx),
-                            None => this.on_detached("tmux exited".into(), cx),
-                        }
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let this = Self {
-            profile,
-            session_name,
-            config: config.clone(),
-            io: Rc::new(RefCell::new(Io { writer: writer_tx, pending: VecDeque::new() })),
-            windows: BTreeMap::new(),
-            panes: HashMap::new(),
-            insets: HashMap::new(),
-            pane_styles: HashMap::new(),
-            titles: HashMap::new(),
-            reported: HashMap::new(),
-            stale: HashSet::new(),
-            active_window: None,
-            client_size: None,
-            child,
-            user_commands: 0,
-            attached: false,
-            attach_error: None,
-            detached: false,
-            state_source: None,
-            subscribed: false,
-            poll_state: PollState::default(),
-            polling: false,
-            poll_again: false,
-            poll_timer: None,
-            released: false,
-            quitting: false,
-            _reader: reader,
-            _quit: None,
-        };
-        // Quitting may not leave time for `Drop`'s commands to be written, so
-        // leave the session here and wait (briefly) until tmux has them.
-        let quit = cx.on_app_quit(|this: &mut TmuxSession, cx| {
-            this.quitting = true;
-            this.release();
-            let written = this.io.borrow_mut().flush();
-            let timeout = cx.background_executor().timer(std::time::Duration::from_millis(50));
-            async move {
-                futures::future::select(written, timeout).await;
-            }
-        });
-        let mut this = this;
-        this._quit = Some(quit);
+        self.child = child;
         if let Some(err) = startup_error {
             log::error!("{err}");
             // Defer so the workspace has subscribed before we report.
@@ -658,11 +776,18 @@ impl TmuxSession {
             })
             .detach();
         } else {
-            this.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
-            this.list_windows();
+            self.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
+            self.list_windows();
         }
-        this
     }
+
+    /// Another Brindle shows the session: it isn't attached here.
+    fn on_shown_elsewhere(&mut self, name: String, cx: &mut Context<Self>) {
+        log::info!("tmux session {name:?} is shown by another Brindle; not attaching it");
+        self.detached = true;
+        cx.emit(TmuxEvent::ShownByAnotherBrindle(name));
+    }
+
 
     fn send(&self, command: impl Into<String>) {
         self.io.borrow_mut().send(command.into(), Pending::Ignore);
@@ -1784,6 +1909,49 @@ mod tests {
         assert_eq!(command_line(&profile, &named, None).1, ["-u", "-L", "x", "-C", "new-session", "-s", "logs"]);
         let (_, args) = command_line(&profile, &AttachSpec::New(None), Some(&PathBuf::from("/tmp")));
         assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-c", "/tmp"]);
+    }
+
+    #[test]
+    fn list_clients_matches_exactly() {
+        let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
+        let (program, args) = list_clients_command(&profile, "work");
+        assert_eq!(program, "tmux");
+        assert_eq!(args, ["-L", "x", "list-clients", "-t", "=work", "-F", "#{client_pid}"]);
+    }
+
+    #[test]
+    fn parent_pid_follows_the_name() {
+        assert_eq!(parent_pid("4242 (tmux: client) S 4200 4242 4200 0 -1"), Some(4200));
+        assert_eq!(parent_pid("7 (a) b) R 1 7 7"), Some(1));
+        assert_eq!(parent_pid("garbage"), None);
+    }
+
+    #[test]
+    fn other_brindle_clients() {
+        let env = |marker: Option<u32>| {
+            let mut environ = b"TERM=xterm-256color\0".to_vec();
+            if let Some(pid) = marker {
+                environ.extend(format!("{CONTROL_CLIENT_MARKER}={pid}\0").into_bytes());
+            }
+            environ.extend(b"HOME=/home/x\0");
+            environ
+        };
+        let processes: HashMap<u32, (u32, Vec<u8>)> = [
+            (10, (100, env(Some(100)))), // another Brindle's client
+            (11, (1, env(Some(1)))),     // ours (we are pid 1 here)
+            (12, (300, env(Some(100)))), // `tmux -C` from a pane, marker inherited
+            (13, (400, env(None))),      // another program's client
+        ]
+        .into_iter()
+        .collect();
+        let read = |pid| processes.get(&pid).cloned();
+        assert!(other_brindle_client(&[10], 1, read));
+        assert!(other_brindle_client(&[13, 12, 10], 1, read));
+        assert!(!other_brindle_client(&[11], 1, read));
+        assert!(!other_brindle_client(&[12], 1, read));
+        assert!(!other_brindle_client(&[13], 1, read));
+        assert!(!other_brindle_client(&[99], 1, read), "unreadable");
+        assert!(!other_brindle_client(&[], 1, read));
     }
 
     #[test]

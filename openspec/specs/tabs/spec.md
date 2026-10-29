@@ -119,7 +119,7 @@ On Windows these areas SHALL behave like a native caption. This includes Snap wh
 - **THEN** that control responds as it does on Linux, and the window does not start moving
 
 ### Requirement: Multiple windows
-The user SHALL be able to open additional windows (ctrl-shift-n), each with its own tabs, and quit everything with ctrl-shift-q. A new window SHALL open with one tab using the default profile. When the default profile is a control-mode profile whose session is already shown in any window, ctrl-shift-n SHALL NOT open a window directly; it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere" in `tmux-control-mode`.
+The user SHALL be able to open additional windows (ctrl-shift-n), each with its own tabs, and quit everything with ctrl-shift-q. A new window SHALL open with one tab using the default profile. When the default profile is a control-mode profile whose session is already shown in any window of this Brindle, ctrl-shift-n SHALL NOT open a window directly; it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere" in `tmux-control-mode`. When another Brindle shows it instead, the new window SHALL open and ask there, as defined by "Session shown by another Brindle".
 
 #### Scenario: New window
 - **WHEN** the user presses ctrl-shift-n
@@ -128,6 +128,10 @@ The user SHALL be able to open additional windows (ctrl-shift-n), each with its 
 #### Scenario: Default session already open
 - **WHEN** the default profile is the control-mode profile for session `main`, a window shows `main`, and the user presses ctrl-shift-n
 - **THEN** no window opens yet, the current window offers "Go to main", "New tmux session…" and "New window: <profile>" rows, and `tmux list-clients` still shows one Brindle client for `main`
+
+#### Scenario: Default session shown by another Brindle
+- **WHEN** the default profile is the control-mode profile for session `main`, another Brindle shows `main`, and the user presses ctrl-shift-n
+- **THEN** a new window opens with no tabs and asks about `main`, and the current window stays as it was
 
 ### Requirement: New tab with the default profile does not move between windows
 ctrl-shift-t (or the `+` button) in a tab that is not a control-mode tab SHALL open the default profile. When the default profile is a control-mode profile whose session is shown in the current window, its tab SHALL become active. When that session is shown in another window, Brindle SHALL ask what to do, as defined by "Choosing when a session is open elsewhere" in `tmux-control-mode`, and SHALL NOT switch windows unless the user chooses to.
