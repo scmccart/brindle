@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthChar as _;
 use crate::actions::*;
 use crate::picker::{PromptRequest, ready};
 use crate::settings::Settings;
+use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::{CellMetrics, cell_metrics, fit_grid};
 use crate::terminal_view::TerminalView;
@@ -54,7 +55,8 @@ pub struct TmuxWindowView {
 /// Prompted commands ask the workspace to show the prompt.
 impl EventEmitter<PromptRequest> for TmuxWindowView {}
 
-/// Bells and notifications from the window's panes, for the workspace.
+/// Bells, notifications and status changes from the window's panes, for
+/// the workspace.
 impl EventEmitter<TerminalEvent> for TmuxWindowView {}
 
 impl TmuxWindowView {
@@ -113,6 +115,12 @@ impl TmuxWindowView {
         self.session.read(cx).pane_terminal(self.active?)
     }
 
+    /// The most pressing program status across the window's panes, for
+    /// the tab's indicator.
+    pub fn status_summary(&self, cx: &App) -> Option<State> {
+        self.views.values().filter_map(|(view, _)| view.read(cx).terminal.read(cx).status().summary()).max()
+    }
+
     /// Applies a reloaded profile (theme and font size).
     pub fn set_profile(&mut self, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
@@ -168,7 +176,7 @@ impl TmuxWindowView {
                 session.update(cx, |s, cx| s.select_pane(id, cx));
             });
             let forward = cx.subscribe(&terminal, |_, _, event: &TerminalEvent, cx| {
-                if matches!(event, TerminalEvent::Bell | TerminalEvent::Notify(_)) {
+                if matches!(event, TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Status(_)) {
                     cx.emit(event.clone());
                 }
             });

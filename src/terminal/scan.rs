@@ -1,8 +1,9 @@
-//! A reader that scans PTY output for notifications.
+//! A reader that scans PTY output for the sequences Brindle handles beside
+//! the parser (notifications, program status, prompt starts).
 //!
 //! The shell-integration PTY reader (`pty.rs`) reads the PTY through a
-//! [`ScanReader`], so OSC 9/777 are found on alacritty's I/O thread before
-//! the bytes are parsed.
+//! [`ScanReader`], so they are found on alacritty's I/O thread before the
+//! bytes are parsed.
 
 use std::io::{self, Read};
 
@@ -11,7 +12,7 @@ use futures::channel::mpsc::UnboundedSender;
 use super::ChannelEvent;
 use crate::notify::osc::Scanner;
 
-/// Reads from `inner`, reporting the notifications in what it read.
+/// Reads from `inner`, reporting what the scanner finds in what it read.
 pub struct ScanReader<R> {
     inner: R,
     scanner: Scanner,
@@ -32,8 +33,8 @@ impl<R> ScanReader<R> {
 impl<R: Read> Read for ScanReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        for notice in self.scanner.scan(&buf[..n]) {
-            self.tx.unbounded_send(ChannelEvent::Notice(notice)).ok();
+        for found in self.scanner.scan(&buf[..n]) {
+            self.tx.unbounded_send(ChannelEvent::Osc(found)).ok();
         }
         Ok(n)
     }
@@ -46,7 +47,7 @@ mod tests {
     use futures::channel::mpsc::unbounded;
 
     use super::*;
-    use crate::notify::osc::Source;
+    use crate::notify::osc::{Found, Source};
 
     /// Returns one chunk per read, like a PTY delivering output in pieces.
     struct Chunks(VecDeque<&'static [u8]>);
@@ -73,7 +74,7 @@ mod tests {
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"fy;T;B\x07more");
         match rx.try_next() {
-            Ok(Some(ChannelEvent::Notice(notice))) => {
+            Ok(Some(ChannelEvent::Osc(Found::Notice(notice)))) => {
                 assert_eq!(notice.source, Source::Osc777);
                 assert_eq!((notice.title.as_str(), notice.body.as_str()), ("T", "B"));
             }

@@ -11,9 +11,10 @@ fn notifications(ctx: &Ctx) -> Vec<String> {
     text.lines().map(str::to_string).collect()
 }
 
-/// tmux sends no `%bell` to control clients: bells, OSC 9 and OSC 777 from
-/// a pane arrive raw in `%output`, also for a window that isn't current.
-/// `Terminal::feed` relies on this to find them in tmux panes.
+/// tmux sends no `%bell` to control clients: bells, OSC 9, OSC 777 and
+/// OSC 7501 from a pane arrive raw in `%output`, also for a window that
+/// isn't current. `Terminal::feed` relies on this to find them in tmux
+/// panes.
 pub fn tmux_osc_in_output(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let mut client = ControlClient::attach(&server, 100, 30)?;
@@ -23,10 +24,10 @@ pub fn tmux_osc_in_output(ctx: &Ctx) -> Result<Outcome> {
         let pane = server.display("e2e:bg", "#{pane_id}")?;
         ctx.sleep(0.5);
         let mark = client.mark();
-        server.type_line(&pane, r"printf '\033]777;notify;T;B\a\033]9;Hi\a\a'")?;
+        server.type_line(&pane, r"printf '\033]777;notify;T;B\a\033]9;Hi\a\a\033]7501;state=idle\033\\'")?;
         // tmux may put the command's line ending in the same %output line.
         let prefix = format!("%output {pane} ");
-        let want = r"\033]777;notify;T;B\007\033]9;Hi\007\007";
+        let want = r"\033]777;notify;T;B\007\033]9;Hi\007\007\033]7501;state=idle\033\134";
         let line = client.wait_for(ctx, mark, 3.0, |l| l.starts_with(&prefix) && l.contains(want));
         ensure!(line.is_some(), "no %output with the raw sequences from {pane} within 3 s");
         Ok(())

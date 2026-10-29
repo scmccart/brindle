@@ -1,9 +1,13 @@
-//! Finds OSC 9 and OSC 777 notifications in terminal output.
+//! Finds the sequences Brindle acts on beside alacritty's parser, which
+//! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
+//! program status reports, and the OSC 133 `A` prompt starts and `ESC c`
+//! resets that end status records.
 //!
-//! alacritty's parser drops OSCs it doesn't know, so the output is scanned
-//! beside it. The scanner keeps its state between calls, so a sequence split
-//! across reads is still found, and it never buffers anything but the
-//! payload of an OSC 9 or 777.
+//! The scanner keeps its state between calls, so a sequence split across
+//! reads is still found, and it never buffers anything but the payload of
+//! an OSC it wants.
+
+use crate::terminal::status::{self, Message};
 
 /// Where a notification came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -11,6 +15,8 @@ pub enum Source {
     Bell,
     Osc9,
     Osc777,
+    /// A program status record (OSC 7501) that needs the user.
+    Osc7501,
 }
 
 impl Source {
@@ -19,6 +25,7 @@ impl Source {
             Source::Bell => "bell",
             Source::Osc9 => "osc9",
             Source::Osc777 => "osc777",
+            Source::Osc7501 => "osc7501",
         }
     }
 }
@@ -30,6 +37,18 @@ pub struct Notice {
     /// OSC 777's title; empty for OSC 9.
     pub title: String,
     pub body: String,
+}
+
+/// What the scanner found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    Notice(Notice),
+    /// An OSC 7501 report, clear or query.
+    Status(Message),
+    /// OSC 133 `A`: a new shell prompt begins.
+    PromptStart,
+    /// `ESC c`: a full reset.
+    Reset,
 }
 
 /// Payloads longer than this are ignored.
@@ -50,7 +69,7 @@ enum State {
     Esc,
     /// After `ESC ]`, reading the OSC number.
     Number,
-    /// In the payload of an OSC 9 or 777 (`collect`), or of any other OSC.
+    /// In the payload of a wanted OSC (`collect`), or of any other OSC.
     Payload { collect: bool },
     /// ESC inside an OSC: `\` completes it, anything else cancels it.
     PayloadEsc { collect: bool },
@@ -60,7 +79,7 @@ enum State {
 pub struct Scanner {
     state: State,
     number: u32,
-    /// Digits seen in `number`; more than 3 can't be 9 or 777.
+    /// Digits seen in `number`, which must match the wanted number's.
     digits: u8,
     payload: Vec<u8>,
     overflow: bool,
@@ -77,9 +96,8 @@ impl Scanner {
         Self::default()
     }
 
-    /// Scans the next chunk of output and returns the notifications that
-    /// completed in it.
-    pub fn scan(&mut self, bytes: &[u8]) -> Vec<Notice> {
+    /// Scans the next chunk of output and returns what completed in it.
+    pub fn scan(&mut self, bytes: &[u8]) -> Vec<Found> {
         let mut found = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
@@ -96,14 +114,14 @@ impl Scanner {
             }
             let byte = bytes[i];
             i += 1;
-            if let Some(notice) = self.step(byte) {
-                found.push(notice);
+            if let Some(item) = self.step(byte) {
+                found.push(item);
             }
         }
         found
     }
 
-    fn step(&mut self, byte: u8) -> Option<Notice> {
+    fn step(&mut self, byte: u8) -> Option<Found> {
         match self.state {
             State::Ground => {
                 if byte == ESC {
@@ -118,6 +136,10 @@ impl Scanner {
                         State::Number
                     }
                     ESC => State::Esc,
+                    b'c' => {
+                        self.state = State::Ground;
+                        return Some(Found::Reset);
+                    }
                     _ => State::Ground,
                 };
             }
@@ -127,7 +149,8 @@ impl Scanner {
                     self.number = self.number * 10 % 100_000 + u32::from(byte - b'0');
                 }
                 b';' => {
-                    let wanted = self.digits <= 3 && (self.number == 9 || self.number == 777);
+                    // Written as the number is: `0009` isn't 9.
+                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133, 3) | (7501, 4));
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -149,7 +172,7 @@ impl Scanner {
         None
     }
 
-    fn payload_byte(&mut self, byte: u8, collect: bool) -> Option<Notice> {
+    fn payload_byte(&mut self, byte: u8, collect: bool) -> Option<Found> {
         match byte {
             BEL => {
                 self.state = State::Ground;
@@ -173,14 +196,17 @@ impl Scanner {
         None
     }
 
-    fn finish(&mut self, collect: bool) -> Option<Notice> {
+    fn finish(&mut self, collect: bool) -> Option<Found> {
         if !collect || self.overflow {
             return None;
         }
         let payload = std::mem::take(&mut self.payload);
         match self.number {
-            9 => parse_osc9(&payload),
-            777 => parse_osc777(&payload),
+            9 => parse_osc9(&payload).map(Found::Notice),
+            777 => parse_osc777(&payload).map(Found::Notice),
+            // `133;A` may carry options after a `;`.
+            133 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
+            7501 => status::parse(&payload).map(Found::Status),
             _ => None,
         }
     }
@@ -236,16 +262,23 @@ pub fn truncate(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    fn scan(bytes: &[u8]) -> Vec<Notice> {
+    fn scan(bytes: &[u8]) -> Vec<Found> {
         Scanner::new().scan(bytes)
     }
 
-    fn osc9(body: &str) -> Notice {
-        Notice { source: Source::Osc9, title: String::new(), body: body.into() }
+    fn osc9(body: &str) -> Found {
+        Found::Notice(Notice { source: Source::Osc9, title: String::new(), body: body.into() })
     }
 
-    fn osc777(title: &str, body: &str) -> Notice {
-        Notice { source: Source::Osc777, title: title.into(), body: body.into() }
+    fn osc777(title: &str, body: &str) -> Found {
+        Found::Notice(Notice { source: Source::Osc777, title: title.into(), body: body.into() })
+    }
+
+    fn body(found: &Found) -> &str {
+        match found {
+            Found::Notice(notice) => &notice.body,
+            other => panic!("not a notice: {other:?}"),
+        }
     }
 
     #[test]
@@ -272,7 +305,7 @@ mod tests {
         }
         // And one byte at a time.
         let mut scanner = Scanner::new();
-        let found: Vec<Notice> = input.iter().flat_map(|b| scanner.scan(std::slice::from_ref(b))).collect();
+        let found: Vec<Found> = input.iter().flat_map(|b| scanner.scan(std::slice::from_ref(b))).collect();
         assert_eq!(found.len(), 2);
     }
 
@@ -290,7 +323,7 @@ mod tests {
     #[test]
     fn other_oscs_are_ignored() {
         assert!(scan(b"\x1b]0;9;x\x07\x1b]99;x\x07\x1b]7770;notify;a;b\x07\x1b]52;c;aGk=\x07").is_empty());
-        assert!(scan(b"\x1b]0009;x\x07").is_empty());
+        assert!(scan(b"\x1b]0009;x\x07\x1b]07501;state=idle\x07\x1b]75010;state=idle\x07").is_empty());
         // A number with no payload.
         assert!(scan(b"\x1b]9\x07").is_empty());
     }
@@ -334,5 +367,47 @@ mod tests {
         let notice = parse_osc9(long.as_bytes()).unwrap();
         assert_eq!(notice.body.chars().count(), MAX_BODY_CHARS);
         assert!(notice.body.ends_with('…'));
+    }
+
+    #[test]
+    fn program_status() {
+        use crate::terminal::status::{Record, State};
+        let report = Found::Status(Message::Report {
+            id: String::new(),
+            record: Record {
+                state: State::Working,
+                kind: None,
+                progress: None,
+                app: Some("x".into()),
+                title: None,
+                msg: None,
+            },
+        });
+        assert_eq!(scan(b"\x1b]7501;state=working:app=x\x1b\\"), std::slice::from_ref(&report));
+        assert_eq!(scan(b"\x1b]7501;state=working:app=x\x07"), std::slice::from_ref(&report));
+        assert_eq!(scan(b"\x1b]7501;?\x1b\\"), [Found::Status(Message::Query)]);
+        assert_eq!(scan(b"\x1b]7501;state=clear\x07"), [Found::Status(Message::Clear { id: None })]);
+        // Ignored reports yield nothing, and don't disturb what follows.
+        assert_eq!(scan(b"\x1b]7501;state=odd\x07\x1b]9;hi\x07"), [osc9("hi")]);
+        // Split anywhere.
+        let input = b"\x1b]7501;state=working:app=x\x1b\\";
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, std::slice::from_ref(&report), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn prompt_starts_and_resets() {
+        let two_prompts = b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;A;k=i\x1b\\";
+        assert_eq!(scan(two_prompts), [Found::PromptStart, Found::PromptStart]);
+        assert!(scan(b"\x1b]133;D;0\x07\x1b]133;AB\x07").is_empty());
+        assert_eq!(scan(b"a\x1bcb\x1b[0m\x1b]9;x\x07"), [Found::Reset, osc9("x")]);
+        // `ESC c` inside an OSC cancels it, as any other ESC does.
+        assert_eq!(scan(b"\x1b]9;lost\x1bc"), [Found::Reset]);
+        assert!(scan(b"\x1b[c").is_empty(), "DA, not RIS");
+        assert_eq!(body(&scan(b"\x1b]9;hi\x07")[0]), "hi");
     }
 }

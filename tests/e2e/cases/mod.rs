@@ -23,6 +23,7 @@ mod search;
 mod session_end;
 mod settings;
 mod shell;
+mod status;
 mod styles;
 mod titles;
 mod tmux;
@@ -135,6 +136,8 @@ fn unix() -> Vec<Case> {
         display("shell-tmux-clear-up-down", shell::tmux_clear_up_down),
         display("notify-osc-local", notify::osc_local),
         display("notify-tmux-background", notify::tmux_background),
+        display("status-local", status::local),
+        display("status-tmux-pane", status::tmux_pane),
         display("search-local", search::local),
         display("search-step", search::step),
         display("search-long-query", search::long_query),

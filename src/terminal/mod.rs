@@ -19,6 +19,7 @@ mod pty;
 pub mod shell_integration;
 mod scan;
 pub mod search;
+pub mod status;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -46,14 +47,15 @@ use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
-use crate::notify::osc::{Notice, Scanner};
+use crate::notify::osc::{Found, Notice, Scanner};
 use crate::theme::{Color, Theme};
 
 /// What reaches the UI thread from the emulator and the output scanner.
 pub enum ChannelEvent {
     Alac(AlacEvent),
-    /// A notification found in PTY output (on alacritty's I/O thread).
-    Notice(Notice),
+    /// A sequence the scanner found in PTY output (on alacritty's I/O
+    /// thread).
+    Osc(Found),
 }
 
 #[derive(Clone)]
@@ -148,6 +150,9 @@ pub enum TerminalEvent {
     Notify(Notice),
     /// The child process exited (PTY) or the pane closed (remote).
     Exited,
+    /// The program status records (OSC 7501) changed. The notice is set
+    /// when a record now needs the user: blocked, done or error.
+    Status(Option<Notice>),
 }
 
 enum Backend {
@@ -180,6 +185,8 @@ pub struct Terminal {
     size: GridSize,
     title: Option<String>,
     exited: bool,
+    /// Program status records (OSC 7501).
+    status: status::Records,
     pub theme: Theme,
     /// Replace the theme's default colors (set from tmux pane styles).
     pub default_colors: DefaultColors,
@@ -225,7 +232,7 @@ impl Terminal {
                     for event in events {
                         match event {
                             ChannelEvent::Alac(event) => this.handle_event(event, cx),
-                            ChannelEvent::Notice(notice) => cx.emit(TerminalEvent::Notify(notice)),
+                            ChannelEvent::Osc(found) => this.handle_found(found, cx),
                         }
                     }
                     cx.notify();
@@ -260,6 +267,7 @@ impl Terminal {
             size,
             title: None,
             exited: false,
+            status: status::Records::default(),
             theme,
             default_colors: DefaultColors::default(),
             copy_on_select: config.copy_on_select,
@@ -376,15 +384,15 @@ impl Terminal {
         let Backend::Remote { scanner, .. } = &mut self.backend else {
             return;
         };
-        let notices = scanner.scan(bytes);
+        let found = scanner.scan(bytes);
         {
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
             parser.advance(&mut *term, &self.marks, bytes);
             self.output.advance(Instant::now());
         }
-        for notice in notices {
-            cx.emit(TerminalEvent::Notify(notice));
+        for item in found {
+            self.handle_found(item, cx);
         }
         self.last_activity = Instant::now();
         Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
@@ -456,7 +464,43 @@ impl Terminal {
     pub fn mark_exited(&mut self, cx: &mut Context<Self>) {
         if !self.exited {
             self.exited = true;
+            if self.status.end_activity() {
+                cx.emit(TerminalEvent::Status(None));
+            }
             cx.emit(TerminalEvent::Exited);
+        }
+    }
+
+    /// The program status records (OSC 7501).
+    pub fn status(&self) -> &status::Records {
+        &self.status
+    }
+
+    /// Acts on a sequence the scanner found in the output, in stream order.
+    fn handle_found(&mut self, found: Found, cx: &mut Context<Self>) {
+        let changed = match found {
+            Found::Notice(notice) => {
+                cx.emit(TerminalEvent::Notify(notice));
+                return;
+            }
+            Found::Status(status::Message::Query) => {
+                // tmux doesn't answer this one, so a pane's reply goes
+                // through its input like the palette replies.
+                self.write(status::QUERY_REPLY);
+                return;
+            }
+            Found::Status(message) => {
+                let update = self.status.apply(&message);
+                if update.changed {
+                    cx.emit(TerminalEvent::Status(update.notice));
+                }
+                return;
+            }
+            Found::PromptStart => self.status.end_activity(),
+            Found::Reset => self.status.reset(),
+        };
+        if changed {
+            cx.emit(TerminalEvent::Status(None));
         }
     }
 
@@ -536,8 +580,12 @@ impl Terminal {
     }
 
     /// Writes user input: snaps the view back to the prompt and drops the
-    /// selection, like every other terminal.
+    /// selection, like every other terminal. The user has now seen the
+    /// program's `done` and `error` status records.
     pub fn input(&mut self, bytes: impl Into<Cow<'static, [u8]>>, cx: &mut Context<Self>) {
+        if self.status.seen() {
+            cx.emit(TerminalEvent::Status(None));
+        }
         {
             let mut term = self.term.lock();
             if term.grid().display_offset() != 0 {

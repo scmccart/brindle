@@ -435,6 +435,7 @@ desktop. Configure it in `config.toml`:
 bell = true          # bells
 osc9 = true          # OSC 9
 osc777 = true        # OSC 777
+osc7501 = true       # program status (OSC 7501), see below
 when = "unfocused"   # or "always"
 ```
 
@@ -442,6 +443,31 @@ In tmux control mode, bells and notifications from any pane, in any tmux window,
 work the same way. In classic tmux, tmux itself swallows OSC 9 and 777 unless the
 program wraps them in tmux's passthrough (`set -g allow-passthrough on`); bells
 get through.
+
+#### Program status
+
+Programs that speak the [Program Status Protocol][osc7501] (OSC 7501: Claude
+Code, Codex, Terraform, Homebrew, …) tell Brindle what they are doing, and each
+tab shows a dot for it: yellow while the program is **blocked** on you (a
+permission, a question, a login), red when it **failed**, green when it is
+**done** with something you haven't looked at, and grey while it is **working**.
+A `blocked`, `done` or `error` report also raises a desktop notification, with
+the program's message when it sent one. `working` and `blocked` end at the
+program's next shell prompt or when it exits; `done` and `error` stay until you
+type into that tab. Brindle answers the protocol's `OSC 7501 ; ?` query, so
+programs that check first know to report. Any shell can report:
+
+```sh
+status() { printf '\033]7501;state=%s:msg=%s\033\\' "$1" "$(printf %s "$2" | base64 | tr -d '\n')"; }
+status working "Syncing photos"
+rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error "rsync failed"
+```
+
+`notifications.osc7501 = false` keeps the dots and drops the notifications. In
+tmux control mode, reports from any pane reach the window's tab (tmux passes the
+sequence through); classic tmux swallows it like OSC 9.
+
+[osc7501]: https://gist.github.com/mitchellh/7acae3abd8355c1c00287d67e96c913a
 
 On Windows, notifications are toasts from "Brindle". Brindle registers that name
 for your user account the first time it shows one (under
