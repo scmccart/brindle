@@ -1,0 +1,67 @@
+# Spec Delta
+
+## MODIFIED Requirements
+
+### Requirement: Debug automation hooks
+For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>` and `--find <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab. `--step-interval <SECONDS>` SHALL space them that many seconds apart instead, with half that interval before the first step, and SHALL be rejected with a usage error unless it is a positive number:
+- `--send` text is typed as user input, and `\r`, `\n`, `\t` and `\e` are unescaped. While a text input has keyboard focus (in a palette, the settings dialog or the find bar), the text SHALL be inserted into that input at its cursor instead of being sent to the terminal, with control characters dropped;
+- `--action` runs a named action;
+- `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
+- `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it.
+
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
+
+#### Scenario: Scripted check
+- **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
+- **THEN** stdout contains the tab list, a screen header, a grid geometry line, and a line `hi`, and the process exits
+
+#### Scenario: Grid geometry for pixel checks
+- **WHEN** Brindle runs with `--send 'printf "\e[41m \e[0m"\r' --dump-screen-after 3`, and the window is captured before it quits
+- **THEN** the red cell in the capture sits at the dumped origin, offset by the cell size for its row and column and scaled by the dumped scale factor
+
+#### Scenario: Unknown action
+- **WHEN** an `--action` step names an action that does not exist
+- **THEN** an error is logged and the remaining steps still run
+
+#### Scenario: Typing into the palette
+- **WHEN** Brindle runs with `--action open_command_palette --send 'splt' --action text_input_left --send 'i' --dump-screen-after 5`
+- **THEN** the dump shows the focused input holding `split` with the cursor after `i`, and nothing was typed into the terminal
+
+#### Scenario: Hovering a link
+- **WHEN** the screen shows `https://example.com` at row 0 and Brindle runs with `--hover ctrl-3,0 --dump-screen-after 3`
+- **THEN** the dump has a line `--- link https://example.com`
+
+#### Scenario: Clicking a link
+- **WHEN** `BRINDLE_LINK_OPENER` names a script that records its argument and Brindle runs with `--click ctrl-3,0` over that URL
+- **THEN** the script records `https://example.com`
+
+#### Scenario: Malformed position
+- **WHEN** a `--hover` or `--click` step's position cannot be parsed
+- **THEN** an error is logged and the remaining steps still run
+
+#### Scenario: Selection in the dump
+- **WHEN** Brindle runs with `--action select_all --dump-screen-after 3`
+- **THEN** the dump contains a selection line with the selected text, escaped onto one line
+
+#### Scenario: Scripted search
+- **WHEN** Brindle runs with `--send 'echo needle\r' --find needle --dump-screen-after 4`
+- **THEN** stdout contains a find line with query `needle`, a match count of at least one, and the current match's row and column
+
+#### Scenario: Stretched steps
+- **WHEN** Brindle runs with `--step-interval 2 --send 'a' --send 'b' --dump-screen-after 4`
+- **THEN** the dump shows `a` typed but not `b`, because the steps are due about 3 and 5 seconds after launch
+
+#### Scenario: Invalid interval
+- **WHEN** Brindle runs with `--step-interval 0`
+- **THEN** it prints a usage error and exits without opening a window
+
+#### Scenario: Status records in the dump
+- **WHEN** Brindle runs with `--send 'printf "\e]7501;state=blocked:kind=auth:app=brew\e\\"\r' --dump-screen-after 3`
+- **THEN** stdout contains the line `--- status state=blocked kind=auth app="brew"`
+
+### Requirement: Notification log for tests
+When the environment variable `BRINDLE_NOTIFY_LOG` names a file, Brindle SHALL append each notification it would show to that file instead of sending it to the desktop, one line per notification: the source (`bell`, `osc9`, `osc777` or `osc7501`), the title and the body, separated by tabs. The line SHALL be written before the notification counts as sent, so it is in the file even if Brindle quits right after, for example from `--dump-screen-after`.
+
+#### Scenario: Logged notification
+- **WHEN** Brindle runs with `BRINDLE_NOTIFY_LOG=/tmp/n.log`, `notifications.when = "always"`, and `--send 'printf "\033]9;hi\a"\r'`
+- **THEN** `/tmp/n.log` contains a line `osc9<TAB><tab title><TAB>hi` and no desktop notification appears
