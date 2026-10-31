@@ -47,6 +47,18 @@ fn with_alt(m: &Modifiers, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Modified Enter key encoding. Plain Enter is `\r`, Alt+Enter is `\x1b\r` (or
+/// CSI u when disambiguate mode is set), while Shift and/or Control send CSI u
+/// (`\x1b[13;<m>u`).
+fn enter_key(m: &Modifiers, mode: TermMode) -> Vec<u8> {
+    if m.shift || m.control || mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        if any_modifier(m) {
+            return format!("\x1b[13;{}u", modifier_param(m)).into_bytes();
+        }
+    }
+    with_alt(m, b"\r")
+}
+
 /// Control code for `ctrl-<key>`, following xterm/VT220.
 fn control_code(key: &str) -> Option<u8> {
     let mut chars = key.chars();
@@ -79,7 +91,7 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: TermMode) -> Option<Cow<'static, 
     }
 
     let bytes: Vec<u8> = match keystroke.key.as_str() {
-        "enter" => with_alt(m, b"\r"),
+        "enter" => enter_key(m, mode),
         "tab" if m.shift && !m.control && !m.alt => b"\x1b[Z".to_vec(),
         "tab" if m.control => return None, // tab switching
         "tab" => with_alt(m, b"\t"),
@@ -194,6 +206,16 @@ mod tests {
     #[test]
     fn special_keys() {
         assert_eq!(esc("enter"), Some(b"\r".to_vec()));
+        assert_eq!(esc("shift-enter"), Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(esc("ctrl-enter"), Some(b"\x1b[13;5u".to_vec()));
+        assert_eq!(esc("ctrl-shift-enter"), Some(b"\x1b[13;6u".to_vec()));
+        assert_eq!(esc("alt-shift-enter"), Some(b"\x1b[13;4u".to_vec()));
+        assert_eq!(esc("ctrl-alt-enter"), Some(b"\x1b[13;7u".to_vec()));
+        assert_eq!(esc("ctrl-alt-shift-enter"), Some(b"\x1b[13;8u".to_vec()));
+        assert_eq!(
+            to_esc_str(&ks("alt-enter"), TermMode::DISAMBIGUATE_ESC_CODES).map(|c| c.into_owned()),
+            Some(b"\x1b[13;3u".to_vec())
+        );
         assert_eq!(esc("tab"), Some(b"\t".to_vec()));
         assert_eq!(esc("shift-tab"), Some(b"\x1b[Z".to_vec()));
         assert_eq!(esc("backspace"), Some(b"\x7f".to_vec()));
