@@ -20,7 +20,7 @@ use crate::actions::*;
 use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn};
+use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
 use crate::text_input::TextInput;
 use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
@@ -62,7 +62,10 @@ pub struct Tab {
     /// The most pressing program status (OSC 7501) in the tab's terminal,
     /// or in any pane of its tmux window; see [`Workspace::refresh_status`].
     pub status: Option<State>,
-    /// Cached so rendering never probes /proc; see [`Tab::refresh_title`].
+    /// A user-chosen label (`Rename Tab`), shown instead of the automatic
+    /// title until changed or cleared.
+    manual_title: Option<String>,
+    /// Cached displayed title so rendering never probes /proc; see [`Tab::refresh_title`].
     title: SharedString,
     _subscriptions: Vec<Subscription>,
 }
@@ -83,6 +86,7 @@ impl Tab {
             origin,
             bell: false,
             status: None,
+            manual_title: None,
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
@@ -98,25 +102,29 @@ impl Tab {
     /// only when a title needs it (a program's own title, which can change
     /// thousands of times a second, never does).
     fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
-        let title: SharedString = match &self.content {
+        let mut displayed = std::mem::take(&mut self.title);
+        let changed = refresh_displayed_title(&mut displayed, self.manual_title.as_deref(), || {
+            self.automatic_title(snapshot, cx)
+        });
+        self.title = displayed;
+        changed
+    }
+
+    fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
+        match &self.content {
             TabContent::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
-                let own = terminal.title().filter(|t| {
-                    !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t))
-                });
-                match own {
-                    Some(title) => title.to_string(),
-                    None => terminal
-                        .foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
-                        .unwrap_or_else(|| self.profile.name.clone()),
-                }
+                terminal_automatic_title(terminal.title(), &self.profile.name, || {
+                    terminal.foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
+                })
             }
             TabContent::Tmux { view, .. } => view.read(cx).title(cx),
         }
-        .into();
-        let changed = title != self.title;
-        self.title = title;
-        changed
+    }
+
+    fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+        self.manual_title = parse_manual_title(text);
+        self.refresh_title(snapshot, cx)
     }
 
     /// Whether this tab shows `session` (and, if given, its `window`).
@@ -368,9 +376,12 @@ impl Workspace {
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
-                RestoredTab::Local { profile, cwd } => {
+                RestoredTab::Local { profile, cwd, title } => {
                     self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx);
-                    let Some(tab) = self.tabs.get(self.active) else { continue };
+                    let Some(tab) = self.tabs.get_mut(self.active) else { continue };
+                    if let Some(title) = title {
+                        tab.set_manual_title(&title, &mut None, cx);
+                    }
                     previous = Some(tab.id);
                     if ix == state.active {
                         active_tab = Some(tab.id);
@@ -435,6 +446,7 @@ impl Workspace {
                 (_, TabContent::Terminal(view)) => SnapshotTab::Local {
                     profile: tab.profile.name.clone(),
                     cwd: view.read(cx).terminal.read(cx).working_directory(),
+                    title: tab.manual_title.clone(),
                 },
             });
             tabs.extend(pending_after(Some(tab.id)));
@@ -1247,6 +1259,26 @@ impl Workspace {
         self.move_tab(1, cx);
     }
 
+    fn rename_tab(&mut self, _: &RenameTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let tab_id = tab.id;
+        let initial = tab.title.to_string();
+        let this = cx.entity().downgrade();
+        let submit: SubmitFn = Rc::new(move |text, cx| {
+            this.update(cx, |this, cx| {
+                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id)
+                    && tab.set_manual_title(&text, &mut None, cx)
+                {
+                    cx.notify();
+                }
+            })
+            .ok();
+            ready(Ok(()))
+        });
+        let label = "Rename tab".into();
+        self.open_prompt(PromptRequest { label, initial, submit }, window, cx);
+    }
+
     fn drop_tab(&mut self, dragged: &DraggedTab, target: usize, cx: &mut Context<Self>) {
         let Some(from) = self.tabs.iter().position(|t| t.id == dragged.id) else { return };
         let active_id = self.tabs[self.active].id;
@@ -1594,6 +1626,10 @@ impl Workspace {
                 tab.profile = p.clone();
             }
         }
+        let mut snapshot = None;
+        for tab in &mut self.tabs {
+            tab.refresh_title(&mut snapshot, cx);
+        }
         self.apply_tab_themes(cx);
         for (session, _) in &self.tmux_sessions {
             session.update(cx, |s, cx| {
@@ -1921,13 +1957,54 @@ impl Workspace {
     }
 }
 
-/// Gives a tab's terminals `theme`, keeping its font size.
+
+/// Trims a submitted `Rename Tab` value: a non-empty string sets a manual
+/// title, and an empty one clears it.
+fn parse_manual_title(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Automatic title for a local tab: the program's OSC title (ignoring empty
+/// strings and Windows' default console path titles), else the foreground
+/// process name, else the profile name.
+fn terminal_automatic_title(
+    osc_title: Option<&str>,
+    profile_name: &str,
+    foreground_process: impl FnOnce() -> Option<String>,
+) -> String {
+    let own = osc_title.filter(|t| {
+        !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t))
+    });
+    match own {
+        Some(title) => title.to_string(),
+        None => foreground_process().unwrap_or_else(|| profile_name.to_string()),
+    }
+}
+
+/// Updates `displayed` from `manual_title` when set, else from `automatic_title`.
+/// Returns whether `displayed` changed.
+fn refresh_displayed_title(
+    displayed: &mut SharedString,
+    manual_title: Option<&str>,
+    automatic_title: impl FnOnce() -> String,
+) -> bool {
+    let title: SharedString = match manual_title {
+        Some(manual) => manual.to_string().into(),
+        None => automatic_title().into(),
+    };
+    let changed = title != *displayed;
+    *displayed = title;
+    changed
+}
+
 /// The new name for a profile called `name`, if it was renamed (names
 /// match ignoring case, as profile lookups do).
 fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
     renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
 }
 
+/// Gives a tab's terminals `theme`, keeping its font size.
 fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
     match &tab.content {
         TabContent::Terminal(view) => view.update(cx, |view, cx| {
@@ -2097,6 +2174,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::activate_tab))
                     .on_action(cx.listener(Self::move_tab_left))
                     .on_action(cx.listener(Self::move_tab_right))
+                    .on_action(cx.listener(Self::rename_tab))
                     .on_action(cx.listener(Self::close_window))
                     .on_action(cx.listener(Self::increase_font_size))
                     .on_action(cx.listener(Self::decrease_font_size))
@@ -2313,5 +2391,54 @@ mod tests {
         assert_eq!(renamed("work", &renames), Some("Job"));
         assert_eq!(renamed("Shell", &renames), None);
         assert_eq!(renamed("Work", &[]), None);
+    }
+
+    #[test]
+    fn title_refresh_automatic_manual_and_clear() {
+        let mut displayed = SharedString::default();
+        let mut manual = None;
+
+        // Unset manual title: automatic title precedence (OSC -> foreground -> profile).
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            terminal_automatic_title(None, "Shell", || None)
+        }));
+        assert_eq!(displayed.as_ref(), "Shell");
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            terminal_automatic_title(None, "Shell", || None)
+        }));
+
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            terminal_automatic_title(None, "Shell", || Some("htop".into()))
+        }));
+        assert_eq!(displayed.as_ref(), "htop");
+
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            terminal_automatic_title(Some("vim: Cargo.toml"), "Shell", || Some("htop".into()))
+        }));
+        assert_eq!(displayed.as_ref(), "vim: Cargo.toml");
+
+        // Manual title trims input and overrides OSC, foreground, profile and tmux changes.
+        manual = parse_manual_title("  prod logs  ");
+        assert_eq!(manual.as_deref(), Some("prod logs"));
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || "ignored".into()));
+        assert_eq!(displayed.as_ref(), "prod logs");
+
+        let mut probed = false;
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            probed = true;
+            terminal_automatic_title(Some("new-osc"), "RenamedProfile", || Some("python".into()))
+        }));
+        assert!(!probed, "automatic source is not even queried while manual title is set");
+        assert_eq!(displayed.as_ref(), "prod logs");
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || "tmux-window-2".into()));
+        assert_eq!(displayed.as_ref(), "prod logs");
+
+        // Clearing with empty/whitespace input resumes automatic title calculation.
+        manual = parse_manual_title("   \t ");
+        assert_eq!(manual, None);
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
+            terminal_automatic_title(None, "Shell", || Some("bash".into()))
+        }));
+        assert_eq!(displayed.as_ref(), "bash");
     }
 }

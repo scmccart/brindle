@@ -57,6 +57,8 @@ pub enum TabState {
         profile: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     /// A tmux control-mode session, attached once for all its windows.
     Tmux { profile: String, session: String },
@@ -205,7 +207,7 @@ fn private_file() -> std::fs::OpenOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RestoredTab {
     /// Launch profile `profile` in `cwd`.
-    Local { profile: usize, cwd: PathBuf },
+    Local { profile: usize, cwd: PathBuf, title: Option<String> },
     /// Attach profile `profile` (a control-mode profile) to `session`.
     Tmux { profile: usize, session: String },
 }
@@ -214,9 +216,12 @@ pub enum RestoredTab {
 /// becomes the default one, a vanished directory the profile's own (or
 /// home), and the profile's current tmux mode decides how it opens.
 pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab {
-    let (name, cwd) = match tab {
-        TabState::Local { profile, cwd } => (profile, cwd.as_deref()),
-        TabState::Tmux { profile, .. } => (profile, None),
+    let (name, cwd, title) = match tab {
+        TabState::Local { profile, cwd, title } => (profile, cwd.as_deref(), title.as_deref().and_then(|t| {
+            let trimmed = t.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })),
+        TabState::Tmux { profile, .. } => (profile, None, None),
     };
     if config.profile_index(name).is_none() {
         log::warn!("session restore: no profile named {name:?}, using the default profile");
@@ -231,7 +236,7 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab 
         .map(Path::to_path_buf)
         .or_else(|| profile.working_directory().filter(|d| d.is_dir()))
         .unwrap_or_else(|| home.to_path_buf());
-    RestoredTab::Local { profile: index, cwd }
+    RestoredTab::Local { profile: index, cwd, title }
 }
 
 /// The control-mode profile and session a recorded tab attaches, if its
@@ -292,7 +297,7 @@ pub fn dedupe_windows(windows: Vec<WindowState>, config: &Config) -> Vec<WindowS
 /// One tab as seen when taking a snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SnapshotTab {
-    Local { profile: String, cwd: Option<PathBuf> },
+    Local { profile: String, cwd: Option<PathBuf>, title: Option<String> },
     /// A tab of a control-mode session; `key` identifies the session.
     Tmux { profile: String, session: String, key: u64 },
     /// Not recorded (message tabs).
@@ -308,8 +313,8 @@ pub fn collapse(tabs: &[SnapshotTab], active: usize) -> (Vec<TabState>, usize) {
     let mut active_entry = None;
     for (ix, tab) in tabs.iter().enumerate() {
         let entry = match tab {
-            SnapshotTab::Local { profile, cwd } => {
-                entries.push(TabState::Local { profile: profile.clone(), cwd: cwd.clone() });
+            SnapshotTab::Local { profile, cwd, title } => {
+                entries.push(TabState::Local { profile: profile.clone(), cwd: cwd.clone(), title: title.clone() });
                 Some(entries.len() - 1)
             }
             SnapshotTab::Tmux { profile, session, key } => Some(*sessions.entry(*key).or_insert_with(|| {
@@ -434,12 +439,12 @@ mod tests {
                 maximized: false,
                 active: 1,
                 tabs: vec![
-                    TabState::Local { profile: "Shell".into(), cwd: Some("/tmp".into()) },
+                    TabState::Local { profile: "Shell".into(), cwd: Some("/tmp".into()), title: Some("server".into()) },
                     TabState::Tmux { profile: "tmux".into(), session: "main".into() },
-                    TabState::Local { profile: "Shell".into(), cwd: None },
+                    TabState::Local { profile: "Shell".into(), cwd: None, title: None },
                 ],
             },
-            WindowState { width: None, height: None, maximized: true, active: 0, tabs: vec![TabState::Local { profile: "x".into(), cwd: None }] },
+            WindowState { width: None, height: None, maximized: true, active: 0, tabs: vec![TabState::Local { profile: "x".into(), cwd: None, title: None }] },
         ])
     }
 
@@ -448,6 +453,8 @@ mod tests {
         let text = sample().to_text();
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains("kind = \"tmux\""), "{text}");
+        assert!(text.contains("title = \"server\""), "{text}");
+        assert_eq!(text.matches("title = ").count(), 1, "{text}");
         assert_eq!(State::parse(&text).unwrap(), sample());
     }
 
@@ -468,6 +475,7 @@ mod tests {
         let text = "version = 1\nfuture = true\n[[windows]]\nactive = 7\n[[windows.tabs]]\nkind = \"local\"\nprofile = \"a\"\n";
         let state = State::parse(text).unwrap();
         assert_eq!(state.windows[0].active, 0);
+        assert_eq!(state.windows[0].tabs, vec![TabState::Local { profile: "a".into(), cwd: None, title: None }]);
     }
 
     #[test]
@@ -532,34 +540,43 @@ mod tests {
     fn resolve_fallbacks() {
         let config = config();
         let home = Path::new("/home/nobody");
-        let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), cwd: cwd.map(PathBuf::from) };
+        let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), cwd: cwd.map(PathBuf::from), title: None };
         let tmp = std::env::temp_dir();
         let tmp = tmp.to_str().unwrap();
         // Recorded directory kept.
-        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into() });
+        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None });
         // Missing profile: the default one.
-        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into() });
+        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None });
         // Deleted directory: home, or the profile's own directory.
         let gone = "/nonexistent/brindle-dir";
-        assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
-        assert_eq!(resolve_tab(&local("shell", None), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
-        assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), RestoredTab::Local { profile: 1, cwd: "/".into() });
+        assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None });
+        assert_eq!(resolve_tab(&local("shell", None), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None });
+        assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), RestoredTab::Local { profile: 1, cwd: "/".into(), title: None });
         // Classic tmux is a local tab.
-        assert_eq!(resolve_tab(&local("classic", Some(tmp)), &config, home), RestoredTab::Local { profile: 3, cwd: tmp.into() });
+        assert_eq!(resolve_tab(&local("classic", Some(tmp)), &config, home), RestoredTab::Local { profile: 3, cwd: tmp.into(), title: None });
         // Control mode keeps the recorded (possibly renamed) session.
         let tmux = |profile: &str, session: &str| TabState::Tmux { profile: profile.into(), session: session.into() };
         assert_eq!(resolve_tab(&tmux("TMUX", "renamed"), &config, home), RestoredTab::Tmux { profile: 2, session: "renamed".into() });
         // A tmux entry whose profile isn't a control profile any more opens as a tab.
-        assert_eq!(resolve_tab(&tmux("Shell", "x"), &config, home), RestoredTab::Local { profile: 0, cwd: home.into() });
+        assert_eq!(resolve_tab(&tmux("Shell", "x"), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None });
         // A local entry whose profile is now control mode attaches its session.
         assert_eq!(resolve_tab(&local("tmux", Some("/tmp")), &config, home), RestoredTab::Tmux { profile: 2, session: "work".into() });
+        // Recorded manual title is preserved for local tabs (and trimmed/ignored if empty).
+        assert_eq!(
+            resolve_tab(&TabState::Local { profile: "Shell".into(), cwd: Some(tmp.into()), title: Some("server".into()) }, &config, home),
+            RestoredTab::Local { profile: 0, cwd: tmp.into(), title: Some("server".into()) }
+        );
+        assert_eq!(
+            resolve_tab(&TabState::Local { profile: "Shell".into(), cwd: Some(tmp.into()), title: Some("  ".into()) }, &config, home),
+            RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None }
+        );
     }
 
     #[test]
     fn dedupe_keeps_each_session_once() {
         let config = config();
         let tmux = |session: &str| TabState::Tmux { profile: "tmux".into(), session: session.into() };
-        let local = || TabState::Local { profile: "Shell".into(), cwd: None };
+        let local = || TabState::Local { profile: "Shell".into(), cwd: None, title: None };
         let window = |active: usize, tabs: Vec<TabState>| WindowState { width: None, height: None, maximized: false, active, tabs };
         let windows = vec![
             window(0, vec![tmux("main")]),
@@ -598,7 +615,7 @@ mod tests {
 
     #[test]
     fn collapse_sessions() {
-        let local = |p: &str| SnapshotTab::Local { profile: p.into(), cwd: None };
+        let local = |p: &str| SnapshotTab::Local { profile: p.into(), cwd: None, title: None };
         let tmux = |key| SnapshotTab::Tmux { profile: "tmux".into(), session: format!("s{key}"), key };
         let tabs = [local("a"), tmux(1), tmux(1), SnapshotTab::Skip, tmux(2), tmux(1), local("b")];
         let (entries, active) = collapse(&tabs, 5);
@@ -610,6 +627,11 @@ mod tests {
         // An active message tab maps to the first entry.
         assert_eq!(collapse(&tabs, 3).1, 0);
         assert_eq!(collapse(&[], 0), (vec![], 0));
+        let titled = SnapshotTab::Local { profile: "a".into(), cwd: None, title: Some("server".into()) };
+        assert_eq!(
+            collapse(&[titled], 0).0,
+            vec![TabState::Local { profile: "a".into(), cwd: None, title: Some("server".into()) }]
+        );
     }
 
     fn window(tabs: usize) -> WindowState {
@@ -618,7 +640,7 @@ mod tests {
             height: None,
             maximized: false,
             active: 0,
-            tabs: (0..tabs).map(|i| TabState::Local { profile: format!("p{i}"), cwd: None }).collect(),
+            tabs: (0..tabs).map(|i| TabState::Local { profile: format!("p{i}"), cwd: None, title: None }).collect(),
         }
     }
 

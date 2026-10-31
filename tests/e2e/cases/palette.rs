@@ -44,11 +44,13 @@ pub fn lists_for_tab(ctx: &Ctx) -> Result<Outcome> {
     ensure!(tmux.iter().any(|r| label(r) == "tmux: Split Right"), "tmux tab rows: {tmux:?}");
     ensure!(tmux.iter().any(|r| r == "tmux: Detach  [ctrl-shift-d]"), "tmux tab rows: {tmux:?}");
     ensure!(tmux.iter().any(|r| label(r) == "Clear Scrollback"), "tmux tab rows: {tmux:?}");
+    ensure!(tmux.iter().any(|r| label(r) == "Rename Tab"), "tmux tab rows: {tmux:?}");
 
     let out = Run::new(ctx, &server, "local").profile("Shell").action("open_command_palette").dump_at(3.5).run()?;
     let local = rows(&out)?;
     let listed: Vec<&str> = local.iter().map(|r| label(r)).filter(|l| l.starts_with("tmux: ")).collect();
     ensure!(listed == ["tmux: New Session"], "tmux commands in a local tab: {listed:?}");
     ensure!(local.iter().any(|r| label(r) == "Clear Scrollback"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| label(r) == "Rename Tab"), "local tab rows: {local:?}");
     Ok(Outcome::Pass)
 }

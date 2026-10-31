@@ -36,6 +36,8 @@ A manual title SHALL stay in effect until the user changes or clears it. Program
 - **WHEN** the user clears a manual title from a tab whose foreground process is `bash`
 - **THEN** the tab is titled `bash` by the automatic title rules
 
+## ADDED Requirements
+
 ### Requirement: Manual tab title command
 The user SHALL be able to set a manual title for the active tab with a `Rename Tab` command. The command SHALL prompt for one line of text, pre-filled with the tab's current displayed title and selected for replacement.
 
