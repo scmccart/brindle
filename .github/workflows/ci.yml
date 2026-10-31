@@ -2,14 +2,13 @@
 # plus a Windows build and tests. The e2e jobs are advisory: they go red on
 # failure but aren't required checks.
 #
-# Every push and every pull request runs it. Dependabot's branches always
-# have a PR, so their pushes are skipped instead of running twice.
+# Pushes to main and every pull request run it.
 
 name: CI
 
 on:
   push:
-    branches-ignore: ["dependabot/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

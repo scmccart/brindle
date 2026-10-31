@@ -121,8 +121,8 @@ bus, so nothing opens on the desktop.
 
 CI (`.github/workflows/ci.yml`) checks the new commits' messages, and runs the
 unit tests, a release build, and the end-to-end suite that way on Ubuntu
-26.04, against tmux 3.6a (Ubuntu's) and 3.8 (built from source), for every
-push and every pull request. Each tmux
+26.04, against tmux 3.6a (Ubuntu's) and 3.8 (built from source), for pushes
+to `main` and every pull request. Each tmux
 version's suite is split into 4 shards that run as separate jobs. A failed
 shard uploads its `target/tmp/e2e/` as an artifact. A Windows job runs the
 release build, the unit tests and the harness self-tests on `windows-latest`.
