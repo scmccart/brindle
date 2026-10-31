@@ -42,7 +42,7 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it;
 - `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 seconds without it, Brindle SHALL log a warning and run the remaining steps.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -95,6 +95,10 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 #### Scenario: Status records in the dump
 - **WHEN** Brindle runs with `--send 'printf "\e]7501;state=blocked:kind=auth:app=brew\e\\"\r' --dump-screen-after 3`
 - **THEN** stdout contains the line `--- status state=blocked kind=auth app="brew"`
+
+#### Scenario: Zones in the dump
+- **WHEN** Brindle runs in a local tab with `--action split_zone_right --dump-screen-after 3`
+- **THEN** stdout contains `--- zones count=2 active=2`, `--- zone id=1 rect=0,0,0.5,1` and `--- zone id=2 rect=0.5,0,0.5,1 active`, and a single-zone local tab prints no `--- zones` line
 
 ### Requirement: Latency log
 `--latency-log <FILE>` SHALL time every keystroke a terminal tab receives, whether typed or from `--latency-bench`, and append one JSON line per keystroke to FILE: the key, and the milliseconds until the program's output arrived, until that output was painted, and until the next frame began. On quit, Brindle SHALL print a summary to stderr. Without the option, no timing SHALL be recorded.
