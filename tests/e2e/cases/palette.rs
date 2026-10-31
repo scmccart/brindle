@@ -36,13 +36,15 @@ fn label(row: &str) -> &str {
 }
 
 /// tmux commands are listed for a control-mode tab, with their shortcuts;
-/// a local tab lists only "tmux: New Session" of them.
+/// a local tab lists zone commands and only "tmux: New Session" of the tmux
+/// commands.
 pub fn lists_for_tab(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let out = Run::new(ctx, &server, "tmux").action("open_command_palette").dump_at(3.5).run()?;
     let tmux = rows(&out)?;
     ensure!(tmux.iter().any(|r| label(r) == "tmux: Split Right"), "tmux tab rows: {tmux:?}");
     ensure!(tmux.iter().any(|r| r == "tmux: Detach  [ctrl-shift-d]"), "tmux tab rows: {tmux:?}");
+    ensure!(!tmux.iter().any(|r| label(r).contains("Zone")), "zone commands in a tmux tab: {tmux:?}");
     ensure!(tmux.iter().any(|r| label(r) == "Clear Scrollback"), "tmux tab rows: {tmux:?}");
     ensure!(tmux.iter().any(|r| label(r) == "Rename Tab"), "tmux tab rows: {tmux:?}");
 
@@ -50,6 +52,10 @@ pub fn lists_for_tab(ctx: &Ctx) -> Result<Outcome> {
     let local = rows(&out)?;
     let listed: Vec<&str> = local.iter().map(|r| label(r)).filter(|l| l.starts_with("tmux: ")).collect();
     ensure!(listed == ["tmux: New Session"], "tmux commands in a local tab: {listed:?}");
+    ensure!(local.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| r == "Split Zone Down  [ctrl-shift-o]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| r == "Close Zone  [ctrl-shift-x]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| label(r) == "Focus Zone Left"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| label(r) == "Clear Scrollback"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| label(r) == "Rename Tab"), "local tab rows: {local:?}");
     Ok(Outcome::Pass)

@@ -26,6 +26,7 @@ pub fn all() -> Vec<Case> {
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
         display("windows-wsl-tmux", wsl_tmux),
+        display("windows-zones", zones),
     ]
 }
 
@@ -532,5 +533,98 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
     // The dump comes on time only if closing the flooding tab didn't block.
     let took = started.elapsed().as_secs_f64();
     ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
+    Ok(Outcome::Pass)
+}
+
+fn zones(ctx: &Ctx) -> Result<Outcome> {
+    let restore_config = format!("restore_session = true\n{CONFIG}");
+    let split = run_with(
+        ctx,
+        &restore_config,
+        "zones-split",
+        &[
+            "-p",
+            "cmd",
+            "--send",
+            "echo zone1-left\r",
+            "--action",
+            "split_zone_right",
+            "--action",
+            "split_zone_down",
+            "--action",
+            "focus_zone_left",
+        ],
+        &[],
+        6.5,
+        None,
+    )?;
+    ensure!(split.dump.zones.as_deref() == Some("count=3 active=1"), "zones: {:?}", split.dump.zones);
+    ensure!(
+        split.dump.zone_list
+            == [
+                "id=1 rect=0,0,0.5,1 active",
+                "id=2 rect=0.5,0,0.5,0.5",
+                "id=3 rect=0.5,0.5,0.5,0.5",
+            ],
+        "zone_list: {:?}",
+        split.dump.zone_list
+    );
+    ensure!(screen(&split.dump).contains("zone1-left"), "screen: {}", screen(&split.dump));
+    let state_path = ctx.dir.join("state").join("session.toml");
+    let state_toml = std::fs::read_to_string(&state_path).map_err(|e| format!("reading session.toml: {e}"))?;
+    ctx.save("zones-split-session.toml", &state_toml);
+    ensure!(state_toml.contains("split = \"horizontal\""), "session.toml missing split:\n{state_toml}");
+    ensure!(state_toml.contains("active = true"), "session.toml missing active leaf:\n{state_toml}");
+
+    let restored = run_with(
+        ctx,
+        &restore_config,
+        "zones-restored",
+        &["--action", "open_command_palette"],
+        &[],
+        3.5,
+        None,
+    )?;
+    ensure!(restored.dump.zones.as_deref() == Some("count=3 active=1"), "restored zones: {:?}", restored.dump.zones);
+    ensure!(
+        restored.dump.zone_list
+            == [
+                "id=1 rect=0,0,0.5,1 active",
+                "id=2 rect=0.5,0,0.5,0.5",
+                "id=3 rect=0.5,0.5,0.5,0.5",
+            ],
+        "restored zone_list: {:?}",
+        restored.dump.zone_list
+    );
+    ensure!(
+        restored.dump.palette.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"),
+        "palette rows: {:?}",
+        restored.dump.palette
+    );
+    ensure!(
+        restored.dump.palette.iter().any(|r| r == "Close Zone  [ctrl-shift-x]"),
+        "palette rows: {:?}",
+        restored.dump.palette
+    );
+
+    let closed = run(
+        ctx,
+        "zones-close",
+        &[
+            "-p",
+            "cmd",
+            "--send",
+            "echo zone1-kept\r",
+            "--action",
+            "split_zone_right",
+            "--action",
+            "close_zone",
+        ],
+        &[],
+        5.5,
+        None,
+    )?;
+    ensure!(closed.dump.zones.is_none(), "single zone should have no --- zones: {:?}", closed.dump.zones);
+    ensure!(screen(&closed.dump).contains("zone1-kept"), "screen: {}", screen(&closed.dump));
     Ok(Outcome::Pass)
 }

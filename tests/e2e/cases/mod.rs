@@ -28,6 +28,7 @@ mod styles;
 mod titles;
 mod tmux;
 mod windows;
+mod zones;
 
 use crate::capture::Cells;
 use crate::brindle::Output;
@@ -160,6 +161,9 @@ fn unix() -> Vec<Case> {
         display("dividers-tiled", dividers::tiled),
         display("dividers-t-junction", dividers::t_junction),
         display("reload-theme-attached", reload::theme_attached),
+        display("zones-split-and-focus", zones::split_and_focus),
+        display("zones-close", zones::close),
+        display("zones-restore", zones::restore),
     ]
 }
 

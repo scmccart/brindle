@@ -15,6 +15,9 @@ while sessions stay in tmux, persistent and detachable.
   A new tab starts in the active tab's directory: on Linux the foreground
   program's, on Windows the one its shell last reported (see
   [Shell integration](#shell-integration)).
+- **Zones**: split any local tab horizontally (ctrl-shift-e) or vertically (ctrl-shift-o)
+  into a binary tree of zones with native GPUI header bars and controls, move between
+  them with alt-arrows, and close a zone with ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
 - **Shell integration** (OSC 133): jump between prompts, select or copy the last
@@ -260,6 +263,9 @@ On first launch Brindle writes a commented config to
 | ctrl-tab, ctrl-pageup/down | switch tab |
 | alt-1 … alt-9 | go to tab (9 = last) |
 | ctrl-shift-pageup/down | move tab |
+| ctrl-shift-e / ctrl-shift-o | split zone right / down (in a local tab) |
+| ctrl-shift-x | close zone (in a local tab) |
+| alt-arrows | move between zones (in a local tab) |
 | ctrl-shift-p | command palette (every command, with its shortcut) |
 | ctrl-shift-space, or the strip's `⌄` | new tab with a profile |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
@@ -345,7 +351,7 @@ With `restore_session = true` in the config (it is off by default), launching
 when it last quit:
 
 - each window's size, its tabs in order, and its active tab;
-- each tab's profile, in its shell's last directory;
+- each tab's profile and zone split tree, with each zone in its shell's last directory and the active zone focused;
 - classic tmux tabs, which reattach to their session;
 - control-mode sessions, attached once each. Their windows come back as tabs
   where they were, and tmux's current window and panes are left as they are.

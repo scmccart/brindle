@@ -482,6 +482,10 @@ pub struct Dump {
     /// The active terminal's program status records (`--- status …`), one
     /// line each without the prefix.
     pub status: Vec<String>,
+    /// The active tab's zone header (`--- zones …`), when it has 2+ zones.
+    pub zones: Option<String>,
+    /// The active tab's zone lines (`--- zone …`), one line each without the prefix.
+    pub zone_list: Vec<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
     /// The tab titles of the other windows (`--- window N tabs=[…]`), by
@@ -530,6 +534,10 @@ impl Dump {
                 dump.selection = unquote(rest);
             } else if let Some(rest) = line.strip_prefix("--- status ") {
                 dump.status.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- zones ") {
+                dump.zones = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- zone ") {
+                dump.zone_list.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- settings ") {
                 dump.settings = Some(rest.to_string());
                 in_screen = false;
@@ -667,6 +675,17 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.status == ["state=done app=\"brew\"", "state=blocked id=\"b\" kind=auth"], "status {:?}", dump.status);
     ensure!(dump.screen == ["hi"], "screen after status {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
+         --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",
+    );
+    ensure!(dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", dump.zones);
+    ensure!(
+        dump.zone_list == ["id=1 rect=0,0,0.5,1", "id=2 rect=0.5,0,0.5,1 active"],
+        "zone_list {:?}",
+        dump.zone_list
+    );
+    ensure!(dump.screen == ["hi"], "screen after zones {:?}", dump.screen);
     let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- settings section=Theme mode=list\n");
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);

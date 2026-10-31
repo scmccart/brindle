@@ -24,6 +24,7 @@ mod tmux_view;
 #[cfg(windows)]
 mod win;
 mod workspace;
+mod zone_view;
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};

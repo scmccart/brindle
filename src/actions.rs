@@ -46,6 +46,13 @@ actions!(
         ReloadConfig,
         OpenConfig,
         OpenSettings,
+        SplitZoneRight,
+        SplitZoneDown,
+        CloseZone,
+        FocusZoneLeft,
+        FocusZoneRight,
+        FocusZoneUp,
+        FocusZoneDown,
         TmuxDetach,
         TmuxSplitRight,
         TmuxSplitDown,
@@ -172,6 +179,13 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("reload_config", Some("Reload Config"), || Box::new(ReloadConfig)),
     ("open_config", Some("Open Config"), || Box::new(OpenConfig)),
     ("open_settings", Some("Open Settings"), || Box::new(OpenSettings)),
+    ("split_zone_right", Some("Split Zone Right"), || Box::new(SplitZoneRight)),
+    ("split_zone_down", Some("Split Zone Down"), || Box::new(SplitZoneDown)),
+    ("close_zone", Some("Close Zone"), || Box::new(CloseZone)),
+    ("focus_zone_left", Some("Focus Zone Left"), || Box::new(FocusZoneLeft)),
+    ("focus_zone_right", Some("Focus Zone Right"), || Box::new(FocusZoneRight)),
+    ("focus_zone_up", Some("Focus Zone Up"), || Box::new(FocusZoneUp)),
+    ("focus_zone_down", Some("Focus Zone Down"), || Box::new(FocusZoneDown)),
     ("tmux_detach", Some("tmux: Detach"), || Box::new(TmuxDetach)),
     ("tmux_split_right", Some("tmux: Split Right"), || Box::new(TmuxSplitRight)),
     ("tmux_split_down", Some("tmux: Split Down"), || Box::new(TmuxSplitDown)),
@@ -281,6 +295,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     let t = Some("Terminal");
     let p = Some("Palette");
     let x = Some("TmuxWindow");
+    let z = Some("ZoneTree");
     let s = Some("SettingsDialog");
     let i = Some("TextInput");
     let c = Some("SettingsChoice");
@@ -335,6 +350,13 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", FindClose, f),
         KeyBinding::new("alt-c", FindToggleCase, f),
         KeyBinding::new("alt-r", FindToggleRegex, f),
+        KeyBinding::new("ctrl-shift-e", SplitZoneRight, z),
+        KeyBinding::new("ctrl-shift-o", SplitZoneDown, z),
+        KeyBinding::new("ctrl-shift-x", CloseZone, z),
+        KeyBinding::new("alt-left", FocusZoneLeft, z),
+        KeyBinding::new("alt-right", FocusZoneRight, z),
+        KeyBinding::new("alt-up", FocusZoneUp, z),
+        KeyBinding::new("alt-down", FocusZoneDown, z),
         KeyBinding::new("ctrl-shift-e", TmuxSplitRight, x),
         KeyBinding::new("ctrl-shift-o", TmuxSplitDown, x),
         KeyBinding::new("ctrl-shift-x", TmuxClosePane, x),
@@ -526,6 +548,37 @@ mod tests {
                 let first = bindings.first().unwrap_or_else(|| panic!("{stack:?}: ctrl-shift-{key} is unbound"));
                 assert!(first.action().partial_eq(expected), "{stack:?}: ctrl-shift-{key} -> {}", first.action().name());
             }
+        }
+    }
+
+    #[test]
+    fn zone_keys_resolve_in_zone_tree_and_tmux_keys_in_tmux_window() {
+        use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+        let keymap = Keymap::new(default_bindings());
+        let ctrl_shift = |key: &str| Keystroke {
+            modifiers: Modifiers { control: true, shift: true, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        let alt = |key: &str| Keystroke {
+            modifiers: Modifiers { alt: true, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        let zone_ctx: Vec<KeyContext> =
+            ["Workspace", "ZoneTree", "Terminal"].iter().map(|c| KeyContext::parse(c).unwrap()).collect();
+        for (press, expected) in [
+            (ctrl_shift("e"), &SplitZoneRight as &dyn Action),
+            (ctrl_shift("o"), &SplitZoneDown as &dyn Action),
+            (ctrl_shift("x"), &CloseZone as &dyn Action),
+            (alt("left"), &FocusZoneLeft as &dyn Action),
+            (alt("right"), &FocusZoneRight as &dyn Action),
+            (alt("up"), &FocusZoneUp as &dyn Action),
+            (alt("down"), &FocusZoneDown as &dyn Action),
+        ] {
+            let (bindings, pending) = keymap.bindings_for_input(&[press], &zone_ctx);
+            assert!(!pending);
+            assert!(bindings[0].action().partial_eq(expected));
         }
     }
 

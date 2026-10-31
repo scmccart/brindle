@@ -22,7 +22,7 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
 use crate::text_input::TextInput;
-use crate::session::{self, RestoredTab, SessionStore, SnapshotTab, WindowState};
+use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
@@ -33,12 +33,13 @@ use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession, has_session_command};
 use crate::tmux_view::TmuxWindowView;
+use crate::zone_view::ZoneTreeView;
 
 const TAB_BAR_HEIGHT: f32 = 38.0;
 const RESIZE_BORDER: f32 = 6.0;
 
 pub enum TabContent {
-    Terminal(Entity<TerminalView>),
+    Zones(Entity<ZoneTreeView>),
     Tmux { session: Entity<TmuxSession>, view: Entity<TmuxWindowView> },
 }
 
@@ -101,28 +102,27 @@ impl Tab {
     /// `snapshot` is the processes running, for the foreground name, taken
     /// only when a title needs it (a program's own title, which can change
     /// thousands of times a second, never does).
-    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
+        let zone_changed = match &self.content {
+            TabContent::Zones(view) => view.update(cx, |v, cx| v.refresh_titles(snapshot, cx)),
+            TabContent::Tmux { .. } => false,
+        };
         let mut displayed = std::mem::take(&mut self.title);
         let changed = refresh_displayed_title(&mut displayed, self.manual_title.as_deref(), || {
             self.automatic_title(snapshot, cx)
         });
         self.title = displayed;
-        changed
+        changed || zone_changed
     }
 
     fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
         match &self.content {
-            TabContent::Terminal(view) => {
-                let terminal = view.read(cx).terminal.read(cx);
-                terminal_automatic_title(terminal.title(), &self.profile.name, || {
-                    terminal.foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
-                })
-            }
+            TabContent::Zones(view) => view.read(cx).automatic_title(snapshot, cx),
             TabContent::Tmux { view, .. } => view.read(cx).title(cx),
         }
     }
 
-    fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
         self.manual_title = parse_manual_title(text);
         self.refresh_title(snapshot, cx)
     }
@@ -135,21 +135,21 @@ impl Tab {
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.content {
-            TabContent::Terminal(view) => view.read(cx).focus_handle.clone(),
+            TabContent::Zones(view) => view.read(cx).focus_handle(cx),
             TabContent::Tmux { view, .. } => view.read(cx).focus_handle(cx),
         }
     }
 
     fn theme(&self, cx: &App) -> Theme {
         match &self.content {
-            TabContent::Terminal(view) => view.read(cx).terminal.read(cx).theme.clone(),
+            TabContent::Zones(view) => view.read(cx).theme.clone(),
             TabContent::Tmux { view, .. } => view.read(cx).theme.clone(),
         }
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
         match &self.content {
-            TabContent::Terminal(view) => Some(view.read(cx).terminal.clone()),
+            TabContent::Zones(view) => view.read(cx).active_terminal(cx),
             TabContent::Tmux { view, .. } => view.read(cx).active_terminal(cx),
         }
     }
@@ -157,7 +157,7 @@ impl Tab {
     /// The view of the terminal that has (or last had) focus in this tab.
     fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
         match &self.content {
-            TabContent::Terminal(view) => Some(view.clone()),
+            TabContent::Zones(view) => view.read(cx).active_view(),
             TabContent::Tmux { view, .. } => view.read(cx).active_view(),
         }
     }
@@ -174,7 +174,7 @@ impl Tab {
     /// The most pressing program status across the tab's terminals.
     fn status_summary(&self, cx: &App) -> Option<State> {
         match &self.content {
-            TabContent::Terminal(view) => view.read(cx).terminal.read(cx).status().summary(),
+            TabContent::Zones(view) => view.read(cx).status_summary(cx),
             TabContent::Tmux { view, .. } => view.read(cx).status_summary(cx),
         }
     }
@@ -376,8 +376,11 @@ impl Workspace {
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
-                RestoredTab::Local { profile, cwd, title } => {
-                    self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx);
+                RestoredTab::Local { profile, cwd, title, zones } => {
+                    match zones {
+                        Some(zones) => self.restore_local_zones(profile, zones, window, cx),
+                        None => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
+                    }
                     let Some(tab) = self.tabs.get_mut(self.active) else { continue };
                     if let Some(title) = title {
                         tab.set_manual_title(&title, &mut None, cx);
@@ -403,6 +406,50 @@ impl Workspace {
         if let Some(ix) = active_tab.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
             self.activate(ix, window, cx);
         }
+    }
+
+    fn restore_local_zones(
+        &mut self,
+        profile_ix: usize,
+        zones: RestoredZoneNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = Self::settings(cx).clone();
+        let Some(profile) = config.profiles.get(profile_ix).cloned() else { return };
+        let command = match profile.tmux {
+            TmuxMode::Plain => {
+                let mut args = profile.tmux_args.clone();
+                args.extend([
+                    "new-session".into(),
+                    "-A".into(),
+                    "-s".into(),
+                    profile.tmux_session_name().to_string(),
+                ]);
+                Some(("tmux".into(), args))
+            }
+            _ => None,
+        };
+        let (tree, leaves, active_id) = zones.into_tree();
+        let terminals: Vec<_> = leaves
+            .into_iter()
+            .map(|(id, cwd)| {
+                let cmd = command.clone();
+                let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, cmd, Some(cwd), &config, cx));
+                (id, terminal)
+            })
+            .collect();
+        let font_size = profile.font_size;
+        let theme = self.tab_theme(&profile, &config);
+        let p_clone = profile.clone();
+        let view = cx.new(|cx| {
+            ZoneTreeView::from_restored(p_clone, theme, font_size, tree, terminals, active_id, window, cx)
+        });
+        let subscriptions = vec![cx.subscribe_in(&view, window, |this, view, event, window, cx| {
+            this.on_zone_tree_event(view, event, window, cx)
+        })];
+        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
+        self.insert_tab(tab, None, window, cx);
     }
 
     /// This window as session restore records it.
@@ -443,11 +490,18 @@ impl Workspace {
             tabs.push(match (&tab.origin, &tab.content) {
                 (TabOrigin::Message, _) => SnapshotTab::Skip,
                 (_, TabContent::Tmux { session, .. }) => session_tab(session),
-                (_, TabContent::Terminal(view)) => SnapshotTab::Local {
-                    profile: tab.profile.name.clone(),
-                    cwd: view.read(cx).terminal.read(cx).working_directory(),
-                    title: tab.manual_title.clone(),
-                },
+                (_, TabContent::Zones(view)) => {
+                    let z = view.read(cx);
+                    let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
+                        z.zone_working_directory(id, cx)
+                    });
+                    SnapshotTab::Local {
+                        profile: tab.profile.name.clone(),
+                        cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
+                        title: tab.manual_title.clone(),
+                        zones,
+                    }
+                }
             });
             tabs.extend(pending_after(Some(tab.id)));
         }
@@ -532,11 +586,13 @@ impl Workspace {
 
         let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, command, cwd, &config, cx));
         let font_size = profile.font_size;
-        let view = cx.new(|cx| TerminalView::new(terminal.clone(), font_size, window, cx));
-        let subscriptions = vec![cx.subscribe_in(&terminal, window, |this, terminal, event, window, cx| {
-            this.on_terminal_event(terminal, event, window, cx)
+        let theme = self.tab_theme(&profile, &config);
+        let p_clone = profile.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let subscriptions = vec![cx.subscribe_in(&view, window, |this, view, event, window, cx| {
+            this.on_zone_tree_event(view, event, window, cx)
         })];
-        let tab = Tab::new(profile, TabContent::Terminal(view), TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -794,7 +850,7 @@ impl Workspace {
         let config = Self::settings(cx);
         let tab_profile = self.tabs.get(self.active).and_then(|t| match &t.content {
             TabContent::Tmux { session, .. } => Some(session.read(cx).profile.clone()),
-            TabContent::Terminal(_) => None,
+            TabContent::Zones(_) => None,
         });
         let default = &config.profiles[config.default_profile_index()];
         let profile = tab_profile
@@ -1052,15 +1108,15 @@ impl Workspace {
         self.close_orphans(window, cx);
     }
 
-    fn on_terminal_event(
+    fn on_zone_tree_event(
         &mut self,
-        terminal: &Entity<Terminal>,
+        view: &Entity<ZoneTreeView>,
         event: &TerminalEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.tabs.iter().position(|t| {
-            matches!(&t.content, TabContent::Terminal(view) if view.read(cx).terminal == *terminal)
+            matches!(&t.content, TabContent::Zones(v) if v == view)
         }) else {
             return;
         };
@@ -1154,8 +1210,8 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(ix);
-        if let TabContent::Terminal(view) = &tab.content {
-            view.read(cx).terminal.clone().update(cx, |t, _| t.shutdown());
+        if let TabContent::Zones(view) = &tab.content {
+            view.update(cx, |v, cx| v.shutdown_all(cx));
         }
         if self.tabs.is_empty() {
             // Nothing to restore for a window whose tabs all closed.
@@ -1175,9 +1231,10 @@ impl Workspace {
     fn open_message_tab(&mut self, profile: Profile, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let theme = config.profile_theme(&profile);
-        let terminal = cx.new(|cx| Terminal::message(text, theme, &config, cx));
-        let view = cx.new(|cx| TerminalView::new(terminal, profile.font_size, window, cx));
-        let tab = Tab::new(profile, TabContent::Terminal(view), TabOrigin::Message, Vec::new(), cx);
+        let terminal = cx.new(|cx| Terminal::message(text, theme.clone(), &config, cx));
+        let p_clone = profile.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, profile.font_size, terminal, window, cx));
+        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -1727,6 +1784,9 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
+            if let Some(TabContent::Zones(zones)) = self.tabs.get(self.active).map(|t| &t.content) {
+                out.push_str(&zones.read(cx).describe_zones());
+            }
             out.push_str(&terminal.screen_text());
         }
         if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
@@ -1950,7 +2010,7 @@ impl Workspace {
 
     fn render_content(&self) -> AnyElement {
         match self.tabs.get(self.active).map(|t| &t.content) {
-            Some(TabContent::Terminal(view)) => view.clone().into_any_element(),
+            Some(TabContent::Zones(view)) => view.clone().into_any_element(),
             Some(TabContent::Tmux { view, .. }) => view.clone().into_any_element(),
             None => div().into_any_element(),
         }
@@ -1968,7 +2028,7 @@ fn parse_manual_title(text: &str) -> Option<String> {
 /// Automatic title for a local tab: the program's OSC title (ignoring empty
 /// strings and Windows' default console path titles), else the foreground
 /// process name, else the profile name.
-fn terminal_automatic_title(
+pub(crate) fn terminal_automatic_title(
     osc_title: Option<&str>,
     profile_name: &str,
     foreground_process: impl FnOnce() -> Option<String>,
@@ -2007,10 +2067,10 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
 /// Gives a tab's terminals `theme`, keeping its font size.
 fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
     match &tab.content {
-        TabContent::Terminal(view) => view.update(cx, |view, cx| {
-            view.font_size_override = font_size;
-            view.terminal.update(cx, |t, _| t.theme = theme)
-        }),
+        TabContent::Zones(view) => {
+            let profile = tab.profile.clone();
+            view.update(cx, |view, cx| view.set_profile(profile, theme, font_size, cx))
+        }
         TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
     }
 }
