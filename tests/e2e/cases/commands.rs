@@ -146,3 +146,47 @@ pub fn detach_beside_local(ctx: &Ctx) -> Result<Outcome> {
     server.run(&["has-session", "-t", "e2e"]).map_err(|e| format!("after detaching: {e}"))?;
     Ok(Outcome::Pass)
 }
+
+/// `rename_tab` trims the submitted text, overrides OSC title changes on a
+/// local tab, clears when given only whitespace so automatic titles resume,
+/// and on a tmux control-mode tab renames only Brindle's tab while leaving
+/// the tmux window name untouched.
+pub fn rename_tab(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let title = |out: &crate::brindle::Output| out.dump.tabs.first().map(|(t, _)| t.clone()).unwrap_or_default();
+
+    let renamed = Run::new(ctx, &server, "local-rename")
+        .profile("Shell")
+        .action("rename_tab")
+        .send("  server  ")
+        .action("picker_confirm")
+        .send("printf '\\033]2;osc-title\\007'\r")
+        .dump_at(6.5)
+        .run()?;
+    ensure!(title(&renamed) == "server", "local renamed title: {:?}", renamed.dump.tabs);
+
+    let cleared = Run::new(ctx, &server, "local-clear")
+        .profile("Shell")
+        .send("printf '\\033]2;auto-title\\007'\r")
+        .action("rename_tab")
+        .send("  server  ")
+        .action("picker_confirm")
+        .action("rename_tab")
+        .send("   ")
+        .action("picker_confirm")
+        .dump_at(9.5)
+        .run()?;
+    ensure!(title(&cleared) == "auto-title", "local cleared title: {:?}", cleared.dump.tabs);
+
+    server.run(&["rename-window", "-t", "e2e:0", "editor"])?;
+    let tmux = Run::new(ctx, &server, "tmux-rename")
+        .action("rename_tab")
+        .send("  review  ")
+        .action("picker_confirm")
+        .dump_at(5.5)
+        .run()?;
+    ensure!(title(&tmux) == "review", "tmux tab title: {:?}", tmux.dump.tabs);
+    let window_name = server.run(&["display-message", "-p", "-t", "e2e:0", "#{window_name}"])?;
+    ensure!(window_name.trim() == "editor", "tmux window name changed to {window_name:?}");
+    Ok(Outcome::Pass)
+}

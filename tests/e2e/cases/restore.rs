@@ -52,16 +52,20 @@ pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
         .restore()
         .default_profile("Shell")
         .send(&format!("cd {}\r", quote(&a)))
+        .action("rename_tab")
+        .send("  server  ")
+        .action("picker_confirm")
         .action("new_tab")
         .send(&format!("cd {}\r", quote(&b)))
         .action("prev_tab")
-        .dump_at(6.0)
+        .dump_at(9.0)
         .run()?;
     let recorded = state_text(ctx)?;
     ctx.save("recorded.toml", &recorded);
     for want in [
         format!("cwd = \"{}\"", a.display()),
         format!("cwd = \"{}\"", b.display()),
+        "title = \"server\"".to_string(),
         "active = 0".to_string(),
         "width = 1000.0".to_string(),
         "height = 660.0".to_string(),
@@ -71,7 +75,7 @@ pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
     ensure!(recorded.find(&a.display().to_string()) < recorded.find(&b.display().to_string()), "tab order:\n{recorded}");
 
     let out = Run::new(ctx, &server, "restore").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
-    ensure!(titles(&out.dump.tabs) == ["bash*", "bash"], "restored tabs {:?}", out.dump.tabs);
+    ensure!(titles(&out.dump.tabs) == ["server*", "bash"], "restored tabs {:?}", out.dump.tabs);
     ensure!(printed_pwd(&out.dump.screen, &a), "pwd in the active tab: {:?}", out.dump.screen);
     // The size comes back as it was: the window doesn't grow per restore.
     let again = state_text(ctx)?;

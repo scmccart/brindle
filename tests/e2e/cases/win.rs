@@ -49,11 +49,22 @@ fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
         "default_profile = \"wsl\"\n\n[[profiles]]\nname = \"wsl\"\ntmux = \"control\"\ncommand = \"wsl\"\n\
          tmux_args = [\"tmux\", \"-L\", \"{socket}\", \"-f\", \"/dev/null\"]\n"
     );
-    let ran = run_with(ctx, &config, "attach", &["-p", "wsl"], &[], 6.0, None);
+    let ran = run_with(
+        ctx,
+        &config,
+        "attach",
+        &["-p", "wsl", "--action", "rename_tab", "--send", "  review  ", "--action", "picker_confirm"],
+        &[],
+        8.0,
+        None,
+    );
+    let windows = tmux(&["list-windows", "-t", "main", "-F", "#{window_name}"]);
     tmux(&["kill-server"]).ok();
     let ran = ran?;
     let titles: Vec<&str> = ran.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
-    ensure!(titles == ["first", "second"], "tabs: {titles:?}; see attach.log");
+    ensure!(titles == ["review", "second"], "tabs: {titles:?}; see attach.log");
+    let windows = String::from_utf8_lossy(&windows.map_err(|e| e.to_string())?.stdout).into_owned();
+    ensure!(windows.lines().collect::<Vec<_>>() == ["first", "second"], "tmux windows: {windows:?}");
     Ok(Outcome::Pass)
 }
 
@@ -385,6 +396,52 @@ fn title_child(ctx: &Ctx) -> Result<Outcome> {
     ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
     let after = run(ctx, "after", &["-p", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
     ensure!(title(&after.dump) == "pwsh", "title after ping: {:?}", title(&after.dump));
+    let renamed = run(
+        ctx,
+        "rename",
+        &[
+            "-p",
+            "cmd",
+            "--action",
+            "rename_tab",
+            "--send",
+            "  server  ",
+            "--action",
+            "picker_confirm",
+            "--send",
+            "title ignored-title\r",
+        ],
+        &[],
+        6.5,
+        None,
+    )?;
+    ensure!(title(&renamed.dump) == "server", "title after rename_tab: {:?}", title(&renamed.dump));
+    let cleared = run(
+        ctx,
+        "clear-rename",
+        &[
+            "-p",
+            "cmd",
+            "--send",
+            "title auto-title\r",
+            "--action",
+            "rename_tab",
+            "--send",
+            "  server  ",
+            "--action",
+            "picker_confirm",
+            "--action",
+            "rename_tab",
+            "--send",
+            "   ",
+            "--action",
+            "picker_confirm",
+        ],
+        &[],
+        9.5,
+        None,
+    )?;
+    ensure!(title(&cleared.dump) == "auto-title", "title after clearing manual title: {:?}", title(&cleared.dump));
     Ok(Outcome::Pass)
 }
 

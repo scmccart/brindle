@@ -156,6 +156,7 @@ fn unix() -> Vec<Case> {
         display("commands-layouts", commands::layouts),
         display("commands-rotate-swap", commands::rotate_swap),
         display("commands-detach-beside-local", commands::detach_beside_local),
+        display("commands-rename-tab", commands::rename_tab),
         display("dividers-tiled", dividers::tiled),
         display("dividers-t-junction", dividers::t_junction),
         display("reload-theme-attached", reload::theme_attached),
