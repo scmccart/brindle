@@ -120,6 +120,8 @@ pub enum TabState {
     Local {
         profile: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<crate::config::RemoteTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -331,6 +333,12 @@ pub enum RestoredTab {
 }
 
 fn resolve_cwd(cwd: Option<&Path>, profile: &crate::config::Profile, home: &Path) -> PathBuf {
+    if profile.remote.is_some() {
+        return cwd
+            .map(Path::to_path_buf)
+            .or_else(|| profile.cwd.as_deref().map(PathBuf::from))
+            .unwrap_or_default();
+    }
     cwd.filter(|d| d.is_dir())
         .map(Path::to_path_buf)
         .or_else(|| profile.working_directory().filter(|d| d.is_dir()))
@@ -356,9 +364,10 @@ fn resolve_zone_node(node: &ZoneNodeState, profile: &crate::config::Profile, hom
 /// becomes the default one, a vanished directory the profile's own (or
 /// home), and the profile's current tmux mode decides how it opens.
 pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab {
-    let (name, cwd, title, zones) = match tab {
-        TabState::Local { profile, cwd, title, zones } => (
+    let (name, recorded_remote, cwd, title, zones) = match tab {
+        TabState::Local { profile, remote, cwd, title, zones } => (
             profile,
+            remote.as_ref(),
             cwd.as_deref(),
             title.as_deref().and_then(|t| {
                 let trimmed = t.trim();
@@ -366,7 +375,7 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab 
             }),
             zones.as_ref(),
         ),
-        TabState::Tmux { profile, .. } => (profile, None, None, None),
+        TabState::Tmux { profile, .. } => (profile, None, None, None, None),
     };
     if config.profile_index(name).is_none() {
         log::warn!("session restore: no profile named {name:?}, using the default profile");
@@ -376,8 +385,10 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab 
     }
     let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
     let profile = &config.profiles[index];
-    let cwd = resolve_cwd(cwd, profile, home);
+    let same_endpoint = recorded_remote == profile.remote.as_ref();
+    let cwd = resolve_cwd(cwd.filter(|_| same_endpoint), profile, home);
     let zones = zones
+        .filter(|_| same_endpoint)
         .map(|z| resolve_zone_node(z, profile, home))
         .filter(|z| matches!(z, RestoredZoneNode::Split { .. }));
     RestoredTab::Local { profile: index, cwd, title, zones }
@@ -443,6 +454,7 @@ pub fn dedupe_windows(windows: Vec<WindowState>, config: &Config) -> Vec<WindowS
 pub enum SnapshotTab {
     Local {
         profile: String,
+        remote: Option<crate::config::RemoteTarget>,
         cwd: Option<PathBuf>,
         title: Option<String>,
         zones: Option<ZoneNodeState>,
@@ -462,9 +474,10 @@ pub fn collapse(tabs: &[SnapshotTab], active: usize) -> (Vec<TabState>, usize) {
     let mut active_entry = None;
     for (ix, tab) in tabs.iter().enumerate() {
         let entry = match tab {
-            SnapshotTab::Local { profile, cwd, title, zones } => {
+            SnapshotTab::Local { profile, remote, cwd, title, zones } => {
                 entries.push(TabState::Local {
                     profile: profile.clone(),
+                    remote: remote.clone(),
                     cwd: cwd.clone(),
                     title: title.clone(),
                     zones: zones.clone(),
@@ -593,12 +606,12 @@ mod tests {
                 maximized: false,
                 active: 1,
                 tabs: vec![
-                    TabState::Local { profile: "Shell".into(), cwd: Some("/tmp".into()), title: Some("server".into()), zones: None },
+                    TabState::Local { profile: "Shell".into(), remote: None, cwd: Some("/tmp".into()), title: Some("server".into()), zones: None },
                     TabState::Tmux { profile: "tmux".into(), session: "main".into() },
-                    TabState::Local { profile: "Shell".into(), cwd: None, title: None, zones: None },
+                    TabState::Local { profile: "Shell".into(), remote: None, cwd: None, title: None, zones: None },
                 ],
             },
-            WindowState { width: None, height: None, maximized: true, active: 0, tabs: vec![TabState::Local { profile: "x".into(), cwd: None, title: None, zones: None }] },
+            WindowState { width: None, height: None, maximized: true, active: 0, tabs: vec![TabState::Local { profile: "x".into(), remote: None, cwd: None, title: None, zones: None }] },
         ])
     }
 
@@ -629,7 +642,7 @@ mod tests {
         let text = "version = 1\nfuture = true\n[[windows]]\nactive = 7\n[[windows.tabs]]\nkind = \"local\"\nprofile = \"a\"\n";
         let state = State::parse(text).unwrap();
         assert_eq!(state.windows[0].active, 0);
-        assert_eq!(state.windows[0].tabs, vec![TabState::Local { profile: "a".into(), cwd: None, title: None, zones: None }]);
+        assert_eq!(state.windows[0].tabs, vec![TabState::Local { profile: "a".into(), remote: None, cwd: None, title: None, zones: None }]);
     }
 
     #[test]
@@ -694,7 +707,7 @@ mod tests {
     fn resolve_fallbacks() {
         let config = config();
         let home = Path::new("/home/nobody");
-        let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), cwd: cwd.map(PathBuf::from), title: None, zones: None };
+        let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), remote: None, cwd: cwd.map(PathBuf::from), title: None, zones: None };
         let tmp = std::env::temp_dir();
         let tmp = tmp.to_str().unwrap();
         // Recorded directory kept.
@@ -717,12 +730,42 @@ mod tests {
         assert_eq!(resolve_tab(&local("tmux", Some("/tmp")), &config, home), RestoredTab::Tmux { profile: 2, session: "work".into() });
         // Recorded manual title is preserved for local tabs (and trimmed/ignored if empty).
         assert_eq!(
-            resolve_tab(&TabState::Local { profile: "Shell".into(), cwd: Some(tmp.into()), title: Some("server".into()), zones: None }, &config, home),
+            resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("server".into()), zones: None }, &config, home),
             RestoredTab::Local { profile: 0, cwd: tmp.into(), title: Some("server".into()), zones: None }
         );
         assert_eq!(
-            resolve_tab(&TabState::Local { profile: "Shell".into(), cwd: Some(tmp.into()), title: Some("  ".into()), zones: None }, &config, home),
+            resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("  ".into()), zones: None }, &config, home),
             RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None, zones: None }
+        );
+    }
+
+    #[test]
+    fn remote_restore_drops_cwd_from_another_endpoint() {
+        let config = Config::parse(
+            "default_profile = \"Remote\"\n[[profiles]]\nname = \"Remote\"\ncwd = \"/home/current\"\nremote = { type = \"ssh\", host = \"new-host\" }\n"
+        )
+        .unwrap();
+        let tab = TabState::Local {
+            profile: "Remote".into(),
+            remote: Some(crate::config::RemoteTarget::Ssh {
+                host: "old-host".into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                ssh_args: Vec::new(),
+            }),
+            cwd: Some("/secret/on/old-host".into()),
+            title: None,
+            zones: None,
+        };
+        assert_eq!(
+            resolve_tab(&tab, &config, Path::new("/local/home")),
+            RestoredTab::Local {
+                profile: 0,
+                cwd: "/home/current".into(),
+                title: None,
+                zones: None,
+            }
         );
     }
 
@@ -730,7 +773,7 @@ mod tests {
     fn dedupe_keeps_each_session_once() {
         let config = config();
         let tmux = |session: &str| TabState::Tmux { profile: "tmux".into(), session: session.into() };
-        let local = || TabState::Local { profile: "Shell".into(), cwd: None, title: None, zones: None };
+        let local = || TabState::Local { profile: "Shell".into(), remote: None, cwd: None, title: None, zones: None };
         let window = |active: usize, tabs: Vec<TabState>| WindowState { width: None, height: None, maximized: false, active, tabs };
         let windows = vec![
             window(0, vec![tmux("main")]),
@@ -769,7 +812,7 @@ mod tests {
 
     #[test]
     fn collapse_sessions() {
-        let local = |p: &str| SnapshotTab::Local { profile: p.into(), cwd: None, title: None, zones: None };
+        let local = |p: &str| SnapshotTab::Local { profile: p.into(), remote: None, cwd: None, title: None, zones: None };
         let tmux = |key| SnapshotTab::Tmux { profile: "tmux".into(), session: format!("s{key}"), key };
         let tabs = [local("a"), tmux(1), tmux(1), SnapshotTab::Skip, tmux(2), tmux(1), local("b")];
         let (entries, active) = collapse(&tabs, 5);
@@ -781,10 +824,10 @@ mod tests {
         // An active message tab maps to the first entry.
         assert_eq!(collapse(&tabs, 3).1, 0);
         assert_eq!(collapse(&[], 0), (vec![], 0));
-        let titled = SnapshotTab::Local { profile: "a".into(), cwd: None, title: Some("server".into()), zones: None };
+        let titled = SnapshotTab::Local { profile: "a".into(), remote: None, cwd: None, title: Some("server".into()), zones: None };
         assert_eq!(
             collapse(&[titled], 0).0,
-            vec![TabState::Local { profile: "a".into(), cwd: None, title: Some("server".into()), zones: None }]
+            vec![TabState::Local { profile: "a".into(), remote: None, cwd: None, title: Some("server".into()), zones: None }]
         );
     }
 
@@ -794,7 +837,7 @@ mod tests {
             height: None,
             maximized: false,
             active: 0,
-            tabs: (0..tabs).map(|i| TabState::Local { profile: format!("p{i}"), cwd: None, title: None, zones: None }).collect(),
+            tabs: (0..tabs).map(|i| TabState::Local { profile: format!("p{i}"), remote: None, cwd: None, title: None, zones: None }).collect(),
         }
     }
 
@@ -870,12 +913,14 @@ mod tests {
             tabs: vec![
                 TabState::Local {
                     profile: "Shell".into(),
+                    remote: None,
                     cwd: Some("/b".into()),
                     title: None,
                     zones: Some(two_state.clone()),
                 },
                 TabState::Local {
                     profile: "Shell".into(),
+                    remote: None,
                     cwd: Some("/c".into()),
                     title: Some("work".into()),
                     zones: Some(three_state.clone()),
@@ -902,6 +947,7 @@ mod tests {
         );
         let tab = TabState::Local {
             profile: "Shell".into(),
+            remote: None,
             cwd: Some(tmp.clone()),
             title: None,
             zones: Some(mixed),

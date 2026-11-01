@@ -11,9 +11,9 @@ Build dependencies are the system packages listed in README.md. Wayland, fontcon
 ```sh
 cargo build                          # deps built at opt-level 2 (Blade is unusable unoptimized)
 cargo build --release                # stripped, thin LTO
-cargo test                           # all unit tests (no GUI needed; the e2e suite skips itself)
-cargo test tmux::layout              # one module
-cargo test collector_matches_the_spike_transcript   # one test
+cargo test --workspace               # all unit tests, including the remote agent (no GUI needed)
+cargo test -p brindle tmux::layout   # one module
+cargo test -p brindle collector_matches_the_spike_transcript   # one test
 ```
 
 - **`Cargo.lock` was seeded from gpui 0.2.2's own lockfile.** Do not regenerate it, and avoid broad `cargo update`: a newer `libc` breaks `xattr`. Add new dependencies with care.
@@ -23,11 +23,11 @@ cargo test collector_matches_the_spike_transcript   # one test
 ### Windows
 
 The Windows port (OpenSpec change `port-to-windows`) builds on `x86_64-pc-windows-msvc` with the MSVC toolchain and the Windows 11 SDK.
-- The same `cargo build`, `cargo build --release` and `cargo test` commands work in PowerShell or Git Bash. The release build needs the SDK's `fxc.exe`: on `PATH`, in SDK 10.0.26100.0, or named by `GPUI_FXC_PATH`.
+- The same `cargo build`, `cargo build --release` and `cargo test --workspace` commands work in PowerShell or Git Bash. The release build needs the SDK's `fxc.exe`: on `PATH`, in SDK 10.0.26100.0, or named by `GPUI_FXC_PATH`.
 - Platform code is behind `cfg`: `target_os = "linux"` for D-Bus, Wayland and X11 captures, `unix` for `libc`, `windows` for the `windows` crate. `src/win.rs` holds small Windows helpers. Process info is in `terminal/process.rs` (the seam `port-to-macos` uses), and the primary selection is in `src/primary.rs`.
 - `.gitattributes` keeps every text file LF, because `include_str!` embeds assets and shell scripts.
 - The Windows icons (`assets/windows/brindle.ico` and `brindle-256.png`, for toasts) are rendered from `assets/brindle.svg` by `scripts/render-icons.sh` and committed; re-run it after changing the SVG.
-- On Windows `BRINDLE_E2E=1 cargo test --test e2e` lists only the Windows cases (`tests/e2e/cases/win.rs`: the ConPTY host and fallback, passthrough, glyph widths, closing mid-output, titles, PowerShell integration, the caption hit-test, WSL tmux), and `tests/perf` runs only its self-test.
+- On Windows `BRINDLE_E2E=1 cargo test --test e2e` lists only the Windows cases (`tests/e2e/cases/win.rs`: the ConPTY host and fallback, passthrough, glyph widths, closing mid-output, titles, PowerShell integration, the caption hit-test, WSL tmux) plus the `remote-*` cases, which skip unless `BRINDLE_REMOTE_AGENT` names a Linux helper, and `tests/perf` runs only its self-test.
 - Pitfalls found on the way:
   - `--send` turns `\t`, `\e`, `\r` and `\n` into controls, so Windows paths in steps use `/`.
   - `brindle.exe` is a GUI program: PowerShell doesn't wait for it unless its output is piped, or it is run with `Start-Process -Wait`.
@@ -83,6 +83,8 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/4   # every 4th selected case, 
 - Each case starts its own throwaway tmux server (`brindle-e2e-<pid>-<n>`) and runs Brindle against it with the debug hooks. Cases compare the dump with `capture-pane`, sample colors in window captures, or read OSC 10/11 replies. `tmux-*` cases check tmux behaviour Brindle relies on, over a raw `tmux -C` client, with no display.
 - Expected colors come from the `e2e` theme in the generated test config (`tests/e2e/brindle.rs`), not from built-in themes.
 - `BRINDLE_E2E_BIN` tests another binary (default: this build's). `BRINDLE_E2E_SLOW=2` doubles every delay, Brindle's step spacing included (through `--step-interval`). `BRINDLE_E2E_DISPLAY` picks the X display (default `:0`).
+- The `remote-*` cases (`tests/e2e/cases/remote.rs`) run Brindle against disposable Docker containers built from `tests/fixtures/remote` (an SSH server and tmux) and deploy the sibling `brindle-remote` helper (`cargo build -p brindle-remote-agent`). Without a Docker daemon or the helper they skip; `BRINDLE_REMOTE_E2E_REQUIRED=1` turns that into an error.
+- `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client` is an opt-in transport test with no GUI: `client::connect` against real `docker exec` and OpenSSH containers (deployment and reuse, exit and failure events, shell noise, orphans, floods, Ctrl-C). It runs the static helper at `target/x86_64-unknown-linux-musl/release/brindle-remote`, built with the Docker command in README.md; rebuild it after changing agent code, or the test runs a stale one.
 - Each case's config, dumps, logs, captures (`.ppm`) and transcripts are kept in `target/tmp/e2e/<case>/`.
 - When a change adds a GUI check, add it as a case here instead of a one-off script.
 - `scripts/with-xvfb <command>` runs it headless: a private Xvfb on a free display, openbox, lavapipe (`VK_DRIVER_FILES`), `LC_ALL=C.UTF-8` and a private session bus (`dbus-run-session`). Runs under it open no windows on the desktop, so they don't need asking first, unlike runs on `:0`. The suite needs the window manager (palette and multi-window cases). The locale keeps programs in panes consistent; tmux doesn't need it, since control clients run with `-u`.
@@ -120,11 +122,11 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
 - **`terminal/`** — the `Terminal` entity wraps an `Arc<FairMutex<alacritty Term>>` and a `Backend`:
   - `Pty`: alacritty's `EventLoop` runs on its own thread.
   - `Remote`: bytes are pushed in with `feed()` and input goes to a closure. Used for tmux panes and for error-message tabs (`Terminal::message`).
-
+  - `Agent`: a remote Linux helper owns the PTY; framed output reaches `feed()`, while input, resize and process/CWD queries go back over its channel.
   - **Program status (`status.rs`):** the OSC 7501 parser and each `Terminal`'s `Records` (one per id, the root is `""`), with the lifetime rules: `end_activity` on OSC 133 `A` and process exit (drops `working`/`blocked`), `seen` on user input (drops `done`/`error`), `reset` on `ESC c`. `handle_found` applies what the scanner found in stream order and answers the `?` query with `write` (for a pane that goes through `send-keys -H`; tmux passes the OSC through raw but doesn't answer it). `TerminalEvent::Status(Option<Notice>)` carries a notice when a record became blocked/done/error with a different kind, title or message. `Workspace` keeps `Tab::status` (the max over the tab's terminals, `TmuxWindowView::status_summary` for panes) and draws it as a coloured dot beside the bell dot; `--dump-screen-after` prints the records as `--- status` lines.
 
   `links.rs` finds URLs in a line of chars and runs the opener (`xdg-open`, or `BRINDLE_LINK_OPENER`) on a background thread. `link_at` returns the link at a grid point: the cell's OSC 8 hyperlink, or else a URL found in the logical line, where rows are joined by `WRAPLINE`. `TerminalView` looks links up only in event handlers while ctrl is held (hover) or on a ctrl-click, never in `prepaint`, which just underlines the stored spans.
-  - **Parsing and shell integration (`shell_integration.rs`, `pty.rs`):** both backends parse through Brindle's own `Parser` (vte processor + OSC 133 scanner). For `Pty`, `MarkedPty` wraps alacritty's `Pty` (Unix) or Brindle's pseudoconsole (Windows) so the event loop's reader (`ParsingReader<R>`) parses under the term lock and returns `Ok(0)`; alacritty's own processor never sees bytes. Lock order is parser → term (`lock_unfair` while holding the parser) → marks. Marks are absolute lines (`base + Line`); `base` is kept by finding the row that was at `Line(0)` after each processor call (rows rotate, their cells never move), and resizes remap marks through logical lines. Synchronized-update timeouts are flushed from the GPUI side on `Wakeup`.
+  - **Parsing and shell integration (`shell_integration.rs`, `pty.rs`):** every backend parses through Brindle's own `Parser` (vte processor + OSC 133 scanner). For `Pty`, `MarkedPty` wraps alacritty's `Pty` (Unix) or Brindle's pseudoconsole (Windows) so the event loop's reader (`ParsingReader<R>`) parses under the term lock and returns `Ok(0)`; alacritty's own processor never sees bytes. Lock order is parser → term (`lock_unfair` while holding the parser) → marks. Marks are absolute lines (`base + Line`); `base` is kept by finding the row that was at `Line(0)` after each processor call (rows rotate, their cells never move), and resizes remap marks through logical lines. Synchronized-update timeouts are flushed from the GPUI side on `Wakeup`.
 
   - **Windows pseudoconsole (`conpty.rs`, `cmdline.rs`):** Brindle creates the pseudoconsole itself; alacritty's ConPTY backend isn't used.
     - The ConPTY functions are resolved once. They come from the packaged `conpty.dll` that `build.rs` embeds (`scripts/fetch-conpty.ps1` fetches it). It is loaded by absolute path from beside the exe, else from a copy extracted to `%LOCALAPPDATA%\brindle\conpty\<version>`, and only when the bytes there match the embedded ones. Otherwise the inbox kernel32 functions are used, with one warning. `BRINDLE_CONPTY=inbox` forces those.
@@ -134,6 +136,7 @@ Data flows **PTY / tmux → `Terminal` (model) → `TerminalView` (input) → `T
     - Arguments are quoted with the MSVC rules. The environment block is merged and sorted case-insensitively, with profile entries winning.
 
   Alacritty events reach GPUI through an unbounded channel drained by a spawned task. Replies the emulator generates go through `reply()`, which drops them for `Remote` terminals, because tmux answers terminal queries itself. `keys.rs` and `mouse.rs` are pure xterm encoders with unit tests.
+- **`remote/` / `brindle-remote`** — `protocol.rs` defines bounded framed stdio messages. `client.rs` deploys a matching Linux helper through OpenSSH or Docker/Podman exec on a background thread, then routes PTY data, resize, exit and `/proc` process info to `Terminal::Agent`. The helper is cached by Brindle version with user-only permissions. Remote tmux control profiles run `tmux -C` directly through SSH/container pipes and keep using the existing `TmuxSession` collector; `SessionKey` includes the remote target.
 - **`terminal_view.rs` / `terminal_element.rs`**
   - Key handling: GPUI resolves keybindings *before* `on_key_down`. `key_down` encodes special keys and modifier combos and calls `stop_propagation`. Plain text (no modifiers or shift only) instead arrives through the `EntityInputHandler` path, which is what makes IME work. That's why app shortcuts are ctrl-shift-*.
   - Painting: the element batches each row into same-style runs, shapes each batch once, and places it at its exact column. Non-ASCII glyphs and the cursor cell get their own batch. Box drawing (U+2500–U+259F) is painted as rectangles, not glyphs.

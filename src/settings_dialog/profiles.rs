@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::{Profile, TmuxMode};
+use crate::config::{Profile, RemoteTarget, TmuxMode};
 use crate::config_edit::{self, IMPLICIT_PROFILE, ProfileRef};
 
 /// A profile in the list.
@@ -139,6 +139,9 @@ struct Values {
     /// `None` follows the global theme.
     theme: Option<String>,
     tmux: TmuxMode,
+    /// The settings UI does not edit remote targets yet, but it must preserve
+    /// one while editing the profile's other fields.
+    remote: Option<RemoteTarget>,
     default: bool,
 }
 
@@ -157,6 +160,7 @@ impl Values {
                 join_words(&p.tmux_args),
             ],
             theme: p.theme.clone(),
+            remote: p.remote.clone(),
             tmux: p.tmux,
             default,
         }
@@ -333,6 +337,7 @@ impl ProfileEditor {
         let tmux = self.values.tmux;
         Ok(Profile {
             name: name.to_string(),
+            remote: self.values.remote.clone(),
             command: optional(Field::Command),
             args,
             cwd: optional(Field::Cwd),

@@ -611,7 +611,7 @@ impl ZoneTreeView {
 
         let config: Config = Settings::get(cx).config.clone();
         // A split inherits the target zone's current working directory; if
-        // unavailable, `Terminal::spawn_pty` falls back to the profile's cwd or home.
+        // unavailable, `Terminal::spawn` falls back to the profile's cwd or home.
         let cwd = self.zone_working_directory(target, cx);
         let command = match self.profile.tmux {
             TmuxMode::Plain => {
@@ -633,7 +633,7 @@ impl ZoneTreeView {
             return;
         }
 
-        let terminal = cx.new(|cx| Terminal::spawn_pty(&self.profile, command, cwd, &config, cx));
+        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, command, cwd, &config, cx));
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         let mut snapshot = None;
         self.refresh_zone_title(target, &mut snapshot, cx);

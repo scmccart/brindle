@@ -27,6 +27,8 @@ pub fn all() -> Vec<Case> {
         display("windows-caption", caption),
         display("windows-wsl-tmux", wsl_tmux),
         display("windows-zones", zones),
+        display("remote-container-exec", super::remote::container_exec),
+        display("remote-ssh-container", super::remote::ssh_container),
     ]
 }
 

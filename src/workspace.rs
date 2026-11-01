@@ -2,6 +2,7 @@
 //! active tab's content, and the palettes.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -435,7 +436,7 @@ impl Workspace {
             .into_iter()
             .map(|(id, cwd)| {
                 let cmd = command.clone();
-                let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, cmd, Some(cwd), &config, cx));
+                let terminal = cx.new(|cx| Terminal::spawn(&profile, cmd, Some(cwd), &config, cx));
                 (id, terminal)
             })
             .collect();
@@ -497,6 +498,7 @@ impl Workspace {
                     });
                     SnapshotTab::Local {
                         profile: tab.profile.name.clone(),
+                        remote: tab.profile.remote.clone(),
                         cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
                         title: tab.manual_title.clone(),
                         zones,
@@ -546,8 +548,13 @@ impl Workspace {
             .unwrap_or_else(|| Self::settings(cx).theme(None))
     }
 
-    fn active_cwd(&self, cx: &App) -> Option<PathBuf> {
+    /// The active directory only has meaning to a profile on the same host
+    /// or container. In particular, never pass a Windows path to remote tmux.
+    fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
+        if tab.profile.remote != profile.remote {
+            return None;
+        }
         tab.active_terminal(cx)?.read(cx).working_directory()
     }
 
@@ -559,9 +566,17 @@ impl Workspace {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
+        let requested_cwd = request.cwd.filter(|cwd| {
+            if profile.remote.is_none() {
+                return true;
+            }
+            let cwd = cwd.to_string_lossy();
+            cwd.starts_with('/') || cwd == "~" || cwd.starts_with("~/")
+        });
 
         if profile.tmux == TmuxMode::Control && request.command.is_none() {
-            self.attach_tmux(profile, request.cwd, window, cx);
+            let cwd = requested_cwd.or_else(|| profile.working_directory());
+            self.attach_tmux(profile, cwd, window, cx);
             return;
         }
 
@@ -579,12 +594,13 @@ impl Workspace {
             _ => None,
         });
 
-        let cwd = request.cwd.or_else(|| {
-            // New tabs follow the current directory unless the profile pins one.
-            if profile.cwd.is_none() { self.active_cwd(cx) } else { None }
+        let cwd = requested_cwd.or_else(|| {
+            // New tabs follow the current directory only on the same endpoint,
+            // unless the destination profile pins one.
+            if profile.cwd.is_none() { self.active_cwd_for(&profile, cx) } else { None }
         });
 
-        let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, command, cwd, &config, cx));
+        let terminal = cx.new(|cx| Terminal::spawn(&profile, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
@@ -660,7 +676,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<TmuxSession> {
         let config = Self::settings(cx).clone();
-        let cwd = cwd.or_else(|| self.active_cwd(cx));
+        let cwd = cwd.or_else(|| self.active_cwd_for(&profile, cx));
         let session = cx.new(|cx| TmuxSession::attach(profile, spec, cwd, &config, cx));
         let subscription = cx.subscribe_in(&session, window, |this, session, event, window, cx| {
             this.on_tmux_event(session.clone(), event, window, cx)
@@ -789,7 +805,7 @@ impl Workspace {
     /// server, here or in a new window.
     fn ask_new_session(&mut self, profile: Profile, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle().downcast::<Workspace>();
-        let cwd = self.active_cwd(cx);
+        let cwd = self.active_cwd_for(&profile, cx);
         let submit: SubmitFn = Rc::new(move |name, cx| {
             let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
             let (reply, result) = oneshot::channel();
@@ -811,15 +827,27 @@ impl Workspace {
                     .spawn(async move |cx| {
                         if let Some(name) = &name {
                             let (program, args) = has_session_command(&profile, name);
+                            let remote_profile = profile.clone();
                             let env = crate::terminal::child_env(&profile);
                             let taken = cx
                                 .background_executor()
                                 .spawn(async move {
-                                    let mut command = std::process::Command::new(program);
+                                    let (mut command, initial_input) = if remote_profile.remote.is_some() {
+                                        match crate::remote::tmux_command(&remote_profile, &program, &args) {
+                                            Ok(process) => (process.command, process.initial_input),
+                                            Err(_) => return false,
+                                        }
+                                    } else {
+                                        let mut command = std::process::Command::new(program);
+                                        command.args(args).envs(env);
+                                        (command, Vec::new())
+                                    };
                                     command
-                                        .args(args)
-                                        .envs(env)
-                                        .stdin(std::process::Stdio::null())
+                                        .stdin(if initial_input.is_empty() {
+                                            std::process::Stdio::null()
+                                        } else {
+                                            std::process::Stdio::piped()
+                                        })
                                         .stdout(std::process::Stdio::null())
                                         .stderr(std::process::Stdio::null());
                                     #[cfg(windows)]
@@ -827,7 +855,11 @@ impl Workspace {
                                         &mut command,
                                         crate::win::CREATE_NO_WINDOW,
                                     );
-                                    command.status().is_ok_and(|s| s.success())
+                                    command_status_with_input(
+                                        command,
+                                        &initial_input,
+                                        std::time::Duration::from_secs(30),
+                                    )
                                 })
                                 .await;
                             if taken {
@@ -1680,7 +1712,9 @@ impl Workspace {
         }
         for tab in &mut self.tabs {
             if let Some(p) = config.profile(&tab.profile.name) {
+                let remote = tab.profile.remote.clone();
                 tab.profile = p.clone();
+                tab.profile.remote = remote;
             }
         }
         let mut snapshot = None;
@@ -2039,6 +2073,35 @@ pub(crate) fn terminal_automatic_title(
     match own {
         Some(title) => title.to_string(),
         None => foreground_process().unwrap_or_else(|| profile_name.to_string()),
+    }
+}
+
+fn command_status_with_input(
+    mut command: std::process::Command,
+    input: &[u8],
+    timeout: std::time::Duration,
+) -> bool {
+    let Ok(mut child) = command.spawn() else { return false };
+    if !input.is_empty()
+        && !child.stdin.take().is_some_and(|mut stdin| stdin.write_all(input).is_ok())
+    {
+        child.kill().ok();
+        child.wait().ok();
+        return false;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                return false;
+            }
+        }
     }
 }
 

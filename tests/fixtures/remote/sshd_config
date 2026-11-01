@@ -1,0 +1,12 @@
+ListenAddress 0.0.0.0
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+UsePAM no
+StrictModes yes
+AuthorizedKeysFile .ssh/authorized_keys
+PrintMotd no
+PrintLastLog no
+PidFile /run/sshd/sshd.pid

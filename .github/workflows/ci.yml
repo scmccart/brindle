@@ -81,11 +81,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace
       - name: e2e harness self-test
-        run: BRINDLE_E2E=1 cargo test --locked --test e2e -- --self-test
+        run: BRINDLE_E2E=1 cargo test --locked -p brindle --test e2e -- --self-test
       - name: perf harness self-test
-        run: BRINDLE_PERF=1 cargo test --locked --test perf -- --self-test
+        run: BRINDLE_PERF=1 cargo test --locked -p brindle --test perf -- --self-test
 
   release:
     runs-on: ubuntu-26.04
@@ -95,17 +95,28 @@ jobs:
         run: |
           sudo apt-get update
           # shellcheck disable=SC2086 # a list of packages
-          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
       - run: cargo build --release --locked
+      - name: Build static Linux remote helper
+        run: |
+          cargo build --release --locked -p brindle-remote-agent --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/brindle-remote brindle-remote-linux-x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-remote-linux-x86_64
+          path: brindle-remote-linux-x86_64
+          retention-days: 14
 
   windows:
     runs-on: windows-latest
+    needs: release
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -114,6 +125,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows
+      - uses: actions/download-artifact@v7
+        with:
+          name: brindle-remote-linux-x86_64
+          path: target/release
       # GPUI's release build compiles its shaders with fxc.exe, which it
       # otherwise looks for only on PATH and in one SDK version's directory.
       - name: Find fxc.exe
@@ -127,13 +142,13 @@ jobs:
       - run: scripts/fetch-conpty.ps1
         shell: pwsh
       - run: cargo build --release --locked
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace
       - name: e2e harness self-test
-        run: cargo test --locked --test e2e -- --self-test
+        run: cargo test --locked -p brindle --test e2e -- --self-test
         env:
           BRINDLE_E2E: "1"
       - name: perf harness self-test
-        run: cargo test --locked --test perf -- --self-test
+        run: cargo test --locked -p brindle --test perf -- --self-test
         env:
           BRINDLE_PERF: "1"
       - name: Version resource, icon and DPI manifest in brindle.exe
@@ -220,9 +235,9 @@ jobs:
       - run: scripts/fetch-conpty.ps1
         shell: pwsh
       - name: Build
-        run: cargo test --locked --test e2e --no-run
+        run: cargo test --locked -p brindle --test e2e --no-run
       - name: End-to-end suite
-        run: cargo test --locked --test e2e
+        run: cargo test --locked -p brindle --test e2e
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
@@ -294,13 +309,16 @@ jobs:
         with:
           shared-key: dev
       - name: Build
-        run: cargo test --locked --test e2e --no-run
+        run: |
+          cargo build --locked -p brindle-remote-agent
+          cargo test --locked -p brindle --test e2e --no-run
       - name: End-to-end suite
-        run: scripts/with-xvfb cargo test --locked --test e2e -- --shard ${{ matrix.shard }}/4
+        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- --shard ${{ matrix.shard }}/4
         env:
           BRINDLE_E2E: "1"
           # lavapipe and shared runners are slower than a desktop.
           BRINDLE_E2E_SLOW: "2"
+          BRINDLE_REMOTE_E2E_REQUIRED: "1"
       - name: Upload the suite's output
         if: failure()
         uses: actions/upload-artifact@v7

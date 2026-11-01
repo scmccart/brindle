@@ -120,15 +120,18 @@ pub enum Event {
 /// Groups lines into notifications and `%begin`…`%end` responses. tmux
 /// never sends notifications inside a response block, and a block is only
 /// closed by an `%end`/`%error` carrying the same command number.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_LINES: usize = 65_536;
+
 #[derive(Default)]
 pub struct Collector {
-    current: Option<(u64, bool, Vec<Vec<u8>>)>,
+    current: Option<(u64, bool, Vec<Vec<u8>>, usize, usize)>,
 }
 
 impl Collector {
     pub fn feed_line(&mut self, line: &[u8]) -> Option<Event> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some((number, ours, body)) = &mut self.current {
+        if let Some((number, ours, body, bytes, lines)) = &mut self.current {
             if line.starts_with(b"%end ") || line.starts_with(b"%error ") {
                 let closing = match parse_line(line) {
                     Notification::End { number: n, .. } if n == *number => Some(true),
@@ -142,12 +145,20 @@ impl Collector {
                     return Some(Event::Response { ours, ok, body });
                 }
             }
+            *bytes = bytes.saturating_add(line.len() + 1 + std::mem::size_of::<Vec<u8>>());
+            *lines = lines.saturating_add(1);
+            if *bytes > MAX_RESPONSE_BYTES || *lines > MAX_RESPONSE_LINES {
+                self.current = None;
+                return Some(Event::Notification(Notification::Exit(Some(
+                    "tmux response exceeded its size limit".into(),
+                ))));
+            }
             body.push(line.to_vec());
             return None;
         }
         match parse_line(line) {
             Notification::Begin { number, ours } => {
-                self.current = Some((number, ours, Vec::new()));
+                self.current = Some((number, ours, Vec::new(), 0, 0));
                 None
             }
             notification => Some(Event::Notification(notification)),
@@ -444,6 +455,49 @@ mod tests {
                 },
                 n(Notification::Exit(None)),
             ]
+        );
+    }
+
+    #[test]
+    fn collector_tolerates_login_noise_before_the_first_begin() {
+        // A remote `sh -lc` can print a motd or profile output first.
+        let mut collector = Collector::default();
+        let mut events = Vec::new();
+        for line in [
+            &b"Welcome to Ubuntu"[..],
+            b"",
+            b"echo from .profile\r",
+            b"%begin 1700000000 1 1",
+            b"@0 bash",
+            b"%end 1700000000 1 1",
+        ] {
+            events.extend(collector.feed_line(line));
+        }
+        let responses: Vec<_> = events.iter().filter(|e| matches!(e, Event::Response { .. })).collect();
+        assert_eq!(
+            responses,
+            [&Event::Response { ours: true, ok: true, body: vec![b"@0 bash".to_vec()] }]
+        );
+        assert!(events.iter().all(|e| !matches!(e, Event::Notification(Notification::Exit(_)))));
+    }
+
+    #[test]
+    fn collector_rejects_oversized_response() {
+        let mut collector = Collector::default();
+        assert_eq!(collector.feed_line(b"%begin 0 1 1"), None);
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut rejected = None;
+        for _ in 0..9 {
+            rejected = collector.feed_line(&chunk);
+            if rejected.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            rejected,
+            Some(Event::Notification(Notification::Exit(Some(
+                "tmux response exceeded its size limit".into()
+            ))))
         );
     }
 

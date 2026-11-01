@@ -11,6 +11,7 @@ mod latency;
 mod notify;
 mod picker;
 mod primary;
+mod remote;
 mod session;
 mod settings;
 mod settings_dialog;

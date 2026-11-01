@@ -17,6 +17,7 @@ mod restore;
 mod notify;
 mod palette;
 mod reattach;
+mod remote;
 mod reload;
 mod selection;
 mod search;
@@ -57,6 +58,8 @@ fn unix() -> Vec<Case> {
         display("tmux-poll-session-end-inside", tmux::poll_session_end_inside),
         display("attach-without-locale", tmux::attach_without_locale),
         display("dump-grid-geometry", dump::grid_geometry),
+        display("remote-container-exec", remote::container_exec),
+        display("remote-ssh-container", remote::ssh_container),
         display("geometry-plain", geometry::plain),
         display("geometry-top-before-attach", geometry::top_before_attach),
         display("geometry-top-while-attached", geometry::top_while_attached),

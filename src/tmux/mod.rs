@@ -10,12 +10,12 @@ pub mod style;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
@@ -25,6 +25,27 @@ use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
 use protocol::{Collector, Event, Notification, PaneId, WindowId};
 use style::{Style, StyledRun, TmuxColor};
+
+const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
+
+fn read_bounded_tmux_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+        let take = available.iter().position(|&byte| byte == b'\n').map_or(available.len(), |at| at + 1);
+        if line.len() + take > MAX_CONTROL_LINE_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "tmux control line exceeds 1 MiB"));
+        }
+        let complete = available[take - 1] == b'\n';
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if complete {
+            return Ok(line.len());
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TmuxEvent {
@@ -77,15 +98,18 @@ enum WriterMessage {
     Flush(oneshot::Sender<()>),
 }
 
+const MAX_PENDING_RESPONSES: usize = 4096;
+const MAX_TMUX_WINDOWS: usize = 256;
+
 /// The write side of the control connection, shared with pane input closures.
 struct Io {
-    writer: std::sync::mpsc::Sender<WriterMessage>,
+    writer: std::sync::mpsc::SyncSender<WriterMessage>,
     pending: VecDeque<Pending>,
 }
 
 impl Io {
     fn send(&mut self, command: String, pending: Pending) {
-        if self.write(command) {
+        if self.pending.len() < MAX_PENDING_RESPONSES && self.write(command) {
             self.pending.push_back(pending);
         }
     }
@@ -93,13 +117,13 @@ impl Io {
     /// Writes a command line without expecting a reply of its own.
     fn write(&mut self, command: String) -> bool {
         log::debug!("tmux <- {command}");
-        self.writer.send(WriterMessage::Line(command)).is_ok()
+        self.writer.try_send(WriterMessage::Line(command)).is_ok()
     }
 
     /// Resolves once everything sent so far has been written to tmux.
     fn flush(&mut self) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
-        self.writer.send(WriterMessage::Flush(tx)).ok();
+        self.writer.try_send(WriterMessage::Flush(tx)).ok();
         rx
     }
 }
@@ -398,8 +422,10 @@ impl EventEmitter<TmuxEvent> for TmuxSession {}
 /// that no other Brindle shows it.
 struct Starter {
     program: String,
-    command: Command,
-    event_tx: futures::channel::mpsc::UnboundedSender<Option<Event>>,
+    /// The control client's command, or why it could not be built.
+    command: Result<Command, String>,
+    initial_input: Vec<u8>,
+    event_tx: futures::channel::mpsc::Sender<Option<Event>>,
     writer_rx: std::sync::mpsc::Receiver<WriterMessage>,
 }
 
@@ -429,7 +455,8 @@ struct TmuxCommand {
 /// session names reach it verbatim.
 fn tmux_command(profile: &Profile) -> TmuxCommand {
     let program = profile.command.clone().unwrap_or_else(|| "tmux".into());
-    let wsl = crate::terminal::cmdline::program_stem(&program).eq_ignore_ascii_case("wsl");
+    let wsl = profile.remote.is_none()
+        && crate::terminal::cmdline::program_stem(&program).eq_ignore_ascii_case("wsl");
     if !wsl {
         return TmuxCommand { program, prefix: Vec::new(), options: profile.tmux_args.clone(), wsl };
     }
@@ -531,9 +558,10 @@ fn read_process(pid: u32) -> Option<(u32, Vec<u8>)> {
 /// Runs tmux, so it belongs off the UI thread. A missing session or server
 /// means no.
 fn shown_by_another_brindle(profile: &Profile, name: &str) -> bool {
-    // Clients are recognised through /proc, and through WSL the marker
-    // doesn't reach them and their parents aren't Brindle's pid.
-    if cfg!(windows) {
+    // Clients are recognised through the local /proc tree. A remote host or
+    // WSL has a different process tree, so this check cannot identify its
+    // Brindle parent reliably.
+    if cfg!(windows) || profile.remote.is_some() {
         return false;
     }
     let (program, args) = list_clients_command(profile, name);
@@ -556,6 +584,7 @@ fn shown_by_another_brindle(profile: &Profile, name: &str) -> bool {
 /// three show the same session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionKey {
+    remote: Option<crate::config::RemoteTarget>,
     program: String,
     tmux_args: Vec<String>,
     name: String,
@@ -567,9 +596,13 @@ impl SessionKey {
         (profile.tmux == TmuxMode::Control).then(|| Self::new(profile, profile.tmux_session_name()))
     }
 
-    /// Session `name` on `profile`'s server.
     pub fn new(profile: &Profile, name: &str) -> Self {
-        Self { program: tmux_command(profile).program, tmux_args: profile.tmux_args.clone(), name: name.to_string() }
+        Self {
+            remote: profile.remote.clone(),
+            program: tmux_command(profile).program,
+            tmux_args: profile.tmux_args.clone(),
+            name: name.to_string(),
+        }
     }
 }
 
@@ -587,6 +620,99 @@ fn attach_error(body: &[Vec<u8>]) -> Option<String> {
     let text = body.iter().map(|l| String::from_utf8_lossy(l).trim().to_string()).collect::<Vec<_>>().join("; ");
     (!text.is_empty()).then_some(text)
 }
+/// The most of a remote client's stderr kept to explain why it exited.
+const MAX_TMUX_STDERR: usize = 4096;
+
+fn start_control_child(
+    mut child: Child,
+    initial_input: &[u8],
+    event_tx: futures::channel::mpsc::Sender<Option<Event>>,
+    writer_rx: std::sync::mpsc::Receiver<WriterMessage>,
+) -> io::Result<Child> {
+    let started = (|| -> io::Result<()> {
+        let stdout = child.stdout.take().ok_or_else(|| io::Error::other("tmux stdout unavailable"))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| io::Error::other("tmux stdin unavailable"))?;
+        stdin.write_all(initial_input)?;
+        stdin.flush()?;
+        // A remote client's stderr is where `tmux: command not found` or an ssh
+        // error goes; keep the start of it to explain an exit.
+        let stderr_text = child.stderr.take().map(|mut stderr| {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::Builder::new().name("tmux-stderr".into()).spawn(move || {
+                let mut kept = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while let Ok(n) = io::Read::read(&mut stderr, &mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = MAX_TMUX_STDERR.saturating_sub(kept.len()).min(n);
+                    kept.extend_from_slice(&buffer[..room]);
+                }
+                tx.send(String::from_utf8_lossy(&kept).trim().to_string()).ok();
+            }).ok();
+            rx
+        });
+        std::thread::Builder::new()
+            .name("tmux-reader".into())
+            .spawn(move || {
+                let mut reader = BufReader::with_capacity(1 << 16, stdout);
+                let mut collector = Collector::default();
+                let mut line = Vec::new();
+                let mut event_tx = event_tx;
+                loop {
+                    line.clear();
+                    match read_bounded_tmux_line(&mut reader, &mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+                    if let Some(event) = collector.feed_line(trimmed)
+                        && futures::executor::block_on(event_tx.send(Some(event))).is_err()
+                    {
+                        return;
+                    }
+                }
+                let explanation = stderr_text
+                    .and_then(|rx| rx.recv_timeout(std::time::Duration::from_millis(500)).ok())
+                    .filter(|text| !text.is_empty());
+                if let Some(text) = explanation {
+                    let exit = Event::Notification(Notification::Exit(Some(text)));
+                    futures::executor::block_on(event_tx.send(Some(exit))).ok();
+                }
+                futures::executor::block_on(event_tx.send(None)).ok();
+            })?;
+        std::thread::Builder::new()
+            .name("tmux-writer".into())
+            .spawn(move || {
+                while let Ok(first) = writer_rx.recv() {
+                    let (mut batch, mut acks) = (String::new(), Vec::new());
+                    for message in std::iter::once(first).chain(std::iter::from_fn(|| writer_rx.try_recv().ok())) {
+                        match message {
+                            WriterMessage::Line(command) => {
+                                batch.push_str(&command);
+                                batch.push('\n');
+                            }
+                            WriterMessage::Flush(ack) => acks.push(ack),
+                        }
+                    }
+                    if !batch.is_empty() && stdin.write_all(batch.as_bytes()).and_then(|_| stdin.flush()).is_err() {
+                        break;
+                    }
+                    for ack in acks {
+                        ack.send(()).ok();
+                    }
+                }
+            })?;
+        Ok(())
+    })();
+    if let Err(error) = started {
+        child.kill().ok();
+        child.wait().ok();
+        return Err(error);
+    }
+    Ok(child)
+}
+
 
 impl TmuxSession {
     pub fn attach(
@@ -601,23 +727,37 @@ impl TmuxSession {
             // tmux may change the name (`.` and `:`); `%session-changed` says.
             AttachSpec::New(_) => None,
         };
-        let (program, args) = command_line(&profile, &spec, cwd.as_ref().filter(|d| d.is_dir()));
-        let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<Option<Event>>();
-        let (writer_tx, writer_rx) = std::sync::mpsc::channel::<WriterMessage>();
+        let valid_cwd = cwd.as_ref().filter(|d| !d.as_os_str().is_empty() && (profile.remote.is_some() || d.is_dir()));
+        let (program, args) = command_line(&profile, &spec, valid_cwd);
+        let (event_tx, event_rx) = futures::channel::mpsc::channel::<Option<Event>>(64);
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WriterMessage>(256);
 
-        let mut command = Command::new(&program);
-        command
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .envs(crate::terminal::child_env(&profile))
-            .env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
-        // Brindle has no console to share: without this, `wsl.exe` (a
-        // console program) would open a window of its own.
+        #[allow(unused_mut)] // Mutated below only on Windows for CREATE_NO_WINDOW.
+        let (command, initial_input) = match &profile.remote {
+            Some(_) => match crate::remote::tmux_command(&profile, &program, &args) {
+                Ok(process) => (Ok(process.command), process.initial_input),
+                Err(err) => (Err(format!("{err:#}")), Vec::new()),
+            },
+            None => {
+                let mut command = Command::new(&program);
+                command
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .envs(crate::terminal::child_env(&profile))
+                    .env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
+                (Ok(command), Vec::new())
+            }
+        };
+        // Brindle has no console to share: without this, console programs
+        // open a window of their own.
         #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
-        let starter = Starter { program, command, event_tx, writer_rx };
+        let command = command.map(|mut command| {
+            std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
+            command
+        });
+        let starter = Starter { program, command, initial_input, event_tx, writer_rx };
 
         let reader = cx.spawn(async move |this, cx| {
             let mut events = event_rx.ready_chunks(4096);
@@ -707,75 +847,26 @@ impl TmuxSession {
 
     /// Spawns the control client and asks for the version and the windows.
     fn start(&mut self, starter: Starter, cx: &mut Context<Self>) {
-        let Starter { program, mut command, event_tx, writer_rx } = starter;
-        let mut startup_error = None;
-        let child = match command.spawn() {
-            Ok(mut child) => {
-                let stdout = child.stdout.take().unwrap();
-                let mut stdin = child.stdin.take().unwrap();
-                std::thread::Builder::new()
-                    .name("tmux-reader".into())
-                    .spawn(move || {
-                        let mut reader = BufReader::with_capacity(1 << 16, stdout);
-                        let mut collector = Collector::default();
-                        let mut line = Vec::new();
-                        loop {
-                            line.clear();
-                            match reader.read_until(b'\n', &mut line) {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
-                            }
-                            let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
-                            if let Some(event) = collector.feed_line(trimmed)
-                                && event_tx.unbounded_send(Some(event)).is_err()
-                            {
-                                return;
-                            }
-                        }
-                        event_tx.unbounded_send(None).ok();
-                    })
-                    .ok();
-                std::thread::Builder::new()
-                    .name("tmux-writer".into())
-                    .spawn(move || {
-                        while let Ok(first) = writer_rx.recv() {
-                            // Coalesce queued commands into one write.
-                            let (mut batch, mut acks) = (String::new(), Vec::new());
-                            for message in std::iter::once(first).chain(std::iter::from_fn(|| writer_rx.try_recv().ok())) {
-                                match message {
-                                    WriterMessage::Line(command) => {
-                                        batch.push_str(&command);
-                                        batch.push('\n');
-                                    }
-                                    WriterMessage::Flush(ack) => acks.push(ack),
-                                }
-                            }
-                            if !batch.is_empty() && stdin.write_all(batch.as_bytes()).and_then(|_| stdin.flush()).is_err() {
-                                break;
-                            }
-                            for ack in acks {
-                                ack.send(()).ok();
-                            }
-                        }
-                    })
-                    .ok();
-                Some(child)
-            }
+        let Starter { program, command, initial_input, event_tx, writer_rx } = starter;
+        let child = command.map_err(|err| format!("could not start remote {program:?}: {err}")).and_then(|mut command| {
+            command
+                .spawn()
+                .and_then(|child| start_control_child(child, &initial_input, event_tx, writer_rx))
+                .map_err(|err| format!("could not run {program:?}: {err}"))
+        });
+        self.child = match child {
+            Ok(child) => Some(child),
             Err(err) => {
-                startup_error = Some(format!("could not run {program:?}: {err}"));
+                log::error!("{err}");
+                // Defer so the workspace has subscribed before we report.
+                cx.spawn(async move |this, cx| {
+                    this.update(cx, |this, cx| this.on_detached(err, cx)).ok();
+                })
+                .detach();
                 None
             }
         };
-
-        self.child = child;
-        if let Some(err) = startup_error {
-            log::error!("{err}");
-            // Defer so the workspace has subscribed before we report.
-            cx.spawn(async move |this, cx| {
-                this.update(cx, |this, cx| this.on_detached(err, cx)).ok();
-            })
-            .detach();
-        } else {
+        if self.child.is_some() {
             self.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
             self.list_windows();
         }
@@ -1187,6 +1278,10 @@ impl TmuxSession {
     }
 
     fn on_window_list(&mut self, body: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        if body.len() > MAX_TMUX_WINDOWS {
+            self.on_detached(format!("tmux reported more than {MAX_TMUX_WINDOWS} windows"), cx);
+            return;
+        }
         let source = *self.state_source.get_or_insert_with(|| StateSource::choose(None));
         let first = !self.attached && !self.released;
         if first && source == StateSource::Subscribe {
@@ -1196,13 +1291,13 @@ impl TmuxSession {
             self.subscribed = true;
         }
         self.attached = true;
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         let mut added = Vec::new();
         let mut active = None;
         for line in body {
             let Some(line) = parse_window_line(&String::from_utf8_lossy(&line)) else { continue };
             let id = line.id;
-            seen.push(id);
+            seen.insert(id);
             if line.active {
                 active = Some(id);
             }
@@ -1479,7 +1574,14 @@ impl TmuxSession {
 
     /// Picks up a reloaded config for panes created from now on, and reports
     /// the new theme's colors for the existing ones.
-    pub fn set_config(&mut self, profile: Profile, config: &Config, cx: &mut Context<Self>) {
+    pub fn set_config(&mut self, mut profile: Profile, config: &Config, cx: &mut Context<Self>) {
+        // The running control client stays on its original server even if a
+        // live reload retargets the profile. Only a newly opened session uses
+        // the new endpoint/server settings.
+        profile.remote = self.profile.remote.clone();
+        profile.command = self.profile.command.clone();
+        profile.tmux_args = self.profile.tmux_args.clone();
+        profile.tmux_session = self.profile.tmux_session.clone();
         self.profile = profile;
         self.config = config.clone();
         let panes: Vec<PaneId> = self.panes.keys().copied().collect();
@@ -1682,6 +1784,21 @@ pub fn restore_bytes(state: &[u32], alternate: Option<&[Vec<u8>]>, screen: &[Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_lines_are_bounded() {
+        let mut line = Vec::new();
+        let mut input = std::io::Cursor::new(b"%exit done\n".to_vec());
+        assert_eq!(read_bounded_tmux_line(&mut input, &mut line).unwrap(), 11);
+        assert_eq!(line, b"%exit done\n");
+
+        let mut line = Vec::new();
+        let mut input = std::io::Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]);
+        assert_eq!(
+            read_bounded_tmux_line(&mut input, &mut line).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn every_subscription_is_removed() {

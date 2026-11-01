@@ -5,6 +5,11 @@
 
 use super::protocol::PaneId;
 
+const MAX_LAYOUT_WIDTH: u16 = 1024;
+const MAX_LAYOUT_HEIGHT: u16 = 512;
+const MAX_LAYOUT_DEPTH: usize = 64;
+const MAX_LAYOUT_NODES: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: u16,
@@ -108,6 +113,7 @@ impl Layout {
 struct Parser<'a> {
     s: &'a [u8],
     pos: usize,
+    nodes: usize,
 }
 
 impl Parser<'_> {
@@ -127,14 +133,23 @@ impl Parser<'_> {
         self.s.get(self.pos).copied()
     }
 
-    fn cell(&mut self) -> Option<Layout> {
-        let width = self.number()? as u16;
+    fn cell(&mut self, depth: usize) -> Option<Layout> {
+        if depth > MAX_LAYOUT_DEPTH || self.nodes >= MAX_LAYOUT_NODES {
+            return None;
+        }
+        self.nodes += 1;
+        let width = u16::try_from(self.number()?).ok()?;
         self.expect(b'x')?;
-        let height = self.number()? as u16;
+        let height = u16::try_from(self.number()?).ok()?;
         self.expect(b',')?;
-        let x = self.number()? as u16;
+        let x = u16::try_from(self.number()?).ok()?;
         self.expect(b',')?;
-        let y = self.number()? as u16;
+        let y = u16::try_from(self.number()?).ok()?;
+        if width == 0 || height == 0 || width > MAX_LAYOUT_WIDTH || height > MAX_LAYOUT_HEIGHT {
+            return None;
+        }
+        x.checked_add(width)?;
+        y.checked_add(height)?;
         let rect = Rect { x, y, width, height };
         match self.peek() {
             Some(b',') => {
@@ -154,10 +169,10 @@ impl Parser<'_> {
             Some(open @ (b'{' | b'[')) => {
                 self.pos += 1;
                 let close = if open == b'{' { b'}' } else { b']' };
-                let mut children = vec![self.cell()?];
+                let mut children = vec![self.cell(depth + 1)?];
                 while self.peek() == Some(b',') {
                     self.pos += 1;
-                    children.push(self.cell()?);
+                    children.push(self.cell(depth + 1)?);
                 }
                 self.expect(close)?;
                 Some(if open == b'{' {
@@ -174,8 +189,8 @@ impl Parser<'_> {
 /// Parses a full layout string including its leading checksum.
 pub fn parse(layout: &str) -> Option<Layout> {
     let (_checksum, body) = layout.split_once(',')?;
-    let mut parser = Parser { s: body.as_bytes(), pos: 0 };
-    let tree = parser.cell()?;
+    let mut parser = Parser { s: body.as_bytes(), pos: 0, nodes: 0 };
+    let tree = parser.cell(0)?;
     (parser.pos == parser.s.len()).then_some(tree)
 }
 
@@ -242,6 +257,13 @@ mod tests {
         .unwrap();
         let ids: Vec<_> = layout.panes().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn rejects_unsafe_geometry() {
+        assert_eq!(parse("abcd,1025x40,0,0,0"), None);
+        assert_eq!(parse("abcd,120x513,0,0,0"), None);
+        assert_eq!(parse("abcd,1x1,65535,0,0"), None);
     }
 
     #[test]

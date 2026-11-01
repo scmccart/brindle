@@ -24,4 +24,4 @@ else
     $sudo rm -f "$PREFIX/share/applications/brindle.desktop" \
         "$PREFIX/share/icons/hicolor/scalable/apps/brindle.svg"
 fi
-$sudo rm -f "$bin"
+$sudo rm -f "$bin" "$PREFIX/bin/brindle-remote"

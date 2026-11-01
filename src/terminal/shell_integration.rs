@@ -88,14 +88,29 @@ const BEL: u8 = 0x07;
 /// A byte-level state machine that follows vte's closely enough to find
 /// OSC 133 marks and the few other sequences that move marks around. Its
 /// state carries across calls, so sequences may be split between reads.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Scanner {
     state: State,
     buf: Vec<u8>,
     overflow: bool,
     intermediate: bool,
+    /// Whether working-directory reports use Windows rather than POSIX paths.
+    windows_paths: bool,
     /// The directory the last [`Split::Cwd`] reported.
     cwd: Option<PathBuf>,
+}
+
+impl Default for Scanner {
+    fn default() -> Self {
+        Self {
+            state: State::default(),
+            buf: Vec::new(),
+            overflow: false,
+            intermediate: false,
+            windows_paths: cfg!(windows),
+            cwd: None,
+        }
+    }
 }
 
 impl Scanner {
@@ -249,7 +264,7 @@ impl Scanner {
             return Some(Split::Mark(mark));
         }
         // A cut-off path would name the wrong directory.
-        let dir = (!self.overflow).then(|| reported_dir(&self.buf, cfg!(windows))).flatten()?;
+        let dir = (!self.overflow).then(|| reported_dir(&self.buf, self.windows_paths)).flatten()?;
         self.cwd = Some(PathBuf::from(dir));
         Some(Split::Cwd)
     }
@@ -755,6 +770,13 @@ impl Parser {
         Self::default()
     }
 
+    /// A parser for a remote Linux PTY, even when Brindle itself runs on Windows.
+    pub fn posix() -> Self {
+        let mut parser = Self::default();
+        parser.scanner.windows_paths = false;
+        parser
+    }
+
     /// When a synchronized update (mode 2026) that is buffering output
     /// must be flushed, if one is.
     pub fn sync_deadline(&self) -> Option<Instant> {
@@ -828,6 +850,11 @@ mod tests {
     use crate::terminal::GridSize;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term;
+
+    #[test]
+    fn remote_parser_uses_posix_paths_on_every_platform() {
+        assert!(!Parser::posix().scanner.windows_paths);
+    }
 
     fn scan_all(input: &[&[u8]]) -> Vec<Split> {
         let mut scanner = Scanner::default();
@@ -948,6 +975,18 @@ mod tests {
         // A reset clears marks, not the directory.
         h.feed(b"\x1bc");
         assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(second)));
+    }
+
+    #[test]
+    fn posix_parser_keeps_remote_osc7_paths_on_any_host() {
+        // A remote Linux terminal must read `/var/log`, not a Windows path,
+        // even when Brindle itself runs on Windows.
+        let mut h = Harness::new(80, 24, 0);
+        h.parser = Parser::posix();
+        h.feed(b"\x1b]7;file://remote-host/var/log\x07");
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new("/var/log")));
+        h.feed(b"\x1b]7;file://remote-host/home/u/My%20Dir/caf%C3%A9\x1b\\");
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new("/home/u/My Dir/café")));
     }
 
     // ---- against a real Term ------------------------------------------------------
