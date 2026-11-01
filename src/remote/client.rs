@@ -671,14 +671,16 @@ fn deploy_agent(target: &RemoteTarget, local: &Path, cancel: &AtomicBool) -> Res
                 container,
                 "sh",
                 "-c",
-                "test -f \"$1\" && test \"$(stat -c %u \"$1\")\" = 0",
+                // `docker cp` can keep the host file's owner, depending on the
+                // daemon, so root takes the regular file over before checking.
+                "test -f \"$1\" && test ! -L \"$1\" && chown 0:0 \"$1\" && test \"$(stat -c %u \"$1\")\" = 0",
                 "sh",
                 deployment.path(),
             ]);
             let (status, stderr) = run_status(command, cancel, "verifying container helper")?;
             if !status.success() {
                 return Err(bootstrap_failure(
-                    "container helper is not a regular file",
+                    "container helper is not a root-owned regular file",
                     &stderr,
                 ));
             }
@@ -1011,7 +1013,11 @@ mod tests {
             helper.display()
         );
         unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
-        let scratch = std::env::temp_dir().join(format!("brindle-client-test-{}", std::process::id()));
+        // Under target/, not the system temp directory: a snap Docker's
+        // `docker cp` can't see the host's /tmp.
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("brindle-client-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let ubuntu = Container::start("ubuntu:24.04", "main").unwrap();
         let mut failures = Vec::new();
@@ -1547,7 +1553,9 @@ mod tests {
             helper.display()
         );
         unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
-        let scratch = std::env::temp_dir().join(format!("brindle-ssh-test-{}", std::process::id()));
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("brindle-ssh-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let fx = SshFixture::start(&scratch).expect("ssh fixture");
         let mut failures = Vec::new();

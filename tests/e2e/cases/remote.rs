@@ -213,6 +213,9 @@ pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {
     let cache_dir = "/root/.cache/brindle";
     container.assert_absent(cache_dir)?;
     container.copy_to(&key.public, "/root/.ssh/authorized_keys")?;
+    // `docker cp` can keep the host file's owner, and sshd's StrictModes
+    // refuses keys that root doesn't own.
+    container.exec(&["chown", "root:root", "/root/.ssh/authorized_keys"])?;
     container.exec(&["chmod", "700", "/root/.ssh"])?;
     container.exec(&["chmod", "600", "/root/.ssh/authorized_keys"])?;
     container.exec(&["/usr/sbin/sshd", "-t"])?;
