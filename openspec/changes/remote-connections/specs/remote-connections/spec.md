@@ -39,6 +39,21 @@ A remote terminal session SHALL provide bidirectional PTY stream forwarding, res
 - **WHEN** the user resizes a remote terminal window to 120 columns and 40 rows
 - **THEN** the remote PTY updates its terminal dimensions to 120x40
 
+### Requirement: A vanished client ends the remote session
+The remote helper SHALL end a session, hanging up its shell and the processes under it, when it receives nothing from the client for a bounded idle limit. The client SHALL send a heartbeat while it is otherwise silent, so an idle but connected session is kept. A client that is merely slow to read output SHALL NOT be treated as vanished.
+
+#### Scenario: Network cut without a clean close
+- **WHEN** the client stops sending anything while the transport stays open on the server (the connection was cut and the server did not notice)
+- **THEN** the helper, the shell and the processes under it are gone within the idle limit plus a few seconds
+
+#### Scenario: Idle session stays connected
+- **WHEN** a remote tab sits idle for longer than the idle limit with the client running
+- **THEN** the session is still alive and accepts input
+
+#### Scenario: Slow reader during heavy output
+- **WHEN** the client stops reading for longer than the idle limit while the remote program floods output
+- **THEN** the helper does not end the session for idleness, and output resumes when the client reads again
+
 ### Requirement: Process tracking and automatic titles
 Remote Linux sessions SHALL inspect the remote foreground process name from `/proc` and provide it to Brindle's title refresh loop, matching local title behavior.
 

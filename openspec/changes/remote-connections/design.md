@@ -75,7 +75,7 @@ The client and remote agent communicate over `stdin`/`stdout` of the SSH or cont
 To support binary transparency (terminal PTY data, out-of-band resize, and cwd/title queries), we use a lightweight, efficient framing protocol. One helper process serves one session, so frames carry no session id.
 
 Each message is framed with a five-byte header and a payload:
-- `msg_type: u8` (Data = 1, Resize = 2, Exit = 3, QueryProcess = 4, ProcessInfo = 5, Spawn = 6, SpawnResponse = 7, Error = 8)
+- `msg_type: u8` (Data = 1, Resize = 2, Exit = 3, QueryProcess = 4, ProcessInfo = 5, Spawn = 6, SpawnResponse = 7, Error = 8, Heartbeat = 9)
 - `length: u32` (Big-endian payload length)
 - `payload: [u8; length]`
 
@@ -90,6 +90,8 @@ For control and process info payloads, concise JSON or binary encoding is used:
   - `cwd: Option<String>`
   - `env: BTreeMap<String, String>`
   - `cols: u16`, `rows: u16`, `cell_width: u16`, `cell_height: u16`
+  - `idle_limit_secs: u32` (1 to 86400; the client sends 60): how long the agent waits without any frame from the client before it ends the session
+- `Heartbeat`: empty payload, sent by the client every 10 s when it has written nothing else
 - `Resize`: `cols: u16`, `rows: u16`, `cell_width: u16`, `cell_height: u16`
 - `ProcessInfo`:
   - `pid: u32`
@@ -110,6 +112,10 @@ On the remote host:
    - Forward bytes received from the client to the PTY master fd.
    - Read from the PTY master fd and frame it to the client.
    - When requested, inspects `/proc` of the foreground process group (via `tcgetpgrp(fd)` and `/proc/<pid>/stat` / `/proc/<pid>/cwd` / `/proc/<pid>/comm`).
+
+A client that vanishes without closing (a cut network) leaves `ssh` dead on the client while sshd keeps the session open, so the agent sees no stdin EOF. The client's writer thread therefore sends a `Heartbeat` after 10 s without writing anything (its existing 100 ms wake-up loop; any other frame also counts). The agent ends the session, with the same SIGHUP-then-SIGKILL shutdown as stdin EOF, when no frame of any kind has been processed for the spawn request's `idle_limit_secs`.
+
+The agent must not mistake a busy session for a dead client. While the client drains output slowly, the main loop blocks in `send_output` and the stdin reader blocks behind a full queue, so a healthy client's frames can sit unread for a long time. So liveness is measured by the stdin reader thread, which keeps reading while the main loop is blocked. The reader stamps the time of every frame it reads. A heartbeat is then dropped on the spot and never enters the event queue, so output cannot hold it back. For any other frame the reader sets a `busy` flag around the blocking hand-over to the (possibly full) queue and stamps again when it is done: a reader blocked handing over a real frame means the client has just sent something, not that it is silent. Both are atomics, so the blocked reader holds no lock. The main loop checks on every pass, whether it received an event or timed out, so steady output cannot starve the check: if the session is not already ending, the child has not exited, the reader is not `busy` and the last stamp is at least `idle_limit_secs` old, it fails the session. The clock starts when the session starts, so a client that sends nothing after its spawn request is bounded too. A dead client during a nonstop flood is also caught by this check, and by the 120 s stdout stall limit if the transport is merely wedged.
 
 The helper serves only PTY sessions. Brindle's `TmuxSession` runs `tmux -u [tmux_args] -C ...` directly over the SSH/exec pipes through `remote::tmux_command`.
 

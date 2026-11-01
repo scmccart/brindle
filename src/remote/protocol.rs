@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,31 @@ pub const MSG_PROCESS_INFO: u8 = 5;
 pub const MSG_SPAWN: u8 = 6;
 pub const MSG_SPAWN_RESPONSE: u8 = 7;
 pub const MSG_ERROR: u8 = 8;
+/// Sent by the client while it is alive and idle, with an empty payload. The
+/// agent ends the session when it hears nothing at all for the idle limit.
+pub const MSG_HEARTBEAT: u8 = 9;
+
+/// How often the client sends a [`MSG_HEARTBEAT`] when it has nothing else to say.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// How long the agent waits without any frame from the client before it ends
+/// the session. Several heartbeats may be lost or late before it expires.
+pub const DEFAULT_IDLE_LIMIT_SECS: u32 = 60;
+/// The largest idle limit a spawn request may ask for (one day).
+#[allow(dead_code)] // Used by the agent only.
+pub const MAX_IDLE_LIMIT_SECS: u32 = 24 * 60 * 60;
+
+/// Checks a spawn request's `idle_limit_secs`: non-zero and at most
+/// [`MAX_IDLE_LIMIT_SECS`].
+#[allow(dead_code)] // Used by the agent only.
+pub fn validate_idle_limit(secs: u32) -> io::Result<Duration> {
+    if secs == 0 || secs > MAX_IDLE_LIMIT_SECS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("idle limit must be between 1 and {MAX_IDLE_LIMIT_SECS} seconds, not {secs}"),
+        ));
+    }
+    Ok(Duration::from_secs(u64::from(secs)))
+}
 
 /// Written by the agent in `--server` mode before its first frame. Over SSH
 /// the remote command runs through the user's shell, whose startup files may
@@ -129,6 +155,13 @@ impl Frame {
 
     pub fn query_process() -> io::Result<Self> {
         Self::new(MSG_QUERY_PROCESS, Vec::new())
+    }
+
+    pub fn heartbeat() -> Self {
+        Self {
+            msg_type: MSG_HEARTBEAT,
+            payload: Vec::new(),
+        }
     }
 
     pub fn spawn(request: &SpawnRequest) -> io::Result<Self> {
@@ -243,6 +276,8 @@ pub struct SpawnRequest {
     pub rows: u16,
     pub cell_width: u16,
     pub cell_height: u16,
+    /// The agent ends the session when no frame arrives for this long.
+    pub idle_limit_secs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,6 +422,51 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_is_an_empty_frame_of_its_own_type() {
+        let frame = Frame::heartbeat();
+        assert_eq!(frame.msg_type, MSG_HEARTBEAT);
+        assert!(frame.payload.is_empty());
+        for known in [
+            MSG_DATA,
+            MSG_RESIZE,
+            MSG_EXIT,
+            MSG_QUERY_PROCESS,
+            MSG_PROCESS_INFO,
+            MSG_SPAWN,
+            MSG_SPAWN_RESPONSE,
+            MSG_ERROR,
+        ] {
+            assert_ne!(MSG_HEARTBEAT, known);
+        }
+        let mut wire = Vec::new();
+        frame.write_to(&mut wire).unwrap();
+        assert_eq!(wire, [MSG_HEARTBEAT, 0, 0, 0, 0]);
+        assert_eq!(Frame::read_from(&mut wire.as_slice()).unwrap(), frame);
+    }
+
+    #[test]
+    fn idle_limit_must_be_non_zero_and_bounded() {
+        assert_eq!(
+            validate_idle_limit(DEFAULT_IDLE_LIMIT_SECS).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(validate_idle_limit(1).unwrap(), Duration::from_secs(1));
+        assert_eq!(
+            validate_idle_limit(MAX_IDLE_LIMIT_SECS).unwrap(),
+            Duration::from_secs(u64::from(MAX_IDLE_LIMIT_SECS))
+        );
+        for bad in [0, MAX_IDLE_LIMIT_SECS + 1, u32::MAX] {
+            let error = validate_idle_limit(bad).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_default_idle_limit_leaves_room_for_missed_heartbeats() {
+        assert!(DEFAULT_IDLE_LIMIT_SECS >= 3 * HEARTBEAT_INTERVAL.as_secs() as u32);
+    }
+
+    #[test]
     fn control_payloads_roundtrip() {
         let spawn = SpawnRequest {
             command: Some("/bin/bash".into()),
@@ -397,6 +477,7 @@ mod tests {
             rows: 24,
             cell_width: 9,
             cell_height: 18,
+            idle_limit_secs: 45,
         };
         let spawn_frame = Frame::spawn(&spawn).unwrap();
         assert_eq!(spawn_frame.msg_type, MSG_SPAWN);

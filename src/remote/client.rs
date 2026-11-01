@@ -16,8 +16,8 @@ use futures::channel::mpsc::Sender as EventSender;
 use sha2::{Digest as _, Sha256};
 
 use super::protocol::{
-    ErrorMessage, Frame, MSG_DATA, MSG_ERROR, MSG_EXIT, MSG_PROCESS_INFO, MSG_SPAWN_RESPONSE,
-    ProcessInfo, SpawnRequest, SpawnResponse,
+    DEFAULT_IDLE_LIMIT_SECS, ErrorMessage, Frame, HEARTBEAT_INTERVAL, MSG_DATA, MSG_ERROR,
+    MSG_EXIT, MSG_PROCESS_INFO, MSG_SPAWN_RESPONSE, ProcessInfo, SpawnRequest, SpawnResponse,
 };
 use super::{hide_window, wait_process};
 use crate::config::{Profile, RemoteTarget};
@@ -102,7 +102,43 @@ pub fn connect(
     command_override: Option<(String, Vec<String>)>,
     cwd_override: Option<PathBuf>,
     size: GridSize,
+    events: EventSender<Event>,
+) -> Handle {
+    connect_with(
+        profile,
+        command_override,
+        cwd_override,
+        size,
+        events,
+        Timing::default(),
+    )
+}
+
+/// How the client and the helper keep each other honest about being alive.
+#[derive(Clone, Copy)]
+struct Timing {
+    /// How often an idle client sends a heartbeat.
+    heartbeat_interval: Duration,
+    /// How long the helper may hear nothing before it ends the session.
+    idle_limit_secs: u32,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            idle_limit_secs: DEFAULT_IDLE_LIMIT_SECS,
+        }
+    }
+}
+
+fn connect_with(
+    profile: Profile,
+    command_override: Option<(String, Vec<String>)>,
+    cwd_override: Option<PathBuf>,
+    size: GridSize,
     mut events: EventSender<Event>,
+    timing: Timing,
 ) -> Handle {
     let (tx, rx) = mpsc::sync_channel(128);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -118,10 +154,10 @@ pub fn connect(
                 rx,
                 worker_cancel,
                 &mut events,
+                timing,
             ) {
-                let text =
-                    format!("\r\n\x1b[31mBrindle remote connection failed:\x1b[0m\r\n{err:#}\r\n");
-                send_event(&mut events, Event::Output(text.into_bytes()));
+                let text = format!("\n\x1b[31mBrindle remote connection failed:\x1b[0m\n{err:#}\n");
+                send_event(&mut events, notice(&text));
                 send_event(&mut events, Event::Failed);
             }
         })
@@ -129,8 +165,59 @@ pub fn connect(
     Handle { tx, cancel }
 }
 
+/// Text for the terminal itself to show. The grid needs CR LF, and ssh or a
+/// remote shell supplies bare LFs, which would leave each line indented
+/// under the end of the last.
+fn notice(text: &str) -> Event {
+    Event::Output(text.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes())
+}
+
 fn send_event(events: &mut EventSender<Event>, event: Event) -> bool {
     futures::executor::block_on(events.send(event)).is_ok()
+}
+
+/// Sends queued input to the agent and, while idle, a heartbeat every
+/// `heartbeat` so the agent can tell a quiet client from a vanished one.
+///
+/// This is the only loop that writes to the agent, so a heartbeat is due only
+/// when nothing has been written for `heartbeat`: any frame already proves the
+/// client is alive. A write that blocks because the agent is not reading (it
+/// is busy forwarding a flood of output) delays the next heartbeat, but the
+/// agent hears this write the moment it reads again, and it only checks for
+/// silence when it is idle.
+fn write_loop(
+    outgoing: &mpsc::Receiver<Outgoing>,
+    cancel: &AtomicBool,
+    writer: &mut impl std::io::Write,
+    heartbeat: Duration,
+) -> Result<()> {
+    let mut last_written = Instant::now();
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            // The transport may already be gone (the session ended on its
+            // own, or the child was killed): a failed goodbye is no error.
+            if let Ok(frame) = Frame::exit(None) {
+                frame.write_to(writer).ok();
+            }
+            break;
+        }
+        match outgoing.recv_timeout(Duration::from_millis(100)) {
+            Ok(message) => {
+                message.into_frame()?.write_to(writer)?;
+                last_written = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_written.elapsed() >= heartbeat {
+                    // After the session ended this fails; the caller ignores a
+                    // writer error once the protocol saw a clean exit.
+                    Frame::heartbeat().write_to(writer)?;
+                    last_written = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
 }
 
 fn run_connection(
@@ -141,6 +228,7 @@ fn run_connection(
     outgoing: mpsc::Receiver<Outgoing>,
     cancel: Arc<AtomicBool>,
     events: &mut EventSender<Event>,
+    timing: Timing,
 ) -> Result<()> {
     let target = profile
         .remote
@@ -171,6 +259,7 @@ fn run_connection(
         rows: size.rows,
         cell_width: size.cell_width,
         cell_height: size.cell_height,
+        idle_limit_secs: timing.idle_limit_secs,
     };
     let mut command = agent_command(target, &deployment.path)?;
     command
@@ -198,24 +287,9 @@ fn run_connection(
         })?;
 
     let writer_cancel = cancel.clone();
-    let writer = thread::spawn(move || -> Result<()> {
-        loop {
-            if writer_cancel.load(Ordering::Acquire) {
-                // The transport may already be gone (the session ended on its
-                // own, or the child was killed): a failed goodbye is no error.
-                if let Ok(frame) = Frame::exit(None) {
-                    frame.write_to(&mut stdin).ok();
-                }
-                break;
-            }
-            let message = match outgoing.recv_timeout(Duration::from_millis(100)) {
-                Ok(message) => message,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-            message.into_frame()?.write_to(&mut stdin)?;
-        }
-        Ok(())
+    let heartbeat_interval = timing.heartbeat_interval;
+    let writer = thread::spawn(move || {
+        write_loop(&outgoing, &writer_cancel, &mut stdin, heartbeat_interval)
     });
     let stderr_reader = spawn_stderr_drain(stderr);
 
@@ -263,16 +337,8 @@ fn run_connection(
                 MSG_EXIT => break,
                 MSG_ERROR => {
                     let error: ErrorMessage = frame.decode_json()?;
-                    if !send_event(
-                        events,
-                        Event::Output(
-                            format!(
-                                "\r\n\x1b[31mRemote agent error:\x1b[0m {}\r\n",
-                                error.message
-                            )
-                            .into_bytes(),
-                        ),
-                    ) {
+                    let text = format!("\n\x1b[31mRemote agent error:\x1b[0m {}\n", error.message);
+                    if !send_event(events, notice(&text)) {
                         break;
                     }
                 }
@@ -303,10 +369,7 @@ fn run_connection(
         log::debug!("remote writer ended with an error after exit: {err:#}");
     }
     if !status.success() && !diagnostic.trim().is_empty() {
-        send_event(
-            events,
-            Event::Output(format!("\r\n{diagnostic}\r\n").into_bytes()),
-        );
+        send_event(events, notice(&format!("\n{diagnostic}\n")));
     }
     // Clean up first: closing the last tab quits Brindle, which would end
     // this thread before it removed the container's helper.
@@ -697,6 +760,7 @@ fn agent_command(target: &RemoteTarget, remote_agent: &str) -> Result<Command> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::MSG_HEARTBEAT;
     use super::*;
 
     #[test]
@@ -1270,6 +1334,11 @@ mod tests {
         child: std::process::Child,
         stdin: Option<std::process::ChildStdin>,
         _frames: mpsc::Receiver<Frame>,
+        /// While set, the reader takes no frames, as a client that has
+        /// stopped draining the transport.
+        paused: Arc<AtomicBool>,
+        /// Session output bytes received so far.
+        received: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl RawAgent {
@@ -1278,6 +1347,7 @@ mod tests {
             remote_path: &str,
             command: &str,
             args: &[&str],
+            idle_limit_secs: u32,
         ) -> std::result::Result<Self, String> {
             let mut transport = super::super::remote_command(
                 target,
@@ -1298,14 +1368,27 @@ mod tests {
                 rows: 24,
                 cell_width: 8,
                 cell_height: 16,
+                idle_limit_secs,
             };
             Frame::spawn(&request).and_then(|f| f.write_to(&mut stdin)).map_err(|e| e.to_string())?;
             let (tx, frames) = mpsc::channel();
+            let paused = Arc::new(AtomicBool::new(false));
+            let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (pause, counter) = (paused.clone(), received.clone());
             thread::spawn(move || {
                 if super::super::protocol::skip_preamble(&mut stdout).is_err() {
                     return;
                 }
-                while let Ok(Some(frame)) = Frame::read_from_or_eof(&mut stdout) {
+                loop {
+                    while pause.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    let Ok(Some(frame)) = Frame::read_from_or_eof(&mut stdout) else {
+                        break;
+                    };
+                    if frame.msg_type == MSG_DATA {
+                        counter.fetch_add(frame.payload.len() as u64, Ordering::AcqRel);
+                    }
                     if tx.send(frame).is_err() {
                         break;
                     }
@@ -1318,7 +1401,17 @@ mod tests {
             if !response.success {
                 return Err(format!("spawn failed: {:?}", response.error));
             }
-            Ok(Self { child, stdin: Some(stdin), _frames: frames })
+            Ok(Self {
+                child,
+                stdin: Some(stdin),
+                _frames: frames,
+                paused,
+                received,
+            })
+        }
+
+        fn heartbeat(&mut self) {
+            Frame::heartbeat().write_to(self.stdin.as_mut().unwrap()).ok();
         }
 
         fn input(&mut self, text: &str) {
@@ -1364,7 +1457,13 @@ mod tests {
         shell: &str,
         shell_args: &[&str],
     ) -> std::result::Result<(), String> {
-        let mut agent = RawAgent::start(target, remote_path, shell, shell_args)?;
+        let mut agent = RawAgent::start(
+            target,
+            remote_path,
+            shell,
+            shell_args,
+            DEFAULT_IDLE_LIMIT_SECS,
+        )?;
         agent.input("sleep 4321 &\n");
         agent.input("sleep 4322\n");
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1486,6 +1585,268 @@ mod tests {
         Ok(())
     }
 
+    const IDLE_TEST_LIMIT_SECS: u32 = 3;
+    /// Matches only the raw helper, not the shell that greps for it.
+    const RAW_AGENT: &str = "raw-agen[t] --server";
+    const IDLE_JOB: &str = "sleep 433[1]";
+
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Starts a raw session with a short idle limit and a job running under
+    /// its shell.
+    fn start_idle_session(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<RawAgent, String> {
+        let mut agent = RawAgent::start(target, "/tmp/raw-agent", "sh", &[], IDLE_TEST_LIMIT_SECS)?;
+        agent.input("sleep 4331\n");
+        if !wait_until(Duration::from_secs(20), || count_procs(c, IDLE_JOB) == 1) {
+            return Err(format!("job never started: {}", list_procs(c, IDLE_JOB)));
+        }
+        Ok(agent)
+    }
+
+    fn wait_session_gone(c: &Container, within: Duration) -> std::result::Result<(), String> {
+        if wait_until(within, || {
+            count_procs(c, IDLE_JOB) == 0 && count_procs(c, RAW_AGENT) == 0
+        }) {
+            return Ok(());
+        }
+        Err(format!(
+            "still running after {within:?}: {} {}",
+            list_procs(c, RAW_AGENT),
+            list_procs(c, IDLE_JOB)
+        ))
+    }
+
+    /// A client that goes silent with its transport still open (a cut network
+    /// leaves sshd holding the session) loses the helper, the shell and the
+    /// job under it shortly after the idle limit.
+    fn scenario_idle_client_is_dropped(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<(), String> {
+        let _agent = start_idle_session(c, target)?;
+        let started = Instant::now();
+        wait_session_gone(c, Duration::from_secs(u64::from(IDLE_TEST_LIMIT_SECS) + 8))?;
+        // The limit counts from the spawn, a little before `started`.
+        if started.elapsed() < Duration::from_secs(1) {
+            return Err(format!("ended too early: {:?}", started.elapsed()));
+        }
+        Ok(())
+    }
+
+    /// Heartbeats keep a silent session alive past the limit; once they stop
+    /// the session goes.
+    fn scenario_heartbeats_keep_the_session(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<(), String> {
+        let mut agent = start_idle_session(c, target)?;
+        for _ in 0..8 {
+            agent.heartbeat();
+            thread::sleep(Duration::from_secs(1));
+        }
+        if count_procs(c, IDLE_JOB) != 1 || count_procs(c, RAW_AGENT) != 1 {
+            return Err(format!(
+                "died despite heartbeats: {} {}",
+                list_procs(c, RAW_AGENT),
+                list_procs(c, IDLE_JOB)
+            ));
+        }
+        wait_session_gone(c, Duration::from_secs(u64::from(IDLE_TEST_LIMIT_SECS) + 8))
+    }
+
+    /// While the reader is stalled under a flood, real input (not just
+    /// heartbeats) fills the helper's event queue and leaves its stdin reader
+    /// blocked mid-hand-over. That is not silence: the session survives, and
+    /// Ctrl-C still stops the flood once the client reads again.
+    fn scenario_input_during_stall_then_ctrl_c(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<(), String> {
+        let mut agent = RawAgent::start(target, "/tmp/raw-agent", "sh", &[], IDLE_TEST_LIMIT_SECS)?;
+        agent.input("yes\n");
+        if !wait_until(Duration::from_secs(20), || {
+            agent.received.load(Ordering::Acquire) > 100_000
+        }) {
+            return Err("the flood never started".into());
+        }
+        agent.paused.store(true, Ordering::Release);
+        // More frames than the helper's event queue holds.
+        for _ in 0..100 {
+            agent.input("x");
+        }
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(u64::from(IDLE_TEST_LIMIT_SECS) * 3) {
+            agent.heartbeat();
+            thread::sleep(Duration::from_secs(1));
+            if count_procs(c, RAW_AGENT) != 1 {
+                return Err(format!("helper gone after {:?} of stalled reading", started.elapsed()));
+            }
+        }
+        agent.paused.store(false, Ordering::Release);
+        agent.input("\u{3}");
+        agent.input("echo CTRLC-OK-$((2+3))\n");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut tail = String::new();
+        while Instant::now() < deadline {
+            let Ok(frame) = agent._frames.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            if frame.msg_type == MSG_DATA {
+                tail.push_str(&String::from_utf8_lossy(&frame.payload));
+                if tail.len() > 256 {
+                    let mut cut = tail.len() - 128;
+                    while !tail.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    tail.drain(..cut);
+                }
+                if tail.contains("CTRLC-OK-5\r\n") {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!(
+            "^C did not stop the flood; helpers: {:?}; tail={tail:?}",
+            list_procs(c, RAW_AGENT)
+        ))
+    }
+
+    /// Output every 10 ms never leaves the helper's event queue quiet for a
+    /// whole poll interval, yet a client that has gone silent (while still
+    /// reading) must lose the session at the idle limit all the same.
+    fn scenario_steady_output_does_not_hide_a_vanished_client(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<(), String> {
+        let busy = "busyloo[p]";
+        let _agent = RawAgent::start(
+            target,
+            "/tmp/raw-agent",
+            "sh",
+            &["-c", "while :; do echo x; sleep 0.01; done # busyloop"],
+            IDLE_TEST_LIMIT_SECS,
+        )?;
+        if !wait_until(Duration::from_secs(20), || count_procs(c, busy) == 1) {
+            return Err(format!("loop never started: {}", list_procs(c, busy)));
+        }
+        let limit = Duration::from_secs(u64::from(IDLE_TEST_LIMIT_SECS));
+        if !wait_until(limit + Duration::from_secs(8), || {
+            count_procs(c, busy) == 0 && count_procs(c, RAW_AGENT) == 0
+        }) {
+            return Err(format!(
+                "still running: {} {}",
+                list_procs(c, RAW_AGENT),
+                list_procs(c, busy)
+            ));
+        }
+        Ok(())
+    }
+
+    /// A healthy client that stops draining a flood for longer than the idle
+    /// limit, while its heartbeats pile up unread behind the output, must not
+    /// be dropped by the idle check: the helper's loop is blocked on the
+    /// backed-up output, so silence there proves nothing. Once the client
+    /// drains again, the session carries on.
+    fn scenario_stalled_reader_under_flood(
+        c: &Container,
+        target: &RemoteTarget,
+    ) -> std::result::Result<(), String> {
+        let mut agent = RawAgent::start(target, "/tmp/raw-agent", "sh", &[], IDLE_TEST_LIMIT_SECS)?;
+        agent.input("yes\n");
+        // Let the pipeline fill, then stop reading.
+        if !wait_until(Duration::from_secs(20), || {
+            agent.received.load(Ordering::Acquire) > 100_000
+        }) {
+            return Err("the flood never started".into());
+        }
+        agent.paused.store(true, Ordering::Release);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(u64::from(IDLE_TEST_LIMIT_SECS) * 3) {
+            agent.heartbeat();
+            thread::sleep(Duration::from_secs(1));
+            if count_procs(c, RAW_AGENT) != 1 {
+                return Err(format!("helper gone after {:?} of stalled reading", started.elapsed()));
+            }
+        }
+        let before = agent.received.load(Ordering::Acquire);
+        agent.paused.store(false, Ordering::Release);
+        // The client is still alive, so it keeps its heartbeats going; with
+        // the 3 s test limit, 3 s of silence here would be a vanished client.
+        for _ in 0..3 {
+            agent.heartbeat();
+            thread::sleep(Duration::from_secs(1));
+        }
+        let gained = agent.received.load(Ordering::Acquire) - before;
+        if gained < 1_000_000 || count_procs(c, RAW_AGENT) != 1 {
+            return Err(format!(
+                "output did not resume: {gained} bytes in 3 s; helpers: {:?}",
+                list_procs(c, RAW_AGENT)
+            ));
+        }
+        Ok(())
+    }
+
+    /// The real client keeps an idle session alive past the idle limit with
+    /// its own heartbeats, and the limit it sends is the one the helper uses.
+    fn scenario_client_heartbeats(target: &RemoteTarget) -> std::result::Result<(), String> {
+        let timing = Timing {
+            heartbeat_interval: Duration::from_secs(1),
+            idle_limit_secs: IDLE_TEST_LIMIT_SECS,
+        };
+        let session = |timing| {
+            let (tx, rx) = futures::channel::mpsc::channel(1024);
+            let h = connect_with(
+                profile_for(target),
+                Some(("sh".into(), Vec::new())),
+                None,
+                test_size(80, 24),
+                tx,
+                timing,
+            );
+            (h, rx)
+        };
+        let (h, mut rx) = session(timing);
+        let mut out = String::new();
+        h.input(b"echo up-$((1+1))\n".to_vec());
+        if !wait_for(&mut rx, &mut out, "up-2\r\n") {
+            return Err(format!("session never came up: {out:?}"));
+        }
+        let end = pump(&mut rx, &mut out, Duration::from_secs(7), |_| false, &mut Vec::new());
+        if end != End::TimedOut {
+            return Err(format!("idle session ended: {end:?} {out:?}"));
+        }
+        h.input(b"echo still-$((2+2))\n".to_vec());
+        if !wait_for(&mut rx, &mut out, "still-4\r\n") {
+            return Err(format!("session died while idle: {out:?}"));
+        }
+        h.input(b"exit\n".to_vec());
+
+        // With heartbeats slower than the limit, the same path loses the session.
+        let (_h, mut rx) = session(Timing {
+            heartbeat_interval: Duration::from_secs(60),
+            ..timing
+        });
+        let (end, out) = run_to_end(&mut rx, Duration::from_secs(20));
+        if end != End::Exited && end != End::Failed {
+            return Err(format!("silent client kept its session: {end:?} {out:?}"));
+        }
+        Ok(())
+    }
+
     /// Starts the profile's default session and reports what the shell sees.
     fn scenario_default_shell(
         target: &RemoteTarget,
@@ -1604,6 +1965,24 @@ mod tests {
             Err(e) => record("docker flood", Err(e)),
         }
         record("docker ctrl-c during flood", scenario_ctrl_c_during_flood(&target));
+        record("idle client is dropped", scenario_idle_client_is_dropped(&c, &target));
+        record(
+            "heartbeats keep a silent session",
+            scenario_heartbeats_keep_the_session(&c, &target),
+        );
+        record(
+            "a stalled reader under flood is not dropped",
+            scenario_stalled_reader_under_flood(&c, &target),
+        );
+        record(
+            "input during a stall is not silence, and ^C works after",
+            scenario_input_during_stall_then_ctrl_c(&c, &target),
+        );
+        record(
+            "steady output does not hide a vanished client",
+            scenario_steady_output_does_not_hide_a_vanished_client(&c, &target),
+        );
+        record("the client sends heartbeats", scenario_client_heartbeats(&target));
         match scenario_default_shell(&target, None) {
             Ok(line) => record(
                 "default shell is the passwd login shell with a sane TERM",
@@ -1623,6 +2002,122 @@ mod tests {
             Err(e) => record("default shell, missing cwd", Err(e)),
         }
         assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
+    }
+
+    fn frames_in(wire: &[u8]) -> Vec<Frame> {
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut frames = Vec::new();
+        while let Some(frame) = Frame::read_from_or_eof(&mut cursor).unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// Runs `write_loop` until `stop_after` has passed, then cancels it.
+    fn run_write_loop(
+        rx: &mpsc::Receiver<Outgoing>,
+        heartbeat: Duration,
+        stop_after: Duration,
+        writer: &mut impl std::io::Write,
+    ) -> Result<()> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopper = cancel.clone();
+        let timer = thread::spawn(move || {
+            thread::sleep(stop_after);
+            stopper.store(true, Ordering::Release);
+        });
+        let result = write_loop(rx, &cancel, writer, heartbeat);
+        timer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn an_idle_writer_sends_heartbeats_and_then_the_goodbye() {
+        let (_tx, rx) = mpsc::sync_channel::<Outgoing>(8);
+        let mut wire = Vec::new();
+        run_write_loop(
+            &rx,
+            Duration::from_millis(200),
+            Duration::from_millis(900),
+            &mut wire,
+        )
+        .unwrap();
+        let frames = frames_in(&wire);
+        let beats = frames.iter().filter(|f| f.msg_type == MSG_HEARTBEAT).count();
+        assert!((2..=5).contains(&beats), "{beats} heartbeats in {frames:?}");
+        assert_eq!(frames.last().unwrap().msg_type, MSG_EXIT);
+        assert_eq!(
+            frames.iter().filter(|f| f.msg_type == MSG_EXIT).count(),
+            1,
+            "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_just_sent_input_does_not_add_a_heartbeat() {
+        let (tx, rx) = mpsc::sync_channel::<Outgoing>(8);
+        let feeder = thread::spawn(move || {
+            for _ in 0..8 {
+                tx.send(Outgoing::Data(b"x".to_vec())).unwrap();
+                thread::sleep(Duration::from_millis(100));
+            }
+            tx
+        });
+        let mut wire = Vec::new();
+        run_write_loop(
+            &rx,
+            Duration::from_millis(500),
+            Duration::from_millis(850),
+            &mut wire,
+        )
+        .unwrap();
+        let _tx = feeder.join().unwrap();
+        let frames = frames_in(&wire);
+        assert!(frames.iter().all(|f| f.msg_type != MSG_HEARTBEAT), "{frames:?}");
+    }
+
+    struct BrokenPipe;
+
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_goodbye_is_not_an_error() {
+        let (_tx, rx) = mpsc::sync_channel::<Outgoing>(8);
+        run_write_loop(
+            &rx,
+            Duration::from_secs(60),
+            Duration::from_millis(150),
+            &mut BrokenPipe,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_heartbeat_ends_the_writer_with_an_error_for_the_caller_to_ignore() {
+        let (_tx, rx) = mpsc::sync_channel::<Outgoing>(8);
+        let result = run_write_loop(
+            &rx,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            &mut BrokenPipe,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn notices_use_crlf_for_every_line() {
+        let Event::Output(bytes) = notice("one\ntwo\r\nthree\n") else {
+            panic!("expected output");
+        };
+        assert_eq!(bytes, b"one\r\ntwo\r\nthree\r\n");
     }
 
     #[test]

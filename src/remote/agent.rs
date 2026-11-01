@@ -33,14 +33,15 @@ mod platform {
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use super::super::protocol::{
-        ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_QUERY_PROCESS,
-        MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SpawnRequest, SpawnResponse,
+        ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_HEARTBEAT,
+        MSG_QUERY_PROCESS, MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SpawnRequest,
+        SpawnResponse, validate_idle_limit,
     };
 
     const OUTPUT_CHUNK_SIZE: usize = 32 * 1024;
@@ -109,10 +110,12 @@ mod platform {
             return Err(error);
         }
 
-        run_session(session)
+        let idle_limit = Duration::from_secs(u64::from(request.idle_limit_secs));
+        run_session(session, idle_limit)
     }
 
     fn validate_request(request: &SpawnRequest) -> io::Result<()> {
+        validate_idle_limit(request.idle_limit_secs)?;
         if request.command.as_deref().is_some_and(str::is_empty) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -425,13 +428,72 @@ mod platform {
         }
     }
 
-    fn run_session(session: SpawnedSession) -> io::Result<()> {
+    /// When the client last sent a frame, as measured by the stdin reader
+    /// thread. The session loop can block for a long time on a slow client's
+    /// output, so only the reader, which keeps taking frames off stdin, can
+    /// tell silence from a backlog.
+    ///
+    /// The reader stamps every frame it reads, including heartbeats, which it
+    /// then drops. A real frame is handed to the loop through the event queue,
+    /// which can be full; while the reader waits for room, `busy` says the
+    /// client has just sent something, and finishing the hand-over stamps
+    /// again. The loop reads `busy` before the stamp (both Acquire, paired
+    /// with Release stores in the reader's order stamp, busy, stamp, not-busy),
+    /// so it never pairs an old stamp with a finished hand-over. Nothing here
+    /// is a lock, so a blocked reader holds nothing the loop needs.
+    struct Liveness {
+        start: Instant,
+        /// Milliseconds from `start` to the latest stamp.
+        last_frame_ms: AtomicU64,
+        busy: AtomicBool,
+    }
+
+    impl Liveness {
+        /// The clock starts at `start`, so a client that sends nothing after
+        /// its spawn request is still bounded.
+        fn new(start: Instant) -> Self {
+            Self {
+                start,
+                last_frame_ms: AtomicU64::new(0),
+                busy: AtomicBool::new(false),
+            }
+        }
+
+        fn stamp(&self, now: Instant) {
+            let ms = now.saturating_duration_since(self.start).as_millis() as u64;
+            self.last_frame_ms.fetch_max(ms, Ordering::Release);
+        }
+
+        fn set_busy(&self, busy: bool) {
+            self.busy.store(busy, Ordering::Release);
+        }
+
+        /// The reader has passed a real frame on.
+        fn finish_handover(&self, now: Instant) {
+            self.stamp(now);
+            self.set_busy(false);
+        }
+
+        /// Whether the client has sent nothing for the whole `limit`.
+        fn expired(&self, now: Instant, limit: Duration) -> bool {
+            if self.busy.load(Ordering::Acquire) {
+                return false;
+            }
+            let last = Duration::from_millis(self.last_frame_ms.load(Ordering::Acquire));
+            now.saturating_duration_since(self.start)
+                .saturating_sub(last)
+                >= limit
+        }
+    }
+
+    fn run_session(session: SpawnedSession, idle_limit: Duration) -> io::Result<()> {
         let child_exited = Arc::new(AtomicBool::new(false));
         let output_enabled = Arc::new(AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::sync_channel(32);
         let (outgoing_tx, writer) = spawn_frame_writer(event_tx.clone());
 
-        spawn_input_reader(event_tx.clone());
+        let liveness = Arc::new(Liveness::new(Instant::now()));
+        spawn_input_reader(event_tx.clone(), liveness.clone());
         spawn_output_reader(
             session.master.clone(),
             event_tx.clone(),
@@ -519,6 +581,17 @@ mod platform {
             }
 
             let now = Instant::now();
+            // On every pass, events and timeouts alike, so steady output
+            // can't starve it. The reader's clock is independent of how far
+            // behind this loop is.
+            if shutdown.started.is_none() && !child_waited && liveness.expired(now, idle_limit) {
+                let message = format!(
+                    "no message from the client for {} seconds; ending the session",
+                    idle_limit.as_secs()
+                );
+                let error = io::Error::new(io::ErrorKind::TimedOut, message.clone());
+                shutdown.fail(&outgoing_tx, message, error, child_waited);
+            }
             if let Some(started) = shutdown.started {
                 if shutdown.force_killed_at.is_none()
                     && now.duration_since(started) >= GRACEFUL_SHUTDOWN
@@ -658,14 +731,23 @@ mod platform {
         })
     }
 
-    fn spawn_input_reader(events: SyncSender<Event>) {
+    fn spawn_input_reader(events: SyncSender<Event>, liveness: Arc<Liveness>) {
         thread::spawn(move || {
             let stdin = io::stdin();
             let mut reader = stdin.lock();
             loop {
                 match Frame::read_from_or_eof(&mut reader) {
                     Ok(Some(frame)) => {
-                        if events.send(Event::Incoming(frame)).is_err() {
+                        liveness.stamp(Instant::now());
+                        // Proof of life only: it never waits in the queue
+                        // behind output.
+                        if frame.msg_type == MSG_HEARTBEAT {
+                            continue;
+                        }
+                        liveness.set_busy(true);
+                        let sent = events.send(Event::Incoming(frame));
+                        liveness.finish_handover(Instant::now());
+                        if sent.is_err() {
                             return;
                         }
                     }
@@ -1032,6 +1114,64 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn request(idle_limit_secs: u32) -> SpawnRequest {
+            SpawnRequest {
+                command: None,
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                cols: 80,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+                idle_limit_secs,
+            }
+        }
+
+        #[test]
+        fn requests_need_a_sensible_idle_limit() {
+            assert!(validate_request(&request(60)).is_ok());
+            assert!(validate_request(&request(0)).is_err());
+            assert!(validate_request(&request(u32::MAX)).is_err());
+        }
+
+        #[test]
+        fn the_client_is_silent_only_after_the_whole_limit() {
+            let start = Instant::now();
+            let limit = Duration::from_secs(60);
+            let live = Liveness::new(start);
+            assert!(!live.expired(start, limit));
+            assert!(!live.expired(start + Duration::from_secs(59), limit));
+            assert!(live.expired(start + limit, limit));
+            // A clock reading before the stamp is not silence.
+            live.stamp(start + limit);
+            assert!(!live.expired(start, limit));
+        }
+
+        #[test]
+        fn a_stamp_clears_the_silence() {
+            let start = Instant::now();
+            let limit = Duration::from_secs(60);
+            let live = Liveness::new(start);
+            assert!(live.expired(start + limit, limit));
+            live.stamp(start + limit);
+            assert!(!live.expired(start + limit + Duration::from_secs(59), limit));
+            assert!(live.expired(start + limit + limit, limit));
+        }
+
+        #[test]
+        fn a_frame_being_handed_over_is_never_silence() {
+            let start = Instant::now();
+            let limit = Duration::from_secs(60);
+            let live = Liveness::new(start);
+            live.set_busy(true);
+            assert!(!live.expired(start + limit * 10, limit));
+            // Finishing the hand-over counts as the client's latest sign of life.
+            live.finish_handover(start + limit * 10);
+            assert!(!live.expired(start + limit * 10 + Duration::from_secs(1), limit));
+            assert!(live.expired(start + limit * 11, limit));
+        }
 
         #[test]
         fn cwd_tilde_uses_remote_environment_home() {
