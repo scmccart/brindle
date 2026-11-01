@@ -1,7 +1,7 @@
 //! Client transport and helper deployment for remote PTY sessions.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +17,16 @@ use sha2::{Digest as _, Sha256};
 
 use super::protocol::{
     ErrorMessage, Frame, MSG_DATA, MSG_ERROR, MSG_EXIT, MSG_PROCESS_INFO, MSG_SPAWN_RESPONSE,
-    ProcessInfo, SessionKind, SpawnRequest, SpawnResponse,
+    ProcessInfo, SpawnRequest, SpawnResponse,
 };
+use super::{hide_window, wait_process};
 use crate::config::{Profile, RemoteTarget};
 use crate::terminal::GridSize;
 
 const REMOTE_DIR: &str = ".cache/brindle";
+/// How much of the agent's stdout is read ahead: the preamble scan and every
+/// frame read share one buffered reader.
+const AGENT_READ_BUFFER: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum Event {
@@ -42,11 +46,16 @@ enum Outgoing {
 
 const DATA_CHUNK_SIZE: usize = 32 * 1024;
 
-fn write_data_frames(writer: &mut impl Write, channel_id: u32, bytes: &[u8]) -> Result<()> {
-    for chunk in bytes.chunks(DATA_CHUNK_SIZE) {
-        Frame::data(channel_id, chunk)?.write_to(writer)?;
+impl Outgoing {
+    fn into_frame(self) -> std::io::Result<Frame> {
+        match self {
+            Self::Data(bytes) => Frame::data(bytes),
+            Self::Resize(size) => {
+                Frame::resize(size.cols, size.rows, size.cell_width, size.cell_height)
+            }
+            Self::QueryProcess => Frame::query_process(),
+        }
     }
-    Ok(())
 }
 
 /// A running remote PTY connection. Clones share one writer thread.
@@ -57,7 +66,15 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Queues `bytes` as data messages of at most [`DATA_CHUNK_SIZE`] each.
     pub fn input(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() <= DATA_CHUNK_SIZE {
+            self.tx.try_send(Outgoing::Data(bytes)).ok();
+            return;
+        }
         for chunk in bytes.chunks(DATA_CHUNK_SIZE) {
             if self.tx.try_send(Outgoing::Data(chunk.to_vec())).is_err() {
                 break;
@@ -87,7 +104,6 @@ pub fn connect(
     size: GridSize,
     mut events: EventSender<Event>,
 ) -> Handle {
-    let channel_id = 1;
     let (tx, rx) = mpsc::sync_channel(128);
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
@@ -99,7 +115,6 @@ pub fn connect(
                 command_override,
                 cwd_override,
                 size,
-                channel_id,
                 rx,
                 worker_cancel,
                 &mut events,
@@ -123,7 +138,6 @@ fn run_connection(
     command_override: Option<(String, Vec<String>)>,
     cwd_override: Option<PathBuf>,
     size: GridSize,
-    channel_id: u32,
     outgoing: mpsc::Receiver<Outgoing>,
     cancel: Arc<AtomicBool>,
     events: &mut EventSender<Event>,
@@ -133,7 +147,12 @@ fn run_connection(
         .as_ref()
         .context("remote profile has no remote target")?;
     let local_agent = agent_path()?;
-    let deployment = deploy_agent(target, &local_agent, &cancel)?;
+    let deployment = match target {
+        RemoteTarget::Ssh { .. } => deploy_ssh(target, &local_agent, &cancel)?,
+        RemoteTarget::Container {
+            engine, container, ..
+        } => deploy_container(engine, container, &local_agent, &cancel)?,
+    };
     let (command, args) = command_override.unwrap_or_else(|| {
         (
             profile.command.clone().unwrap_or_default(),
@@ -141,8 +160,6 @@ fn run_connection(
         )
     });
     let request = SpawnRequest {
-        channel_id,
-        kind: SessionKind::Pty,
         command: (!command.is_empty()).then_some(command),
         args,
         cwd: cwd_override
@@ -155,19 +172,14 @@ fn run_connection(
         cell_width: size.cell_width,
         cell_height: size.cell_height,
     };
-    let mut command = agent_command(target, deployment.path())?;
+    let mut command = agent_command(target, &deployment.path)?;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(
-        &mut command,
-        crate::win::CREATE_NO_WINDOW,
-    );
     let mut child = ChildGuard::new(command.spawn().context("starting remote agent")?);
     let mut stdin = child.take_stdin()?;
-    let mut stdout = child.take_stdout()?;
+    let mut stdout = BufReader::with_capacity(AGENT_READ_BUFFER, child.take_stdout()?);
     let stderr = child.take_stderr()?;
     Frame::spawn(&request)?.write_to(&mut stdin)?;
     let child = Arc::new(Mutex::new(child));
@@ -191,7 +203,7 @@ fn run_connection(
             if writer_cancel.load(Ordering::Acquire) {
                 // The transport may already be gone (the session ended on its
                 // own, or the child was killed): a failed goodbye is no error.
-                if let Ok(frame) = Frame::exit(channel_id, None) {
+                if let Ok(frame) = Frame::exit(None) {
                     frame.write_to(&mut stdin).ok();
                 }
                 break;
@@ -201,21 +213,7 @@ fn run_connection(
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            let frame = match message {
-                Outgoing::Data(bytes) => {
-                    write_data_frames(&mut stdin, channel_id, &bytes)?;
-                    continue;
-                }
-                Outgoing::Resize(size) => Frame::resize(
-                    channel_id,
-                    size.cols,
-                    size.rows,
-                    size.cell_width,
-                    size.cell_height,
-                )?,
-                Outgoing::QueryProcess => Frame::query_process(channel_id)?,
-            };
-            frame.write_to(&mut stdin)?;
+            message.into_frame()?.write_to(&mut stdin)?;
         }
         Ok(())
     });
@@ -225,22 +223,13 @@ fn run_connection(
         super::protocol::skip_preamble(&mut stdout)
             .context("waiting for the remote agent's frame marker")?;
         let first = Frame::read_from(&mut stdout).context("reading remote agent handshake")?;
-        if first.channel_id != super::protocol::CHANNEL_CONTROL
-            || first.msg_type != MSG_SPAWN_RESPONSE
-        {
+        if first.msg_type != MSG_SPAWN_RESPONSE {
             bail!(
-                "remote agent sent channel {} message {} before spawn response",
-                first.channel_id,
+                "remote agent sent message {} before spawn response",
                 first.msg_type
             );
         }
         let response: SpawnResponse = first.decode_json()?;
-        if response.channel_id != channel_id {
-            bail!(
-                "remote agent spawn response is for channel {} instead of {channel_id}",
-                response.channel_id
-            );
-        }
         if !response.success {
             bail!(
                 "remote agent could not spawn session: {}",
@@ -253,9 +242,6 @@ fn run_connection(
             else {
                 bail!("connection lost: the remote agent closed the stream without reporting an exit");
             };
-            if frame.channel_id != channel_id {
-                continue;
-            }
             match frame.msg_type {
                 MSG_DATA => {
                     if frame.payload.len() > DATA_CHUNK_SIZE {
@@ -478,59 +464,59 @@ fn agent_path() -> Result<PathBuf> {
     )
 }
 
+/// Where the helper runs from on the endpoint, and what to remove after.
 struct Deployment {
     path: String,
-    cleanup: Option<(String, String, String)>,
+    cleanup: Option<ContainerCleanup>,
 }
 
-impl Deployment {
-    fn path(&self) -> &str {
-        &self.path
-    }
+/// A container's private helper directory, removed when the session ends.
+struct ContainerCleanup {
+    engine: String,
+    container: String,
+    directory: String,
 }
 
 impl Drop for Deployment {
     fn drop(&mut self) {
-        if let Some((engine, container, directory)) = &self.cleanup {
-            let mut command = hidden_command(engine);
-            command.args([
-                "exec",
-                "--user",
-                "0",
-                container,
-                "rm",
-                "-rf",
-                directory,
-            ]);
+        if let Some(cleanup) = &self.cleanup {
             let never_cancel = AtomicBool::new(false);
-            run_status(command, &never_cancel, "removing container helper").ok();
+            container_exec_root(
+                &cleanup.engine,
+                &cleanup.container,
+                &["rm", "-rf", &cleanup.directory],
+                &never_cancel,
+                "removing container helper",
+                "container helper removal failed",
+            )
+            .ok();
         }
     }
 }
 
 fn hidden_command(program: &str) -> Command {
-    #[allow(unused_mut)] // Mutated below only on Windows for CREATE_NO_WINDOW.
     let mut command = Command::new(program);
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(
-        &mut command,
-        crate::win::CREATE_NO_WINDOW,
-    );
+    hide_window(&mut command);
     command
 }
 
-fn wait_process(mut child: Child, cancel: &AtomicBool, timeout: Duration) -> Result<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().context("waiting for bootstrap process")? {
-            return Ok(status);
-        }
-        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
-            child.kill().ok();
-            return child.wait().context("reaping bootstrap process");
-        }
-        thread::sleep(Duration::from_millis(20));
+/// Runs `args` as root inside the container, failing with `failure` (and the
+/// command's stderr) when it exits unsuccessfully.
+fn container_exec_root(
+    engine: &str,
+    container: &str,
+    args: &[&str],
+    cancel: &AtomicBool,
+    what: &str,
+    failure: &str,
+) -> Result<()> {
+    let mut command = hidden_command(engine);
+    command.args(["exec", "--user", "0", container]).args(args);
+    let (status, stderr) = run_status(command, cancel, what)?;
+    if !status.success() {
+        return Err(bootstrap_failure(failure, &stderr));
     }
+    Ok(())
 }
 
 /// Runs a bootstrap command, returning its status and bounded stderr.
@@ -574,134 +560,118 @@ fn file_sha256(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(&hasher.finalize()))
 }
 
-fn deploy_agent(target: &RemoteTarget, local: &Path, cancel: &AtomicBool) -> Result<Deployment> {
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Makes the helper available on an SSH host, uploading it unless the cache
+/// (keyed by version and digest) already has it.
+fn deploy_ssh(target: &RemoteTarget, local: &Path, cancel: &AtomicBool) -> Result<Deployment> {
     let version = env!("CARGO_PKG_VERSION");
     let digest = file_sha256(local)?;
-    match target {
-        RemoteTarget::Ssh { .. } => {
-            let remote = format!("$HOME/{REMOTE_DIR}/{version}-{digest}/brindle-remote");
-            let check = format!("test -x \"{remote}\" && test \"$(\"{remote}\" --version)\" = {version}");
-            let command = super::remote_command(target, "sh", &["-lc".into(), check])?;
-            let (status, stderr) =
-                run_status(command, cancel, "checking cached SSH remote helper")?;
-            if status.success() {
-                return Ok(Deployment {
-                    path: remote,
-                    cleanup: None,
-                });
-            }
-            if status.code() == Some(255) {
-                // ssh itself failed (auth, host key, network): uploading would too.
-                return Err(bootstrap_failure("SSH connection failed", &stderr));
-            }
-            let script = format!(
-                "umask 077; mkdir -p \"$HOME/{REMOTE_DIR}/{version}-{digest}\" && tmp=\"{remote}.tmp.$$\" && cat > \"$tmp\" && chmod 700 \"$tmp\" && mv \"$tmp\" \"{remote}\""
-            );
-            let mut upload = super::remote_command(target, "sh", &["-lc".into(), script])?;
-            upload
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped());
-            let mut child = upload.spawn().context("starting SSH helper upload")?;
-            let upload_stderr = child.stderr.take().map(spawn_stderr_drain);
-            let mut input = child.stdin.take().context("SSH upload stdin unavailable")?;
-            let mut file = File::open(local)
-                .with_context(|| format!("opening remote helper {}", local.display()))?;
-            let copy = thread::spawn(move || std::io::copy(&mut file, &mut input));
-            let status = wait_process(child, cancel, Duration::from_secs(30))?;
-            let copied = copy
-                .join()
-                .map_err(|_| anyhow::anyhow!("SSH upload thread panicked"))??;
-            if !status.success() {
-                let stderr = upload_stderr
-                    .map(|rx| await_stderr(&rx))
-                    .unwrap_or_default();
-                return Err(bootstrap_failure(
-                    &format!("SSH helper upload failed after {copied} bytes"),
-                    &stderr,
-                ));
-            }
-            Ok(Deployment {
-                path: remote,
-                cleanup: None,
-            })
-        }
-        RemoteTarget::Container {
-            engine, container, ..
-        } => {
-            let mut random = [0u8; 16];
-            getrandom::fill(&mut random).context("generating container helper path")?;
-            let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-            let directory = format!("/tmp/brindle-{nonce}");
-            let remote = format!("{directory}/brindle-remote");
-            let deployment = Deployment {
-                path: remote,
-                cleanup: Some((engine.clone(), container.clone(), directory.clone())),
-            };
-            let mut command = hidden_command(engine);
-            command.args([
-                "exec", "--user", "0", container, "mkdir", "-m", "755", &directory,
-            ]);
-            let (status, stderr) = run_status(
-                command,
-                cancel,
-                "creating private container helper directory",
-            )?;
-            if !status.success() {
-                return Err(bootstrap_failure(
-                    "container helper directory failed",
-                    &stderr,
-                ));
-            }
-            let destination = format!("{container}:{}", deployment.path());
-            let mut command = hidden_command(engine);
-            command.args(["cp"]).arg(local).arg(&destination);
-            let (status, stderr) = run_status(command, cancel, "copying container helper")?;
-            if !status.success() {
-                return Err(bootstrap_failure("container helper upload failed", &stderr));
-            }
-            let mut command = hidden_command(engine);
-            command.args([
-                "exec",
-                "--user",
-                "0",
-                container,
-                "sh",
-                "-c",
-                // `docker cp` can keep the host file's owner, depending on the
-                // daemon, so root takes the regular file over before checking.
-                "test -f \"$1\" && test ! -L \"$1\" && chown 0:0 \"$1\" && test \"$(stat -c %u \"$1\")\" = 0",
-                "sh",
-                deployment.path(),
-            ]);
-            let (status, stderr) = run_status(command, cancel, "verifying container helper")?;
-            if !status.success() {
-                return Err(bootstrap_failure(
-                    "container helper is not a root-owned regular file",
-                    &stderr,
-                ));
-            }
-            let mut command = hidden_command(engine);
-            command.args([
-                "exec",
-                "--user",
-                "0",
-                container,
-                "chmod",
-                "755",
-                deployment.path(),
-            ]);
-            let (status, stderr) =
-                run_status(command, cancel, "marking container helper executable")?;
-            if !status.success() {
-                return Err(bootstrap_failure("container helper chmod failed", &stderr));
-            }
-            Ok(deployment)
-        }
+    let remote = format!("$HOME/{REMOTE_DIR}/{version}-{digest}/brindle-remote");
+    let check = format!("test -x \"{remote}\" && test \"$(\"{remote}\" --version)\" = {version}");
+    let command = super::remote_command(target, "sh", &["-c".into(), check])?;
+    let (status, stderr) = run_status(command, cancel, "checking cached SSH remote helper")?;
+    if status.success() {
+        return Ok(Deployment {
+            path: remote,
+            cleanup: None,
+        });
     }
+    if status.code() == Some(255) {
+        // ssh itself failed (auth, host key, network): uploading would too.
+        return Err(bootstrap_failure("SSH connection failed", &stderr));
+    }
+    let script = format!(
+        "umask 077; mkdir -p \"$HOME/{REMOTE_DIR}/{version}-{digest}\" && tmp=\"{remote}.tmp.$$\" && cat > \"$tmp\" && chmod 700 \"$tmp\" && mv \"$tmp\" \"{remote}\""
+    );
+    let mut upload = super::remote_command(target, "sh", &["-c".into(), script])?;
+    upload
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = upload.spawn().context("starting SSH helper upload")?;
+    let upload_stderr = child.stderr.take().map(spawn_stderr_drain);
+    let mut input = child.stdin.take().context("SSH upload stdin unavailable")?;
+    let mut file = File::open(local)
+        .with_context(|| format!("opening remote helper {}", local.display()))?;
+    let copy = thread::spawn(move || std::io::copy(&mut file, &mut input));
+    let status = wait_process(child, cancel, Duration::from_secs(30))?;
+    let copied = copy
+        .join()
+        .map_err(|_| anyhow::anyhow!("SSH upload thread panicked"))??;
+    if !status.success() {
+        let stderr = upload_stderr
+            .map(|rx| await_stderr(&rx))
+            .unwrap_or_default();
+        return Err(bootstrap_failure(
+            &format!("SSH helper upload failed after {copied} bytes"),
+            &stderr,
+        ));
+    }
+    Ok(Deployment {
+        path: remote,
+        cleanup: None,
+    })
+}
+
+/// Copies the helper into a fresh private directory in the container; the
+/// returned [`Deployment`] removes it when dropped.
+fn deploy_container(
+    engine: &str,
+    container: &str,
+    local: &Path,
+    cancel: &AtomicBool,
+) -> Result<Deployment> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).context("generating container helper path")?;
+    let directory = format!("/tmp/brindle-{}", hex(&random));
+    let deployment = Deployment {
+        path: format!("{directory}/brindle-remote"),
+        cleanup: Some(ContainerCleanup {
+            engine: engine.to_owned(),
+            container: container.to_owned(),
+            directory: directory.clone(),
+        }),
+    };
+    container_exec_root(
+        engine,
+        container,
+        &["mkdir", "-m", "755", &directory],
+        cancel,
+        "creating private container helper directory",
+        "container helper directory failed",
+    )?;
+    let mut command = hidden_command(engine);
+    command
+        .args(["cp"])
+        .arg(local)
+        .arg(format!("{container}:{}", deployment.path));
+    let (status, stderr) = run_status(command, cancel, "copying container helper")?;
+    if !status.success() {
+        return Err(bootstrap_failure("container helper upload failed", &stderr));
+    }
+    container_exec_root(
+        engine,
+        container,
+        &[
+            "sh",
+            "-c",
+            // `docker cp` can keep the host file's owner, depending on the
+            // daemon, so root takes the regular file over before checking.
+            "test -f \"$1\" && test ! -L \"$1\" && chown 0:0 \"$1\" && chmod 755 \"$1\" && test \"$(stat -c %u \"$1\")\" = 0",
+            "sh",
+            &deployment.path,
+        ],
+        cancel,
+        "verifying container helper",
+        "container helper is not a root-owned regular file",
+    )?;
+    Ok(deployment)
 }
 
 fn agent_command(target: &RemoteTarget, remote_agent: &str) -> Result<Command> {
@@ -1320,8 +1290,6 @@ mod tests {
             let mut stdin = child.stdin.take().unwrap();
             let mut stdout = child.stdout.take().unwrap();
             let request = SpawnRequest {
-                channel_id: 1,
-                kind: SessionKind::Pty,
                 command: Some(command.into()),
                 args: args.iter().map(|a| a.to_string()).collect(),
                 cwd: None,
@@ -1354,7 +1322,7 @@ mod tests {
         }
 
         fn input(&mut self, text: &str) {
-            let frame = Frame::data(1, text.as_bytes()).unwrap();
+            let frame = Frame::data(text.as_bytes().to_vec()).unwrap();
             frame.write_to(self.stdin.as_mut().unwrap()).ok();
         }
 
@@ -1660,13 +1628,21 @@ mod tests {
     #[test]
     fn large_input_is_chunked_without_loss() {
         let bytes: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (tx, rx) = mpsc::sync_channel(128);
+        let handle = Handle {
+            tx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        handle.input(bytes.clone());
+        drop(handle);
         let mut wire = Vec::new();
-        write_data_frames(&mut wire, 7, &bytes).unwrap();
+        for message in rx {
+            message.into_frame().unwrap().write_to(&mut wire).unwrap();
+        }
         let mut cursor = std::io::Cursor::new(wire);
         let mut decoded = Vec::new();
         let mut frames = 0;
         while let Some(frame) = Frame::read_from_or_eof(&mut cursor).unwrap() {
-            assert_eq!(frame.channel_id, 7);
             assert_eq!(frame.msg_type, MSG_DATA);
             assert!(frame.payload.len() <= DATA_CHUNK_SIZE);
             decoded.extend(frame.payload);

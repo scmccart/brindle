@@ -4,40 +4,22 @@
 //! carry framed protocol values; stderr is reserved for startup diagnostics
 //! from the binary and is never mixed into the framed stream.
 
-use std::io;
-
-use super::protocol::SpawnRequest;
-
-/// Serves one already-described session over the process's framed stdio.
-///
-/// On success, the first frame written is always a `SpawnResponse`. A failed
-/// spawn is also reported with a `SpawnResponse`, after which this returns
-/// successfully because the protocol-level request was handled.
-pub fn serve_stdio(request: SpawnRequest) -> io::Result<()> {
-    platform::serve_stdio(request)
-}
-
-/// Compatibility entry point for a client that sends its `SpawnRequest` as
-/// the first control-channel frame instead of passing JSON on the command
-/// line.
-pub fn serve_server_stdio() -> io::Result<()> {
-    platform::serve_server_stdio()
-}
+/// Serves one session over the process's framed stdio: writes the frame
+/// marker, reads the client's `SpawnRequest` as its first frame, then answers
+/// with a `SpawnResponse`. A failed spawn is also reported with a
+/// `SpawnResponse`, after which this returns successfully because the
+/// protocol-level request was handled.
+pub use platform::serve_stdio;
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
     use std::io;
 
-    use super::SpawnRequest;
-
-    const UNSUPPORTED: &str = "brindle-remote sessions are supported only on Linux";
-
-    pub fn serve_stdio(_request: SpawnRequest) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, UNSUPPORTED))
-    }
-
-    pub fn serve_server_stdio() -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, UNSUPPORTED))
+    pub fn serve_stdio() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "brindle-remote sessions are supported only on Linux",
+        ))
     }
 }
 
@@ -45,11 +27,11 @@ mod platform {
 mod platform {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File};
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::PathBuf;
-    use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -57,9 +39,8 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use super::super::protocol::{
-        CHANNEL_CONTROL, ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_PING, MSG_PONG,
-        MSG_QUERY_PROCESS, MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SessionKind,
-        SpawnRequest, SpawnResponse,
+        ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_QUERY_PROCESS,
+        MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SpawnRequest, SpawnResponse,
     };
 
     const OUTPUT_CHUNK_SIZE: usize = 32 * 1024;
@@ -75,7 +56,7 @@ mod platform {
     const STDOUT_STALL_LIMIT: Duration = Duration::from_secs(120);
     const SESSION_INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
 
-    pub fn serve_server_stdio() -> io::Result<()> {
+    pub fn serve_stdio() -> io::Result<()> {
         // Shell startup files can print before the helper runs; the marker
         // lets the client find where the frame stream begins.
         {
@@ -88,21 +69,17 @@ mod platform {
             let stdin = io::stdin();
             let mut reader = stdin.lock();
             let frame = Frame::read_from(&mut reader)?;
-            if frame.channel_id != CHANNEL_CONTROL || frame.msg_type != MSG_SPAWN {
+            if frame.msg_type != MSG_SPAWN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "the first server frame must be a Spawn request on channel 0",
+                    "the first frame must be a Spawn request",
                 ));
             }
             frame.decode_json::<SpawnRequest>()?
         };
-        serve_stdio(request)
-    }
 
-    pub fn serve_stdio(request: SpawnRequest) -> io::Result<()> {
         if let Err(error) = validate_request(&request) {
             write_spawn_response(&SpawnResponse {
-                channel_id: request.channel_id,
                 success: false,
                 error: Some(error.to_string()),
                 pid: None,
@@ -110,11 +87,10 @@ mod platform {
             return Ok(());
         }
 
-        let mut session = match spawn_session(&request) {
+        let mut session = match spawn_pty(&request) {
             Ok(session) => session,
             Err(error) => {
                 write_spawn_response(&SpawnResponse {
-                    channel_id: request.channel_id,
                     success: false,
                     error: Some(error.to_string()),
                     pid: None,
@@ -124,7 +100,6 @@ mod platform {
         };
 
         if let Err(error) = write_spawn_response(&SpawnResponse {
-            channel_id: request.channel_id,
             success: true,
             error: None,
             pid: Some(session.pid as u32),
@@ -134,23 +109,17 @@ mod platform {
             return Err(error);
         }
 
-        run_session(request, session)
+        run_session(session)
     }
 
     fn validate_request(request: &SpawnRequest) -> io::Result<()> {
-        if request.channel_id == CHANNEL_CONTROL {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a session channel must be non-zero",
-            ));
-        }
         if request.command.as_deref().is_some_and(str::is_empty) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "command must not be empty",
             ));
         }
-        if request.kind == SessionKind::Pty && (request.cols == 0 || request.rows == 0) {
+        if request.cols == 0 || request.rows == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "PTY rows and columns must be non-zero",
@@ -168,53 +137,9 @@ mod platform {
     struct SpawnedSession {
         pid: libc::pid_t,
         child: Child,
-        input: SessionInput,
-        output: SessionOutput,
-        stderr: Option<ChildStderr>,
-        kind: SessionKind,
-    }
-
-    enum SessionInput {
-        Pty(Arc<OwnedFd>),
-        Pipe(Option<ChildStdin>),
-    }
-
-    impl SessionInput {
-        fn write_all(&mut self, bytes: &[u8], child_exited: &AtomicBool) -> io::Result<()> {
-            match self {
-                Self::Pty(master) => write_all_fd(master.as_raw_fd(), bytes, child_exited),
-                Self::Pipe(Some(stdin)) => write_all_fd(stdin.as_raw_fd(), bytes, child_exited),
-                Self::Pipe(None) => Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "session input is closed",
-                )),
-            }
-        }
-
-        fn close(&mut self) {
-            if let Self::Pipe(stdin) = self {
-                stdin.take();
-            }
-        }
-
-        fn pty_fd(&self) -> Option<RawFd> {
-            match self {
-                Self::Pty(master) => Some(master.as_raw_fd()),
-                Self::Pipe(_) => None,
-            }
-        }
-    }
-
-    enum SessionOutput {
-        Pty(Arc<OwnedFd>),
-        Pipe(ChildStdout),
-    }
-
-    fn spawn_session(request: &SpawnRequest) -> io::Result<SpawnedSession> {
-        match request.kind {
-            SessionKind::Pty => spawn_pty(request),
-            SessionKind::Tmux => spawn_tmux(request),
-        }
+        /// The PTY master: session input goes in, output and the process
+        /// queries come from it.
+        master: Arc<OwnedFd>,
     }
 
     fn spawn_pty(request: &SpawnRequest) -> io::Result<SpawnedSession> {
@@ -264,66 +189,11 @@ mod platform {
 
         let child = command.spawn()?;
         let pid = child.id() as libc::pid_t;
-        let master = Arc::new(master);
         Ok(SpawnedSession {
             pid,
             child,
-            input: SessionInput::Pty(master.clone()),
-            output: SessionOutput::Pty(master),
-            stderr: None,
-            kind: SessionKind::Pty,
+            master: Arc::new(master),
         })
-    }
-
-    fn spawn_tmux(request: &SpawnRequest) -> io::Result<SpawnedSession> {
-        let mut command = command_for(request, OsString::from("tmux"));
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let mut child = command.spawn()?;
-        let pid = child.id() as libc::pid_t;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => return cleanup_incomplete_child(child, "tmux stdin was not piped"),
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => return cleanup_incomplete_child(child, "tmux stdout was not piped"),
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => return cleanup_incomplete_child(child, "tmux stderr was not piped"),
-        };
-        if let Err(error) = set_nonblocking(stdin.as_raw_fd()) {
-            signal_process_group(pid, libc::SIGKILL);
-            let _ = child.wait();
-            return Err(error);
-        }
-
-        Ok(SpawnedSession {
-            pid,
-            child,
-            input: SessionInput::Pipe(Some(stdin)),
-            output: SessionOutput::Pipe(stdout),
-            stderr: Some(stderr),
-            kind: SessionKind::Tmux,
-        })
-    }
-
-    fn cleanup_incomplete_child<T>(mut child: Child, message: &'static str) -> io::Result<T> {
-        signal_process_group(child.id() as libc::pid_t, libc::SIGKILL);
-        let _ = child.wait();
-        Err(io::Error::other(message))
     }
 
     fn command_for(request: &SpawnRequest, default_program: OsString) -> Command {
@@ -488,12 +358,74 @@ mod platform {
         Output(Vec<u8>),
         OutputClosed,
         OutputFailed(io::Error),
-        Diagnostic(String),
         ChildExited(io::Result<Option<i32>>),
         WriterFailed(io::Error),
     }
 
-    fn run_session(request: SpawnRequest, mut session: SpawnedSession) -> io::Result<()> {
+    /// How the session is being ended: the signals sent to its process group
+    /// and the first error, which the agent reports when it exits.
+    struct Shutdown {
+        pid: libc::pid_t,
+        child_exited: Arc<AtomicBool>,
+        started: Option<Instant>,
+        force_killed_at: Option<Instant>,
+        error: Option<io::Error>,
+    }
+
+    impl Shutdown {
+        fn new(pid: libc::pid_t, child_exited: Arc<AtomicBool>) -> Self {
+            Self {
+                pid,
+                child_exited,
+                started: None,
+                force_killed_at: None,
+                error: None,
+            }
+        }
+
+        /// The child has been waited for or is a zombie, so signals are moot.
+        fn child_gone(&self, child_waited: bool) -> bool {
+            child_waited || self.child_exited.load(Ordering::Acquire)
+        }
+
+        fn remember(&mut self, error: io::Error) {
+            self.error.get_or_insert(error);
+        }
+
+        /// Hangs the session up once; later calls only keep the clock.
+        fn begin(&mut self, child_waited: bool) {
+            if self.started.is_none() {
+                self.started = Some(Instant::now());
+                if !self.child_gone(child_waited) {
+                    signal_process_group(self.pid, libc::SIGHUP);
+                }
+            }
+        }
+
+        /// Tells the client what went wrong, remembers it and ends the session.
+        fn fail(
+            &mut self,
+            outgoing: &SyncSender<Frame>,
+            message: impl Into<String>,
+            error: io::Error,
+            child_waited: bool,
+        ) {
+            let _ = send_protocol_error(outgoing, message);
+            self.remember(error);
+            self.begin(child_waited);
+        }
+
+        /// Kills the process group unless the child is gone; says whether it did.
+        fn kill(&self, child_waited: bool) -> bool {
+            let alive = !self.child_gone(child_waited);
+            if alive {
+                signal_process_group(self.pid, libc::SIGKILL);
+            }
+            alive
+        }
+    }
+
+    fn run_session(session: SpawnedSession) -> io::Result<()> {
         let child_exited = Arc::new(AtomicBool::new(false));
         let output_enabled = Arc::new(AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::sync_channel(32);
@@ -501,25 +433,21 @@ mod platform {
 
         spawn_input_reader(event_tx.clone());
         spawn_output_reader(
-            session.output,
+            session.master.clone(),
             event_tx.clone(),
             child_exited.clone(),
             output_enabled.clone(),
         );
-        if let Some(stderr) = session.stderr.take() {
-            spawn_stderr_reader(stderr, event_tx.clone(), output_enabled.clone());
-        }
         spawn_child_waiter(session.child, event_tx.clone(), child_exited.clone());
         drop(event_tx);
 
+        let master_fd = session.master.as_raw_fd();
+        let mut shutdown = Shutdown::new(session.pid, child_exited.clone());
         let mut child_waited = false;
         let mut exit_code = None;
         let mut output_closed = false;
         let mut drain_idle_deadline = None;
         let mut drain_hard_deadline = None;
-        let mut shutdown_started = None;
-        let mut force_killed_at = None;
-        let mut terminal_error = None;
         let mut writer_failed = false;
 
         loop {
@@ -527,73 +455,29 @@ mod platform {
                 Ok(Event::Incoming(frame)) => {
                     match handle_frame(
                         frame,
-                        &request,
-                        &mut session.input,
+                        master_fd,
                         session.pid,
                         &child_exited,
                         &outgoing_tx,
                     ) {
                         Ok(FrameAction::Continue) => {}
-                        Ok(FrameAction::Shutdown) => begin_shutdown(
-                            &mut session.input,
-                            session.pid,
-                            session.kind,
-                            &mut shutdown_started,
-                            child_waited || child_exited.load(Ordering::Acquire),
-                        ),
+                        Ok(FrameAction::Shutdown) => shutdown.begin(child_waited),
                         Err(error) => {
-                            let _ = send_protocol_error(
-                                &outgoing_tx,
-                                request.channel_id,
-                                error.to_string(),
-                            );
-                            remember_error(&mut terminal_error, error);
-                            begin_shutdown(
-                                &mut session.input,
-                                session.pid,
-                                session.kind,
-                                &mut shutdown_started,
-                                child_waited || child_exited.load(Ordering::Acquire),
-                            );
+                            let message = error.to_string();
+                            shutdown.fail(&outgoing_tx, message, error, child_waited);
                         }
                     }
                 }
-                Ok(Event::InputEof) => begin_shutdown(
-                    &mut session.input,
-                    session.pid,
-                    session.kind,
-                    &mut shutdown_started,
-                    child_waited || child_exited.load(Ordering::Acquire),
-                ),
+                Ok(Event::InputEof) => shutdown.begin(child_waited),
                 Ok(Event::InputFailed(error)) => {
-                    let _ = send_protocol_error(
-                        &outgoing_tx,
-                        request.channel_id,
-                        format!("failed to read a client frame: {error}"),
-                    );
-                    remember_error(&mut terminal_error, error);
-                    begin_shutdown(
-                        &mut session.input,
-                        session.pid,
-                        session.kind,
-                        &mut shutdown_started,
-                        child_waited || child_exited.load(Ordering::Acquire),
-                    );
+                    let message = format!("failed to read a client frame: {error}");
+                    shutdown.fail(&outgoing_tx, message, error, child_waited);
                 }
                 Ok(Event::Output(bytes)) => {
                     if output_enabled.load(Ordering::Acquire) {
-                        if let Err(error) = send_output(
-                            &outgoing_tx,
-                            Frame::new(request.channel_id, MSG_DATA, bytes),
-                        ) {
-                            remember_error(&mut terminal_error, error);
-                            begin_shutdown(
-                                &mut session.input,
-                                session.pid,
-                                session.kind,
-                                &mut shutdown_started,
-                                child_waited || child_exited.load(Ordering::Acquire),
-                            );
+                        if let Err(error) = send_output(&outgoing_tx, Frame::data(bytes)) {
+                            shutdown.remember(error);
+                            shutdown.begin(child_waited);
                         }
                         if child_waited {
                             drain_idle_deadline = Some(Instant::now() + OUTPUT_DRAIN_IDLE);
@@ -602,33 +486,15 @@ mod platform {
                 }
                 Ok(Event::OutputClosed) => output_closed = true,
                 Ok(Event::OutputFailed(error)) => {
-                    let _ = send_protocol_error(
-                        &outgoing_tx,
-                        request.channel_id,
-                        format!("failed to read session output: {error}"),
-                    );
-                    remember_error(&mut terminal_error, error);
+                    let message = format!("failed to read session output: {error}");
                     output_closed = true;
-                    begin_shutdown(
-                        &mut session.input,
-                        session.pid,
-                        session.kind,
-                        &mut shutdown_started,
-                        child_waited || child_exited.load(Ordering::Acquire),
-                    );
-                }
-                Ok(Event::Diagnostic(message)) => {
-                    if let Err(error) =
-                        send_protocol_error(&outgoing_tx, request.channel_id, message)
-                    {
-                        remember_error(&mut terminal_error, error);
-                    }
+                    shutdown.fail(&outgoing_tx, message, error, child_waited);
                 }
                 Ok(Event::ChildExited(result)) => {
                     child_waited = true;
                     match result {
                         Ok(code) => exit_code = code,
-                        Err(error) => remember_error(&mut terminal_error, error),
+                        Err(error) => shutdown.remember(error),
                     }
                     let now = Instant::now();
                     drain_idle_deadline = Some(now + OUTPUT_DRAIN_IDLE);
@@ -636,45 +502,37 @@ mod platform {
                 }
                 Ok(Event::WriterFailed(error)) => {
                     writer_failed = true;
-                    remember_error(&mut terminal_error, error);
-                    session.input.close();
-                    if !child_waited && !child_exited.load(Ordering::Acquire) {
-                        signal_process_group(session.pid, libc::SIGKILL);
-                        force_killed_at.get_or_insert_with(Instant::now);
+                    shutdown.remember(error);
+                    if shutdown.kill(child_waited) {
+                        shutdown.force_killed_at.get_or_insert_with(Instant::now);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     if !child_waited {
-                        remember_error(
-                            &mut terminal_error,
-                            io::Error::other("all remote-agent workers stopped unexpectedly"),
-                        );
+                        shutdown.remember(io::Error::other(
+                            "all remote-agent workers stopped unexpectedly",
+                        ));
                     }
                     break;
                 }
             }
 
             let now = Instant::now();
-            if let Some(started) = shutdown_started {
-                if !child_waited
-                    && !child_exited.load(Ordering::Acquire)
-                    && force_killed_at.is_none()
+            if let Some(started) = shutdown.started {
+                if shutdown.force_killed_at.is_none()
                     && now.duration_since(started) >= GRACEFUL_SHUTDOWN
+                    && shutdown.kill(child_waited)
                 {
-                    signal_process_group(session.pid, libc::SIGKILL);
-                    force_killed_at = Some(now);
+                    shutdown.force_killed_at = Some(now);
                 }
             }
-            if let Some(killed_at) = force_killed_at {
+            if let Some(killed_at) = shutdown.force_killed_at {
                 if !child_waited && now.duration_since(killed_at) >= FORCED_SHUTDOWN {
-                    remember_error(
-                        &mut terminal_error,
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "session did not exit after SIGKILL",
-                        ),
-                    );
+                    shutdown.remember(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "session did not exit after SIGKILL",
+                    ));
                     break;
                 }
             }
@@ -685,10 +543,8 @@ mod platform {
                 if output_closed || idle_expired || limit_expired {
                     output_enabled.store(false, Ordering::Release);
                     if !writer_failed {
-                        if let Err(error) =
-                            send_outgoing(&outgoing_tx, Frame::exit(request.channel_id, exit_code))
-                        {
-                            remember_error(&mut terminal_error, error);
+                        if let Err(error) = send_outgoing(&outgoing_tx, Frame::exit(exit_code)) {
+                            shutdown.remember(error);
                         }
                     }
                     break;
@@ -697,20 +553,17 @@ mod platform {
         }
 
         output_enabled.store(false, Ordering::Release);
-        session.input.close();
-        if !child_waited && !child_exited.load(Ordering::Acquire) {
-            signal_process_group(session.pid, libc::SIGKILL);
-        }
+        let _ = shutdown.kill(child_waited);
         drop(outgoing_tx);
 
         let writer_result = writer
             .join()
             .map_err(|_| io::Error::other("remote frame writer thread panicked"))?;
         if let Err(error) = writer_result {
-            remember_error(&mut terminal_error, error);
+            shutdown.remember(error);
         }
 
-        match terminal_error {
+        match shutdown.error {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -724,86 +577,43 @@ mod platform {
 
     fn handle_frame(
         frame: Frame,
-        request: &SpawnRequest,
-        input: &mut SessionInput,
+        master_fd: RawFd,
         child_pid: libc::pid_t,
         child_exited: &AtomicBool,
         outgoing: &SyncSender<Frame>,
     ) -> io::Result<FrameAction> {
-        if frame.msg_type == MSG_PING {
-            send_outgoing(
-                outgoing,
-                Frame::new(frame.channel_id, MSG_PONG, frame.payload),
-            )?;
-            return Ok(FrameAction::Continue);
-        }
-        if frame.channel_id != request.channel_id {
-            send_protocol_error(
-                outgoing,
-                frame.channel_id,
-                format!(
-                    "frame is for channel {}, but this agent serves channel {}",
-                    frame.channel_id, request.channel_id
-                ),
-            )?;
-            return Ok(FrameAction::Continue);
-        }
-
         match frame.msg_type {
             MSG_DATA => {
-                input.write_all(&frame.payload, child_exited)?;
+                write_all_fd(master_fd, &frame.payload, child_exited)?;
                 Ok(FrameAction::Continue)
             }
             MSG_RESIZE => {
                 let resize = match frame.decode_json::<ResizeRequest>() {
                     Ok(resize) if resize.cols != 0 && resize.rows != 0 => resize,
                     Ok(_) => {
-                        send_protocol_error(
-                            outgoing,
-                            frame.channel_id,
-                            "PTY rows and columns must be non-zero",
-                        )?;
+                        send_protocol_error(outgoing, "PTY rows and columns must be non-zero")?;
                         return Ok(FrameAction::Continue);
                     }
                     Err(error) => {
-                        send_protocol_error(
-                            outgoing,
-                            frame.channel_id,
-                            format!("invalid Resize payload: {error}"),
-                        )?;
+                        send_protocol_error(outgoing, format!("invalid Resize payload: {error}"))?;
                         return Ok(FrameAction::Continue);
                     }
                 };
-                match input.pty_fd() {
-                    Some(fd) => resize_pty(fd, &resize)?,
-                    None => send_protocol_error(
-                        outgoing,
-                        frame.channel_id,
-                        "Resize is valid only for PTY sessions",
-                    )?,
-                }
+                resize_pty(master_fd, &resize)?;
                 Ok(FrameAction::Continue)
             }
             MSG_QUERY_PROCESS => {
                 if !frame.payload.is_empty() {
-                    send_protocol_error(
-                        outgoing,
-                        frame.channel_id,
-                        "QueryProcess payload must be empty",
-                    )?;
+                    send_protocol_error(outgoing, "QueryProcess payload must be empty")?;
                     return Ok(FrameAction::Continue);
                 }
-                let info = inspect_process(input.pty_fd(), child_pid, request.channel_id);
+                let info = inspect_process(master_fd, child_pid);
                 send_outgoing(outgoing, Frame::process_info(&info))?;
                 Ok(FrameAction::Continue)
             }
             MSG_EXIT => {
                 if let Err(error) = frame.decode_json::<ExitMessage>() {
-                    send_protocol_error(
-                        outgoing,
-                        frame.channel_id,
-                        format!("invalid Exit payload: {error}"),
-                    )?;
+                    send_protocol_error(outgoing, format!("invalid Exit payload: {error}"))?;
                     return Ok(FrameAction::Continue);
                 }
                 Ok(FrameAction::Shutdown)
@@ -811,7 +621,6 @@ mod platform {
             other => {
                 send_protocol_error(
                     outgoing,
-                    frame.channel_id,
                     format!("unsupported session message type {other}"),
                 )?;
                 Ok(FrameAction::Continue)
@@ -819,38 +628,11 @@ mod platform {
         }
     }
 
-    fn begin_shutdown(
-        input: &mut SessionInput,
-        pid: libc::pid_t,
-        kind: SessionKind,
-        started: &mut Option<Instant>,
-        child_waited: bool,
-    ) {
-        input.close();
-        if started.is_none() {
-            *started = Some(Instant::now());
-            if !child_waited {
-                let signal = match kind {
-                    SessionKind::Pty => libc::SIGHUP,
-                    SessionKind::Tmux => libc::SIGTERM,
-                };
-                signal_process_group(pid, signal);
-            }
-        }
-    }
-
-    fn remember_error(slot: &mut Option<io::Error>, error: io::Error) {
-        if slot.is_none() {
-            *slot = Some(error);
-        }
-    }
-
     fn send_protocol_error(
         outgoing: &SyncSender<Frame>,
-        channel_id: u32,
         message: impl Into<String>,
     ) -> io::Result<()> {
-        send_outgoing(outgoing, Frame::error(channel_id, message))
+        send_outgoing(outgoing, Frame::error(message))
     }
 
     fn send_outgoing(outgoing: &SyncSender<Frame>, frame: io::Result<Frame>) -> io::Result<()> {
@@ -867,32 +649,13 @@ mod platform {
 
     /// Session output waits for room in the writer queue instead of failing:
     /// a PTY can produce data far faster than a slow link drains it, and the
-    /// bounded queues are the backpressure. Only a writer that makes no room
-    /// for `STDOUT_STALL_LIMIT` is an error.
+    /// bounded queues are the backpressure. A writer that makes no progress
+    /// for `STDOUT_STALL_LIMIT` fails (`TimedWriter`) and exits, which drops
+    /// the queue's receiver and ends this wait with an error.
     fn send_output(outgoing: &SyncSender<Frame>, frame: io::Result<Frame>) -> io::Result<()> {
-        let mut frame = frame?;
-        let deadline = Instant::now() + STDOUT_STALL_LIMIT;
-        loop {
-            match outgoing.try_send(frame) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::TrySendError::Full(returned)) => {
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "client is not draining remote output",
-                        ));
-                    }
-                    frame = returned;
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "remote frame writer has stopped",
-                    ));
-                }
-            }
-        }
+        outgoing.send(frame?).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "remote frame writer has stopped")
+        })
     }
 
     fn spawn_input_reader(events: SyncSender<Event>) {
@@ -920,15 +683,12 @@ mod platform {
     }
 
     fn spawn_output_reader(
-        output: SessionOutput,
+        master: Arc<OwnedFd>,
         events: SyncSender<Event>,
         child_exited: Arc<AtomicBool>,
         enabled: Arc<AtomicBool>,
     ) {
-        thread::spawn(move || match output {
-            SessionOutput::Pty(master) => read_pty_output(master, &events, &child_exited, &enabled),
-            SessionOutput::Pipe(stdout) => read_pipe_output(stdout, &events, &enabled),
-        });
+        thread::spawn(move || read_pty_output(master, &events, &child_exited, &enabled));
     }
 
     fn read_pty_output(
@@ -1005,63 +765,6 @@ mod platform {
             }
         }
         let _ = events.send(Event::OutputClosed);
-    }
-
-    fn read_pipe_output(mut output: ChildStdout, events: &SyncSender<Event>, enabled: &AtomicBool) {
-        let mut buffer = vec![0; OUTPUT_CHUNK_SIZE];
-        loop {
-            match output.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(length) => {
-                    if !enabled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if events
-                        .send(Event::Output(buffer[..length].to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    let _ = events.send(Event::OutputFailed(error));
-                    break;
-                }
-            }
-        }
-        let _ = events.send(Event::OutputClosed);
-    }
-
-    fn spawn_stderr_reader(
-        mut stderr: ChildStderr,
-        events: SyncSender<Event>,
-        enabled: Arc<AtomicBool>,
-    ) {
-        thread::spawn(move || {
-            let mut buffer = vec![0; 4096];
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => return,
-                    Ok(length) => {
-                        if !enabled.load(Ordering::Acquire) {
-                            return;
-                        }
-                        let message = String::from_utf8_lossy(&buffer[..length]).into_owned();
-                        if events.send(Event::Diagnostic(message)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        let _ = events.send(Event::Diagnostic(format!(
-                            "failed to read session stderr: {error}"
-                        )));
-                        return;
-                    }
-                }
-            }
-        });
     }
 
     fn spawn_child_waiter(
@@ -1267,14 +970,8 @@ mod platform {
         Ok(())
     }
 
-    fn inspect_process(
-        pty_fd: Option<RawFd>,
-        child_pid: libc::pid_t,
-        channel_id: u32,
-    ) -> ProcessInfo {
-        let foreground_group = pty_fd
-            .map(|fd| unsafe { libc::tcgetpgrp(fd) })
-            .filter(|pid| *pid > 0);
+    fn inspect_process(pty_fd: RawFd, child_pid: libc::pid_t) -> ProcessInfo {
+        let foreground_group = Some(unsafe { libc::tcgetpgrp(pty_fd) }).filter(|pid| *pid > 0);
         let pid = foreground_group
             .and_then(find_process_in_group)
             .unwrap_or(child_pid);
@@ -1291,7 +988,6 @@ mod platform {
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
         ProcessInfo {
-            channel_id,
             pid: pid.max(0) as u32,
             foreground_name,
             cwd,

@@ -2,7 +2,6 @@
 //! active tab's content, and the palettes.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -32,7 +31,7 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
-use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession, has_session_command};
+use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
 use crate::zone_view::ZoneTreeView;
 
@@ -826,41 +825,10 @@ impl Workspace {
                 Target::Window => cx
                     .spawn(async move |cx| {
                         if let Some(name) = &name {
-                            let (program, args) = has_session_command(&profile, name);
-                            let remote_profile = profile.clone();
-                            let env = crate::terminal::child_env(&profile);
+                            let (checked, checked_name) = (profile.clone(), name.clone());
                             let taken = cx
                                 .background_executor()
-                                .spawn(async move {
-                                    let (mut command, initial_input) = if remote_profile.remote.is_some() {
-                                        match crate::remote::tmux_command(&remote_profile, &program, &args) {
-                                            Ok(process) => (process.command, process.initial_input),
-                                            Err(_) => return false,
-                                        }
-                                    } else {
-                                        let mut command = std::process::Command::new(program);
-                                        command.args(args).envs(env);
-                                        (command, Vec::new())
-                                    };
-                                    command
-                                        .stdin(if initial_input.is_empty() {
-                                            std::process::Stdio::null()
-                                        } else {
-                                            std::process::Stdio::piped()
-                                        })
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null());
-                                    #[cfg(windows)]
-                                    std::os::windows::process::CommandExt::creation_flags(
-                                        &mut command,
-                                        crate::win::CREATE_NO_WINDOW,
-                                    );
-                                    command_status_with_input(
-                                        command,
-                                        &initial_input,
-                                        std::time::Duration::from_secs(30),
-                                    )
-                                })
+                                .spawn(async move { crate::tmux::session_exists(&checked, &checked_name) })
                                 .await;
                             if taken {
                                 reply.send(Err(format!("duplicate session: {name}"))).ok();
@@ -2073,35 +2041,6 @@ pub(crate) fn terminal_automatic_title(
     match own {
         Some(title) => title.to_string(),
         None => foreground_process().unwrap_or_else(|| profile_name.to_string()),
-    }
-}
-
-fn command_status_with_input(
-    mut command: std::process::Command,
-    input: &[u8],
-    timeout: std::time::Duration,
-) -> bool {
-    let Ok(mut child) = command.spawn() else { return false };
-    if !input.is_empty()
-        && !child.stdin.take().is_some_and(|mut stdin| stdin.write_all(input).is_ok())
-    {
-        child.kill().ok();
-        child.wait().ok();
-        return false;
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                child.kill().ok();
-                child.wait().ok();
-                return false;
-            }
-        }
     }
 }
 

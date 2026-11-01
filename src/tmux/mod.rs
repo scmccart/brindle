@@ -476,7 +476,9 @@ fn tmux_command(profile: &Profile) -> TmuxCommand {
 /// The tmux command line for attaching to (or creating) a session. `-u`
 /// marks the client UTF-8 whatever the locale: otherwise tmux replaces the
 /// tabs in our `-F` formats, and non-ASCII text, with `_`. Through WSL no
-/// start directory is given: the tab's would be a Windows path.
+/// start directory is given: the tab's would be a Windows path. A remote
+/// profile gets none either: its directory goes to [`tmux_process`] on its
+/// own, to be expanded on the endpoint.
 pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>) -> (String, Vec<String>) {
     let tmux = tmux_command(profile);
     let mut args = tmux.prefix;
@@ -490,11 +492,51 @@ pub fn command_line(profile: &Profile, spec: &AttachSpec, cwd: Option<&PathBuf>)
         AttachSpec::New(Some(name)) => args.extend(["-s".into(), name.clone()]),
         AttachSpec::New(None) => {}
     }
-    if let Some(dir) = cwd.filter(|_| !tmux.wsl) {
+    if let Some(dir) = cwd.filter(|_| !tmux.wsl && profile.remote.is_none()) {
         args.push("-c".into());
         args.push(dir.to_string_lossy().into_owned());
     }
     (tmux.program, args)
+}
+
+/// The process that runs `program args` for `profile`: over SSH or container
+/// exec for a remote profile (starting in `cwd` there), else a local one with
+/// the profile's environment. It opens no console window. The caller sets
+/// stdio, and writes `initial_input` to stdin first.
+fn tmux_process(
+    profile: &Profile,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+) -> anyhow::Result<crate::remote::TmuxProcess> {
+    if profile.remote.is_some() {
+        return crate::remote::tmux_command(profile, program, args, cwd);
+    }
+    let mut command = Command::new(program);
+    command.args(args).envs(crate::terminal::child_env(profile));
+    crate::remote::hide_window(&mut command);
+    Ok(crate::remote::TmuxProcess { command, initial_input: Vec::new() })
+}
+
+/// Whether session `name` exists on `profile`'s server. Runs tmux, so it
+/// belongs off the UI thread. Anything but a prompt success (a missing
+/// server, a tmux that won't start, a timeout) means no.
+pub fn session_exists(profile: &Profile, name: &str) -> bool {
+    let (program, args) = has_session_command(profile, name);
+    let Ok(process) = tmux_process(profile, &program, &args, None) else { return false };
+    let (mut command, input) = (process.command, process.initial_input);
+    command
+        .stdin(if input.is_empty() { Stdio::null() } else { Stdio::piped() })
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else { return false };
+    if !input.is_empty() && !child.stdin.take().is_some_and(|mut stdin| stdin.write_all(&input).is_ok()) {
+        child.kill().ok();
+        child.wait().ok();
+        return false;
+    }
+    let never_cancel = std::sync::atomic::AtomicBool::new(false);
+    crate::remote::wait_process(child, &never_cancel, std::time::Duration::from_secs(30)).is_ok_and(|status| status.success())
 }
 
 /// The command that succeeds when session `name` exists on `profile`'s
@@ -565,12 +607,8 @@ fn shown_by_another_brindle(profile: &Profile, name: &str) -> bool {
         return false;
     }
     let (program, args) = list_clients_command(profile, name);
-    let output = Command::new(program)
-        .args(args)
-        .envs(crate::terminal::child_env(profile))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
+    let Ok(mut process) = tmux_process(profile, &program, &args, None) else { return false };
+    let output = process.command.stdin(Stdio::null()).stderr(Stdio::null()).output();
     let Ok(output) = output.inspect_err(|e| log::warn!("tmux list-clients: {e}")) else { return false };
     if !output.status.success() {
         return false;
@@ -732,31 +770,20 @@ impl TmuxSession {
         let (event_tx, event_rx) = futures::channel::mpsc::channel::<Option<Event>>(64);
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WriterMessage>(256);
 
-        #[allow(unused_mut)] // Mutated below only on Windows for CREATE_NO_WINDOW.
-        let (command, initial_input) = match &profile.remote {
-            Some(_) => match crate::remote::tmux_command(&profile, &program, &args) {
-                Ok(process) => (Ok(process.command), process.initial_input),
-                Err(err) => (Err(format!("{err:#}")), Vec::new()),
-            },
-            None => {
-                let mut command = Command::new(&program);
-                command
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .envs(crate::terminal::child_env(&profile))
-                    .env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
-                (Ok(command), Vec::new())
+        let remote_cwd = valid_cwd.map(|dir| dir.to_string_lossy().into_owned());
+        let (command, initial_input) = match tmux_process(&profile, &program, &args, remote_cwd.as_deref()) {
+            Ok(mut process) => {
+                // A remote client's stderr is where `tmux: command not found`
+                // or an ssh error goes (see `start_control_child`).
+                let stderr = if profile.remote.is_some() { Stdio::piped() } else { Stdio::null() };
+                process.command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(stderr);
+                if profile.remote.is_none() {
+                    process.command.env(CONTROL_CLIENT_MARKER, std::process::id().to_string());
+                }
+                (Ok(process.command), process.initial_input)
             }
+            Err(err) => (Err(format!("{err:#}")), Vec::new()),
         };
-        // Brindle has no console to share: without this, console programs
-        // open a window of their own.
-        #[cfg(windows)]
-        let command = command.map(|mut command| {
-            std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
-            command
-        });
         let starter = Starter { program, command, initial_input, event_tx, writer_rx };
 
         let reader = cx.spawn(async move |this, cx| {

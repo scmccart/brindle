@@ -8,15 +8,46 @@ pub mod client;
 pub mod protocol;
 
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
 use crate::config::{Profile, RemoteTarget};
 
+/// Keeps a process Brindle starts outside a tab from opening a console
+/// window of its own: Brindle has no console to share, so a console program
+/// would otherwise get one. Does nothing off Windows.
+pub(crate) fn hide_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(command, crate::win::CREATE_NO_WINDOW);
+    command
+}
+
+/// Waits for `child` to exit, killing it if `cancel` is set or `timeout`
+/// passes first.
+pub(crate) fn wait_process(
+    mut child: Child,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for bootstrap process")? {
+            return Ok(status);
+        }
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
+            child.kill().ok();
+            return child.wait().context("reaping bootstrap process");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Builds a command whose stdio is the remote command's stdio.
 pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> Result<Command> {
-    #[allow(unused_mut)] // Mutated below only on Windows for CREATE_NO_WINDOW.
     let mut command = match target {
         RemoteTarget::Ssh {
             host,
@@ -70,40 +101,34 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             command
         }
     };
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(
-        &mut command,
-        crate::win::CREATE_NO_WINDOW,
-    );
+    hide_window(&mut command);
     Ok(command)
 }
 
+/// A tmux process ready to spawn, and what to write to its stdin first.
+/// The caller sets its stdio.
 pub struct TmuxProcess {
     pub command: Command,
     pub initial_input: Vec<u8>,
 }
 
-/// Builds the remote tmux control client process used by `TmuxSession`.
-pub fn tmux_command(profile: &Profile, program: &str, args: &[String]) -> Result<TmuxProcess> {
+/// Builds the remote tmux process used by `TmuxSession`, starting in `cwd`
+/// on the endpoint when given (`~` is expanded there, not here).
+pub fn tmux_command(
+    profile: &Profile,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+) -> Result<TmuxProcess> {
     let target = profile
         .remote
         .as_ref()
         .context("remote profile has no target")?;
-    let mut args = args.to_vec();
-    let cwd = args
-        .iter()
-        .rposition(|arg| arg == "-c")
-        .filter(|at| *at + 2 == args.len())
-        .map(|at| {
-            let cwd = args.remove(at + 1);
-            args.remove(at);
-            cwd
-        });
     let mut argv = vec![program.to_string()];
-    argv.extend(args);
+    argv.extend(args.iter().cloned());
     let command = shlex::try_join(argv.iter().map(String::as_str))
         .context("tmux command contains a NUL byte")?;
-    let launch = match cwd.as_deref() {
+    let launch = match cwd {
         Some("~") => format!("cd \"$HOME\" && exec {command}"),
         Some(cwd) if cwd.starts_with("~/") => {
             let rest = shlex::try_quote(&cwd[2..]).context("tmux directory contains a NUL byte")?;
@@ -117,11 +142,7 @@ pub fn tmux_command(profile: &Profile, program: &str, args: &[String]) -> Result
     };
     let script =
         format!("IFS= read -r brindle_env || exit 1; eval \"$brindle_env\" || exit 1; {launch}");
-    let mut command = remote_command(target, "sh", &["-lc".into(), script])?;
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let command = remote_command(target, "sh", &["-lc".into(), script])?;
     let environment: BTreeMap<_, _> = crate::terminal::child_env(profile).into_iter().collect();
     let mut setup = String::new();
     for (key, value) in environment {
@@ -231,7 +252,7 @@ mod tests {
             env: [("TOKEN".into(), "a b".into())].into(),
             ..Profile::default_shell()
         };
-        let process = tmux_command(&profile, "tmux", &["-C".into()]).unwrap();
+        let process = tmux_command(&profile, "tmux", &["-C".into()], None).unwrap();
         let args: Vec<_> = process
             .command
             .get_args()
@@ -260,7 +281,7 @@ mod tests {
             env: [("TOKEN".into(), "first\nsecond".into())].into(),
             ..Profile::default_shell()
         };
-        assert!(tmux_command(&profile, "tmux", &["-C".into()]).is_err());
+        assert!(tmux_command(&profile, "tmux", &["-C".into()], None).is_err());
     }
 
     #[test]
@@ -278,12 +299,8 @@ mod tests {
         let process = tmux_command(
             &profile,
             "tmux",
-            &[
-                "-C".into(),
-                "new-session".into(),
-                "-c".into(),
-                "~/src tree".into(),
-            ],
+            &["-C".into(), "new-session".into()],
+            Some("~/src tree"),
         )
         .unwrap();
         let args: Vec<_> = process

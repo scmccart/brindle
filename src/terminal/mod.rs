@@ -260,8 +260,28 @@ impl Terminal {
             let mut rx = rx.ready_chunks(64);
             while let Some(events) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
+                    // Consecutive output goes through one `feed`, in order
+                    // relative to the other events.
+                    let mut output: Vec<u8> = Vec::new();
                     for event in events {
-                        this.handle_remote_event(event, cx);
+                        match event {
+                            crate::remote::client::Event::Output(bytes) => {
+                                if output.is_empty() {
+                                    output = bytes;
+                                } else {
+                                    output.extend_from_slice(&bytes);
+                                }
+                            }
+                            other => {
+                                if !output.is_empty() {
+                                    this.feed(&std::mem::take(&mut output), cx);
+                                }
+                                this.handle_remote_event(other, cx);
+                            }
+                        }
+                    }
+                    if !output.is_empty() {
+                        this.feed(&output, cx);
                     }
                     cx.notify();
                 });
@@ -322,7 +342,7 @@ impl Terminal {
 
     /// Spawns `profile`'s program on a new PTY. If that fails, the terminal
     /// shows the error instead so the tab explains what went wrong.
-    pub fn spawn_pty(
+    fn spawn_pty(
         profile: &Profile,
         command_override: Option<(String, Vec<String>)>,
         cwd_override: Option<std::path::PathBuf>,

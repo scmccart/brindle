@@ -33,7 +33,7 @@ Providing first-class remote Linux host and container connections turns remote s
      - One supervised session worker per helper process, supporting terminal PTY spawning, process inspection (`/proc`), and bounded shutdown.
      - A bounded binary framing protocol over stdio for PTY I/O, resizing, child exit, and status signals; JSON is confined to bounded control-frame payloads and never placed in process arguments.
      - CWD and title tracking via Linux `/proc` and OSC 7 notifications.
-     - The helper can also run `tmux -C` itself, but Brindle does not use that: remote tmux control mode runs `tmux -u -C` directly over the SSH/exec pipes (no helper) and feeds Brindle's native `TmuxSession` and `TmuxWindowView`.
+     - The helper serves PTY sessions only: remote tmux control mode runs `tmux -u -C` directly over the SSH/exec pipes (no helper) and feeds Brindle's native `TmuxSession` and `TmuxWindowView`.
 
 3. **Client-Side Remote Subsystem (`src/remote/`):**
    - `Transport`: manages SSH or container exec child process pipes, handshake, and message framing.

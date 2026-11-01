@@ -164,10 +164,7 @@ fn open_with(program: String, uri: String) -> Option<std::thread::JoinHandle<()>
         command.arg(&uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        // Brindle has no console to share, so a console program would get a
-        // window of its own.
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, crate::win::CREATE_NO_WINDOW);
+        crate::remote::hide_window(&mut command);
         let child = command.spawn();
         match child.and_then(|mut child| child.wait()) {
             Ok(status) if !status.success() => log::warn!("{program} {uri}: {status}"),
