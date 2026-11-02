@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::{DEFAULT_CONFIG, Profile, TmuxMode, TmuxSessionEnd};
+use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget, TmuxMode, TmuxSessionEnd};
 use crate::theme::{BUILTIN_THEMES, Theme};
 
 pub fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -301,6 +301,29 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
         (!items.is_empty()).then(|| Value::Array(items.iter().map(String::as_str).collect()))
     }
     set_value(table, "name", Value::from(p.name.as_str()));
+    if table.get("remote").is_none()
+        && let Some(remote) = &p.remote
+    {
+        let mut target = InlineTable::new();
+        match remote {
+            RemoteTarget::Ssh { host, user, port, identity_file, ssh_args } => {
+                target.insert("type", Value::from("ssh"));
+                target.insert("host", Value::from(host.as_str()));
+                if let Some(user) = user { target.insert("user", Value::from(user.as_str())); }
+                if let Some(port) = port { target.insert("port", Value::from(i64::from(*port))); }
+                if let Some(identity) = identity_file { target.insert("identity_file", Value::from(identity.as_str())); }
+                if let Some(args) = strings(ssh_args) { target.insert("ssh_args", args); }
+            }
+            RemoteTarget::Container { engine, container, user } => {
+                target.insert("type", Value::from("container"));
+                target.insert("engine", Value::from(engine.as_str()));
+                target.insert("container", Value::from(container.as_str()));
+                if let Some(user) = user { target.insert("user", Value::from(user.as_str())); }
+            }
+        }
+        target.fmt();
+        set_value(table, "remote", Value::InlineTable(target));
+    }
     set_or_remove(table, "command", p.command.as_deref().map(Value::from));
     set_or_remove(table, "args", strings(&p.args));
     set_or_remove(table, "cwd", p.cwd.as_deref().map(Value::from));
@@ -758,6 +781,24 @@ background = "nope"
         let config = reparse(&doc);
         assert_eq!(config.profiles[0].cwd.as_deref(), Some("~/src"));
         assert_eq!(config.profiles[1].name, "Work");
+    }
+
+    #[test]
+    fn new_profile_writes_remote_target() {
+        let mut doc = parse("[[profiles]]\nname = \"Shell\"\n").unwrap();
+        let profile = Profile {
+            name: "Remote copy".into(),
+            remote: Some(RemoteTarget::Ssh {
+                host: "A8".into(),
+                user: Some("dev".into()),
+                port: Some(2222),
+                identity_file: Some("~/.ssh/work".into()),
+                ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+            }),
+            ..Default::default()
+        };
+        upsert_profile(&mut doc, None, &profile).unwrap();
+        assert_eq!(reparse(&doc).profiles[1].remote, profile.remote);
     }
 
     #[test]

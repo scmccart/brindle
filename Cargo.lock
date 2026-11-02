@@ -682,6 +682,7 @@ dependencies = [
  "embed-resource",
  "env_logger",
  "futures",
+ "getrandom 0.3.4",
  "gpui",
  "libc",
  "log",
@@ -689,6 +690,8 @@ dependencies = [
  "polling",
  "raw-window-handle",
  "serde",
+ "serde_json",
+ "sha2",
  "shlex",
  "smallvec",
  "toml 0.8.23",
@@ -700,6 +703,15 @@ dependencies = [
  "windows 0.61.3",
  "x11rb",
  "zbus",
+]
+
+[[package]]
+name = "brindle-remote-agent"
+version = "0.2.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

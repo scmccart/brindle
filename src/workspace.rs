@@ -31,7 +31,7 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
-use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession, has_session_command};
+use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
 use crate::zone_view::ZoneTreeView;
 
@@ -435,7 +435,7 @@ impl Workspace {
             .into_iter()
             .map(|(id, cwd)| {
                 let cmd = command.clone();
-                let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, cmd, Some(cwd), &config, cx));
+                let terminal = cx.new(|cx| Terminal::spawn(&profile, cmd, Some(cwd), &config, cx));
                 (id, terminal)
             })
             .collect();
@@ -497,6 +497,7 @@ impl Workspace {
                     });
                     SnapshotTab::Local {
                         profile: tab.profile.name.clone(),
+                        remote: tab.profile.remote.clone(),
                         cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
                         title: tab.manual_title.clone(),
                         zones,
@@ -546,8 +547,13 @@ impl Workspace {
             .unwrap_or_else(|| Self::settings(cx).theme(None))
     }
 
-    fn active_cwd(&self, cx: &App) -> Option<PathBuf> {
+    /// The active directory only has meaning to a profile on the same host
+    /// or container. In particular, never pass a Windows path to remote tmux.
+    fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
+        if tab.profile.remote != profile.remote {
+            return None;
+        }
         tab.active_terminal(cx)?.read(cx).working_directory()
     }
 
@@ -559,9 +565,17 @@ impl Workspace {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
+        let requested_cwd = request.cwd.filter(|cwd| {
+            if profile.remote.is_none() {
+                return true;
+            }
+            let cwd = cwd.to_string_lossy();
+            cwd.starts_with('/') || cwd == "~" || cwd.starts_with("~/")
+        });
 
         if profile.tmux == TmuxMode::Control && request.command.is_none() {
-            self.attach_tmux(profile, request.cwd, window, cx);
+            let cwd = requested_cwd.or_else(|| profile.working_directory());
+            self.attach_tmux(profile, cwd, window, cx);
             return;
         }
 
@@ -579,12 +593,13 @@ impl Workspace {
             _ => None,
         });
 
-        let cwd = request.cwd.or_else(|| {
-            // New tabs follow the current directory unless the profile pins one.
-            if profile.cwd.is_none() { self.active_cwd(cx) } else { None }
+        let cwd = requested_cwd.or_else(|| {
+            // New tabs follow the current directory only on the same endpoint,
+            // unless the destination profile pins one.
+            if profile.cwd.is_none() { self.active_cwd_for(&profile, cx) } else { None }
         });
 
-        let terminal = cx.new(|cx| Terminal::spawn_pty(&profile, command, cwd, &config, cx));
+        let terminal = cx.new(|cx| Terminal::spawn(&profile, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
@@ -660,7 +675,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<TmuxSession> {
         let config = Self::settings(cx).clone();
-        let cwd = cwd.or_else(|| self.active_cwd(cx));
+        let cwd = cwd.or_else(|| self.active_cwd_for(&profile, cx));
         let session = cx.new(|cx| TmuxSession::attach(profile, spec, cwd, &config, cx));
         let subscription = cx.subscribe_in(&session, window, |this, session, event, window, cx| {
             this.on_tmux_event(session.clone(), event, window, cx)
@@ -789,7 +804,7 @@ impl Workspace {
     /// server, here or in a new window.
     fn ask_new_session(&mut self, profile: Profile, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle().downcast::<Workspace>();
-        let cwd = self.active_cwd(cx);
+        let cwd = self.active_cwd_for(&profile, cx);
         let submit: SubmitFn = Rc::new(move |name, cx| {
             let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
             let (reply, result) = oneshot::channel();
@@ -810,25 +825,10 @@ impl Workspace {
                 Target::Window => cx
                     .spawn(async move |cx| {
                         if let Some(name) = &name {
-                            let (program, args) = has_session_command(&profile, name);
-                            let env = crate::terminal::child_env(&profile);
+                            let (checked, checked_name) = (profile.clone(), name.clone());
                             let taken = cx
                                 .background_executor()
-                                .spawn(async move {
-                                    let mut command = std::process::Command::new(program);
-                                    command
-                                        .args(args)
-                                        .envs(env)
-                                        .stdin(std::process::Stdio::null())
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null());
-                                    #[cfg(windows)]
-                                    std::os::windows::process::CommandExt::creation_flags(
-                                        &mut command,
-                                        crate::win::CREATE_NO_WINDOW,
-                                    );
-                                    command.status().is_ok_and(|s| s.success())
-                                })
+                                .spawn(async move { crate::tmux::session_exists(&checked, &checked_name) })
                                 .await;
                             if taken {
                                 reply.send(Err(format!("duplicate session: {name}"))).ok();
@@ -1680,7 +1680,9 @@ impl Workspace {
         }
         for tab in &mut self.tabs {
             if let Some(p) = config.profile(&tab.profile.name) {
+                let remote = tab.profile.remote.clone();
                 tab.profile = p.clone();
+                tab.profile.remote = remote;
             }
         }
         let mut snapshot = None;

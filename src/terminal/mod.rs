@@ -50,11 +50,10 @@ use crate::latency::Latency;
 use crate::notify::osc::{Found, Notice, Scanner};
 use crate::theme::{Color, Theme};
 
-/// What reaches the UI thread from the emulator and the output scanner.
+/// What reaches the UI thread from the emulator and output scanner.
 pub enum ChannelEvent {
     Alac(AlacEvent),
-    /// A sequence the scanner found in PTY output (on alacritty's I/O
-    /// thread).
+    /// A sequence the scanner found in PTY output (on alacritty's I/O thread).
     Osc(Found),
 }
 
@@ -162,10 +161,18 @@ enum Backend {
         #[cfg(windows)]
         console: Arc<conpty::Pseudoconsole>,
     },
+    /// A tmux pane whose stream and input are owned by `TmuxSession`.
     Remote {
         scanner: Scanner,
         input: Rc<dyn Fn(&[u8])>,
         palette: Option<PaletteHandler>,
+    },
+    /// A PTY owned by the remote Linux helper.
+    Agent {
+        scanner: Scanner,
+        handle: crate::remote::client::Handle,
+        foreground_name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
     },
 }
 
@@ -196,6 +203,7 @@ pub struct Terminal {
     /// Pending flush of a synchronized update (mode 2026).
     sync_flush: Option<Task<()>>,
     _events: Task<()>,
+    _remote_events: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for Terminal {}
@@ -244,6 +252,46 @@ impl Terminal {
         })
     }
 
+    fn spawn_remote_events(
+        rx: futures::channel::mpsc::Receiver<crate::remote::client::Event>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let mut rx = rx.ready_chunks(64);
+            while let Some(events) = rx.next().await {
+                let alive = this.update(cx, |this, cx| {
+                    // Consecutive output goes through one `feed`, in order
+                    // relative to the other events.
+                    let mut output: Vec<u8> = Vec::new();
+                    for event in events {
+                        match event {
+                            crate::remote::client::Event::Output(bytes) => {
+                                if output.is_empty() {
+                                    output = bytes;
+                                } else {
+                                    output.extend_from_slice(&bytes);
+                                }
+                            }
+                            other => {
+                                if !output.is_empty() {
+                                    this.feed(&std::mem::take(&mut output), cx);
+                                }
+                                this.handle_remote_event(other, cx);
+                            }
+                        }
+                    }
+                    if !output.is_empty() {
+                        this.feed(&output, cx);
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
@@ -259,6 +307,7 @@ impl Terminal {
     ) -> Self {
         Self {
             _events: Self::spawn_events(rx, cx),
+            _remote_events: None,
             term,
             backend,
             output,
@@ -276,9 +325,24 @@ impl Terminal {
         }
     }
 
+    /// Spawns either a local PTY or a remote-agent PTY according to the profile.
+    pub fn spawn(
+        profile: &Profile,
+        command_override: Option<(String, Vec<String>)>,
+        cwd_override: Option<std::path::PathBuf>,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if profile.remote.is_some() {
+            Self::spawn_remote(profile, command_override, cwd_override, config, cx)
+        } else {
+            Self::spawn_pty(profile, command_override, cwd_override, config, cx)
+        }
+    }
+
     /// Spawns `profile`'s program on a new PTY. If that fails, the terminal
     /// shows the error instead so the tab explains what went wrong.
-    pub fn spawn_pty(
+    fn spawn_pty(
         profile: &Profile,
         command_override: Option<(String, Vec<String>)>,
         cwd_override: Option<std::path::PathBuf>,
@@ -349,6 +413,34 @@ impl Terminal {
         }
     }
 
+    fn spawn_remote(
+        profile: &Profile,
+        command_override: Option<(String, Vec<String>)>,
+        cwd_override: Option<std::path::PathBuf>,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (tx, rx) = unbounded();
+        let (remote_tx, remote_rx) = futures::channel::mpsc::channel(64);
+        let output = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, output.clone());
+        let size = GridSize::default();
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener)));
+        let parser = Arc::new(Mutex::new(Parser::posix()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
+        let handle = crate::remote::client::connect(profile.clone(), command_override, cwd_override, size, remote_tx);
+        let backend = Backend::Agent {
+            scanner: Scanner::new(),
+            handle,
+            foreground_name: None,
+            cwd: None,
+        };
+        let theme = config.profile_theme(profile);
+        let mut this = Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx);
+        this._remote_events = Some(Self::spawn_remote_events(remote_rx, cx));
+        this
+    }
+
     /// A terminal whose output is supplied via [`Terminal::feed`] and whose
     /// input is handed to `input`. Palette queries go to `palette`, if any.
     pub fn remote(
@@ -381,8 +473,9 @@ impl Terminal {
 
     /// Feeds output into a remote terminal.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let Backend::Remote { scanner, .. } = &mut self.backend else {
-            return;
+        let scanner = match &mut self.backend {
+            Backend::Remote { scanner, .. } | Backend::Agent { scanner, .. } => scanner,
+            Backend::Pty { .. } => return,
         };
         let found = scanner.scan(bytes);
         {
@@ -398,6 +491,29 @@ impl Terminal {
         Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
         self.schedule_sync_flush(cx);
         cx.notify();
+    }
+
+    fn handle_remote_event(&mut self, event: crate::remote::client::Event, cx: &mut Context<Self>) {
+        match event {
+            crate::remote::client::Event::Output(bytes) => self.feed(&bytes, cx),
+            crate::remote::client::Event::ProcessInfo(info) => {
+                if let Backend::Agent { foreground_name, cwd, .. } = &mut self.backend {
+                    let title_changed = *foreground_name != info.foreground_name;
+                    *foreground_name = info.foreground_name;
+                    *cwd = info.cwd.map(Into::into);
+                    if title_changed {
+                        cx.emit(TerminalEvent::TitleChanged);
+                    }
+                }
+            }
+            crate::remote::client::Event::Exited => self.mark_exited(cx),
+            crate::remote::client::Event::Failed => {
+                self.exited = true;
+                if self.status.end_activity() {
+                    cx.emit(TerminalEvent::Status(None));
+                }
+            }
+        }
     }
 
     /// A synchronized update (mode 2026) may be buffering output; make sure
@@ -576,6 +692,7 @@ impl Terminal {
                 sender.send(Msg::Input(bytes)).ok();
             }
             Backend::Remote { input, .. } => input(&bytes),
+            Backend::Agent { handle, .. } => handle.input(bytes.into_owned()),
         }
     }
 
@@ -613,8 +730,10 @@ impl Terminal {
         let mut term = self.term.lock();
         self.marks.lock().resize(&mut *term, size);
         drop(term);
-        if let Backend::Pty { sender, .. } = &self.backend {
-            sender.send(Msg::Resize(size.into())).ok();
+        match &self.backend {
+            Backend::Pty { sender, .. } => _ = sender.send(Msg::Resize(size.into())),
+            Backend::Agent { handle, .. } => handle.resize(size),
+            Backend::Remote { .. } => {}
         }
     }
 
@@ -750,10 +869,14 @@ impl Terminal {
     /// Name of the foreground process on the PTY (e.g. `vim`), for tab
     /// titles. `snapshot` is the title tick's look at all processes.
     pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
-        let Backend::Pty { process, .. } = &self.backend else {
-            return None;
-        };
-        process.foreground_name(snapshot)
+        match &self.backend {
+            Backend::Pty { process, .. } => process.foreground_name(snapshot),
+            Backend::Agent { handle, foreground_name, .. } => {
+                handle.query_process();
+                foreground_name.clone()
+            }
+            Backend::Remote { .. } => None,
+        }
     }
 
     /// Parents the tab's console window to `window`, so dialogs that console
@@ -774,13 +897,19 @@ impl Terminal {
     /// read, it is the directory the program last reported (OSC 7 or 9;9),
     /// if it still exists.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
-        let Backend::Pty { process, .. } = &self.backend else {
-            return None;
-        };
-        if cfg!(windows) {
-            return self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into);
+        match &self.backend {
+            Backend::Pty { process, .. } => {
+                if cfg!(windows) {
+                    self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
+                } else {
+                    process.working_directory()
+                }
+            }
+            Backend::Agent { cwd, .. } => {
+                self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
+            }
+            Backend::Remote { .. } => None,
         }
-        process.working_directory()
     }
 
     /// The visible screen as plain text (used by `--dump-screen` and tests).
@@ -789,8 +918,10 @@ impl Terminal {
     }
 
     pub fn shutdown(&mut self) {
-        if let Backend::Pty { sender, .. } = &self.backend {
-            sender.send(Msg::Shutdown).ok();
+        match &self.backend {
+            Backend::Pty { sender, .. } => _ = sender.send(Msg::Shutdown),
+            Backend::Agent { handle, .. } => handle.close(),
+            Backend::Remote { .. } => {}
         }
     }
 }

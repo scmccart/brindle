@@ -179,6 +179,34 @@ impl Default for NotificationConfig {
     }
 }
 
+/// A remote Linux host or container endpoint.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RemoteTarget {
+    Ssh {
+        host: String,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        identity_file: Option<String>,
+        #[serde(default)]
+        ssh_args: Vec<String>,
+    },
+    Container {
+        #[serde(default = "default_container_engine")]
+        engine: String,
+        container: String,
+        #[serde(default)]
+        user: Option<String>,
+    },
+}
+
+fn default_container_engine() -> String {
+    "docker".into()
+}
+
 /// How a profile uses tmux.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -196,6 +224,8 @@ pub enum TmuxMode {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default)]
+    pub remote: Option<RemoteTarget>,
     pub name: String,
     /// Program to run. Defaults to `$SHELL`, then `/bin/sh`; on Windows to
     /// `pwsh.exe` on `PATH`, then `powershell.exe`, then `%COMSPEC%`, then
@@ -227,15 +257,23 @@ impl Profile {
 
     /// A short description of what the profile runs.
     pub fn description(&self) -> String {
-        match self.tmux {
+        let target_prefix = match &self.remote {
+            Some(RemoteTarget::Ssh { host, .. }) => format!("ssh:{host} · "),
+            Some(RemoteTarget::Container { container, .. }) => format!("container:{container} · "),
+            None => String::new(),
+        };
+        let base = match self.tmux {
             TmuxMode::Control => format!("tmux control mode · {}", self.tmux_session_name()),
             TmuxMode::Plain => format!("tmux · {}", self.tmux_session_name()),
             TmuxMode::None => self.command.clone().unwrap_or_else(|| "default shell".into()),
-        }
+        };
+        format!("{target_prefix}{base}")
     }
 
     pub fn working_directory(&self) -> Option<PathBuf> {
-        self.cwd.as_deref().map(expand_tilde)
+        self.cwd.as_deref().map(|path| {
+            if self.remote.is_some() { PathBuf::from(path) } else { expand_tilde(path) }
+        })
     }
 }
 
@@ -407,6 +445,49 @@ mod tests {
         assert_eq!(config.font.size, 96.0);
         let theme = config.theme(None);
         assert_eq!(theme.background.to_string(), "#000000");
+    }
+
+    #[test]
+    fn remote_profiles() {
+        let config = Config::parse(
+            r##"
+            [[profiles]]
+            name = "A8"
+            remote = { type = "ssh", host = "A8", user = "ubuntu", port = 2222, ssh_args = ["-v"] }
+            cwd = "~/src"
+
+            [[profiles]]
+            name = "DevContainer"
+            remote = { type = "container", engine = "docker", container = "rust-box" }
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.profiles.len(), 2);
+        match &config.profiles[0].remote {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+                assert_eq!(host, "A8");
+                assert_eq!(user.as_deref(), Some("ubuntu"));
+                assert_eq!(*port, Some(2222));
+                assert_eq!(identity_file, &None);
+                assert_eq!(ssh_args, &["-v"]);
+            }
+            _ => panic!("expected ssh remote"),
+        }
+        match &config.profiles[1].remote {
+            Some(RemoteTarget::Container { engine, container, user }) => {
+                assert_eq!(engine, "docker");
+                assert_eq!(container, "rust-box");
+                assert_eq!(user, &None);
+            }
+            _ => panic!("expected container remote"),
+        }
+        assert_eq!(config.profiles[0].description(), "ssh:A8 · default shell");
+        assert_eq!(config.profiles[1].description(), "container:rust-box · default shell");
+        assert_eq!(config.profiles[0].working_directory(), Some(PathBuf::from("~/src")));
+        assert!(Config::parse(
+            "[[profiles]]\nname = \"bad\"\nremote = { type = \"ssh\", host = \"A8\", password = \"secret\" }"
+        )
+        .is_err());
     }
 
     #[test]

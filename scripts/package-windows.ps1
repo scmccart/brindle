@@ -1,7 +1,7 @@
 # Packs the release build into the Windows release zip,
 # target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip: brindle.exe,
-# Brindle's licences and the notice for the ConPTY that brindle.exe embeds.
-# The exe needs nothing beside it, so this is the whole release.
+# the Linux x86-64 remote helper, Brindle's licences and the notice for the
+# ConPTY that brindle.exe embeds.
 #
 #   scripts/fetch-conpty.ps1
 #   cargo build --release --locked
@@ -11,7 +11,8 @@
 # before scripts/fetch-conpty.ps1 would be.
 
 param(
-    [string]$Exe = 'target\release\brindle.exe'
+    [string]$Exe = 'target\release\brindle.exe',
+    [string]$RemoteAgent = 'target\release\brindle-remote-linux-x86_64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,12 +45,19 @@ public static class Embedded {
         }
     }
 
+    if (-not (Test-Path $RemoteAgent)) {
+        throw "package-windows: no $RemoteAgent; download or build the Linux remote helper"
+    }
+    $agentBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $RemoteAgent))
+    if ($agentBytes.Length -lt 4 -or $agentBytes[0] -ne 0x7f -or $agentBytes[1] -ne 0x45 -or $agentBytes[2] -ne 0x4c -or $agentBytes[3] -ne 0x46) {
+        throw "package-windows: $RemoteAgent is not a Linux ELF binary"
+    }
     $name = "brindle-$version-x86_64-pc-windows-msvc"
     $dist = 'target\dist'
     $stage = Join-Path $dist $name
     Remove-Item -Recurse -Force $stage, "$stage.zip" -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $stage | Out-Null
-    Copy-Item $Exe, LICENSE-MIT, LICENSE-APACHE, packaging\windows\THIRD-PARTY-NOTICES.txt $stage
+    Copy-Item $Exe, $RemoteAgent, LICENSE-MIT, LICENSE-APACHE, packaging\windows\THIRD-PARTY-NOTICES.txt $stage
     Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip"
     Remove-Item -Recurse -Force $stage
     Write-Output (Resolve-Path "$stage.zip").Path

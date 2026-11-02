@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Brindle and installs it, with its launcher entry and icon.
+# Builds Brindle and its remote helper, then installs them with the launcher entry and icon.
 #
 #   scripts/install.sh                      # into ~/.local
 #   PREFIX=/usr/local scripts/install.sh    # system-wide; uses sudo to copy
@@ -19,7 +19,7 @@ case $PREFIX in
 esac
 
 cd "$(dirname "$0")/.."
-cargo build --release
+cargo build --release --locked -p brindle -p brindle-remote-agent
 
 # Whether the nearest existing ancestor of $1 is writable.
 writable() {
@@ -32,6 +32,7 @@ if writable "$PREFIX/bin" && writable "$PREFIX/share"; then sudo=; else sudo=sud
 # install(1) replaces the file instead of overwriting it in place, so a running
 # Brindle is unaffected.
 $sudo install -Dm755 target/release/brindle "$PREFIX/bin/brindle"
+$sudo install -Dm755 target/release/brindle-remote "$PREFIX/bin/brindle-remote"
 # Run the installed copy, so the desktop entry's Exec points at it.
 $sudo "$PREFIX/bin/brindle" --install-desktop --prefix "$PREFIX"
 

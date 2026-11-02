@@ -66,6 +66,7 @@ name = "Shell"
 # theme = "tokyo-night"
 # font_size = 13
 
+
 # tmux in control mode: each tmux window becomes a Brindle tab and panes are
 # drawn natively. Detaching (ctrl-shift-d) keeps the session running; what the
 # window does afterwards is set by tmux_session_end above.
@@ -88,6 +89,17 @@ tmux_session = "main"
 # tmux = "control"
 # command = "wsl"
 # tmux_args = ["tmux"]
+# Remote Linux host over OpenSSH. `host` can be an SSH config alias; optional
+# fields are `user`, `port`, `identity_file` and `ssh_args`.
+# [[profiles]]
+# name = "remote shell"
+# remote = { type = "ssh", host = "server" }
+
+# Existing Docker or Podman container (engine defaults to docker). Add
+# `tmux = "control"` for native remote tmux windows and panes.
+# [[profiles]]
+# name = "dev container"
+# remote = { type = "container", container = "devbox", user = "1000" }
 
 # ---------------------------------------------------------------------------
 # Custom themes. Unspecified colors inherit from brindle-dark.

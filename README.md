@@ -36,6 +36,62 @@ while sessions stay in tmux, persistent and detachable.
     layout grid. Existing panes are restored on attach, including their alternate
     screen and mouse modes. Detaching leaves the session running.
 
+## Remote hosts and containers
+
+Profiles can run on a Linux host over SSH or inside an existing Docker/Podman
+container. Brindle keeps drawing the terminal locally; a small headless
+`brindle-remote` helper owns the remote PTY, resize and `/proc` process queries.
+It is copied to a versioned, user-only cache on first connection and reused
+while its version matches. Output remains the terminal's original byte stream,
+so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status,
+clipboard/color replies and shell-integration marks work as in a local tab.
+Zone splits stay on the same endpoint and inherit its remote directory.
+
+SSH uses your normal OpenSSH configuration, agent and host aliases:
+
+```toml
+[[profiles]]
+name = "A8"
+remote = { type = "ssh", host = "A8" }
+
+[[profiles]]
+name = "A8 tmux"
+remote = { type = "ssh", host = "A8", user = "dev", port = 22 }
+tmux = "control"
+tmux_session = "main"
+```
+
+`identity_file` and `ssh_args` are optional SSH fields. Brindle never stores
+credentials and leaves host-key verification to OpenSSH.
+
+For an already-running container:
+
+```toml
+[[profiles]]
+name = "dev container"
+remote = { type = "container", container = "my-devbox" }
+
+[[profiles]]
+name = "dev container tmux"
+remote = { type = "container", engine = "podman", container = "my-devbox", user = "1000" }
+tmux = "control"
+```
+
+The engine defaults to `docker`. Brindle copies the helper to a unique,
+root-owned path under `/tmp`, starts it with `exec -i` as the profile user, and
+removes it when the connection ends. It does not create or start containers.
+Remote control-mode profiles run `tmux -C` on the endpoint, so remote tmux
+windows and panes are native Brindle tabs and panes.
+Official Windows archives include the static x86-64 Linux helper beside
+`brindle.exe`. For a Windows source build, build that helper in Docker and
+point Brindle at it:
+
+```powershell
+docker run --rm -v "${PWD}:/src" -w /src rust:1.99.1 sh -c `
+  "apt-get update -qq && apt-get install -y -qq musl-tools && rustup target add x86_64-unknown-linux-musl && cargo build --locked --release -p brindle-remote-agent --target x86_64-unknown-linux-musl"
+$env:BRINDLE_REMOTE_AGENT = "$PWD/target/x86_64-unknown-linux-musl/release/brindle-remote"
+```
+
 ## Control mode or classic?
 
 Control mode gives each pane its own scrollback (the wheel scrolls it, with no
