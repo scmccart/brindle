@@ -4,7 +4,7 @@ Outline only. Each item below still needs its own decision, and possibly its own
 
 ## Why
 
-The quality review of `remote-connections` left four groups of work alone on purpose, so as not to change bootstrap or close behaviour right before testing on a real host. Each is described in section 7 of that change's `design.md`.
+The quality review of `remote-connections` left four groups of work alone on purpose, so as not to change bootstrap or close behaviour right before testing on a real host. Each is described in section 7 of `openspec/changes/archive/2026-11-02-remote-connections/design.md`.
 
 1. **Behaviour that may need to change.**
    - `Workspace::apply_config` keeps an open tab on the endpoint it started on, even if the profile's `remote` changes, while tmux tabs take the new profile.
