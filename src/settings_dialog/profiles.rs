@@ -34,10 +34,28 @@ pub enum Field {
     Session,
     TmuxArgs,
     Default,
+    Remote,
+    SshHost,
+    SshUser,
+    SshPort,
+    SshIdentity,
+    SshArgs,
+    Engine,
+    Container,
+    ContainerUser,
 }
 
-pub const FIELDS: [Field; 11] = [
+pub const FIELDS: [Field; 20] = [
     Field::Name,
+    Field::Remote,
+    Field::SshHost,
+    Field::SshUser,
+    Field::SshPort,
+    Field::SshIdentity,
+    Field::SshArgs,
+    Field::Engine,
+    Field::Container,
+    Field::ContainerUser,
     Field::Command,
     Field::Args,
     Field::Cwd,
@@ -51,7 +69,7 @@ pub const FIELDS: [Field; 11] = [
 ];
 
 /// The fields edited as text, in [`Values::texts`] order.
-pub const TEXT_FIELDS: [Field; 8] = [
+pub const TEXT_FIELDS: [Field; 15] = [
     Field::Name,
     Field::Command,
     Field::Args,
@@ -60,7 +78,34 @@ pub const TEXT_FIELDS: [Field; 8] = [
     Field::FontSize,
     Field::Session,
     Field::TmuxArgs,
+    Field::SshHost,
+    Field::SshUser,
+    Field::SshPort,
+    Field::SshIdentity,
+    Field::SshArgs,
+    Field::Container,
+    Field::ContainerUser,
 ];
+
+/// What kind of endpoint a profile runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteKind {
+    Local,
+    Ssh,
+    Container,
+}
+
+pub const REMOTE_KINDS: [RemoteKind; 3] = [RemoteKind::Local, RemoteKind::Ssh, RemoteKind::Container];
+
+pub fn remote_label(kind: RemoteKind) -> &'static str {
+    match kind {
+        RemoteKind::Local => "none",
+        RemoteKind::Ssh => "ssh",
+        RemoteKind::Container => "container",
+    }
+}
+
+pub const ENGINES: [&str; 2] = ["docker", "podman"];
 
 impl Field {
     pub fn label(self) -> &'static str {
@@ -76,6 +121,15 @@ impl Field {
             Field::Session => "Session",
             Field::TmuxArgs => "tmux arguments",
             Field::Default => "Default",
+            Field::Remote => "Remote",
+            Field::SshHost => "Host",
+            Field::SshUser => "User",
+            Field::SshPort => "Port",
+            Field::SshIdentity => "Identity file",
+            Field::SshArgs => "ssh arguments",
+            Field::Engine => "Engine",
+            Field::Container => "Container",
+            Field::ContainerUser => "User",
         }
     }
 
@@ -89,8 +143,22 @@ impl Field {
             Field::FontSize => "global size",
             Field::Session => "main",
             Field::TmuxArgs => "shell words, e.g. -L work",
+            Field::SshHost => "hostname or ssh config alias",
+            Field::SshUser | Field::ContainerUser => "default user",
+            Field::SshPort => "22",
+            Field::SshIdentity => "default key",
+            Field::SshArgs => "shell words, e.g. -J bastion",
+            Field::Container => "name or id",
             _ => "",
         }
+    }
+
+    fn ssh_only(self) -> bool {
+        matches!(self, Field::SshHost | Field::SshUser | Field::SshPort | Field::SshIdentity | Field::SshArgs)
+    }
+
+    fn container_only(self) -> bool {
+        matches!(self, Field::Engine | Field::Container | Field::ContainerUser)
     }
 
     pub fn text_index(self) -> Option<usize> {
@@ -139,31 +207,52 @@ struct Values {
     /// `None` follows the global theme.
     theme: Option<String>,
     tmux: TmuxMode,
-    /// The settings UI does not edit remote targets yet, but it must preserve
-    /// one while editing the profile's other fields.
-    remote: Option<RemoteTarget>,
+    remote: RemoteKind,
+    /// `docker` or `podman`.
+    engine: String,
     default: bool,
 }
 
 impl Values {
     fn from_profile(p: &Profile, default: bool) -> Self {
         let env: Vec<String> = p.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
-        Self {
-            texts: [
-                p.name.clone(),
-                p.command.clone().unwrap_or_default(),
-                join_words(&p.args),
-                p.cwd.clone().unwrap_or_default(),
-                env.join(" "),
-                p.font_size.map(|s| s.to_string()).unwrap_or_default(),
-                p.tmux_session.clone().unwrap_or_default(),
-                join_words(&p.tmux_args),
-            ],
-            theme: p.theme.clone(),
-            remote: p.remote.clone(),
-            tmux: p.tmux,
-            default,
-        }
+        let mut texts = [
+            p.name.clone(),
+            p.command.clone().unwrap_or_default(),
+            join_words(&p.args),
+            p.cwd.clone().unwrap_or_default(),
+            env.join(" "),
+            p.font_size.map(|s| s.to_string()).unwrap_or_default(),
+            p.tmux_session.clone().unwrap_or_default(),
+            join_words(&p.tmux_args),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+        let at = |field: Field| TEXT_FIELDS.iter().position(|f| *f == field).expect("text field");
+        let mut engine = ENGINES[0].to_string();
+        let kind = match &p.remote {
+            None => RemoteKind::Local,
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+                texts[at(Field::SshHost)] = host.clone();
+                texts[at(Field::SshUser)] = user.clone().unwrap_or_default();
+                texts[at(Field::SshPort)] = port.map(|p| p.to_string()).unwrap_or_default();
+                texts[at(Field::SshIdentity)] = identity_file.clone().unwrap_or_default();
+                texts[at(Field::SshArgs)] = join_words(ssh_args);
+                RemoteKind::Ssh
+            }
+            Some(RemoteTarget::Container { engine: e, container, user }) => {
+                engine = e.clone();
+                texts[at(Field::Container)] = container.clone();
+                texts[at(Field::ContainerUser)] = user.clone().unwrap_or_default();
+                RemoteKind::Container
+            }
+        };
+        Self { texts, theme: p.theme.clone(), remote: kind, engine, tmux: p.tmux, default }
     }
 
     fn text(&self, field: Field) -> &str {
@@ -251,9 +340,35 @@ impl ProfileEditor {
         self.values != self.initial
     }
 
-    /// The fields shown: the tmux session and arguments only for tmux.
+    /// The fields shown: the tmux session and arguments only for tmux, and
+    /// the target's fields only for its kind.
     pub fn visible_fields(&self) -> Vec<Field> {
-        FIELDS.into_iter().filter(|f| !f.tmux_only() || self.values.tmux != TmuxMode::None).collect()
+        FIELDS
+            .into_iter()
+            .filter(|f| !f.tmux_only() || self.values.tmux != TmuxMode::None)
+            .filter(|f| !f.ssh_only() || self.values.remote == RemoteKind::Ssh)
+            .filter(|f| !f.container_only() || self.values.remote == RemoteKind::Container)
+            .collect()
+    }
+
+    pub fn remote_kind(&self) -> RemoteKind {
+        self.values.remote
+    }
+
+    pub fn engine(&self) -> &str {
+        &self.values.engine
+    }
+
+    pub fn choose_remote(&mut self, kind: RemoteKind) {
+        self.values.remote = kind;
+        // A hidden field can't keep focus.
+        if !self.visible_fields().contains(&self.focused) {
+            self.focused = Field::Remote;
+        }
+    }
+
+    pub fn choose_engine(&mut self, engine: &str) {
+        self.values.engine = engine.to_string();
     }
 
     pub fn move_focus(&mut self, forward: bool) {
@@ -273,6 +388,14 @@ impl ProfileEditor {
         match field {
             Field::Theme => self.values.theme = step(&self.theme_choices, &self.values.theme, forward),
             Field::Tmux => self.values.tmux = step(&TMUX_MODES, &self.values.tmux, forward),
+            Field::Remote => {
+                let kind = step(&REMOTE_KINDS, &self.values.remote, forward);
+                self.choose_remote(kind);
+            }
+            Field::Engine => {
+                let engines = ENGINES.map(str::to_string);
+                self.values.engine = step(&engines, &self.values.engine, forward);
+            }
             _ => {}
         }
     }
@@ -331,13 +454,50 @@ impl ProfileEditor {
                 }
             },
         };
+        let remote = match self.values.remote {
+            RemoteKind::Local => None,
+            RemoteKind::Ssh => {
+                let host = text(Field::SshHost);
+                if host.is_empty() {
+                    errors.push((Field::SshHost, "the host can't be empty".into()));
+                }
+                let port = match optional(Field::SshPort) {
+                    None => None,
+                    Some(t) => match t.parse::<u16>() {
+                        Ok(port) if port >= 1 => Some(port),
+                        _ => {
+                            errors.push((Field::SshPort, "use a number from 1 to 65535".into()));
+                            None
+                        }
+                    },
+                };
+                Some(RemoteTarget::Ssh {
+                    host: host.to_string(),
+                    user: optional(Field::SshUser),
+                    port,
+                    identity_file: optional(Field::SshIdentity),
+                    ssh_args: words(Field::SshArgs, &mut errors),
+                })
+            }
+            RemoteKind::Container => {
+                let container = text(Field::Container);
+                if container.is_empty() {
+                    errors.push((Field::Container, "the container can't be empty".into()));
+                }
+                Some(RemoteTarget::Container {
+                    engine: self.values.engine.clone(),
+                    container: container.to_string(),
+                    user: optional(Field::ContainerUser),
+                })
+            }
+        };
         if !errors.is_empty() {
             return Err(errors);
         }
         let tmux = self.values.tmux;
         Ok(Profile {
             name: name.to_string(),
-            remote: self.values.remote.clone(),
+            remote,
             command: optional(Field::Command),
             args,
             cwd: optional(Field::Cwd),
@@ -705,7 +865,7 @@ use crate::actions::{
 use crate::text_input::{TextInput, TextInputEvent};
 
 /// The fields shown as a choice or checkbox rather than text.
-const CHOICE_FIELDS: [Field; 3] = [Field::Theme, Field::Tmux, Field::Default];
+const CHOICE_FIELDS: [Field; 5] = [Field::Theme, Field::Tmux, Field::Default, Field::Remote, Field::Engine];
 
 impl SettingsDialog {
     /// Creates the profile editor's inputs and focus handles when it opens,
@@ -1006,6 +1166,8 @@ impl SettingsDialog {
             let control: AnyElement = match field {
                 Field::Theme => this.render_theme_choice(editor, focused, cx),
                 Field::Tmux => this.render_tmux_choice(editor, focused, cx),
+                Field::Remote => this.render_remote_choice(editor, focused, cx),
+                Field::Engine => this.render_engine_choice(editor, focused, cx),
                 Field::Default => this.render_default_toggle(editor, focused, cx),
                 _ => {
                     let input = this.profile_inputs.iter().find(|(f, _)| *f == field).map(|(_, i)| i.clone());
@@ -1182,6 +1344,50 @@ impl SettingsDialog {
         })
         .collect::<Vec<_>>();
         self.choice_box(Field::Tmux, focused, cx).gap_1().children(segments).into_any_element()
+    }
+
+    fn render_remote_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let labels: Vec<&'static str> = REMOTE_KINDS.iter().map(|&k| remote_label(k)).collect();
+        let selected = REMOTE_KINDS.iter().position(|&k| k == editor.remote_kind()).unwrap_or(0);
+        self.segment_choice(Field::Remote, &labels, selected, focused, cx, |e, ix| e.choose_remote(REMOTE_KINDS[ix]))
+    }
+
+    fn render_engine_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let selected = ENGINES.iter().position(|e| *e == editor.engine()).unwrap_or(0);
+        self.segment_choice(Field::Engine, &ENGINES, selected, focused, cx, |e, ix| e.choose_engine(ENGINES[ix]))
+    }
+
+    /// A row of labelled segments, one selected.
+    fn segment_choice(
+        &self,
+        field: Field,
+        labels: &[&'static str],
+        selected: usize,
+        focused: bool,
+        cx: &mut Context<Self>,
+        choose: fn(&mut ProfileEditor, usize),
+    ) -> AnyElement {
+        let t = &self.theme;
+        let panel = t.chrome_background();
+        let segments = labels
+            .iter()
+            .enumerate()
+            .map(|(ix, &label)| {
+                div()
+                    .id((field.label(), ix))
+                    .px_3()
+                    .rounded_sm()
+                    .when(ix == selected, |d| d.bg(panel.mix(t.accent(), 0.3).hsla()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.edit_profile(window, cx, |e| {
+                            e.focused = field;
+                            choose(e, ix);
+                        });
+                    }))
+                    .child(label)
+            })
+            .collect::<Vec<_>>();
+        self.choice_box(field, focused, cx).gap_1().children(segments).into_any_element()
     }
 
     /// A checkbox: a bordered square, filled with the accent and ticked when
@@ -1426,6 +1632,92 @@ theme = "gone"
         state.save(&f.path, &[]).unwrap();
         let shell = f.config().profiles[0].clone();
         assert_eq!((shell.tmux, shell.tmux_session), (TmuxMode::None, None));
+    }
+
+    #[test]
+    fn ssh_target_is_written_and_read_back() {
+        let f = Fixture::new("remote-ssh", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        assert_eq!(editor.remote_kind(), RemoteKind::Local);
+        assert!(!editor.visible_fields().contains(&Field::SshHost));
+        editor.cycle(Field::Remote, true);
+        assert_eq!(editor.remote_kind(), RemoteKind::Ssh);
+        assert!(editor.visible_fields().contains(&Field::SshHost));
+        assert!(!editor.visible_fields().contains(&Field::Container));
+        editor.set_text(Field::SshHost, "A8");
+        editor.set_text(Field::SshUser, "ubuntu");
+        editor.set_text(Field::SshPort, "2222");
+        editor.set_text(Field::SshArgs, "-J 'my bastion'");
+        state.save(&f.path, &[]).unwrap();
+        match &f.config().profiles[2].remote {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+                assert_eq!((host.as_str(), user.as_deref(), *port), ("A8", Some("ubuntu"), Some(2222)));
+                assert_eq!(identity_file, &None);
+                assert_eq!(ssh_args, &["-J", "my bastion"]);
+            }
+            other => panic!("expected ssh, got {other:?}"),
+        }
+        // Opening it again shows the same values.
+        let editor = edit(&mut state, "Work");
+        assert_eq!(editor.remote_kind(), RemoteKind::Ssh);
+        assert_eq!(editor.text(Field::SshPort), "2222");
+        assert_eq!(editor.text(Field::SshArgs), "-J 'my bastion'");
+    }
+
+    #[test]
+    fn container_target_and_removal() {
+        let f = Fixture::new("remote-container", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        editor.cycle(Field::Remote, false);
+        assert_eq!(editor.remote_kind(), RemoteKind::Container);
+        editor.set_text(Field::Container, "my-box");
+        editor.cycle(Field::Engine, true);
+        state.save(&f.path, &[]).unwrap();
+        assert_eq!(
+            f.config().profiles[2].remote,
+            Some(RemoteTarget::Container { engine: "podman".into(), container: "my-box".into(), user: None })
+        );
+        let editor = edit(&mut state, "Work");
+        assert_eq!((editor.remote_kind(), editor.engine()), (RemoteKind::Container, "podman"));
+        editor.choose_remote(RemoteKind::Local);
+        state.save(&f.path, &[]).unwrap();
+        assert_eq!(f.config().profiles[2].remote, None);
+        assert!(!f.text().contains("remote"));
+    }
+
+    #[test]
+    fn remote_validation() {
+        let f = Fixture::new("remote-validation", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        editor.choose_remote(RemoteKind::Ssh);
+        assert_eq!(invalid(&state), [Field::SshHost]);
+        let editor = state.editor_mut().unwrap();
+        editor.set_text(Field::SshHost, "A8");
+        editor.set_text(Field::SshPort, "70000");
+        assert_eq!(invalid(&state), [Field::SshPort]);
+        let editor = state.editor_mut().unwrap();
+        editor.set_text(Field::SshPort, "0");
+        assert_eq!(invalid(&state), [Field::SshPort]);
+        let editor = state.editor_mut().unwrap();
+        editor.set_text(Field::SshPort, "");
+        assert!(invalid(&state).is_empty());
+        let editor = state.editor_mut().unwrap();
+        editor.choose_remote(RemoteKind::Container);
+        assert_eq!(invalid(&state), [Field::Container]);
+    }
+
+    #[test]
+    fn hiding_the_target_fields_moves_focus_off_them() {
+        let f = Fixture::new("remote-focus", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        editor.choose_remote(RemoteKind::Ssh);
+        editor.focused = Field::SshHost;
+        editor.choose_remote(RemoteKind::Local);
+        assert_eq!(editor.focused, Field::Remote);
     }
 
     #[test]

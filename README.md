@@ -82,6 +82,10 @@ root-owned path under `/tmp`, starts it with `exec -i` as the profile user, and
 removes it when the connection ends. It does not create or start containers.
 Remote control-mode profiles run `tmux -C` on the endpoint, so remote tmux
 windows and panes are native Brindle tabs and panes.
+If the connection drops, Brindle notices within about 30 seconds (it sends a
+no-op command when tmux is quiet, and any reply or output counts), ends the
+session as a detach ("connection lost") and, in the background, asks the
+server to detach its client. The remote tmux session keeps running.
 Official Windows archives include the static x86-64 Linux helper beside
 `brindle.exe`. For a Windows source build, build that helper in Docker and
 point Brindle at it:
@@ -348,7 +352,8 @@ updates `config.toml` in place: your comments and the rest of the file are kept.
 
 The Profiles section lists your profiles with their ctrl-alt-N numbers. Enter or `e` edits one, `n` makes a new one, `c` duplicates
 the selected one, `d` deletes it, and alt-up/alt-down reorder the list. The
-editor covers every profile setting; arguments, environment (`KEY=value`) and
+editor covers every profile setting, including the remote target (`none`, `ssh` or
+`container`, with the fields of the chosen kind); arguments, environment (`KEY=value`) and
 tmux arguments are written as shell words. A profile's theme and font size show
 on its open tabs while you edit; the other settings apply to new tabs. Renaming
 a profile keeps its open tabs linked to it and updates `default_profile`.

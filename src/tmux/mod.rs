@@ -74,6 +74,9 @@ enum Pending {
     Ignore,
     /// `#{version}`, asked before the first window list.
     Version,
+    /// `#{client_name}` of this control client, kept so a dropped remote
+    /// connection can detach it from the server.
+    ClientName,
     ListWindows,
     /// A `poll_command` reply.
     Poll,
@@ -89,6 +92,52 @@ enum Pending {
     PaletteClients { pane: PaneId, index: usize, reply: Vec<u8> },
     /// `#{pane-colours[index]}` for the same query.
     PaletteOption { pane: PaneId, reply: Vec<u8> },
+}
+
+/// A remote control client with no word from tmux this long gets a heartbeat.
+const HEARTBEAT_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// The connection is dead after this long without anything from tmux. A
+/// heartbeat has been outstanding for all but the first [`HEARTBEAT_AFTER`].
+const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a [`LinkWatch`] check asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkAction {
+    Nothing,
+    /// Send a no-op command so a live link answers.
+    Heartbeat,
+    /// Nothing has arrived for too long.
+    Dead,
+}
+
+/// Tracks when a remote control client last heard from tmux. Anything
+/// received counts, so a busy session never needs a heartbeat's reply.
+#[derive(Debug)]
+struct LinkWatch {
+    last_heard: std::time::Instant,
+    heartbeat_sent: bool,
+}
+
+impl LinkWatch {
+    fn new(now: std::time::Instant) -> Self {
+        Self { last_heard: now, heartbeat_sent: false }
+    }
+
+    fn heard(&mut self, now: std::time::Instant) {
+        self.last_heard = now;
+        self.heartbeat_sent = false;
+    }
+
+    fn check(&mut self, now: std::time::Instant) -> LinkAction {
+        let silent = now.saturating_duration_since(self.last_heard);
+        if silent >= DEAD_AFTER {
+            LinkAction::Dead
+        } else if silent >= HEARTBEAT_AFTER && !std::mem::replace(&mut self.heartbeat_sent, true) {
+            LinkAction::Heartbeat
+        } else {
+            LinkAction::Nothing
+        }
+    }
 }
 
 /// What the writer thread is asked to do.
@@ -404,6 +453,11 @@ pub struct TmuxSession {
     poll_again: bool,
     /// Polls every second while attached on `StateSource::Poll`.
     poll_timer: Option<Task<()>>,
+    /// Watches a remote client's connection (remote profiles only).
+    link: Option<LinkWatch>,
+    link_timer: Option<Task<()>>,
+    /// This control client's name on the server, once known.
+    client_name: Option<String>,
     /// `release` has run: the session is being left.
     released: bool,
     /// Brindle is quitting: leaving the session must not change the window,
@@ -793,7 +847,7 @@ impl TmuxSession {
                     for event in batch {
                         match event {
                             Some(event) => this.handle_event(event, cx),
-                            None => this.on_detached("tmux exited".into(), cx),
+                            None => this.on_stream_ended(cx),
                         }
                     }
                 });
@@ -828,6 +882,9 @@ impl TmuxSession {
             polling: false,
             poll_again: false,
             poll_timer: None,
+            link: None,
+            link_timer: None,
+            client_name: None,
             released: false,
             quitting: false,
             _reader: reader,
@@ -896,7 +953,72 @@ impl TmuxSession {
         if self.child.is_some() {
             self.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
             self.list_windows();
+            if self.profile.remote.is_some() {
+                self.io
+                    .borrow_mut()
+                    .send(format!("display-message -p {}", protocol::quote("#{client_name}")), Pending::ClientName);
+                self.start_link_watch(cx);
+            }
         }
+    }
+
+    /// Checks a remote connection every few seconds (see [`LinkWatch`]).
+    fn start_link_watch(&mut self, cx: &mut Context<Self>) {
+        self.link = Some(LinkWatch::new(std::time::Instant::now()));
+        self.link_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                let alive = this.update(cx, |this, cx| {
+                    let action = this.link.as_mut().map(|link| link.check(std::time::Instant::now()));
+                    match action {
+                        Some(LinkAction::Heartbeat) => {
+                            this.io.borrow_mut().send("display-message -p ''".into(), Pending::Ignore);
+                        }
+                        Some(LinkAction::Dead) => this.on_connection_lost(cx),
+                        _ => {}
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The control stream closed. For a remote client that was attached and
+    /// not asked to go, that is a lost connection.
+    fn on_stream_ended(&mut self, cx: &mut Context<Self>) {
+        if self.profile.remote.is_some() && self.attached && !self.released && !self.detached {
+            self.on_connection_lost(cx);
+        } else {
+            self.on_detached("tmux exited".into(), cx);
+        }
+    }
+
+    /// The remote connection is dead: end the session as a detach, and ask
+    /// the server, over a new connection and in the background, to let go of
+    /// this client.
+    fn on_connection_lost(&mut self, cx: &mut Context<Self>) {
+        if self.detached {
+            return;
+        }
+        log::warn!("remote tmux connection lost");
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                child.kill().ok();
+                child.wait().ok();
+            });
+        }
+        if let Some(client) = self.client_name.take() {
+            let tmux = tmux_command(&self.profile);
+            match crate::remote::detach_command(&self.profile, &tmux.program, &tmux.options, &client) {
+                Ok(command) => {
+                    std::thread::spawn(move || crate::remote::detach_client(command));
+                }
+                Err(error) => log::debug!("cannot detach the dropped tmux client: {error:#}"),
+            }
+        }
+        self.on_detached("connection lost".into(), cx);
     }
 
     /// Another Brindle shows the session: it isn't attached here.
@@ -1081,6 +1203,8 @@ impl TmuxSession {
             return;
         }
         self.released = true;
+        self.link = None;
+        self.link_timer = None;
         self.stop_polling();
         self.unsubscribe();
         self.send("detach-client");
@@ -1129,6 +1253,9 @@ impl TmuxSession {
     // ---- incoming -----------------------------------------------------------------
 
     fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if let Some(link) = &mut self.link {
+            link.heard(std::time::Instant::now());
+        }
         match event {
             Event::Response { ours: false, ok: false, body } if !self.attached => {
                 self.attach_error = attach_error(&body);
@@ -1142,6 +1269,13 @@ impl TmuxSession {
                         let source = StateSource::choose(version.as_deref());
                         log::debug!("tmux version {version:?}: following pane state by {source:?}");
                         self.state_source = Some(source);
+                    }
+                    Some(Pending::ClientName) => {
+                        self.client_name = body
+                            .first()
+                            .filter(|_| ok)
+                            .map(|l| String::from_utf8_lossy(l).trim().to_string())
+                            .filter(|name| !name.is_empty());
                     }
                     Some(Pending::ListWindows) if ok => self.on_window_list(body, cx),
                     Some(Pending::PaneState(pane)) => {
@@ -1583,6 +1717,8 @@ impl TmuxSession {
         }
         self.detached = true;
         self.stop_polling();
+        self.link = None;
+        self.link_timer = None;
         // Nothing more will be answered; dropping waiting user commands
         // closes their prompts.
         self.io.borrow_mut().pending.clear();
@@ -2232,4 +2368,28 @@ mod tests {
         }
         assert!(!s.contains("\x1b[?1003h"));
     }
+
+#[test]
+fn link_watch_heartbeats_then_declares_death() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut watch = LinkWatch::new(t0);
+    assert_eq!(watch.check(t0 + Duration::from_secs(9)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(10)), LinkAction::Heartbeat);
+    // One heartbeat per silence.
+    assert_eq!(watch.check(t0 + Duration::from_secs(12)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(30)), LinkAction::Dead);
+}
+
+#[test]
+fn link_watch_resets_on_anything_heard() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut watch = LinkWatch::new(t0);
+    assert_eq!(watch.check(t0 + Duration::from_secs(11)), LinkAction::Heartbeat);
+    watch.heard(t0 + Duration::from_secs(25));
+    assert_eq!(watch.check(t0 + Duration::from_secs(34)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(36)), LinkAction::Heartbeat);
+    assert_eq!(watch.check(t0 + Duration::from_secs(40)), LinkAction::Nothing);
+}
 }

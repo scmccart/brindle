@@ -105,6 +105,47 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
     Ok(command)
 }
 
+/// How long [`detach_client`] may take, connecting included.
+const DETACH_LIMIT: Duration = Duration::from_secs(10);
+
+/// The command that detaches the tmux client `client` on the profile's
+/// endpoint: `tmux_program <tmux_options> detach-client -t <client>`.
+pub fn detach_command(
+    profile: &Profile,
+    tmux_program: &str,
+    tmux_options: &[String],
+    client: &str,
+) -> Result<Command> {
+    let mut target = profile
+        .remote
+        .clone()
+        .context("remote profile has no target")?;
+    if let RemoteTarget::Ssh { ssh_args, .. } = &mut target {
+        // No password prompt on a connection nobody is watching; the first
+        // value of an option wins in ssh.
+        ssh_args.splice(0..0, ["-o".to_string(), "BatchMode=yes".to_string()]);
+    }
+    let mut args = tmux_options.to_vec();
+    args.extend(["detach-client".to_string(), "-t".to_string(), client.to_string()]);
+    remote_command(&target, tmux_program, &args)
+}
+
+/// Runs `command` to completion in at most [`DETACH_LIMIT`], silently. Meant
+/// for a background thread: the connection it needs may be gone.
+pub fn detach_client(mut command: Command) {
+    use std::process::Stdio;
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    match command.spawn() {
+        Ok(child) => {
+            let never = AtomicBool::new(false);
+            if let Err(error) = wait_process(child, &never, DETACH_LIMIT) {
+                log::debug!("detaching the dropped tmux client: {error:#}");
+            }
+        }
+        Err(error) => log::debug!("detaching the dropped tmux client: {error}"),
+    }
+}
+
 /// A tmux process ready to spawn, and what to write to its stdin first.
 /// The caller sets its stdio.
 pub struct TmuxProcess {
@@ -314,5 +355,25 @@ mod tests {
         assert!(script.contains("src tree"), "{script}");
         assert!(script.contains("exec tmux -C new-session"), "{script}");
         assert!(!script.contains(" -c "));
+    }
+
+    #[test]
+    fn detach_command_names_the_client_and_never_prompts() {
+        let profile = Profile {
+            remote: Some(RemoteTarget::Ssh {
+                host: "A8".into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                ssh_args: vec![],
+            }),
+            ..Profile::default()
+        };
+        let command =
+            detach_command(&profile, "tmux", &["-L".into(), "work".into()], "client-42").unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]), "{args:?}");
+        assert_eq!(args.last().unwrap(), "tmux -L work detach-client -t client-42");
+        assert!(detach_command(&Profile::default(), "tmux", &[], "c").is_err());
     }
 }
