@@ -37,12 +37,10 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// the session. Several heartbeats may be lost or late before it expires.
 pub const DEFAULT_IDLE_LIMIT_SECS: u32 = 60;
 /// The largest idle limit a spawn request may ask for (one day).
-#[allow(dead_code)] // Used by the agent only.
 pub const MAX_IDLE_LIMIT_SECS: u32 = 24 * 60 * 60;
 
 /// Checks a spawn request's `idle_limit_secs`: non-zero and at most
 /// [`MAX_IDLE_LIMIT_SECS`].
-#[allow(dead_code)] // Used by the agent only.
 pub fn validate_idle_limit(secs: u32) -> io::Result<Duration> {
     if secs == 0 || secs > MAX_IDLE_LIMIT_SECS {
         return Err(io::Error::new(
@@ -168,17 +166,14 @@ impl Frame {
         Self::json(MSG_SPAWN, request)
     }
 
-    #[allow(dead_code)] // Used by the agent only.
     pub fn spawn_response(response: &SpawnResponse) -> io::Result<Self> {
         Self::json(MSG_SPAWN_RESPONSE, response)
     }
 
-    #[allow(dead_code)] // Used by the agent only.
     pub fn process_info(info: &ProcessInfo) -> io::Result<Self> {
         Self::json(MSG_PROCESS_INFO, info)
     }
 
-    #[allow(dead_code)] // Used by the agent only.
     pub fn error(message: impl Into<String>) -> io::Result<Self> {
         Self::json(
             MSG_ERROR,

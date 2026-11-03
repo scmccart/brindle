@@ -1,8 +1,4 @@
-#[path = "../../src/remote/agent.rs"]
 mod agent;
-#[path = "../../src/remote/protocol.rs"]
-#[allow(dead_code)]
-mod protocol;
 
 use std::env;
 use std::process::ExitCode;
