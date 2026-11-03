@@ -10,11 +10,11 @@
 
 ## 3. Reusable build workflows
 
-- [ ] 3.1 Add `rust-toolchain.toml` (`channel = "1.99.1"`, `profile = "minimal"`, no targets). In `ci.yml`, replace `dtolnay/rust-toolchain` with `rustup toolchain install`, plus `rustup target add x86_64-unknown-linux-musl` where the helper is built, and remove the `RUST_VERSION` env. Update the README's build section to say rustup picks the toolchain from the file. Verify: `rustup show active-toolchain` in the checkout reports 1.99.1 from `rust-toolchain.toml`, a local `cargo build` recompiles no dependencies, `actionlint` is clean, and CI's logs show 1.99.1.
+- [x] 3.1 Add `rust-toolchain.toml` (`channel = "1.99.1"`, `profile = "minimal"`, no targets). In `ci.yml`, replace `dtolnay/rust-toolchain` with `rustup toolchain install`, plus `rustup target add x86_64-unknown-linux-musl` where the helper is built, and remove the `RUST_VERSION` env. Update the README's build section to say rustup picks the toolchain from the file. Verify: `rustup show active-toolchain` in the checkout reports 1.99.1 from `rust-toolchain.toml`, a local `cargo build` recompiles no dependencies, `actionlint` is clean, and CI's logs show 1.99.1.
 - [x] 3.2 Add `scripts/package-linux.sh`, which checks that the helper is a static ELF and that `brindle --version` matches the crate version, then writes `target/dist/brindle-<version>-x86_64-unknown-linux-gnu.tar.gz` with its top-level directory, the two binaries and the licences. Verify: run it locally after `cargo build --release` and the musl helper build, then list the tarball's contents.
-- [ ] 3.3 Extract `ci.yml`'s `release` job into `.github/workflows/build-linux.yml` (`workflow_call`, inputs `ref`), uploading the helper and the `brindle-linux-x64` tarball artifact. Verify: `actionlint`, and a CI run on the branch shows both artifacts.
-- [ ] 3.4 Extract `ci.yml`'s `windows` job into `.github/workflows/build-windows.yml` (inputs `ref` and `winget-validate`, default true), with the manifest and `winget validate` step gated on the input. Verify: `actionlint`, and a CI run on the branch passes the exe checks and uploads `brindle-windows-x64`.
-- [ ] 3.5 Replace the two jobs in `ci.yml` with `uses:` calls, keeping the job names so the e2e and needs wiring hold. Verify: the branch's CI run is green with the same set of checks as before, plus the Linux tarball.
+- [x] 3.3 Extract `ci.yml`'s `release` job into `.github/workflows/build-linux.yml` (`workflow_call`, inputs `ref`), uploading the helper and the `brindle-linux-x64` tarball artifact. Verify: `actionlint`, and a CI run on the branch shows both artifacts.
+- [x] 3.4 Extract `ci.yml`'s `windows` job into `.github/workflows/build-windows.yml` (inputs `ref` and `winget-validate`, default true), with the manifest and `winget validate` step gated on the input. Verify: `actionlint`, and a CI run on the branch passes the exe checks and uploads `brindle-windows-x64`.
+- [x] 3.5 Replace the two jobs in `ci.yml` with `uses:` calls, keeping the job names so the e2e and needs wiring hold. Verify: the branch's CI run is green with the same set of checks as before, plus the Linux tarball.
 
 ## 4. PR title check
 
