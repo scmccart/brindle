@@ -22,18 +22,25 @@
 ## Decisions
 
 ### release-please, as one root package
-Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust`, the `cargo-workspace` plugin, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `main`'s head when the change branches (`d33e156`, the 0.2.0 state), since a merge commit can't name itself. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
+Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust` and no plugins, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `main`'s head when the change branches (`d33e156`, the 0.2.0 state), since a merge commit can't name itself. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
 
 Alternatives: tag-push plus git-cliff (manual versioning, which was rejected), and a `workflow_dispatch` that bumps and pushes (fights branch protection).
 
-### One version through `[workspace.package]`
-Root `Cargo.toml` gains `[workspace.package] version = "0.2.0"`, and all three crates use `version.workspace = true`. release-please then has one value to bump. The `cargo-workspace` plugin rewrites the members' entries in `Cargo.lock` and leaves third-party entries alone, which honours the lockfile rule.
+### One version, bumped by the rust strategy
+The three crates keep their own literal `version = "…"`. When the root manifest has `[workspace].members`, release-please's `rust` strategy sets the root package and every member to the new version. In `Cargo.lock` it rewrites only the entries with those crate names, which honours the lockfile rule. A step in `ci.yml`'s `test` job fails when the three versions differ, to catch a hand edit.
 
-Local build time is unaffected. Inheriting the version is resolved at manifest-load time, and a version bump recompiles only the workspace crates (`CARGO_PKG_VERSION` changes), exactly as a hand bump does today. Dependencies are not rebuilt.
+Local builds are untouched. A version bump recompiles only the workspace crates (`CARGO_PKG_VERSION` changes), exactly as a hand bump does today.
 
-**This needs a spike first** (task 1.1): confirm on a scratch branch that the rust strategy and `cargo-workspace` bump `[workspace.package].version` and the lockfile when crates inherit it. Fallback if they don't: `release-type: simple` with a `toml` extra-file at `$.workspace.package.version`, plus a release-PR job that runs `cargo update -w --offline` and pushes the lockfile change.
+**Spike result (task 1.1)**, from reading release-please 17.11.2's source:
+- `updaters/rust/cargo-toml.js` replaces only a literal `package.version`.
+- With `version.workspace = true` it throws `value at path package.version is not tagged`, and it never edits `[workspace.package]`.
+- `strategies/rust.js` already bumps every member and their lockfile entries together.
+- Path dependencies without a `version` (`brindle-remote-protocol`) are skipped.
 
-Alternative: three versioned packages linked by `linked-versions`. It gives three components and three changelogs for one product, and the tags collide.
+Rejected alternatives:
+- `[workspace.package]` inheritance, because the updater can't handle it.
+- The `cargo-workspace` plugin, which versions each crate as its own component.
+- Three packages linked by `linked-versions`: three changelogs for one product, and colliding tags.
 
 ### A GitHub App token for release-please
 Pull requests opened with `GITHUB_TOKEN` trigger no `pull_request` workflows, so the release PR would get no CI and couldn't satisfy required checks. The release workflow mints a token with `actions/create-github-app-token` from `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`, for an app installed only on this repo with contents and pull-requests write. An App beats a PAT: it is short-lived, scoped to one repo and not tied to a person.
@@ -41,7 +48,10 @@ Pull requests opened with `GITHUB_TOKEN` trigger no `pull_request` workflows, so
 ### Draft until complete
 release-please creates the GitHub Release as a draft (`draft: true`, with `force-tag-creation: true` so the tag exists while it is a draft, since release-please finds the last release through its tag). The same run then builds, uploads the assets and `SHA256SUMS`, and publishes with `gh release edit --draft=false`. A failed build leaves a draft, which a rerun completes.
 
-The spike (task 1.1) confirms `force-tag-creation` with drafts. Fallback: `skip-github-release` on the release-please step, and the workflow creates the tag and draft itself from release-please's notes output.
+**Spike result (task 1.1):**
+- With `force-tag-creation`, `github-api.js` creates `refs/tags/v<version>` at the release commit before creating the draft release on it.
+- The next run finds the last release by parsing the merged release PR's title, so a draft doesn't hide it.
+- The pattern `chore(release): ${version}` parses, because release-please escapes the parentheses. It warns that `${scope}` and `${component}` are missing, which is expected for one unscoped package.
 
 ### Reusable build workflows
 ```
@@ -68,8 +78,7 @@ release.yml -----+        artifacts: brindle-remote-linux-x86_64, [brindle-linux
 
 ## Risks / Trade-offs
 
-- [release-please doesn't handle inherited workspace versions] → Spike first; the fallback (simple strategy plus a lockfile job) is in place.
-- [Drafts and tags interact badly] → Spike first; fallback is `skip-github-release` with the workflow creating the draft.
+- [A future release-please changes how the rust strategy treats members] → The action is pinned to a major version, and the version-match step in CI catches drift.
 - [App secrets missing or expired] → The release-please step fails loudly; nothing is published.
 - [`docs`/`chore` hidden from notes may drop something worth mentioning] → Use `feat`/`fix` for user-visible changes, as the commit rules already ask.
 - [glibc floor of ubuntu-26.04 excludes older distros] → Documented. An older build runner can be a follow-up.
