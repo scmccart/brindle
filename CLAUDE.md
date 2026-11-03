@@ -50,7 +50,7 @@ Commits follow Conventional Commits, checked by commitlint (`commitlint.config.m
 - `!` marks a breaking change (a changed key, config or default).
 - OpenSpec propose, archive and check-off commits are `docs(openspec): …`. Merges keep `Merge …`, which the linter skips.
 - `git config core.hooksPath scripts/hooks` (set in this clone) runs `scripts/lint-commits --edit` as a `commit-msg` hook. `scripts/lint-commits` alone checks the commits not on `origin/main`; `scripts/lint-commits BASE` checks `BASE..HEAD`; `scripts/lint-commits --title TITLE` checks a PR title.
-- PRs are squash-merged, so the PR title becomes the commit on `main` with ` (#NN)` appended. Titles follow the same rules, and are at most 93 characters to leave room for the suffix.
+- PRs are squash-merged, so the PR title becomes the commit on `main` with ` (#NN)` appended. Titles follow the same rules, and are at most 93 characters to leave room for the suffix. The squash commit's body is empty (the repository's squash default is the PR title alone), so the title is what release-please sees: mark a breaking change there with `!`.
 - It runs commitlint through `npx` (Node ≥ 22.12), with `COMMITLINT_VERSION` pinned in the script and moved by hand. To vet a bump, run `scripts/lint-commits 7157fba` (the root commit) over the whole history.
 
 ## Verifying GUI behaviour
