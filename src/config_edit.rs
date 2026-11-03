@@ -301,9 +301,7 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
         (!items.is_empty()).then(|| Value::Array(items.iter().map(String::as_str).collect()))
     }
     set_value(table, "name", Value::from(p.name.as_str()));
-    if table.get("remote").is_none()
-        && let Some(remote) = &p.remote
-    {
+    if let Some(remote) = &p.remote {
         let mut target = InlineTable::new();
         match remote {
             RemoteTarget::Ssh { host, user, port, identity_file, ssh_args } => {
@@ -323,6 +321,8 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
         }
         target.fmt();
         set_value(table, "remote", Value::InlineTable(target));
+    } else {
+        table.remove("remote");
     }
     set_or_remove(table, "command", p.command.as_deref().map(Value::from));
     set_or_remove(table, "args", strings(&p.args));

@@ -60,6 +60,7 @@ fn unix() -> Vec<Case> {
         display("dump-grid-geometry", dump::grid_geometry),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
+        display("remote-tmux-connection-lost", remote::tmux_connection_lost),
         display("geometry-plain", geometry::plain),
         display("geometry-top-before-attach", geometry::top_before_attach),
         display("geometry-top-while-attached", geometry::top_while_attached),
