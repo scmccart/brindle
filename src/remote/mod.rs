@@ -5,7 +5,7 @@
 //! directly because tmux control mode already is a byte-stream protocol.
 
 pub mod client;
-pub mod protocol;
+pub use brindle_remote_protocol as protocol;
 
 use std::collections::BTreeMap;
 use std::process::{Child, Command, ExitStatus};

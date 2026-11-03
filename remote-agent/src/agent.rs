@@ -38,7 +38,7 @@ mod platform {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use super::super::protocol::{
+    use brindle_remote_protocol::{
         ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_HEARTBEAT,
         MSG_QUERY_PROCESS, MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SpawnRequest,
         SpawnResponse, validate_idle_limit,
