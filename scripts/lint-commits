@@ -5,16 +5,21 @@
 #   scripts/lint-commits                # the commits not on origin/main
 #   scripts/lint-commits BASE           # BASE..HEAD
 #   scripts/lint-commits --edit FILE    # one message (the commit-msg hook)
+#   scripts/lint-commits --title TITLE  # a pull request title
 #
-# Merges (`Merge …`) are skipped. commitlint runs through npx, which needs
+# A pull request title becomes the squash commit's subject with ` (#NN)`
+# appended, so it may be at most 93 characters, leaving room within the
+# 100-character header limit. Merges (`Merge …`) are skipped. commitlint runs through npx, which needs
 # Node 22.12 or later; the first run downloads it. Its version is pinned
 # here and moved by hand.
 set -eu
 
 COMMITLINT_VERSION=21.2.3
 
+TITLE_MAX=93
+
 usage() {
-    echo "usage: scripts/lint-commits [BASE | --edit FILE]" >&2
+    echo "usage: scripts/lint-commits [BASE | --edit FILE | --title TITLE]" >&2
     exit 2
 }
 if ! command -v npx >/dev/null 2>&1; then
@@ -34,11 +39,27 @@ case $# in
     base=$1
     ;;
 2)
-    [ "$1" = --edit ] || usage
-    file=$(realpath "$2")
-    cd "$root"
-    commitlint --edit "$file"
-    exit
+    case $1 in
+    --edit)
+        file=$(realpath "$2")
+        cd "$root"
+        commitlint --edit "$file"
+        exit
+        ;;
+    --title)
+        # Both checks run, so every problem is reported at once.
+        status=0
+        length=$(printf '%s' "$2" | wc -m)
+        if [ "$length" -gt "$TITLE_MAX" ]; then
+            echo "lint-commits: the title is $length characters; the limit is $TITLE_MAX, leaving room for the squash commit's \" (#NN)\"" >&2
+            status=1
+        fi
+        cd "$root"
+        printf '%s\n' "$2" | commitlint || status=1
+        exit "$status"
+        ;;
+    *) usage ;;
+    esac
     ;;
 *) usage ;;
 esac

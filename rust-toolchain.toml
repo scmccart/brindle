@@ -1,0 +1,7 @@
+# The one Rust pin, for local builds and CI alike, so releases come from the
+# compiler that was tested. Move it by hand. Targets aren't listed: CI adds
+# x86_64-unknown-linux-musl where it builds the remote helper.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
