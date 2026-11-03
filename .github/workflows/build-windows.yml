@@ -1,0 +1,140 @@
+# The Windows build, tests, exe checks and release zip, called by CI and by
+# releases after build-linux.yml, whose remote helper artifact the zip packs.
+# The zip is uploaded as brindle-windows-x64.
+#
+# No concurrency group here: the caller's applies, and a matching one would
+# cancel the caller.
+
+name: Build Windows
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build; empty for the caller's own.
+        type: string
+        default: ""
+      winget-validate:
+        description: Write the WinGet manifest for the zip and check it with winget validate.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      # rust-toolchain.toml names the toolchain.
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      - uses: actions/download-artifact@v7
+        with:
+          name: brindle-remote-linux-x86_64
+          path: target/release
+      # GPUI's release build compiles its shaders with fxc.exe, which it
+      # otherwise looks for only on PATH and in one SDK version's directory.
+      - name: Find fxc.exe
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $fxc) { throw "no fxc.exe in the Windows SDK" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      # The packaged ConPTY that build.rs embeds.
+      - run: scripts/fetch-conpty.ps1
+        shell: pwsh
+      - run: cargo build --release --locked
+      - run: cargo test --locked --workspace
+      - name: e2e harness self-test
+        run: cargo test --locked -p brindle --test e2e -- --self-test
+        env:
+          BRINDLE_E2E: "1"
+      - name: perf harness self-test
+        run: cargo test --locked -p brindle --test perf -- --self-test
+        env:
+          BRINDLE_PERF: "1"
+      - name: Version resource, icon and DPI manifest in brindle.exe
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $info = (Get-Item $exe).VersionInfo
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version) {
+            throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)', expected Brindle $version"
+          }
+          # Icon group 1 (RT_GROUP_ICON is 14) with all 8 sizes. Extracting
+          # the icon proves nothing: Windows supplies a default one.
+          Add-Type -Namespace Res -Name Api -MemberDefinition @'
+          [DllImport("kernel32", CharSet = CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
+          [DllImport("kernel32")] public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+          [DllImport("kernel32")] public static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+          [DllImport("kernel32")] public static extern IntPtr LockResource(IntPtr data);
+          '@
+          $module = [Res.Api]::LoadLibraryExW($exe, 0, 2) # LOAD_LIBRARY_AS_DATAFILE
+          $group = [Res.Api]::FindResourceW($module, 1, 14)
+          if ($group -eq 0) { throw 'no icon in brindle.exe' }
+          $count = [Runtime.InteropServices.Marshal]::ReadInt16([Res.Api]::LockResource([Res.Api]::LoadResource($module, $group)), 4)
+          if ($count -ne 8) { throw "the icon has $count sizes, expected 8" }
+          # GPUI embeds the manifest; without it the window renders blurry above 100% scale.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
+          if (-not (Select-String -Path manifest.xml -Pattern 'PerMonitorV2' -Quiet)) { throw 'no PerMonitorV2 in the manifest' }
+      # brindle.exe is a GUI program, so PowerShell waits for it only
+      # through Start-Process -Wait.
+      - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/brindle.exe).Path
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Brindle.lnk'
+          function Run($arguments) { (Start-Process $exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow).ExitCode }
+          if ((Run '--install-desktop') -ne 0 -or -not (Test-Path $lnk)) { throw 'install failed' }
+          $item = (New-Object -ComObject Shell.Application).Namespace((Split-Path $lnk)).ParseName('Brindle.lnk')
+          $id = $item.ExtendedProperty('System.AppUserModel.ID')
+          if ($id -ne 'Brindle.Terminal') { throw "AppUserModelID is '$id'" }
+          $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          if ($target -ne $exe) { throw "target is '$target'" }
+          # Through a symlink, as WinGet runs it: the shortcut starts the
+          # link, and takes its icon from the exe, since the shell reads no
+          # icon through a link.
+          New-Item -ItemType Directory -Force target/links | Out-Null
+          $link = (New-Item -ItemType SymbolicLink -Force -Path target/links/brindle.exe -Target $exe).FullName
+          $code = (Start-Process $link -ArgumentList '--install-desktop' -Wait -PassThru -NoNewWindow).ExitCode
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          if ($code -ne 0 -or $shortcut.TargetPath -ne $link) { throw "through a link: exit $code, target '$($shortcut.TargetPath)'" }
+          if ($shortcut.IconLocation -ne "$exe,0") { throw "through a link: icon '$($shortcut.IconLocation)'" }
+          if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
+          if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
+          if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
+      # A Windows release is one zip (brindle.exe needs nothing beside it).
+      - name: Release zip
+        id: zip
+        shell: pwsh
+        run: |
+          $zip = scripts/package-windows.ps1
+          "path=$zip" >> $env:GITHUB_OUTPUT
+      - name: WinGet manifest
+        if: inputs.winget-validate
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.zip.outputs.path }}
+        run: |
+          winget --version
+          $manifest = scripts/winget-manifest.ps1 -Zip $env:ZIP
+          winget validate --disable-interactivity --manifest $manifest
+          if ($LASTEXITCODE -ne 0) { throw "winget validate failed for $manifest" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: target/dist/*.zip
+          retention-days: 14

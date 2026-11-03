@@ -1,0 +1,37 @@
+# Checks each pull request's title against the commit rules (see CLAUDE.md).
+# Pull requests are squash-merged, so the title becomes the commit subject on
+# main, with " (#NN)" appended; CI's commits job checks only the branch's
+# own commits. A required check.
+#
+# The rules and the script come from the base branch, so a pull request
+# can't loosen the rules its own title is checked against.
+
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          # commitlint 21 needs 22.12 or later.
+          node-version: 24
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/lint-commits --title "$TITLE"

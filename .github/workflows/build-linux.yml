@@ -1,0 +1,61 @@
+# The Linux release build, called by CI and by releases: brindle, the static
+# x86-64 remote helper (uploaded as brindle-remote-linux-x86_64, which the
+# Windows build packs too) and the release archive (brindle-linux-x64).
+#
+# No concurrency group here: the caller's applies, and a matching one would
+# cancel the caller.
+
+name: Build Linux
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build; empty for the caller's own.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools
+      # rust-toolchain.toml names the toolchain.
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - run: cargo build --release --locked
+      - name: Build static Linux remote helper
+        run: |
+          cargo build --release --locked -p brindle-remote-agent --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/brindle-remote brindle-remote-linux-x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-remote-linux-x86_64
+          path: brindle-remote-linux-x86_64
+          retention-days: 14
+      - name: Release archive
+        run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-linux-x64
+          path: target/dist/*.tar.gz
+          retention-days: 14

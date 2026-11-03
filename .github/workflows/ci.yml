@@ -1,6 +1,8 @@
 # Unit tests, a release build, and the end-to-end suite on two tmux versions,
 # plus a Windows build and tests. The e2e jobs are advisory: they go red on
-# failure but aren't required checks.
+# failure but aren't required checks. The release and Windows builds are the
+# reusable build-linux.yml and build-windows.yml, which releases run too.
+# rust-toolchain.toml pins Rust for every job.
 #
 # Pushes to main and every pull request run it.
 
@@ -20,8 +22,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The desktop's toolchain; the runner image's own lags behind.
-  RUST_VERSION: "1.99.1"
   CARGO_TERM_COLOR: always
   BUILD_PACKAGES: build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libfreetype-dev
 
@@ -75,149 +75,36 @@ jobs:
           sudo apt-get update
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install Rust
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev
+      # Brindle matches its remote helper by version, and release-please
+      # bumps all three crates together, so they never differ.
+      - name: Check the workspace crates share one version
+        run: |
+          versions=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.version)"')
+          if [ "$(echo "$versions" | cut -d' ' -f2 | sort -u | wc -l)" -ne 1 ]; then
+            echo "the workspace crates' versions differ:" >&2
+            echo "$versions" >&2
+            exit 1
+          fi
       - run: cargo test --locked --workspace
       - name: e2e harness self-test
         run: BRINDLE_E2E=1 cargo test --locked -p brindle --test e2e -- --self-test
       - name: perf harness self-test
         run: BRINDLE_PERF=1 cargo test --locked -p brindle --test perf -- --self-test
 
+  # The release build, the static remote helper and the Linux archive.
   release:
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install packages
-        run: |
-          sudo apt-get update
-          # shellcheck disable=SC2086 # a list of packages
-          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release
-      - run: cargo build --release --locked
-      - name: Build static Linux remote helper
-        run: |
-          cargo build --release --locked -p brindle-remote-agent --target x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/brindle-remote brindle-remote-linux-x86_64
-      - uses: actions/upload-artifact@v7
-        with:
-          name: brindle-remote-linux-x86_64
-          path: brindle-remote-linux-x86_64
-          retention-days: 14
+    uses: ./.github/workflows/build-linux.yml
 
+  # The Windows build, tests, exe checks and zip, with its WinGet manifest
+  # validated.
   windows:
-    runs-on: windows-latest
     needs: release
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows
-      - uses: actions/download-artifact@v7
-        with:
-          name: brindle-remote-linux-x86_64
-          path: target/release
-      # GPUI's release build compiles its shaders with fxc.exe, which it
-      # otherwise looks for only on PATH and in one SDK version's directory.
-      - name: Find fxc.exe
-        shell: pwsh
-        run: |
-          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
-            Sort-Object FullName | Select-Object -Last 1
-          if (-not $fxc) { throw "no fxc.exe in the Windows SDK" }
-          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      # The packaged ConPTY that build.rs embeds.
-      - run: scripts/fetch-conpty.ps1
-        shell: pwsh
-      - run: cargo build --release --locked
-      - run: cargo test --locked --workspace
-      - name: e2e harness self-test
-        run: cargo test --locked -p brindle --test e2e -- --self-test
-        env:
-          BRINDLE_E2E: "1"
-      - name: perf harness self-test
-        run: cargo test --locked -p brindle --test perf -- --self-test
-        env:
-          BRINDLE_PERF: "1"
-      - name: Version resource, icon and DPI manifest in brindle.exe
-        shell: pwsh
-        run: |
-          $exe = (Resolve-Path target/release/brindle.exe).Path
-          $info = (Get-Item $exe).VersionInfo
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version) {
-            throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)', expected Brindle $version"
-          }
-          # Icon group 1 (RT_GROUP_ICON is 14) with all 8 sizes. Extracting
-          # the icon proves nothing: Windows supplies a default one.
-          Add-Type -Namespace Res -Name Api -MemberDefinition @'
-          [DllImport("kernel32", CharSet = CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
-          [DllImport("kernel32")] public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
-          [DllImport("kernel32")] public static extern IntPtr LoadResource(IntPtr module, IntPtr info);
-          [DllImport("kernel32")] public static extern IntPtr LockResource(IntPtr data);
-          '@
-          $module = [Res.Api]::LoadLibraryExW($exe, 0, 2) # LOAD_LIBRARY_AS_DATAFILE
-          $group = [Res.Api]::FindResourceW($module, 1, 14)
-          if ($group -eq 0) { throw 'no icon in brindle.exe' }
-          $count = [Runtime.InteropServices.Marshal]::ReadInt16([Res.Api]::LockResource([Res.Api]::LoadResource($module, $group)), 4)
-          if ($count -ne 8) { throw "the icon has $count sizes, expected 8" }
-          # GPUI embeds the manifest; without it the window renders blurry above 100% scale.
-          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
-          & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
-          if (-not (Select-String -Path manifest.xml -Pattern 'PerMonitorV2' -Quiet)) { throw 'no PerMonitorV2 in the manifest' }
-      # brindle.exe is a GUI program, so PowerShell waits for it only
-      # through Start-Process -Wait.
-      - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)
-        shell: pwsh
-        run: |
-          $exe = (Resolve-Path target/release/brindle.exe).Path
-          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Brindle.lnk'
-          function Run($arguments) { (Start-Process $exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow).ExitCode }
-          if ((Run '--install-desktop') -ne 0 -or -not (Test-Path $lnk)) { throw 'install failed' }
-          $item = (New-Object -ComObject Shell.Application).Namespace((Split-Path $lnk)).ParseName('Brindle.lnk')
-          $id = $item.ExtendedProperty('System.AppUserModel.ID')
-          if ($id -ne 'Brindle.Terminal') { throw "AppUserModelID is '$id'" }
-          $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
-          if ($target -ne $exe) { throw "target is '$target'" }
-          # Through a symlink, as WinGet runs it: the shortcut starts the
-          # link, and takes its icon from the exe, since the shell reads no
-          # icon through a link.
-          New-Item -ItemType Directory -Force target/links | Out-Null
-          $link = (New-Item -ItemType SymbolicLink -Force -Path target/links/brindle.exe -Target $exe).FullName
-          $code = (Start-Process $link -ArgumentList '--install-desktop' -Wait -PassThru -NoNewWindow).ExitCode
-          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-          if ($code -ne 0 -or $shortcut.TargetPath -ne $link) { throw "through a link: exit $code, target '$($shortcut.TargetPath)'" }
-          if ($shortcut.IconLocation -ne "$exe,0") { throw "through a link: icon '$($shortcut.IconLocation)'" }
-          if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
-          if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
-          if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
-      # A Windows release is one zip (brindle.exe needs nothing beside it),
-      # plus the WinGet manifest for it. Publishing both is a release step.
-      - name: Release zip and WinGet manifest
-        shell: pwsh
-        run: |
-          winget --version
-          $zip = scripts/package-windows.ps1
-          $manifest = scripts/winget-manifest.ps1 -Zip $zip
-          winget validate --disable-interactivity --manifest $manifest
-          if ($LASTEXITCODE -ne 0) { throw "winget validate failed for $manifest" }
-      - uses: actions/upload-artifact@v7
-        with:
-          name: brindle-windows-x64
-          path: target/dist/*.zip
-          retention-days: 14
+    uses: ./.github/workflows/build-windows.yml
 
   # The Windows cases of the end-to-end suite, on the runner's desktop.
   # Advisory, like the Linux e2e jobs.
@@ -226,9 +113,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install Rust
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows
@@ -302,9 +188,8 @@ jobs:
         run: |
           tmux -V
           test "$(tmux -V)" = "${{ matrix.tmux.reports }}"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
+      - name: Install Rust
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev

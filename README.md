@@ -123,6 +123,9 @@ Wayland, fontconfig and Vulkan are loaded at runtime (dlopen), so only their
 runtime libraries are needed, and every desktop install has them. `tmux` is
 only needed for the tmux profiles.
 
+`rust-toolchain.toml` pins the Rust version that CI and releases build with.
+rustup installs it on the first `cargo` run in the checkout.
+
 On Windows 11 (Windows 10 isn't supported), install the MSVC toolchain and the
 Windows 11 SDK (Visual Studio Build Tools with "Desktop development with C++"),
 then, in PowerShell:
@@ -242,6 +245,24 @@ scripts/lint-commits                      # check the commits not on origin/main
 
 ## Installing
 
+Each [GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
+x86-64 archive, `brindle-<version>-x86_64-unknown-linux-gnu.tar.gz`, holding
+`brindle`, the static remote helper `brindle-remote-linux-x86_64` and the
+licences, plus a `SHA256SUMS` file. It's built on Ubuntu 26.04, so it needs a
+glibc at least that new, along with the runtime libraries of the build
+dependencies above (xkbcommon, xcb, FreeType), which desktop installs have.
+Keep the helper beside `brindle`, where remote profiles look for it:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf brindle-<version>-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 -t ~/.local/bin brindle-<version>-x86_64-unknown-linux-gnu/brindle \
+  brindle-<version>-x86_64-unknown-linux-gnu/brindle-remote-linux-x86_64
+~/.local/bin/brindle --install-desktop   # launcher entry and icon
+```
+
+To update, install the new release's files the same way.
+
 From a checkout, after installing the build dependencies above:
 
 ```sh
@@ -273,8 +294,9 @@ in `~/.config/brindle` is kept either way.
 
 There's no installer: `brindle.exe` carries everything it needs, including the
 packaged ConPTY, which it unpacks to `%LOCALAPPDATA%\brindle\conpty` on first
-run. Each release has a zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`,
-with the exe and the licences; unpack it anywhere and run `brindle.exe`. Once
+run. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
+zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with the exe, the Linux
+remote helper and the licences (`SHA256SUMS` beside it lists its hash); unpack it anywhere and run `brindle.exe`. Once
 releases are published to WinGet, it installs as a `brindle` command on `PATH`:
 
 ```powershell
