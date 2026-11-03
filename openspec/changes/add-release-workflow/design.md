@@ -22,7 +22,7 @@
 ## Decisions
 
 ### release-please, as one root package
-Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust` and no plugins, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `main`'s head when the change branches (`d33e156`, the 0.2.0 state), since a merge commit can't name itself. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
+Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust` and no plugins, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `2d6942e` (#9), the commit that set the version to 0.2.0. 0.2.0 was never published, so the first release (0.3.0) lists everything since that bump. The first choice, `main`'s head at branching (`d33e156`), left no user-facing commits, so no release would open until the next `feat` or `fix`. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
 
 Alternatives: tag-push plus git-cliff (manual versioning, which was rejected), and a `workflow_dispatch` that bumps and pushes (fights branch protection).
 
@@ -86,7 +86,7 @@ release.yml -----+        artifacts: brindle-remote-linux-x86_64, [brindle-linux
 
 ## Migration Plan
 
-1. Land the change. `bootstrap-sha` makes release-please ignore history up to 0.2.0.
+1. Land the change. `bootstrap-sha` makes release-please ignore history up to the 0.2.0 version bump.
 2. Create the GitHub App, install it on the repo and add the two secrets. Set the title check as required and the squash default to PR title.
 3. The next `feat`/`fix` on `main` opens `chore(release): 0.3.0` (or 0.2.1). Merging it produces the first release.
 
