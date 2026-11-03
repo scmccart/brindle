@@ -18,7 +18,7 @@
 
 ## 4. PR title check
 
-- [ ] 4.1 Add `.github/workflows/pr-title.yml` (`pull_request`: opened, edited, reopened, synchronize; `contents: read`). Pass the title through `env`, fail above 93 characters, then run `scripts/lint-commits --edit` on a file holding it. Verify: on a test PR, `Add release workflow` fails naming the rule, a 95-character valid title fails naming the 93 limit, and `ci: add a release workflow` passes after an edit.
+- [x] 4.1 Add `.github/workflows/pr-title.yml` (`pull_request`: opened, edited, reopened, synchronize; `contents: read`). Pass the title through `env`, fail above 93 characters, then run `scripts/lint-commits --edit` on a file holding it. Verify: on a test PR, `Add release workflow` fails naming the rule, a 95-character valid title fails naming the 93 limit, and `ci: add a release workflow` passes after an edit.
 
 ## 5. Release workflow
 
