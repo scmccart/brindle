@@ -45,6 +45,9 @@ Rejected alternatives:
 ### A GitHub App token for release-please
 Pull requests opened with `GITHUB_TOKEN` trigger no `pull_request` workflows, so the release PR would get no CI and couldn't satisfy required checks. The release workflow mints a token with `actions/create-github-app-token` from `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`, for an app installed only on this repo with contents and pull-requests write. An App beats a PAT: it is short-lived, scoped to one repo and not tied to a person.
 
+### Light CI on release pull requests
+The release PR is rewritten on every push to `main`, but changes only versions and `CHANGELOG.md` on code that already passed CI. So `ci.yml`'s builds and e2e jobs skip branches starting `release-please--`. `commits`, `test` (the version-match check and a `--locked` build) and the title check still run, which satisfies the "release pull requests run CI" requirement. The full builds run in the release run itself, before anything is published.
+
 ### Draft until complete
 release-please creates the GitHub Release as a draft (`draft: true`, with `force-tag-creation: true` so the tag exists while it is a draft, since release-please finds the last release through its tag). The same run then builds, uploads the assets and `SHA256SUMS`, and publishes with `gh release edit --draft=false`. A failed build leaves a draft, which a rerun completes.
 
