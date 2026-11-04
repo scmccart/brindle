@@ -18,22 +18,22 @@
 
 ## 4. PR title check
 
-- [x] 4.1 Add `.github/workflows/pr-title.yml` (`pull_request`: opened, edited, reopened, synchronize; `contents: read`). Pass the title through `env`, fail above 93 characters, then run `scripts/lint-commits --edit` on a file holding it. Verify: on a test PR, `Add release workflow` fails naming the rule, a 95-character valid title fails naming the 93 limit, and `ci: add a release workflow` passes after an edit.
+- [x] 4.1 Add `.github/workflows/pr-title.yml` (`pull_request`: opened, edited, reopened, synchronize; `contents: read`). Pass the title through `env` to `scripts/lint-commits --title`, a new mode that fails above 93 characters and runs commitlint on the title, with the script taken from the base commit. Verify: on a test PR, `Add release workflow` fails naming the rule, a 95-character valid title fails naming the 93 limit, and `ci: add a release workflow` passes after an edit.
 
 ## 5. Release workflow
 
 - [x] 5.1 Add `release-please-config.json` (one package `.`, rust type, no plugins, `include-component-in-tag: false`, `bump-minor-pre-major`, `pull-request-title-pattern: "chore(release): ${version}"`, `changelog-sections` showing only feat/fix/perf/revert, `draft` and `force-tag-creation`, `bootstrap-sha` `2d6942e`, the 0.2.0 version bump) and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is no `CHANGELOG.md` yet: release-please creates it, and an existing file without a version heading would be demoted below the first entry. Verify: the config validates against release-please 17.11.2's schema; its `CargoToml` and `CargoLock` updaters, run on this repo for 0.3.0, change only the three `version` lines and the three members' lockfile entries; and `cargo metadata --locked --offline` accepts the result. (Version choice and notes are checked end to end in 7.1.)
-- [ ] 5.2 Add `.github/workflows/release.yml` (on push to `main`): mint the App token, run release-please, and on `release_created` call `build-linux.yml` and `build-windows.yml` (`winget-validate: false`) at the tag. Then download the two archives, write `SHA256SUMS`, `gh release upload` all three, and `gh release edit --draft=false`. Set `concurrency` so release runs don't overlap. Verify: `actionlint` is clean. The draft, upload and publish sequence is proven by the first real release in 7.1 rather than a fork (a failure there leaves only a draft).
+- [x] 5.2 Add `.github/workflows/release.yml` (on push to `main`): mint the App token, run release-please, and on `release_created` call `build-linux.yml` and `build-windows.yml` (`winget-validate: false`) at the tag. Then download the two archives, write `SHA256SUMS`, `gh release upload` all three, and `gh release edit --draft=false`. Set `concurrency` so release runs don't overlap. Verify: `actionlint` is clean. The draft, upload and publish sequence is proven by the first real release in 7.1 rather than a fork (a failure there leaves only a draft).
 - [x] 5.3 Document in README.md the Linux tarball (contents, glibc floor, running `brindle --install-desktop` from it) and that the Windows zip comes from GitHub Releases. Verify: the README's commands match the archive layout from 3.2.
 
 ## 6. Docs and settings
 
 - [x] 6.1 Update CLAUDE.md's CI paragraph: the reusable build workflows, `rust-toolchain.toml` as the one Rust pin (replacing "`RUST_VERSION` matches the desktop's toolchain"), the Linux tarball in CI, `pr-title.yml` and its 93-character limit, `release.yml`, release-please's config files, and the App secrets. Verify: every file and pin the paragraph names exists.
-- [ ] 6.2 List the manual repository settings in the PR description: create and install the GitHub App, add `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`, make `PR title` a required check, and set the squash commit default to the PR title. Verify: the user confirms each is done.
+- [x] 6.2 List the manual repository settings in the PR description: create and install the GitHub App, add `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`, make `PR title` a required check (a ruleset on `main`), and set the squash commit default to the PR title. Verify: the user confirms each is done.
 
 ## 7. End-to-end check
 
-- [ ] 7.1 After merging and setting up the settings, push a `fix:` commit and confirm the release PR opens with CI and the title check running on it. Merge it, then confirm that `v0.2.1` is tagged, the release stays a draft until its three assets are attached, and `sha256sum -c SHA256SUMS` passes on the downloads.
+- [x] 7.1 After merging and setting up the settings, get the first release PR to open with the commit, test and title checks running on it, and the builds and e2e jobs skipped. Merge it, then confirm that `v0.3.0` is tagged on the merge commit, the release stays a draft until its three assets are attached, and `sha256sum -c SHA256SUMS` passes on the downloads. Moving `bootstrap-sha` to the 0.2.0 bump (#18) opened the release PR, #19, from the commits since 0.2.0.
 
 ## Workflow follow-up
 
