@@ -86,11 +86,15 @@ The release assets SHALL be built by the same build-and-check steps CI runs for 
 - **THEN** the release run fails before the zip is attached
 
 ### Requirement: Release pull requests run CI
-The release pull request SHALL trigger the same pull-request checks as any other pull request, including CI and the title check.
+The release pull request SHALL trigger pull-request checks like any other pull request: the commit message check, the unit tests with the workspace version check, and the title check. The release builds and the end-to-end suites MAY be skipped on it, since its code is unchanged and the release run builds both platforms before publishing.
 
 #### Scenario: Release pull request opened
 - **WHEN** the release pull request is opened or updated
-- **THEN** CI and the title check run on it, and it can satisfy required checks
+- **THEN** the commit, test and title checks run on it, and it can satisfy required checks
+
+#### Scenario: Heavy jobs skipped
+- **WHEN** the release pull request is updated after a push to `main`
+- **THEN** the release builds and end-to-end jobs report as skipped rather than running
 
 ### Requirement: Pull request title check
 Every pull request's title SHALL be checked against the repository's Conventional Commits rules, the same rules as commit messages, whenever the pull request is opened, edited, reopened or updated. The title SHALL also be at most 93 characters, so the squash commit's subject with GitHub's ` (#NN)` suffix stays within the 100-character header limit.

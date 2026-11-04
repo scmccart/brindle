@@ -96,19 +96,28 @@ jobs:
       - name: perf harness self-test
         run: BRINDLE_PERF=1 cargo test --locked -p brindle --test perf -- --self-test
 
+  # The builds and e2e jobs below skip release-please's release pull requests
+  # (branches release-please--…). Those change only versions and
+  # CHANGELOG.md on code CI has already passed, and release.yml builds and
+  # checks both platforms again before publishing. commits and test still
+  # run: test's version check and --locked build catch a bad version bump.
+
   # The release build, the static remote helper and the Linux archive.
   release:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     uses: ./.github/workflows/build-linux.yml
 
   # The Windows build, tests, exe checks and zip, with its WinGet manifest
   # validated.
   windows:
     needs: release
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     uses: ./.github/workflows/build-windows.yml
 
   # The Windows cases of the end-to-end suite, on the runner's desktop.
   # Advisory, like the Linux e2e jobs.
   windows-e2e:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -137,6 +146,7 @@ jobs:
 
   e2e:
     name: e2e (tmux ${{ matrix.tmux.version }}, ${{ matrix.shard }}/4)
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:

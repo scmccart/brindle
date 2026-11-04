@@ -22,7 +22,7 @@
 ## Decisions
 
 ### release-please, as one root package
-Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust` and no plugins, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `main`'s head when the change branches (`d33e156`, the 0.2.0 state), since a merge commit can't name itself. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
+Use `googleapis/release-please-action` with `release-please-config.json` and `.release-please-manifest.json` (`{".": "0.2.0"}`). There is one package at `.`, with `release-type: rust` and no plugins, `include-component-in-tag: false` (tags are `v0.3.0`), `bump-minor-pre-major: true`, `pull-request-title-pattern: "chore(release): ${version}"`, and `bootstrap-sha` set to `2d6942e` (#9), the commit that set the version to 0.2.0. 0.2.0 was never published, so the first release (0.3.0) lists everything since that bump. The first choice, `main`'s head at branching (`d33e156`), left no user-facing commits, so no release would open until the next `feat` or `fix`. `changelog-sections` lists `feat`, `fix`, `perf` and `revert` and hides the rest. Breaking changes always get their own section.
 
 Alternatives: tag-push plus git-cliff (manual versioning, which was rejected), and a `workflow_dispatch` that bumps and pushes (fights branch protection).
 
@@ -44,6 +44,9 @@ Rejected alternatives:
 
 ### A GitHub App token for release-please
 Pull requests opened with `GITHUB_TOKEN` trigger no `pull_request` workflows, so the release PR would get no CI and couldn't satisfy required checks. The release workflow mints a token with `actions/create-github-app-token` from `RELEASE_APP_ID` and `RELEASE_APP_PRIVATE_KEY`, for an app installed only on this repo with contents and pull-requests write. An App beats a PAT: it is short-lived, scoped to one repo and not tied to a person.
+
+### Light CI on release pull requests
+The release PR is rewritten on every push to `main`, but changes only versions and `CHANGELOG.md` on code that already passed CI. So `ci.yml`'s builds and e2e jobs skip branches starting `release-please--`. `commits`, `test` (the version-match check and a `--locked` build) and the title check still run, which satisfies the "release pull requests run CI" requirement. The full builds run in the release run itself, before anything is published.
 
 ### Draft until complete
 release-please creates the GitHub Release as a draft (`draft: true`, with `force-tag-creation: true` so the tag exists while it is a draft, since release-please finds the last release through its tag). The same run then builds, uploads the assets and `SHA256SUMS`, and publishes with `gh release edit --draft=false`. A failed build leaves a draft, which a rerun completes.
@@ -86,7 +89,7 @@ release.yml -----+        artifacts: brindle-remote-linux-x86_64, [brindle-linux
 
 ## Migration Plan
 
-1. Land the change. `bootstrap-sha` makes release-please ignore history up to 0.2.0.
+1. Land the change. `bootstrap-sha` makes release-please ignore history up to the 0.2.0 version bump.
 2. Create the GitHub App, install it on the repo and add the two secrets. Set the title check as required and the squash default to PR title.
 3. The next `feat`/`fix` on `main` opens `chore(release): 0.3.0` (or 0.2.1). Merging it produces the first release.
 
