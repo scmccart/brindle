@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "brindle"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "brindle-remote-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brindle-remote-protocol",
  "libc",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "brindle-remote-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
