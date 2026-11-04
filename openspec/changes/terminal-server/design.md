@@ -1,6 +1,6 @@
 # Design
 
-**On ice.** These are exploration notes for section 5 of `proposal.md` (persistent sessions through a terminal server), captured so the context survives a pause. They are not a settled design. The work will probably be split into its own change, or a series of changes, before specs and tasks. Follow-ups 1–4 have no design yet.
+**Exploration notes, not a settled design.** They were captured so the context survives a pause, and moved here with the change when it was split out of `remote-connections-followups`. The work will probably become a series of changes before specs and tasks; see "Phasing" below.
 
 ## Context
 
@@ -110,7 +110,7 @@ Profiles opt in, rather than every remote profile being dialled, because some ho
 1. **`terminal-server`:** the server, a versioned protocol, the vt buffer and replay, the management commands, and local Linux terminals going through it. `on_close` defaults to `kill`, so nothing users see changes.
 2. **`on_close`:** `detach` and `ask`, reattach through `session-restore`, and the "sessions on host" palette.
 3. **Windows server:** ConPTY moves into the helper, the named-pipe transport, the job breakaway, and the HWND reparent.
-4. **Remote and eager:** SSH and container relays to each host's server, eager connect with an offline state, starting containers, and Windows SSH hosts. This absorbs follow-ups 2–4 of `proposal.md`.
+4. **Remote and eager:** SSH and container relays to each host's server, eager connect with an offline state, starting containers, and Windows SSH hosts. This absorbs follow-ups 2–4 of `remote-connections-followups`.
 
 ## Unresolved decisions
 
@@ -120,4 +120,4 @@ These block phase 1 and are for the user to decide. They are not deferrable open
   - (a) kill its sessions with a warning, keeping a protocol versioned from day one, and add a handoff later. This was the recommendation.
   - (b) let old and new servers run side by side until the old one's sessions end. That breaks "one per host" for a while.
   - (c) hand sessions over to the new server: PTY fds over `SCM_RIGHTS` on Linux, and on Windows `DuplicateHandle` for the pipes and process. Whether an HPCON can move to another process is unknown and needs a spike.
-- **Splitting.** Whether section 5 becomes its own change or the series above, and what stays in this change.
+- **Splitting.** Whether this change becomes the series above, keeping phase 1, or stays one change.
