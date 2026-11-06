@@ -1,46 +1,57 @@
 # Proposal
 
-**Status: exploration, not yet a settled proposal.** This change was split out of `remote-connections-followups` on 2026-11-04, where an exploration had added it as section 5 of a review-cleanup change. The user wants to reconsider it carefully before going further. `design.md` holds the exploration notes; the decisions that block any specs or tasks are listed there under "Unresolved decisions". The work is likely to become a series of changes (see "Phasing" in `design.md`), with this change keeping the first of them.
+This change is phase 1 of the terminal-server series (see "Phasing" in `design.md`). It was split out of `remote-connections-followups` on 2026-11-04 as an exploration. On 2026-11-06 the user settled its two blocking decisions:
+- the work is a series of changes, and this one keeps phase 1;
+- a running server is upgraded by handing its sessions over to the new version, so no session is lost.
 
 ## Why
 
 Today `brindle-remote` is one stdio child per tab, and it deliberately ends the session when the tab closes or the client goes quiet (`remote-connections`: "A vanished client ends the remote session"). Local terminals are PTYs owned by the Brindle process, so they end with it. Only tmux control-mode profiles persist, and only where tmux is available, which excludes native Windows.
 
-The goal is a UX like herdr, where a server owns the terminals: they keep running when Brindle closes, and they are reattached when it opens again. Remote profiles are pre-registered, so Brindle can connect to them eagerly at launch and show their live sessions.
+The goal of the series is a UX like herdr, where a server owns the terminals: they keep running when Brindle closes, and they are reattached when it opens again. Phase 1 builds that server and moves local Linux terminals onto it. It keeps today's close behaviour, so users see no change yet. The later phases only change policy and transport.
 
 ## What Changes
 
-Decided in the exploration:
+- **`brindle-remote` gains a terminal-server mode.** One server runs per user per host, on a user-only Unix socket. It starts on demand and exits when it has neither sessions nor clients. It owns each session's PTY and runs an emulator per session.
+- **Local Linux terminals run in the server.** Brindle connects to the local server, starting it if needed, and every local Linux tab and zone gets its PTY from there. Each session gets the environment of the Brindle that opened it, not the server's. Titles, directories, shell integration, status and notifications behave as they do today.
+- **Close behaviour stays `kill`.** A session ends when its tab or zone closes, when Brindle quits or crashes, and when its connection drops. The server protocol also has a `detach` policy, which the server's own tests use; Brindle doesn't use it until phase 2.
+- **Attach replays the screen.** A client that attaches to a detached session first receives a repaint of the session's screen, scrollback, modes, title, program status and prompt marks, then live output.
+- **The protocol is versioned.** A server speaks every protocol version since this one, so an older Brindle keeps working with a newer server.
+- **Upgrades hand the sessions over.** When a Brindle whose server binary is newer connects to an older running server, the server re-executes itself as the new binary in place. Sessions, their screens and all client connections carry over: programs keep running, with the same pids. If the handover can't happen, the old server keeps running.
+- **Management commands:** `brindle-remote list`, `kill <id>`, `kill --all`, `status` and `stop` manage the local server from a shell.
+- **Always the server, no fallback.** On Linux, Brindle no longer runs local programs on PTYs of its own. When the server can't be used (helper missing, server unreachable, no common protocol version), the tab shows the error, as it does for a program that can't start.
+- **Isolated servers for tests:** `BRINDLE_SERVER_DIR` picks the server's directory, so each test gets its own server.
 
-- **All terminals go through `brindle-remote`, local ones too, on Linux and on Windows.** It becomes the terminal server everywhere, with one instance per user per host. The GUI only renders. Persistence is the same wherever the session lives.
-- **No tmux dependency.** This keeps Windows at parity and enables the eager display. tmux control mode stays as it is, as a separate persistence layer.
-- **A virtual buffer in `brindle-remote`.** The server runs an emulator per session and uses it for the first draw when a client attaches.
-- **Close behaviour is a per-profile option** for local and remote profiles alike, and it SHALL be respected in every case: closing a zone, tab or window, quitting, a crash, a dropped connection, and the shell exiting.
-- **`brindle-remote` gets management commands** (`list`, `kill`, `status`, `stop`), so sessions can be managed on the host itself.
-- **Session restore reattaches by session id,** and falls back to respawning in the recorded directory when the session is gone.
-- **Container profiles may start their container** when Brindle connects to them eagerly.
+Not in this phase:
+- the per-profile `on_close` option, reattaching on launch through `session-restore`, and the "sessions on host" palette (phase 2);
+- Windows (phase 3), where local tabs keep Brindle's in-process ConPTY;
+- remote profiles (phase 4), which keep the per-tab stdio helper, its heartbeat and its idle limit.
+
+tmux control-mode profiles (`tmux -C` over pipes) are unchanged. Classic tmux profiles run on a PTY, so they go through the server like any other local tab.
 
 ### Relation to `remote-connections-followups`
 
-This change would absorb or supersede three of that change's follow-ups:
+Phase 4 absorbs or supersedes three of that change's follow-ups:
 - follow-up 2 (lifecycle polling): the server replaces the per-tab cancel watcher, writer and `try_wait` loops;
 - follow-up 3 (an `Endpoint` type): a transport-agnostic server is the `Endpoint` type;
 - follow-up 4 (connection cost): one connection per host instead of per tab, and a long-lived helper instead of per-tab container copies.
 
-It would also replace the idle-limit requirement in `remote-connections`.
-
-## Open questions
-
-- The two decisions under "Unresolved decisions" in `design.md`: how an upgrade treats a running server that owns live sessions, and whether this change becomes the phased series. Both block phase 1.
-- Which, if any, of follow-ups 2–4 in `remote-connections-followups` are worth doing first.
+Phase 1 leaves them, and the idle-limit requirement in `remote-connections`, untouched.
 
 ## Capabilities
 
-Likely `remote-connections`, `terminal-emulation`, `tabs`, `zones`, `session-restore`, `command-line`, `configuration` and `profiles`, plus a new capability for the terminal server itself. `tmux-control-mode` is out of scope (see "Non-Goals" in `design.md`).
+### New Capabilities
+- `terminal-server`: the per-user server. It covers its lifetime, socket and access, sessions and their close policies, attach with replay, protocol versions, the in-place upgrade, isolation of failures, and the management commands.
+
+### Modified Capabilities
+- `terminal-emulation`: local Linux terminals run in the terminal server, with the launching Brindle's environment. Losing the server, or not being able to use it, is reported in the tab.
+- `command-line`: the `BRINDLE_SERVER_DIR` environment variable.
 
 ## Impact
 
-- `remote-agent/` and `remote-protocol/`: the helper becomes a long-lived server with a versioned protocol, a vt buffer, management commands and a Windows build.
-- `src/terminal/`: `Backend::Pty` goes away; the PTY side of `pty.rs`, `conpty.rs`, `cmdline.rs` and `process.rs` move into the helper.
-- `src/workspace.rs`, session restore and settings: the close option, reattach by session id, and eager connection with an offline state.
-- Tests: every e2e case needs an isolated server, and `tests/perf` baselines are taken before and after the extra IPC hop.
+- `remote-agent/`: a server mode with a poll loop over the socket, its clients and the PTYs. It also gets a per-session `alacritty_terminal::Term` (already in `Cargo.lock`) with a replay renderer, the handover (state serialization and re-exec), and the management subcommands. The stdio `--server` mode is kept for remote profiles.
+- `remote-protocol/`: a versioned, multiplexed socket protocol beside the existing stdio frames, with session ids, a hello/upgrade handshake, close policies, attach and replay markers.
+- `src/terminal/`: a server backend for local Linux tabs. Output is parsed on the connection's reader thread, as `pty.rs` does today, and process info is read from `/proc` with the pid the server reports. `Backend::Pty` remains only on Windows; its Unix side (alacritty's `tty::Pty` and `MarkedPty` in `pty.rs`) goes away.
+- `src/remote/`: a per-process connection to the local server that multiplexes every local terminal, found and started with the same helper lookup as remote deployment (`BRINDLE_REMOTE_AGENT`, then beside the executable).
+- Packaging: `scripts/install.sh` and the Linux archive already ship the helper. Dev and test runs need `cargo build -p brindle-remote-agent` too.
+- Tests: the e2e harness gives each case its own `BRINDLE_SERVER_DIR` and stops that server afterwards. The agent crate gets server tests (attach, replay, policies, handover, peer checks, management). `tests/perf` baselines are taken before and after the extra hop.
