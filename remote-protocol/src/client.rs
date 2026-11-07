@@ -184,6 +184,11 @@ pub struct Exit {
     /// `None` when the program was ended by a signal.
     #[serde(default)]
     pub code: Option<i32>,
+    /// Set when the session ended because the server lost it (its holder
+    /// ended), not because its program exited: why. A client keeps such a
+    /// tab open and says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,10 +525,17 @@ pub(crate) mod samples {
             ToClient::Exit(Exit {
                 session: 7,
                 code: Some(3),
+                lost: None,
             }),
             ToClient::Exit(Exit {
                 session: 8,
                 code: None,
+                lost: None,
+            }),
+            ToClient::Exit(Exit {
+                session: 9,
+                code: None,
+                lost: Some("its holder ended".into()),
             }),
             ToClient::ReplayStart(ReplayStart {
                 req: Some(2),

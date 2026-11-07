@@ -1292,6 +1292,18 @@ mod tests {
         assert!(marker.at() >= before && marker.at() <= Instant::now());
     }
 
+    #[test]
+    fn a_replay_raises_no_attention_but_keeps_its_state() {
+        use crate::notify::osc::Source;
+        let notice = Notice { source: Source::Osc9, title: "t".into(), body: "b".into() };
+        assert_eq!(quiet(TerminalEvent::Bell), None);
+        assert_eq!(quiet(TerminalEvent::Notify(notice.clone())), None);
+        assert_eq!(quiet(TerminalEvent::Status(Some(notice))), Some(TerminalEvent::Status(None)));
+        assert_eq!(quiet(TerminalEvent::Status(None)), Some(TerminalEvent::Status(None)));
+        assert_eq!(quiet(TerminalEvent::TitleChanged), Some(TerminalEvent::TitleChanged));
+        assert_eq!(quiet(TerminalEvent::Exited), Some(TerminalEvent::Exited));
+    }
+
     #[cfg(unix)]
     #[test]
     fn server_sessions_get_brindles_environment_with_the_profiles_over_it() {

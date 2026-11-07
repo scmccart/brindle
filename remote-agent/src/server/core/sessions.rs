@@ -265,6 +265,20 @@ impl<L: EventLoop> Core<L> {
             }
             return;
         }
+        // A client attached now is told the session was lost, not that its
+        // program exited, so it can keep the tab open and say why.
+        if let Some(client) = session.attached {
+            log!("session {id}: lost with its holder");
+            self.sessions.remove(&id);
+            return self.send_client(
+                client,
+                ToClient::Exit(Exit {
+                    session: id,
+                    code: None,
+                    lost: Some("its holder ended".into()),
+                }),
+            );
+        }
         self.session_exited(holder, id, None);
     }
 
@@ -359,7 +373,7 @@ impl<L: EventLoop> Core<L> {
         }
         let session = self.sessions.remove(&id).expect("the session");
         if let Some(client) = session.attached {
-            self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+            self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
     }
 
@@ -390,7 +404,7 @@ impl<L: EventLoop> Core<L> {
             session.awaiting_owner = false;
             if let Some(code) = session.exited {
                 self.sessions.remove(&id);
-                self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+                self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
                 continue;
             }
             self.replay(client, id, None, None);
@@ -677,7 +691,7 @@ impl<L: EventLoop> Core<L> {
         );
         if let Some(code) = exited {
             self.sessions.remove(&id);
-            return self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+            return self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
         if let Some((cols, rows)) = size
             && cols > 0

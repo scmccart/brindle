@@ -75,7 +75,7 @@ pub fn shared() -> Result<Arc<Connection>> {
     }
     let endpoint = Endpoint::from_env()?;
     let connected = connect(&endpoint, client_token())?;
-    let connection = Connection::start(endpoint, connected)?;
+    let connection = Connection::start(endpoint, client_token(), connected)?;
     *current = Some(connection.clone());
     Ok(connection)
 }
@@ -263,11 +263,26 @@ pub fn hello(mut stream: UnixStream, token: &str) -> Result<Connected> {
     }
 }
 
+/// The core answered `HELLO` with an `ERROR`: it shares no protocol
+/// version with this Brindle. Retrying won't help.
+#[derive(Debug)]
+pub struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the terminal server refused Brindle ({}); install a brindle-remote that matches it, \
+             or stop it with `brindle-remote stop` (its sessions end)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
 fn refused(message: &str) -> anyhow::Error {
-    anyhow!(
-        "the terminal server refused Brindle ({message}); install a brindle-remote that matches it, \
-         or stop it with `brindle-remote stop` (its sessions end)"
-    )
+    Refused(message.to_string()).into()
 }
 
 #[cfg(test)]

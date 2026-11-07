@@ -373,7 +373,7 @@ fn spawned(req: u64, session: u32, pid: u32) -> Step {
 }
 
 fn exit(session: u32, code: Option<i32>) -> Step {
-    s(client::ToClient::Exit(client::Exit { session, code }))
+    s(client::ToClient::Exit(client::Exit { session, code, lost: None }))
 }
 
 fn error(req: Option<u64>, session: Option<u32>, message: &str) -> Step {

@@ -74,3 +74,77 @@ impl SessionSink for Sink {
         self.send(ChannelEvent::Lost);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::term;
+    use futures::channel::mpsc::unbounded;
+
+    use super::*;
+    use crate::notify::osc::Found;
+    use crate::terminal::{GridSize, OutputMarker};
+
+    fn sink() -> (Sink, futures::channel::mpsc::UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
+        let (tx, rx) = unbounded();
+        let marker = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, marker.clone());
+        let term = Term::new(term::Config::default(), &GridSize::default(), listener.clone());
+        let sink = Sink::new(
+            Arc::new(FairMutex::new(term)),
+            Arc::new(Mutex::new(Parser::new())),
+            Arc::new(Mutex::new(Marks::default())),
+            listener,
+        );
+        (sink, rx, marker)
+    }
+
+    /// What the terminal's event task gets, by kind, in order.
+    fn kinds(rx: &mut futures::channel::mpsc::UnboundedReceiver<ChannelEvent>) -> Vec<&'static str> {
+        std::iter::from_fn(|| rx.try_next().ok().flatten())
+            .map(|event| match event {
+                ChannelEvent::Replay(true) => "replay-start",
+                ChannelEvent::Replay(false) => "replay-end",
+                ChannelEvent::Osc(Found::Notice(_)) => "notice",
+                ChannelEvent::Osc(_) => "osc",
+                ChannelEvent::Alac(AlacEvent::Bell) => "bell",
+                ChannelEvent::Alac(AlacEvent::Wakeup) => "wakeup",
+                ChannelEvent::Alac(AlacEvent::Exit) => "exit",
+                ChannelEvent::Alac(_) => "alac",
+                ChannelEvent::Lost => "lost",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn output_is_parsed_and_wakes_the_ui_like_a_pty_read() {
+        let (mut sink, mut rx, marker) = sink();
+        sink.output(b"hello\x1b]9;done\x07");
+        assert_eq!(kinds(&mut rx), ["notice", "wakeup"]);
+        assert_eq!(marker.generation(), 1);
+        assert!(crate::terminal::screen_text(&sink.term.lock()).starts_with("hello\n"));
+        sink.exited(Some(0));
+        assert_eq!(kinds(&mut rx), ["exit"]);
+    }
+
+    #[test]
+    fn a_replays_bell_and_notice_arrive_between_its_markers() {
+        let (mut sink, mut rx, _) = sink();
+        sink.replay(true);
+        sink.output(b"\x07\x1b]9;from the tail\x07");
+        sink.replay(false);
+        sink.output(b"\x07");
+        assert_eq!(
+            kinds(&mut rx),
+            ["replay-start", "notice", "bell", "wakeup", "replay-end", "bell", "wakeup"]
+        );
+    }
+
+    #[test]
+    fn a_lost_session_says_why_on_screen() {
+        let (mut sink, mut rx, _) = sink();
+        sink.lost("its holder ended");
+        assert_eq!(kinds(&mut rx), ["wakeup", "lost"]);
+        let text = crate::terminal::screen_text(&sink.term.lock());
+        assert!(text.contains("Session lost: its holder ended"), "{text}");
+    }
+}
