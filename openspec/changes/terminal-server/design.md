@@ -136,6 +136,16 @@ It uses the same frame header, with its own message numbers and its own version,
   - **A `kill` session explicitly `DETACH`ed** has no client and no policy that ends it. Phase 1's Brindle never detaches. Phase 2 must settle this with `on_close`.
   - **Rebuilding:** a replay asked for while an adopted session is still being rebuilt waits for the holder's tail.
   - **Fault injection for tests:** `BRINDLE_TEST_FEED_PANIC`, compiled in only with `debug_assertions`.
+- **Settled in task group 6:**
+  - **`STEP_DOWN`** flushes the checkpoints and `GOODBYE` to every holder (up to 10 s each) before `OK`. A `SPAWN` during a step-down is refused with "try again". `STEP_DOWN` is refused, with a log entry, only during a `STOP` or another step-down. A session still starting isn't checkpointed, and the next core adopts it from its holder.
+  - **Logging refusals:** `check` runs in the client, so it appends its refusal reason to `core.log` when the server directory exists, as well as printing it on stderr.
+  - **Draining:** every core sends `DRAIN` to any adopted holder of another build, not only after an upgrade. The core tracks the draining flag itself.
+  - **The commands:**
+    - With no server, `status --json` prints `{"running":false}`. With one, it prints `SERVER_STATUS` plus `"running": true`.
+    - `list` prints one tab-separated line per session (id, pid, attached or detached, command or "(login shell)", directory or "-"), with no header. With no server, `list --json` prints nothing.
+    - `kill` and `stop` with no server say so on stderr and exit 0.
+    - `status`'s client count includes the command's own connection.
+  - **Code layout:** the commands live in `remote-agent/src/server/cli.rs`. `brindle-remote-protocol` re-exports `serde_json`.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
