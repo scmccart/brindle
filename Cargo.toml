@@ -7,7 +7,9 @@ license = "MIT OR Apache-2.0"
 default-run = "brindle"
 
 [workspace]
-members = [".", "remote-agent", "remote-protocol"]
+members = [".", "remote-agent", "remote-protocol", "term-core"]
+# Every member, so plain `cargo build` also builds the `brindle-remote` helper.
+default-members = [".", "remote-agent", "remote-protocol", "term-core"]
 
 [dependencies]
 gpui = "0.2.2"
