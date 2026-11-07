@@ -472,7 +472,7 @@ pub struct Marks {
 }
 
 impl Marks {
-    #[cfg(test)]
+    /// The commands recorded, oldest first.
     pub fn commands(&self) -> &VecDeque<Command> {
         &self.commands
     }
@@ -847,7 +847,31 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::GridSize;
+
+    /// The size of a test grid (Brindle's `GridSize` lives in `brindle`).
+    struct GridSize {
+        cols: u16,
+        rows: u16,
+    }
+
+    impl Default for GridSize {
+        fn default() -> Self {
+            Self { cols: 80, rows: 24 }
+        }
+    }
+
+    impl Dimensions for GridSize {
+        fn total_lines(&self) -> usize {
+            self.rows as usize
+        }
+        fn screen_lines(&self) -> usize {
+            self.rows as usize
+        }
+        fn columns(&self) -> usize {
+            self.cols as usize
+        }
+    }
+
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term;
 

@@ -7,7 +7,9 @@ license = "MIT OR Apache-2.0"
 default-run = "brindle"
 
 [workspace]
-members = [".", "remote-agent", "remote-protocol"]
+members = [".", "remote-agent", "remote-protocol", "term-core"]
+# Every member, so plain `cargo build` also builds the `brindle-remote` helper.
+default-members = [".", "remote-agent", "remote-protocol", "term-core"]
 
 [dependencies]
 gpui = "0.2.2"
@@ -23,6 +25,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 brindle-remote-protocol = { path = "remote-protocol" }
+brindle-term-core = { path = "term-core" }
 sha2 = "0.10"
 smallvec = "1"
 toml = "0.8"

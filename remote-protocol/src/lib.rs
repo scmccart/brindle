@@ -2,7 +2,27 @@
 //!
 //! Each frame has a five-byte header followed by an opaque payload:
 //! `message_type: u8` and `payload_length: u32` (big endian). One agent
-//! process serves one session, so frames carry no session id.
+//! process serves one session, so the stdio frames in this module carry no
+//! session id.
+//!
+//! The terminal server's protocols use the same header with their own
+//! message numbers: [`client`] (client ↔ core, protocol 1) and [`holder`]
+//! (core ↔ holder, H1).
+
+pub mod build_id;
+pub mod client;
+pub mod holder;
+pub mod server_dir;
+pub mod version;
+mod wire;
+
+#[cfg(test)]
+mod fuzz;
+
+pub use wire::{RequestId, SessionId};
+/// Re-exported for the helper's `--json` output, so it needs no dependency
+/// of its own.
+pub use serde_json;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

@@ -32,7 +32,7 @@ fn tmux_windows(server: &TmuxServer) -> Result<usize> {
 /// Runs `first`, then `second` once `first` has had `gap` seconds to
 /// attach, as two Brindle processes. Both runs must use the same config:
 /// they share the case's `config.toml`.
-fn two_processes<'a>(ctx: &Ctx, gap: f64, first: Run<'a>, second: Run<'a>) -> Result<(Output, Output)> {
+pub(super) fn two_processes<'a>(ctx: &Ctx, gap: f64, first: Run<'a>, second: Run<'a>) -> Result<(Output, Output)> {
     let (first, second) = std::thread::scope(|scope| {
         let first = scope.spawn(|| first.run());
         ctx.sleep(gap);

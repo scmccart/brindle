@@ -120,6 +120,8 @@ enum Event {
     Record(Vec<String>, String),
     /// Rewrites the config with another theme (Brindle reloads it).
     Theme(&'static str),
+    /// Runs a check or an action, given Brindle's pid; an error fails the run.
+    Call(Box<dyn FnOnce(u32) -> Result + Send>),
 }
 
 /// One run of Brindle attached to a test server's session.
@@ -136,6 +138,10 @@ pub struct Run<'a> {
     expect_exit: bool,
     /// The window has no tabs at the dump, only a palette.
     without_tabs: bool,
+    /// A timeline call kills Brindle, so it prints no dump.
+    expect_killed: bool,
+    /// Another Brindle binary than `ctx.bin`.
+    bin: Option<std::path::PathBuf>,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     env_remove: Vec<String>,
@@ -166,6 +172,8 @@ impl<'a> Run<'a> {
             top: String::new(),
             expect_exit: false,
             without_tabs: false,
+            expect_killed: false,
+            bin: None,
             steps: Vec::new(),
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -258,6 +266,35 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Expects a [`Run::call_at`] to kill Brindle before the dump: the run
+    /// fails if Brindle exits successfully instead. The dump is empty.
+    pub fn expect_killed(mut self) -> Self {
+        self.expect_killed = true;
+        self
+    }
+
+    /// Runs another Brindle binary.
+    pub fn bin(mut self, path: &std::path::Path) -> Self {
+        self.bin = Some(path.to_path_buf());
+        self
+    }
+
+    /// Waits for `text` on the active terminal's screen before the next
+    /// step (`--wait-for`, at most 30 s). It takes a step's interval even
+    /// when the text is already there, so it also spaces steps out.
+    pub fn wait_for(mut self, text: &str) -> Self {
+        self.steps.extend(["--wait-for".to_string(), text.to_string()]);
+        self
+    }
+
+    /// Calls `call` with Brindle's pid `secs` after Brindle starts (stretched
+    /// like the other timeline events), on the timeline thread. Its error
+    /// fails the run; later events wait for it to return.
+    pub fn call_at(mut self, secs: f64, call: impl FnOnce(u32) -> Result + Send + 'static) -> Self {
+        self.timeline.push((secs, Event::Call(Box::new(call))));
+        self
+    }
+
     /// Expects the dumped window to have no tabs, only an open palette, so
     /// the dump has no screen.
     pub fn without_tabs(mut self) -> Self {
@@ -323,7 +360,7 @@ impl<'a> Run<'a> {
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
-        let mut command = Command::new(&ctx.bin);
+        let mut command = Command::new(self.bin.as_ref().unwrap_or(&ctx.bin));
         if self.restore {
             command.env("BRINDLE_STATE_DIR", state_dir(ctx));
         } else {
@@ -338,6 +375,7 @@ impl<'a> Run<'a> {
             .args(ctx.step_interval())
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
+            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
             .env("DISPLAY", &ctx.display)
             .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -354,6 +392,7 @@ impl<'a> Run<'a> {
         let slow = ctx.secs(1.0);
         let config_for_reload = config_path.clone();
         let (case_dir, label) = (ctx.dir.clone(), self.label);
+        let brindle_pid = child.id();
         let events = std::thread::spawn(move || -> Vec<String> {
             let mut errors = Vec::new();
             for (secs, event) in timeline {
@@ -390,6 +429,11 @@ impl<'a> Run<'a> {
                             errors.push(format!("rewriting config: {e}"));
                         }
                     }
+                    Event::Call(call) => {
+                        if let Err(e) = call(brindle_pid) {
+                            errors.push(e);
+                        }
+                    }
                 }
             }
             errors
@@ -421,6 +465,10 @@ impl<'a> Run<'a> {
         let errors = events.join().unwrap_or_default();
         ensure!(errors.is_empty(), "timeline: {}", errors.join("; "));
         let dump = Dump::parse(&stdout);
+        if self.expect_killed {
+            ensure!(!status.success(), "Brindle exited by itself ({status}); see {}.log", self.label);
+            return Ok(Output { dump, image });
+        }
         if self.expect_exit {
             ensure!(
                 dump.tabs.is_empty() && dump.size.is_none(),

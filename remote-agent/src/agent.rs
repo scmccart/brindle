@@ -25,13 +25,10 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::ffi::{OsStr, OsString};
-    use std::fs::{self, File};
     use std::io::{self, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-    use std::path::PathBuf;
-    use std::process::{Child, Command, Stdio};
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Child;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -40,16 +37,16 @@ mod platform {
 
     use brindle_remote_protocol::{
         ExitMessage, FRAME_STREAM_MARKER, Frame, MSG_DATA, MSG_EXIT, MSG_HEARTBEAT,
-        MSG_QUERY_PROCESS, MSG_RESIZE, MSG_SPAWN, ProcessInfo, ResizeRequest, SpawnRequest,
-        SpawnResponse, validate_idle_limit,
+        MSG_QUERY_PROCESS, MSG_RESIZE, MSG_SPAWN, ResizeRequest, SpawnRequest, SpawnResponse,
+        validate_idle_limit,
     };
 
-    const OUTPUT_CHUNK_SIZE: usize = 32 * 1024;
+    use crate::pty::{
+        self, FORCED_SHUTDOWN, GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE,
+        OUTPUT_DRAIN_LIMIT, PtyCommand, inspect_process, set_nonblocking, signal_process_group,
+    };
+
     const EVENT_INTERVAL: Duration = Duration::from_millis(50);
-    const GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(1);
-    const FORCED_SHUTDOWN: Duration = Duration::from_secs(1);
-    const OUTPUT_DRAIN_IDLE: Duration = Duration::from_millis(250);
-    const OUTPUT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
     /// How long the client may stop draining output before the session ends.
     /// Long enough to ride out a network stall or a laptop wake; a dead
     /// transport is detected separately (stdout write error, stdin EOF, ssh
@@ -146,211 +143,22 @@ mod platform {
     }
 
     fn spawn_pty(request: &SpawnRequest) -> io::Result<SpawnedSession> {
-        let winsize = make_winsize(
-            request.cols,
-            request.rows,
-            request.cell_width,
-            request.cell_height,
-        );
-        let (master, slave) = open_pty(&winsize)?;
-        set_nonblocking(master.as_raw_fd())?;
-
-        let slave_stdin = duplicate_fd(slave.as_raw_fd())?;
-        let slave_stdout = duplicate_fd(slave.as_raw_fd())?;
-        let shell = default_shell(request);
-        let mut command = command_for(request, shell.clone());
-        if request.command.is_none() {
-            // The default session is a login shell, as a terminal emulator or
-            // sshd would start it.
-            if let Some(name) = std::path::Path::new(&shell).file_name() {
-                let mut login = OsString::from("-");
-                login.push(name);
-                command.arg0(login);
-            }
-        }
-        if !request.env.contains_key("TERM") {
-            command.env("TERM", "xterm-256color");
-        }
-        command
-            .stdin(Stdio::from(File::from(slave_stdin)))
-            .stdout(Stdio::from(File::from(slave_stdout)))
-            .stderr(Stdio::from(File::from(slave)));
-
-        // The child must become a session leader and acquire the slave as its
-        // controlling terminal for shell job control and tcgetpgrp to work.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let child = command.spawn()?;
-        let pid = child.id() as libc::pid_t;
+        let spawned = pty::spawn(&PtyCommand {
+            command: request.command.as_deref(),
+            args: &request.args,
+            cwd: request.cwd.as_deref(),
+            env: &request.env,
+            cols: request.cols,
+            rows: request.rows,
+            cell_width: request.cell_width,
+            cell_height: request.cell_height,
+            exact_env: false,
+        })?;
         Ok(SpawnedSession {
-            pid,
-            child,
-            master: Arc::new(master),
+            pid: spawned.pid,
+            child: spawned.child,
+            master: Arc::new(spawned.master),
         })
-    }
-
-    fn command_for(request: &SpawnRequest, default_program: OsString) -> Command {
-        let program = request
-            .command
-            .as_ref()
-            .map(|program| OsString::from(program.as_str()))
-            .unwrap_or(default_program);
-        let mut command = Command::new(program);
-        command.args(&request.args).envs(&request.env);
-        if let Some(cwd) = &request.cwd {
-            // A directory that does not exist here (a path inherited from a
-            // different host, or since deleted) starts the session in $HOME.
-            let wanted = expand_remote_cwd(cwd, &request.env);
-            if wanted.is_dir() {
-                command.current_dir(wanted);
-            } else if let Some(home) = home_dir(&request.env).filter(|home| home.is_dir()) {
-                command.current_dir(home);
-            }
-        }
-        command
-    }
-
-    fn home_dir(env: &std::collections::BTreeMap<String, String>) -> Option<PathBuf> {
-        env.get("HOME")
-            .filter(|home| !home.is_empty())
-            .map(OsStr::new)
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .filter(|home| !home.is_empty())
-                    .map(PathBuf::from)
-            })
-            .or_else(|| passwd_entry().map(|(_, home)| home))
-    }
-
-    /// The login shell and home directory of the current user from the
-    /// passwd database. `docker exec` sets no `SHELL`.
-    fn passwd_entry() -> Option<(OsString, PathBuf)> {
-        use std::ffi::CStr;
-        use std::os::unix::ffi::OsStringExt;
-
-        let mut buffer = vec![0u8; 4096];
-        let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-        let mut found: *mut libc::passwd = std::ptr::null_mut();
-        let status = unsafe {
-            libc::getpwuid_r(
-                libc::getuid(),
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if status != 0 || found.is_null() {
-            return None;
-        }
-        let entry = unsafe { entry.assume_init() };
-        if entry.pw_shell.is_null() || entry.pw_dir.is_null() {
-            return None;
-        }
-        let shell = unsafe { CStr::from_ptr(entry.pw_shell) }.to_bytes().to_vec();
-        let dir = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes().to_vec();
-        Some((
-            OsString::from_vec(shell),
-            PathBuf::from(OsString::from_vec(dir)),
-        ))
-    }
-
-    fn expand_remote_cwd(cwd: &str, env: &std::collections::BTreeMap<String, String>) -> PathBuf {
-        let home = || home_dir(env);
-        if cwd == "~" {
-            return home().unwrap_or_else(|| PathBuf::from(cwd));
-        }
-        if let Some(rest) = cwd.strip_prefix("~/")
-            && let Some(home) = home()
-        {
-            return home.join(rest);
-        }
-        PathBuf::from(cwd)
-    }
-
-    fn default_shell(request: &SpawnRequest) -> OsString {
-        request
-            .env
-            .get("SHELL")
-            .filter(|shell| !shell.is_empty())
-            .map(|shell| OsString::from(shell.as_str()))
-            .or_else(|| std::env::var_os("SHELL").filter(|shell| !shell.is_empty()))
-            .or_else(|| {
-                passwd_entry()
-                    .map(|(shell, _)| shell)
-                    .filter(|shell| !shell.is_empty() && PathBuf::from(shell).exists())
-            })
-            .unwrap_or_else(|| OsString::from("/bin/sh"))
-    }
-
-    fn open_pty(winsize: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut master = -1;
-        let mut slave = -1;
-        let result = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                winsize,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if master >= 0 {
-                unsafe { libc::close(master) };
-            }
-            if slave >= 0 {
-                unsafe { libc::close(slave) };
-            }
-            return Err(error);
-        }
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        set_close_on_exec(master.as_raw_fd())?;
-        set_close_on_exec(slave.as_raw_fd())?;
-        Ok((master, slave))
-    }
-
-    fn set_close_on_exec(fd: RawFd) -> io::Result<()> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn duplicate_fd(fd: RawFd) -> io::Result<OwnedFd> {
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-        if duplicate == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-    }
-
-    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     #[derive(Debug)]
@@ -515,13 +323,7 @@ mod platform {
         loop {
             match event_rx.recv_timeout(EVENT_INTERVAL) {
                 Ok(Event::Incoming(frame)) => {
-                    match handle_frame(
-                        frame,
-                        master_fd,
-                        session.pid,
-                        &child_exited,
-                        &outgoing_tx,
-                    ) {
+                    match handle_frame(frame, master_fd, session.pid, &child_exited, &outgoing_tx) {
                         Ok(FrameAction::Continue) => {}
                         Ok(FrameAction::Shutdown) => shutdown.begin(child_waited),
                         Err(error) => {
@@ -1030,85 +832,14 @@ mod platform {
         Ok(())
     }
 
-    fn make_winsize(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> libc::winsize {
-        libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: cols.saturating_mul(cell_width),
-            ws_ypixel: rows.saturating_mul(cell_height),
-        }
-    }
-
     fn resize_pty(fd: RawFd, request: &ResizeRequest) -> io::Result<()> {
-        let winsize = make_winsize(
+        pty::resize(
+            fd,
             request.cols,
             request.rows,
             request.cell_width,
             request.cell_height,
-        );
-        if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn inspect_process(pty_fd: RawFd, child_pid: libc::pid_t) -> ProcessInfo {
-        let foreground_group = Some(unsafe { libc::tcgetpgrp(pty_fd) }).filter(|pid| *pid > 0);
-        let pid = foreground_group
-            .and_then(find_process_in_group)
-            .unwrap_or(child_pid);
-        let proc_dir = format!("/proc/{pid}");
-        let foreground_name = fs::read_to_string(format!("{proc_dir}/comm"))
-            .ok()
-            .map(|name| {
-                name.trim_end_matches(|character| character == '\r' || character == '\n')
-                    .to_owned()
-            })
-            .filter(|name| !name.is_empty());
-        let cwd = fs::read_link(format!("{proc_dir}/cwd"))
-            .or_else(|_| fs::read_link(format!("/proc/{child_pid}/cwd")))
-            .ok()
-            .map(|path| path.to_string_lossy().into_owned());
-        ProcessInfo {
-            pid: pid.max(0) as u32,
-            foreground_name,
-            cwd,
-        }
-    }
-
-    fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
-        if process_group(group) == Some(group) {
-            return Some(group);
-        }
-        let entries = fs::read_dir("/proc").ok()?;
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::pid_t>().ok())
-            else {
-                continue;
-            };
-            if process_group(pid) == Some(group) {
-                return Some(pid);
-            }
-        }
-        None
-    }
-
-    fn process_group(pid: libc::pid_t) -> Option<libc::pid_t> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let fields = stat.get(stat.rfind(')')? + 1..)?;
-        // Fields after the command are: state (3), ppid (4), pgrp (5).
-        fields.split_whitespace().nth(2)?.parse().ok()
-    }
-
-    fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) {
-        if pid > 0 {
-            unsafe {
-                libc::kill(-pid, signal);
-            }
-        }
+        )
     }
 
     #[cfg(test)]
@@ -1171,20 +902,6 @@ mod platform {
             live.finish_handover(start + limit * 10);
             assert!(!live.expired(start + limit * 10 + Duration::from_secs(1), limit));
             assert!(live.expired(start + limit * 11, limit));
-        }
-
-        #[test]
-        fn cwd_tilde_uses_remote_environment_home() {
-            let env = [("HOME".to_string(), "/home/remote".to_string())].into();
-            assert_eq!(expand_remote_cwd("~", &env), PathBuf::from("/home/remote"));
-            assert_eq!(
-                expand_remote_cwd("~/src tree", &env),
-                PathBuf::from("/home/remote/src tree")
-            );
-            assert_eq!(
-                expand_remote_cwd("/srv/app", &env),
-                PathBuf::from("/srv/app")
-            );
         }
     }
 }

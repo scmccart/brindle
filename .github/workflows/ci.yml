@@ -87,7 +87,7 @@ jobs:
         with:
           shared-key: dev
       # Brindle matches its remote helper by version, and release-please
-      # bumps all three crates together, so they never differ.
+      # bumps all four crates together, so they never differ.
       - name: Check the workspace crates share one version
         run: |
           versions=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "\(.name) \(.version)"')

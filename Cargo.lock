@@ -679,6 +679,7 @@ dependencies = [
  "anyhow",
  "base64",
  "brindle-remote-protocol",
+ "brindle-term-core",
  "dirs 5.0.1",
  "embed-resource",
  "env_logger",
@@ -711,6 +712,7 @@ name = "brindle-remote-agent"
 version = "0.3.0"
 dependencies = [
  "brindle-remote-protocol",
+ "brindle-term-core",
  "libc",
 ]
 
@@ -720,6 +722,15 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "brindle-term-core"
+version = "0.3.0"
+dependencies = [
+ "alacritty_terminal",
+ "base64",
+ "parking_lot",
 ]
 
 [[package]]

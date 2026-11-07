@@ -14,7 +14,7 @@ use base64::Engine as _;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
-use crate::notify::osc::{Notice, Source};
+use crate::notice::{Notice, Source};
 
 /// What a record says its program is doing, least pressing first: a tab
 /// shows the greatest state among its records.
@@ -87,6 +87,36 @@ pub struct Record {
     pub title: Option<String>,
     /// One line: what the record is doing, waiting for, or finished.
     pub msg: Option<String>,
+}
+
+impl Record {
+    /// The OSC 7501 body (after `7501;`) that [`parse`] reads back as this
+    /// record with id `id`.
+    pub fn encode(&self, id: &str) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        let mut out = format!("state={}", self.state.name());
+        if !id.is_empty() {
+            out.push_str(":id=");
+            out.push_str(id);
+        }
+        if let Some(kind) = self.kind {
+            out.push_str(":kind=");
+            out.push_str(kind.name());
+        }
+        if let Some(progress) = self.progress {
+            out.push_str(&format!(":progress={progress}"));
+        }
+        if let Some(app) = &self.app {
+            out.push_str(":app=");
+            out.push_str(app);
+        }
+        for (key, text) in [("title", &self.title), ("msg", &self.msg)] {
+            if let Some(text) = text {
+                out.push_str(&format!(":{key}={}", STANDARD.encode(text)));
+            }
+        }
+        out
+    }
 }
 
 /// One parsed OSC 7501 body.
@@ -292,6 +322,14 @@ impl Records {
     /// Every record, root first, then by id.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Record)> {
         self.map.iter().map(|(id, e)| (id.as_str(), &e.record))
+    }
+
+    /// Every record, least recently updated first: replaying them in this
+    /// order rebuilds the same eviction order.
+    pub fn iter_by_update(&self) -> impl Iterator<Item = (&str, &Record)> {
+        let mut entries: Vec<_> = self.map.iter().collect();
+        entries.sort_by_key(|(_, e)| e.updated);
+        entries.into_iter().map(|(id, e)| (id.as_str(), &e.record))
     }
 
     /// Applies a report or a clear (queries are answered elsewhere).

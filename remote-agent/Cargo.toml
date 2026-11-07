@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 brindle-remote-protocol = { path = "../remote-protocol" }
+brindle-term-core = { path = "../term-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

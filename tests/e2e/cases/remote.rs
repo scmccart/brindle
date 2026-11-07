@@ -755,6 +755,7 @@ fn run_brindle(
         .args(["--dump-screen-after", &dump_after.to_string()])
         .env("BRINDLE_CONFIG", &config_path)
         .env("BRINDLE_REMOTE_AGENT", agent)
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env(
             "BRINDLE_NOTIFY_LOG",
             ctx.dir.join(format!("{label}.notify")),

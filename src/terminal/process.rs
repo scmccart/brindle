@@ -97,33 +97,22 @@ fn windows_rows() -> Vec<ProcessRow> {
 #[derive(Clone, Copy, Debug)]
 pub struct PtyProcess {
     child_pid: u32,
-    /// The PTY master, for `tcgetpgrp`. It stays open for as long as the
-    /// event loop owns the PTY.
-    #[cfg(unix)]
-    master_fd: i32,
 }
 
 impl PtyProcess {
-    #[cfg(unix)]
-    pub fn new(child_pid: u32, master_fd: i32) -> Self {
-        Self { child_pid, master_fd }
-    }
-
-    #[cfg(not(unix))]
     pub fn new(child_pid: u32) -> Self {
         Self { child_pid }
     }
 
-    /// The PTY's foreground process group, which is its leader's pid.
-    #[cfg(unix)]
+    /// The PTY's foreground process group, which is its leader's pid. The
+    /// PTY belongs to the terminal server, so it is read from `/proc`, as
+    /// the controlling terminal of the tab's program.
+    #[cfg(target_os = "linux")]
     fn foreground_pid(&self) -> Option<u32> {
-        // SAFETY: tcgetpgrp has no memory-safety preconditions; a stale fd
-        // only makes it fail.
-        let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
-        (pgrp > 0).then_some(pgrp as u32)
+        terminal_foreground(self.child_pid)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     fn foreground_pid(&self) -> Option<u32> {
         None
     }
@@ -142,10 +131,28 @@ impl PtyProcess {
 
     /// Current working directory of the foreground process (falls back to
     /// the program the tab started).
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn working_directory(&self) -> Option<PathBuf> {
         let pid = self.foreground_pid().unwrap_or(self.child_pid);
         process_cwd(pid).or_else(|| process_cwd(self.child_pid))
     }
+}
+
+/// The foreground process group of `pid`'s controlling terminal: the
+/// `tpgid` field of `/proc/<pid>/stat`. `None` without a terminal.
+#[cfg(target_os = "linux")]
+pub fn terminal_foreground(pid: u32) -> Option<u32> {
+    parse_tpgid(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// `tpgid` from a `/proc/<pid>/stat` line. The command name is in
+/// parentheses and may hold spaces and parentheses itself, so the fields
+/// are counted from the last `)`: state, ppid, pgrp, session, tty_nr, tpgid.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_tpgid(stat: &str) -> Option<u32> {
+    let fields = &stat[stat.rfind(')')? + 1..];
+    let tpgid: i64 = fields.split_whitespace().nth(5)?.parse().ok()?;
+    u32::try_from(tpgid).ok().filter(|&pgid| pgid > 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -227,5 +234,70 @@ mod tests {
         let pid = std::process::id();
         assert!(process_name(pid).is_some_and(|name| !name.is_empty()));
         assert_eq!(process_cwd(pid), std::env::current_dir().ok());
+    }
+
+    #[test]
+    fn tpgid_is_counted_from_the_last_parenthesis() {
+        assert_eq!(parse_tpgid("42 (bash) S 1 42 42 34816 4321 4194560 0 0"), Some(4321));
+        assert_eq!(parse_tpgid("42 (a) b (c)) S 1 42 42 34816 77 0"), Some(77));
+        assert_eq!(parse_tpgid("42 (sleep) S 1 42 42 0 -1 0"), None);
+        assert_eq!(parse_tpgid("42 (sleep) S 1"), None);
+        assert_eq!(parse_tpgid(""), None);
+    }
+
+    /// A child on a PTY of its own, as a holder starts a session's program:
+    /// a shell with job control running `sleep` in the foreground, in /tmp.
+    #[test]
+    fn the_foreground_job_of_a_spawned_child() {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty fills both fds on success; they are owned below.
+        let opened = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+        };
+        assert_eq!(opened, 0);
+        // SAFETY: freshly opened, owned here.
+        let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "set -m; sleep 30; :"])
+            .current_dir("/tmp")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let process = PtyProcess::new(child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut name = None;
+        while Instant::now() < deadline {
+            name = process.foreground_name(&Snapshot::default());
+            if name.as_deref() == Some("sleep") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let foreground = terminal_foreground(child.id());
+        let cwd = process.working_directory();
+        child.kill().ok();
+        child.wait().ok();
+        if let Some(sleep) = foreground {
+            unsafe { libc::kill(sleep as i32, libc::SIGKILL) };
+        }
+        assert_eq!(name.as_deref(), Some("sleep"));
+        assert_ne!(foreground, Some(child.id()), "the job has its own group");
+        assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/tmp")));
     }
 }

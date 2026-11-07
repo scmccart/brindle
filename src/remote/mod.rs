@@ -5,9 +5,13 @@
 //! directly because tmux control mode already is a byte-stream protocol.
 
 pub mod client;
+#[cfg(target_os = "linux")]
+pub mod local;
 pub use brindle_remote_protocol as protocol;
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -24,6 +28,29 @@ pub(crate) fn hide_window(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(command, crate::win::CREATE_NO_WINDOW);
     command
+}
+
+/// The names the `brindle-remote` helper goes by beside Brindle: the Linux
+/// archive's, then the one `scripts/install.sh` and cargo build.
+const HELPER_NAMES: [&str; 2] = ["brindle-remote-linux-x86_64", "brindle-remote"];
+
+/// The `brindle-remote` helper, for remote tabs and for the local terminal
+/// server alike: `BRINDLE_REMOTE_AGENT`, else beside Brindle's executable.
+/// `None` when there is none; each caller says how to fix that.
+pub(crate) fn find_helper() -> Result<Option<PathBuf>> {
+    let exe = std::env::current_exe().context("locating Brindle executable")?;
+    find_helper_in(std::env::var_os("BRINDLE_REMOTE_AGENT"), &exe)
+}
+
+fn find_helper_in(variable: Option<OsString>, exe: &Path) -> Result<Option<PathBuf>> {
+    if let Some(path) = variable.filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+        bail!("BRINDLE_REMOTE_AGENT does not name a file: {}", path.display());
+    }
+    Ok(HELPER_NAMES.iter().map(|name| exe.with_file_name(name)).find(|path| path.is_file()))
 }
 
 /// Waits for `child` to exit, killing it if `cancel` is set or `timeout`
@@ -355,6 +382,25 @@ mod tests {
         assert!(script.contains("src tree"), "{script}");
         assert!(script.contains("exec tmux -C new-session"), "{script}");
         assert!(!script.contains(" -c "));
+    }
+
+    #[test]
+    fn the_helper_is_the_variable_or_beside_brindle() {
+        let dir = std::env::temp_dir().join(format!("brindle-find-helper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("brindle");
+        assert_eq!(find_helper_in(None, &exe).unwrap(), None);
+        std::fs::write(dir.join("brindle-remote"), b"").unwrap();
+        assert_eq!(find_helper_in(None, &exe).unwrap(), Some(dir.join("brindle-remote")));
+        assert_eq!(find_helper_in(Some("".into()), &exe).unwrap(), Some(dir.join("brindle-remote")));
+        std::fs::write(dir.join("brindle-remote-linux-x86_64"), b"").unwrap();
+        assert_eq!(find_helper_in(None, &exe).unwrap(), Some(dir.join("brindle-remote-linux-x86_64")));
+        let named = dir.join("elsewhere");
+        let error = find_helper_in(Some(named.clone().into()), &exe).unwrap_err();
+        assert!(error.to_string().contains("does not name a file"), "{error}");
+        std::fs::write(&named, b"").unwrap();
+        assert_eq!(find_helper_in(Some(named.clone().into()), &exe).unwrap(), Some(named));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
