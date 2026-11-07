@@ -53,7 +53,7 @@ use self::clients::{Client, Pending};
 use self::holders::{Holder, HolderStart, WaitingSpawn};
 use self::sessions::Session;
 use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
-use super::{build_id, daemon, dir};
+use super::{build_id, conn, daemon, dir};
 
 /// With no sessions and no clients for this long, the core exits.
 pub const UNUSED_LIMIT: Duration = Duration::from_secs(5);
@@ -460,28 +460,114 @@ impl<L: EventLoop> Core<L> {
             .is_some_and(|since| now.duration_since(since) >= UNUSED_LIMIT)
     }
 
+    /// Closes these holders' and clients' connections gracefully, all at
+    /// once, within `limit`: each gets its queue and the connection's end,
+    /// and the core reads until the peer closes too, since closing with
+    /// unread input resets the connection and loses what the peer hadn't
+    /// read yet. Holders' output and exits still go to their clients
+    /// meanwhile. Each closed connection is dropped; the result lists those
+    /// that failed or ran out of time.
+    fn close_peers(
+        &mut self,
+        holders: &[Token],
+        clients: &[Token],
+        limit: Duration,
+    ) -> Vec<(Token, io::Error)> {
+        let deadline = Instant::now() + limit;
+        let mut open: Vec<(Token, bool)> = holders
+            .iter()
+            .map(|&token| (token, true))
+            .chain(clients.iter().map(|&token| (token, false)))
+            .collect();
+        let mut failed = Vec::new();
+        loop {
+            let mut still = Vec::new();
+            for (token, holder) in open {
+                let step = if holder {
+                    let Some(entry) = self.holders.get_mut(&token) else {
+                        continue;
+                    };
+                    let step = entry.conn.close_step();
+                    self.closing_holder_frames(token);
+                    step
+                } else {
+                    let Some(entry) = self.clients.get_mut(&token) else {
+                        continue;
+                    };
+                    let step = entry.conn.close_step();
+                    entry.conn.discard_input();
+                    step
+                };
+                match step {
+                    Ok(false) => still.push((token, holder)),
+                    Ok(true) => self.forget_peer(token, holder),
+                    Err(error) => {
+                        failed.push((token, error));
+                        self.forget_peer(token, holder);
+                    }
+                }
+            }
+            open = still;
+            if open.is_empty() {
+                return failed;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let conns: Vec<&conn::Conn> = open
+                .iter()
+                .filter_map(|&(token, holder)| {
+                    if holder {
+                        self.holders.get(&token).map(|entry| &entry.conn)
+                    } else {
+                        self.clients.get(&token).map(|entry| &entry.conn)
+                    }
+                })
+                .collect();
+            if remaining.is_zero() {
+                failed.extend(
+                    open.iter()
+                        .zip(&conns)
+                        .map(|(&(token, _), conn)| (token, conn.unfinished())),
+                );
+                return failed;
+            }
+            conn::wait(&conns, remaining);
+        }
+    }
+
+    /// Drops a peer's connection while the core exits.
+    fn forget_peer(&mut self, token: Token, holder: bool) {
+        self.drop_source(token);
+        if holder {
+            self.holders.remove(&token);
+        } else {
+            self.clients.remove(&token);
+        }
+    }
+
     fn shutdown(mut self) {
         // Nothing can find this core once the socket is gone.
         let _ = fs::remove_file(&self.paths.socket);
         let stepped_down = self.stepping_down.take();
         if stepped_down.is_some() {
             // The checkpoints and GOODBYEs reach the holders before the
-            // client hears OK, so the core it starts next finds them.
-            for holder in self.holders.values_mut() {
-                if let Err(error) = holder.conn.flush_for(STEP_DOWN_FLUSH_LIMIT) {
-                    log!("a holder didn't take its checkpoints: {error}");
-                }
+            // client hears OK, so the core it starts next finds them. What
+            // the holders sent before their GOODBYE still reaches the
+            // clients.
+            let holders: Vec<Token> = self.holders.keys().copied().collect();
+            for (_, error) in self.close_peers(&holders, &[], STEP_DOWN_FLUSH_LIMIT) {
+                log!("a holder didn't take its checkpoints: {error}");
             }
         }
         let stopped = self.stopping.take();
         if let Some(answer) = stopped.as_ref().or(stepped_down.as_ref()) {
             self.send_client(answer.client, ToClient::Ok(Request { req: answer.req }));
         }
-        for client in self.clients.values_mut() {
-            let _ = client.conn.flush_for(EXIT_FLUSH_LIMIT);
-        }
-        for holder in self.holders.values_mut() {
-            let _ = holder.conn.flush_for(EXIT_FLUSH_LIMIT);
+        let holders: Vec<Token> = self.holders.keys().copied().collect();
+        let clients: Vec<Token> = self.clients.keys().copied().collect();
+        for (token, error) in self.close_peers(&holders, &clients, EXIT_FLUSH_LIMIT) {
+            if holders.contains(&token) {
+                log!("holder {token} didn't take its last messages: {error}");
+            }
         }
         if stepped_down.is_some() {
             log!(

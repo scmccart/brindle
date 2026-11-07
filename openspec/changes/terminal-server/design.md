@@ -155,6 +155,7 @@ It uses the same frame header, with its own message numbers and its own version,
   - **The holder sets `IUTF8`** on every PTY, as alacritty did, so line editing handles multibyte characters.
   - **Spawning never blocks the UI thread:** `Terminal::spawn` returns at once, and the connection, a reconnect or an upgrade's step-down finishes in the background, with input queued, as `Backend::Agent` does.
   - **e2e server directories** are under `/tmp`, not `target/tmp/e2e/<case>/`, because holder socket paths there exceed the 108-byte `sun_path` limit. The harness copies `core.log` into the case directory.
+  - **Closing connections (found by the perf run):** closing a Unix socket with unread input resets the connection, and the peer loses what it hadn't read yet. So an exiting holder sends its whole queue (a flood's output, then `EXITED`), shuts its write side and reads until the core closes, for up to 10 s, logging an expiry. An exiting core does the same with every client and holder, and during a step-down still forwards the holders' output and exits to clients. A holder that got `GOODBYE` keeps later exits for the next `WELCOME`. Both sides process what they read before a read error.
   - **`local-server-no-helper`** installs the helper beside a linked copy of Brindle while it runs, as the spec's "Recovery" scenario says, because a running Brindle's `BRINDLE_REMOTE_AGENT` can't change.
 
 ### Client protocol

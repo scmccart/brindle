@@ -238,9 +238,12 @@ impl<L: EventLoop> Core<L> {
         let Some(holder) = self.holders.get_mut(&token) else {
             return;
         };
-        let eof = match holder.conn.read_available() {
-            Ok(eof) => eof,
-            Err(error) => return self.drop_holder(token, &format!("read failed: {error}")),
+        // What was read before a failure still counts: a holder's last
+        // messages (`EXITED`) come right before its end.
+        let ended = match holder.conn.read_available() {
+            Ok(false) => None,
+            Ok(true) => Some("the connection closed".to_string()),
+            Err(error) => Some(format!("read failed: {error}")),
         };
         loop {
             let Some(holder) = self.holders.get_mut(&token) else {
@@ -256,8 +259,27 @@ impl<L: EventLoop> Core<L> {
                 Err(error) => log!("holder {token} sent a bad message: {error}"),
             }
         }
-        if eof {
-            self.drop_holder(token, "the connection closed");
+        if let Some(reason) = ended {
+            self.drop_holder(token, &reason);
+        }
+    }
+
+    /// While the core exits, a holder's output and exits still reach the
+    /// attached clients, whose connections close after the holders'.
+    /// Everything else it says is moot now.
+    pub(super) fn closing_holder_frames(&mut self, token: Token) {
+        loop {
+            let Some(holder) = self.holders.get_mut(&token) else {
+                return;
+            };
+            let frame = match holder.conn.next_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return,
+                Err(_) => return holder.conn.discard_input(),
+            };
+            if let Ok(message @ (ToCore::Output(_) | ToCore::Exited(_))) = ToCore::decode(&frame) {
+                self.handle_holder(token, message);
+            }
         }
     }
 
@@ -443,6 +465,12 @@ impl<L: EventLoop> Core<L> {
         if holder.draining && lost.is_empty() {
             log!(
                 "drain: holder {} (pid {:?}) ended its last session and exited",
+                holder.socket.display(),
+                holder.welcome.as_ref().map(|welcome| welcome.pid),
+            );
+        } else if lost.is_empty() {
+            log!(
+                "holder {} (pid {:?}) closed its connection with no sessions ({reason})",
                 holder.socket.display(),
                 holder.welcome.as_ref().map(|welcome| welcome.pid),
             );

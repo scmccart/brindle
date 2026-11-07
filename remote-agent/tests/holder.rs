@@ -148,6 +148,110 @@ fn exit_statuses_are_reported_and_an_empty_holder_exits() {
     );
 }
 
+/// Reads at most `chunk` bytes per call, pausing before each: a core
+/// slower than the program's output.
+struct Throttled<R> {
+    inner: R,
+    chunk: usize,
+    pause: Duration,
+}
+
+impl<R: std::io::Read> std::io::Read for Throttled<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.pause);
+        let len = buffer.len().min(self.chunk);
+        self.inner.read(&mut buffer[..len])
+    }
+}
+
+/// A flood followed by the program's exit, read by a core much slower than
+/// the holder's queue fills: the holder must deliver every byte and the
+/// `EXITED` before it exits, however long that takes (within its bound),
+/// and leave without resetting the connection while the core still writes.
+#[test]
+fn an_exiting_holder_delivers_a_flood_and_its_exit_to_a_slow_core() {
+    const FLOOD: usize = 6 * 1024 * 1024;
+    let mut dir = TempDir::new("flood");
+    start_holder(&dir.path);
+    let socket = dir.holder_sockets().remove(0);
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let send = |stream: &mut std::os::unix::net::UnixStream, message: ToHolder| {
+        message.encode().unwrap().write_to(stream).unwrap()
+    };
+    send(
+        &mut stream,
+        ToHolder::Hello(h1::Hello {
+            min: h1::PROTOCOLS.min,
+            max: h1::PROTOCOLS.max,
+            core_build: "test-core".into(),
+            instance: 1,
+        }),
+    );
+    // No newlines, so the PTY passes the bytes through unchanged.
+    send(
+        &mut stream,
+        ToHolder::Spawn(shell(
+            1,
+            &format!("head -c {FLOOD} /dev/zero | tr '\\0' x; exit 0"),
+        )),
+    );
+    // About 1.3 MB/s: the flood takes about 5 s to read, longer than the
+    // holder used to wait.
+    let mut reader = std::io::BufReader::with_capacity(
+        32 * 1024,
+        Throttled {
+            inner: stream.try_clone().unwrap(),
+            chunk: 32 * 1024,
+            pause: Duration::from_millis(25),
+        },
+    );
+    let mut output = 0usize;
+    let mut code = None;
+    let mut last_poke = std::time::Instant::now();
+    loop {
+        let frame = match Frame::read_from_or_eof(&mut reader) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => panic!("after {output} bytes of output: {error}"),
+        };
+        match ToCore::decode(&frame).unwrap() {
+            ToCore::Welcome(welcome) => dir.track(welcome.pid),
+            ToCore::Spawned(_) => {}
+            ToCore::Output(data) => {
+                assert_eq!(code, None, "output after EXITED");
+                assert!(data.bytes.iter().all(|&byte| byte == b'x'));
+                output += data.bytes.len();
+            }
+            ToCore::Exited(exited) => {
+                assert_eq!(exited.session, 1);
+                code = Some(exited.code);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A core keeps talking to its holder (pauses, resumes,
+        // checkpoints); an unknown session isn't an error.
+        if last_poke.elapsed() >= Duration::from_millis(100) {
+            last_poke = std::time::Instant::now();
+            let _ = ToHolder::Resume(h1::SessionRef { session: 99 })
+                .encode()
+                .unwrap()
+                .write_to(&mut stream);
+        }
+    }
+    assert_eq!(output, FLOOD, "every byte of output");
+    assert_eq!(code, Some(Some(0)), "the exit, with its status");
+    // The holder closed its side; once the core closes too, it is gone.
+    drop(reader);
+    drop(stream);
+    assert!(
+        eventually(TIMEOUT, || dir.holder_sockets().is_empty()
+            && server_processes(&dir.path, "hold").is_empty()),
+        "the holder didn't exit"
+    );
+    let logs = dir.logs();
+    assert!(!logs.contains("didn't take"), "{logs}");
+}
+
 #[test]
 fn input_resize_and_output_reach_the_program() {
     let (_dir, mut core, _) = holder("io");

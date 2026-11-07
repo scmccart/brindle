@@ -63,8 +63,9 @@ const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
 /// A connection must send `HELLO` within this long.
 const HELLO_LIMIT: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 16;
-/// How long an exiting holder waits for the core to take its last messages.
-const EXIT_FLUSH_LIMIT: Duration = Duration::from_secs(2);
+/// How long an exiting holder waits for the core to take its last messages
+/// (a flood's output, then `EXITED`) and close the connection.
+const EXIT_CLOSE_LIMIT: Duration = Duration::from_secs(10);
 const READS_PER_EVENT: usize = 4;
 const TICK_FAST: Duration = Duration::from_millis(50);
 const TICK_SLOW: Duration = Duration::from_millis(500);
@@ -273,6 +274,8 @@ struct Core {
     checkpoints: Assembler,
     /// It sent `GOODBYE { handover: true }`.
     handover: bool,
+    /// It sent `GOODBYE`: it is going, so exits wait for the next core.
+    goodbye: bool,
 }
 
 struct Pending {
@@ -363,15 +366,19 @@ impl<L: EventLoop> Holder<L> {
 
     fn run(mut self) -> io::Result<()> {
         let mut events: Vec<Event> = Vec::new();
-        loop {
+        let result = loop {
             self.update_interests();
             let fast = !self.kills.is_empty()
                 || self
                     .sessions
                     .values()
                     .any(|session| session.reaped.is_some() && session.held.exit.is_none());
-            self.ev
-                .wait(&mut events, Some(if fast { TICK_FAST } else { TICK_SLOW }))?;
+            if let Err(error) = self
+                .ev
+                .wait(&mut events, Some(if fast { TICK_FAST } else { TICK_SLOW }))
+            {
+                break Err(error);
+            }
             for event in &events {
                 self.dispatch(*event);
             }
@@ -379,11 +386,12 @@ impl<L: EventLoop> Holder<L> {
             let now = Instant::now();
             self.tick(now);
             if self.should_exit(now) {
-                break;
+                break Ok(());
             }
-        }
+        };
+        // Even on a failure, the core gets what is queued for it.
         self.shutdown();
-        Ok(())
+        result
     }
 
     fn token(&mut self) -> Token {
@@ -530,6 +538,7 @@ impl<L: EventLoop> Holder<L> {
             instance: hello.instance,
             checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
             handover: false,
+            goodbye: false,
         };
         let sessions = self
             .sessions
@@ -608,16 +617,15 @@ impl<L: EventLoop> Holder<L> {
         let Some(core) = self.core.as_mut() else {
             return;
         };
-        let eof = match core.conn.read_available() {
-            Ok(eof) => eof,
-            Err(error) => {
-                self.lose_core(&format!("read failed: {error}"));
-                return;
-            }
+        // What was read before a failure still counts.
+        let ended = match core.conn.read_available() {
+            Ok(false) => None,
+            Ok(true) => Some("the connection closed".to_string()),
+            Err(error) => Some(format!("read failed: {error}")),
         };
         self.process_core_frames();
-        if eof {
-            self.lose_core("the connection closed");
+        if let Some(reason) = ended {
+            self.lose_core(&reason);
         }
     }
 
@@ -723,6 +731,7 @@ impl<L: EventLoop> Holder<L> {
             ToHolder::Goodbye(goodbye) => {
                 if let Some(core) = self.core.as_mut() {
                     core.handover = goodbye.handover;
+                    core.goodbye = true;
                 }
             }
             ToHolder::Reparent(reparent) => self.send_error(Some(reparent.session), "unsupported"),
@@ -1034,8 +1043,9 @@ impl<L: EventLoop> Holder<L> {
             }
         }
         for (id, code) in finished {
-            // Without a core, the next one's WELCOME reports it.
-            if self.core.is_some() {
+            // Without a core, or with one that said GOODBYE (it may no
+            // longer read), the next one's WELCOME reports it.
+            if self.core.as_ref().is_some_and(|core| !core.goodbye) {
                 self.send(ToCore::Exited(Exited { session: id, code }));
                 self.remove_session(id);
             }
@@ -1147,13 +1157,36 @@ impl<L: EventLoop> Holder<L> {
                 || (self.core.is_none() && now >= self.started + UNUSED_LIMIT))
     }
 
+    /// Exits. The core gets everything queued for it (the last session's
+    /// output and `EXITED`) and the connection's end, and the holder waits
+    /// for the core to close its side, reading what it still sends: closing
+    /// with unread input would reset the connection and lose the queued
+    /// messages in the core's socket buffer.
     fn shutdown(mut self) {
-        if let Some(core) = self.core.as_mut() {
-            let _ = core.conn.flush_for(EXIT_FLUSH_LIMIT);
-        }
+        // Nothing new can find this holder.
         let _ = fs::remove_file(&self.slot.socket_path);
         let _ = fs::remove_file(&self.slot.lock_path);
-        log!("no sessions left; exiting");
+        if let Some(core) = self.core.as_mut() {
+            let queued = core.conn.queued();
+            let started = Instant::now();
+            match core.conn.close_for(EXIT_CLOSE_LIMIT) {
+                Ok(()) => log!(
+                    "delivered the last {queued} bytes to core instance {} in {} ms",
+                    core.instance,
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => log!(
+                    "core instance {} didn't take the last messages within {}s: {error}",
+                    core.instance,
+                    EXIT_CLOSE_LIMIT.as_secs()
+                ),
+            }
+        }
+        if self.sessions.is_empty() {
+            log!("no sessions left; exiting");
+        } else {
+            log!("exiting with {} session(s)", self.sessions.len());
+        }
     }
 }
 

@@ -19,6 +19,7 @@ pub struct Conn {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
+    write_shut: bool,
 }
 
 impl Conn {
@@ -31,6 +32,7 @@ impl Conn {
             input_start: 0,
             output: Vec::new(),
             output_start: 0,
+            write_shut: false,
         })
     }
 
@@ -125,6 +127,63 @@ impl Conn {
         Ok(())
     }
 
+    /// One non-blocking step of a graceful close: sends what the socket
+    /// takes, shuts the write side down once the queue is empty, and reads
+    /// what the peer sends (into the input, for [`Conn::next_frame`]).
+    /// Returns `true` once the peer has closed its side too.
+    ///
+    /// The point is never to close a socket with unread input: Linux then
+    /// resets the connection, and the peer loses what it hadn't read yet,
+    /// our last messages included.
+    pub fn close_step(&mut self) -> io::Result<bool> {
+        if !self.write_shut {
+            self.flush()?;
+            if self.queued() == 0 {
+                self.write_shut = true;
+                // The peer may have closed already; reading tells.
+                let _ = self.stream.shutdown(std::net::Shutdown::Write);
+            }
+        }
+        self.read_available()
+    }
+
+    /// Drops what was read and not yet taken as frames.
+    pub fn discard_input(&mut self) {
+        self.input.clear();
+        self.input_start = 0;
+    }
+
+    /// Closes gracefully ([`Conn::close_step`]) within `limit`, discarding
+    /// what the peer sends meanwhile. An error names what was left undone.
+    pub fn close_for(&mut self, limit: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let closed = self.close_step();
+            self.discard_input();
+            if closed? {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.unfinished());
+            }
+            wait(&[&*self], remaining);
+        }
+    }
+
+    /// Why a graceful close didn't finish.
+    pub fn unfinished(&self) -> io::Error {
+        let message = if self.write_shut {
+            "the peer didn't close its side".to_string()
+        } else {
+            format!(
+                "the peer stopped reading with {} bytes unsent",
+                self.queued()
+            )
+        };
+        io::Error::new(io::ErrorKind::TimedOut, message)
+    }
+
     /// Flushes the whole queue, waiting for the peer for at most `limit`.
     pub fn flush_for(&mut self, limit: Duration) -> io::Result<()> {
         let deadline = Instant::now() + limit;
@@ -149,6 +208,27 @@ impl Conn {
             unsafe { libc::poll(&mut pollfd, 1, timeout) };
         }
     }
+}
+
+/// Waits up to `limit` (at most 100 ms at a time) until one of `conns` can
+/// make progress on a graceful close: readable, or writable while it has
+/// output queued.
+pub fn wait(conns: &[&Conn], limit: Duration) {
+    let mut pollfds: Vec<libc::pollfd> = conns
+        .iter()
+        .map(|conn| libc::pollfd {
+            fd: conn.fd(),
+            events: libc::POLLIN
+                | if !conn.write_shut && conn.queued() > 0 {
+                    libc::POLLOUT
+                } else {
+                    0
+                },
+            revents: 0,
+        })
+        .collect();
+    let timeout = limit.as_millis().clamp(1, 100) as libc::c_int;
+    unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
 }
 
 #[cfg(test)]

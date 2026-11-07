@@ -201,6 +201,48 @@ fn exit_statuses_reach_the_client() {
     }
 }
 
+/// The perf run's failure: a flood, then the program's exit, read slowly by
+/// the client. The holder becomes empty as soon as the program ends, so it
+/// exits while the core is still busy with the flood (paused, sending
+/// checkpoints). The client must still get every byte and the exit, not a
+/// lost session.
+#[test]
+fn a_flood_and_its_exit_reach_a_slow_client() {
+    const FLOOD: usize = 6 * 1024 * 1024;
+    let (dir, mut client) = core("flood");
+    // No newlines, so the PTY passes the bytes through unchanged.
+    let (session, _) = client.spawn(client_shell(&format!(
+        "head -c {FLOOD} /dev/zero | tr '\\0' x; exit 0"
+    )));
+    let mut output = 0usize;
+    let mut since_pause = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let exit = loop {
+        assert!(Instant::now() < deadline, "only {output} bytes arrived");
+        match client.recv() {
+            ToClient::Data(data) if data.session == session => {
+                assert!(data.bytes.iter().all(|&byte| byte == b'x'));
+                output += data.bytes.len();
+                since_pause += data.bytes.len();
+                if since_pause >= 64 * 1024 {
+                    since_pause = 0;
+                    thread::sleep(Duration::from_millis(30));
+                }
+            }
+            ToClient::Exit(exit) if exit.session == session => break exit,
+            other => panic!("after {output} bytes: {other:?}"),
+        }
+    };
+    assert_eq!(output, FLOOD, "every byte of output");
+    assert_eq!((exit.code, exit.lost), (Some(0), None), "{}", dir.logs());
+    assert!(
+        eventually(TIMEOUT, || dir.holder_sockets().is_empty()),
+        "the empty holder didn't exit"
+    );
+    let logs = dir.logs();
+    assert!(!logs.contains("lost"), "{logs}");
+}
+
 #[test]
 fn spawning_as_the_last_session_ends_still_works() {
     // An empty holder exits, maybe with the next SPAWN unread; the core

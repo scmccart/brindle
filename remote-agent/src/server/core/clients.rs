@@ -175,13 +175,15 @@ impl<L: EventLoop> Core<L> {
         let Some(client) = self.clients.get_mut(&token) else {
             return;
         };
-        let eof = match client.conn.read_available() {
-            Ok(eof) => eof,
-            Err(error) => return self.drop_client(token, &format!("read failed: {error}")),
+        // What was read before a failure still counts.
+        let ended = match client.conn.read_available() {
+            Ok(false) => None,
+            Ok(true) => Some("the connection closed".to_string()),
+            Err(error) => Some(format!("read failed: {error}")),
         };
         self.process_client_frames(token);
-        if eof {
-            self.drop_client(token, "the connection closed");
+        if let Some(reason) = ended {
+            self.drop_client(token, &reason);
         }
     }
 
