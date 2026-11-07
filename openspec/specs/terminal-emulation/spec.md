@@ -212,6 +212,21 @@ Closing a Windows tab, or its program exiting, SHALL release its pseudoconsole w
 - **WHEN** a Windows tab is running a command that prints continuously and the user closes the tab
 - **THEN** the tab closes at once and the window stays responsive
 
+### Requirement: The window stays responsive during continuous output
+While any terminal in a window (a local tab or zone, a remote terminal or a tmux pane) receives output continuously, the window SHALL keep repainting that terminal's latest output, SHALL keep handling input and actions, and Brindle SHALL still quit when asked. Updates during continuous output MAY be grouped, but output that arrives after a quiet spell SHALL be shown without added delay.
+
+#### Scenario: Flooding tab keeps painting
+- **WHEN** a Windows tab runs `for /L %i in (1,0,2) do @echo flood %i` in `cmd` for several seconds
+- **THEN** the window repaints with new `flood` lines while the loop runs and Windows never reports it as not responding
+
+#### Scenario: Quitting while a tab floods
+- **WHEN** a tab is printing continuously and Brindle is asked to quit (for example by `--dump-screen-after`)
+- **THEN** Brindle prints its dump and exits within a second of the deadline
+
+#### Scenario: Echo after a quiet spell
+- **WHEN** a tab has had no output for a while and the user types a character that the shell echoes
+- **THEN** the echo is painted on the next frame, with no pacing delay added
+
 ### Requirement: Local Linux terminals run in the terminal server
 On Linux, each local tab and zone SHALL run its program in a session of the terminal server, as defined by the `terminal-server` capability, with the `kill` close policy. Brindle SHALL start the server when none is running. Every other requirement of this capability, and titles, directories, shell integration, program status and notifications, SHALL behave as they do with a PTY owned by Brindle.
 
