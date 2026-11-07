@@ -270,6 +270,22 @@ fn shell_output_with_wrapped_lines() {
     assert_eq!(copy.marks.lock().reported_dir(), Some(std::path::Path::new("/home/me/src dir")));
 }
 
+/// Plain cells take the renderer's fast path, and each of these leaves it
+/// and comes back within a row: a style, a wide char, a combining mark, a
+/// hyperlink, an underline color, a tab, and a gap the cursor jumps.
+#[test]
+fn a_row_mixing_plain_cells_with_everything_else() {
+    let fixture = concat!(
+        "ab\x1b[1;31mcd\x1b[0mef中gh",
+        "e\u{301}ij\x1b]8;id=1;https://example.com\x07kl\x1b]8;;\x07mn",
+        "\x1b[4;58;5;3mop\x1b[0mqr\tst\x1b[5Cuv\r\n",
+        "\x1b[44mwhole row in blue\x1b[0m then plain\r\n",
+        "plain é ünïcode",
+    );
+    let (session, copy) = round_trip(80, 5, 10, fixture.as_bytes());
+    assert_eq!(copy.text(0), session.text(0));
+}
+
 #[test]
 fn wrapped_rows_rewrap_in_the_copy() {
     let fixture = format!("{}\r\n$ ", "abcdefghij".repeat(4));

@@ -382,6 +382,9 @@ const STYLE: Flags = Flags::BOLD
     .union(Flags::HIDDEN)
     .union(Flags::STRIKEOUT);
 
+/// Cells that [`write_grid`] never writes through its fast path.
+const SPECIAL: Flags = Flags::WIDE_CHAR_SPACER.union(Flags::LEADING_WIDE_CHAR_SPACER);
+
 impl Default for Pen {
     fn default() -> Self {
         Pen::of(&Cell::default())
@@ -523,6 +526,28 @@ impl Out {
         }
     }
 
+    /// Whether `cell` needs no pen change: it has no extras (underline
+    /// color, hyperlink or zero-width characters), and its colors and style
+    /// are the pen's, which has none either. The same as
+    /// `Pen::of(cell) == self.pen`, without building a `Pen`.
+    fn pen_fits(&self, cell: &Cell) -> bool {
+        cell.extra.is_none()
+            && self.pen.underline.is_none()
+            && self.pen.link.is_none()
+            && cell.fg == self.pen.fg
+            && cell.bg == self.pen.bg
+            && cell.flags & STYLE == self.pen.flags
+    }
+
+    fn char(&mut self, c: char) {
+        if c.is_ascii() {
+            self.buf.push(c as u8);
+        } else {
+            let mut utf8 = [0; 4];
+            self.buf.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+        }
+    }
+
     /// Writes a cell's text (its character and zero-width ones).
     fn text(&mut self, cell: &Cell) {
         let c = if cell.c == '\t' || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) { ' ' } else { cell.c };
@@ -608,6 +633,14 @@ fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<(usize
                 }
             }
             let cell = &row[Column(col)];
+            // The common case, a cell in the current pen right where the
+            // receiver's cursor is: its text alone, as the general path
+            // below would write it.
+            if at == col && !deferred && !cell.flags.intersects(SPECIAL) && cell.c != '\t' && out.pen_fits(cell) {
+                out.char(cell.c);
+                at = col + if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                continue;
+            }
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
