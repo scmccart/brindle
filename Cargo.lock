@@ -712,6 +712,7 @@ name = "brindle-remote-agent"
 version = "0.3.0"
 dependencies = [
  "brindle-remote-protocol",
+ "brindle-term-core",
  "libc",
 ]
 
