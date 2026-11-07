@@ -82,7 +82,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 6. Upgrades and management
 
-- [ ] 6.1 Upgrades:
+- [x] 6.1 Upgrades:
   - `WELCOME` reports the core's build and its holders' protocols;
   - `brindle-remote check --holder-protocols <list>`;
   - `STEP_DOWN`: checkpoint everything, `GOODBYE { handover }`, close the clients, exit;

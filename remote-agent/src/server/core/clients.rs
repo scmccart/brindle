@@ -222,29 +222,12 @@ impl<L: EventLoop> Core<L> {
             ),
             ToCore::Attach(attach) => self.client_attach(client, attach),
             ToCore::Detach(target) => self.client_detach(client, target.session),
-            ToCore::List(request) => self.not_supported(client, "LIST", Some(request.req), None),
+            ToCore::List(request) => self.client_list(client, request.req),
             ToCore::Kill(kill) => self.client_kill(client, kill),
-            ToCore::Status(request) => {
-                self.not_supported(client, "STATUS", Some(request.req), None)
-            }
+            ToCore::Status(request) => self.client_status(client, request.req),
             ToCore::Stop(request) => self.client_stop(client, request.req),
-            ToCore::StepDown(request) => {
-                self.not_supported(client, "STEP_DOWN", Some(request.req), None)
-            }
+            ToCore::StepDown(request) => self.client_step_down(client, request.req),
         }
-    }
-
-    fn not_supported(
-        &mut self,
-        client: Token,
-        name: &str,
-        req: Option<RequestId>,
-        session: Option<SessionId>,
-    ) {
-        self.send_client(
-            client,
-            error(req, session, format!("this core doesn't support {name}")),
-        );
     }
 
     /// Queues a message for a client. Past [`CLIENT_QUEUE_HIGH`] the client's

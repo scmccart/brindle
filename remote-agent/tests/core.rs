@@ -22,10 +22,6 @@ fn core(tag: &str) -> (TempDir, TestClient) {
     (dir, client)
 }
 
-fn gone(pid: u32) -> bool {
-    eventually(TIMEOUT, || !alive(pid))
-}
-
 // 4.1
 
 #[test]
@@ -312,11 +308,6 @@ fn a_stalled_client_doesnt_delay_another_clients_session() {
 
 // 4.3
 
-/// Holders start a real core of their own once theirs is gone.
-const SUPERVISED: (&str, &str) = (
-    "BRINDLE_TEST_HOLDER_CORE_ARGS",
-    "serve --ready-fd {ready_fd}",
-);
 /// A little more than the core's reconnect grace period.
 const PAST_GRACE: Duration = Duration::from_secs(12);
 

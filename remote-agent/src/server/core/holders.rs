@@ -16,7 +16,8 @@ use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHo
 
 use super::clients::error;
 use super::sessions::Session;
-use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};use crate::server::conn::Conn;
+use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};
+use crate::server::conn::Conn;
 use crate::server::daemon;
 use crate::server::event_loop::{EventLoop, Interest, Token};
 
@@ -40,6 +41,9 @@ pub(super) struct Holder {
     welcome: Option<Welcomed>,
     /// Sessions whose checkpoint and tail are still to come.
     adopting: HashSet<SessionId>,
+    /// Of another build: told to `DRAIN`, so it takes no new sessions and
+    /// exits after its last one.
+    draining: bool,
     checkpoints: Assembler,
     tails: Assembler,
 }
@@ -58,6 +62,18 @@ impl Holder {
 
     fn is_adopted(&self) -> bool {
         self.welcome.is_some() && self.adopting.is_empty()
+    }
+
+    /// Its entry in `SERVER_STATUS`, once it has welcomed the core.
+    pub(super) fn status(&self, sessions: u32) -> Option<client::HolderStatus> {
+        let welcome = self.welcome.as_ref()?;
+        Some(client::HolderStatus {
+            pid: welcome.pid,
+            build: welcome.build.clone(),
+            protocol: welcome.protocol,
+            sessions,
+            draining: self.draining,
+        })
     }
 }
 
@@ -200,6 +216,7 @@ impl<L: EventLoop> Core<L> {
                 initial,
                 welcome: None,
                 adopting: HashSet::new(),
+                draining: false,
                 checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
                 tails: Assembler::new(h1::TAIL_LIMIT),
             },
@@ -325,11 +342,33 @@ impl<L: EventLoop> Core<L> {
             welcome.sessions.len()
         );
         holder.own_build = welcome.build == self.build;
+        if welcome.previous == h1::Previous::Handover {
+            log!(
+                "upgrade: took holder {} over from a core that stepped down",
+                holder.socket.display()
+            );
+        }
+        let drain = !holder.own_build;
+        if drain {
+            log!(
+                "drain: holder {} is of build {}, not {}; it takes no new sessions and exits after its last one",
+                holder.socket.display(),
+                welcome.build,
+                self.build
+            );
+            holder.draining = true;
+        }
         holder.welcome = Some(Welcomed {
             protocol: welcome.protocol,
             build: welcome.build,
             pid: welcome.pid,
         });
+        if drain {
+            self.send_holder(token, ToHolder::Drain(h1::Drain {}));
+        }
+        let Some(holder) = self.holders.get_mut(&token) else {
+            return;
+        };
         // Every listed session's checkpoint and tail follow.
         holder.adopting = welcome.sessions.iter().map(|held| held.session).collect();
         let mut adopted_any = false;
@@ -401,12 +440,20 @@ impl<L: EventLoop> Core<L> {
             .filter(|(_, session)| session.holder == token)
             .map(|(&id, _)| id)
             .collect();
-        log!(
-            "holder {} (pid {:?}) left ({reason}); {} session(s) lost",
-            holder.socket.display(),
-            holder.welcome.as_ref().map(|welcome| welcome.pid),
-            lost.len()
-        );
+        if holder.draining && lost.is_empty() {
+            log!(
+                "drain: holder {} (pid {:?}) ended its last session and exited",
+                holder.socket.display(),
+                holder.welcome.as_ref().map(|welcome| welcome.pid),
+            );
+        } else {
+            log!(
+                "holder {} (pid {:?}) left ({reason}); {} session(s) lost",
+                holder.socket.display(),
+                holder.welcome.as_ref().map(|welcome| welcome.pid),
+                lost.len()
+            );
+        }
         for id in lost {
             self.session_lost(token, id);
         }
@@ -450,7 +497,7 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    fn fail_waiting(&mut self, message: &str) {
+    pub(super) fn fail_waiting(&mut self, message: &str) {
         for waiting in std::mem::take(&mut self.waiting) {
             let req = waiting.spawn.req;
             self.send_client(waiting.client, error(Some(req), None, message));

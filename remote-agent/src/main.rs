@@ -7,8 +7,7 @@ mod server;
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: brindle-remote --version | --server | serve [--ready-fd N] | hold [--ready-fd N]";
+const USAGE: &str = "usage: brindle-remote --version | --server | serve [--ready-fd N] | hold [--ready-fd N] | check --holder-protocols LIST";
 
 fn main() -> ExitCode {
     match run() {
@@ -47,7 +46,8 @@ fn run() -> Result<(), String> {
         }
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
-        _ => Err(USAGE.into()),
+        Some(command) => manage(command, &rest).unwrap_or_else(|| Err(USAGE.into())),
+        None => Err(USAGE.into()),
     }
 }
 
@@ -61,6 +61,12 @@ fn hold(args: &[String]) -> Result<(), String> {
     server::holder::run(args)
 }
 
+/// `check`; `None` for anything else.
+#[cfg(target_os = "linux")]
+fn manage(command: &str, args: &[String]) -> Option<Result<(), String>> {
+    (command == "check").then(|| server::check::run(args))
+}
+
 #[cfg(not(target_os = "linux"))]
 fn serve(_args: &[String]) -> Result<(), String> {
     Err("the terminal server runs only on Linux".into())
@@ -69,4 +75,9 @@ fn serve(_args: &[String]) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn hold(_args: &[String]) -> Result<(), String> {
     Err("the terminal server runs only on Linux".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn manage(command: &str, _args: &[String]) -> Option<Result<(), String>> {
+    (command == "check").then(|| Err("the terminal server runs only on Linux".into()))
 }

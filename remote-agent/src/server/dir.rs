@@ -37,13 +37,19 @@ pub fn resolve(
 
 /// The server directory for this process's environment, created if needed.
 pub fn from_env() -> io::Result<PathBuf> {
-    let dir = resolve(
+    let dir = resolve_from_env()?;
+    ensure(&dir, own_uid())?;
+    Ok(dir)
+}
+
+/// Where the server directory for this process's environment is, without
+/// creating it.
+pub fn resolve_from_env() -> io::Result<PathBuf> {
+    resolve(
         std::env::var_os("BRINDLE_SERVER_DIR"),
         std::env::var_os("XDG_RUNTIME_DIR"),
         crate::pty::home_dir(&Default::default()),
-    )?;
-    ensure(&dir, own_uid())?;
-    Ok(dir)
+    )
 }
 
 pub fn own_uid() -> u32 {

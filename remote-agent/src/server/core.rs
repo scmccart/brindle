@@ -19,16 +19,20 @@
 //!   accepted once the holders found at startup are adopted, so session ids
 //!   continue from the largest adopted one and returning clients find their
 //!   sessions. A holder of the core's own build is started when a session
-//!   needs one.
+//!   needs one, and holders of other builds are told to `DRAIN`.
+//! - **Management and upgrades** ([`manage`]): `LIST`, `STATUS`, and
+//!   `STEP_DOWN`, after which the core exits for the next one.
 //! - **Sessions** ([`sessions`]): spawned through a holder, with their I/O,
 //!   the close policies and, after adopting sessions, the
 //!   [`RECONNECT_GRACE`] for their owners to come back. Each has an
 //!   emulator ([`screen`]) fed with all of its output.
-//! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, or
-//!   once `STOP` has ended every session. The socket is removed first.
+//! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, once
+//!   `STOP` has ended every session, or after `STEP_DOWN`. The socket is
+//!   removed first.
 
 mod clients;
 mod holders;
+mod manage;
 mod screen;
 mod sessions;
 
@@ -66,6 +70,9 @@ const LOSER_WAIT: Duration = Duration::from_secs(2);
 const ADOPT_LIMIT: Duration = Duration::from_secs(5);
 /// How long a flush may wait for a peer when the core exits.
 const EXIT_FLUSH_LIMIT: Duration = Duration::from_secs(1);
+/// How long a stepping-down core waits for each holder to take its
+/// checkpoints.
+const STEP_DOWN_FLUSH_LIMIT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(250);
 
 macro_rules! log {
@@ -213,9 +220,9 @@ enum Source {
 
 const LISTENER: Token = 0;
 
-/// A `STOP` in progress: the client and request to answer once every
-/// session has ended.
-struct Stopping {
+/// A `STOP` or `STEP_DOWN` in progress: the client and request to answer
+/// when the core exits.
+struct Answer {
     client: Token,
     req: RequestId,
 }
@@ -247,7 +254,10 @@ pub(super) struct Core<L: EventLoop> {
     /// While the owners of adopted sessions may still come back.
     grace_until: Option<Instant>,
     idle_since: Option<Instant>,
-    stopping: Option<Stopping>,
+    /// Answered once every session has ended.
+    stopping: Option<Answer>,
+    /// Answered once the holders have their checkpoints and `GOODBYE`.
+    stepping_down: Option<Answer>,
 }
 
 impl<L: EventLoop> Core<L> {
@@ -302,6 +312,7 @@ impl<L: EventLoop> Core<L> {
             grace_until: None,
             idle_since: None,
             stopping: None,
+            stepping_down: None,
         })
     }
 
@@ -442,7 +453,7 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn should_exit(&self, now: Instant) -> bool {
-        if self.stopping.is_some() && self.sessions.is_empty() {
+        if self.stepping_down.is_some() || (self.stopping.is_some() && self.sessions.is_empty()) {
             return true;
         }
         self.idle_since
@@ -452,9 +463,19 @@ impl<L: EventLoop> Core<L> {
     fn shutdown(mut self) {
         // Nothing can find this core once the socket is gone.
         let _ = fs::remove_file(&self.paths.socket);
+        let stepped_down = self.stepping_down.take();
+        if stepped_down.is_some() {
+            // The checkpoints and GOODBYEs reach the holders before the
+            // client hears OK, so the core it starts next finds them.
+            for holder in self.holders.values_mut() {
+                if let Err(error) = holder.conn.flush_for(STEP_DOWN_FLUSH_LIMIT) {
+                    log!("a holder didn't take its checkpoints: {error}");
+                }
+            }
+        }
         let stopped = self.stopping.take();
-        if let Some(stopping) = &stopped {
-            self.send_client(stopping.client, ToClient::Ok(Request { req: stopping.req }));
+        if let Some(answer) = stopped.as_ref().or(stepped_down.as_ref()) {
+            self.send_client(answer.client, ToClient::Ok(Request { req: answer.req }));
         }
         for client in self.clients.values_mut() {
             let _ = client.conn.flush_for(EXIT_FLUSH_LIMIT);
@@ -462,7 +483,12 @@ impl<L: EventLoop> Core<L> {
         for holder in self.holders.values_mut() {
             let _ = holder.conn.flush_for(EXIT_FLUSH_LIMIT);
         }
-        if stopped.is_some() {
+        if stepped_down.is_some() {
+            log!(
+                "upgrade: stepped down after {}s; the next core takes the holders over",
+                self.started.elapsed().as_secs()
+            );
+        } else if stopped.is_some() {
             log!("stopped; exiting");
         } else {
             log!(

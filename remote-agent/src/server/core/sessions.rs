@@ -78,6 +78,12 @@ struct PendingReplay {
 }
 
 impl Session {
+    /// Its program runs: it isn't starting, and didn't exit while its owner
+    /// was away.
+    pub(super) fn is_running(&self) -> bool {
+        self.spawning.is_none() && self.exited.is_none()
+    }
+
     /// A session reported in a holder's `WELCOME`. It has no client until
     /// its owner comes back. One that exited while no core was connected
     /// is gone from the holder already.
@@ -121,6 +127,16 @@ impl<L: EventLoop> Core<L> {
             return self.send_client(
                 client,
                 error(Some(spawn.req), None, "the server is stopping"),
+            );
+        }
+        if self.stepping_down.is_some() {
+            return self.send_client(
+                client,
+                error(
+                    Some(spawn.req),
+                    None,
+                    "the core is stepping down for an upgrade; try again",
+                ),
             );
         }
         let id = self.allocate_id();
@@ -322,7 +338,6 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Checkpoints every session, before the core steps down.
-    #[allow(dead_code, reason = "STEP_DOWN (task 6.1) calls it")]
     pub(super) fn checkpoint_all(&mut self) {
         let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for id in ids {
@@ -442,7 +457,7 @@ impl<L: EventLoop> Core<L> {
     /// `OK`) once they have all ended.
     pub(super) fn client_stop(&mut self, client: Token, req: RequestId) {
         log!("stopping: hanging up {} session(s)", self.sessions.len());
-        self.stopping = Some(super::Stopping { client, req });
+        self.stopping = Some(super::Answer { client, req });
         for waiting in std::mem::take(&mut self.waiting) {
             let req = waiting.spawn.req;
             self.send_client(

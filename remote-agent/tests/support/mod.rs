@@ -534,6 +534,27 @@ pub fn core_socket(dir: &Path) -> PathBuf {
     dir.join("core.sock")
 }
 
+/// Runs `brindle-remote args…` (a management command, say) for `dir`.
+pub fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .args(args)
+        .env("BRINDLE_SERVER_DIR", dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// Holders start a real core of their own once theirs is gone.
+pub const SUPERVISED: (&str, &str) = (
+    "BRINDLE_TEST_HOLDER_CORE_ARGS",
+    "serve --ready-fd {ready_fd}",
+);
+
+/// Waits until `pid` is gone.
+pub fn gone(pid: u32) -> bool {
+    eventually(TIMEOUT, || !alive(pid))
+}
+
 /// What [`TestClient::next`] got.
 #[derive(Debug)]
 pub enum Recv {
@@ -835,6 +856,37 @@ impl TestClient {
 
     pub fn detach(&mut self, session: SessionId) {
         self.send(client::ToCore::Detach(client::SessionRef { session }));
+    }
+
+    /// Sends a request built with a fresh `req` and returns its reply.
+    pub fn request(&mut self, message: impl FnOnce(RequestId) -> client::ToCore) -> ToClient {
+        let req = self.take_req();
+        self.send(message(req));
+        self.reply(req)
+    }
+
+    /// `STEP_DOWN`, expecting `OK`.
+    pub fn step_down(&mut self) {
+        match self.request(|req| client::ToCore::StepDown(client::Request { req })) {
+            ToClient::Ok(_) => {}
+            other => panic!("expected OK, got {other:?}"),
+        }
+    }
+
+    /// `LIST`'s sessions.
+    pub fn list(&mut self) -> Vec<client::SessionInfo> {
+        match self.request(|req| client::ToCore::List(client::Request { req })) {
+            ToClient::Sessions(sessions) => sessions.sessions,
+            other => panic!("expected SESSIONS, got {other:?}"),
+        }
+    }
+
+    /// `STATUS`'s answer.
+    pub fn status(&mut self) -> client::ServerStatus {
+        match self.request(|req| client::ToCore::Status(client::Request { req })) {
+            ToClient::ServerStatus(status) => status,
+            other => panic!("expected SERVER_STATUS, got {other:?}"),
+        }
     }
 
     /// Attaches to `session` (at 80×24) until the replay, fed to a fresh
