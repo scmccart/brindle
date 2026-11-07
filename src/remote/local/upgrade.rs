@@ -13,8 +13,8 @@
 //! Then Brindle sends `STEP_DOWN`, waits for the core to close the
 //! connection, and starts the new core from its helper. Holders start a
 //! core of their own build again if the new one won't start, so Brindle
-//! connects to whichever core answers. The tab that asked waits for all of
-//! this.
+//! connects to whichever core answers. The start thread of the tab that
+//! asked waits for all of this, with the tab's input queued.
 
 use std::io;
 use std::os::unix::net::UnixStream;

@@ -59,9 +59,11 @@ pub trait SessionSink: Send {
     fn exited(&mut self, code: Option<i32>);
     /// The session can't be got back; `reason` says why.
     fn lost(&mut self, reason: &str);
+    /// The session never started: no server, or the core refused it.
+    fn failed(&mut self, error: &anyhow::Error);
 }
 
-type Sink = Arc<Mutex<Box<dyn SessionSink>>>;
+pub type Sink = Arc<Mutex<Box<dyn SessionSink>>>;
 
 /// What a new session runs.
 pub struct SpawnRequest {
@@ -151,8 +153,8 @@ impl Connection {
     }
 
     /// Starts a session whose output goes to `sink`, and waits for the core
-    /// to report its id and pid.
-    pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Box<dyn SessionSink>) -> Result<Session> {
+    /// to report its id and pid. Not on the UI thread: this blocks.
+    pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink) -> Result<Running> {
         let req = self.req();
         let (reply, answer) = mpsc::sync_channel(1);
         {
@@ -160,7 +162,6 @@ impl Connection {
             if state.dead {
                 bail!("the connection to the terminal server ended");
             }
-            let sink = Arc::new(Mutex::new(sink));
             state.spawns.insert(req, PendingSpawn { sink, reply, written: false });
         }
         let command = Some(request.command).filter(|command| !command.is_empty());
@@ -181,7 +182,7 @@ impl Connection {
         // Gone already when answered; a late `SPAWNED` is closed.
         self.state.lock().spawns.remove(&req);
         match answer {
-            Ok(Ok((id, pid))) => Ok(Session { id, pid, conn: self.clone() }),
+            Ok(Ok((id, pid))) => Ok(Running { id, pid, conn: self.clone() }),
             Ok(Err(message)) => Err(anyhow!("{message}")),
             Err(_) => bail!(
                 "the terminal server didn't start the session within {} s",
@@ -437,14 +438,14 @@ fn missing<T>(sessions: &mut HashMap<SessionId, T>, kept: &HashSet<SessionId>) -
     gone.into_iter().filter_map(|id| sessions.remove(&id)).collect()
 }
 
-/// One session, as a local tab's backend holds it.
-pub struct Session {
+/// A session the core started, once [`super::Session`] has it.
+pub struct Running {
     id: SessionId,
     pid: u32,
     conn: Arc<Connection>,
 }
 
-impl Session {
+impl Running {
     /// The program's pid.
     pub fn pid(&self) -> u32 {
         self.pid

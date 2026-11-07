@@ -179,10 +179,7 @@ enum Backend {
     },
     /// A session of the local terminal server.
     #[cfg(target_os = "linux")]
-    Server {
-        session: crate::remote::local::Session,
-        process: process::PtyProcess,
-    },
+    Server { session: crate::remote::local::Session },
     /// A tmux pane whose stream and input are owned by `TmuxSession`.
     Remote {
         scanner: Scanner,
@@ -415,14 +412,13 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
+        // Returns at once: the session starts in the background, and a
+        // failure is shown in the terminal then.
         #[cfg(target_os = "linux")]
-        let spawned = (|| -> anyhow::Result<Backend> {
-            let connection = crate::remote::local::shared()?;
-            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener);
-            let session = connection.spawn(request, Box::new(sink))?;
-            let process = process::PtyProcess::new(session.pid());
-            Ok(Backend::Server { session, process })
-        })();
+        let spawned: anyhow::Result<Backend> = {
+            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, program.clone());
+            Ok(Backend::Server { session: crate::remote::local::Session::start(request, Box::new(sink)) })
+        };
         #[cfg(all(unix, not(target_os = "linux")))]
         let spawned: anyhow::Result<Backend> = {
             let _ = (listener, args, working_directory);
@@ -942,7 +938,9 @@ impl Terminal {
             #[cfg(windows)]
             Backend::Pty { process, .. } => process.foreground_name(snapshot),
             #[cfg(target_os = "linux")]
-            Backend::Server { process, .. } => process.foreground_name(snapshot),
+            Backend::Server { session } => {
+                session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
+            }
             Backend::Agent { handle, foreground_name, .. } => {
                 handle.query_process();
                 foreground_name.clone()
@@ -975,7 +973,9 @@ impl Terminal {
                 self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
             }
             #[cfg(target_os = "linux")]
-            Backend::Server { process, .. } => process.working_directory(),
+            Backend::Server { session } => {
+                session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
+            }
             Backend::Agent { cwd, .. } => {
                 self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
             }

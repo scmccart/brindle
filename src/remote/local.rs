@@ -12,12 +12,15 @@
 //! tab that needed the server. Nothing is cached, so the next tab tries
 //! again.
 //!
-//! The process keeps one [`Connection`] for all its tabs ([`shared`]).
+//! The process keeps one [`Connection`] for all its tabs ([`shared`]). A
+//! tab's [`Session`] gets it, and its session, on a thread of its own.
 
 mod connection;
+mod session;
 mod upgrade;
 
-pub use connection::{Connection, Session, SessionSink, SpawnRequest};
+pub use connection::{Connection, SessionSink, SpawnRequest};
+pub use session::Session;
 
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -65,9 +68,10 @@ pub fn client_token() -> &'static str {
     })
 }
 
-/// The process's connection to the core, made (starting a core if needed)
-/// when there is none or the last one ended. Called on the UI thread when
-/// a local tab starts.
+/// The process's connection to the core, made (starting a core if needed,
+/// and offering it an upgrade) when there is none or the last one ended.
+/// It blocks, so it runs on a session's start thread ([`Session::start`]),
+/// never on the UI thread.
 pub fn shared() -> Result<Arc<Connection>> {
     static CURRENT: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
     let mut current = CURRENT.lock();

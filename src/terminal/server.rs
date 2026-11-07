@@ -27,6 +27,8 @@ pub struct Sink {
     marks: Arc<Mutex<Marks>>,
     listener: Listener,
     scanner: Scanner,
+    /// What the session runs, for the error line if it never starts.
+    program: String,
 }
 
 impl Sink {
@@ -35,8 +37,9 @@ impl Sink {
         parser: Arc<Mutex<Parser>>,
         marks: Arc<Mutex<Marks>>,
         listener: Listener,
+        program: String,
     ) -> Self {
-        Self { term, parser, marks, listener, scanner: Scanner::new() }
+        Self { term, parser, marks, listener, scanner: Scanner::new(), program }
     }
 
     fn send(&self, event: ChannelEvent) {
@@ -73,6 +76,19 @@ impl SessionSink for Sink {
         self.output(line.as_bytes());
         self.send(ChannelEvent::Lost);
     }
+
+    /// The tab shows the error, as a tab whose program can't start always
+    /// has, and stays open.
+    fn failed(&mut self, error: &anyhow::Error) {
+        log::error!("failed to launch {:?}: {error:#}", self.program);
+        let text = format!(
+            "\x1b[31mBrindle could not start {:?}:\x1b[0m\r\n{}\r\n",
+            self.program,
+            format!("{error:#}").replace('\n', "\r\n")
+        );
+        self.output(text.as_bytes());
+        self.send(ChannelEvent::Lost);
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +110,7 @@ mod tests {
             Arc::new(Mutex::new(Parser::new())),
             Arc::new(Mutex::new(Marks::default())),
             listener,
+            "sh".into(),
         );
         (sink, rx, marker)
     }
