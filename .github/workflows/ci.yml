@@ -4,7 +4,9 @@
 # reusable build-linux.yml and build-windows.yml, which releases run too.
 # rust-toolchain.toml pins Rust for every job.
 #
-# Pushes to main and every pull request run it.
+# Pushes to main and pull requests run it. A pull request that changes only
+# docs (Markdown, OpenSpec, the licenses) doesn't. Its required check, the
+# PR title, is a separate workflow (pr-title.yml) and still runs.
 
 name: CI
 
@@ -12,6 +14,10 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "openspec/**"
+      - "LICENSE-*"
   workflow_dispatch:
 
 permissions:
