@@ -1,4 +1,9 @@
 mod agent;
+#[cfg(target_os = "linux")]
+mod pty;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "used by the holder and the core (tasks 3.2 and 4.1)")]
+mod server;
 
 use std::env;
 use std::process::ExitCode;
