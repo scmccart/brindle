@@ -228,7 +228,22 @@ fn open_pty(winsize: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     set_close_on_exec(master.as_raw_fd())?;
     set_close_on_exec(slave.as_raw_fd())?;
+    set_utf8(master.as_raw_fd());
     Ok((master, slave))
+}
+
+/// Sets `IUTF8`, as alacritty's PTY did, so the line discipline erases a
+/// whole multibyte character. Failing to is not fatal.
+fn set_utf8(fd: RawFd) {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `tcgetattr` fills the struct on success, and only then is it read.
+    unsafe {
+        if libc::tcgetattr(fd, termios.as_mut_ptr()) == 0 {
+            let mut termios = termios.assume_init();
+            termios.c_iflag |= libc::IUTF8;
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
 }
 
 pub fn set_close_on_exec(fd: RawFd) -> io::Result<()> {

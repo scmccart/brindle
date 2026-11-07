@@ -170,6 +170,18 @@ fn input_resize_and_output_reach_the_program() {
 }
 
 #[test]
+fn ptys_are_utf8() {
+    let (_dir, mut core, _) = holder("iutf8");
+    core.spawn(shell(1, "stty -a; echo done.; exit 0"));
+    let output = String::from_utf8_lossy(&core.output_until(1, b"done.")).into_owned();
+    assert!(
+        output.split_whitespace().any(|flag| flag == "iutf8"),
+        "{output}"
+    );
+    assert_eq!(core.exit_code(1), Some(0));
+}
+
+#[test]
 fn hangup_kills_the_process_group() {
     let (_dir, mut core, holder_pid) = holder("hangup");
     // Started first, so the holder isn't left empty (and exits) between the two.
