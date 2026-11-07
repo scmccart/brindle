@@ -53,7 +53,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - on a new `HELLO`, report the sessions, then each `CHECKPOINT` and `TAIL`.
 
   Add the backpressure: stop reading PTYs past an 8 MiB queue to the core, and stop reading a session whose tail is full while no core is connected. Verify with tests for a reconnect after output with and without a checkpoint, truncation, and a program blocked (not losing output) while no core is connected.
-- [ ] 3.4 `DRAIN` (no new sessions, exit when the last ends) and core supervision: with no core for 3 s, start `serve` from `/proc/self/exe`, retrying with backoff capped at 60 s. Verify with tests: a drained holder refuses `SPAWN` and exits after its last session, and a holder whose core was SIGKILLed starts a new core within a few seconds, even after its binary file has been replaced.
+- [x] 3.4 `DRAIN` (no new sessions, exit when the last ends) and core supervision: with no core for 3 s, start `serve` from `/proc/self/exe`, retrying with backoff capped at 60 s. Verify with tests: a drained holder refuses `SPAWN` and exits after its last session, and a holder whose core was SIGKILLed starts a new core within a few seconds, even after its binary file has been replaced.
 
 ## 4. Core
 
