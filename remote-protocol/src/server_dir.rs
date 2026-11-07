@@ -46,6 +46,8 @@ mod tests {
         Some(OsString::from(value))
     }
 
+    // Unix paths: on Windows, `std::path::absolute` adds the current drive.
+    #[cfg(unix)]
     #[test]
     fn the_variables_are_used_in_order() {
         let home = Some(PathBuf::from("/home/u"));
@@ -61,6 +63,10 @@ mod tests {
             resolve(os(""), os(""), home.clone()).unwrap(),
             PathBuf::from("/home/u/.cache/brindle/run")
         );
+    }
+
+    #[test]
+    fn nothing_set_is_an_error_and_relative_paths_become_absolute() {
         assert!(resolve(None, None, None).is_err());
         let relative = resolve(os("rel/dir"), None, None).unwrap();
         assert!(relative.is_absolute() && relative.ends_with("rel/dir"));

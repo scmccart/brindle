@@ -456,7 +456,6 @@ fn link_or_copy(from: &Path, to: &Path) -> Result {
 /// note flipped) and a newer file time: what an install of a new build
 /// leaves beside Brindle. Returns it and both build ids.
 fn other_build(ctx: &Ctx) -> Result<(PathBuf, String, String)> {
-    use std::os::unix::fs::PermissionsExt as _;
     use brindle_remote_protocol::build_id;
     let mut bytes = std::fs::read(&ctx.helper).map_err(|e| format!("reading {}: {e}", ctx.helper.display()))?;
     let old = build_id::of_binary(&bytes);
@@ -470,7 +469,12 @@ fn other_build(ctx: &Ctx) -> Result<(PathBuf, String, String)> {
     let path = dir.join("brindle-remote");
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     let file = std::fs::File::options().write(true).open(&path).map_err(|e| e.to_string())?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    // The cases run only on Linux, but the suite also compiles on Windows.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
     file.set_modified(SystemTime::now() + Duration::from_secs(60)).map_err(|e| e.to_string())?;
     Ok((path, old, new))
 }
