@@ -9,9 +9,10 @@
 //! level-triggered poll, so the loop keeps doing everything else (polling,
 //! the write queue, resize, child exit, drain on exit) unchanged.
 //!
-//! On Unix, [`MarkedPty`] wraps alacritty's `Pty` and reads a clone of its
-//! master. On Windows it wraps Brindle's own pseudoconsole
-//! ([`super::conpty`]), whose output pipe it reads directly.
+//! [`MarkedPty`] wraps Brindle's own pseudoconsole ([`super::conpty`]),
+//! whose output pipe it reads directly. This is Windows only: local Linux
+//! terminals run in the terminal server, whose output the connection's
+//! reader parses (`server.rs`).
 
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -77,73 +78,7 @@ impl<R: Read> Read for ParsingReader<R> {
     }
 }
 
-/// alacritty's `Pty` with a [`ParsingReader`].
-#[cfg(unix)]
-pub struct MarkedPty {
-    pty: tty::Pty,
-    reader: ParsingReader<std::fs::File>,
-}
-
-#[cfg(unix)]
-impl MarkedPty {
-    pub fn new(
-        pty: tty::Pty,
-        term: Arc<FairMutex<Term<Listener>>>,
-        parser: Arc<Mutex<Parser>>,
-        marks: Arc<Mutex<Marks>>,
-        listener: Listener,
-        tx: UnboundedSender<ChannelEvent>,
-    ) -> io::Result<Self> {
-        // Same open file description, so the same non-blocking flag.
-        let file = pty.file().try_clone()?;
-        Ok(Self { reader: ParsingReader::new(file, term, parser, marks, listener, tx), pty })
-    }
-}
-
-#[cfg(unix)]
-impl EventedReadWrite for MarkedPty {
-    type Reader = ParsingReader<std::fs::File>;
-    type Writer = std::fs::File;
-
-    unsafe fn register(&mut self, poll: &Arc<Poller>, interest: Event, mode: PollMode) -> io::Result<()> {
-        // SAFETY: forwarded unchanged; the inner PTY outlives its registration
-        // exactly as it would without the wrapper.
-        unsafe { self.pty.register(poll, interest, mode) }
-    }
-
-    fn reregister(&mut self, poll: &Arc<Poller>, interest: Event, mode: PollMode) -> io::Result<()> {
-        self.pty.reregister(poll, interest, mode)
-    }
-
-    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
-        self.pty.deregister(poll)
-    }
-
-    fn reader(&mut self) -> &mut Self::Reader {
-        &mut self.reader
-    }
-
-    fn writer(&mut self) -> &mut std::fs::File {
-        self.pty.writer()
-    }
-}
-
-#[cfg(unix)]
-impl EventedPty for MarkedPty {
-    fn next_child_event(&mut self) -> Option<ChildEvent> {
-        self.pty.next_child_event()
-    }
-}
-
-#[cfg(unix)]
-impl OnResize for MarkedPty {
-    fn on_resize(&mut self, size: WindowSize) {
-        self.pty.on_resize(size)
-    }
-}
-
 /// Brindle's pseudoconsole with a [`ParsingReader`] on its output.
-#[cfg(windows)]
 pub struct MarkedPty {
     // First, so it is released and closed (if the tab is done with it too)
     // before the pipes drop.

@@ -97,33 +97,14 @@ fn windows_rows() -> Vec<ProcessRow> {
 #[derive(Clone, Copy, Debug)]
 pub struct PtyProcess {
     child_pid: u32,
-    /// The PTY master, for `tcgetpgrp`. It stays open for as long as the
-    /// event loop owns the PTY.
-    #[cfg(unix)]
-    master_fd: i32,
 }
 
 impl PtyProcess {
-    #[cfg(unix)]
-    pub fn new(child_pid: u32, master_fd: i32) -> Self {
-        Self { child_pid, master_fd }
-    }
-
-    #[cfg(not(unix))]
     pub fn new(child_pid: u32) -> Self {
         Self { child_pid }
     }
 
     /// The PTY's foreground process group, which is its leader's pid.
-    #[cfg(unix)]
-    fn foreground_pid(&self) -> Option<u32> {
-        // SAFETY: tcgetpgrp has no memory-safety preconditions; a stale fd
-        // only makes it fail.
-        let pgrp = unsafe { libc::tcgetpgrp(self.master_fd) };
-        (pgrp > 0).then_some(pgrp as u32)
-    }
-
-    #[cfg(not(unix))]
     fn foreground_pid(&self) -> Option<u32> {
         None
     }
@@ -142,6 +123,7 @@ impl PtyProcess {
 
     /// Current working directory of the foreground process (falls back to
     /// the program the tab started).
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn working_directory(&self) -> Option<PathBuf> {
         let pid = self.foreground_pid().unwrap_or(self.child_pid);
         process_cwd(pid).or_else(|| process_cwd(self.child_pid))

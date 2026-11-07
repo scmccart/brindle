@@ -11,6 +11,12 @@
 //! Every failure is an error naming its reason and the fix, shown in the
 //! tab that needed the server. Nothing is cached, so the next tab tries
 //! again.
+//!
+//! The process keeps one [`Connection`] for all its tabs ([`shared`]).
+
+mod connection;
+
+pub use connection::{Connection, Session, SessionSink, SpawnRequest};
 
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -18,10 +24,11 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use parking_lot::Mutex;
 
 use super::protocol::client::{self, Hello, ToClient, ToCore, Welcome};
 use super::protocol::{Frame, server_dir};
@@ -55,6 +62,22 @@ pub fn client_token() -> &'static str {
         let hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         format!("brindle-{}-{hex}", std::process::id())
     })
+}
+
+/// The process's connection to the core, made (starting a core if needed)
+/// when there is none or the last one ended. Called on the UI thread when
+/// a local tab starts.
+pub fn shared() -> Result<Arc<Connection>> {
+    static CURRENT: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
+    let mut current = CURRENT.lock();
+    if let Some(connection) = current.as_ref().filter(|connection| !connection.is_dead()) {
+        return Ok(connection.clone());
+    }
+    let endpoint = Endpoint::from_env()?;
+    let connected = connect(&endpoint, client_token())?;
+    let connection = Connection::start(endpoint, connected)?;
+    *current = Some(connection.clone());
+    Ok(connection)
 }
 
 /// Where the server is and what starts it.
