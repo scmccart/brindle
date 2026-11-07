@@ -26,7 +26,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - unknown JSON fields ignored.
 
   Verify with unit tests for round trips, negotiation (overlap, no overlap, ranges) and the session prefix.
-- [ ] 2.2 The core–holder protocol (H1) as a separate module, with everything design.md lists:
+- [x] 2.2 The core–holder protocol (H1) as a separate module, with everything design.md lists:
   - `HELLO`/`WELCOME`, with `previous`, the session list and `truncated`;
   - `SPAWN`, `INPUT`, `RESIZE`, `HANGUP`, `CHECKPOINT`, `DRAIN`, `GOODBYE` and `REPARENT`;
   - `TAIL`, `OUTPUT`, `SPAWNED`, `SPAWN_FAILED` and `EXITED`;

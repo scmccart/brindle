@@ -54,8 +54,33 @@ pub(crate) fn split_session<'a>(name: &str, frame: &'a Frame) -> io::Result<(Ses
     Ok((u32::from_be_bytes(*prefix), rest))
 }
 
+/// Decodes a session-prefixed payload that must hold exactly `N` more bytes.
+pub(crate) fn session_fixed<const N: usize>(
+    name: &str,
+    frame: &Frame,
+) -> io::Result<(SessionId, [u8; N])> {
+    let (session, rest) = split_session(name, frame)?;
+    let fixed: [u8; N] = rest.try_into().map_err(|_| {
+        invalid(format!(
+            "{name} carries {} bytes after its session id, not {N}",
+            rest.len()
+        ))
+    })?;
+    Ok((session, fixed))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_payloads_reject_other_lengths() {
+        let frame = Frame::new(1, vec![0, 0, 0, 5, 9, 9]).unwrap();
+        assert_eq!(session_fixed::<2>("x", &frame).unwrap(), (5, [9, 9]));
+        assert!(session_fixed::<1>("x", &frame).is_err());
+        assert!(session_fixed::<3>("x", &frame).is_err());
+        let frame = Frame::new(1, vec![0, 0, 0, 5]).unwrap();
+        assert_eq!(session_fixed::<0>("x", &frame).unwrap(), (5, []));
+    }
+
     use super::*;
 
     #[test]

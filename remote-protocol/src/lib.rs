@@ -10,6 +10,7 @@
 //! (core ↔ holder, H1).
 
 pub mod client;
+pub mod holder;
 pub mod version;
 mod wire;
 

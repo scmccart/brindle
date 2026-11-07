@@ -4,7 +4,7 @@
 
 use std::io;
 
-use crate::{Frame, client};
+use crate::{Frame, client, holder};
 
 pub(crate) struct XorShift(u64);
 
@@ -39,6 +39,10 @@ fn decoders() -> Vec<Decoder> {
         ("client::ToClient", |f| {
             client::ToClient::decode(f).map(drop)
         }),
+        ("holder::ToHolder", |f| {
+            holder::ToHolder::decode(f).map(drop)
+        }),
+        ("holder::ToCore", |f| holder::ToCore::decode(f).map(drop)),
     ]
 }
 
@@ -51,6 +55,16 @@ fn seeds() -> Vec<Frame> {
     );
     frames.extend(
         client::samples::to_client()
+            .iter()
+            .map(|m| m.encode().unwrap()),
+    );
+    frames.extend(
+        holder::samples::to_holder()
+            .iter()
+            .map(|m| m.encode().unwrap()),
+    );
+    frames.extend(
+        holder::samples::to_core()
             .iter()
             .map(|m| m.encode().unwrap()),
     );
@@ -152,6 +166,31 @@ fn the_frame_reader_never_panics_on_random_streams() {
             for (_, decode) in &decoders {
                 let _ = decode(&frame);
             }
+        }
+    }
+}
+
+#[test]
+fn the_assembler_never_panics_on_random_sequences() {
+    let mut rng = XorShift::new(0x00a5_5e4b_1e00_0003);
+    for _ in 0..2000 {
+        let mut assembler = holder::Assembler::new(rng.below(64) as u64);
+        for _ in 0..rng.below(24) {
+            let session = rng.below(3) as u32;
+            let _ = match rng.below(4) {
+                0 => assembler.begin(holder::BlobBegin {
+                    session,
+                    len: rng.below(80) as u64,
+                }),
+                1 | 2 => {
+                    let len = rng.below(24);
+                    assembler.chunk(&holder::Data {
+                        session,
+                        bytes: rng.bytes(len),
+                    })
+                }
+                _ => assembler.end(holder::BlobEnd { session }).map(drop),
+            };
         }
     }
 }
