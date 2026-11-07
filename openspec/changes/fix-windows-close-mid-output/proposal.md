@@ -1,28 +1,38 @@
 # Proposal
 
-Outline only: the cause is not known yet.
-
 ## Why
 
-The e2e case `windows-close-mid-output` checks that closing a tab whose program is flooding output doesn't block Brindle. It floods `cmd` with `for /L %i in (1,0,2) do @echo flood %i`, opens a second tab, goes back to the first, closes it, and expects the dump on time.
+On Windows, a tab whose program prints continuously freezes Brindle's window. It stops repainting, Windows marks it "not responding", and it ignores quitting. The e2e case `windows-close-mid-output` fails on this desktop every time for that reason ("Brindle didn't exit"). The close step isn't to blame: flooding alone, with no close, hangs the same way, with the packaged ConPTY or `BRINDLE_CONPTY=inbox`, and in debug or release builds.
 
-On one Windows 11 desktop it fails every time with "Brindle didn't exit". Brindle never reaches its `--dump-screen-after` deadline, and the harness gives up after about 36 s. `close.log` holds only startup lines, ending at font fallback.
+The cause, found on 2026-11-07 at `1b4bd93`:
+- Each terminal's event task (`Terminal::spawn_events`) loops on `ready_chunks` and never awaits anything that is pending while output keeps arriving. Under a flood it stays inside one poll and holds the main thread.
+- GPUI 0.2.2 on Windows wakes the main thread with one posted `WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD` message per task wake. Win32 delivers `WM_PAINT` and `WM_QUIT` only when no posted message is waiting. A steady stream of wakes therefore starves painting and quitting, even when the task does yield.
 
-- It failed 6 runs out of 6 on the `feat/remoting` branch, and 3 out of 3 on a build of `main` (`d9c1801`), so it predates that branch.
-- The `main` baseline run didn't have the packaged `conpty.dll` copied beside it, so it may have used a different ConPTY than the branch build.
-- It passes on the CI `windows-latest` runner, including at `c800343`.
-- It is not known when it last passed on that desktop. Its previous output there is from 2026-10-17.
+Two experiments in a scratch worktree confirmed it:
+- A bare yield after each batch made the window respond and the dump print, but Brindle still didn't exit, and the main thread stayed at 100 %.
+- Waiting 4 ms between batches made the case pass. It exited in about 7 s, with one tab left.
 
-A machine-specific hang when closing a flooding tab could still be a real bug: the case exists because closing such a tab once blocked.
+The CI runner passes. That's probably because its program produces output more slowly, which lets the channel drain. Users hit the freeze on fast machines.
 
 ## What Changes
 
-To be decided once the cause is found. First steps:
-
-- Reproduce with the same ConPTY on both builds: the packaged `conpty.dll`, then `BRINDLE_CONPTY=inbox`.
-- Find where the process stops: which thread blocks, and whether the GPUI thread is still running.
-- Compare the desktop with the CI runner: ConPTY version, Windows build, debug versus release, and whether a display is attached.
+- A terminal's event loop paces its UI updates while output keeps arriving. Batches that come within a short interval of the previous update wait out the rest of that interval, so the main thread's message queue goes idle between them. An event after a quiet spell is still handled at once.
+- The same pacing applies to the other per-terminal and per-session event loops of the same shape: remote and agent terminals, and tmux sessions.
+- The `windows-close-mid-output` case keeps checking close during output. A flood-only check confirms that the window keeps painting and quits on time while a program floods.
 
 ## Capabilities
 
-To be decided. Possibly none, if this is a test or environment fix.
+### New Capabilities
+
+None.
+
+### Modified Capabilities
+
+- `terminal-emulation`: adds a requirement that the window stays responsive (it paints, takes input and quits) while a terminal receives continuous output.
+
+## Impact
+
+- `src/terminal/mod.rs` (`spawn_events`, `spawn_remote_events`) and `src/tmux/mod.rs` (the session event loop), plus a small shared pacing helper.
+- `tests/e2e/cases/win.rs`: a flood-only case beside `windows-close-mid-output`.
+- Output latency: an update can be delayed by at most the pacing interval, and only during continuous output. Keystroke echo after a quiet spell is unaffected. The `--latency-bench` numbers are checked before and after.
+- No dependency changes. GPUI isn't patched.
