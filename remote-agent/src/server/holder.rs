@@ -404,20 +404,19 @@ impl<L: EventLoop> Holder<L> {
 
     fn accept(&mut self) {
         loop {
-            let stream = match self.listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // The peer check comes before reading anything.
+            let stream = match peer::accept(&self.listener, self.uid) {
+                Ok(Some(stream)) => stream,
+                Ok(None) => return,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    log!("{error}");
+                    continue;
+                }
                 Err(error) => {
                     log!("accept failed: {error}");
                     return;
                 }
             };
-            // Before reading anything.
-            if let Err(error) = peer::check(stream.as_raw_fd(), self.uid) {
-                log!("{error}");
-                continue;
-            }
             if self.pending.len() >= MAX_PENDING {
                 log!("too many connections waiting to say HELLO; refusing one");
                 continue;

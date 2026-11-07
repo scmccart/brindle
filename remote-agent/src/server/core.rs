@@ -471,3 +471,42 @@ impl<L: EventLoop> Core<L> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::dir::tests::TempDir;
+    use crate::server::peer::tests::{closed_unread, send_hello};
+
+    /// A core in a fresh directory that runs, as far as its peer check is
+    /// concerned, as `uid`.
+    fn core_as(temp: &TempDir, uid: u32) -> Core<PollLoop> {
+        let paths = Paths::new(&temp.0).unwrap();
+        let Claim::Core(lock) = claim(&paths).unwrap() else {
+            panic!("another core holds the lock");
+        };
+        let ev = PollLoop::new().unwrap();
+        Core::new(ev, temp.0.clone(), paths, lock, "test".into(), uid).unwrap()
+    }
+
+    #[test]
+    fn a_foreign_uid_is_closed_without_being_read() {
+        let temp = TempDir::new("core-peer");
+        // As if this core ran as someone else.
+        let mut core = core_as(&temp, dir::own_uid().wrapping_add(1));
+        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
+        send_hello(&mut stream);
+        core.accept();
+        assert!(core.pending.is_empty() && core.clients.is_empty());
+        assert!(closed_unread(&mut stream));
+        drop(core);
+
+        // The same connection from its own user waits for its HELLO.
+        let temp = TempDir::new("core-peer-own");
+        let mut core = core_as(&temp, dir::own_uid());
+        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
+        send_hello(&mut stream);
+        core.accept();
+        assert_eq!(core.pending.len(), 1);
+    }
+}
