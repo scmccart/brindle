@@ -8,4 +8,5 @@ pub mod conn;
 pub mod daemon;
 pub mod dir;
 pub mod event_loop;
+pub mod holder;
 pub mod peer;

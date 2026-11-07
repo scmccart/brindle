@@ -2,13 +2,12 @@ mod agent;
 #[cfg(target_os = "linux")]
 mod pty;
 #[cfg(target_os = "linux")]
-#[allow(dead_code, reason = "used by the holder and the core (tasks 3.2 and 4.1)")]
 mod server;
 
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: brindle-remote --version | --server";
+const USAGE: &str = "usage: brindle-remote --version | --server | hold [--ready-fd N]";
 
 fn main() -> ExitCode {
     match run() {
@@ -28,7 +27,8 @@ fn run() -> Result<(), String> {
         std::fs::remove_file(exe).ok();
     }
     let mode = args.next();
-    let has_extra = args.next().is_some();
+    let rest: Vec<String> = args.collect();
+    let has_extra = !rest.is_empty();
 
     match mode.as_deref() {
         Some("--version") => {
@@ -44,6 +44,17 @@ fn run() -> Result<(), String> {
             }
             agent::serve_stdio().map_err(|error| error.to_string())
         }
+        Some("hold") => hold(&rest),
         _ => Err(USAGE.into()),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn hold(args: &[String]) -> Result<(), String> {
+    server::holder::run(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hold(_args: &[String]) -> Result<(), String> {
+    Err("the terminal server runs only on Linux".into())
 }
