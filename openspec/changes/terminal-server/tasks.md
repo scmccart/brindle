@@ -18,7 +18,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 2. Protocols
 
-- [ ] 2.1 The client protocol (protocol 1) in `remote-protocol`, as a module beside the stdio frames, with everything design.md lists:
+- [x] 2.1 The client protocol (protocol 1) in `remote-protocol`, as a module beside the stdio frames, with everything design.md lists:
   - `HELLO`/`WELCOME` with version negotiation and `client_token`;
   - `req` ids and session-prefixed `DATA`;
   - the session, attach, reconnect replay, management and `STEP_DOWN` messages;
