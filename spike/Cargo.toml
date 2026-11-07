@@ -1,0 +1,30 @@
+# Throwaway spike for terminal-server task group 0. Its own workspace, so it
+# does not touch the brindle workspace. Not built by CI; deleted before merge.
+[workspace]
+
+[package]
+name = "conpty-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+  "Win32_System_Memory",
+  "Win32_UI_WindowsAndMessaging",
+] }
