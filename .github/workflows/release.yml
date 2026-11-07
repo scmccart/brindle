@@ -2,7 +2,7 @@
 # (release-please-config.json, .release-please-manifest.json).
 #
 # Each push to main updates the release pull request, `chore(release): X.Y.Z`,
-# which bumps the three crates' versions, their Cargo.lock entries and
+# which bumps the four crates' versions, their Cargo.lock entries and
 # CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
 # release with that version's notes. This run then builds both platforms at
 # the tag with the same reusable workflows CI uses, attaches the Linux
