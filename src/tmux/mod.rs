@@ -20,6 +20,7 @@ use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
 use crate::config::{Config, Profile, TmuxMode};
+use crate::terminal::pace::{self, Pace};
 use crate::terminal::{DefaultColors, GridSize, PaletteHandler, Terminal};
 use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
@@ -842,18 +843,23 @@ impl TmuxSession {
 
         let reader = cx.spawn(async move |this, cx| {
             let mut events = event_rx.ready_chunks(4096);
+            let mut pace = Pace::default();
             while let Some(batch) = events.next().await {
+                pace.wait(cx).await;
                 let alive = this.update(cx, |this, cx| {
-                    for event in batch {
-                        match event {
-                            Some(event) => this.handle_event(event, cx),
-                            None => this.on_stream_ended(cx),
+                    pace::drain(&mut events, batch, |batch| {
+                        for event in batch {
+                            match event {
+                                Some(event) => this.handle_event(event, cx),
+                                None => this.on_stream_ended(cx),
+                            }
                         }
-                    }
+                    });
                 });
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         });
 

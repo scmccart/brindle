@@ -22,6 +22,7 @@ pub fn all() -> Vec<Case> {
         display("windows-passthrough", passthrough),
         display("windows-glyph-width", glyph_width),
         display("windows-close-mid-output", close_mid_output),
+        display("windows-flood-responsive", flood_responsive),
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
@@ -535,6 +536,19 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
     // The dump comes on time only if closing the flooding tab didn't block.
     let took = started.elapsed().as_secs_f64();
     ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
+    Ok(Outcome::Pass)
+}
+
+/// A tab that prints without pause must not starve the window: every GPUI
+/// main-thread wake is a posted message, and Windows hands out `WM_PAINT`
+/// and `WM_QUIT` only when none is waiting. The dump comes on time only if
+/// the window kept getting idle gaps.
+fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
+    let started = Instant::now();
+    let ran = run(ctx, "flood", &["-p", "cmd", "--send", "for /L %i in (1,0,2) do @echo flood %i\r"], &[], 6.0, None)?;
+    let took = started.elapsed().as_secs_f64();
+    ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
+    ensure!(ran.dump.screen.iter().any(|line| line.starts_with("flood ")), "screen {:?}", ran.dump.screen);
     Ok(Outcome::Pass)
 }
 
