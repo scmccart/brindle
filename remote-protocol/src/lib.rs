@@ -18,6 +18,9 @@ mod wire;
 mod fuzz;
 
 pub use wire::{RequestId, SessionId};
+/// Re-exported for the helper's `--json` output, so it needs no dependency
+/// of its own.
+pub use serde_json;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

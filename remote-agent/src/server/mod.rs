@@ -5,6 +5,7 @@
 
 pub mod build_id;
 pub mod check;
+pub mod cli;
 pub mod conn;
 pub mod core;
 pub mod daemon;

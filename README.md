@@ -96,6 +96,30 @@ docker run --rm -v "${PWD}:/src" -w /src rust:1.99.1 sh -c `
 $env:BRINDLE_REMOTE_AGENT = "$PWD/target/x86_64-unknown-linux-musl/release/brindle-remote"
 ```
 
+### Terminal server
+
+On Linux, `brindle-remote` is also a terminal server whose sessions outlive
+the client that started them. Holders (`brindle-remote hold`) own the PTYs
+and are the programs' parents; the core (`brindle-remote serve`) runs an
+emulator per session, so a client that attaches or reconnects gets the
+screen replayed. The core can be restarted or upgraded without ending a
+session: a newer core takes the holders over and rebuilds every screen, and
+holders of an older build drain, taking no new sessions. Their sockets, locks
+and logs (`core.log`, `holder-*.log`) are in `$BRINDLE_SERVER_DIR`, else
+`$XDG_RUNTIME_DIR/brindle`, else `~/.cache/brindle/run`.
+
+These commands manage the server of that directory, and never start one:
+
+```sh
+brindle-remote list [--json]     # id, pid, attached/detached, command, directory
+brindle-remote kill ID           # hang one session up (kill --all for every one)
+brindle-remote status [--json]   # the core's version, pid and uptime, and its holders
+brindle-remote stop              # hang every session up; the core and holders exit
+brindle-remote check --holder-protocols 1   # whether this binary can take those holders over
+```
+
+With no server running, `list` prints nothing and `status` says so.
+
 ## Control mode or classic?
 
 Control mode gives each pane its own scrollback (the wheel scrolls it, with no

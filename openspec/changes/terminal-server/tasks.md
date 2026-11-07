@@ -94,7 +94,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - when an old-build holder drains, the next session goes to a new holder;
   - a failing check leaves the core running, with the reason in the log;
   - a new core that exits at startup is replaced by the holders' own core within a few seconds, with every session listed.
-- [ ] 6.2 `brindle-remote list`, `kill <id>`, `kill --all`, `status` and `stop`, with `--json` for `list` and `status`. Verify with tests for each spec scenario:
+- [x] 6.2 `brindle-remote list`, `kill <id>`, `kill --all`, `status` and `stop`, with `--json` for `list` and `status`. Verify with tests for each spec scenario:
   - two sessions listed;
   - killing an attached session delivers `EXIT` to its client;
   - an unknown id fails naming it;
