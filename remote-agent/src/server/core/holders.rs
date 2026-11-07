@@ -16,7 +16,7 @@ use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHo
 
 use super::clients::error;
 use super::sessions::Session;
-use super::{ADOPT_LIMIT, Core, Source, log};
+use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};
 use crate::server::conn::Conn;
 use crate::server::daemon;
 use crate::server::event_loop::{EventLoop, Interest, Token};
@@ -333,6 +333,7 @@ impl<L: EventLoop> Core<L> {
         });
         // Every listed session's checkpoint and tail follow.
         holder.adopting = welcome.sessions.iter().map(|held| held.session).collect();
+        let mut adopted_any = false;
         for held in welcome.sessions {
             let id = held.session;
             if self.sessions.contains_key(&id) {
@@ -341,6 +342,13 @@ impl<L: EventLoop> Core<L> {
             }
             self.next_session = self.next_session.max(id.saturating_add(1));
             self.sessions.insert(id, Session::adopted(token, held));
+            adopted_any = true;
+        }
+        // A holder found after startup gives its sessions' owners the same
+        // grace period (startup's starts once clients are accepted).
+        if adopted_any && self.accepting {
+            let until = Instant::now() + RECONNECT_GRACE;
+            self.grace_until = Some(self.grace_until.map_or(until, |grace| grace.max(until)));
         }
         self.holder_adopted(token);
     }
