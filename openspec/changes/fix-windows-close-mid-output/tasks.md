@@ -24,7 +24,7 @@
 ## 5. Integration
 
 - [x] 5.1 On Windows, run `cargo test --workspace` and `BRINDLE_E2E=1 cargo test --test e2e` (all Windows cases; ask first). Verify: everything passes, apart from cases that skip as before.
-- [ ] 5.2 Push the branch and ask the Linux machine's session to run `cargo test --locked`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Also ask for a `BRINDLE_PERF=1 cargo test --test perf` comparison against a run of `main` (`BRINDLE_PERF_BASELINE`). Verify: the tests pass, and latency and throughput show no regression beyond noise.
+- [x] 5.2 Push the branch and ask the Linux machine's session to run `cargo test --locked`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Also ask for a `BRINDLE_PERF=1 cargo test --test perf` comparison against a run of `main` (`BRINDLE_PERF_BASELINE`). Verify: the tests pass, and latency and throughput show no regression beyond noise. Result at `1e03cd1`: the tests pass, and latency matches `main`. Two `throughput-tmux` lines (`dense_cells` +8 %, `unicode` +37 %) are slower, and that was accepted (see design.md, Risks).
 
 ## Workflow follow-up
 

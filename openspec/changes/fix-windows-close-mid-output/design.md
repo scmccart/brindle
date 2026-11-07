@@ -81,6 +81,7 @@ Pixel checks of repainting aren't needed. A starved window never reaches the dum
 
 - [Pacing could delay an echo typed during continuous output by up to `PACE`; without the burst allowance it delayed every tmux echo, measured] → Measure with `--latency-bench` (local shell) on Windows and Linux before and after. A quiet-spell echo should be unchanged.
 - [Throughput: one update covers more bytes] → Parsing is on the I/O thread for local tabs, so throughput isn't affected. For agent and remote terminals `feed` parses on the UI thread, and bigger batches mean fewer, longer updates; check that `throughput-brindle` doesn't regress on Linux.
+- [Accepted: tmux floods are slower on Linux] → At `1e03cd1`, `throughput-tmux` (median of three runs against `main`, under Xvfb) measured `dense_cells` 268.6 ms vs 248.4 ms (+8 %) and `unicode` 378.5 ms vs 277.1 ms (+37 %). Every other line, `throughput-brindle` and all latency cases are within noise. The cost is the idle gap between paced updates. It was accepted, since typing latency is unchanged and the gap is what keeps Windows responsive. A larger `BUDGET` would shrink it, but the window would then repaint less often during a flood.
 - [A busy tmux session sees its control events grouped up to 4 ms later] → Ordering is unchanged. The response FIFO matching depends only on order, not timing.
 - [The CI runner never showed the bug, so CI can't prove the fix] → The new case fails on unfixed builds on fast machines (this desktop). Record the local before and after results in the PR.
 
