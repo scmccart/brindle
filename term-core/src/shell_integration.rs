@@ -472,7 +472,7 @@ pub struct Marks {
 }
 
 impl Marks {
-    #[cfg(test)]
+    /// The commands recorded, oldest first.
     pub fn commands(&self) -> &VecDeque<Command> {
         &self.commands
     }

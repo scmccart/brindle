@@ -3,6 +3,7 @@
 //! program status records.
 
 pub mod notice;
+pub mod replay;
 pub mod shell_integration;
 pub mod status;
 
