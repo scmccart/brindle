@@ -1025,18 +1025,14 @@ impl<L: EventLoop> Holder<L> {
             }
         }
 
-        let sessions = &self.sessions;
-        self.kills.retain(|&(id, pid, at)| {
+        self.kills.retain(|&(_, pid, at)| {
             if now < at {
                 return true;
             }
-            // Until the leader is reaped (even as a zombie) its pid, and so
-            // the group id, can't be reused. After that the number may
-            // belong to someone else's group, so it gets no signal.
-            if sessions
-                .get(&id)
-                .is_some_and(|session| session.reaped.is_none())
-            {
+            // A group id can't be reused while the group has members, the
+            // reaped leader's children that ignored SIGHUP included. So the
+            // group gets the SIGKILL as long as it still exists.
+            if pid > 0 && unsafe { libc::kill(-pid, 0) } == 0 {
                 pty::signal_process_group(pid, libc::SIGKILL);
             }
             false

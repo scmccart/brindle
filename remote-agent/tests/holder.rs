@@ -200,6 +200,27 @@ fn hangup_kills_the_process_group() {
     assert!(!alive(plain));
 }
 
+#[test]
+fn hangup_kills_a_child_that_outlives_its_exited_leader() {
+    let (_dir, mut core, _) = holder("hangup-orphan");
+    // The leader goes on SIGHUP; its child ignores it and stays in the group.
+    let pid = core.spawn(shell(
+        1,
+        "(trap '' HUP; exec sleep 1000) & echo \"bg=$!.\"; wait",
+    ));
+    let background = reported_pid(&core.output_until(1, b"."), "bg");
+    assert!(alive(background));
+
+    core.hang_up(1);
+    assert_eq!(core.exit_code(1), None);
+    assert!(!alive(pid), "the leader is reaped");
+    assert!(alive(background), "the child outlived its leader");
+    assert!(
+        eventually(TIMEOUT, || !alive(background)),
+        "the child survived the hang-up"
+    );
+}
+
 /// `SPAWN`'s meta, decoded from JSON as a core would send it.
 fn meta() -> h1::Spawn {
     let frame = Frame::new(
