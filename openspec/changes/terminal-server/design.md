@@ -225,7 +225,7 @@ If no core connects to a holder within 3 s, the holder starts one from its own b
   - checkpoints and tail truncation;
   - an upgrade to the same binary, drain, a refused check, and a new core that won't start;
   - the management commands.
-- **e2e:** every case gets `BRINDLE_SERVER_DIR=target/tmp/e2e/<case>/server` and a `brindle-remote stop` afterwards. The new `local-server-*` cases are listed in tasks 8.2.
+- **e2e:** every case gets its own `BRINDLE_SERVER_DIR` under `/tmp` (see "Settled in task group 7") and a `brindle-remote stop` afterwards. The new `local-server-*` cases are listed in tasks 8.2.
 - **perf:** `tests/perf` on `main` before and on the branch after, with `BRINDLE_PERF_BASELINE`.
 
 ### Windows (phase 3, shaped by the spike)

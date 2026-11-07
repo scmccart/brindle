@@ -115,7 +115,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 8. Test harness and e2e cases
 
-- [ ] 8.1 Give every e2e case its own `BRINDLE_SERVER_DIR` under `/tmp` (paths under `target/tmp/e2e/` are too long for Unix sockets), copy its `core.log` into `target/tmp/e2e/<case>/`, run `brindle-remote stop` after it, and have the harness fail with a clear message if the helper isn't built. Update CLAUDE.md's e2e section and the CI e2e and Windows jobs as needed. Verify that `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` passes on the existing cases, and that no `brindle-remote serve` or `hold` is left running afterwards.
+- [x] 8.1 Give every e2e case its own `BRINDLE_SERVER_DIR` under `/tmp` (paths under `target/tmp/e2e/` are too long for Unix sockets), copy its `core.log` into `target/tmp/e2e/<case>/`, run `brindle-remote stop` after it, and have the harness fail with a clear message if the helper isn't built. Update CLAUDE.md's e2e section and the CI e2e and Windows jobs as needed. Verify that `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` passes on the existing cases, and that no `brindle-remote serve` or `hold` is left running afterwards.
 - [ ] 8.2 Add `tests/e2e/cases/local_server.rs` with these cases:
   - `local-server-session`: listed as attached, and the shell's parent is a holder;
   - `local-server-close`, `local-server-quit` and `local-server-crash`: the programs are gone;

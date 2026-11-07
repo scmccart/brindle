@@ -47,6 +47,9 @@ pub struct Ctx {
     /// Scratch and artifact directory for this case, emptied before it runs.
     pub dir: PathBuf,
     pub bin: PathBuf,
+    /// The terminal server helper Brindle runs (`BRINDLE_REMOTE_AGENT`, else
+    /// `brindle-remote` beside `bin`).
+    pub helper: PathBuf,
     pub display: String,
     /// The case's own terminal server directory (`BRINDLE_SERVER_DIR`), so
     /// local tabs never use the user's server. It is under the system temp
@@ -128,6 +131,15 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_brindle")));
     let slow = std::env::var("BRINDLE_E2E_SLOW").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e");
+    let helper = helper(&bin);
+    // Local tabs run in the terminal server on Linux, so every case that
+    // runs Brindle needs the helper.
+    if cfg!(target_os = "linux") && has_display && selected.iter().any(|case| case.display) {
+        if let Err(why) = check_helper(&helper) {
+            eprintln!("e2e: {why}");
+            std::process::exit(1);
+        }
+    }
 
     let (mut passed, mut failed, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (n, case) in selected.into_iter().enumerate() {
@@ -139,10 +151,25 @@ fn main() {
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).expect("case directory");
             let server_dir = std::env::temp_dir().join(format!("brindle-e2e-{}-{n}", std::process::id()));
-            let ctx = Ctx { name: case.name, dir, bin: bin.clone(), display: display.clone(), server_dir, slow };
+            let ctx = Ctx {
+                name: case.name,
+                dir,
+                bin: bin.clone(),
+                helper: helper.clone(),
+                display: display.clone(),
+                server_dir,
+                slow,
+            };
             let outcome = (case.run)(&ctx);
-            stop_server(&ctx);
-            outcome
+            match stop_server(&ctx) {
+                // A server left running fails a case that passed.
+                Err(why) if !matches!(outcome, Err(_)) => Err(why),
+                Err(why) => {
+                    println!("         {why}");
+                    outcome
+                }
+                Ok(()) => outcome,
+            }
         };
         let took = started.elapsed().as_secs_f64();
         match outcome {
@@ -168,23 +195,107 @@ fn main() {
     }
 }
 
-/// Stops the case's terminal server, if one started, and removes its
-/// directory, keeping its log in the case's directory.
-fn stop_server(ctx: &Ctx) {
-    if !ctx.server_dir.exists() {
-        return;
+/// The helper Brindle runs its terminal server with: `BRINDLE_REMOTE_AGENT`,
+/// else the `brindle-remote` beside the binary, as Brindle looks for it.
+fn helper(bin: &std::path::Path) -> PathBuf {
+    std::env::var_os("BRINDLE_REMOTE_AGENT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| bin.with_file_name(if cfg!(windows) { "brindle-remote.exe" } else { "brindle-remote" }))
+}
+
+/// The helper must be there, and when it is this build's, no older than
+/// its sources (`cargo test --test e2e` doesn't rebuild it).
+fn check_helper(helper: &std::path::Path) -> Result {
+    let built = std::fs::metadata(helper).and_then(|m| m.modified()).map_err(|_| {
+        format!(
+            "the terminal server helper isn't built ({} is missing): run `cargo build`, which builds it, \
+             or set BRINDLE_REMOTE_AGENT",
+            helper.display()
+        )
+    })?;
+    let own = PathBuf::from(env!("CARGO_BIN_EXE_brindle")).with_file_name("brindle-remote");
+    if helper != own {
+        return Ok(());
     }
-    let helper = ctx.bin.with_file_name("brindle-remote");
-    let stopped = std::process::Command::new(&helper)
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let newer = ["remote-agent/src", "remote-protocol/src", "term-core/src"]
+        .iter()
+        .flat_map(|dir| files(&root.join(dir)))
+        .find(|file| std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|time| time > built));
+    match newer {
+        Some(file) => Err(format!(
+            "{} is older than {}: run `cargo build` (the e2e target doesn't rebuild it)",
+            helper.display(),
+            file.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+fn files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() { files(&path) } else { vec![path] }
+        })
+        .collect()
+}
+
+/// Stops the case's terminal server, if one started, and removes its
+/// directory, keeping its log in the case's directory. Fails when a core
+/// or holder of the case's is still running afterwards, killing it.
+fn stop_server(ctx: &Ctx) -> Result {
+    if !ctx.server_dir.exists() {
+        return Ok(());
+    }
+    let stopped = std::process::Command::new(&ctx.helper)
         .arg("stop")
         .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .stdin(std::process::Stdio::null())
         .output();
-    if let Err(error) = stopped {
-        println!("         can't stop {}'s server with {}: {error}", ctx.name, helper.display());
+    let mut problem = match stopped {
+        Err(error) => Some(format!("can't stop the server with {}: {error}", ctx.helper.display())),
+        Ok(_) => None,
+    };
+    // Holders hang their sessions up first (SIGHUP, then SIGKILL after 1 s).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut left = server_processes(&ctx.server_dir);
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left = server_processes(&ctx.server_dir);
+    }
+    if !left.is_empty() {
+        let names: Vec<String> = left.iter().map(|(pid, role)| format!("{role} {pid}")).collect();
+        problem.get_or_insert(format!("left running after `brindle-remote stop`: {}", names.join(", ")));
+        for (pid, _) in &left {
+            std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().ok();
+        }
     }
     std::fs::copy(ctx.server_dir.join("core.log"), ctx.dir.join("server-core.log")).ok();
     std::fs::remove_dir_all(&ctx.server_dir).ok();
+    problem.map_or(Ok(()), Err)
+}
+
+/// The `serve` and `hold` processes using `dir` (their environment names
+/// it), with their roles.
+pub fn server_processes(dir: &std::path::Path) -> Vec<(u32, String)> {
+    let wanted = format!("BRINDLE_SERVER_DIR={}", dir.display());
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let role = cmdline.split(|&b| b == 0).nth(1).map(|arg| String::from_utf8_lossy(arg).into_owned())?;
+            if role != "serve" && role != "hold" {
+                return None;
+            }
+            let environ = std::fs::read(entry.path().join("environ")).ok()?;
+            environ.split(|&b| b == 0).any(|var| var == wanted.as_bytes()).then_some((pid, role))
+        })
+        .collect()
 }
 
 fn usage(why: &str) -> ! {
