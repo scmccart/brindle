@@ -33,7 +33,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - opaque `meta`.
 
   Verify with round-trip unit tests and a fuzz-style test that feeds the decoder random and truncated bytes and expects errors, never a panic.
-- [ ] 2.3 Transcript fixtures for protocol 1 and H1: encoded exchanges for spawn, I/O, attach, reconnect, checkpoint and adopt, and management. Add a test that decodes them. Verify it passes, and that changing an encoding fails it.
+- [x] 2.3 Transcript fixtures for protocol 1 and H1: encoded exchanges for spawn, I/O, attach, reconnect, checkpoint and adopt, and management. Add a test that decodes them. Verify it passes, and that changing an encoding fails it.
 
 ## 3. Holder
 
