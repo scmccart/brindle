@@ -15,18 +15,22 @@
 //! - **Backpressure:** past [`CORE_QUEUE_HIGH`] queued to the core, it stops
 //!   reading PTYs. With no core, it reads a session until its tail is full,
 //!   so the program blocks instead of losing output.
-//! - **Exit:** once it has no sessions (after having one, or when no core
-//!   used it within [`UNUSED_LIMIT`] of starting).
+//! - **Supervision:** with sessions but no core for [`CORE_GRACE`], it
+//!   starts `serve` from `/proc/self/exe` (which survives the file being
+//!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`].
+//! - **Exit:** once it has no sessions (after having one, after `DRAIN`, or
+//!   when no core used it within [`UNUSED_LIMIT`] of starting).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
@@ -36,7 +40,7 @@ use brindle_remote_protocol::holder::{
 };
 
 use super::conn::Conn;
-use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
+use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token, pipe};
 use super::{build_id, daemon, dir, peer};
 use crate::pty::{
     self, GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
@@ -44,6 +48,12 @@ use crate::pty::{
 
 /// Past this much queued to the core, the holder stops reading PTYs.
 pub const CORE_QUEUE_HIGH: usize = 8 * 1024 * 1024;
+/// With sessions but no core for this long, the holder starts one.
+pub const CORE_GRACE: Duration = Duration::from_secs(3);
+/// The first retry delay after starting a core that didn't connect...
+pub const CORE_BACKOFF_START: Duration = Duration::from_secs(3);
+/// ...doubling up to this.
+pub const CORE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A holder that never had a session exits this long after starting, unless
 /// a core is connected.
 pub const UNUSED_LIMIT: Duration = Duration::from_secs(10);
@@ -57,6 +67,15 @@ const EXIT_FLUSH_LIMIT: Duration = Duration::from_secs(2);
 const READS_PER_EVENT: usize = 4;
 const TICK_FAST: Duration = Duration::from_millis(50);
 const TICK_SLOW: Duration = Duration::from_millis(500);
+
+/// The core the holder starts, run from its own binary. Tests replace the
+/// arguments with `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated);
+/// `{ready_fd}` stands for the ready pipe's fd number.
+const CORE_PROGRAM: &str = "/proc/self/exe";
+const DEFAULT_CORE_ARGS: &[&str] = &["serve", "--ready-fd", "{ready_fd}"];
+const CORE_ARGS_ENV: &str = "BRINDLE_TEST_HOLDER_CORE_ARGS";
+/// The fd the started core's ready pipe gets.
+const CORE_READY_FD: libc::c_int = 3;
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -85,8 +104,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("can't open {}: {error}", slot.log_path.display()))?;
         daemon::daemonize(&log).map_err(|error| error.to_string())?;
     }
+    let core_args = std::env::var(CORE_ARGS_ENV)
+        .ok()
+        .map(|args| args.split_whitespace().map(String::from).collect())
+        .unwrap_or_else(|| {
+            DEFAULT_CORE_ARGS
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect()
+        });
     let ev = PollLoop::new().map_err(|error| error.to_string())?;
-    let holder = Holder::new(ev, build, slot).map_err(|error| {
+    let holder = Holder::new(ev, build, slot, core_args).map_err(|error| {
         log!("can't start: {error}");
         error.to_string()
     })?;
@@ -240,6 +268,7 @@ enum Source {
     Pending,
     Core,
     Master(SessionId),
+    CoreReady,
 }
 
 const LISTENER: Token = 0;
@@ -256,14 +285,20 @@ struct Holder<L: EventLoop> {
     pending: HashMap<Token, Pending>,
     sessions: BTreeMap<SessionId, Session>,
     previous: Previous,
+    draining: bool,
     had_session: bool,
     started: Instant,
+    next_core_start: Option<Instant>,
+    backoff: Duration,
+    core_args: Vec<String>,
+    core_starts: Vec<Child>,
+    core_ready: HashMap<Token, OwnedFd>,
     /// Process groups to `SIGKILL` when their hang-up grace ends.
     kills: Vec<(libc::pid_t, Instant)>,
 }
 
 impl<L: EventLoop> Holder<L> {
-    fn new(mut ev: L, build: String, slot: Slot) -> io::Result<Self> {
+    fn new(mut ev: L, build: String, slot: Slot, core_args: Vec<String>) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
         match fs::remove_file(&slot.socket_path) {
             Ok(()) => {}
@@ -295,8 +330,14 @@ impl<L: EventLoop> Holder<L> {
             pending: HashMap::new(),
             sessions: BTreeMap::new(),
             previous: Previous::None,
+            draining: false,
             had_session: false,
             started: Instant::now(),
+            next_core_start: None,
+            backoff: CORE_BACKOFF_START,
+            core_args,
+            core_starts: Vec::new(),
+            core_ready: HashMap::new(),
             kills: Vec::new(),
         })
     }
@@ -352,6 +393,7 @@ impl<L: EventLoop> Holder<L> {
                     self.read_output(session);
                 }
             }
+            Some(Source::CoreReady) => self.read_core_ready(event.token),
             None => {}
         }
     }
@@ -508,6 +550,8 @@ impl<L: EventLoop> Holder<L> {
             self.remove_session(id);
         }
         self.core = Some(core);
+        self.next_core_start = None;
+        self.backoff = CORE_BACKOFF_START;
         self.process_core_frames();
     }
 
@@ -526,6 +570,7 @@ impl<L: EventLoop> Holder<L> {
             core.instance,
             self.sessions.len()
         );
+        self.next_core_start = Some(Instant::now() + CORE_GRACE);
     }
 
     fn flush_core(&mut self) {
@@ -646,7 +691,12 @@ impl<L: EventLoop> Holder<L> {
                     Err(error) => self.send_error(Some(end.session), error.to_string()),
                 }
             }
-            ToHolder::Drain(_) => self.send_error(None, "DRAIN isn't supported yet"),
+            ToHolder::Drain(_) => {
+                if !self.draining {
+                    log!("draining: no new sessions; exiting after the last one");
+                }
+                self.draining = true;
+            }
             ToHolder::Goodbye(goodbye) => {
                 if let Some(core) = self.core.as_mut() {
                     core.handover = goodbye.handover;
@@ -658,7 +708,9 @@ impl<L: EventLoop> Holder<L> {
 
     fn spawn(&mut self, spawn: Spawn) {
         let id = spawn.session;
-        let refusal = if self.sessions.contains_key(&id) {
+        let refusal = if self.draining {
+            Some("the holder is draining and takes no new sessions".to_string())
+        } else if self.sessions.contains_key(&id) {
             Some(format!("session {id} already exists"))
         } else if spawn.command.as_deref() == Some("") {
             Some("command must not be empty".into())
@@ -869,6 +921,24 @@ impl<L: EventLoop> Holder<L> {
         }
     }
 
+    fn read_core_ready(&mut self, token: Token) {
+        let Some(fd) = self.core_ready.get(&token) else {
+            return;
+        };
+        let mut buffer = [0u8; 16];
+        let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            return;
+        }
+        if read > 0 {
+            log!("the core it started is listening");
+        } else {
+            log!("the core it started exited before listening");
+        }
+        self.core_ready.remove(&token);
+        self.drop_source(token);
+    }
+
     fn remove_session(&mut self, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id)
             && session.master.is_some()
@@ -877,7 +947,7 @@ impl<L: EventLoop> Holder<L> {
         }
     }
 
-    /// Reaps exited programs; run after every wake-up
+    /// Reaps exited programs and started cores; run after every wake-up
     /// (`SIGCHLD` wakes the loop).
     fn reap(&mut self) {
         let now = Instant::now();
@@ -900,6 +970,8 @@ impl<L: EventLoop> Holder<L> {
                 }
             }
         }
+        self.core_starts
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
     fn tick(&mut self, now: Instant) {
@@ -952,6 +1024,68 @@ impl<L: EventLoop> Holder<L> {
             self.pending.remove(&token);
             self.drop_source(token);
         }
+
+        if self.core.is_none() && !self.sessions.is_empty() {
+            let due = *self.next_core_start.get_or_insert(now + CORE_GRACE);
+            if now >= due {
+                self.start_core();
+                self.next_core_start = Some(now + self.backoff);
+                self.backoff = (self.backoff * 2).min(CORE_BACKOFF_MAX);
+            }
+        }
+    }
+
+    /// Starts a core from this holder's own binary, which `/proc/self/exe`
+    /// names even after an install replaced the file.
+    fn start_core(&mut self) {
+        let (ready_read, ready_write) = match pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => return log!("can't start a core: {error}"),
+        };
+        let args: Vec<OsString> = self
+            .core_args
+            .iter()
+            .map(|arg| arg.replace("{ready_fd}", &CORE_READY_FD.to_string()).into())
+            .collect();
+        let mut command = Command::new(CORE_PROGRAM);
+        command.args(&args).stdin(Stdio::null());
+        let write_fd = ready_write.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if write_fd == CORE_READY_FD {
+                    let flags = libc::fcntl(write_fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else if libc::dup2(write_fd, CORE_READY_FD) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        match command.spawn() {
+            Ok(child) => {
+                log!(
+                    "no core for a while; started {CORE_PROGRAM} {} as pid {}",
+                    self.core_args.join(" "),
+                    child.id()
+                );
+                self.core_starts.push(child);
+            }
+            Err(error) => return log!("can't start a core: {error}"),
+        }
+        drop(ready_write);
+        let token = self.token();
+        if self
+            .ev
+            .register(ready_read.as_raw_fd(), token, Interest::READABLE)
+            .is_ok()
+        {
+            self.sources.insert(token, Source::CoreReady);
+            self.core_ready.insert(token, ready_read);
+        }
     }
 
     fn update_interests(&mut self) {
@@ -988,7 +1122,9 @@ impl<L: EventLoop> Holder<L> {
     fn should_exit(&self, now: Instant) -> bool {
         self.sessions.is_empty()
             && self.kills.is_empty()
-            && (self.had_session || (self.core.is_none() && now >= self.started + UNUSED_LIMIT))
+            && (self.had_session
+                || self.draining
+                || (self.core.is_none() && now >= self.started + UNUSED_LIMIT))
     }
 
     fn shutdown(mut self) {

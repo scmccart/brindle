@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use brindle_remote_protocol::Frame;
-use brindle_remote_protocol::holder::{self as h1, Goodbye, Previous, ToCore, ToHolder};
+use brindle_remote_protocol::holder::{self as h1, Drain, Goodbye, Previous, ToCore, ToHolder};
 
 use support::*;
 
@@ -349,5 +349,72 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
     );
     core.hang_up(1);
     assert_eq!(core.exit_code(1), None);
+    assert!(holder_exits(&dir, holder_pid));
+}
+
+#[test]
+fn a_drained_holder_refuses_spawn_and_exits_after_its_last_session() {
+    let (dir, mut core, holder_pid) = holder("drain");
+    core.spawn(shell(1, "read x"));
+    core.send(ToHolder::Drain(Drain {}));
+    core.send(ToHolder::Spawn(shell(2, "exit 0")));
+    match core.recv() {
+        ToCore::SpawnFailed(failed) => {
+            assert_eq!(failed.session, 2);
+            assert!(failed.message.contains("draining"), "{}", failed.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(alive(holder_pid));
+    core.input(1, b"\n");
+    assert_eq!(core.exit_code(1), Some(0));
+    assert!(holder_exits(&dir, holder_pid));
+}
+
+#[test]
+fn a_holder_without_a_core_starts_one_from_its_own_binary_even_after_it_was_replaced() {
+    let mut dir = TempDir::new("supervise");
+    let bin_dir = TempDir::new("supervise-bin");
+    let copy = bin_dir.path.join("brindle-remote");
+    fs::copy(BIN, &copy).unwrap();
+    // Instead of `serve`, which comes later, the started "core" prints the
+    // version of whichever binary ran, into the holder's log.
+    start(
+        &copy,
+        "hold",
+        &dir.path,
+        &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")],
+    )
+    .unwrap();
+    let mut core = TestCore::connect_to(&dir);
+    let holder_pid = core.hello(1).welcome().pid;
+    dir.track(holder_pid);
+    core.spawn(shell(1, "read x"));
+
+    // An install replaces the file.
+    let replacement = bin_dir.path.join("new");
+    fs::write(&replacement, "#!/bin/sh\necho replaced binary ran\n").unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&replacement, &copy).unwrap();
+
+    // The core goes away, as if SIGKILLed.
+    drop(core);
+    let version = env!("CARGO_PKG_VERSION");
+    let starts = |logs: &str| logs.lines().filter(|line| *line == version).count();
+    assert!(
+        eventually(Duration::from_secs(60), || starts(&dir.logs()) >= 2),
+        "no repeated core starts: {}",
+        dir.logs()
+    );
+    let logs = dir.logs();
+    assert!(!logs.contains("replaced binary ran"), "{logs}");
+    assert!(logs.contains("started /proc/self/exe --version"), "{logs}");
+
+    // A core that connects stops the retries and keeps the session.
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    assert_eq!(adopted.welcome().sessions.len(), 1);
+    core.input(1, b"\n");
+    assert_eq!(core.exit_code(1), Some(0));
     assert!(holder_exits(&dir, holder_pid));
 }
