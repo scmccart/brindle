@@ -2,13 +2,19 @@
 //! terminal server's core.
 //!
 //! A holder is the programs' parent. It pumps their I/O, resizes, signals
-//! and reaps them, and parses nothing.
+//! and reaps them, and parses nothing. Per session it keeps the core's
+//! latest checkpoint and the raw output since then (the tail), as bytes it
+//! doesn't interpret, so a new core can rebuild the screens.
 //!
 //! - **Socket:** `holder-<build>-<n>.sock` in the server directory, beside
 //!   `holder-<build>-<n>.lock`, which it flocks for its whole life (a
 //!   socket path can't be opened to flock), and its log.
 //! - **One core at a time:** a newer `HELLO` takes the holder over from the
-//!   connected core. `WELCOME` lists the sessions.
+//!   connected core. `WELCOME` lists the sessions, then each one's
+//!   checkpoint and tail follow.
+//! - **Backpressure:** past [`CORE_QUEUE_HIGH`] queued to the core, it stops
+//!   reading PTYs. With no core, it reads a session until its tail is full,
+//!   so the program blocks instead of losing output.
 //! - **Exit:** once it has no sessions (after having one, or when no core
 //!   used it within [`UNUSED_LIMIT`] of starting).
 
@@ -25,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::holder::{
-    self as h1, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous, Spawn,
-    SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
+    self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
+    Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
 };
 
 use super::conn::Conn;
@@ -36,6 +42,8 @@ use crate::pty::{
     self, GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
 };
 
+/// Past this much queued to the core, the holder stops reading PTYs.
+pub const CORE_QUEUE_HIGH: usize = 8 * 1024 * 1024;
 /// A holder that never had a session exits this long after starting, unless
 /// a core is connected.
 pub const UNUSED_LIMIT: Duration = Duration::from_secs(10);
@@ -158,6 +166,41 @@ impl Slot {
     }
 }
 
+/// The output kept since the session's last checkpoint, at most
+/// [`h1::TAIL_LIMIT`] bytes; past that the oldest bytes go.
+#[derive(Default)]
+struct Tail {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+impl Tail {
+    const LIMIT: usize = h1::TAIL_LIMIT as usize;
+
+    fn push(&mut self, data: &[u8]) {
+        self.bytes.extend(data);
+        let excess = self.bytes.len().saturating_sub(Self::LIMIT);
+        if excess > 0 {
+            self.bytes.drain(..excess);
+            self.truncated = true;
+        }
+    }
+
+    fn room(&self) -> usize {
+        Self::LIMIT.saturating_sub(self.bytes.len())
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.truncated = false;
+    }
+
+    fn to_vec(&self) -> Vec<u8> {
+        let (front, back) = self.bytes.as_slices();
+        [front, back].concat()
+    }
+}
+
 struct Session {
     /// The entry `WELCOME` reports; `exit` is set once the program has
     /// exited and its output is drained.
@@ -167,6 +210,8 @@ struct Session {
     master: Option<OwnedFd>,
     token: Token,
     interest: Interest,
+    checkpoint: Vec<u8>,
+    tail: Tail,
     input: VecDeque<u8>,
     /// The program was reaped, with its exit code (`None` for a signal).
     reaped: Option<(Option<i32>, Instant)>,
@@ -179,6 +224,7 @@ struct Core {
     token: Token,
     interest: Interest,
     instance: u64,
+    checkpoints: Assembler,
     /// It sent `GOODBYE { handover: true }`.
     handover: bool,
 }
@@ -422,12 +468,16 @@ impl<L: EventLoop> Holder<L> {
             token,
             interest: Interest::READABLE,
             instance: hello.instance,
+            checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
             handover: false,
         };
         let sessions = self
             .sessions
             .values()
-            .map(|session| session.held.clone())
+            .map(|session| HeldSession {
+                truncated: session.tail.truncated,
+                ..session.held.clone()
+            })
             .collect();
         queue(
             &mut core.conn,
@@ -439,12 +489,11 @@ impl<L: EventLoop> Holder<L> {
                 sessions,
             }),
         );
-        // No checkpoints or tails are kept yet, so each is empty.
-        for &id in self.sessions.keys() {
-            for message in ToCore::checkpoint(id, &[])
-                .into_iter()
-                .chain(ToCore::tail(id, &[]))
-            {
+        for (&id, session) in &self.sessions {
+            for message in ToCore::checkpoint(id, &session.checkpoint) {
+                queue(&mut core.conn, message);
+            }
+            for message in ToCore::tail(id, &session.tail.to_vec()) {
                 queue(&mut core.conn, message);
             }
         }
@@ -573,10 +622,30 @@ impl<L: EventLoop> Holder<L> {
                     self.send_error(Some(target.session), no_session(target.session));
                 }
             }
-            // Checkpoints aren't kept yet.
-            ToHolder::CheckpointBegin(_)
-            | ToHolder::CheckpointChunk(_)
-            | ToHolder::CheckpointEnd(_) => {}
+            ToHolder::CheckpointBegin(begin) => {
+                let core = self.core.as_mut().expect("a core sent this");
+                if let Err(error) = core.checkpoints.begin(begin) {
+                    self.send_error(Some(begin.session), error.to_string());
+                }
+            }
+            ToHolder::CheckpointChunk(chunk) => {
+                let core = self.core.as_mut().expect("a core sent this");
+                if let Err(error) = core.checkpoints.chunk(&chunk) {
+                    self.send_error(Some(chunk.session), error.to_string());
+                }
+            }
+            ToHolder::CheckpointEnd(end) => {
+                let core = self.core.as_mut().expect("a core sent this");
+                match core.checkpoints.end(end) {
+                    Ok(bytes) => {
+                        if let Some(session) = self.sessions.get_mut(&end.session) {
+                            session.checkpoint = bytes;
+                            session.tail.clear();
+                        }
+                    }
+                    Err(error) => self.send_error(Some(end.session), error.to_string()),
+                }
+            }
             ToHolder::Drain(_) => self.send_error(None, "DRAIN isn't supported yet"),
             ToHolder::Goodbye(goodbye) => {
                 if let Some(core) = self.core.as_mut() {
@@ -661,6 +730,8 @@ impl<L: EventLoop> Holder<L> {
                 master: Some(spawned.master),
                 token,
                 interest: Interest::READABLE,
+                checkpoint: Vec::new(),
+                tail: Tail::default(),
                 input: VecDeque::new(),
                 reaped: None,
                 last_output: Instant::now(),
@@ -722,9 +793,20 @@ impl<L: EventLoop> Holder<L> {
             if session.output_closed {
                 break;
             }
-            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            let limit = match &self.core {
+                Some(core) if core.conn.queued() >= CORE_QUEUE_HIGH => break,
+                Some(_) => buffer.len(),
+                // Nothing is lost while the core is away: the program
+                // blocks once its tail is full.
+                None => session.tail.room().min(buffer.len()),
+            };
+            if limit == 0 {
+                break;
+            }
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), limit) };
             if read > 0 {
                 let bytes = &buffer[..read as usize];
+                session.tail.push(bytes);
                 session.last_output = Instant::now();
                 if let Some(core) = self.core.as_mut() {
                     queue(
@@ -874,12 +956,18 @@ impl<L: EventLoop> Holder<L> {
 
     fn update_interests(&mut self) {
         self.flush_core();
+        let queued = self.core.as_ref().map(|core| core.conn.queued());
         for session in self.sessions.values_mut() {
             if session.master.is_none() {
                 continue;
             }
+            let readable = !session.output_closed
+                && match queued {
+                    Some(queued) => queued < CORE_QUEUE_HIGH,
+                    None => session.tail.room() > 0,
+                };
             let want = Interest {
-                readable: !session.output_closed,
+                readable,
                 writable: !session.input.is_empty(),
             };
             if want != session.interest && self.ev.modify(session.token, want).is_ok() {
@@ -927,6 +1015,28 @@ fn queue(conn: &mut Conn, message: ToCore) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tail_keeps_the_newest_bytes() {
+        let mut tail = Tail::default();
+        tail.push(b"abc");
+        assert_eq!(
+            (tail.to_vec(), tail.truncated, tail.room()),
+            (b"abc".to_vec(), false, Tail::LIMIT - 3)
+        );
+        tail.push(&vec![b'x'; Tail::LIMIT - 3]);
+        assert!(!tail.truncated);
+        assert_eq!(tail.room(), 0);
+        tail.push(b"yz");
+        assert!(tail.truncated);
+        let bytes = tail.to_vec();
+        assert_eq!(bytes.len(), Tail::LIMIT);
+        assert!(bytes.starts_with(b"cx") && bytes.ends_with(b"xyz"));
+        tail.push(&vec![b'q'; Tail::LIMIT + 5]);
+        assert_eq!(tail.to_vec(), vec![b'q'; Tail::LIMIT]);
+        tail.clear();
+        assert_eq!((tail.to_vec().len(), tail.truncated), (0, false));
+    }
 
     #[test]
     fn slots_take_the_first_free_index() {
