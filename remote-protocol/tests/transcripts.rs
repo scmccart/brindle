@@ -282,7 +282,7 @@ fn every_message_type_appears_in_a_transcript() {
             "client type {msg_type}"
         );
     }
-    let holder_types = (holder::MSG_HELLO..=holder::MSG_REPARENT)
+    let holder_types = (holder::MSG_HELLO..=holder::MSG_RESUME)
         .chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
     for msg_type in holder_types {
         assert!(
@@ -636,7 +636,7 @@ fn transcripts() -> Vec<Transcript> {
         Transcript {
             name: "holder-spawn-io",
             protocol: Protocol::Holder,
-            about: "A new holder: handshake, spawn with meta, I/O, resize, a failed spawn, reparent refused, hangup.",
+            about: "A new holder: handshake, spawn with meta, I/O, resize, pause and resume, a failed spawn, reparent refused, hangup.",
             steps: vec![
                 holder_hello(1),
                 h(holder::ToCore::Welcome(holder::Welcome {
@@ -681,6 +681,8 @@ fn transcripts() -> Vec<Transcript> {
                     cell_w: 9,
                     cell_h: 18,
                 })),
+                ch(holder::ToHolder::Pause(holder::SessionRef { session: 1 })),
+                ch(holder::ToHolder::Resume(holder::SessionRef { session: 1 })),
                 ch(holder::ToHolder::Spawn(holder::Spawn {
                     session: 2,
                     command: Some("/nonexistent".into()),

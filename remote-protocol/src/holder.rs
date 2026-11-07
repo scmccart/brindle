@@ -20,6 +20,8 @@
 //! |    9 | `DRAIN`            | core → holder | `{}`                                                             |
 //! |   10 | `GOODBYE`          | core → holder | `handover`                                                       |
 //! |   11 | `REPARENT`         | core → holder | `session, hwnd` (a Linux holder answers `ERROR`)                 |
+//! |   12 | `PAUSE`            | core → holder | `session`                                                        |
+//! |   13 | `RESUME`           | core → holder | `session`                                                        |
 //! |   32 | `WELCOME`          | holder → core | `protocol, build, pid, previous, sessions: [{session, pid, cols, rows, exit, meta, truncated}]` |
 //! |   33 | `OUTPUT`           | holder → core | session, bytes                                                   |
 //! |   34 | `SPAWNED`          | holder → core | `session, pid`                                                   |
@@ -39,6 +41,13 @@
 //! replaces its stored checkpoint, and drops that session's tail, only on
 //! `CHECKPOINT_END`; a connection lost mid-blob leaves the previous one in
 //! place. [`split`] cuts a blob into messages and [`Assembler`] rebuilds it.
+//!
+//! **Flow control.** `PAUSE` makes the holder stop reading a session's PTY,
+//! so its program blocks, and `RESUME` reads it again. The core pauses the
+//! sessions of a client that isn't keeping up, so one stalled client
+//! doesn't hold up the connection's other sessions. A holder forgets the
+//! pauses when its core leaves. An unknown session is ignored, since it may
+//! just have ended.
 //!
 //! **Adopting.** `WELCOME` is followed, for each session it lists, by that
 //! session's checkpoint and then its tail, each possibly empty (`len` 0).
@@ -76,6 +85,8 @@ pub const MSG_CHECKPOINT_END: u8 = 8;
 pub const MSG_DRAIN: u8 = 9;
 pub const MSG_GOODBYE: u8 = 10;
 pub const MSG_REPARENT: u8 = 11;
+pub const MSG_PAUSE: u8 = 12;
+pub const MSG_RESUME: u8 = 13;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_OUTPUT: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -284,6 +295,9 @@ pub enum ToHolder {
     Drain(Drain),
     Goodbye(Goodbye),
     Reparent(Reparent),
+    /// Stop reading the session's PTY until `RESUME`.
+    Pause(SessionRef),
+    Resume(SessionRef),
 }
 
 impl ToHolder {
@@ -300,6 +314,8 @@ impl ToHolder {
             Self::Drain(m) => wire::json(MSG_DRAIN, m),
             Self::Goodbye(m) => wire::json(MSG_GOODBYE, m),
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
+            Self::Pause(m) => wire::json(MSG_PAUSE, m),
+            Self::Resume(m) => wire::json(MSG_RESUME, m),
         }
     }
 
@@ -316,6 +332,8 @@ impl ToHolder {
             MSG_DRAIN => Self::Drain(wire::from_json("DRAIN", frame)?),
             MSG_GOODBYE => Self::Goodbye(wire::from_json("GOODBYE", frame)?),
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
+            MSG_PAUSE => Self::Pause(wire::from_json("PAUSE", frame)?),
+            MSG_RESUME => Self::Resume(wire::from_json("RESUME", frame)?),
             other => return Err(wire::unknown_type("core-to-holder", other)),
         })
     }
@@ -560,6 +578,54 @@ impl Assembler {
     }
 }
 
+/// What the core keeps in a session's `meta`. The holder never reads it, but
+/// every later core does when it adopts the session, so it is defined here
+/// with the protocols. Fields are additive with defaults, like the JSON
+/// messages', and declared in sorted order, which [`SessionMeta::to_value`]
+/// keeps whether or not serde_json preserves insertion order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionMeta {
+    /// The program and its arguments, for `list`; empty for the login shell.
+    pub command: String,
+    pub cwd: Option<String>,
+    /// The owning client's `client_token`.
+    pub owner: String,
+    pub policy: crate::client::Policy,
+    /// The emulator's scrollback limit, in lines.
+    pub scrollback: u32,
+}
+
+impl SessionMeta {
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+
+    /// Reads a held session's meta. Anything that isn't an object of the
+    /// expected fields gives the defaults for what's missing or malformed.
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        let Some(object) = value.as_object() else {
+            return Self::default();
+        };
+        fn parse<T: serde::de::DeserializeOwned + Default>(
+            object: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+        ) -> T {
+            object
+                .get(name)
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default()
+        }
+        Self {
+            command: parse(object, "command"),
+            cwd: parse(object, "cwd"),
+            owner: parse(object, "owner"),
+            policy: parse(object, "policy"),
+            scrollback: parse(object, "scrollback"),
+        }
+    }
+}
+
 /// A holder's answer to a `HELLO`: the version both speak, or the `ERROR` to
 /// send before closing the connection.
 pub fn answer_hello(hello: &Hello, supported: VersionRange) -> Result<u32, ErrorMessage> {
@@ -629,6 +695,8 @@ pub(crate) mod samples {
                 session: 1,
                 hwnd: 0x0001_0a2c,
             }),
+            ToHolder::Pause(SessionRef { session: 1 }),
+            ToHolder::Resume(SessionRef { session: 1 }),
         ]
     }
 
@@ -707,7 +775,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToHolder::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_HELLO..=MSG_REPARENT {
+        for expected in MSG_HELLO..=MSG_RESUME {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -762,6 +830,36 @@ mod tests {
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         }
+    }
+
+    #[test]
+    fn the_cores_meta_has_sorted_keys_and_tolerates_anything() {
+        let meta = SessionMeta {
+            command: "bash -l".into(),
+            cwd: Some("/home/u".into()),
+            owner: "4f1c9a".into(),
+            policy: crate::client::Policy::Detach,
+            scrollback: 10_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&meta.to_value()).unwrap(),
+            r#"{"command":"bash -l","cwd":"/home/u","owner":"4f1c9a","policy":"detach","scrollback":10000}"#
+        );
+        assert_eq!(SessionMeta::from_value(&meta.to_value()), meta);
+        assert_eq!(SessionMeta::from_value(&samples::meta()).owner, "4f1c9a");
+
+        let odd = serde_json::json!({"owner": 7, "policy": "kill", "later": [1]});
+        assert_eq!(
+            SessionMeta::from_value(&odd),
+            SessionMeta {
+                policy: crate::client::Policy::Kill,
+                ..SessionMeta::default()
+            }
+        );
+        assert_eq!(
+            SessionMeta::from_value(&serde_json::Value::Null),
+            SessionMeta::default()
+        );
     }
 
     #[test]
@@ -860,12 +958,12 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, 12, 255] {
+        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, 14, 255] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             let error = ToHolder::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_INPUT, MSG_REPARENT, 41, 255] {
+        for msg_type in [0, MSG_HELLO, MSG_INPUT, MSG_REPARENT, MSG_RESUME, 41, 255] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             assert!(ToCore::decode(&frame).is_err());
         }

@@ -353,6 +353,28 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
 }
 
 #[test]
+fn a_paused_session_blocks_until_resumed() {
+    let (_dir, mut core, _) = holder("pause");
+    let pid = core.spawn(shell(1, "read go; seq 1 300000; echo DONE; read z"));
+    core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
+    core.input(1, b"go\n");
+    let mut seq = Vec::new();
+    assert!(eventually(TIMEOUT, || {
+        seq = children_named(pid, "seq");
+        !seq.is_empty()
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(alive(seq[0]), "seq finished, so the PTY was read");
+    assert_eq!(state(seq[0]), Some('S'));
+
+    core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
+    let output = core.output_until(1, b"DONE\r\n");
+    assert!(contains(&output, b"\r\n300000\r\n"));
+    core.hang_up(1);
+    assert_eq!(core.exit_code(1), None);
+}
+
+#[test]
 fn a_drained_holder_refuses_spawn_and_exits_after_its_last_session() {
     let (dir, mut core, holder_pid) = holder("drain");
     core.spawn(shell(1, "read x"));

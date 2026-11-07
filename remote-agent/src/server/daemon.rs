@@ -9,7 +9,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The pipe to write the ready byte to.
@@ -42,6 +44,38 @@ impl Ready {
             }
         }
     }
+}
+
+/// Spawns a server's starter (`command`, such as `brindle-remote hold
+/// --ready-fd 3`) with stdin on `/dev/null` and the write end of a new pipe
+/// as fd `ready_fd`. Returns the child, which exits once the server has
+/// detached, and the pipe's non-blocking read end: one byte arrives once the
+/// server is listening, or EOF if it failed first.
+pub fn spawn_with_ready_pipe(
+    command: &mut Command,
+    ready_fd: libc::c_int,
+) -> io::Result<(Child, OwnedFd)> {
+    let (ready_read, ready_write) = crate::server::event_loop::pipe()?;
+    let write_fd = ready_write.as_raw_fd();
+    command.stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            if write_fd == ready_fd {
+                let flags = libc::fcntl(write_fd, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if libc::dup2(write_fd, ready_fd) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    drop(ready_write);
+    Ok((child, ready_read))
 }
 
 /// Parses `--ready-fd N` from a role's arguments; nothing else is accepted.

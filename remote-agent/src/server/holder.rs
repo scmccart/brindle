@@ -13,8 +13,9 @@
 //!   connected core. `WELCOME` lists the sessions, then each one's
 //!   checkpoint and tail follow.
 //! - **Backpressure:** past [`CORE_QUEUE_HIGH`] queued to the core, it stops
-//!   reading PTYs. With no core, it reads a session until its tail is full,
-//!   so the program blocks instead of losing output.
+//!   reading PTYs, and it doesn't read a session the core has paused. With
+//!   no core, it reads a session until its tail is full, so the program
+//!   blocks instead of losing output.
 //! - **Supervision:** with sessions but no core for [`CORE_GRACE`], it
 //!   starts `serve` from `/proc/self/exe` (which survives the file being
 //!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`].
@@ -28,9 +29,9 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
@@ -40,7 +41,7 @@ use brindle_remote_protocol::holder::{
 };
 
 use super::conn::Conn;
-use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token, pipe};
+use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
 use super::{build_id, daemon, dir, peer};
 use crate::pty::{
     self, GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
@@ -245,6 +246,8 @@ struct Session {
     reaped: Option<(Option<i32>, Instant)>,
     last_output: Instant,
     output_closed: bool,
+    /// The connected core sent `PAUSE`: its client isn't keeping up.
+    paused: bool,
 }
 
 struct Core {
@@ -561,6 +564,10 @@ impl<L: EventLoop> Holder<L> {
             return;
         };
         self.drop_source(core.token);
+        // Pauses were that core's; the next one starts with none.
+        for session in self.sessions.values_mut() {
+            session.paused = false;
+        }
         self.previous = if core.handover {
             Previous::Handover
         } else {
@@ -704,6 +711,16 @@ impl<L: EventLoop> Holder<L> {
                 }
             }
             ToHolder::Reparent(reparent) => self.send_error(Some(reparent.session), "unsupported"),
+            ToHolder::Pause(target) => self.set_paused(target.session, true),
+            ToHolder::Resume(target) => self.set_paused(target.session, false),
+        }
+    }
+
+    /// `PAUSE` and `RESUME`. An unknown session may just have ended, so it
+    /// is no error.
+    fn set_paused(&mut self, id: SessionId, paused: bool) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.paused = paused;
         }
     }
 
@@ -789,6 +806,7 @@ impl<L: EventLoop> Holder<L> {
                 reaped: None,
                 last_output: Instant::now(),
                 output_closed: false,
+                paused: false,
             },
         );
         self.had_session = true;
@@ -848,7 +866,7 @@ impl<L: EventLoop> Holder<L> {
                 break;
             }
             let limit = match &self.core {
-                Some(core) if core.conn.queued() >= CORE_QUEUE_HIGH => break,
+                Some(core) if core.conn.queued() >= CORE_QUEUE_HIGH || session.paused => break,
                 Some(_) => buffer.len(),
                 // Nothing is lost while the core is away: the program
                 // blocks once its tail is full.
@@ -1049,45 +1067,25 @@ impl<L: EventLoop> Holder<L> {
     /// Starts a core from this holder's own binary, which `/proc/self/exe`
     /// names even after an install replaced the file.
     fn start_core(&mut self) {
-        let (ready_read, ready_write) = match pipe() {
-            Ok(pipe) => pipe,
-            Err(error) => return log!("can't start a core: {error}"),
-        };
         let args: Vec<OsString> = self
             .core_args
             .iter()
             .map(|arg| arg.replace("{ready_fd}", &CORE_READY_FD.to_string()).into())
             .collect();
         let mut command = Command::new(CORE_PROGRAM);
-        command.args(&args).stdin(Stdio::null());
-        let write_fd = ready_write.as_raw_fd();
-        unsafe {
-            command.pre_exec(move || {
-                if write_fd == CORE_READY_FD {
-                    let flags = libc::fcntl(write_fd, libc::F_GETFD);
-                    if flags == -1
-                        || libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                } else if libc::dup2(write_fd, CORE_READY_FD) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        match command.spawn() {
-            Ok(child) => {
+        command.args(&args);
+        let ready_read = match daemon::spawn_with_ready_pipe(&mut command, CORE_READY_FD) {
+            Ok((child, ready_read)) => {
                 log!(
                     "no core for a while; started {CORE_PROGRAM} {} as pid {}",
                     self.core_args.join(" "),
                     child.id()
                 );
                 self.core_starts.push(child);
+                ready_read
             }
             Err(error) => return log!("can't start a core: {error}"),
-        }
-        drop(ready_write);
+        };
         let token = self.token();
         if self
             .ev
@@ -1108,7 +1106,7 @@ impl<L: EventLoop> Holder<L> {
             }
             let readable = !session.output_closed
                 && match queued {
-                    Some(queued) => queued < CORE_QUEUE_HIGH,
+                    Some(queued) => queued < CORE_QUEUE_HIGH && !session.paused,
                     None => session.tail.room() > 0,
                 };
             let want = Interest {
