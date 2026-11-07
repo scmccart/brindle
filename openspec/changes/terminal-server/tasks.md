@@ -64,7 +64,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 5. Emulator, replay and checkpoints
 
-- [ ] 5.1 A per-session `Term` in the core, fed through `brindle-term-core`'s `Parser`, with a listener that drops every event, the scrollback limit from `SPAWN`, and `catch_unwind` around each feed. Verify with tests: `ESC [ 6 n` gets exactly one reply (from the test client), and an injected panic leaves the session forwarding output and other sessions untouched.
+- [x] 5.1 A per-session `Term` in the core, fed through `brindle-term-core`'s `Parser`, with a listener that drops every event, the scrollback limit from `SPAWN`, and `catch_unwind` around each feed. Verify with tests: `ESC [ 6 n` gets exactly one reply (from the test client), and an injected panic leaves the session forwarding output and other sessions untouched.
 - [x] 5.2 The pure replay renderer (`&Term → Vec<u8>`), with everything in design.md. Verify with round-trip tests over fixtures:
   - shell output with wrapped lines;
   - an `htop`-like alternate-screen app with mouse modes;

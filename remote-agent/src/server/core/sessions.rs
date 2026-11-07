@@ -17,6 +17,7 @@ use brindle_remote_protocol::{RequestId, SessionId};
 
 use super::clients::error;
 use super::holders::WaitingSpawn;
+use super::screen::Screen;
 use super::{Core, log};
 use crate::server::event_loop::{EventLoop, Token};
 
@@ -45,6 +46,8 @@ pub(super) struct Session {
     exited: Option<Option<i32>>,
     /// What its holder kept, for a session this core adopted.
     adopted: Option<Adopted>,
+    /// Its emulator, fed with all of its output.
+    pub(super) screen: Screen,
 }
 
 /// A held session's last checkpoint and the raw output since then, kept as
@@ -65,10 +68,12 @@ impl Session {
     /// its owner comes back. One that exited while no core was connected
     /// is gone from the holder already.
     pub(super) fn adopted(holder: Token, held: HeldSession) -> Self {
+        let meta = SessionMeta::from_value(&held.meta);
         Self {
             holder,
             pid: held.pid,
-            meta: SessionMeta::from_value(&held.meta),
+            screen: Screen::new(held.cols, held.rows, meta.scrollback),
+            meta,
             cols: held.cols,
             rows: held.rows,
             attached: None,
@@ -134,6 +139,7 @@ impl<L: EventLoop> Core<L> {
 
     pub(super) fn send_spawn(&mut self, holder: Token, waiting: WaitingSpawn) {
         let WaitingSpawn { client, id, spawn } = waiting;
+        let screen = Screen::new(spawn.cols, spawn.rows, spawn.scrollback);
         let meta = SessionMeta {
             command: command_line(&spawn),
             cwd: spawn.cwd.clone(),
@@ -171,6 +177,7 @@ impl<L: EventLoop> Core<L> {
                 awaiting_owner: false,
                 exited: None,
                 adopted: None,
+                screen,
             },
         );
     }
@@ -245,6 +252,8 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
+        // Attached or not, so a detached session's screen stays current.
+        session.screen.feed(id, &bytes);
         if let Some(client) = session.attached {
             self.send_client(client, ToClient::Data(Data { session: id, bytes }));
         }
@@ -466,6 +475,7 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.client_session(client, data.session) else {
             return;
         };
+        session.screen.input_seen(data.session);
         let holder = session.holder;
         self.send_holder(
             holder,
@@ -482,6 +492,7 @@ impl<L: EventLoop> Core<L> {
         };
         session.cols = resize.cols;
         session.rows = resize.rows;
+        session.screen.resize(resize.session, resize.cols, resize.rows);
         let holder = session.holder;
         self.send_holder(
             holder,

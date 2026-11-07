@@ -22,12 +22,14 @@
 //!   needs one.
 //! - **Sessions** ([`sessions`]): spawned through a holder, with their I/O,
 //!   the close policies and, after adopting sessions, the
-//!   [`RECONNECT_GRACE`] for their owners to come back.
+//!   [`RECONNECT_GRACE`] for their owners to come back. Each has an
+//!   emulator ([`screen`]) fed with all of its output.
 //! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, or
 //!   once `STOP` has ended every session. The socket is removed first.
 
 mod clients;
 mod holders;
+mod screen;
 mod sessions;
 
 use std::collections::{BTreeMap, HashMap};

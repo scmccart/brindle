@@ -488,6 +488,52 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
     assert!(dir.holder_sockets().is_empty());
 }
 
+// 5.1
+
+#[test]
+fn a_cursor_position_query_gets_only_the_clients_reply() {
+    let (_dir, mut client) = core("query");
+    // Reads, after two seconds, everything that came back to it.
+    let (session, _) = client.spawn(client_shell(
+        "stty raw -echo min 0 time 20; printf 'ask\\033[6n'; sleep 2; \
+         got=$(dd bs=4096 count=1 2>/dev/null | od -An -c | tr -d ' \\n'); \
+         printf 'got=%s.\\r\\n' \"$got\"",
+    ));
+    client.output_until(session, b"ask\x1b[6n");
+    client.input(session, b"\x1b[5;7R");
+    let output = client.output_until(session, b".\r\n");
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("got=033[5;7R."), "{text:?}");
+    assert_eq!(client.exit_code(session), Some(0));
+}
+
+/// What makes a session's emulator panic in a debug core.
+const PANIC_MARKER: &str = "brindle-test-panic-now";
+
+#[test]
+fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
+    let mut dir = TempDir::new("panic");
+    start_core(&dir.path, &[("BRINDLE_TEST_FEED_PANIC", PANIC_MARKER)]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "t");
+    dir.track(client.core_pid());
+    let (broken, _) = client.spawn(client_spawn("cat", &[]));
+    let (other, _) = client.spawn(client_spawn("cat", &[]));
+
+    client.input(broken, format!("{PANIC_MARKER}\n").as_bytes());
+    client.output_until(broken, format!("{PANIC_MARKER}\r\n{PANIC_MARKER}\r\n").as_bytes());
+    assert!(
+        eventually(TIMEOUT, || dir.logs().contains("the emulator panicked")),
+        "{}",
+        dir.logs()
+    );
+    // Still forwarding, and not breaking again.
+    client.input(broken, format!("after {PANIC_MARKER}\n").as_bytes());
+    client.output_until(broken, format!("after {PANIC_MARKER}\r\n").as_bytes());
+    client.input(other, b"fine\n");
+    client.output_until(other, b"fine\r\nfine\r\n");
+    assert_eq!(dir.logs().matches("the emulator panicked").count(), 1);
+}
+
 /// A process's resident set, in KiB.
 fn rss_kib(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
