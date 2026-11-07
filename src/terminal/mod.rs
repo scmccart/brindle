@@ -16,10 +16,10 @@ pub mod links;
 pub mod mouse;
 pub mod process;
 mod pty;
-pub mod shell_integration;
 mod scan;
 pub mod search;
-pub mod status;
+// Moved to `brindle-term-core`, which the server core shares.
+pub use brindle_term_core::{shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;

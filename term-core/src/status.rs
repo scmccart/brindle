@@ -14,7 +14,7 @@ use base64::Engine as _;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
-use crate::notify::osc::{Notice, Source};
+use crate::notice::{Notice, Source};
 
 /// What a record says its program is doing, least pressing first: a tab
 /// shows the greatest state among its records.

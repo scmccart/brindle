@@ -679,6 +679,7 @@ dependencies = [
  "anyhow",
  "base64",
  "brindle-remote-protocol",
+ "brindle-term-core",
  "dirs 5.0.1",
  "embed-resource",
  "env_logger",

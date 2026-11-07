@@ -13,7 +13,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 ## 1. Shared crate and builds
 
 - [x] 1.1 Add the `term-core/` crate (`brindle-term-core`, same version as the others) to the workspace and to `default-members`, with every member in `default-members`. Verify that plain `cargo build` produces `target/debug/brindle-remote`, that the CI version check passes, and, from release-please's docs or a dry run, that a release bumps the new crate with the others; adjust `release-please-config.json` if it wouldn't.
-- [ ] 1.2 Move `Parser` and `Marks` (`src/terminal/shell_integration.rs`) and `Records` (`src/terminal/status.rs`) into `brindle-term-core`, keeping anything GPUI-specific in `brindle`. Verify that `cargo test --workspace --locked` passes with the moved unit tests, and that `Cargo.lock` gains only the new crate's own entry.
+- [x] 1.2 Move `Parser` and `Marks` (`src/terminal/shell_integration.rs`) and `Records` (`src/terminal/status.rs`) into `brindle-term-core`, keeping anything GPUI-specific in `brindle`. Verify that `cargo test --workspace --locked` passes with the moved unit tests, and that `Cargo.lock` gains only the new crate's own entry.
 - [ ] 1.3 Make `brindle-remote-agent` depend on `brindle-term-core` and build the static musl helper (README's Docker command). Record the binary size before and after in the PR, and verify that `--server` still passes `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client`.
 
 ## 2. Protocols
