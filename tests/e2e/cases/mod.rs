@@ -12,6 +12,7 @@ mod dump;
 mod geometry;
 mod input;
 mod links;
+mod local_server;
 mod multi_window;
 mod restore;
 mod notify;
@@ -168,6 +169,17 @@ fn unix() -> Vec<Case> {
         display("zones-split-and-focus", zones::split_and_focus),
         display("zones-close", zones::close),
         display("zones-restore", zones::restore),
+        display("local-server-session", local_server::session),
+        display("local-server-close", local_server::close),
+        display("local-server-quit", local_server::quit),
+        display("local-server-crash", local_server::crash),
+        display("local-server-env", local_server::env),
+        display("local-server-core-restart", local_server::core_restart),
+        display("local-server-replay-quiet", local_server::replay_quiet),
+        display("local-server-holder-lost", local_server::holder_lost),
+        display("local-server-no-helper", local_server::no_helper),
+        display("local-server-upgrade", local_server::upgrade),
+        display("local-server-manage", local_server::manage),
     ]
 }
 

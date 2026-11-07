@@ -155,6 +155,7 @@ It uses the same frame header, with its own message numbers and its own version,
   - **The holder sets `IUTF8`** on every PTY, as alacritty did, so line editing handles multibyte characters.
   - **Spawning never blocks the UI thread:** `Terminal::spawn` returns at once, and the connection, a reconnect or an upgrade's step-down finishes in the background, with input queued, as `Backend::Agent` does.
   - **e2e server directories** are under `/tmp`, not `target/tmp/e2e/<case>/`, because holder socket paths there exceed the 108-byte `sun_path` limit. The harness copies `core.log` into the case directory.
+  - **`local-server-no-helper`** installs the helper beside a linked copy of Brindle while it runs, as the spec's "Recovery" scenario says, because a running Brindle's `BRINDLE_REMOTE_AGENT` can't change.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
