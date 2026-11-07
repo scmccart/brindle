@@ -78,7 +78,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - after a core SIGKILL and respawn, a fresh attach to a full-screen session matches its screen;
   - a session with more than 512 KiB of output since its start rebuilds exactly;
   - a truncated tail still gives a working session.
-- [ ] 5.5 Reconnect: after `WELCOME`, send each held session's replay to a returning `client_token`. Verify with a test that restarts the core under an attached client running a full-screen fixture: the client gets the replay, then live output, and the pid is unchanged.
+- [x] 5.5 Reconnect: after `WELCOME`, send each held session's replay to a returning `client_token`. Verify with a test that restarts the core under an attached client running a full-screen fixture: the client gets the replay, then live output, and the pid is unchanged.
 
 ## 6. Upgrades and management
 

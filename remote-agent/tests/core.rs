@@ -771,6 +771,44 @@ fn a_truncated_tail_still_gives_a_working_session() {
     other.output_until(session, b"END two\r\n");
 }
 
+// 5.5
+
+#[test]
+fn a_client_back_after_a_core_restart_gets_its_replay_then_live_output() {
+    let mut dir = TempDir::new("reconnect-replay");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "back");
+    let first = full_screen_fixture(1);
+    let second = full_screen_fixture(2);
+    fs::write(dir.path.join("second"), &second).unwrap();
+    // A kill session, attached all along.
+    let mut spawn = fixture_spawn(&dir, "first", &first, 1000);
+    spawn.policy = client::Policy::Kill;
+    spawn.args[1] = format!(
+        "stty raw -echo; cat '{}'; read x; cat '{}'; exec sleep 1000",
+        dir.path.join("first").display(),
+        dir.path.join("second").display()
+    );
+    let (session, pid) = client.spawn(spawn);
+    dir.track(parent(pid).unwrap());
+    client.output_until(session, b"frame 1\x1b[12;30H");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut client = TestClient::hello(&dir.path, "back");
+    let (start, replay) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid, start.req), (session, pid, None));
+    let mut screen = replayed(&replay, 80, 24, 1000);
+    assert_eq!(snapshot(&screen), snapshot(&replayed(&first, 80, 24, 1000)));
+
+    // Live output follows the replay.
+    client.input(session, b"\n");
+    let live = client.output_until(session, b"frame 2\x1b[12;30H");
+    screen.feed(&live);
+    let both = [first, second].concat();
+    assert_eq!(snapshot(&screen), snapshot(&replayed(&both, 80, 24, 1000)));
+    assert!(alive(pid));
+}
+
 /// A process's resident set, in KiB.
 fn rss_kib(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();

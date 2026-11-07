@@ -349,7 +349,9 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// A returning owner (`HELLO` with the session's `client_token`) gets
-    /// back every session of its own that has no client.
+    /// back every session of its own that has no client, each after its
+    /// replay (`REPLAY_START` without a `req`). One that exited meanwhile
+    /// gets just its `EXIT`.
     pub(super) fn reattach(&mut self, client: Token) {
         let Some(token) = self.client_token(client).map(str::to_string) else {
             return;
@@ -376,10 +378,7 @@ impl<L: EventLoop> Core<L> {
                 self.send_client(client, ToClient::Exit(Exit { session: id, code }));
                 continue;
             }
-            session.attached = Some(client);
-            if self.client_is_over(client) {
-                self.set_paused(id, true);
-            }
+            self.replay(client, id, None, None);
         }
     }
 
