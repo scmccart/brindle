@@ -87,6 +87,12 @@ The same stream does two jobs:
 
 A new core rebuilds each session by feeding a fresh `Term` the checkpoint, then the tail. If a tail ever overflowed its 1 MiB limit, the holder marks it truncated, and the rebuild is the last 1 MiB only, which may be approximate.
 - The renderer is pure (`&Term → Vec<u8>`) and tested by round trips over fixtures.
+- **Settled in task 5.2:**
+  - The signature is `replay::render(&mut Term, &Marks, &Records, title) -> Vec<u8>`. It takes `&mut` because alacritty hides the primary grid under the alternate screen, the scroll region, the tab stops and the charset: the renderer probes for them and restores the term afterwards.
+  - `Term` keeps its title private, so the core's listener keeps the title from `Title`/`ResetTitle` events and drops every other event.
+  - Records replay least recently updated first.
+  - Each render costs about O(screen rows) of clones, so it runs on attach and at checkpoints only, never per output chunk.
+  - The known fidelity limits are listed in `term-core/src/replay.rs`, for example the title stack and marks scrolled above the history.
 - *Alternatives rejected:* a raw ring buffer alone, which breaks full-screen apps and rotated scrollback, and hidden tmux.
 
 ### Core ↔ holder protocol
@@ -103,6 +109,14 @@ It uses the same frame header, with its own message numbers and its own version,
 - **`meta` is an opaque JSON blob the core owns:** the policy, the owning client's token, the scrollback limit, and the command and directory for `list`. The holder only stores it.
 - **Session ids:** the core allocates them, and a new core continues from the largest id its holders report.
 - **One core per holder:** a newer `HELLO` takes a holder over from an older connection.
+- **Settled in task group 3:**
+  - **Locking:** a holder flocks a sibling `holder-<build>-<n>.lock`, which also picks `n`, and checks the inode after locking.
+  - **Empty start:** a holder that never had a session exits 10 s after starting with no core.
+  - **Exits while no core is connected** are reported in the next `WELCOME`, and the session is dropped after that.
+  - **Takeover:** a takeover reports `previous: crash` unless the old core sent `GOODBYE { handover: true }`.
+  - **Input:** more than 4 MiB of queued input for one session is dropped, with an `ERROR`.
+  - **Supervision:** the holder starts `/proc/self/exe serve --ready-fd 3` 3 s after its core leaves, retrying at 3, 6, 12 s and so on, capped at 60 s. Tests override the arguments with `BRINDLE_TEST_HOLDER_CORE_ARGS`.
+  - **Code layout:** the PTY code shared with the stdio helper lives in `remote-agent/src/pty.rs`, and the server modules in `remote-agent/src/server/`.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
