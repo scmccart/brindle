@@ -117,6 +117,13 @@ It uses the same frame header, with its own message numbers and its own version,
   - **Input:** more than 4 MiB of queued input for one session is dropped, with an `ERROR`.
   - **Supervision:** the holder starts `/proc/self/exe serve --ready-fd 3` 3 s after its core leaves, retrying at 3, 6, 12 s and so on, capped at 60 s. Tests override the arguments with `BRINDLE_TEST_HOLDER_CORE_ARGS`.
   - **Code layout:** the PTY code shared with the stdio helper lives in `remote-agent/src/pty.rs`, and the server modules in `remote-agent/src/server/`.
+- **Settled in task group 4:**
+  - **Per-session flow control:** H1 gained `PAUSE { session }` and `RESUME { session }` (types 12 and 13). One holder connection carries every client's sessions, so the core can't stop reading from it for one client. Instead it pauses a client's sessions once more than 1 MiB is queued to that client, and resumes them below 256 KiB. H1 hasn't shipped, so this edits H1 rather than bumping its version.
+  - **A `serve` that loses the start race** waits up to 2 s for the winner to accept, writes its ready byte and exits 0, so both starters succeed.
+  - **The core accepts clients only after adopting the startup holders** (at most 5 s), so session ids continue correctly and returning owners find their sessions.
+  - **A returning `client_token`** gets back every session of its own that has no client, `detach` ones included. A session that exits while its owner is away keeps its `EXIT` for that owner.
+  - **Hangup:** the holder sends the final SIGKILL to the session's process group while the group still has members (`kill(-pgid, 0)` succeeds), even once the leader is reaped. A pgid can't be reused while members hold it, so this reaches children that ignore SIGHUP without a pid-reuse risk.
+  - **Code layout:** the core lives in `remote-agent/src/server/core.rs`, with `core/{clients,holders,sessions}.rs`.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
