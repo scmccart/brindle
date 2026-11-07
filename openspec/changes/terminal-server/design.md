@@ -124,6 +124,18 @@ It uses the same frame header, with its own message numbers and its own version,
   - **A returning `client_token`** gets back every session of its own that has no client, `detach` ones included. A session that exits while its owner is away keeps its `EXIT` for that owner.
   - **Hangup:** the holder sends the final SIGKILL to the session's process group while the group still has members (`kill(-pgid, 0)` succeeds), even once the leader is reaped. A pgid can't be reused while members hold it, so this reaches children that ignore SIGHUP without a pid-reuse risk.
   - **Code layout:** the core lives in `remote-agent/src/server/core.rs`, with `core/{clients,holders,sessions}.rs`.
+- **Settled in task group 5:**
+  - **`CHECKPOINT_END { session, covers: u64 }`:** a checkpoint covers only the tail bytes the core had fed when it rendered, and the holder drops just that many from the front of its tail. Dropping the whole tail lost output that was still on its way to the core. This is an H1 edit made before release.
+  - **`Emulator`:** the client's OSC scanner (`notify/osc.rs`) moved into `brindle-term-core` (Brindle re-exports it), and a new `Emulator` type there bundles the `Term`, `Parser`, `Marks`, `Records` and the kept title. term-core re-exports `alacritty_terminal`, so the agent crate needs no new dependency.
+  - **Feeding details:**
+    - Scrollback 0 in `SPAWN` means 10 000 lines, Brindle's default.
+    - `ESC c` clears the kept title.
+    - A synchronized update still in progress is applied before rendering, so its output is in the replay and the checkpoint.
+    - Client `DATA` drops `done` and `error` records, as user input does in Brindle. The core can't tell typing from replies to queries, so its records can drift slightly from the client's.
+  - **Ownership:** an attaching client becomes a session's owner only inside the running core, because H1 can't update the owner the holder keeps. After a core restart, the original owner gets the session back. Phase 1's Brindle never attaches, so this only matters from phase 2.
+  - **A `kill` session explicitly `DETACH`ed** has no client and no policy that ends it. Phase 1's Brindle never detaches. Phase 2 must settle this with `on_close`.
+  - **Rebuilding:** a replay asked for while an adopted session is still being rebuilt waits for the holder's tail.
+  - **Fault injection for tests:** `BRINDLE_TEST_FEED_PANIC`, compiled in only with `debug_assertions`.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
