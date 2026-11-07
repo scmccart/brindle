@@ -132,6 +132,7 @@ fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &
         .args(["--dump-screen-after", &ctx.secs(20.0).to_string()])
         .env("BRINDLE_CONFIG", &config)
         .env("BRINDLE_STATE_DIR", state_dir(ctx))
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env("DISPLAY", &ctx.display)
         .env_remove("WAYLAND_DISPLAY")
         .stdout(std::process::Stdio::null())

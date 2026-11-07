@@ -48,6 +48,11 @@ pub struct Ctx {
     pub dir: PathBuf,
     pub bin: PathBuf,
     pub display: String,
+    /// The case's own terminal server directory (`BRINDLE_SERVER_DIR`), so
+    /// local tabs never use the user's server. It is under the system temp
+    /// directory, not `dir`, because a holder's socket path must fit in
+    /// `sun_path` (108 bytes).
+    pub server_dir: PathBuf,
     slow: f64,
 }
 
@@ -125,7 +130,7 @@ fn main() {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e");
 
     let (mut passed, mut failed, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
-    for case in selected {
+    for (n, case) in selected.into_iter().enumerate() {
         let started = Instant::now();
         let outcome = if case.display && !has_display {
             Ok(Outcome::Skip(format!("no X display at {display}")))
@@ -133,8 +138,11 @@ fn main() {
             let dir = root.join(case.name);
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).expect("case directory");
-            let ctx = Ctx { name: case.name, dir, bin: bin.clone(), display: display.clone(), slow };
-            (case.run)(&ctx)
+            let server_dir = std::env::temp_dir().join(format!("brindle-e2e-{}-{n}", std::process::id()));
+            let ctx = Ctx { name: case.name, dir, bin: bin.clone(), display: display.clone(), server_dir, slow };
+            let outcome = (case.run)(&ctx);
+            stop_server(&ctx);
+            outcome
         };
         let took = started.elapsed().as_secs_f64();
         match outcome {
@@ -158,6 +166,25 @@ fn main() {
         println!("failed: {}", failed.join(" "));
         std::process::exit(1);
     }
+}
+
+/// Stops the case's terminal server, if one started, and removes its
+/// directory, keeping its log in the case's directory.
+fn stop_server(ctx: &Ctx) {
+    if !ctx.server_dir.exists() {
+        return;
+    }
+    let helper = ctx.bin.with_file_name("brindle-remote");
+    let stopped = std::process::Command::new(&helper)
+        .arg("stop")
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
+        .stdin(std::process::Stdio::null())
+        .output();
+    if let Err(error) = stopped {
+        println!("         can't stop {}'s server with {}: {error}", ctx.name, helper.display());
+    }
+    std::fs::copy(ctx.server_dir.join("core.log"), ctx.dir.join("server-core.log")).ok();
+    std::fs::remove_dir_all(&ctx.server_dir).ok();
 }
 
 fn usage(why: &str) -> ! {

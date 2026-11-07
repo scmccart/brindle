@@ -338,6 +338,7 @@ impl<'a> Run<'a> {
             .args(ctx.step_interval())
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .env("BRINDLE_CONFIG", &config_path)
+            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
             .env("DISPLAY", &ctx.display)
             .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
