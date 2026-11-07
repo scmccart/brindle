@@ -17,6 +17,7 @@ The CI runner passes. That's probably because its program produces output more s
 ## What Changes
 
 - A terminal's event loop paces its UI updates while output keeps arriving. Batches that come within a short interval of the previous update wait out the rest of that interval, so the main thread's message queue goes idle between them. An event after a quiet spell is still handled at once.
+- A batch's `Wakeup` events and title changes are handled once per update, not once per event. Found during implementation: cmd retitles the console for every command, and each title change made Brindle take process snapshots, which cost seconds per batch under a flood.
 - The same pacing applies to the other per-terminal and per-session event loops of the same shape: remote and agent terminals, and tmux sessions.
 - The `windows-close-mid-output` case keeps checking close during output. A flood-only check confirms that the window keeps painting and quits on time while a program floods.
 

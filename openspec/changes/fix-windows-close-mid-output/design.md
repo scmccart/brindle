@@ -17,7 +17,12 @@ See proposal.md, "Why", for the cause. The constraints that shape the fix:
   |---|---|
   | unchanged | hangs; main thread at 100 %; `Responding=False` |
   | yield after each batch | responds and dumps, but doesn't exit; main thread still at 100 % |
-  | `timer(4 ms)` after each batch | case passes in about 7 s |
+  | `timer(4 ms)` after each batch | case passes in about 7 s, but not reliably |
+  | pacing alone (found during apply) | hangs: one 351-event update took 4.6 s |
+  | pacing and coalescing | 7–8 s in every run |
+  | coalescing alone | 8 s and 13 s, the second over the case's limit |
+
+  Per-event timing during apply found that the handlers themselves take under 1 ms. The time went to the `TitleChanged` subscribers. cmd retitles the console for every command it runs (`C:\…\cmd.exe - echo flood N`). `terminal_automatic_title` ignores console titles and falls back to the foreground process name, which takes a Toolhelp `Snapshot` (zone, then tab, two or three per event). One title event per loop iteration came to seconds per batch.
 
 ## Goals / Non-Goals
 
@@ -34,13 +39,25 @@ See proposal.md, "Why", for the cause. The constraints that shape the fix:
 ## Decisions
 
 ### Pace updates in time, not by yielding
-After an update, the loop notes when it finished. When the next batch is ready sooner than `PACE` after that, the loop first awaits a GPUI timer (`background_executor().timer`) for the rest of `PACE`. After the wait it also takes whatever else has queued, so that one update covers it all. A batch that arrives after `PACE` has already passed is handled at once.
+After an update, the loop notes when it finished. When the next batch is ready sooner than `PACE` after that, the loop first awaits a GPUI timer (`background_executor().timer`) for the rest of `PACE`. After the wait it also takes at most one more ready chunk into the same update. Draining until the channel is empty never ends under a flood: that was measured during apply. A batch that arrives after `PACE` has already passed is handled at once.
 
 - A timer sends nothing to the main thread until it fires: it runs on the threadpool and dispatches once. That leaves the gap Windows needs.
 - **Alternatives considered:**
   - A bare yield: measured, and not enough. Each wake is still a posted message, so the queue never empties.
   - Coalescing `Wakeup`s at the sender with a flag: it cuts the number of wakes, but the next one is posted as soon as the UI clears the flag, so the queue still never idles.
   - Pacing on frames (`on_next_frame`): frames come from `WM_PAINT`, which is the thing being starved, and `Terminal` is a model with no window.
+
+### Count a batch's `Wakeup`s and title changes once
+`Terminal::spawn_events` splits each batch with `Batch::coalesce`, a pure function with unit tests:
+- Its `Wakeup`s count as one, handled after the other events.
+- Only its last `Title` or `ResetTitle` is applied.
+- Every other event keeps its order.
+
+Within one update nothing observes the titles in between, so only the last one matters. `Wakeup` handling (latency marker, sync-flush scheduling) depends only on the latest generation.
+
+- **Alternatives considered:**
+  - Caching the process snapshot across refreshes: it would make each refresh cheaper, but the number of refreshes would still scale with the program's titles.
+  - Sharing one snapshot between the zone and tab refreshes: worth doing, but it's a separate change and isn't needed here.
 
 ### `PACE` is 4 ms
 This value was measured to work. It caps a flooding terminal at about 250 updates a second, above any display rate, so painting isn't visibly throttled. With a fixed `PACE`, the worst-case added latency during continuous output is one interval.

@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
 use crate::config::{Config, Profile, TmuxMode};
+use crate::terminal::pace::Pace;
 use crate::terminal::{DefaultColors, GridSize, PaletteHandler, Terminal};
 use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
@@ -842,7 +843,12 @@ impl TmuxSession {
 
         let reader = cx.spawn(async move |this, cx| {
             let mut events = event_rx.ready_chunks(4096);
-            while let Some(batch) = events.next().await {
+            let mut pace = Pace::default();
+            while let Some(mut batch) = events.next().await {
+                pace.wait(cx).await;
+                if let Some(Some(more)) = events.next().now_or_never() {
+                    batch.extend(more);
+                }
                 let alive = this.update(cx, |this, cx| {
                     for event in batch {
                         match event {
@@ -854,6 +860,7 @@ impl TmuxSession {
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         });
 

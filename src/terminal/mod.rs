@@ -18,6 +18,7 @@ mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
+pub mod pace;
 pub mod process;
 #[cfg(windows)]
 mod pty;
@@ -46,11 +47,12 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
-use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
+use self::pace::Pace;
 use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
@@ -70,6 +72,34 @@ pub enum ChannelEvent {
     /// The server session can't be got back; the reason is on the screen.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Lost,
+}
+
+/// One update's worth of [`ChannelEvent`]s, with its `Wakeup`s and title
+/// changes counted once each. A flood sends a `Wakeup` per read, and a
+/// program can retitle the console for every command (cmd does, in a
+/// loop); each `TitleChanged` can cost process snapshots, when the title is
+/// a console one and the tab falls back to the foreground process's name.
+struct Batch {
+    /// The other events, in order.
+    rest: Vec<ChannelEvent>,
+    woke: bool,
+    /// The last title change: `Some(None)` is a reset.
+    title: Option<Option<String>>,
+}
+
+impl Batch {
+    fn coalesce(events: Vec<ChannelEvent>) -> Self {
+        let mut batch = Self { rest: Vec::with_capacity(events.len()), woke: false, title: None };
+        for event in events {
+            match event {
+                ChannelEvent::Alac(AlacEvent::Wakeup) => batch.woke = true,
+                ChannelEvent::Alac(AlacEvent::Title(title)) => batch.title = Some(Some(title)),
+                ChannelEvent::Alac(AlacEvent::ResetTitle) => batch.title = Some(None),
+                other => batch.rest.push(other),
+            }
+        }
+        batch
+    }
 }
 
 #[derive(Clone)]
@@ -257,9 +287,15 @@ impl Terminal {
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(1024);
-            while let Some(events) = rx.next().await {
+            let mut pace = Pace::default();
+            while let Some(mut events) = rx.next().await {
+                pace.wait(cx).await;
+                if let Some(Some(more)) = rx.next().now_or_never() {
+                    events.extend(more);
+                }
+                let batch = Batch::coalesce(events);
                 let alive = this.update(cx, |this, cx| {
-                    for event in events {
+                    for event in batch.rest {
                         match event {
                             ChannelEvent::Alac(event) => this.handle_event(event, cx),
                             ChannelEvent::Osc(found) => this.handle_found(found, cx),
@@ -267,11 +303,18 @@ impl Terminal {
                             ChannelEvent::Lost => this.mark_lost(cx),
                         }
                     }
+                    if let Some(title) = batch.title {
+                        this.set_title(title, cx);
+                    }
+                    if batch.woke {
+                        this.handle_event(AlacEvent::Wakeup, cx);
+                    }
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         })
     }
@@ -282,7 +325,12 @@ impl Terminal {
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(64);
-            while let Some(events) = rx.next().await {
+            let mut pace = Pace::default();
+            while let Some(mut events) = rx.next().await {
+                pace.wait(cx).await;
+                if let Some(Some(more)) = rx.next().now_or_never() {
+                    events.extend(more);
+                }
                 let alive = this.update(cx, |this, cx| {
                     // Consecutive output goes through one `feed`, in order
                     // relative to the other events.
@@ -312,6 +360,7 @@ impl Terminal {
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         })
     }
@@ -1258,6 +1307,35 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    #[test]
+    fn batch_counts_wakeups_and_titles_once() {
+        let title = |t: &str| ChannelEvent::Alac(AlacEvent::Title(t.into()));
+        let events = vec![
+            ChannelEvent::Alac(AlacEvent::Wakeup),
+            title("one"),
+            ChannelEvent::Alac(AlacEvent::Bell),
+            ChannelEvent::Alac(AlacEvent::Wakeup),
+            title("two"),
+            ChannelEvent::Replay(true),
+        ];
+        let batch = Batch::coalesce(events);
+        assert!(batch.woke);
+        assert_eq!(batch.title, Some(Some("two".to_string())));
+        assert!(matches!(batch.rest[..], [ChannelEvent::Alac(AlacEvent::Bell), ChannelEvent::Replay(true)]));
+    }
+
+    #[test]
+    fn batch_keeps_the_last_title_change() {
+        let batch = Batch::coalesce(vec![
+            ChannelEvent::Alac(AlacEvent::Title("x".into())),
+            ChannelEvent::Alac(AlacEvent::ResetTitle),
+        ]);
+        assert_eq!(batch.title, Some(None));
+        let quiet = Batch::coalesce(vec![ChannelEvent::Alac(AlacEvent::Bell)]);
+        assert!(!quiet.woke);
+        assert_eq!(quiet.title, None);
+    }
 
     #[test]
     fn default_colors_replace_the_theme() {
