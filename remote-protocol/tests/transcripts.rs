@@ -113,6 +113,9 @@ fn describe(name: &str, frame: &Frame) -> String {
     let (session, rest) = frame.payload.split_at(4.min(frame.payload.len()));
     let session = u32::from_be_bytes(session.try_into().unwrap_or([0; 4]));
     if name.ends_with("End") {
+        if let Ok(covers) = <[u8; 8]>::try_from(rest) {
+            return format!("session {session}, covers {}", u64::from_be_bytes(covers));
+        }
         return format!("session {session}");
     }
     if let (true, Ok(len)) = (name.ends_with("Begin"), <[u8; 8]>::try_from(rest)) {
@@ -413,11 +416,13 @@ fn holder_hello(instance: u64) -> Step {
     }))
 }
 
-fn checkpoint_to_holder(session: u32, bytes: &[u8], chunk_len: usize) -> Vec<Step> {
-    let (begin, chunks, end) = holder::split(session, bytes, chunk_len);
+fn checkpoint_to_holder(session: u32, bytes: &[u8], chunk_len: usize, covers: u64) -> Vec<Step> {
+    let (begin, chunks, _) = holder::split(session, bytes, chunk_len);
     std::iter::once(holder::ToHolder::CheckpointBegin(begin))
         .chain(chunks.into_iter().map(holder::ToHolder::CheckpointChunk))
-        .chain(std::iter::once(holder::ToHolder::CheckpointEnd(end)))
+        .chain(std::iter::once(holder::ToHolder::CheckpointEnd(
+            holder::CheckpointEnd { session, covers },
+        )))
         .map(ch)
         .collect()
 }
@@ -738,7 +743,7 @@ fn transcripts() -> Vec<Transcript> {
                         sessions: Vec::new(),
                     })),
                 ],
-                checkpoint_to_holder(1, CHECKPOINT, 16),
+                checkpoint_to_holder(1, CHECKPOINT, 16, 4096),
                 vec![ch(holder::ToHolder::Goodbye(holder::Goodbye {
                     handover: true,
                 }))],

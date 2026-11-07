@@ -30,8 +30,9 @@ const RESET: &[u8] = b"\x1bc";
 pub(super) struct Screen {
     /// `None` once it panicked.
     emulator: Option<Emulator>,
-    /// Output fed since the last checkpoint.
-    pub(super) since_checkpoint: usize,
+    /// Output fed since the last checkpoint (or, once rebuilt from a
+    /// holder, since the start of its tail): what the next one covers.
+    pub(super) since_checkpoint: u64,
 }
 
 impl Screen {
@@ -42,8 +43,15 @@ impl Screen {
         }
     }
 
+    /// Feeds the session's output.
     pub(super) fn feed(&mut self, id: SessionId, bytes: &[u8]) {
-        self.since_checkpoint += bytes.len();
+        self.since_checkpoint += bytes.len() as u64;
+        self.restore(id, bytes);
+    }
+
+    /// Feeds bytes that aren't new output: a checkpoint, or the tail the
+    /// holder kept, when rebuilding.
+    pub(super) fn restore(&mut self, id: SessionId, bytes: &[u8]) {
         self.guard(id, "feeding output", |emulator| {
             inject_fault(bytes);
             emulator.feed(bytes);

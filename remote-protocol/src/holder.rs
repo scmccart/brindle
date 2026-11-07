@@ -16,7 +16,7 @@
 //! |    5 | `HANGUP`           | core → holder | `session`                                                        |
 //! |    6 | `CHECKPOINT_BEGIN` | both          | session, `len: u64 BE`                                           |
 //! |    7 | `CHECKPOINT_CHUNK` | both          | session, bytes                                                   |
-//! |    8 | `CHECKPOINT_END`   | both          | session                                                          |
+//! |    8 | `CHECKPOINT_END`   | both          | session; from the core, then `covers: u64 BE`                    |
 //! |    9 | `DRAIN`            | core → holder | `{}`                                                             |
 //! |   10 | `GOODBYE`          | core → holder | `handover`                                                       |
 //! |   11 | `REPARENT`         | core → holder | `session, hwnd` (a Linux holder answers `ERROR`)                 |
@@ -38,9 +38,17 @@
 //! length, any number of `*_CHUNK`s whose lengths add up to it, and `*_END`.
 //! Chunks of one blob may interleave with other sessions' messages, but not
 //! with another blob of the same kind for the same session. The holder
-//! replaces its stored checkpoint, and drops that session's tail, only on
-//! `CHECKPOINT_END`; a connection lost mid-blob leaves the previous one in
-//! place. [`split`] cuts a blob into messages and [`Assembler`] rebuilds it.
+//! replaces its stored checkpoint only on `CHECKPOINT_END`; a connection
+//! lost mid-blob leaves the previous one in place. [`split`] cuts a blob
+//! into messages and [`Assembler`] rebuilds it.
+//!
+//! **What a checkpoint covers.** Output the holder read may still be on its
+//! way to the core when the core renders a checkpoint, so the core's
+//! `CHECKPOINT_END` says how much of the tail the checkpoint covers
+//! (`covers`: bytes read since the previous checkpoint, or for a core that
+//! adopted the session, since the start of the tail it got). The holder
+//! drops that much of the tail and keeps the rest, so the next core's
+//! rebuild from the checkpoint and the tail is exact.
 //!
 //! **Flow control.** `PAUSE` makes the holder stop reading a session's PTY,
 //! so its program blocks, and `RESUME` reads it again. The core pauses the
@@ -123,10 +131,29 @@ pub struct BlobBegin {
     pub len: u64,
 }
 
-/// The end of a chunked blob: `CHECKPOINT_END` or `TAIL_END`.
+/// The end of a chunked blob: `TAIL_END`, or the holder's `CHECKPOINT_END`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobEnd {
     pub session: SessionId,
+}
+
+/// The core's `CHECKPOINT_END`. The checkpoint covers the first `covers`
+/// bytes of output the holder read since the previous checkpoint (for a
+/// core that adopted the session, since the start of the tail it got).
+/// The holder drops those from the tail and keeps the rest, which the core
+/// hadn't fed when it rendered the checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointEnd {
+    pub session: SessionId,
+    pub covers: u64,
+}
+
+impl CheckpointEnd {
+    pub fn blob_end(self) -> BlobEnd {
+        BlobEnd {
+            session: self.session,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,7 +318,7 @@ pub enum ToHolder {
     Hangup(SessionRef),
     CheckpointBegin(BlobBegin),
     CheckpointChunk(Data),
-    CheckpointEnd(BlobEnd),
+    CheckpointEnd(CheckpointEnd),
     Drain(Drain),
     Goodbye(Goodbye),
     Reparent(Reparent),
@@ -310,7 +337,9 @@ impl ToHolder {
             Self::Hangup(m) => wire::json(MSG_HANGUP, m),
             Self::CheckpointBegin(m) => encode_begin(MSG_CHECKPOINT_BEGIN, m),
             Self::CheckpointChunk(m) => encode_data(MSG_CHECKPOINT_CHUNK, m),
-            Self::CheckpointEnd(m) => encode_end(MSG_CHECKPOINT_END, m),
+            Self::CheckpointEnd(m) => {
+                wire::session_bytes(MSG_CHECKPOINT_END, m.session, &m.covers.to_be_bytes())
+            }
             Self::Drain(m) => wire::json(MSG_DRAIN, m),
             Self::Goodbye(m) => wire::json(MSG_GOODBYE, m),
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
@@ -328,7 +357,13 @@ impl ToHolder {
             MSG_HANGUP => Self::Hangup(wire::from_json("HANGUP", frame)?),
             MSG_CHECKPOINT_BEGIN => Self::CheckpointBegin(decode_begin("CHECKPOINT_BEGIN", frame)?),
             MSG_CHECKPOINT_CHUNK => Self::CheckpointChunk(decode_data("CHECKPOINT_CHUNK", frame)?),
-            MSG_CHECKPOINT_END => Self::CheckpointEnd(decode_end("CHECKPOINT_END", frame)?),
+            MSG_CHECKPOINT_END => {
+                let (session, covers) = wire::session_fixed::<8>("CHECKPOINT_END", frame)?;
+                Self::CheckpointEnd(CheckpointEnd {
+                    session,
+                    covers: u64::from_be_bytes(covers),
+                })
+            }
             MSG_DRAIN => Self::Drain(wire::from_json("DRAIN", frame)?),
             MSG_GOODBYE => Self::Goodbye(wire::from_json("GOODBYE", frame)?),
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
@@ -338,13 +373,16 @@ impl ToHolder {
         })
     }
 
-    /// A checkpoint as `CHECKPOINT_BEGIN`, chunks of [`CHUNK_LEN`] and
-    /// `CHECKPOINT_END`.
-    pub fn checkpoint(session: SessionId, bytes: &[u8]) -> Vec<Self> {
+    /// A checkpoint covering `covers` bytes of the tail, as
+    /// `CHECKPOINT_BEGIN`, chunks of [`CHUNK_LEN`] and `CHECKPOINT_END`.
+    pub fn checkpoint(session: SessionId, bytes: &[u8], covers: u64) -> Vec<Self> {
         let (begin, chunks, end) = split(session, bytes, CHUNK_LEN);
         std::iter::once(Self::CheckpointBegin(begin))
             .chain(chunks.into_iter().map(Self::CheckpointChunk))
-            .chain(std::iter::once(Self::CheckpointEnd(end)))
+            .chain(std::iter::once(Self::CheckpointEnd(CheckpointEnd {
+                session: end.session,
+                covers,
+            })))
             .collect()
     }
 }
@@ -688,7 +726,10 @@ pub(crate) mod samples {
                 session: 1,
                 bytes: b"\x1bc!".to_vec(),
             }),
-            ToHolder::CheckpointEnd(BlobEnd { session: 1 }),
+            ToHolder::CheckpointEnd(CheckpointEnd {
+                session: 1,
+                covers: 0x1_0000_0002,
+            }),
             ToHolder::Drain(Drain {}),
             ToHolder::Goodbye(Goodbye { handover: true }),
             ToHolder::Reparent(Reparent {
@@ -1001,7 +1042,7 @@ mod tests {
     #[test]
     fn checkpoints_larger_than_a_frame_are_chunked() {
         let blob = vec![b'x'; 3 * 1024 * 1024 + 5];
-        let messages = ToHolder::checkpoint(4, &blob);
+        let messages = ToHolder::checkpoint(4, &blob, 7);
         assert_eq!(messages.len(), 2 + blob.len().div_ceil(CHUNK_LEN));
         let mut assembler = Assembler::new(MAX_CHECKPOINT_LEN);
         let mut done = None;
@@ -1011,7 +1052,10 @@ mod tests {
             match ToHolder::decode(&frame).unwrap() {
                 ToHolder::CheckpointBegin(begin) => assembler.begin(begin).unwrap(),
                 ToHolder::CheckpointChunk(chunk) => assembler.chunk(&chunk).unwrap(),
-                ToHolder::CheckpointEnd(end) => done = Some(assembler.end(end).unwrap()),
+                ToHolder::CheckpointEnd(end) => {
+                    assert_eq!(end.covers, 7);
+                    done = Some(assembler.end(end.blob_end()).unwrap());
+                }
                 other => panic!("unexpected {other:?}"),
             }
         }

@@ -14,6 +14,12 @@
 //!   after a replay of its screen (`REPLAY_START`, `DATA`…, `REPLAY_END`),
 //!   then applies the client's size. `DETACH` leaves it running with no
 //!   client.
+//! - **Checkpoints:** the session's replay goes to its holder past
+//!   [`CHECKPOINT_AFTER`] of output since the last one, when it is
+//!   detached, and before the core steps down. Each says how much output it
+//!   covers, so the holder keeps what was still on its way. An adopted
+//!   session's emulator is rebuilt from the holder's checkpoint and tail
+//!   (the tail alone, after `ESC c`, when it was truncated).
 
 use brindle_remote_protocol::client::{
     self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
@@ -25,10 +31,13 @@ use super::clients::error;
 use super::holders::WaitingSpawn;
 use super::screen::Screen;
 use super::{Core, log};
+use crate::server::event_loop::{EventLoop, Token};
 
 /// How much of a replay each `DATA` carries.
 const REPLAY_CHUNK: usize = 64 * 1024;
-use crate::server::event_loop::{EventLoop, Token};
+/// Past this much output since the last checkpoint, the core sends the
+/// session's holder a new one.
+pub(super) const CHECKPOINT_AFTER: u64 = 512 * 1024;
 
 pub(super) struct Session {
     /// The holder it runs under.
@@ -53,23 +62,19 @@ pub(super) struct Session {
     /// Its program exited while its owner was away (`None` for a signal);
     /// kept so the owner hears of it when it comes back.
     exited: Option<Option<i32>>,
-    /// What its holder kept, for a session this core adopted.
-    adopted: Option<Adopted>,
+    /// Adopted, and its emulator isn't rebuilt from the holder's checkpoint
+    /// and tail yet: whether the tail was truncated.
+    rebuilding: Option<bool>,
+    /// A replay for its client, waiting for the rebuild.
+    pending_replay: Option<PendingReplay>,
     /// Its emulator, fed with all of its output.
     pub(super) screen: Screen,
 }
 
-/// A held session's last checkpoint and the raw output since then, kept as
-/// opaque bytes until the session's emulator is rebuilt from them.
-#[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "task 5.4 rebuilds the session's emulator from them"
-)]
-pub(super) struct Adopted {
-    pub(super) checkpoint: Vec<u8>,
-    pub(super) tail: Vec<u8>,
-    pub(super) truncated: bool,
+struct PendingReplay {
+    req: Option<RequestId>,
+    /// The size an `ATTACH` asked for.
+    size: Option<(u16, u16)>,
 }
 
 impl Session {
@@ -91,19 +96,8 @@ impl Session {
             hung_up: false,
             awaiting_owner: true,
             exited: held.exit.map(|exit| exit.code),
-            adopted: Some(Adopted {
-                truncated: held.truncated,
-                ..Adopted::default()
-            }),
-        }
-    }
-
-    pub(super) fn store_adopted(&mut self, checkpoint: bool, bytes: Vec<u8>) {
-        let adopted = self.adopted.get_or_insert_with(Adopted::default);
-        if checkpoint {
-            adopted.checkpoint = bytes;
-        } else {
-            adopted.tail = bytes;
+            rebuilding: Some(held.truncated),
+            pending_replay: None,
         }
     }
 }
@@ -185,7 +179,8 @@ impl<L: EventLoop> Core<L> {
                 hung_up: false,
                 awaiting_owner: false,
                 exited: None,
-                adopted: None,
+                rebuilding: None,
+                pending_replay: None,
                 screen,
             },
         );
@@ -263,8 +258,75 @@ impl<L: EventLoop> Core<L> {
         };
         // Attached or not, so a detached session's screen stays current.
         session.screen.feed(id, &bytes);
+        let due = session.screen.since_checkpoint > CHECKPOINT_AFTER;
         if let Some(client) = session.attached {
             self.send_client(client, ToClient::Data(Data { session: id, bytes }));
+        }
+        if due {
+            self.checkpoint(id);
+        }
+    }
+
+    /// An adopted session's checkpoint from its holder: the rebuild starts
+    /// from it, unless the tail was truncated (and so doesn't follow it).
+    pub(super) fn session_checkpoint(&mut self, holder: Token, id: SessionId, bytes: &[u8]) {
+        if let Some(session) = self.holder_session(holder, id)
+            && session.rebuilding == Some(false)
+        {
+            session.screen.restore(id, bytes);
+        }
+    }
+
+    /// An adopted session's tail, the last thing its holder sends for it:
+    /// the rebuild ends with it, and a replay waiting for that is sent.
+    pub(super) fn session_tail(&mut self, holder: Token, id: SessionId, bytes: &[u8]) {
+        let Some(session) = self.holder_session(holder, id) else {
+            return;
+        };
+        let Some(truncated) = session.rebuilding.take() else {
+            return;
+        };
+        if truncated {
+            log!(
+                "session {id}: its tail was truncated; rebuilt from the last {} bytes only",
+                bytes.len()
+            );
+            session.screen.restore(id, b"\x1bc");
+        }
+        session.screen.restore(id, bytes);
+        session.screen.since_checkpoint = bytes.len() as u64;
+        if let (Some(client), Some(pending)) = (session.attached, session.pending_replay.take()) {
+            self.replay(client, id, pending.req, pending.size);
+        }
+    }
+
+    /// Sends the session's holder a checkpoint of its screen, covering the
+    /// output fed since the last one.
+    pub(super) fn checkpoint(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if session.rebuilding.is_some()
+            || session.spawning.is_some()
+            || session.hung_up
+            || session.exited.is_some()
+        {
+            return;
+        }
+        let bytes = session.screen.render(id);
+        let covers = std::mem::take(&mut session.screen.since_checkpoint);
+        let holder = session.holder;
+        for message in ToHolder::checkpoint(id, &bytes, covers) {
+            self.send_holder(holder, message);
+        }
+    }
+
+    /// Checkpoints every session, before the core steps down.
+    #[allow(dead_code, reason = "STEP_DOWN (task 6.1) calls it")]
+    pub(super) fn checkpoint_all(&mut self) {
+        let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.checkpoint(id);
         }
     }
 
@@ -351,7 +413,10 @@ impl<L: EventLoop> Core<L> {
             self.detach_session(id);
             match self.sessions[&id].meta.policy {
                 Policy::Kill => self.hang_up(id),
-                Policy::Detach => log!("session {id}: detached"),
+                Policy::Detach => {
+                    log!("session {id}: detached");
+                    self.checkpoint(id);
+                }
             }
         }
     }
@@ -531,10 +596,12 @@ impl<L: EventLoop> Core<L> {
         if let Some(token) = self.client_token(client).map(str::to_string) {
             self.sessions.get_mut(&id).expect("the session").meta.owner = token;
         }
-        self.replay(client, id, Some(attach.req));
-        if self.sessions.contains_key(&id) && attach.cols > 0 && attach.rows > 0 {
-            self.resize_session(id, attach.cols, attach.rows, 0, 0);
-        }
+        self.replay(
+            client,
+            id,
+            Some(attach.req),
+            Some((attach.cols, attach.rows)),
+        );
     }
 
     /// `DETACH`: the session keeps running with no client.
@@ -544,17 +611,30 @@ impl<L: EventLoop> Core<L> {
         }
         log!("session {id}: detached by client {client}");
         self.detach_session(id);
+        self.checkpoint(id);
     }
 
     /// Gives a session with no client to `client`: `REPLAY_START`, the
-    /// replay as `DATA`, `REPLAY_END`; its live output follows. A session
-    /// whose program exited meanwhile gets its `EXIT` after the replay.
-    pub(super) fn replay(&mut self, client: Token, id: SessionId, req: Option<RequestId>) {
+    /// replay as `DATA`, `REPLAY_END`; then `size` applies, and its live
+    /// output follows. A session whose program exited meanwhile gets its
+    /// `EXIT` after the replay. One still being rebuilt from its holder
+    /// gets its replay once the rebuild is done (no output comes before).
+    pub(super) fn replay(
+        &mut self,
+        client: Token,
+        id: SessionId,
+        req: Option<RequestId>,
+        size: Option<(u16, u16)>,
+    ) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
         session.awaiting_owner = false;
         session.attached = Some(client);
+        if session.rebuilding.is_some() {
+            session.pending_replay = Some(PendingReplay { req, size });
+            return;
+        }
         let pid = session.pid;
         let exited = session.exited;
         // Rendered whole, in this turn of the loop: output read after it
@@ -584,6 +664,12 @@ impl<L: EventLoop> Core<L> {
         if let Some(code) = exited {
             self.sessions.remove(&id);
             return self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+        }
+        if let Some((cols, rows)) = size
+            && cols > 0
+            && rows > 0
+        {
+            self.resize_session(id, cols, rows, 0, 0);
         }
         if self.client_is_over(client) {
             self.set_paused(id, true);

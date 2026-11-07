@@ -1,10 +1,11 @@
 //! `brindle-remote serve`, driven by test clients over protocol 1, with real
-//! holders under it (task group 4).
+//! holders under it (task groups 4 and 5).
 
 #![cfg(target_os = "linux")]
 
 mod support;
 
+use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -657,6 +658,117 @@ fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
         ToClient::Error(error) => assert!(error.message.contains("isn't attached")),
         message => panic!("{message:?}"),
     }
+}
+
+// 5.4
+
+#[test]
+fn after_a_core_restart_a_full_screen_session_rebuilds_from_checkpoint_and_tail() {
+    let mut dir = TempDir::new("rebuild-full");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    let first = full_screen_fixture(1);
+    let second = full_screen_fixture(2);
+    fs::write(dir.path.join("second"), &second).unwrap();
+    let mut spawn = fixture_spawn(&dir, "first", &first, 1000);
+    // The second frame comes after a line of input.
+    spawn.args[1] = format!(
+        "stty raw -echo; cat '{}'; read x; cat '{}'; exec sleep 1000",
+        dir.path.join("first").display(),
+        dir.path.join("second").display()
+    );
+    let (session, pid) = client.spawn(spawn);
+    dir.track(parent(pid).unwrap());
+    client.output_until(session, b"frame 1\x1b[12;30H");
+    // The checkpoint, of the first frame.
+    client.detach(session);
+    client.attach(session, 80, 24).unwrap();
+    // The tail: the second frame.
+    client.input(session, b"\n");
+    client.output_until(session, b"frame 2\x1b[12;30H");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let both = [first, second].concat();
+    let expected = snapshot(&replayed(&both, 80, 24, 1000));
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(start.pid, pid);
+    assert_eq!(snapshot(&screen), expected);
+    let logs = dir.logs();
+    assert!(!logs.contains("truncated"), "{logs}");
+}
+
+/// Numbered, coloured lines: about `kib` KiB of them.
+fn lines_fixture(kib: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut n = 0;
+    while out.len() < kib * 1024 {
+        out.extend_from_slice(
+            format!(
+                "\x1b[3{}mline {n:06}\x1b[0m {}\r\n",
+                n % 8,
+                "-".repeat(40 + n % 30)
+            )
+            .as_bytes(),
+        );
+        n += 1;
+    }
+    out.extend_from_slice(b"all printed\r\n");
+    out
+}
+
+#[test]
+fn a_session_with_more_output_than_a_tail_holds_rebuilds_exactly() {
+    let mut dir = TempDir::new("rebuild-long");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    // More than the 1 MiB tail: only checkpoints keep it exact.
+    let fixture = lines_fixture(1536);
+    let (session, pid) = client.spawn(fixture_spawn(&dir, "lines", &fixture, 1000));
+    dir.track(parent(pid).unwrap());
+    client.output_until(session, b"all printed\r\n");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let expected = snapshot(&replayed(&fixture, 80, 24, 1000));
+    let (_, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(snapshot(&screen), expected);
+    let logs = dir.logs();
+    assert!(!logs.contains("truncated"), "{logs}");
+}
+
+#[test]
+fn a_truncated_tail_still_gives_a_working_session() {
+    let mut dir = TempDir::new("rebuild-truncated");
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    let (session, pid) = client.spawn(detach(client_shell(
+        "stty raw -echo; while read line; do \
+         head -c 1500000 /dev/zero | tr '\\0' x; printf '\\r\\nEND %s\\r\\n' \"$line\"; done",
+    )));
+    let holder = parent(pid).unwrap();
+    dir.track(holder);
+    kill(client.core_pid());
+    assert!(client.closes());
+
+    // A core that never checkpoints: the tail overflows.
+    let mut test_core = TestCore::connect_to(&dir);
+    test_core.hello(7);
+    test_core.input(session, b"one\n");
+    test_core.output_until(session, b"END one\r\n");
+    drop(test_core);
+
+    start_core(&dir.path, &[]).unwrap();
+    let mut other = TestClient::hello(&dir.path, "other");
+    dir.track(other.core_pid());
+    let (start, screen) = other.attach_until(session, 1000, |screen| {
+        rows(screen).iter().any(|row| row == "END one")
+    });
+    assert_eq!(start.pid, pid);
+    assert!(rows(&screen).iter().any(|row| row.starts_with("xxxx")));
+    assert!(dir.logs().contains("tail was truncated"), "{}", dir.logs());
+    other.input(session, b"two\n");
+    other.output_until(session, b"END two\r\n");
 }
 
 /// A process's resident set, in KiB.

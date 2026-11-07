@@ -262,8 +262,8 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
     assert_eq!(adopted.checkpoints[&1], b"");
     assert_eq!(adopted.tails[&1], b"one\r\n");
 
-    // A checkpoint replaces the tail.
-    for message in ToHolder::checkpoint(1, b"CP1") {
+    // A checkpoint replaces the tail it covers ("one\r\n").
+    for message in ToHolder::checkpoint(1, b"CP1", 5) {
         second.send(message);
     }
     second.input(1, b"abc\n");
@@ -300,6 +300,28 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
 }
 
 #[test]
+fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
+    let (dir, mut core, _) = holder("covers");
+    core.spawn(spawn(1, "cat", &[]));
+    core.input(1, b"a\n");
+    core.output_until(1, b"a\r\na\r\n");
+    // As if the core had rendered after the echo but before cat's line.
+    for message in ToHolder::checkpoint(1, b"CP", 3) {
+        core.send(message);
+    }
+    core.input(1, b"b\n");
+    core.output_until(1, b"b\r\nb\r\n");
+    drop(core);
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    assert_eq!(adopted.checkpoints[&1], b"CP");
+    assert_eq!(adopted.tails[&1], b"a\r\nb\r\nb\r\n");
+    assert!(!adopted.welcome().sessions[0].truncated);
+    core.hang_up(1);
+    assert_eq!(core.exit_code(1), None);
+}
+
+#[test]
 fn a_tail_past_its_limit_is_truncated() {
     let (dir, mut core, _) = holder("truncate");
     core.spawn(shell(
@@ -316,7 +338,7 @@ fn a_tail_past_its_limit_is_truncated() {
     assert!(tail.ends_with(b"x\r\nEND\r\n") && tail.starts_with(b"xxx"));
 
     // A checkpoint clears the flag.
-    for message in ToHolder::checkpoint(1, b"CP") {
+    for message in ToHolder::checkpoint(1, b"CP", h1::TAIL_LIMIT) {
         core.send(message);
     }
     drop(core);

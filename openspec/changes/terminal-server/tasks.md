@@ -74,7 +74,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
   Each must reproduce grid, attributes, modes, cursor, marks and records in a fresh `Term`.
 - [x] 5.3 `ATTACH` and `DETACH`: `REPLAY_START`, replay, `REPLAY_END`, then live output, with the client's size applied after the replay, and a refusal when the session is attached. Verify with server tests for the full-screen, scrollback, status and marks cases and the refusal.
-- [ ] 5.4 Checkpoints: send `CHECKPOINT` to the holder past 512 KiB of tail, on detach and before stepping down, and rebuild adopted sessions from the checkpoint plus the tail. Verify with tests:
+- [x] 5.4 Checkpoints: send `CHECKPOINT` to the holder past 512 KiB of tail, on detach and before stepping down, and rebuild adopted sessions from the checkpoint plus the tail. Verify with tests:
   - after a core SIGKILL and respawn, a fresh attach to a full-screen session matches its screen;
   - a session with more than 512 KiB of output since its start rebuilds exactly;
   - a truncated tail still gives a working session.

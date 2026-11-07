@@ -16,8 +16,7 @@ use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHo
 
 use super::clients::error;
 use super::sessions::Session;
-use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};
-use crate::server::conn::Conn;
+use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};use crate::server::conn::Conn;
 use crate::server::daemon;
 use crate::server::event_loop::{EventLoop, Interest, Token};
 
@@ -373,16 +372,13 @@ impl<L: EventLoop> Core<L> {
             Ok(None) => return,
             Err(error) => return self.drop_holder(token, &format!("bad {kind:?}: {error}")),
         };
-        if kind == Blob::Tail {
-            holder.adopting.remove(&id);
-        }
-        if let Some(session) = self.sessions.get_mut(&id)
-            && session.holder == token
-        {
-            session.store_adopted(kind == Blob::Checkpoint, bytes);
-        }
-        if kind == Blob::Tail {
-            self.holder_adopted(token);
+        match kind {
+            Blob::Checkpoint => self.session_checkpoint(token, id, &bytes),
+            Blob::Tail => {
+                holder.adopting.remove(&id);
+                self.session_tail(token, id, &bytes);
+                self.holder_adopted(token);
+            }
         }
     }
 

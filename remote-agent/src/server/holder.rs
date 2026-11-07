@@ -201,6 +201,10 @@ impl Slot {
 struct Tail {
     bytes: VecDeque<u8>,
     truncated: bool,
+    /// Output read that no checkpoint covers yet, counted as the core
+    /// counts `covers`: since the last checkpoint, or since the start of
+    /// the tail last sent to a core. Truncated bytes count too.
+    uncovered: u64,
 }
 
 impl Tail {
@@ -208,6 +212,7 @@ impl Tail {
 
     fn push(&mut self, data: &[u8]) {
         self.bytes.extend(data);
+        self.uncovered += data.len() as u64;
         let excess = self.bytes.len().saturating_sub(Self::LIMIT);
         if excess > 0 {
             self.bytes.drain(..excess);
@@ -219,9 +224,19 @@ impl Tail {
         Self::LIMIT.saturating_sub(self.bytes.len())
     }
 
-    fn clear(&mut self) {
-        self.bytes.clear();
-        self.truncated = false;
+    /// A checkpoint covers the first `covers` uncovered bytes: they go, and
+    /// the rest (read after the core rendered it) stay. It is truncated
+    /// only if some of the rest were lost.
+    fn cover(&mut self, covers: u64) {
+        self.uncovered = self.uncovered.saturating_sub(covers);
+        let keep = self.uncovered.min(self.bytes.len() as u64) as usize;
+        self.bytes.drain(..self.bytes.len() - keep);
+        self.truncated = self.uncovered > keep as u64;
+    }
+
+    /// The tail goes to a new core, which counts from its start.
+    fn sent(&mut self) {
+        self.uncovered = self.bytes.len() as u64;
     }
 
     fn to_vec(&self) -> Vec<u8> {
@@ -534,13 +549,14 @@ impl<L: EventLoop> Holder<L> {
                 sessions,
             }),
         );
-        for (&id, session) in &self.sessions {
+        for (&id, session) in &mut self.sessions {
             for message in ToCore::checkpoint(id, &session.checkpoint) {
                 queue(&mut core.conn, message);
             }
             for message in ToCore::tail(id, &session.tail.to_vec()) {
                 queue(&mut core.conn, message);
             }
+            session.tail.sent();
         }
         // The core now knows how these ended.
         let finished: Vec<SessionId> = self
@@ -688,11 +704,11 @@ impl<L: EventLoop> Holder<L> {
             }
             ToHolder::CheckpointEnd(end) => {
                 let core = self.core.as_mut().expect("a core sent this");
-                match core.checkpoints.end(end) {
+                match core.checkpoints.end(end.blob_end()) {
                     Ok(bytes) => {
                         if let Some(session) = self.sessions.get_mut(&end.session) {
                             session.checkpoint = bytes;
-                            session.tail.clear();
+                            session.tail.cover(end.covers);
                         }
                     }
                     Err(error) => self.send_error(Some(end.session), error.to_string()),
@@ -1174,8 +1190,41 @@ mod tests {
         assert!(bytes.starts_with(b"cx") && bytes.ends_with(b"xyz"));
         tail.push(&vec![b'q'; Tail::LIMIT + 5]);
         assert_eq!(tail.to_vec(), vec![b'q'; Tail::LIMIT]);
-        tail.clear();
+        tail.cover(u64::MAX);
         assert_eq!((tail.to_vec().len(), tail.truncated), (0, false));
+    }
+
+    #[test]
+    fn a_checkpoint_drops_only_what_it_covers() {
+        let mut tail = Tail::default();
+        tail.push(b"seen by the core");
+        tail.push(b", still on its way");
+        tail.cover(16);
+        assert_eq!(tail.to_vec(), b", still on its way");
+        assert!(!tail.truncated);
+
+        // After a new core got the tail, it counts from its start.
+        tail.sent();
+        tail.push(b"!");
+        tail.cover(18);
+        assert_eq!(tail.to_vec(), b"!");
+
+        // Uncovered output that overflowed the tail is lost.
+        tail.push(&vec![b'x'; Tail::LIMIT + 10]);
+        tail.cover(1);
+        assert_eq!(tail.to_vec().len(), Tail::LIMIT);
+        assert!(tail.truncated);
+        tail.cover(10);
+        assert!(!tail.truncated, "what is left follows the checkpoint");
+        // Once a new core got a truncated tail, the next checkpoint
+        // clears the flag.
+        tail.push(&vec![b'y'; Tail::LIMIT]);
+        assert!(tail.truncated);
+        tail.sent();
+        assert!(tail.truncated, "until a checkpoint, the tail is still cut");
+        tail.cover(5);
+        assert!(!tail.truncated);
+        assert_eq!(tail.to_vec().len(), Tail::LIMIT - 5);
     }
 
     #[test]
