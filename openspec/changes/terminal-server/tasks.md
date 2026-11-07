@@ -37,7 +37,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 3. Holder
 
-- [ ] 3.1 The shared server pieces: directory resolution (`BRINDLE_SERVER_DIR`, `$XDG_RUNTIME_DIR/brindle`, `~/.cache/brindle/run`, mode 0700), the `--ready-fd` start with double fork and `setsid`, log files, the `SO_PEERCRED` check, and the event-loop trait with its `poll(2)` implementation. Verify with unit tests for directory resolution and modes, the peer check against a faked uid, and the loop's register/wait/wake.
+- [x] 3.1 The shared server pieces: directory resolution (`BRINDLE_SERVER_DIR`, `$XDG_RUNTIME_DIR/brindle`, `~/.cache/brindle/run`, mode 0700), the `--ready-fd` start with double fork and `setsid`, log files, the `SO_PEERCRED` check, and the event-loop trait with its `poll(2)` implementation. Verify with unit tests for directory resolution and modes, the peer check against a faked uid, and the loop's register/wait/wake.
 - [ ] 3.2 `brindle-remote hold`:
   - the socket and flock;
   - one core connection, with a newer `HELLO` taking over;
