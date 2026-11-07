@@ -505,25 +505,8 @@ impl Drop for ChildGuard {
 }
 
 fn agent_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BRINDLE_REMOTE_AGENT") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        bail!(
-            "BRINDLE_REMOTE_AGENT does not name a file: {}",
-            path.display()
-        );
-    }
-    let exe = std::env::current_exe().context("locating Brindle executable")?;
-    for name in ["brindle-remote-linux-x86_64", "brindle-remote"] {
-        let path = exe.with_file_name(name);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    bail!(
-        "Linux remote helper not found beside Brindle; set BRINDLE_REMOTE_AGENT to a Linux brindle-remote binary"
+    super::find_helper()?.context(
+        "Linux remote helper not found beside Brindle; set BRINDLE_REMOTE_AGENT to a Linux brindle-remote binary",
     )
 }
 

@@ -9,8 +9,10 @@
 //! message numbers: [`client`] (client ↔ core, protocol 1) and [`holder`]
 //! (core ↔ holder, H1).
 
+pub mod build_id;
 pub mod client;
 pub mod holder;
+pub mod server_dir;
 pub mod version;
 mod wire;
 
