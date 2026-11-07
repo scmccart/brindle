@@ -115,7 +115,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 8. Test harness and e2e cases
 
-- [ ] 8.1 Give every e2e case `BRINDLE_SERVER_DIR=target/tmp/e2e/<case>/server`, run `brindle-remote stop` after it, and have the harness fail with a clear message if the helper isn't built. Update CLAUDE.md's e2e section and the CI e2e and Windows jobs as needed. Verify that `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` passes on the existing cases, and that no `brindle-remote serve` or `hold` is left running afterwards.
+- [ ] 8.1 Give every e2e case its own `BRINDLE_SERVER_DIR` under `/tmp` (paths under `target/tmp/e2e/` are too long for Unix sockets), copy its `core.log` into `target/tmp/e2e/<case>/`, run `brindle-remote stop` after it, and have the harness fail with a clear message if the helper isn't built. Update CLAUDE.md's e2e section and the CI e2e and Windows jobs as needed. Verify that `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` passes on the existing cases, and that no `brindle-remote serve` or `hold` is left running afterwards.
 - [ ] 8.2 Add `tests/e2e/cases/local_server.rs` with these cases:
   - `local-server-session`: listed as attached, and the shell's parent is a holder;
   - `local-server-close`, `local-server-quit` and `local-server-crash`: the programs are gone;
@@ -124,7 +124,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - `local-server-replay-quiet`: a bell and an OSC 9 since the last checkpoint raise nothing on reconnect (`BRINDLE_NOTIFY_LOG` stays empty);
   - `local-server-holder-lost`: the holder SIGKILLed, and the tab shows "session lost";
   - `local-server-no-helper`: the tab shows the missing-helper error, and a tab opened after `BRINDLE_REMOTE_AGENT` names the helper runs in the server;
-  - `local-server-upgrade`: a second Brindle with a helper copy whose mtime is newer keeps the first Brindle's tab and pid, and `status` shows the old holder draining;
+  - `local-server-upgrade`: a second Brindle with a helper copy whose build id is patched and whose mtime is newer keeps the first Brindle's tab and pid, and `status` shows the old holder draining;
   - `local-server-manage`: `brindle-remote list` run in a tab lists its own session.
 
   Verify they pass under `scripts/with-xvfb`, with `BRINDLE_E2E_SLOW=2` too.

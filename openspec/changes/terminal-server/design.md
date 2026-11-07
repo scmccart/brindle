@@ -146,6 +146,15 @@ It uses the same frame header, with its own message numbers and its own version,
     - `kill` and `stop` with no server say so on stderr and exit 0.
     - `status`'s client count includes the command's own connection.
   - **Code layout:** the commands live in `remote-agent/src/server/cli.rs`. `brindle-remote-protocol` re-exports `serde_json`.
+- **Settled in task group 7:**
+  - **Shared code:** `server_dir::resolve` and `build_id::of_binary` live in `remote-protocol`, so Brindle and the helper resolve the same directory and build id.
+  - **`EXIT { session, code, lost? }`:** the optional `lost` reason (omitted when unset, so the existing encodings don't change) tells a holder's death apart from a program killed by a signal. Brindle keeps the tab open, with the "session lost" line, when `lost` is set.
+  - **After a reconnect** Brindle sends `LIST` to learn which sessions the core no longer has.
+  - **Upgrade decision:** the running core's binary mtime comes from `/proc/<core pid>/exe`, so `WELCOME` is unchanged.
+  - **Environment:** variables that aren't UTF-8 are dropped, because the protocol carries JSON strings. `WINDOWID` and `ALACRITTY_WINDOW_ID`, which alacritty's PTY code used to set to `0`, are no longer set.
+  - **The holder sets `IUTF8`** on every PTY, as alacritty did, so line editing handles multibyte characters.
+  - **Spawning never blocks the UI thread:** `Terminal::spawn` returns at once, and the connection, a reconnect or an upgrade's step-down finishes in the background, with input queued, as `Backend::Agent` does.
+  - **e2e server directories** are under `/tmp`, not `target/tmp/e2e/<case>/`, because holder socket paths there exceed the 108-byte `sun_path` limit. The harness copies `core.log` into the case directory.
 
 ### Client protocol
 It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
