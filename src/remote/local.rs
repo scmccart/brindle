@@ -15,6 +15,7 @@
 //! The process keeps one [`Connection`] for all its tabs ([`shared`]).
 
 mod connection;
+mod upgrade;
 
 pub use connection::{Connection, Session, SessionSink, SpawnRequest};
 
@@ -75,6 +76,7 @@ pub fn shared() -> Result<Arc<Connection>> {
     }
     let endpoint = Endpoint::from_env()?;
     let connected = connect(&endpoint, client_token())?;
+    let connected = upgrade::offer(&endpoint, client_token(), connected)?;
     let connection = Connection::start(endpoint, client_token(), connected)?;
     *current = Some(connection.clone());
     Ok(connection)
