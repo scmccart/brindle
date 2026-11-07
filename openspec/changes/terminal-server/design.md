@@ -122,6 +122,15 @@ It uses the same frame header with its own numbers, and this change is protocol 
   - the core answers each connection in its negotiated version, and drives each holder in its own negotiated version;
   - transcript tests pin protocol 1 and H1.
 - **No heartbeat locally:** a local socket's EOF is reliable.
+- **Details settled while implementing (task group 2):**
+  - **Replies:** `SESSIONS` answers `LIST`, `SERVER_STATUS` answers `STATUS`, and `OK { req }` answers `KILL`, `STOP` and `STEP_DOWN`.
+  - **`ERROR`** has optional `req` and `session` fields, so a refused message with no `req` (`REPARENT`, `RESIZE`) can be matched. H1 has its own holder-to-core `ERROR { session?, message }`.
+  - **`REPLAY_START`** carries `req?` (empty on reconnect) and the session's `pid`.
+  - **Session entries in H1's `WELCOME`** have `exit: Option<{ code: Option<i32> }>`, to tell a running session from one killed by a signal.
+  - **`KILL`** is `{"target":{"session":N}}` or `{"target":"all"}`.
+  - **Optional fields:** `command` is optional (none means the login shell), `cell_w`, `cell_h` and `scrollback` default to 0, and `instance` is a `u64`.
+  - **Checkpoints and tails** are chunked as `*_BEGIN { session, total: u64 }`, `*_CHUNK`s of 64 KiB and `*_END`. A holder replaces a checkpoint only on `CHECKPOINT_END`. The limits are 64 MiB for a checkpoint and 1 MiB for a tail.
+  - **`meta`** is a `serde_json::Value`, and the core writes it with sorted keys. A workspace build turns on serde_json's `preserve_order`, so key order would otherwise differ between builds.
 
 ### Close policies across core restarts
 A `kill` session ends on `CLOSE`, `KILL` or `STOP`, and when its owner is gone. While the core runs, gone means its client's connection ended. After a core starts with adopted sessions, owners get a reconnect grace period of 10 s; when it passes, the `kill` sessions of owners who didn't return are hung up. Hangup is the holder's job: it closes the master, sends `SIGHUP` to the process group, and sends `SIGKILL` after a grace period, with agent.rs's timings. A `detach` session ends only on `KILL`, `STOP` or its program's exit.
