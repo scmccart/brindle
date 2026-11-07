@@ -532,6 +532,131 @@ fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
     client.input(other, b"fine\n");
     client.output_until(other, b"fine\r\nfine\r\n");
     assert_eq!(dir.logs().matches("the emulator panicked").count(), 1);
+
+    // Its replay is just a reset; the other's is its screen. (One
+    // connection's messages are handled in order, so each DETACH is.)
+    client.detach(broken);
+    client.detach(other);
+    let (_, replay) = client.attach(broken, 80, 24).unwrap();
+    assert_eq!(replay, b"\x1bc");
+    let (_, replay) = client.attach(other, 80, 24).unwrap();
+    assert!(contains(&replay, b"fine"));
+}
+
+// 5.3
+
+/// Spawns `bytes` as a detached fixture session and detaches from it.
+fn detached_fixture(
+    dir: &TempDir,
+    client: &mut TestClient,
+    bytes: &[u8],
+    scrollback: u32,
+) -> (brindle_remote_protocol::SessionId, u32) {
+    let (session, pid) = client.spawn(fixture_spawn(dir, "fixture", bytes, scrollback));
+    client.detach(session);
+    (session, pid)
+}
+
+#[test]
+fn attaching_to_a_full_screen_session_replays_its_screen() {
+    let (dir, mut client) = core("attach-full");
+    let fixture = full_screen_fixture(1);
+    let (session, pid) = detached_fixture(&dir, &mut client, &fixture, 1000);
+    let expected = snapshot(&replayed(&fixture, 80, 24, 1000));
+
+    let mut other = TestClient::hello(&dir.path, "other");
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!((start.session, start.pid), (session, pid));
+    let mode = *screen.term().mode();
+    use brindle_term_core::alacritty_terminal::term::TermMode;
+    assert!(mode.contains(TermMode::ALT_SCREEN | TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE));
+    assert!(!mode.contains(TermMode::SHOW_CURSOR));
+    assert_eq!(screen.title().as_deref(), Some("htop-like"));
+}
+
+#[test]
+fn attaching_replays_the_scrollback() {
+    let (dir, mut client) = core("attach-scroll");
+    let lines: String = (1..=500).map(|n| format!("line {n}\r\n")).collect();
+    let (session, _) = detached_fixture(&dir, &mut client, lines.as_bytes(), 1000);
+    let expected = snapshot(&replayed(lines.as_bytes(), 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    let text: Vec<String> = rows(&screen)
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect();
+    let want: Vec<String> = (1..=500).map(|n| format!("line {n}")).collect();
+    assert_eq!(text, want);
+}
+
+#[test]
+fn attaching_replays_status_records_and_prompt_marks() {
+    let (dir, mut client) = core("attach-marks");
+    let mut fixture = Vec::new();
+    for (n, exit) in [(1, 0), (2, 1), (3, 0)] {
+        fixture.extend_from_slice(
+            format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07cmd{n}\r\n\x1b]133;C\x07output {n}\r\n\x1b]133;D;{exit}\x07"
+            )
+            .as_bytes(),
+        );
+    }
+    fixture.extend_from_slice(b"\x1b]133;A\x07$ \x1b]7501;state=working:app=tests\x1b\\");
+    let (session, _) = detached_fixture(&dir, &mut client, &fixture, 1000);
+    let expected = snapshot(&replayed(&fixture, 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    use brindle_term_core::status::State;
+    assert_eq!(
+        screen.records().get("").map(|record| record.state),
+        Some(State::Working)
+    );
+    let marks = screen.marks();
+    assert_eq!(marks.commands().len(), 4);
+    assert_eq!(marks.prompt_lines().collect::<Vec<_>>(), [0, 2, 4, 6]);
+}
+
+#[test]
+fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
+    let (dir, mut owner) = core("attach-refused");
+    let (session, _) = owner.spawn(detach(client_shell(
+        "while read line; do stty size; done",
+    )));
+    let mut other = TestClient::hello(&dir.path, "other");
+    let refusal = other.attach(session, 100, 30).unwrap_err();
+    assert_eq!(refusal.session, Some(session));
+    assert!(refusal.message.contains("attached"), "{}", refusal.message);
+    assert!(
+        other
+            .attach(999, 80, 24)
+            .unwrap_err()
+            .message
+            .contains("no session 999")
+    );
+    assert!(
+        owner
+            .attach(session, 80, 24)
+            .unwrap_err()
+            .message
+            .contains("already attached")
+    );
+
+    owner.detach(session);
+    let (start, _) = loop {
+        match other.attach(session, 100, 30) {
+            Ok(replay) => break replay,
+            // The DETACH may not have been read yet.
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert_eq!(start.session, session);
+    other.input(session, b"\n");
+    other.output_until(session, b"30 100");
+    // The first client no longer has it.
+    owner.input(session, b"x");
+    match owner.recv() {
+        ToClient::Error(error) => assert!(error.message.contains("isn't attached")),
+        message => panic!("{message:?}"),
+    }
 }
 
 /// A process's resident set, in KiB.

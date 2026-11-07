@@ -34,17 +34,12 @@ pub(super) struct Screen {
     pub(super) since_checkpoint: usize,
 }
 
-#[allow(dead_code, reason = "tasks 5.3 and 5.4 replay and checkpoint it")]
 impl Screen {
     pub(super) fn new(cols: u16, rows: u16, scrollback: u32) -> Self {
         Self {
             emulator: Some(Emulator::new(cols, rows, scrollback as usize)),
             since_checkpoint: 0,
         }
-    }
-
-    pub(super) fn is_broken(&self) -> bool {
-        self.emulator.is_none()
     }
 
     pub(super) fn feed(&mut self, id: SessionId, bytes: &[u8]) {

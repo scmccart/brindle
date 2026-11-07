@@ -23,6 +23,10 @@ use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
 };
 use brindle_remote_protocol::{Frame, RequestId, SessionId};
+use brindle_term_core::alacritty_terminal::grid::Dimensions;
+use brindle_term_core::alacritty_terminal::index::{Column, Line};
+use brindle_term_core::alacritty_terminal::term::cell::Cell;
+pub use brindle_term_core::emulator::Emulator;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
 /// Long enough for a loaded CI machine; tests poll, so passing ones are fast.
@@ -766,6 +770,101 @@ impl TestClient {
         result
     }
 
+    /// Sends `ATTACH` and returns the replay's `REPLAY_START` and bytes, or
+    /// the refusal. Output that arrives before the replay starts is
+    /// dropped; messages for other sessions are kept for later.
+    pub fn attach(
+        &mut self,
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(client::ReplayStart, Vec<u8>), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::Attach(client::Attach {
+            req,
+            session,
+            cols,
+            rows,
+        }));
+        let mut kept = Vec::new();
+        let start = loop {
+            match self.recv() {
+                ToClient::ReplayStart(start) if start.req == Some(req) => break start,
+                ToClient::Error(error) if error.req == Some(req) => {
+                    kept.extend(self.backlog.drain(..));
+                    self.backlog = kept.into();
+                    return Err(error);
+                }
+                ToClient::Data(data) if data.session == session => {}
+                other => kept.push(other),
+            }
+        };
+        let bytes = self.replay_body(session, &mut kept);
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        Ok((start, bytes))
+    }
+
+    /// The replay's bytes after its `REPLAY_START`, up to `REPLAY_END`.
+    fn replay_body(&mut self, session: SessionId, kept: &mut Vec<ToClient>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            match self.recv() {
+                ToClient::Data(data) if data.session == session => bytes.extend(data.bytes),
+                ToClient::ReplayEnd(end) if end.session == session => return bytes,
+                other => kept.push(other),
+            }
+        }
+    }
+
+    /// The next replay without a request (a reconnect's), for any session:
+    /// its `REPLAY_START` and bytes. Other messages are kept for later.
+    pub fn reconnect_replay(&mut self) -> (client::ReplayStart, Vec<u8>) {
+        let mut kept = Vec::new();
+        let start = loop {
+            match self.recv() {
+                ToClient::ReplayStart(start) if start.req.is_none() => break start,
+                other => kept.push(other),
+            }
+        };
+        let bytes = self.replay_body(start.session, &mut kept);
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        (start, bytes)
+    }
+
+    pub fn detach(&mut self, session: SessionId) {
+        self.send(client::ToCore::Detach(client::SessionRef { session }));
+    }
+
+    /// Attaches to `session` (at 80×24) until the replay, fed to a fresh
+    /// emulator, satisfies `done`; between tries it detaches again. For
+    /// sessions whose output arrives while no client is attached.
+    pub fn attach_until(
+        &mut self,
+        session: SessionId,
+        scrollback: usize,
+        mut done: impl FnMut(&Emulator) -> bool,
+    ) -> (client::ReplayStart, Emulator) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let (start, bytes) = self
+                .attach(session, 80, 24)
+                .unwrap_or_else(|error| panic!("attach refused: {}", error.message));
+            let screen = replayed(&bytes, 80, 24, scrollback);
+            if done(&screen) {
+                return (start, screen);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the replay never matched; last:\n{}",
+                snapshot(&screen)
+            );
+            self.detach(session);
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Hands the connection to a `sleep` process (as its fd 3) and closes
     /// this side, so killing that process is a client dying.
     pub fn into_process(self) -> std::process::Child {
@@ -811,6 +910,125 @@ pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
 /// A client `sh -c script` session.
 pub fn client_shell(script: &str) -> client::Spawn {
     client_spawn("/bin/sh", &["-c", script])
+}
+
+/// A fresh emulator of `cols` × `rows`, fed `bytes` (a replay, say).
+pub fn replayed(bytes: &[u8], cols: u16, rows: u16, scrollback: usize) -> Emulator {
+    let mut screen = Emulator::new(cols, rows, scrollback);
+    screen.feed(bytes);
+    screen
+}
+
+/// Every row's text, scrollback first, without trailing blanks.
+pub fn rows(screen: &Emulator) -> Vec<String> {
+    let grid = screen.term().grid();
+    (grid.topmost_line().0..=grid.bottommost_line().0)
+        .map(|line| {
+            let row = &grid[Line(line)];
+            let text: String = (0..grid.columns()).map(|col| row[Column(col)].c).collect();
+            text.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// Everything a replay must reproduce, as text: every row with each
+/// cell's character and attributes, the cursor, the modes, the title, the
+/// status records and the prompt marks.
+pub fn snapshot(screen: &Emulator) -> String {
+    use std::fmt::Write as _;
+    let term = screen.term();
+    let grid = term.grid();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "size {}x{} history {}",
+        grid.columns(),
+        grid.screen_lines(),
+        grid.history_size()
+    );
+    for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let row = &grid[Line(line)];
+        let _ = write!(out, "{line:5}|");
+        for col in 0..grid.columns() {
+            let cell = &row[Column(col)];
+            let _ = write!(out, "{}", cell.c);
+            if (cell.fg, cell.bg) != (Cell::default().fg, Cell::default().bg)
+                || !cell.flags.is_empty()
+            {
+                let _ = write!(out, "[{:?} {:?} {:?}]", cell.fg, cell.bg, cell.flags);
+            }
+        }
+        out.push('\n');
+    }
+    let cursor = &grid.cursor;
+    let _ = writeln!(
+        out,
+        "cursor {:?} wrap {} style {:?}",
+        cursor.point,
+        cursor.input_needs_wrap,
+        term.cursor_style()
+    );
+    let _ = writeln!(out, "mode {:?}", term.mode());
+    let _ = writeln!(out, "title {:?}", screen.title());
+    for (id, record) in screen.records().iter() {
+        let _ = writeln!(out, "record {id:?} {}", record.encode(id));
+    }
+    let marks = screen.marks();
+    for command in marks.commands() {
+        let _ = writeln!(
+            out,
+            "command prompt {} input {:?} output {:?} end {:?} exit {:?}",
+            marks.line(command.prompt),
+            command.input.map(|pos| (marks.line(pos), pos.col)),
+            command.output.map(|pos| (marks.line(pos), pos.col)),
+            command.end.map(|pos| (marks.line(pos), pos.col)),
+            command.exit
+        );
+    }
+    out
+}
+
+/// Writes `bytes` to a file in `dir` and returns a `detach` session spawn
+/// that prints the file unchanged (raw mode: no `\n` → `\r\n`), then waits.
+pub fn fixture_spawn(dir: &TempDir, name: &str, bytes: &[u8], scrollback: u32) -> client::Spawn {
+    let path = dir.path.join(name);
+    fs::write(&path, bytes).unwrap();
+    let mut spawn = client_shell(&format!(
+        "stty raw -echo; cat '{}'; exec sleep 1000",
+        path.display()
+    ));
+    spawn.scrollback = scrollback;
+    spawn.policy = client::Policy::Detach;
+    spawn
+}
+
+/// An `htop`-like full-screen program's output: a line on the primary
+/// screen, then the alternate screen with mouse modes, colours, a hidden
+/// cursor and a title.
+pub fn full_screen_fixture(frame: u32) -> Vec<u8> {
+    let mut out = b"before the program\r\n\x1b]2;htop-like\x07".to_vec();
+    out.extend_from_slice(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1h\x1b=\x1b[?25l");
+    out.extend_from_slice(b"\x1b[H\x1b[2J\x1b[1;37;44m  PID USER      CPU%  MEM%  COMMAND\x1b[K\x1b[0m");
+    for row in 0..20u32 {
+        let pid = 1000 + row * 7 + frame;
+        let cpu = (row * 13 + frame) % 100;
+        out.extend_from_slice(
+            format!(
+                "\x1b[{};1H\x1b[38;5;{}m{pid:5}\x1b[0m user     \x1b[48;2;{};40;60m{cpu:4}.0\x1b[0m  \x1b[1m{:4}.{}\x1b[0m  proc-{row}",
+                row + 2,
+                (row * 11) % 256,
+                (row * 12) % 256,
+                row % 10,
+                frame % 10,
+            )
+            .as_bytes(),
+        );
+    }
+    out.extend_from_slice(
+        format!("\x1b[24;1H\x1b[30;46mF1\x1b[0mHelp  \x1b[30;46mF10\x1b[0mQuit frame {frame}\x1b[12;30H")
+            .as_bytes(),
+    );
+    out
 }
 
 /// The pid in a `pid=N.` line of `output`.

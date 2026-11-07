@@ -220,12 +220,8 @@ impl<L: EventLoop> Core<L> {
                     "REPARENT is for Windows; this core runs on Linux",
                 ),
             ),
-            ToCore::Attach(attach) => {
-                self.not_supported(client, "ATTACH", Some(attach.req), Some(attach.session))
-            }
-            ToCore::Detach(target) => {
-                self.not_supported(client, "DETACH", None, Some(target.session))
-            }
+            ToCore::Attach(attach) => self.client_attach(client, attach),
+            ToCore::Detach(target) => self.client_detach(client, target.session),
             ToCore::List(request) => self.not_supported(client, "LIST", Some(request.req), None),
             ToCore::Kill(kill) => self.client_kill(client, kill),
             ToCore::Status(request) => {

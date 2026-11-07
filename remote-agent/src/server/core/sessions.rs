@@ -8,6 +8,12 @@
 //!   program's exit. Without a client they keep running.
 //! - **Owners** are `client_token`s. A client whose `HELLO` carries a
 //!   session's owner token gets every such session that has no client.
+//!   A client that attaches becomes the owner, as far as this core knows:
+//!   H1 can't change the meta its holder keeps.
+//! - **Attach:** `ATTACH` gives a session with no client to the client,
+//!   after a replay of its screen (`REPLAY_START`, `DATA`…, `REPLAY_END`),
+//!   then applies the client's size. `DETACH` leaves it running with no
+//!   client.
 
 use brindle_remote_protocol::client::{
     self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
@@ -19,6 +25,9 @@ use super::clients::error;
 use super::holders::WaitingSpawn;
 use super::screen::Screen;
 use super::{Core, log};
+
+/// How much of a replay each `DATA` carries.
+const REPLAY_CHUNK: usize = 64 * 1024;
 use crate::server::event_loop::{EventLoop, Token};
 
 pub(super) struct Session {
@@ -487,21 +496,117 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn client_resize(&mut self, client: Token, resize: Resize) {
-        let Some(session) = self.client_session(client, resize.session) else {
+        if self.client_session(client, resize.session).is_none() {
+            return;
+        }
+        self.resize_session(
+            resize.session,
+            resize.cols,
+            resize.rows,
+            resize.cell_w,
+            resize.cell_h,
+        );
+    }
+
+    /// `ATTACH`: a session with no client gets this one, after a replay of
+    /// its screen; then the client's size applies. A session that has a
+    /// client is refused.
+    pub(super) fn client_attach(&mut self, client: Token, attach: client::Attach) {
+        let id = attach.session;
+        let refusal = match self.sessions.get(&id) {
+            None => Some(format!("no session {id}")),
+            Some(session) if session.attached == Some(client) => {
+                Some(format!("session {id} is already attached to this client"))
+            }
+            Some(session) if session.attached.is_some() => {
+                Some(format!("session {id} is attached to another client"))
+            }
+            Some(session) if session.hung_up => Some(format!("session {id} is ending")),
+            Some(_) => None,
+        };
+        if let Some(message) = refusal {
+            return self.send_client(client, error(Some(attach.req), Some(id), message));
+        }
+        log!("session {id}: attached to client {client}");
+        if let Some(token) = self.client_token(client).map(str::to_string) {
+            self.sessions.get_mut(&id).expect("the session").meta.owner = token;
+        }
+        self.replay(client, id, Some(attach.req));
+        if self.sessions.contains_key(&id) && attach.cols > 0 && attach.rows > 0 {
+            self.resize_session(id, attach.cols, attach.rows, 0, 0);
+        }
+    }
+
+    /// `DETACH`: the session keeps running with no client.
+    pub(super) fn client_detach(&mut self, client: Token, id: SessionId) {
+        if self.client_session(client, id).is_none() {
+            return;
+        }
+        log!("session {id}: detached by client {client}");
+        self.detach_session(id);
+    }
+
+    /// Gives a session with no client to `client`: `REPLAY_START`, the
+    /// replay as `DATA`, `REPLAY_END`; its live output follows. A session
+    /// whose program exited meanwhile gets its `EXIT` after the replay.
+    pub(super) fn replay(&mut self, client: Token, id: SessionId, req: Option<RequestId>) {
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        session.cols = resize.cols;
-        session.rows = resize.rows;
-        session.screen.resize(resize.session, resize.cols, resize.rows);
+        session.awaiting_owner = false;
+        session.attached = Some(client);
+        let pid = session.pid;
+        let exited = session.exited;
+        // Rendered whole, in this turn of the loop: output read after it
+        // is fed and forwarded after it, so nothing is lost or reordered.
+        let bytes = session.screen.render(id);
+        self.send_client(
+            client,
+            ToClient::ReplayStart(client::ReplayStart {
+                req,
+                session: id,
+                pid,
+            }),
+        );
+        for chunk in bytes.chunks(REPLAY_CHUNK) {
+            self.send_client(
+                client,
+                ToClient::Data(Data {
+                    session: id,
+                    bytes: chunk.to_vec(),
+                }),
+            );
+        }
+        self.send_client(
+            client,
+            ToClient::ReplayEnd(client::SessionRef { session: id }),
+        );
+        if let Some(code) = exited {
+            self.sessions.remove(&id);
+            return self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+        }
+        if self.client_is_over(client) {
+            self.set_paused(id, true);
+        }
+    }
+
+    /// Resizes the session's emulator and its PTY.
+    fn resize_session(&mut self, id: SessionId, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        session.cols = cols;
+        session.rows = rows;
+        session.screen.resize(id, cols, rows);
         let holder = session.holder;
         self.send_holder(
             holder,
             ToHolder::Resize(h1::Resize {
-                session: resize.session,
-                cols: resize.cols,
-                rows: resize.rows,
-                cell_w: resize.cell_w,
-                cell_h: resize.cell_h,
+                session: id,
+                cols,
+                rows,
+                cell_w,
+                cell_h,
             }),
         );
     }
