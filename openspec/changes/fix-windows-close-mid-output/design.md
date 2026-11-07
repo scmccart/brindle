@@ -41,6 +41,8 @@ See proposal.md, "Why", for the cause. The constraints that shape the fix:
 ### Pace updates in time, not by yielding
 After an update, the loop notes when it finished. When the next batch is ready sooner than `PACE` after that, the loop first awaits a GPUI timer (`background_executor().timer`) for the rest of `PACE`. After the wait it also takes at most one more ready chunk into the same update. Draining until the channel is empty never ends under a flood: that was measured during apply. A batch that arrives after `PACE` has already passed is handled at once.
 
+Pacing starts only after `BURST` (4) updates in a row have each come within `PACE` of the previous one. The first version paced from the second quick update, and Linux `latency-tmux` regressed by about 4 ms at every percentile: a keystroke's `send-keys` response updates the session, and the echo's `%output` follows within `PACE`, so every echo waited. A short burst like that now goes straight through, while a flood is paced from its fifth update on.
+
 - A timer sends nothing to the main thread until it fires: it runs on the threadpool and dispatches once. That leaves the gap Windows needs.
 - **Alternatives considered:**
   - A bare yield: measured, and not enough. Each wake is still a posted message, so the queue never empties.
@@ -77,7 +79,7 @@ Pixel checks of repainting aren't needed. A starved window never reaches the dum
 
 ## Risks / Trade-offs
 
-- [Pacing could delay an echo typed during continuous output by up to `PACE`] → Measure with `--latency-bench` (local shell) on Windows and Linux before and after. A quiet-spell echo should be unchanged.
+- [Pacing could delay an echo typed during continuous output by up to `PACE`; without the burst allowance it delayed every tmux echo, measured] → Measure with `--latency-bench` (local shell) on Windows and Linux before and after. A quiet-spell echo should be unchanged.
 - [Throughput: one update covers more bytes] → Parsing is on the I/O thread for local tabs, so throughput isn't affected. For agent and remote terminals `feed` parses on the UI thread, and bigger batches mean fewer, longer updates; check that `throughput-brindle` doesn't regress on Linux.
 - [A busy tmux session sees its control events grouped up to 4 ms later] → Ordering is unchanged. The response FIFO matching depends only on order, not timing.
 - [The CI runner never showed the bug, so CI can't prove the fix] → The new case fails on unfixed builds on fast machines (this desktop). Record the local before and after results in the PR.

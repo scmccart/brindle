@@ -13,7 +13,7 @@
 
 - [x] 3.1 In `Terminal::spawn_events`, call `pace.wait` before each `this.update`. After the wait, take at most one more ready chunk into the same update (one `now_or_never` on `rx.next()`; draining until empty never ends under a flood), and then call `pace.updated()`. Verify: `windows-flood-responsive` and `windows-close-mid-output` pass on this desktop.
 - [x] 3.4 Add `Batch::coalesce` in `src/terminal/mod.rs` so that each update handles its batch's `Wakeup`s once and applies only the last title change. Use it in `spawn_events`. Verify: the `terminal::tests::batch_*` unit tests pass, and the full close variant exits in under 9 s in three runs out of three.
-- [ ] 3.2 Do the same in `Terminal::spawn_remote_events`, keeping consecutive `Output` merged into one `feed` across the drained chunks. Verify: `cargo test -p brindle remote` passes. On the Linux machine, the `remote-*` e2e cases pass (step 5.2).
+- [x] 3.2 Do the same in `Terminal::spawn_remote_events`, keeping consecutive `Output` merged into one `feed` across the drained chunks. Verify: `cargo test -p brindle remote` passes. On the Linux machine, the `remote-*` e2e cases pass (step 5.2).
 - [x] 3.3 Do the same in the tmux session reader (`src/tmux/mod.rs`, `event_rx.ready_chunks(4096)`), keeping the event order. Verify: `cargo test -p brindle tmux` passes. On Windows, `BRINDLE_E2E=1 cargo test --test e2e -- windows-wsl-tmux` passes or skips as before.
 
 ## 4. Latency and docs
