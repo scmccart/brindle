@@ -17,6 +17,11 @@ use crate::server::peer;
 const HELLO_LIMIT: Duration = Duration::from_secs(5);
 /// At most this many connections may wait to say `HELLO`.
 const MAX_PENDING: usize = 64;
+/// Once this much is queued to a client, [`Core::send_client`] sends what
+/// the socket takes right away, instead of at the loop's next turn: one
+/// turn can read and feed a megabyte of a holder's output, and the client
+/// would otherwise get none of it until the core had fed all of it.
+const EAGER_FLUSH: usize = 64 * 1024;
 /// How long a refused client gets to read its `ERROR`.
 const REFUSAL_FLUSH_LIMIT: Duration = Duration::from_secs(1);
 
@@ -239,6 +244,11 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         queue(&mut entry.conn, message);
+        if entry.conn.queued() >= EAGER_FLUSH {
+            // A failure shows again in the loop's own flush, which drops
+            // the client there.
+            let _ = entry.conn.flush();
+        }
         if !entry.over && entry.conn.queued() > CLIENT_QUEUE_HIGH {
             entry.over = true;
             self.pause_client_sessions(client, true);

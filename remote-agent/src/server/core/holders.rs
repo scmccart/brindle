@@ -259,8 +259,9 @@ impl<L: EventLoop> Core<L> {
                 Err(error) => log!("holder {token} sent a bad message: {error}"),
             }
         }
-        if let Some(reason) = ended {
-            self.drop_holder(token, &reason);
+        match ended {
+            Some(reason) => self.drop_holder(token, &reason),
+            None => self.checkpoint_due(token, true),
         }
     }
 
@@ -274,13 +275,24 @@ impl<L: EventLoop> Core<L> {
             };
             let frame = match holder.conn.next_frame() {
                 Ok(Some(frame)) => frame,
-                Ok(None) => return,
-                Err(_) => return holder.conn.discard_input(),
+                Ok(None) => break,
+                Err(_) => {
+                    holder.conn.discard_input();
+                    break;
+                }
             };
             if let Ok(message @ (ToCore::Output(_) | ToCore::Exited(_))) = ToCore::decode(&frame) {
                 self.handle_holder(token, message);
             }
         }
+        self.checkpoint_due(token, false);
+    }
+
+    /// Whether more of the holder's output is waiting to be read.
+    pub(super) fn holder_behind(&self, token: Token) -> bool {
+        self.holders
+            .get(&token)
+            .is_some_and(|holder| holder.conn.input_waiting())
     }
 
     pub(super) fn flush_holder(&mut self, token: Token) {

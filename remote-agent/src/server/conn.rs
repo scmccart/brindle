@@ -40,6 +40,18 @@ impl Conn {
         self.stream.as_raw_fd()
     }
 
+    /// Whether the peer has sent more than this side has read: bytes are
+    /// waiting in the socket, or part of a frame was read.
+    pub fn input_waiting(&self) -> bool {
+        if self.input.len() > self.input_start {
+            return true;
+        }
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, and the fd is open while `self` is.
+        let result = unsafe { libc::ioctl(self.fd(), libc::FIONREAD, &mut waiting) };
+        result == 0 && waiting > 0
+    }
+
     /// Reads what the socket has, up to a budget. Returns `true` at EOF.
     pub fn read_available(&mut self) -> io::Result<bool> {
         let mut buffer = [0u8; 64 * 1024];
@@ -262,6 +274,24 @@ mod tests {
         assert_eq!(sender.queued(), 0);
         drop(sender);
         assert!(receiver.read_available().unwrap(), "EOF");
+    }
+
+    #[test]
+    fn input_waiting_sees_unread_bytes_and_partial_frames() {
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let mut receiver = Conn::new(b).unwrap();
+        assert!(!receiver.input_waiting());
+        let frame = [1, 0, 0, 0, 2, b'h', b'i'];
+        a.write_all(&frame).unwrap();
+        assert!(receiver.input_waiting(), "unread in the socket");
+        receiver.read_available().unwrap();
+        assert!(receiver.input_waiting(), "read, but not taken as a frame");
+        assert!(receiver.next_frame().unwrap().is_some());
+        assert!(!receiver.input_waiting());
+        a.write_all(&frame[..3]).unwrap();
+        receiver.read_available().unwrap();
+        assert!(receiver.next_frame().unwrap().is_none());
+        assert!(receiver.input_waiting(), "part of a frame");
     }
 
     #[test]

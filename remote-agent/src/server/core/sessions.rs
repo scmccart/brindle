@@ -15,8 +15,10 @@
 //!   then applies the client's size. `DETACH` leaves it running with no
 //!   client.
 //! - **Checkpoints:** the session's replay goes to its holder past
-//!   [`CHECKPOINT_AFTER`] of output since the last one, when it is
-//!   detached, and before the core steps down. Each says how much output it
+//!   [`CHECKPOINT_AFTER`] of output since the last one (checked after each
+//!   read of the holder's output, and deferred while more is waiting: see
+//!   [`is_due`]), when it is detached, and before the core steps down.
+//!   Each says how much output it
 //!   covers, so the holder keeps what was still on its way. An adopted
 //!   session's emulator is rebuilt from the holder's checkpoint and tail
 //!   (the tail alone, after `ESC c`, when it was truncated).
@@ -38,6 +40,24 @@ const REPLAY_CHUNK: usize = 64 * 1024;
 /// Past this much output since the last checkpoint, the core sends the
 /// session's holder a new one.
 pub(super) const CHECKPOINT_AFTER: u64 = 512 * 1024;
+/// The same, while more of the holder's output is waiting to be read.
+const CHECKPOINT_AFTER_BEHIND: u64 = 4 * 1024 * 1024;
+
+/// Whether a session with `since` bytes of output since its last
+/// checkpoint is due for a new one, after a read of its holder's output.
+///
+/// A checkpoint renders the whole screen and scrollback, which costs about
+/// as much as feeding as many bytes. In a flood that keeps the core behind
+/// its holder, checkpoints every [`CHECKPOINT_AFTER`] took a third to a half
+/// of the core's time, and they mostly can't keep the holder's tail whole: the
+/// holder has already read past them. So while more of the holder's output
+/// is waiting (`behind`), a session is due only past
+/// [`CHECKPOINT_AFTER_BEHIND`], and the first read that leaves nothing
+/// waiting checkpoints at [`CHECKPOINT_AFTER`] again.
+fn is_due(since: u64, behind: bool) -> bool {
+    let after = if behind { CHECKPOINT_AFTER_BEHIND } else { CHECKPOINT_AFTER };
+    since > after
+}
 
 pub(super) struct Session {
     /// The holder it runs under.
@@ -287,13 +307,10 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         // Attached or not, so a detached session's screen stays current.
+        // Checkpoints wait for the end of the read (`checkpoint_due`).
         session.screen.feed(id, &bytes);
-        let due = session.screen.since_checkpoint > CHECKPOINT_AFTER;
         if let Some(client) = session.attached {
             self.send_client(client, ToClient::Data(Data { session: id, bytes }));
-        }
-        if due {
-            self.checkpoint(id);
         }
     }
 
@@ -348,6 +365,28 @@ impl<L: EventLoop> Core<L> {
         let holder = session.holder;
         for message in ToHolder::checkpoint(id, &bytes, covers) {
             self.send_holder(holder, message);
+        }
+    }
+
+    /// After a read of `holder`'s output: checkpoints its sessions that are
+    /// due (see [`is_due`]). With `may_defer`, they wait while more of the
+    /// holder's output is waiting.
+    pub(super) fn checkpoint_due(&mut self, holder: Token, may_defer: bool) {
+        let mut due: Vec<(SessionId, u64)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.holder == holder && is_due(session.screen.since_checkpoint, false)
+            })
+            .map(|(&id, session)| (id, session.screen.since_checkpoint))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let behind = may_defer && self.holder_behind(holder);
+        due.retain(|&(_, since)| is_due(since, behind));
+        for (id, _) in due {
+            self.checkpoint(id);
         }
     }
 
@@ -730,5 +769,19 @@ impl<L: EventLoop> Core<L> {
         if self.client_session(client, id).is_some() {
             self.hang_up(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoints_wait_while_the_holder_is_ahead() {
+        assert!(!is_due(CHECKPOINT_AFTER, false));
+        assert!(is_due(CHECKPOINT_AFTER + 1, false));
+        assert!(!is_due(CHECKPOINT_AFTER + 1, true));
+        assert!(!is_due(CHECKPOINT_AFTER_BEHIND, true));
+        assert!(is_due(CHECKPOINT_AFTER_BEHIND + 1, true));
     }
 }
