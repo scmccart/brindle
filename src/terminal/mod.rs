@@ -1292,6 +1292,38 @@ mod tests {
         assert!(marker.at() >= before && marker.at() <= Instant::now());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn server_sessions_get_brindles_environment_with_the_profiles_over_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        let profile = Profile {
+            env: [("FOO".into(), "profile".into()), ("EXTRA".into(), "1".into())].into(),
+            ..Profile::default_shell()
+        };
+        let own = [
+            ("PATH", "/usr/bin"),
+            ("FOO", "brindle"),
+            ("TERM", "dumb"),
+            ("XDG_ACTIVATION_TOKEN", "for-brindle"),
+            ("DESKTOP_STARTUP_ID", "for-brindle"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let not_utf8 = (OsString::from("RAW"), OsString::from_vec(vec![0xff, 0xfe]));
+        let env = server_env(own.into_iter().chain([not_utf8]), &profile);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        // The profile wins over Brindle's own, and Brindle's defaults apply.
+        assert_eq!(env.get("FOO").map(String::as_str), Some("profile"));
+        assert_eq!(env.get("EXTRA").map(String::as_str), Some("1"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Brindle"));
+        assert!(!env.contains_key("XDG_ACTIVATION_TOKEN") && !env.contains_key("DESKTOP_STARTUP_ID"));
+        assert!(!env.contains_key("RAW"));
+        // Without profile entries, Brindle's own value is what the program sees.
+        let env = server_env([(OsString::from("FOO"), OsString::from("2"))], &Profile::default_shell());
+        assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
+    }
+
     #[test]
     fn paste_normalizes_newlines() {
         assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
