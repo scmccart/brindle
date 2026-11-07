@@ -98,15 +98,36 @@ $env:BRINDLE_REMOTE_AGENT = "$PWD/target/x86_64-unknown-linux-musl/release/brind
 
 ### Terminal server
 
-On Linux, `brindle-remote` is also a terminal server whose sessions outlive
-the client that started them. Holders (`brindle-remote hold`) own the PTYs
+On Linux, every local tab runs in the terminal server, which is
+`brindle-remote` in two roles. Holders (`brindle-remote hold`) own the PTYs
 and are the programs' parents; the core (`brindle-remote serve`) runs an
 emulator per session, so a client that attaches or reconnects gets the
-screen replayed. The core can be restarted or upgraded without ending a
-session: a newer core takes the holders over and rebuilds every screen, and
-holders of an older build drain, taking no new sessions. Their sockets, locks
-and logs (`core.log`, `holder-*.log`) are in `$BRINDLE_SERVER_DIR`, else
-`$XDG_RUNTIME_DIR/brindle`, else `~/.cache/brindle/run`.
+screen replayed. Brindle starts them when the first local tab opens, and they
+exit when nothing is left to serve. The core can be restarted or upgraded
+without ending a session: a newer core takes the holders over and rebuilds
+every screen, and holders of an older build drain, taking no new sessions.
+Their sockets, locks and logs (`core.log`, `holder-*.log`) are in
+`$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else
+`~/.cache/brindle/run`. A socket path must fit in 108 bytes, so keep a custom
+`BRINDLE_SERVER_DIR` short.
+
+The helper is therefore required on Linux, found as for remote profiles:
+`BRINDLE_REMOTE_AGENT`, else `brindle-remote-linux-x86_64` or `brindle-remote`
+beside `brindle`. Without it, a new tab says so and tries again for the next
+one. The release archive and `scripts/install.sh` ship it. Windows tabs don't
+use the server yet.
+
+Tabs close their session with them (this release never leaves a session
+running on purpose). A session also ends when its program exits, and if
+Brindle's connection drops (say the core crashes) the tabs reconnect and get
+their screens back; a session the server no longer has shows a red "session
+lost" line and the tab stays open.
+
+When a Brindle whose `brindle-remote` is newer than the running core (after a
+reinstall, say) opens its first local tab, it hands the sessions over to a core
+of the new build, so tabs in other Brindle windows and their programs carry
+on. `brindle-remote status` then shows the
+old holders draining until their sessions end.
 
 These commands manage the server of that directory, and never start one:
 
@@ -146,6 +167,9 @@ cargo build --release
 Wayland, fontconfig and Vulkan are loaded at runtime (dlopen), so only their
 runtime libraries are needed, and every desktop install has them. `tmux` is
 only needed for the tmux profiles.
+
+`cargo build` also builds the `brindle-remote` helper into the same directory,
+where `brindle` finds it for the [terminal server](#terminal-server).
 
 `rust-toolchain.toml` pins the Rust version that CI and releases build with.
 rustup installs it on the first `cargo` run in the checkout.
@@ -275,7 +299,8 @@ x86-64 archive, `brindle-<version>-x86_64-unknown-linux-gnu.tar.gz`, holding
 licences, plus a `SHA256SUMS` file. It's built on Ubuntu 26.04, so it needs a
 glibc at least that new, along with the runtime libraries of the build
 dependencies above (xkbcommon, xcb, FreeType), which desktop installs have.
-Keep the helper beside `brindle`, where remote profiles look for it:
+Keep the helper beside `brindle`, where local tabs (the terminal server) and
+remote profiles look for it:
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
