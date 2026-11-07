@@ -282,8 +282,8 @@ fn every_message_type_appears_in_a_transcript() {
             "client type {msg_type}"
         );
     }
-    let holder_types = (holder::MSG_HELLO..=holder::MSG_RESUME)
-        .chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
+    let holder_types =
+        (holder::MSG_HELLO..=holder::MSG_RESUME).chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
     for msg_type in holder_types {
         assert!(
             seen.contains_key(&("holder", msg_type)),

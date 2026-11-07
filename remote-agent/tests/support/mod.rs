@@ -1,6 +1,6 @@
 //! Shared pieces for the terminal-server tests: a temp server directory,
-//! starting a server process with `--ready-fd`, a test core speaking H1,
-//! and process checks.
+//! starting a server process with `--ready-fd`, a test core speaking H1, a
+//! test client speaking protocol 1, and process checks.
 
 #![allow(dead_code)]
 
@@ -18,10 +18,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::client::{self, ToClient};
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
 };
-use brindle_remote_protocol::{Frame, SessionId};
+use brindle_remote_protocol::{Frame, RequestId, SessionId};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
 /// Long enough for a loaded CI machine; tests poll, so passing ones are fast.
@@ -81,13 +82,39 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        for &pid in &self.pids {
+        let mut pids = self.pids.clone();
+        pids.extend(server_processes(&self.path, "serve"));
+        pids.extend(server_processes(&self.path, "hold"));
+        for pid in pids {
             if alive(pid) {
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             }
         }
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+/// The running `brindle-remote <role>` processes (`serve` or `hold`) whose
+/// environment names `dir` as their server directory.
+pub fn server_processes(dir: &Path, role: &str) -> Vec<u32> {
+    let wanted = format!("BRINDLE_SERVER_DIR={}", dir.display());
+    let mut pids: Vec<u32> = fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                return false;
+            };
+            let is_role = cmdline.split(|&b| b == 0).nth(1) == Some(role.as_bytes());
+            is_role
+                && alive(pid)
+                && fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|env| env.split(|&b| b == 0).any(|var| var == wanted.as_bytes()))
+        })
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// Runs `bin <role> --ready-fd 3` for `dir` and waits for its ready byte.
@@ -483,4 +510,315 @@ pub fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> boo
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Starts a core for `dir` from the built binary. Its holders inherit
+/// `env`; unless it says otherwise, a core a holder starts on its own (once
+/// a test has killed the core) only prints the version.
+pub fn start_core(dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
+    let mut env = env.to_vec();
+    if !env
+        .iter()
+        .any(|(key, _)| *key == "BRINDLE_TEST_HOLDER_CORE_ARGS")
+    {
+        env.push(("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version"));
+    }
+    start(Path::new(BIN), "serve", dir, &env)
+}
+
+pub fn core_socket(dir: &Path) -> PathBuf {
+    dir.join("core.sock")
+}
+
+/// What [`TestClient::next`] got.
+#[derive(Debug)]
+pub enum Recv {
+    Message(ToClient),
+    Closed,
+    TimedOut,
+}
+
+/// A client for tests: protocol 1 over the core's socket, read on the
+/// calling thread (so a test can stop reading, or hand the connection to
+/// another process).
+pub struct TestClient {
+    stream: UnixStream,
+    input: Vec<u8>,
+    backlog: VecDeque<ToClient>,
+    closed: bool,
+    next_req: RequestId,
+    pub welcome: Option<client::Welcome>,
+}
+
+impl TestClient {
+    pub fn connect(dir: &Path) -> Self {
+        let socket = core_socket(dir);
+        let stream = UnixStream::connect(&socket)
+            .unwrap_or_else(|error| panic!("connect {}: {error}", socket.display()));
+        Self {
+            stream,
+            input: Vec::new(),
+            backlog: VecDeque::new(),
+            closed: false,
+            next_req: 1,
+            welcome: None,
+        }
+    }
+
+    /// Connects and says `HELLO` with `token`, expecting `WELCOME`.
+    pub fn hello(dir: &Path, token: &str) -> Self {
+        let mut client = Self::connect(dir);
+        client.send(client::ToCore::Hello(client::Hello {
+            min: client::PROTOCOLS.min,
+            max: client::PROTOCOLS.max,
+            client_version: "test".into(),
+            client_token: token.into(),
+        }));
+        match client.recv() {
+            ToClient::Welcome(welcome) => client.welcome = Some(welcome),
+            other => panic!("expected WELCOME, got {other:?}"),
+        }
+        client
+    }
+
+    /// The core's pid, from `WELCOME`.
+    pub fn core_pid(&self) -> u32 {
+        self.welcome.as_ref().expect("WELCOME").pid
+    }
+
+    pub fn send(&mut self, message: client::ToCore) {
+        message
+            .encode()
+            .unwrap()
+            .write_to(&mut self.stream)
+            .unwrap();
+    }
+
+    fn frame(&mut self) -> Option<Frame> {
+        let header = self.input.first_chunk::<5>()?;
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if self.input.len() < 5 + len {
+            return None;
+        }
+        let frame = Frame::new(header[0], self.input[5..5 + len].to_vec()).unwrap();
+        self.input.drain(..5 + len);
+        Some(frame)
+    }
+
+    /// The next message within `timeout`.
+    pub fn next(&mut self, timeout: Duration) -> Recv {
+        if let Some(message) = self.backlog.pop_front() {
+            return Recv::Message(message);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(frame) = self.frame() {
+                return Recv::Message(ToClient::decode(&frame).unwrap());
+            }
+            if self.closed {
+                return Recv::Closed;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Recv::TimedOut;
+            }
+            self.stream
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .unwrap();
+            let mut buffer = [0u8; 64 * 1024];
+            match io::Read::read(&mut self.stream, &mut buffer) {
+                Ok(0) => self.closed = true,
+                Ok(read) => self.input.extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => self.closed = true,
+            }
+        }
+    }
+
+    pub fn recv(&mut self) -> ToClient {
+        match self.next(TIMEOUT) {
+            Recv::Message(message) => message,
+            other => panic!("expected a message from the core, got {other:?}"),
+        }
+    }
+
+    /// Whether the core closes the connection within the timeout, skipping
+    /// any messages before that.
+    pub fn closes(&mut self) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match self.next(deadline.saturating_duration_since(Instant::now())) {
+                Recv::Message(_) => {}
+                Recv::Closed => return true,
+                Recv::TimedOut => return false,
+            }
+        }
+    }
+
+    fn take_req(&mut self) -> RequestId {
+        let req = self.next_req;
+        self.next_req += 1;
+        req
+    }
+
+    /// Sends a `SPAWN` and returns the reply (`SPAWNED` or `ERROR`). Other
+    /// messages are kept for later.
+    pub fn spawn_reply(&mut self, mut spawn: client::Spawn) -> ToClient {
+        spawn.req = self.take_req();
+        let req = spawn.req;
+        self.send(client::ToCore::Spawn(spawn));
+        self.reply(req)
+    }
+
+    /// The reply to request `req`, keeping other messages for later.
+    pub fn reply(&mut self, req: RequestId) -> ToClient {
+        let mut kept = Vec::new();
+        let reply = loop {
+            let message = self.recv();
+            let matches = match &message {
+                ToClient::Spawned(spawned) => spawned.req == req,
+                ToClient::Error(error) => error.req == Some(req),
+                ToClient::Ok(ok) => ok.req == req,
+                ToClient::Sessions(sessions) => sessions.req == req,
+                ToClient::ServerStatus(status) => status.req == req,
+                _ => false,
+            };
+            if matches {
+                break message;
+            }
+            kept.push(message);
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        reply
+    }
+
+    /// Spawns a session and returns its id and the program's pid.
+    pub fn spawn(&mut self, spawn: client::Spawn) -> (SessionId, u32) {
+        match self.spawn_reply(spawn) {
+            ToClient::Spawned(spawned) => (spawned.session, spawned.pid),
+            other => panic!("expected SPAWNED, got {other:?}"),
+        }
+    }
+
+    pub fn input(&mut self, session: SessionId, bytes: &[u8]) {
+        self.send(client::ToCore::Data(client::Data {
+            session,
+            bytes: bytes.to_vec(),
+        }));
+    }
+
+    /// Collects `session`'s output until it contains `needle`. Other
+    /// messages are kept for later.
+    pub fn output_until(&mut self, session: SessionId, needle: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut kept = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        let mut searched = 0;
+        while !contains(&output[searched..], needle) {
+            searched = output.len().saturating_sub(needle.len());
+            match self.next(deadline.saturating_duration_since(Instant::now())) {
+                Recv::Message(ToClient::Data(client::Data { session: s, bytes }))
+                    if s == session =>
+                {
+                    output.extend(bytes)
+                }
+                Recv::Message(other) => kept.push(other),
+                other => panic!(
+                    "{other:?} before {:?}; output so far {:?}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&output)
+                ),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        output
+    }
+
+    /// Waits for `session`'s `EXIT`, skipping output, and returns its code.
+    pub fn exit_code(&mut self, session: SessionId) -> Option<i32> {
+        self.output_and_exit(session).1
+    }
+
+    /// `session`'s output up to its `EXIT`, and its code. Other messages are
+    /// kept for later.
+    pub fn output_and_exit(&mut self, session: SessionId) -> (Vec<u8>, Option<i32>) {
+        let mut output = Vec::new();
+        let mut kept = Vec::new();
+        let result = loop {
+            match self.recv() {
+                ToClient::Data(client::Data { session: s, bytes }) if s == session => {
+                    output.extend(bytes)
+                }
+                ToClient::Exit(exit) if exit.session == session => break (output, exit.code),
+                ToClient::Data(_) => {}
+                other => kept.push(other),
+            }
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        result
+    }
+
+    /// Hands the connection to a `sleep` process (as its fd 3) and closes
+    /// this side, so killing that process is a client dying.
+    pub fn into_process(self) -> std::process::Child {
+        let fd = self.stream.as_raw_fd();
+        let mut command = Command::new("sleep");
+        command.arg("1000").stdin(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                let result = if fd == 3 {
+                    libc::fcntl(fd, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if result == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(self);
+        child
+    }
+}
+
+/// A client `SPAWN` of `command args` with a minimal environment of its own.
+pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
+    client::Spawn {
+        req: 0,
+        command: Some(command.into()),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        cwd: None,
+        env: base_env(),
+        cols: 80,
+        rows: 24,
+        cell_w: 0,
+        cell_h: 0,
+        scrollback: 1000,
+        policy: client::Policy::Kill,
+    }
+}
+
+/// A client `sh -c script` session.
+pub fn client_shell(script: &str) -> client::Spawn {
+    client_spawn("/bin/sh", &["-c", script])
+}
+
+/// The pid in a `pid=N.` line of `output`.
+pub fn reported_pid(output: &[u8], label: &str) -> u32 {
+    let text = String::from_utf8_lossy(output);
+    text.split(&format!("{label}="))
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("no {label}= in {text:?}"))
 }

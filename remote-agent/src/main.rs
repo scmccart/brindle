@@ -7,7 +7,8 @@ mod server;
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: brindle-remote --version | --server | hold [--ready-fd N]";
+const USAGE: &str =
+    "usage: brindle-remote --version | --server | serve [--ready-fd N] | hold [--ready-fd N]";
 
 fn main() -> ExitCode {
     match run() {
@@ -44,14 +45,25 @@ fn run() -> Result<(), String> {
             }
             agent::serve_stdio().map_err(|error| error.to_string())
         }
+        Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
         _ => Err(USAGE.into()),
     }
 }
 
 #[cfg(target_os = "linux")]
+fn serve(args: &[String]) -> Result<(), String> {
+    server::core::run(args)
+}
+
+#[cfg(target_os = "linux")]
 fn hold(args: &[String]) -> Result<(), String> {
     server::holder::run(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn serve(_args: &[String]) -> Result<(), String> {
+    Err("the terminal server runs only on Linux".into())
 }
 
 #[cfg(not(target_os = "linux"))]

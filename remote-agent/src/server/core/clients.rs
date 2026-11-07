@@ -1,0 +1,327 @@
+//! The core's client connections: accepting with the peer check, the
+//! `HELLO`/`WELCOME` handshake, requests, and the per-client queues whose
+//! length pauses the client's sessions.
+
+use std::io;
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+
+use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
+use brindle_remote_protocol::{RequestId, SessionId};
+
+use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, Source, log};
+use crate::server::conn::Conn;
+use crate::server::event_loop::{EventLoop, Interest, Token};
+use crate::server::peer;
+
+/// A connection must send `HELLO` within this long.
+const HELLO_LIMIT: Duration = Duration::from_secs(5);
+/// At most this many connections may wait to say `HELLO`.
+const MAX_PENDING: usize = 64;
+/// How long a refused client gets to read its `ERROR`.
+const REFUSAL_FLUSH_LIMIT: Duration = Duration::from_secs(1);
+
+/// A connection that hasn't sent `HELLO` yet.
+pub(super) struct Pending {
+    conn: Conn,
+    since: Instant,
+}
+
+pub(super) struct Client {
+    pub(super) conn: Conn,
+    pub(super) interest: Interest,
+    /// The `client_token` from its `HELLO`.
+    pub(super) token: String,
+    /// Its queue passed [`CLIENT_QUEUE_HIGH`], so its sessions are paused.
+    pub(super) over: bool,
+}
+
+impl<L: EventLoop> Core<L> {
+    pub(super) fn accept(&mut self) {
+        loop {
+            let stream = match self.listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    log!("accept failed: {error}");
+                    return;
+                }
+            };
+            // Before reading anything.
+            if let Err(error) = peer::check(stream.as_raw_fd(), self.uid) {
+                log!("{error}");
+                continue;
+            }
+            if self.pending.len() >= MAX_PENDING {
+                log!("too many connections waiting to say HELLO; refusing one");
+                continue;
+            }
+            let conn = match Conn::new(stream) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log!("can't use a connection: {error}");
+                    continue;
+                }
+            };
+            let token = self.token();
+            if let Err(error) = self.ev.register(conn.fd(), token, Interest::READABLE) {
+                log!("can't watch a connection: {error}");
+                continue;
+            }
+            self.sources.insert(token, Source::Pending);
+            self.pending.insert(
+                token,
+                Pending {
+                    conn,
+                    since: Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub(super) fn expire_pending(&mut self, now: Instant) {
+        let expired: Vec<Token> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| now.duration_since(pending.since) >= HELLO_LIMIT)
+            .map(|(&token, _)| token)
+            .collect();
+        for token in expired {
+            self.pending.remove(&token);
+            self.drop_source(token);
+        }
+    }
+
+    pub(super) fn read_pending(&mut self, token: Token) {
+        let Some(pending) = self.pending.get_mut(&token) else {
+            return;
+        };
+        let eof = pending.conn.read_available().unwrap_or(true);
+        match pending.conn.next_frame() {
+            Ok(Some(frame)) => {
+                let mut conn = self.pending.remove(&token).expect("pending").conn;
+                match ToCore::decode(&frame) {
+                    Ok(ToCore::Hello(hello)) => self.welcome(token, conn, hello),
+                    _ => {
+                        queue(
+                            &mut conn,
+                            error(None, None, "the first message must be HELLO"),
+                        );
+                        let _ = conn.flush_for(REFUSAL_FLUSH_LIMIT);
+                        self.drop_source(token);
+                    }
+                }
+            }
+            Ok(None) if !eof => {}
+            Ok(None) | Err(_) => {
+                self.pending.remove(&token);
+                self.drop_source(token);
+            }
+        }
+    }
+
+    /// Answers a `HELLO`: `WELCOME` in the highest common version, or an
+    /// `ERROR` naming both ranges and the end of the connection.
+    fn welcome(&mut self, token: Token, mut conn: Conn, hello: Hello) {
+        let protocol = match client::answer_hello(&hello, client::PROTOCOLS) {
+            Ok(protocol) => protocol,
+            Err(refusal) => {
+                log!(
+                    "refused a client {:?}: {}",
+                    hello.client_version,
+                    refusal.message
+                );
+                queue(&mut conn, ToClient::Error(refusal));
+                let _ = conn.flush_for(REFUSAL_FLUSH_LIMIT);
+                self.drop_source(token);
+                return;
+            }
+        };
+        let mut holder_protocols: Vec<u32> = self
+            .holders
+            .values()
+            .filter_map(|holder| holder.protocol())
+            .collect();
+        holder_protocols.sort_unstable();
+        holder_protocols.dedup();
+        queue(
+            &mut conn,
+            ToClient::Welcome(Welcome {
+                protocol,
+                core_version: env!("CARGO_PKG_VERSION").into(),
+                core_build: self.build.clone(),
+                pid: std::process::id(),
+                holder_protocols,
+            }),
+        );
+        log!(
+            "client {token} connected ({:?}, protocol {protocol})",
+            hello.client_version
+        );
+        self.sources.insert(token, Source::Client);
+        self.clients.insert(
+            token,
+            Client {
+                conn,
+                interest: Interest::READABLE,
+                token: hello.client_token,
+                over: false,
+            },
+        );
+        self.process_client_frames(token);
+    }
+
+    pub(super) fn read_client(&mut self, token: Token) {
+        let Some(client) = self.clients.get_mut(&token) else {
+            return;
+        };
+        let eof = match client.conn.read_available() {
+            Ok(eof) => eof,
+            Err(error) => return self.drop_client(token, &format!("read failed: {error}")),
+        };
+        self.process_client_frames(token);
+        if eof {
+            self.drop_client(token, "the connection closed");
+        }
+    }
+
+    fn process_client_frames(&mut self, token: Token) {
+        loop {
+            let Some(client) = self.clients.get_mut(&token) else {
+                return;
+            };
+            let frame = match client.conn.next_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return,
+                Err(error) => return self.drop_client(token, &format!("bad frame: {error}")),
+            };
+            match ToCore::decode(&frame) {
+                Ok(message) => self.handle_client(token, message),
+                Err(decode) => self.send_client(token, error(None, None, decode.to_string())),
+            }
+        }
+    }
+
+    fn handle_client(&mut self, client: Token, message: ToCore) {
+        match message {
+            ToCore::Hello(_) => self.send_client(
+                client,
+                error(None, None, "this connection already sent HELLO"),
+            ),
+            ToCore::Spawn(spawn) => self.client_spawn(client, spawn),
+            ToCore::Data(data) => self.client_input(client, data),
+            ToCore::Resize(resize) => self.client_resize(client, resize),
+            ToCore::Close(target) => self.client_close(client, target.session),
+            ToCore::Reparent(reparent) => self.send_client(
+                client,
+                error(
+                    None,
+                    Some(reparent.session),
+                    "REPARENT is for Windows; this core runs on Linux",
+                ),
+            ),
+            ToCore::Attach(attach) => {
+                self.not_supported(client, "ATTACH", Some(attach.req), Some(attach.session))
+            }
+            ToCore::Detach(target) => {
+                self.not_supported(client, "DETACH", None, Some(target.session))
+            }
+            ToCore::List(request) => self.not_supported(client, "LIST", Some(request.req), None),
+            ToCore::Kill(kill) => self.not_supported(client, "KILL", Some(kill.req), None),
+            ToCore::Status(request) => {
+                self.not_supported(client, "STATUS", Some(request.req), None)
+            }
+            ToCore::Stop(request) => self.not_supported(client, "STOP", Some(request.req), None),
+            ToCore::StepDown(request) => {
+                self.not_supported(client, "STEP_DOWN", Some(request.req), None)
+            }
+        }
+    }
+
+    fn not_supported(
+        &mut self,
+        client: Token,
+        name: &str,
+        req: Option<RequestId>,
+        session: Option<SessionId>,
+    ) {
+        self.send_client(
+            client,
+            error(req, session, format!("this core doesn't support {name}")),
+        );
+    }
+
+    /// Queues a message for a client. Past [`CLIENT_QUEUE_HIGH`] the client's
+    /// sessions are paused in their holders.
+    pub(super) fn send_client(&mut self, client: Token, message: ToClient) {
+        let Some(entry) = self.clients.get_mut(&client) else {
+            return;
+        };
+        queue(&mut entry.conn, message);
+        if !entry.over && entry.conn.queued() > CLIENT_QUEUE_HIGH {
+            entry.over = true;
+            self.pause_client_sessions(client, true);
+        }
+    }
+
+    /// Sends what the socket takes; back under [`CLIENT_QUEUE_LOW`], the
+    /// client's sessions are resumed.
+    pub(super) fn flush_client(&mut self, client: Token) {
+        let Some(entry) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if let Err(error) = entry.conn.flush() {
+            return self.drop_client(client, &format!("write failed: {error}"));
+        }
+        if entry.over && entry.conn.queued() < CLIENT_QUEUE_LOW {
+            entry.over = false;
+            self.pause_client_sessions(client, false);
+        }
+    }
+
+    /// The client is gone: its sessions are hung up.
+    pub(super) fn drop_client(&mut self, client: Token, reason: &str) {
+        if self.clients.remove(&client).is_none() {
+            return;
+        }
+        self.drop_source(client);
+        self.waiting.retain(|waiting| waiting.client != client);
+        let sessions = self.sessions_of(client);
+        log!(
+            "client {client} left ({reason}); {} session(s) to hang up",
+            sessions.len()
+        );
+        for id in sessions {
+            self.detach_session(id);
+            self.hang_up(id);
+        }
+    }
+
+    pub(super) fn client_token(&self, client: Token) -> Option<&str> {
+        self.clients.get(&client).map(|entry| entry.token.as_str())
+    }
+
+    pub(super) fn client_is_over(&self, client: Token) -> bool {
+        self.clients.get(&client).is_some_and(|entry| entry.over)
+    }
+}
+
+pub(super) fn error(
+    req: Option<RequestId>,
+    session: Option<SessionId>,
+    message: impl Into<String>,
+) -> ToClient {
+    ToClient::Error(ErrorMessage {
+        req,
+        session,
+        message: message.into(),
+    })
+}
+
+fn queue(conn: &mut Conn, message: ToClient) {
+    match message.encode() {
+        Ok(frame) => conn.queue(&frame),
+        Err(error) => log!("can't encode a message: {error}"),
+    }
+}
