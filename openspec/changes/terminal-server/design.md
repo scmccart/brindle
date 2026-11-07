@@ -7,165 +7,200 @@
 - **`Backend::Agent`** (remote tabs) is fed through `Terminal::feed()` on the GPUI thread, and caches process info from `ProcessInfo` events.
 - **Shared parsing state.** The OSC 133 marks (`shell_integration.rs`) and the OSC 7501 records (`status.rs`) live in the `brindle` crate. The helper can't use them yet.
 - **Finding the helper.** `remote::client` looks for it in `BRINDLE_REMOTE_AGENT`, then beside the executable (`brindle-remote-linux-x86_64`, `brindle-remote`). `scripts/install.sh` and the Linux archive already ship it.
+- **The Windows spike** (`spike-windows.md`) found four things:
+  - a pseudoconsole can be reparented to another process's window, asynchronously;
+  - a live HPCON can't be rebuilt in another process. The pipes, process handle and exit code can move, but resize, reparent and close can't, and the inbox ConPTY can't move at all;
+  - a detached helper outlives its parent unless a job forbids breakaway or kills on close;
+  - one IOCP loop can serve a named pipe and several pseudoconsoles over overlapped pipes.
+- **herdr-core** (Apache-2.0, used as a reference for approach only) avoids the HPCON problem by never handing a PTY over. A small holder process owns every PTY and is never replaced while it has terminals. A larger core runs the emulators and restarts freely.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- The server is complete enough for phases 2–4 to change only policy and transport: sessions, both close policies, attach with replay, versioned protocol, handover and management.
-- Local Linux tabs behave exactly as they do today, latency and throughput included, within the measured cost of one more hop.
+- The server is complete enough for phases 2–4 to change only policy and transport: sessions, both close policies, attach with replay, reconnect, versioned protocols, upgrades and management.
+- One upgrade and crash model for Linux and Windows, built on the holder/core split.
+- Local Linux tabs behave as they do today, latency and throughput included, within the measured cost of the extra hops.
 
 **Non-Goals:**
 - Brindle using the `detach` policy, reattaching through `session-restore`, and the "sessions on host" palette (phase 2).
-- Windows: the server, named pipes and pseudoconsole handover (phase 3). Windows keeps `Backend::Pty` unchanged.
+- Windows: the IOCP loops, named pipes and ConPTY holder (phase 3). Windows keeps `Backend::Pty` until then.
 - Remote profiles and the stdio `--server` mode, which stay as they are (phase 4).
 - Several clients attached to one session at once.
+- Replacing a holder that still has sessions. Holders drain instead.
 
 ## Decisions
 
-### A Windows spike comes first
-Windows is phase 3, but several phase 1 decisions have to hold there too, and the riskiest Windows unknowns could overturn them. So the work starts with a spike (tasks group 0), and the rest waits for its findings. The spike covers:
-- reparenting a pseudoconsole that another process owns to Brindle's window;
-- handing a live pseudoconsole to a new process;
-- keeping the server alive after Brindle dies, including inside jobs;
-- a named-pipe transport with a peer check, served by one IOCP loop.
-
-Decisions it may change:
-- **Handover by re-exec.** Windows has no `execve`. If a new process can take the handles over, Linux might use the same model (`SCM_RIGHTS`) so both platforms share one design. That would cost Linux the parent link, and so exit statuses after a handover.
-- **The handover format:** whether it needs platform-specific session state.
-- **The single loop:** whether it becomes a platform-neutral abstraction over `poll` and IOCP.
-- **Protocol 1's message set:** whether it needs `REPARENT { session, hwnd }` from the start.
-- **The upgrade policy on Windows:** if an HPCON can't move, Windows may need the kill-with-warning or side-by-side option that Linux doesn't.
-
-### Server mode in the existing binary
-`brindle-remote serve` runs the server. It is started by a client, never by hand. `--server` (stdio, remote profiles) and `--version` keep their meaning. The management commands are subcommands of the same binary.
-- *Why:* a single artifact to ship and locate, and phase 4 runs the same server on remote hosts.
+### Core and holders (from the spike)
+The server is two roles of one binary.
+- **`brindle-remote hold`** is a holder: it owns many sessions' PTYs, is the programs' parent, pumps their I/O, resizes, signals and reaps them, and parses nothing. It keeps two things per session, as bytes it doesn't interpret: the core's latest checkpoint and the raw output since then. It is kept small and changes rarely.
+- **`brindle-remote serve`** is the core: the client socket, the emulators and replay, the close policies, the management commands, and the holders' supervision. It can restart at any time without ending a session.
+- *Why:* the spike showed a Windows HPCON can't move to another process, so whatever owns a PTY must outlive every upgrade of the code above it. Splitting also means a core crash, the likelier kind since the core holds the parser and the protocol, no longer ends every terminal.
+- *Alternatives rejected:*
+  - **re-executing one server in place** (the earlier plan): there is no `execve` on Windows, and a crash still kills everything;
+  - **side-by-side whole servers on Windows:** two platform models, and two servers to manage;
+  - **killing sessions on upgrade.**
 
 ### Directory, single instance and access
-- **Server directory:** `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else `~/.cache/brindle/run`, created with mode 0700. It holds `server.lock`, `server.sock` and `server.log`.
-- **Single instance:** the server takes `flock(LOCK_EX | LOCK_NB)` on `server.lock` and holds it for its whole life. Only after that does it unlink any stale socket and bind. A server that can't take the lock exits 0. On exit it unlinks the socket before the lock drops.
-- **Access:** every accepted connection is checked with `SO_PEERCRED` against the server's uid before anything is read. The 0700 directory is the first barrier, and the check is the second.
-- **Start:** the client runs `brindle-remote serve --ready-fd N`, with the write end of a pipe as fd N. The server double-forks and `setsid`s, redirects stdio to `server.log`, and writes one byte to the pipe once it is listening. The client waits up to 2 s for that byte, then connects. If two clients race, the loser's server exits on the lock, its pipe closes without the byte, and its client connects to the winner.
-- **Exit:** the server exits after 5 s with no sessions and no clients.
+- **Server directory:** `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else `~/.cache/brindle/run`, created with mode 0700. It holds:
+  - `core.lock`, `core.sock` and `core.log`;
+  - per holder, `holder-<build>-<n>.sock` and `holder-<build>-<n>.log`.
+- **Single core:** the core takes `flock(LOCK_EX | LOCK_NB)` on `core.lock` for its whole life, and only then unlinks a stale `core.sock` and binds. A core that can't take the lock exits 0.
+- **Holders:** a holder binds its own socket and also flocks it, so a core can tell a live holder from a stale socket.
+- **Access:** both kinds of socket check every peer with `SO_PEERCRED` against their own uid before reading anything.
+- **Start:** a process runs `brindle-remote serve --ready-fd N` (or `hold --ready-fd N`), which double-forks, `setsid`s, redirects stdio to its log and writes one byte once it is listening. The starter waits up to 2 s. In a race, the loser exits on the lock, and its starter connects to the winner.
+- **Exit:**
+  - a holder exits when it has no sessions;
+  - the core exits after 5 s with no sessions and no clients.
 
-### One poll loop, no threads
-The server is a single thread running `poll(2)` over the listener, the client sockets, the PTY masters and a self-pipe for `SIGCHLD`. Every fd is non-blocking. Each client has an outgoing queue. When a client's queue passes a high-water mark (1 MiB to start with), the loop stops polling that client's sessions' PTYs for reading, so the kernel PTY buffer pushes back on that program alone.
-- *Why:* the handover needs a quiescent point with no thread holding state, and one loop is that point. It also keeps one session's slow client from blocking another.
-- *Alternative rejected:* agent.rs's thread-per-direction model, which is fine for one session per process but makes a consistent snapshot for handover hard.
-- If measurements show the emulators slowing the loop, they move to worker threads, fed in order per session, with the loop still owning every fd. That changes neither the protocol nor the specs.
+### Event loops
+The core and the holders are each one thread running an event loop over non-blocking fds, with outgoing queues per peer.
+- On Linux the loop is `poll(2)` with a `SIGCHLD` self-pipe in the holder. The loop sits behind a small platform trait (register, wait, wake), so phase 3 can provide IOCP with overlapped pipes, as the spike ran it.
+- **Backpressure:**
+  - a client whose queue passes 1 MiB makes the core stop reading that client's sessions from the holder;
+  - a holder whose queue to the core passes 8 MiB stops reading those PTYs;
+  - with no core connected, a holder keeps reading until a session's tail is full, then stops reading it, so a program blocks rather than lose output while the core is away.
+- If the emulators slow the core's loop, they move to worker threads, fed in order per session. That changes no protocol.
 
 ### Shared terminal-state crate
-A new workspace crate, `brindle-term-core` (`term-core/`), takes the GPUI-free parts that both sides need: Brindle's `Parser` (vte plus the OSC 133 scanner and `Marks`) and the OSC 7501 `Records`, with their unit tests. It depends on `alacritty_terminal`, which is already in `Cargo.lock`. Both `brindle` and `brindle-remote-agent` use it.
-- Its version matches the other crates'. The CI check already covers every workspace crate. Release-please has to bump it with the others, which task 1.1 confirms.
-- *Why:* the server must track marks and records exactly as the client does, or replay drifts from what the client would have built.
-- *Alternative rejected:* copying the scanners into the agent, which gives two implementations to keep in step.
+A new workspace crate, `brindle-term-core` (`term-core/`), takes the GPUI-free parts that both sides need: Brindle's `Parser` (vte plus the OSC 133 scanner and `Marks`) and the OSC 7501 `Records`, with their unit tests. It depends on `alacritty_terminal`, which is already in `Cargo.lock`. `brindle` and the core use it; the holder doesn't.
+- Its version matches the other crates'. The CI check covers every workspace crate, and release-please has to bump it with the others (task 1.1).
+- *Why:* the core must track marks and records exactly as the client does, or replay drifts.
 
-### Per-session emulator and replay
-Each session feeds its PTY output into a `Term` through the shared `Parser`. Its event listener drops every event, `PtyWrite` included, so the server never answers queries. The `Term` uses the session's scrollback limit from the spawn request.
+### Per-session emulator, replay and checkpoints
+In the core, each session feeds output into a `Term` through the shared `Parser`. Its listener drops every event, `PtyWrite` included, so the server never answers queries. The `Term` uses the session's scrollback limit.
 
-On attach, the server renders a replay stream:
+The replay renderer turns a `Term` into a stream:
 - `ESC c`;
-- the primary screen: scrollback lines, then the visible rows, with SGR runs. Rows joined by `WRAPLINE` are written without a line break, so the client rewraps them;
-- OSC 133 marks, written at their lines, so the client's own parser rebuilds its `Marks`;
-- if the alternate screen is active: `CSI ? 1049 h` and the alternate grid;
-- the modes (DECCKM, keypad, mouse 1000/1002/1003/1005/1006, focus 1004, bracketed paste, alternate scroll 1007, cursor visibility, DECSTBM scroll region, origin mode, autowrap);
-- the cursor position, its shape and blink (DECSCUSR), and the title (OSC 2);
+- the primary screen: scrollback, then the visible rows, with SGR runs. Rows joined by `WRAPLINE` have no line break between them;
+- OSC 133 marks at their lines;
+- if the alternate screen is active, `CSI ? 1049 h` and the alternate grid;
+- the modes (DECCKM, keypad, mouse 1000/1002/1003/1005/1006, focus 1004, bracketed paste, 1007, cursor visibility, DECSTBM, origin, autowrap);
+- the cursor position, its shape and blink, and the title;
 - the latest OSC 7501 report for each status record.
 
-The replay is framed by `REPLAY_START` and `REPLAY_END` messages. Phase 2's client suppresses bells and notifications between them.
-- The renderer is pure (`&Term → Vec<u8>`) and tested by round trips: feed a fixture into a `Term`, replay it into a fresh `Term`, and compare grids, cells, modes, cursor and marks.
-- *Alternatives rejected:* a raw output ring buffer, which breaks on full-screen apps and once scrollback has rotated out, and hidden tmux, which brings back the dependency.
+The same stream does two jobs:
+- **Attach:** the stream is sent between `REPLAY_START` and `REPLAY_END`.
+- **Checkpoints:** the core sends a session's stream to its holder as a `CHECKPOINT`, and the holder then drops that session's tail:
+  - when the tail since the last checkpoint passes 512 KiB;
+  - for every session before a planned step-down;
+  - when a session is detached.
 
-### Socket protocol
-The socket protocol reuses the stdio frame header, with its own message numbers. The stdio protocol is untouched.
-- **Handshake:** the client sends `HELLO { min, max, client_version }`. The server replies `WELCOME { protocol, server_version, build_id, pid }`, choosing the highest version both speak, or `ERROR` naming both ranges. This change is protocol 1.
-- **Requests carry a `req` id** and replies echo it. One connection multiplexes sessions, so session-scoped messages carry the session id (`u32`): `DATA`'s payload starts with it, and the JSON messages have a `session` field.
+A new core rebuilds each session by feeding a fresh `Term` the checkpoint, then the tail. If a tail ever overflowed its 1 MiB limit, the holder marks it truncated, and the rebuild is the last 1 MiB only, which may be approximate.
+- The renderer is pure (`&Term → Vec<u8>`) and tested by round trips over fixtures.
+- *Alternatives rejected:* a raw ring buffer alone, which breaks full-screen apps and rotated scrollback, and hidden tmux.
+
+### Core ↔ holder protocol
+It uses the same frame header, with its own message numbers and its own version, H1. It is kept minimal so holders rarely need to change.
+- **Core to holder:**
+  - `HELLO { min, max, core_build, instance }`;
+  - `SPAWN { session, command, args, cwd, env, cols, rows, cell_w, cell_h, meta }`;
+  - `INPUT`, `RESIZE`, `HANGUP { session }`, `CHECKPOINT { session, bytes }`;
+  - `DRAIN`, `GOODBYE { handover }`;
+  - `REPARENT { session, hwnd }`, which a Linux holder answers with `ERROR unsupported`.
+- **Holder to core:**
+  - `WELCOME { protocol, build, pid, previous: none | handover | crash, sessions: [{ session, pid, cols, rows, exit, meta, truncated }] }`, followed by each session's `CHECKPOINT` and `TAIL`;
+  - `OUTPUT`, `SPAWNED { session, pid }`, `SPAWN_FAILED { session, message }`, `EXITED { session, code }`.
+- **`meta` is an opaque JSON blob the core owns:** the policy, the owning client's token, the scrollback limit, and the command and directory for `list`. The holder only stores it.
+- **Session ids:** the core allocates them, and a new core continues from the largest id its holders report.
+- **One core per holder:** a newer `HELLO` takes a holder over from an older connection.
+
+### Client protocol
+It uses the same frame header with its own numbers, and this change is protocol 1. The stdio protocol is untouched.
+- **Handshake:** `HELLO { min, max, client_version, client_token }` → `WELCOME { protocol, core_version, core_build, pid, holder_protocols }` or `ERROR` naming both ranges. `client_token` is random per Brindle process, and it is how a reconnecting client gets its sessions back.
+- **Requests carry `req` ids.** Session-scoped messages carry the session id: `DATA`'s payload starts with it, and the JSON messages have a `session` field.
 - **Messages:**
   - sessions: `SPAWN { req, command, args, cwd, env, cols, rows, cell_w, cell_h, scrollback, policy }` → `SPAWNED { req, session, pid }` or `ERROR { req, message }`;
   - I/O: `DATA`, `RESIZE`, `EXIT { session, code }`, `CLOSE { session }`;
-  - attach: `ATTACH { req, session, cols, rows }` → `REPLAY_START`, `DATA`…, `REPLAY_END`, then live `DATA`; `DETACH { session }`;
+  - attach: `ATTACH { req, session, cols, rows }` → `REPLAY_START`, `DATA`…, `REPLAY_END`; `DETACH { session }`;
+  - reconnect: after `WELCOME`, the core sends a `REPLAY_START` … `REPLAY_END` for each session it still holds for that `client_token`;
   - management: `LIST`, `KILL { session | all }`, `STATUS`, `STOP`;
-  - upgrade: `UPGRADE { req, path }` → `UPGRADED { req, server_version }` or `ERROR`.
-- **Compatibility rules:** JSON payloads ignore unknown fields, and new fields have defaults. A new message type or a changed meaning needs a new protocol version. The server keeps the protocol version each connection negotiated and answers it in that version. Tests pin protocol 1 transcripts, so later servers are checked against them.
-- **No heartbeat or idle limit locally.** A local socket's EOF is reliable, a crashed client included, because the kernel closes its fds.
+  - upgrade: `STEP_DOWN { req }`;
+  - Windows: `REPARENT { session, hwnd }`, reserved in protocol 1 and refused on Linux.
+- **Compatibility:**
+  - JSON fields are additive, with defaults;
+  - new message types need a new version;
+  - the core answers each connection in its negotiated version, and drives each holder in its own negotiated version;
+  - transcript tests pin protocol 1 and H1.
+- **No heartbeat locally:** a local socket's EOF is reliable.
+
+### Close policies across core restarts
+A `kill` session ends on `CLOSE`, `KILL` or `STOP`, and when its owner is gone. While the core runs, gone means its client's connection ended. After a core starts with adopted sessions, owners get a reconnect grace period of 10 s; when it passes, the `kill` sessions of owners who didn't return are hung up. Hangup is the holder's job: it closes the master, sends `SIGHUP` to the process group, and sends `SIGKILL` after a grace period, with agent.rs's timings. A `detach` session ends only on `KILL`, `STOP` or its program's exit.
+
+### Upgrades
+1. A client connects, and `WELCOME` reports the core's build and the holder protocols in use. The client decides whether its own helper is newer: a higher semver, or an equal version with a different build id and a later mtime (dogfooding builds keep the version).
+2. If it is newer, the client runs `<helper> check --holder-protocols <list>`. If that fails, it uses the running core when they share a protocol version, and otherwise shows the error in its tabs.
+3. The client sends `STEP_DOWN`. The core checkpoints every session, sends `GOODBYE { handover }` to each holder, answers `STEP_DOWN`, closes its clients and exits.
+4. The upgrading client starts its own `serve`. The new core finds the holders by their sockets, adopts them, and rebuilds the screens. It sends `DRAIN` to every holder of another build, and starts a holder of its own build when it next needs one.
+5. Other clients see EOF and reconnect. They wait up to 5 s for a core to appear before starting one, so the upgrading client's core wins the race.
+
+If no core connects to a holder within 3 s, the holder starts one from its own binary through `/proc/self/exe`, which works even after an install has replaced the file. It retries with backoff capped at 60 s. That covers both a crashed core and a new core that won't start.
+- *Why the client decides:* the core only needs to vet and step down. That also lets tests "upgrade" to the same binary.
 
 ### Brindle's client
-- **One connection per Brindle process** (`remote::local`), opened on the first local spawn. It has a reader thread that demultiplexes frames and a writer thread with a queue.
-- **Output is parsed on the reader thread.** Each session's sink takes the terminal's `Parser`, `Term` and `Marks` in the usual lock order, then sends `Wakeup` and `Osc` events on the terminal's `ChannelEvent` channel, exactly as `ParsingReader` does. Local output so never queues on the GPUI thread, unlike `Backend::Agent`.
-- **A new `Backend::Server { session, conn, pid }`.** Input, resize and close go to the connection. `EXIT` marks the terminal exited as a PTY exit does.
-- **Losing the connection** feeds each server terminal a red "the terminal server went away" line and marks it exited without emitting `Exited`, so the tab stays open, as `Failed` does for remote tabs.
-- **Process info stays local and synchronous.** On the same host and as the same user, `process.rs` reads `/proc/<pid>/stat` for the session's `tpgid`, then that process's `comm` and `cwd`. This replaces `tcgetpgrp` on the master fd. Titles and split directories are as fresh as today.
-- **The environment** in `SPAWN` is complete: Brindle's own environment with `child_env(profile)` applied over it, so the server's environment never leaks in.
-- **Always the server on Linux.** Local spawns never fall back to in-process PTYs, so there is one local code path, and its Unix `Backend::Pty` side is removed. The first local spawn finds the helper, connects (starting the server if needed) and negotiates. A failure becomes that terminal's error message (`Terminal::message`, as for a program that can't start), and the connection isn't cached, so the next spawn tries again. On Windows the code isn't compiled in.
-  - *Alternative rejected:* an automatic fallback, or a `BRINDLE_TERMINAL_SERVER=off` switch. Either would keep a second backend alive and hide server problems; the user chose the server always.
-- **Upgrade offer.** The client knows the version of the helper it found. When that is newer than `server_version` in `WELCOME`, it sends `UPGRADE` with the helper's path. Newer means a higher semver, or an equal version whose binary digest differs and whose mtime is later than the server's (dogfooding builds keep the version). The client then spawns as usual, upgraded or not.
-
-### Handover by re-executing in place
-On `UPGRADE`, the server:
-1. Checks that `path` is a regular file owned by the user or root, and not group- or world-writable.
-2. Runs `path handover-check --format F`, which exits 0 only if that binary reads handover format `F`.
-3. Stops reading clients and PTYs. Each client's partially read frame and unsent queue go into the state.
-4. Serializes the state into a `memfd`:
-   - sessions: id, pid, master fd number, policy, size, scrollback limit, attached client, and the replay stream, which carries the marks and records;
-   - clients: fd, negotiated protocol, read buffer and outgoing queue;
-   - the listener and lock fds, the next ids and the start time.
-5. Clears `FD_CLOEXEC` on exactly those fds and calls `execve(path, ["brindle-remote", "serve", "--resume", "<memfd>"])`.
-
-The new image reads the state and rebuilds each `Term` by feeding it the replay. It sets `CLOEXEC` again, resumes the loop, and sends `UPGRADED` to the requesting client. If `execve` itself fails, the old image restores `CLOEXEC` and resumes, and the client gets an `ERROR`.
-- *Why exec rather than passing fds over `SCM_RIGHTS` to a new process:*
-  - the programs stay the server's children, so it keeps reaping them and reporting exit status;
-  - the pid doesn't change;
-  - the listening socket and the client connections carry over, with no reconnect and no gap in accepting.
-- The handover format is versioned apart from the protocol, and a binary reads every older format. The server doesn't compare versions itself: the client decides what is newer, and the server only vets the binary. That also lets tests upgrade a server to the same binary.
-- *Alternatives rejected:*
-  - killing sessions with a warning (the user chose handover);
-  - side-by-side servers, which break one server per host.
-
-### Kill and hangup
-Ending a session closes the master, sends `SIGHUP` to the session's process group, and sends `SIGKILL` after a grace period, reusing agent.rs's shutdown timings. A `kill` session ends on `CLOSE`, on its client's EOF or error, on `KILL` and on `STOP`. A `detach` session ends only on `KILL`, `STOP` or its program's exit.
+- **One connection per Brindle process** (`remote::local`), with a reader thread that demultiplexes frames and a writer thread with a queue.
+- **Output is parsed on the reader thread,** in the usual lock order, which then sends `Wakeup` and `Osc` events on the terminal's channel, as `ParsingReader` does.
+- **During a replay** the sink applies everything to the terminal's state, but drops bells, OSC 9/777 notices and status *notices* (`TerminalEvent::Status(Some(_))` becomes `Status(None)`), so a reconnect raises no attention.
+- **A new `Backend::Server { session, conn, pid }`.** Input, resize and close go to the connection, and `EXIT` marks the terminal exited.
+- **Reconnect:** when the connection ends, the client reconnects with the same `client_token`, starting a core if none appears within 5 s, and gets every session back with a replay. Input typed meanwhile is queued per session.
+- **A session that doesn't come back,** or no core within 15 s, gets the red "session lost" line, and the terminal is marked exited without emitting `Exited`, so the tab stays open.
+- **Process info stays local and synchronous:** `/proc/<pid>/stat`'s `tpgid`, then that process's `comm` and `cwd`.
+- **The environment in `SPAWN` is complete:** Brindle's own environment with `child_env(profile)` applied.
+- **Always the server on Linux.** There is no in-process fallback, and the Unix side of `Backend::Pty` is removed. A failure to find the helper, connect or negotiate becomes that terminal's error message (`Terminal::message`) and isn't cached, so the next spawn tries again.
+  - *Alternative rejected:* a fallback or an off switch, which keeps a second backend alive and hides server problems.
 
 ### Failure isolation
-Each `Term` feed runs under `catch_unwind`. A panic marks that session's emulator broken and logs it, and the session keeps forwarding output. Its replay is then just `ESC c`, and its handover state carries no replay.
+- Each `Term` feed in the core runs under `catch_unwind`. A panic marks that session's emulator broken; it keeps forwarding output, and its checkpoints and replays are just `ESC c`.
+- A core crash ends no session.
+- A holder crash ends only its own sessions, so holders stay small.
 
 ### Builds and tests
-- **Builds:** the root `Cargo.toml` gets `default-members` listing every crate, so plain `cargo build` and `cargo build --release` produce `brindle-remote` beside `brindle`.
-- **Server tests** run in the agent crate with no GUI. Each spawns a real server in a temp `BRINDLE_SERVER_DIR` and drives it with a test client. They cover:
-  - the start race, the peer check and exit when unused;
-  - spawn with an explicit environment, I/O, exit codes and a stalled client;
+- **Builds:** the root `Cargo.toml` gets `default-members` listing every crate, so plain `cargo build` produces `brindle-remote`.
+- **Server tests** (agent crate, no GUI) run a real core and holders in a temp `BRINDLE_SERVER_DIR`, with a test client. They cover:
+  - the roles, the start race, peer checks and exit when unused;
+  - spawn, environment, I/O, exit codes and a stalled client;
   - both policies, client SIGKILL, attach and replay fidelity, and refusing to attach a taken session;
-  - status and marks after attach, and that the server never answers queries;
-  - version negotiation, handover to the same binary (with `htop`-like fixtures, pids and exit codes kept), a refused handover and the management commands.
-- **e2e:** the harness sets `BRINDLE_SERVER_DIR=target/tmp/e2e/<case>/server` for every case and runs `brindle-remote stop` after it. New `local-server-*` cases cover:
-  - the session listed, the shell's parent, close, quit and crash;
-  - the environment of a second Brindle;
-  - server loss shown in the tab;
-  - a missing helper shown as the tab's error, and the next tab recovering.
-- **perf:** `tests/perf` runs on `main` before the change (`BRINDLE_PERF_BASELINE`) and on the branch after, and the numbers go into the PR.
+  - status and marks, and that the server never answers queries;
+  - reconnect within and after the grace period, and a core SIGKILL with respawn;
+  - checkpoints and tail truncation;
+  - an upgrade to the same binary, drain, a refused check, and a new core that won't start;
+  - the management commands.
+- **e2e:** every case gets `BRINDLE_SERVER_DIR=target/tmp/e2e/<case>/server` and a `brindle-remote stop` afterwards. The new `local-server-*` cases are listed in tasks 8.2.
+- **perf:** `tests/perf` on `main` before and on the branch after, with `BRINDLE_PERF_BASELINE`.
+
+### Windows (phase 3, shaped by the spike)
+- The holder owns the HPCONs, and the ConPTY code moves into it.
+- It is started with `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB`. When a job refuses breakaway, it retries without the flag and logs that sessions won't outlive the job.
+- The output pipes are overlapped named pipes it creates. Its loop and the core's are IOCP.
+- The sockets are named pipes with a user-and-SYSTEM DACL, `PIPE_REJECT_REMOTE_CLIENTS` and a SID check.
+- `REPARENT` is asynchronous and advisory, and the client sends it again whenever its window changes.
+- The inbox ConPTY works the same way, since nothing ever moves an HPCON.
 
 ## Risks / Trade-offs
 
-- [Every local terminal dies if the server crashes] → One small loop, emulator panics caught per session, heavy tests, and a clear in-tab message when it happens.
-- [The output is parsed twice, by the server's emulator and the client's] → Measure throughput with vtebench. If needed, move emulators to worker threads (see "One poll loop") or feed the server's `Term` lazily, in batches.
-- [Each keystroke takes one more hop] → `latency-shell` before and after. The hop is a local socket write and a non-blocking PTY write in one loop iteration.
-- [A bug in the handover loses every session] → The format pre-check, round-trip tests of the state and the replay, a handover test in CI, and `server.log` for diagnosis. Upgrades happen only when a newer client connects.
-- [The protocol must stay compatible for good] → Version 1 is kept minimal, transcript tests pin it, and the server answers each connection in its negotiated version.
-- [Ping-pong upgrades between two dev builds of one version] → Only a later mtime counts as newer at equal versions, and a refused check leaves the server as it is.
-- [The helper grows: `alacritty_terminal`, the shared crate, the renderer] → Check the musl build and the binary size early (task 1). The remote deploy copies it once per version.
-- [Phase 2: the desktop's app scope may kill the server when Brindle exits] → Doesn't matter with `kill`. Before `detach` ships, check GNOME and KDE app scopes, and start the server through `systemd-run --user` if needed.
+- [Two hops each way, client ↔ core ↔ holder] → Measure `latency-shell` and vtebench against `main`. If they regress noticeably, add a data fast path in which the core passes the client a direct holder channel for one session's I/O. That would be a later protocol version.
+- [The output is parsed twice, by the core and by the client] → Worker threads for emulators, or batched feeding, if the numbers need it.
+- [A holder crash ends its sessions] → Holders have no parser and little code, a fuzzed H1 decoder, and are tested heavily.
+- [Drained holders keep old behaviour until their sessions end] → Accepted. `status` shows draining holders, and H1 stays small, so there's little behaviour to differ.
+- [Checkpoints cost CPU on busy sessions] → A 512 KiB trigger bounds it to one render per 512 KiB of output. Measure in perf.
+- [A race between a reconnecting old client and the upgrading client] → Reconnecting clients wait 5 s before starting a core. A wrong winner converges, because the next newer client steps it down again.
+- [Both protocols must stay compatible for good] → Minimal v1 and H1, transcript tests, per-connection versions.
+- [The helper grows] → Check the musl build and binary size early (task 1.3).
+- [Phase 2: the desktop's app scope may kill holders when Brindle exits] → Doesn't matter with `kill`. Before `detach`, check GNOME and KDE scopes and use `systemd-run --user` if needed.
 
 ## Migration Plan
 
-- No configuration changes. On first launch after the update, Brindle starts a server and local tabs move to it.
-- The helper is required on Linux. `scripts/install.sh` and the Linux archive already ship it, and a missing one shows in each local tab with how to fix it.
-- Rollback is to the previous release; there is no in-process switch.
-- Existing remote profiles and tmux control mode are unaffected.
+- No configuration changes. On first launch after the update, Brindle starts a core and a holder, and local tabs run in them.
+- The helper is required on Linux. `scripts/install.sh` and the Linux archive already ship it.
+- Rollback is to the previous release.
+- Remote profiles and tmux control mode are unaffected.
 
 ## Open Questions
 
-- The exact grace periods (unused-server exit, SIGHUP to SIGKILL) and the queue high-water mark, to be tuned in tests.
-- Whether emulators need worker threads, to be decided by the perf numbers.
+- Grace periods and thresholds (unused exit, reconnect grace, holder respawn, checkpoint trigger, queue marks), to be tuned in tests.
+- Whether emulators need worker threads, and whether the data fast path is needed, to be decided by the perf numbers.
 
 ## Later phases (separate changes)
 
-2. **`on_close`:** a per-profile `kill | detach | ask`, applied to closing a zone, tab or window, quitting, crashes, dropped connections and the shell exiting. Restore reattaches by session id and falls back to respawning in the recorded directory. Adds the "sessions on host" palette and the replay-marker attention suppression in the client.
-3. **Windows server:** local Windows tabs always run in the server too, with no fallback, and `Backend::Pty` is removed entirely. ConPTY moves into the helper, with a named-pipe transport, `CREATE_BREAKAWAY_FROM_JOB` and `DETACHED_PROCESS`, the HWND reparent sent to the server, and the pseudoconsole handover, all built on what the group 0 spike found.
-4. **Remote and eager:** `brindle-remote --attach` relays ssh and exec stdio to each host's server. Eager profiles connect at launch, with an offline state, may start their containers, and Windows SSH hosts get a PowerShell deploy. This absorbs follow-ups 2–4 of `remote-connections-followups` and replaces the idle-limit requirement.
+2. **`on_close`:** a per-profile `kill | detach | ask`, applied to closing a zone, tab or window, quitting, crashes, dropped connections and the shell exiting. Restore reattaches by session id and falls back to respawning in the recorded directory. Adds the "sessions on host" palette.
+3. **Windows server:** local Windows tabs always run in the server too, with no fallback, and `Backend::Pty` is removed entirely. This means the holder and core on IOCP and named pipes, and the HWND reparent, as in "Windows (phase 3, shaped by the spike)".
+4. **Remote and eager:** `brindle-remote --attach` relays ssh and exec stdio to each host's core. Eager profiles connect at launch, with an offline state, may start their containers, and Windows SSH hosts get a PowerShell deploy. This absorbs follow-ups 2–4 of `remote-connections-followups` and replaces the idle-limit requirement.
