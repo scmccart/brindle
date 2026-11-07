@@ -131,7 +131,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
 
 ## 9. Integration and measurements
 
-- [ ] 9.1 Run `tests/perf` on a release build of `main` before the change, then on the branch with `BRINDLE_PERF_BASELINE` set to the first run, and put both summaries in the PR. If latency or throughput regress noticeably, bring the numbers to the user with the options in design.md (emulator worker threads, the data fast path) before changing anything.
+- [x] 9.1 Run `tests/perf` on a release build of `main` before the change, then on the branch with `BRINDLE_PERF_BASELINE` set to the first run, and put both summaries in the PR. If latency or throughput regress noticeably, bring the numbers to the user with the options in design.md (emulator worker threads, the data fast path) before changing anything.
 - [ ] 9.2 Run the full Linux checks (`cargo test --locked`, `cargo build --release --locked`, `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`) and the Windows CI jobs, and confirm the Windows build and its e2e cases are unchanged.
 - [x] 9.3 Update README.md (the terminal server, its core and holders, the `brindle-remote` commands, and the helper being required on Linux) and CLAUDE.md's architecture section (`remote::local`, `Backend::Server`, `brindle-term-core`, the core and holder loops, protocol 1 and H1, checkpoints and upgrades). Verify both against the implementation.
 - [ ] 9.4 Hand the user the manual checks: dogfood via `scripts/install.sh` with a Brindle open, and confirm the reinstall upgrades the core without losing the open tabs (`brindle-remote status` shows the new core and the old holder draining, and the programs keep their pids).
