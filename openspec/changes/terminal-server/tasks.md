@@ -47,7 +47,7 @@ Throwaway code on a spike branch, run on the Windows machine. GUI runs there ste
   - exiting when empty.
 
   Verify with agent-crate tests driving a holder with a test core: the environment comes from the request, a missing command gives `SPAWN_FAILED` naming it, `exit 3` reports 3, hangup kills the process group, and the holder exits once empty.
-- [ ] 3.3 The holder's checkpoints and tails:
+- [x] 3.3 The holder's checkpoints and tails:
   - store `CHECKPOINT` and drop the tail;
   - the tail since the last checkpoint is limited to 1 MiB, with `truncated`;
   - on a new `HELLO`, report the sessions, then each `CHECKPOINT` and `TAIL`.
