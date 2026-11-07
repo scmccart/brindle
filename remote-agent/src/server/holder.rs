@@ -293,8 +293,9 @@ struct Holder<L: EventLoop> {
     core_args: Vec<String>,
     core_starts: Vec<Child>,
     core_ready: HashMap<Token, OwnedFd>,
-    /// Process groups to `SIGKILL` when their hang-up grace ends.
-    kills: Vec<(libc::pid_t, Instant)>,
+    /// Process groups to `SIGKILL` when their hang-up grace ends, with the
+    /// session whose program leads each one.
+    kills: Vec<(SessionId, libc::pid_t, Instant)>,
 }
 
 impl<L: EventLoop> Holder<L> {
@@ -826,7 +827,8 @@ impl<L: EventLoop> Holder<L> {
         if session.reaped.is_none() {
             let pid = session.held.pid as libc::pid_t;
             pty::signal_process_group(pid, libc::SIGHUP);
-            self.kills.push((pid, Instant::now() + GRACEFUL_SHUTDOWN));
+            self.kills
+                .push((id, pid, Instant::now() + GRACEFUL_SHUTDOWN));
             log!("session {id}: hung up");
         }
         true
@@ -1006,11 +1008,20 @@ impl<L: EventLoop> Holder<L> {
             }
         }
 
-        self.kills.retain(|&(pid, at)| {
+        let sessions = &self.sessions;
+        self.kills.retain(|&(id, pid, at)| {
             if now < at {
                 return true;
             }
-            pty::signal_process_group(pid, libc::SIGKILL);
+            // Until the leader is reaped (even as a zombie) its pid, and so
+            // the group id, can't be reused. After that the number may
+            // belong to someone else's group, so it gets no signal.
+            if sessions
+                .get(&id)
+                .is_some_and(|session| session.reaped.is_none())
+            {
+                pty::signal_process_group(pid, libc::SIGKILL);
+            }
             false
         });
 
