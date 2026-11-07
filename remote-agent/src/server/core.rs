@@ -20,10 +20,11 @@
 //!   continue from the largest adopted one and returning clients find their
 //!   sessions. A holder of the core's own build is started when a session
 //!   needs one.
-//! - **Sessions** ([`sessions`]): spawned through a holder, with their I/O.
-//!   A client's sessions are hung up when its connection ends.
-//! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients. The
-//!   socket is removed first.
+//! - **Sessions** ([`sessions`]): spawned through a holder, with their I/O,
+//!   the close policies and, after adopting sessions, the
+//!   [`RECONNECT_GRACE`] for their owners to come back.
+//! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, or
+//!   once `STOP` has ended every session. The socket is removed first.
 
 mod clients;
 mod holders;
@@ -39,7 +40,8 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::SessionId;
+use brindle_remote_protocol::client::{Request, ToClient};
+use brindle_remote_protocol::{RequestId, SessionId};
 
 use self::clients::{Client, Pending};
 use self::holders::{Holder, HolderStart, WaitingSpawn};
@@ -49,6 +51,9 @@ use super::{build_id, daemon, dir};
 
 /// With no sessions and no clients for this long, the core exits.
 pub const UNUSED_LIMIT: Duration = Duration::from_secs(5);
+/// After a core starts with adopted sessions, their owners have this long to
+/// come back before their `kill` sessions are hung up.
+pub const RECONNECT_GRACE: Duration = Duration::from_secs(10);
 /// Past this much queued to a client, its sessions are paused...
 pub const CLIENT_QUEUE_HIGH: usize = 1024 * 1024;
 /// ...until its queue is back under this.
@@ -206,6 +211,13 @@ enum Source {
 
 const LISTENER: Token = 0;
 
+/// A `STOP` in progress: the client and request to answer once every
+/// session has ended.
+struct Stopping {
+    client: Token,
+    req: RequestId,
+}
+
 pub(super) struct Core<L: EventLoop> {
     ev: L,
     dir: PathBuf,
@@ -230,7 +242,10 @@ pub(super) struct Core<L: EventLoop> {
     waiting: Vec<WaitingSpawn>,
     sessions: BTreeMap<SessionId, Session>,
     next_session: SessionId,
+    /// While the owners of adopted sessions may still come back.
+    grace_until: Option<Instant>,
     idle_since: Option<Instant>,
+    stopping: Option<Stopping>,
 }
 
 impl<L: EventLoop> Core<L> {
@@ -282,7 +297,9 @@ impl<L: EventLoop> Core<L> {
             waiting: Vec::new(),
             sessions: BTreeMap::new(),
             next_session: 1,
+            grace_until: None,
             idle_since: None,
+            stopping: None,
         })
     }
 
@@ -396,9 +413,18 @@ impl<L: EventLoop> Core<L> {
         self.expire_pending(now);
         if !self.accepting && self.startup_adopted(now) {
             self.accepting = true;
-            if !self.sessions.is_empty() {
-                log!("adopted {} session(s)", self.sessions.len());
+            if self.sessions.values().any(|session| session.awaiting_owner) {
+                self.grace_until = Some(now + RECONNECT_GRACE);
+                log!(
+                    "adopted {} session(s); their owners have {}s to come back",
+                    self.sessions.len(),
+                    RECONNECT_GRACE.as_secs()
+                );
             }
+        }
+        if self.grace_until.is_some_and(|until| now >= until) {
+            self.grace_until = None;
+            self.end_grace();
         }
         self.check_holder_start(now);
         let idle = self.sessions.is_empty()
@@ -414,6 +440,9 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn should_exit(&self, now: Instant) -> bool {
+        if self.stopping.is_some() && self.sessions.is_empty() {
+            return true;
+        }
         self.idle_since
             .is_some_and(|since| now.duration_since(since) >= UNUSED_LIMIT)
     }
@@ -421,16 +450,24 @@ impl<L: EventLoop> Core<L> {
     fn shutdown(mut self) {
         // Nothing can find this core once the socket is gone.
         let _ = fs::remove_file(&self.paths.socket);
+        let stopped = self.stopping.take();
+        if let Some(stopping) = &stopped {
+            self.send_client(stopping.client, ToClient::Ok(Request { req: stopping.req }));
+        }
         for client in self.clients.values_mut() {
             let _ = client.conn.flush_for(EXIT_FLUSH_LIMIT);
         }
         for holder in self.holders.values_mut() {
             let _ = holder.conn.flush_for(EXIT_FLUSH_LIMIT);
         }
-        log!(
-            "unused for {}s; exiting after {}s",
-            UNUSED_LIMIT.as_secs(),
-            self.started.elapsed().as_secs()
-        );
+        if stopped.is_some() {
+            log!("stopped; exiting");
+        } else {
+            log!(
+                "unused for {}s; exiting after {}s",
+                UNUSED_LIMIT.as_secs(),
+                self.started.elapsed().as_secs()
+            );
+        }
     }
 }

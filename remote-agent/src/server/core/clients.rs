@@ -169,6 +169,7 @@ impl<L: EventLoop> Core<L> {
                 over: false,
             },
         );
+        self.reattach(token);
         self.process_client_frames(token);
     }
 
@@ -228,11 +229,11 @@ impl<L: EventLoop> Core<L> {
                 self.not_supported(client, "DETACH", None, Some(target.session))
             }
             ToCore::List(request) => self.not_supported(client, "LIST", Some(request.req), None),
-            ToCore::Kill(kill) => self.not_supported(client, "KILL", Some(kill.req), None),
+            ToCore::Kill(kill) => self.client_kill(client, kill),
             ToCore::Status(request) => {
                 self.not_supported(client, "STATUS", Some(request.req), None)
             }
-            ToCore::Stop(request) => self.not_supported(client, "STOP", Some(request.req), None),
+            ToCore::Stop(request) => self.client_stop(client, request.req),
             ToCore::StepDown(request) => {
                 self.not_supported(client, "STEP_DOWN", Some(request.req), None)
             }
@@ -280,22 +281,18 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// The client is gone: its sessions are hung up.
+    /// The client is gone, and its sessions' close policies apply.
     pub(super) fn drop_client(&mut self, client: Token, reason: &str) {
         if self.clients.remove(&client).is_none() {
             return;
         }
         self.drop_source(client);
         self.waiting.retain(|waiting| waiting.client != client);
-        let sessions = self.sessions_of(client);
         log!(
-            "client {client} left ({reason}); {} session(s) to hang up",
-            sessions.len()
+            "client {client} left ({reason}) with {} session(s)",
+            self.sessions_of(client).len()
         );
-        for id in sessions {
-            self.detach_session(id);
-            self.hang_up(id);
-        }
+        self.client_gone(client);
     }
 
     pub(super) fn client_token(&self, client: Token) -> Option<&str> {

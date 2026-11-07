@@ -309,6 +309,185 @@ fn a_stalled_client_doesnt_delay_another_clients_session() {
     }
 }
 
+// 4.3
+
+/// Holders start a real core of their own once theirs is gone.
+const SUPERVISED: (&str, &str) = (
+    "BRINDLE_TEST_HOLDER_CORE_ARGS",
+    "serve --ready-fd {ready_fd}",
+);
+/// A little more than the core's reconnect grace period.
+const PAST_GRACE: Duration = Duration::from_secs(12);
+
+fn detach(mut spawn: client::Spawn) -> client::Spawn {
+    spawn.policy = client::Policy::Detach;
+    spawn
+}
+
+fn kill(pid: u32) {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+/// SIGKILLs the client's core and waits until another core (the holders'
+/// own) accepts connections.
+fn kill_core_and_wait_for_another(dir: &TempDir, client: &mut TestClient) {
+    let old = client.core_pid();
+    kill(old);
+    assert!(client.closes());
+    assert!(
+        eventually(Duration::from_secs(60), || {
+            server_processes(&dir.path, "serve")
+                .iter()
+                .any(|&pid| pid != old)
+                && std::os::unix::net::UnixStream::connect(core_socket(&dir.path)).is_ok()
+        }),
+        "no new core: {}",
+        dir.logs()
+    );
+}
+
+#[test]
+fn a_sigkilled_clients_kill_session_ends_with_its_children_and_detach_survives() {
+    let (mut dir, mut client) = core("sigkill");
+    let core_pid = client.core_pid();
+    let (with_child, pid) = client.spawn(client_shell("sleep 1000 & echo \"bg=$!.\"; wait"));
+    let background = reported_pid(&client.output_until(with_child, b"."), "bg");
+    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    dir.track(parent(pid).unwrap());
+
+    let mut process = client.into_process();
+    process.kill().unwrap();
+    process.wait().unwrap();
+    assert!(
+        eventually(Duration::from_secs(5), || !alive(pid) && !alive(background)),
+        "the kill session outlived its client"
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(alive(kept_pid), "the detach session ended with its client");
+    assert!(alive(core_pid), "the core keeps the detach session");
+
+    // Listed as detached, through the holder (LIST is task 6.2): with the
+    // core gone, a test core takes the holder over and reads its list.
+    kill(core_pid);
+    assert!(gone(core_pid));
+    let mut holder = TestCore::connect_to(&dir);
+    let adopted = holder.hello(99);
+    let sessions = &adopted.welcome().sessions;
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let held = &sessions[0];
+    assert_eq!((held.session, held.pid, held.exit), (kept, kept_pid, None));
+    let meta = held.meta.as_object().unwrap();
+    let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["command", "cwd", "owner", "policy", "scrollback"]);
+    assert_eq!(meta["policy"], "detach");
+    assert_eq!(meta["owner"], "token-sigkill");
+    assert_eq!(meta["command"], "cat");
+    assert_eq!(meta["scrollback"], 1000);
+}
+
+#[test]
+fn a_detach_session_goes_back_to_its_owners_token() {
+    let (dir, mut client) = core("detach");
+    let (session, pid) = client.spawn(detach(client_spawn("cat", &[])));
+    drop(client);
+    thread::sleep(Duration::from_millis(500));
+    assert!(alive(pid));
+
+    let mut stranger = TestClient::hello(&dir.path, "stranger");
+    stranger.input(session, b"x\n");
+    match stranger.recv() {
+        ToClient::Error(error) => assert_eq!(error.session, Some(session)),
+        other => panic!("{other:?}"),
+    }
+    let mut owner = TestClient::hello(&dir.path, "token-detach");
+    owner.input(session, b"back\n");
+    owner.output_until(session, b"back\r\nback\r\n");
+}
+
+#[test]
+fn a_client_back_within_the_grace_period_keeps_its_kill_sessions() {
+    let mut dir = TempDir::new("grace-back");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "back");
+    let old_core = client.core_pid();
+    let (session, pid) = client.spawn(client_spawn("cat", &[]));
+    dir.track(parent(pid).unwrap());
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut client = TestClient::hello(&dir.path, "back");
+    assert_ne!(client.core_pid(), old_core);
+    client.input(session, b"still here\n");
+    client.output_until(session, b"still here\r\nstill here\r\n");
+
+    thread::sleep(PAST_GRACE);
+    assert!(alive(pid));
+    client.input(session, b"later\n");
+    client.output_until(session, b"later\r\nlater\r\n");
+}
+
+#[test]
+fn kill_sessions_whose_owner_doesnt_come_back_end_after_the_grace_period() {
+    let mut dir = TempDir::new("grace-gone");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "away");
+    let (_, pid) = client.spawn(client_spawn("cat", &[]));
+    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    dir.track(parent(pid).unwrap());
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    // Someone else's client keeps no session alive.
+    let _observer = TestClient::hello(&dir.path, "someone-else");
+    let adopted = Instant::now();
+    assert!(alive(pid) && alive(kept_pid));
+    assert!(gone(pid));
+    assert!(
+        adopted.elapsed() >= Duration::from_secs(8),
+        "hung up after {:?}",
+        adopted.elapsed()
+    );
+    assert!(alive(kept_pid), "a detach session waits for its owner");
+
+    let mut owner = TestClient::hello(&dir.path, "away");
+    owner.input(kept, b"x\n");
+    owner.output_until(kept, b"x\r\nx\r\n");
+}
+
+#[test]
+fn kill_and_stop_end_sessions_whatever_their_policy() {
+    let (dir, mut client) = core("stop");
+    let core_pid = client.core_pid();
+    let (first, first_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    client.send(client::ToCore::Kill(client::Kill {
+        req: 100,
+        target: client::KillTarget::Session(first),
+    }));
+    assert!(matches!(client.reply(100), ToClient::Ok(_)));
+    assert_eq!(client.exit_code(first), None);
+    assert!(!alive(first_pid));
+
+    client.send(client::ToCore::Kill(client::Kill {
+        req: 101,
+        target: client::KillTarget::Session(999),
+    }));
+    match client.reply(101) {
+        ToClient::Error(error) => assert_eq!(error.message, "no session 999"),
+        other => panic!("{other:?}"),
+    }
+
+    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    let (plain, plain_pid) = client.spawn(client_shell("sleep 1000"));
+    let holder = parent(kept_pid).unwrap();
+    client.send(client::ToCore::Stop(client::Request { req: 102 }));
+    assert!(matches!(client.reply(102), ToClient::Ok(_)));
+    assert_eq!(client.exit_code(kept), None);
+    assert_eq!(client.exit_code(plain), None);
+    assert!(client.closes());
+    assert!(!alive(kept_pid) && !alive(plain_pid));
+    assert!(gone(core_pid) && gone(holder));
+    assert!(!core_socket(&dir.path).exists());
+    assert!(dir.holder_sockets().is_empty());
+}
+
 /// A process's resident set, in KiB.
 fn rss_kib(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();

@@ -1,9 +1,19 @@
 //! The core's sessions: spawning through a holder, their I/O between the
-//! client and the holder, hang-ups and exits.
+//! client and the holder, the close policies, hang-ups and exits.
+//!
+//! - **`kill`** sessions end on `CLOSE`, `KILL` and `STOP`, and when their
+//!   owner is gone: its connection ended, or, for sessions a new core
+//!   adopted, it didn't come back within [`super::RECONNECT_GRACE`].
+//! - **`detach`** sessions end only on `CLOSE`, `KILL`, `STOP` or their
+//!   program's exit. Without a client they keep running.
+//! - **Owners** are `client_token`s. A client whose `HELLO` carries a
+//!   session's owner token gets every such session that has no client.
 
-use brindle_remote_protocol::SessionId;
-use brindle_remote_protocol::client::{self, Data, Exit, Resize, Spawned, ToClient};
+use brindle_remote_protocol::client::{
+    self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
+};
 use brindle_remote_protocol::holder::{self as h1, HeldSession, SessionMeta, ToHolder};
+use brindle_remote_protocol::{RequestId, SessionId};
 
 use super::clients::error;
 use super::holders::WaitingSpawn;
@@ -28,6 +38,11 @@ pub(super) struct Session {
     paused: bool,
     /// Its holder was told to hang it up.
     hung_up: bool,
+    /// Adopted, and its owner hasn't come back yet.
+    pub(super) awaiting_owner: bool,
+    /// Its program exited while its owner was away (`None` for a signal);
+    /// kept so the owner hears of it when it comes back.
+    exited: Option<Option<i32>>,
     /// What its holder kept, for a session this core adopted.
     adopted: Option<Adopted>,
 }
@@ -47,7 +62,8 @@ pub(super) struct Adopted {
 
 impl Session {
     /// A session reported in a holder's `WELCOME`. It has no client until
-    /// its owner comes back.
+    /// its owner comes back. One that exited while no core was connected
+    /// is gone from the holder already.
     pub(super) fn adopted(holder: Token, held: HeldSession) -> Self {
         Self {
             holder,
@@ -59,6 +75,8 @@ impl Session {
             spawning: None,
             paused: false,
             hung_up: false,
+            awaiting_owner: true,
+            exited: held.exit.map(|exit| exit.code),
             adopted: Some(Adopted {
                 truncated: held.truncated,
                 ..Adopted::default()
@@ -91,6 +109,12 @@ impl<L: EventLoop> Core<L> {
     /// A client's `SPAWN`: it gets an id now and goes to a holder of the
     /// core's build once one is ready.
     pub(super) fn client_spawn(&mut self, client: Token, spawn: client::Spawn) {
+        if self.stopping.is_some() {
+            return self.send_client(
+                client,
+                error(Some(spawn.req), None, "the server is stopping"),
+            );
+        }
         let id = self.allocate_id();
         self.waiting.push(WaitingSpawn { client, id, spawn });
         self.place_waiting();
@@ -144,6 +168,8 @@ impl<L: EventLoop> Core<L> {
                 spawning: Some(spawn),
                 paused: false,
                 hung_up: false,
+                awaiting_owner: false,
+                exited: None,
                 adopted: None,
             },
         );
@@ -225,15 +251,139 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// The program exited (`code` is `None` for a signal, or a lost holder):
-    /// the client gets `EXIT` and the session is gone.
+    /// the client gets `EXIT` and the session is gone. An adopted session
+    /// whose owner may still come back keeps its exit for the owner.
     pub(super) fn session_exited(&mut self, holder: Token, id: SessionId, code: Option<i32>) {
-        if self.holder_session(holder, id).is_none() {
+        let Some(session) = self.holder_session(holder, id) else {
+            return;
+        };
+        log!("session {id}: exited ({code:?})");
+        if session.awaiting_owner && session.attached.is_none() && !session.hung_up {
+            session.exited = Some(code);
             return;
         }
         let session = self.sessions.remove(&id).expect("the session");
-        log!("session {id}: exited ({code:?})");
         if let Some(client) = session.attached {
             self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+        }
+    }
+
+    /// A returning owner (`HELLO` with the session's `client_token`) gets
+    /// back every session of its own that has no client.
+    pub(super) fn reattach(&mut self, client: Token) {
+        let Some(token) = self.client_token(client).map(str::to_string) else {
+            return;
+        };
+        let returning: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.attached.is_none() && !session.hung_up && session.meta.owner == token
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        if !returning.is_empty() {
+            log!(
+                "client {client} is back for {} session(s): {returning:?}",
+                returning.len()
+            );
+        }
+        for id in returning {
+            let session = self.sessions.get_mut(&id).expect("the session");
+            session.awaiting_owner = false;
+            if let Some(code) = session.exited {
+                self.sessions.remove(&id);
+                self.send_client(client, ToClient::Exit(Exit { session: id, code }));
+                continue;
+            }
+            session.attached = Some(client);
+            if self.client_is_over(client) {
+                self.set_paused(id, true);
+            }
+        }
+    }
+
+    /// The reconnect grace period is over: adopted `kill` sessions whose
+    /// owners didn't come back are hung up.
+    pub(super) fn end_grace(&mut self) {
+        let orphans: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.awaiting_owner)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in orphans {
+            let session = self.sessions.get_mut(&id).expect("the session");
+            session.awaiting_owner = false;
+            if session.exited.is_some() {
+                self.sessions.remove(&id);
+            } else if session.meta.policy == Policy::Kill {
+                log!("session {id}: its owner didn't come back; hanging up");
+                self.hang_up(id);
+            } else {
+                log!("session {id}: detached; its owner didn't come back");
+            }
+        }
+    }
+
+    /// The client's connection ended: its `kill` sessions are hung up, and
+    /// its `detach` sessions keep running without a client.
+    pub(super) fn client_gone(&mut self, client: Token) {
+        for id in self.sessions_of(client) {
+            self.detach_session(id);
+            match self.sessions[&id].meta.policy {
+                Policy::Kill => self.hang_up(id),
+                Policy::Detach => log!("session {id}: detached"),
+            }
+        }
+    }
+
+    /// `KILL`: hangs up one session or all of them, whatever their policy.
+    pub(super) fn client_kill(&mut self, client: Token, kill: Kill) {
+        let targets: Vec<SessionId> = match kill.target {
+            KillTarget::All => self.sessions.keys().copied().collect(),
+            KillTarget::Session(id) if self.sessions.contains_key(&id) => vec![id],
+            KillTarget::Session(id) => {
+                return self.send_client(
+                    client,
+                    error(Some(kill.req), Some(id), format!("no session {id}")),
+                );
+            }
+        };
+        for id in targets {
+            self.end_session(id);
+        }
+        self.send_client(client, ToClient::Ok(Request { req: kill.req }));
+    }
+
+    /// `STOP`: every session is hung up, and the core exits (answering
+    /// `OK`) once they have all ended.
+    pub(super) fn client_stop(&mut self, client: Token, req: RequestId) {
+        log!("stopping: hanging up {} session(s)", self.sessions.len());
+        self.stopping = Some(super::Stopping { client, req });
+        for waiting in std::mem::take(&mut self.waiting) {
+            let req = waiting.spawn.req;
+            self.send_client(
+                waiting.client,
+                error(Some(req), None, "the server is stopping"),
+            );
+        }
+        let all: Vec<SessionId> = self.sessions.keys().copied().collect();
+        for id in all {
+            self.end_session(id);
+        }
+    }
+
+    /// Hangs a session up, or forgets one that already exited.
+    fn end_session(&mut self, id: SessionId) {
+        if self
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.exited.is_some())
+        {
+            self.sessions.remove(&id);
+        } else {
+            self.hang_up(id);
         }
     }
 
@@ -345,7 +495,7 @@ impl<L: EventLoop> Core<L> {
         );
     }
 
-    /// `CLOSE`: the session ends whatever its policy; its `EXIT` follows.
+    /// `CLOSE`: the session ends, whatever its policy; its `EXIT` follows.
     pub(super) fn client_close(&mut self, client: Token, id: SessionId) {
         if self.client_session(client, id).is_some() {
             self.hang_up(id);
