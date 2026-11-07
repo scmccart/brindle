@@ -13,10 +13,33 @@
 //! next. A short run of quick updates, such as a tmux command's response
 //! followed by the echo it caused, is handled at once, and so is output
 //! after a quiet spell.
+//!
+//! Each update then keeps taking ready batches for up to [`BUDGET`]
+//! ([`drain`]), so a flood is handled in long updates with short gaps: the
+//! gap is what Windows needs, and its share of the time is what a flood's
+//! throughput loses (measured on Linux `throughput-tmux`).
 
 use std::time::{Duration, Instant};
 
+use futures::{FutureExt as _, Stream, StreamExt as _};
 use gpui::AsyncApp;
+
+/// How long one update keeps taking ready batches.
+pub const BUDGET: Duration = Duration::from_millis(16);
+
+/// Handles `first`, then each batch `rx` already has ready, until it has
+/// none or [`BUDGET`] has passed. A closed stream stops it too; the loop's
+/// next `rx.next()` sees the end.
+pub fn drain<S: Stream + Unpin>(rx: &mut S, first: S::Item, mut handle: impl FnMut(S::Item)) {
+    let start = Instant::now();
+    handle(first);
+    while start.elapsed() < BUDGET {
+        match rx.next().now_or_never() {
+            Some(Some(more)) => handle(more),
+            _ => break,
+        }
+    }
+}
 
 /// The least time between two updates of one loop while events keep coming.
 pub const PACE: Duration = Duration::from_millis(4);
@@ -93,6 +116,31 @@ mod tests {
         let last = Instant::now();
         assert_eq!(step(Some(last), BURST + 1, last + PACE), (0, None));
         assert_eq!(step(Some(last), BURST + 1, last + PACE * 10), (0, None));
+    }
+
+    #[test]
+    fn drain_takes_what_is_ready() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        for i in 1..=3 {
+            tx.unbounded_send(i).unwrap();
+        }
+        let mut seen = Vec::new();
+        drain(&mut rx, 0, |i| seen.push(i));
+        assert_eq!(seen, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn drain_stops_at_the_budget() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        for i in 1..=10 {
+            tx.unbounded_send(i).unwrap();
+        }
+        let mut seen = Vec::new();
+        drain(&mut rx, 0, |i| {
+            seen.push(i);
+            std::thread::sleep(BUDGET / 2 + MS);
+        });
+        assert_eq!(seen, [0, 1]);
     }
 
     #[test]

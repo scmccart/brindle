@@ -48,7 +48,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use futures::{FutureExt as _, StreamExt as _};
+use futures::StreamExt as _;
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
@@ -288,25 +288,28 @@ impl Terminal {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(1024);
             let mut pace = Pace::default();
-            while let Some(mut events) = rx.next().await {
+            while let Some(events) = rx.next().await {
                 pace.wait(cx).await;
-                if let Some(Some(more)) = rx.next().now_or_never() {
-                    events.extend(more);
-                }
-                let batch = Batch::coalesce(events);
                 let alive = this.update(cx, |this, cx| {
-                    for event in batch.rest {
-                        match event {
-                            ChannelEvent::Alac(event) => this.handle_event(event, cx),
-                            ChannelEvent::Osc(found) => this.handle_found(found, cx),
-                            ChannelEvent::Replay(active) => this.replaying = active,
-                            ChannelEvent::Lost => this.mark_lost(cx),
+                    // Titles and wakeups count once per update, as in one batch.
+                    let (mut title, mut woke) = (None, false);
+                    pace::drain(&mut rx, events, |events| {
+                        let batch = Batch::coalesce(events);
+                        for event in batch.rest {
+                            match event {
+                                ChannelEvent::Alac(event) => this.handle_event(event, cx),
+                                ChannelEvent::Osc(found) => this.handle_found(found, cx),
+                                ChannelEvent::Replay(active) => this.replaying = active,
+                                ChannelEvent::Lost => this.mark_lost(cx),
+                            }
                         }
-                    }
-                    if let Some(title) = batch.title {
+                        title = batch.title.or(title.take());
+                        woke |= batch.woke;
+                    });
+                    if let Some(title) = title {
                         this.set_title(title, cx);
                     }
-                    if batch.woke {
+                    if woke {
                         this.handle_event(AlacEvent::Wakeup, cx);
                     }
                     cx.notify();
@@ -326,35 +329,34 @@ impl Terminal {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(64);
             let mut pace = Pace::default();
-            while let Some(mut events) = rx.next().await {
+            while let Some(events) = rx.next().await {
                 pace.wait(cx).await;
-                if let Some(Some(more)) = rx.next().now_or_never() {
-                    events.extend(more);
-                }
                 let alive = this.update(cx, |this, cx| {
-                    // Consecutive output goes through one `feed`, in order
-                    // relative to the other events.
-                    let mut output: Vec<u8> = Vec::new();
-                    for event in events {
-                        match event {
-                            crate::remote::client::Event::Output(bytes) => {
-                                if output.is_empty() {
-                                    output = bytes;
-                                } else {
-                                    output.extend_from_slice(&bytes);
+                    pace::drain(&mut rx, events, |events| {
+                        // Consecutive output goes through one `feed`, in order
+                        // relative to the other events.
+                        let mut output: Vec<u8> = Vec::new();
+                        for event in events {
+                            match event {
+                                crate::remote::client::Event::Output(bytes) => {
+                                    if output.is_empty() {
+                                        output = bytes;
+                                    } else {
+                                        output.extend_from_slice(&bytes);
+                                    }
                                 }
-                            }
-                            other => {
-                                if !output.is_empty() {
-                                    this.feed(&std::mem::take(&mut output), cx);
+                                other => {
+                                    if !output.is_empty() {
+                                        this.feed(&std::mem::take(&mut output), cx);
+                                    }
+                                    this.handle_remote_event(other, cx);
                                 }
-                                this.handle_remote_event(other, cx);
                             }
                         }
-                    }
-                    if !output.is_empty() {
-                        this.feed(&output, cx);
-                    }
+                        if !output.is_empty() {
+                            this.feed(&output, cx);
+                        }
+                    });
                     cx.notify();
                 });
                 if alive.is_err() {
