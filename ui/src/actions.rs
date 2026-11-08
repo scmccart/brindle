@@ -31,6 +31,13 @@ actions!(
         // Focus scopes: Tab and shift-Tab among a view's listed stops.
         FocusNext,
         FocusPrev,
+        // Lists: the highlight of a select's menu or a command list, and
+        // confirming the highlighted option.
+        ListUp,
+        ListDown,
+        ListFirst,
+        ListLast,
+        ListConfirm,
     ]
 );
 
@@ -41,6 +48,7 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     let i = Some("TextInput");
     let l = Some("UiLayer");
     let f = Some("UiFocusScope");
+    let s = Some("UiList");
     vec![
         // Escape asks the overlay to close. Bound in the layer around the
         // view, so an inner context that handles escape itself wins.
@@ -48,6 +56,16 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         // Tab cycles through the view's stops and never leaves it.
         KeyBinding::new("tab", FocusNext, f),
         KeyBinding::new("shift-tab", FocusPrev, f),
+        // Lists: the highlight, and enter to confirm it. A text input
+        // inside the list (a command list's filter) keeps home and end,
+        // since its own bindings are nearer the focus.
+        KeyBinding::new("up", ListUp, s),
+        KeyBinding::new("down", ListDown, s),
+        KeyBinding::new("ctrl-p", ListUp, s),
+        KeyBinding::new("ctrl-n", ListDown, s),
+        KeyBinding::new("home", ListFirst, s),
+        KeyBinding::new("end", ListLast, s),
+        KeyBinding::new("enter", ListConfirm, s),
         // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
         // to the palette or dialog around them.
         KeyBinding::new("left", TextInputLeft, i),
@@ -110,7 +128,22 @@ mod tests {
         let scope = in_context(&bindings, "UiFocusScope");
         let scope: Vec<&str> = scope.iter().map(|(_, name)| name.as_str()).collect();
         assert_eq!(scope, ["brindle_ui::FocusNext", "brindle_ui::FocusPrev"]);
+        let list = in_context(&bindings, "UiList");
+        assert_eq!(list.len(), 7);
+        let list_actions: Vec<&str> = list.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(
+            list_actions,
+            [
+                "brindle_ui::ListUp",
+                "brindle_ui::ListDown",
+                "brindle_ui::ListUp",
+                "brindle_ui::ListDown",
+                "brindle_ui::ListFirst",
+                "brindle_ui::ListLast",
+                "brindle_ui::ListConfirm",
+            ]
+        );
         // Every binding is in one of the crate's contexts.
-        assert_eq!(bindings.len(), text_input.len() + layer.len() + scope.len());
+        assert_eq!(bindings.len(), text_input.len() + layer.len() + scope.len() + list.len());
     }
 }
