@@ -259,6 +259,30 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
     Ok(Image { width: geometry.width.into(), height: geometry.height.into(), data })
 }
 
+/// Asks the window of `pid` to close, as a window manager's close button
+/// does: a `WM_DELETE_WINDOW` client message (a protocol message to that
+/// window, not input).
+#[cfg(target_os = "linux")]
+pub fn request_close(display: &str, pid: u32) -> Result {
+    use x11rb::protocol::xproto::{ClientMessageEvent, EventMask};
+    let (conn, screen) = x11rb::connect(Some(display)).map_err(|e| format!("X display {display}: {e}"))?;
+    let root = conn.setup().roots[screen].root;
+    let atom = |name: &[u8]| -> Result<Atom> {
+        Ok(conn.intern_atom(false, name).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.atom)
+    };
+    let (pid_atom, protocols, delete) = (atom(b"_NET_WM_PID")?, atom(b"WM_PROTOCOLS")?, atom(b"WM_DELETE_WINDOW")?);
+    let window = find_window(&conn, root, pid_atom, pid).ok_or_else(|| format!("no viewable window for pid {pid}"))?;
+    let event = ClientMessageEvent::new(32, window, protocols, [delete, x11rb::CURRENT_TIME, 0, 0, 0]);
+    conn.send_event(false, window, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    conn.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn request_close(_display: &str, _pid: u32) -> Result {
+    Err("closing a window by WM_DELETE_WINDOW needs X11".into())
+}
+
 #[cfg(target_os = "linux")]
 fn find_window(conn: &impl Connection, window: Window, atom: Atom, pid: u32) -> Option<Window> {
     let owned = conn

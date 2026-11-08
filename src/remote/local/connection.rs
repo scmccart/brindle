@@ -33,11 +33,15 @@ use anyhow::{Result, anyhow, bail};
 use parking_lot::{Condvar, Mutex};
 
 use super::{Connected, Endpoint, Refused};
-use crate::remote::protocol::client::{self, Data, Policy, Request, Resize, SessionRef, ToClient, ToCore};
+use crate::remote::protocol::client::{
+    self, Data, Kill, KillTarget, Policy, ReplayStart, Request, Resize, SessionInfo, SessionRef,
+    Spawned, ToClient, ToCore,
+};
 use crate::remote::protocol::{Frame, RequestId, SessionId};
 
-/// How long a spawn waits for its `SPAWNED`, a reconnect included.
-const SPAWN_LIMIT: Duration = Duration::from_secs(30);
+/// How long a request waits for its answer (a spawn's `SPAWNED`, an
+/// attach's `REPLAY_START`), a reconnect included.
+const REQUEST_LIMIT: Duration = Duration::from_secs(30);
 /// While reconnecting, how long to wait for a core to appear before
 /// starting one, so an upgrading client's new core wins (design.md).
 pub const START_AFTER: Duration = Duration::from_secs(5);
@@ -77,12 +81,51 @@ pub struct SpawnRequest {
     pub cell_w: u16,
     pub cell_h: u16,
     pub scrollback: u32,
+    /// `detach` keeps the program running when its tab closes or Brindle
+    /// goes away; `kill` ends it.
+    pub policy: Policy,
+    /// The profile that started it, for whoever attaches it later.
+    pub profile: Option<String>,
 }
 
-struct PendingSpawn {
-    sink: Sink,
-    reply: mpsc::SyncSender<Result<(SessionId, u32), String>>,
-    /// Its `SPAWN` went out on the current connection: if that ends, the
+/// Which detached session to attach, and the tab's size.
+pub struct AttachRequest {
+    pub session: SessionId,
+    /// The key the session was listed with, kept for the tab's state.
+    pub key: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+type Reply<T> = mpsc::SyncSender<Result<T, String>>;
+
+/// What a request waits for.
+enum Waiting {
+    /// `SPAWNED`, whose sink then joins the session map.
+    Spawn { sink: Sink, reply: Reply<Spawned> },
+    /// The `REPLAY_START` answering an `ATTACH` (its pid), whose sink joins
+    /// the map before the replay's first `DATA` is read.
+    Attach { sink: Sink, reply: Reply<u32> },
+    /// `SESSIONS`.
+    List(Reply<Vec<SessionInfo>>),
+    /// `OK`.
+    Done(Reply<()>),
+}
+
+impl Waiting {
+    fn fail(self, message: String) {
+        match self {
+            Self::Spawn { reply, .. } => reply.try_send(Err(message)).ok(),
+            Self::Attach { reply, .. } => reply.try_send(Err(message)).ok(),
+            Self::List(reply) => reply.try_send(Err(message)).ok(),
+            Self::Done(reply) => reply.try_send(Err(message)).ok(),
+        };
+    }
+}
+
+struct Pending {
+    waiting: Waiting,
+    /// Its request went out on the current connection: if that ends, the
     /// answer is lost with it.
     written: bool,
 }
@@ -90,7 +133,7 @@ struct PendingSpawn {
 #[derive(Default)]
 struct State {
     sessions: HashMap<SessionId, Sink>,
-    spawns: HashMap<RequestId, PendingSpawn>,
+    requests: HashMap<RequestId, Pending>,
     /// The `LIST` sent after a reconnect's `WELCOME`.
     list: Option<RequestId>,
     /// The connection ended for good; the next tab makes a new one.
@@ -152,21 +195,44 @@ impl Connection {
         self.next_req.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Starts a session whose output goes to `sink`, and waits for the core
-    /// to report its id and pid. Not on the UI thread: this blocks.
-    pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink) -> Result<Running> {
+    /// Sends the request `make` builds and waits up to [`REQUEST_LIMIT`]
+    /// for its answer. Not on the UI thread: this blocks.
+    fn ask<T>(
+        &self,
+        what: &str,
+        make: impl FnOnce(RequestId, Reply<T>) -> (Waiting, ToCore),
+    ) -> Result<T> {
         let req = self.req();
         let (reply, answer) = mpsc::sync_channel(1);
+        let (waiting, message) = make(req, reply);
         {
             let mut state = self.state.lock();
             if state.dead {
                 bail!("the connection to the terminal server ended");
             }
-            state.spawns.insert(req, PendingSpawn { sink, reply, written: false });
+            state.requests.insert(req, Pending { waiting, written: false });
         }
+        self.send(message);
+        let answer = answer.recv_timeout(REQUEST_LIMIT);
+        // Gone already when answered; a late answer is dealt with by `handle`.
+        self.state.lock().requests.remove(&req);
+        match answer {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(message)) => Err(anyhow!("{message}")),
+            Err(_) => bail!(
+                "the terminal server didn't {what} within {} s",
+                REQUEST_LIMIT.as_secs()
+            ),
+        }
+    }
+
+    /// Starts a session whose output goes to `sink`, and waits for the core
+    /// to report its id and pid. Not on the UI thread: this blocks.
+    pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink) -> Result<Running> {
         let command = Some(request.command).filter(|command| !command.is_empty());
-        self.send(ToCore::Spawn(client::Spawn {
-            req,
+        let spawned = self.ask("start the session", |req, reply| {
+            let message = ToCore::Spawn(client::Spawn {
+                req,
             command,
             args: request.args,
             cwd: request.cwd,
@@ -176,19 +242,43 @@ impl Connection {
             cell_w: request.cell_w,
             cell_h: request.cell_h,
             scrollback: request.scrollback,
-            policy: Policy::Kill,
-        }));
-        let answer = answer.recv_timeout(SPAWN_LIMIT);
-        // Gone already when answered; a late `SPAWNED` is closed.
-        self.state.lock().spawns.remove(&req);
-        match answer {
-            Ok(Ok((id, pid))) => Ok(Running { id, pid, conn: self.clone() }),
-            Ok(Err(message)) => Err(anyhow!("{message}")),
-            Err(_) => bail!(
-                "the terminal server didn't start the session within {} s",
-                SPAWN_LIMIT.as_secs()
-            ),
-        }
+                policy: request.policy,
+                profile: request.profile,
+            });
+            (Waiting::Spawn { sink, reply }, message)
+        })?;
+        Ok(Running { id: spawned.session, pid: spawned.pid, key: spawned.key, conn: self.clone() })
+    }
+
+    /// Attaches a detached session, whose replay and then live output go to
+    /// `sink`, and waits for its `REPLAY_START`. Not on the UI thread.
+    pub fn attach(self: &Arc<Self>, request: AttachRequest, sink: Sink) -> Result<Running> {
+        let session = request.session;
+        let pid = self.ask("attach the session", |req, reply| {
+            let message = ToCore::Attach(client::Attach {
+                req,
+                session,
+                cols: request.cols,
+                rows: request.rows,
+            });
+            (Waiting::Attach { sink, reply }, message)
+        })?;
+        Ok(Running { id: session, pid, key: request.key, conn: self.clone() })
+    }
+
+    /// The core's sessions, this client's and detached ones. Blocks.
+    pub fn list(&self) -> Result<Vec<SessionInfo>> {
+        self.ask("list its sessions", |req, reply| {
+            (Waiting::List(reply), ToCore::List(Request { req }))
+        })
+    }
+
+    /// Ends a session whatever its policy or client. Blocks.
+    pub fn kill(&self, session: SessionId) -> Result<()> {
+        self.ask("end the session", |req, reply| {
+            let target = KillTarget::Session(session);
+            (Waiting::Done(reply), ToCore::Kill(Kill { req, target }))
+        })
     }
 
     /// Reads each connection in turn, reconnecting when one ends.
@@ -232,25 +322,66 @@ impl Connection {
             }
             ToClient::Spawned(spawned) => {
                 let mut state = self.state.lock();
-                match state.spawns.remove(&spawned.req) {
-                    Some(pending) => {
-                        state.sessions.insert(spawned.session, pending.sink);
-                        pending.reply.try_send(Ok((spawned.session, spawned.pid))).ok();
+                match state.requests.remove(&spawned.req).map(|pending| pending.waiting) {
+                    Some(Waiting::Spawn { sink, reply }) => {
+                        state.sessions.insert(spawned.session, sink);
+                        reply.try_send(Ok(spawned)).ok();
                     }
-                    None => {
+                    other => {
                         // Its spawner gave up: nobody shows this session.
                         drop(state);
+                        if let Some(other) = other {
+                            other.fail("answered with SPAWNED".into());
+                        }
                         self.send(ToCore::Close(SessionRef { session: spawned.session }));
                     }
                 }
             }
             ToClient::Error(error) => {
-                let pending = error.req.and_then(|req| self.state.lock().spawns.remove(&req));
+                let pending = error.req.and_then(|req| self.state.lock().requests.remove(&req));
                 match pending {
-                    Some(pending) => {
-                        pending.reply.try_send(Err(error.message)).ok();
-                    }
+                    Some(pending) => pending.waiting.fail(error.message),
                     None => log::debug!("terminal server: {}", error.message),
+                }
+            }
+            ToClient::Sessions(sessions) if self.state.lock().list != Some(sessions.req) => {
+                let pending = self.state.lock().requests.remove(&sessions.req);
+                match pending.map(|pending| pending.waiting) {
+                    Some(Waiting::List(reply)) => {
+                        reply.try_send(Ok(sessions.sessions)).ok();
+                    }
+                    Some(other) => other.fail("answered with SESSIONS".into()),
+                    None => {}
+                }
+            }
+            ToClient::Ok(ok) => {
+                let pending = self.state.lock().requests.remove(&ok.req);
+                match pending.map(|pending| pending.waiting) {
+                    Some(Waiting::Done(reply)) => {
+                        reply.try_send(Ok(())).ok();
+                    }
+                    Some(other) => other.fail("answered with OK".into()),
+                    None => {}
+                }
+            }
+            ToClient::ReplayStart(ReplayStart { req: Some(req), session, pid }) => {
+                let mut state = self.state.lock();
+                match state.requests.remove(&req).map(|pending| pending.waiting) {
+                    Some(Waiting::Attach { sink, reply }) => {
+                        state.sessions.insert(session, sink.clone());
+                        drop(state);
+                        sink.lock().replay(true);
+                        reply.try_send(Ok(pid)).ok();
+                    }
+                    other => {
+                        // Its attacher gave up: leave the session detached,
+                        // as it was.
+                        drop(state);
+                        if let Some(other) = other {
+                            other.fail("answered with REPLAY_START".into());
+                        }
+                        self.send(ToCore::Detach(SessionRef { session }));
+                    }
                 }
             }
             ToClient::Exit(exit) => {
@@ -287,7 +418,7 @@ impl Connection {
                     sink.lock().lost("the terminal server no longer has this session");
                 }
             }
-            ToClient::Welcome(_) | ToClient::ServerStatus(_) | ToClient::Ok(_) => {}
+            ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
         }
     }
 
@@ -295,8 +426,8 @@ impl Connection {
         self.state.lock().sessions.get(&session).cloned()
     }
 
-    /// The connection ended: the writer holds its messages, and spawns whose
-    /// `SPAWN` went out on it fail, since their answers are gone.
+    /// The connection ended: the writer holds its messages, and requests
+    /// that went out on it fail, since their answers are gone.
     fn disconnected(&self, reason: &str) {
         if let Some(stream) = self.slot.lock().stream.take() {
             stream.shutdown(std::net::Shutdown::Both).ok();
@@ -304,10 +435,10 @@ impl Connection {
         let mut state = self.state.lock();
         state.list = None;
         let lost: Vec<RequestId> =
-            state.spawns.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
+            state.requests.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
         for req in lost {
-            if let Some(pending) = state.spawns.remove(&req) {
-                pending.reply.try_send(Err(format!("the terminal server went away ({reason})"))).ok();
+            if let Some(pending) = state.requests.remove(&req) {
+                pending.waiting.fail(format!("the terminal server went away ({reason})"));
             }
         }
     }
@@ -361,15 +492,15 @@ impl Connection {
     /// The connection is gone for good: every session is lost and every
     /// spawn fails.
     fn ended(&self, reason: &str) {
-        let (sessions, spawns) = {
+        let (sessions, requests) = {
             let mut state = self.state.lock();
             state.dead = true;
-            (std::mem::take(&mut state.sessions), std::mem::take(&mut state.spawns))
+            (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests))
         };
         self.slot.lock().closed = true;
         self.slot_ready.notify_all();
-        for pending in spawns.into_values() {
-            pending.reply.try_send(Err(reason.to_string())).ok();
+        for pending in requests.into_values() {
+            pending.waiting.fail(reason.to_string());
         }
         for sink in sessions.into_values() {
             sink.lock().lost(reason);
@@ -387,8 +518,11 @@ impl Connection {
                     continue;
                 }
             };
-            let spawn = match &message {
-                ToCore::Spawn(spawn) => Some(spawn.req),
+            let request = match &message {
+                ToCore::Spawn(client::Spawn { req, .. })
+                | ToCore::Attach(client::Attach { req, .. })
+                | ToCore::List(Request { req })
+                | ToCore::Kill(Kill { req, .. }) => Some(*req),
                 _ => None,
             };
             loop {
@@ -404,14 +538,14 @@ impl Connection {
                         self.slot_ready.wait(&mut slot);
                     }
                 };
-                if let Some(req) = spawn {
+                if let Some(req) = request {
                     self.mark_written(req, true);
                 }
                 match frame.write_to(&mut &*stream) {
                     Ok(()) => break,
                     Err(error) => {
                         log::debug!("writing to the terminal server failed: {error}");
-                        if let Some(req) = spawn {
+                        if let Some(req) = request {
                             self.mark_written(req, false);
                         }
                         let mut slot = self.slot.lock();
@@ -425,7 +559,7 @@ impl Connection {
     }
 
     fn mark_written(&self, req: RequestId, written: bool) {
-        if let Some(pending) = self.state.lock().spawns.get_mut(&req) {
+        if let Some(pending) = self.state.lock().requests.get_mut(&req) {
             pending.written = written;
         }
     }
@@ -442,6 +576,7 @@ fn missing<T>(sessions: &mut HashMap<SessionId, T>, kept: &HashSet<SessionId>) -
 pub struct Running {
     id: SessionId,
     pid: u32,
+    key: String,
     conn: Arc<Connection>,
 }
 
@@ -449,6 +584,15 @@ impl Running {
     /// The program's pid.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    pub fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// The session's key; empty from a core that predates keys.
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     pub fn input(&self, bytes: &[u8]) {
@@ -461,13 +605,25 @@ impl Running {
         self.conn.send(ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h }));
     }
 
-    /// Ends the session (its policy is `kill`). Once is enough; a session
-    /// that already exited or was lost isn't closed again.
+    /// Ends the session (`CLOSE`). Once is enough; a session that already
+    /// exited or was lost isn't closed again.
     pub fn close(&self) {
-        let known = self.conn.state.lock().sessions.remove(&self.id).is_some();
-        if known {
+        if self.forget() {
             self.conn.send(ToCore::Close(SessionRef { session: self.id }));
         }
+    }
+
+    /// Leaves the session running with no client (`DETACH`), unless it
+    /// already exited or was lost.
+    pub fn detach(&self) {
+        if self.forget() {
+            self.conn.send(ToCore::Detach(SessionRef { session: self.id }));
+        }
+    }
+
+    /// Stops showing the session; says whether it was still shown.
+    fn forget(&self) -> bool {
+        self.conn.state.lock().sessions.remove(&self.id).is_some()
     }
 }
 

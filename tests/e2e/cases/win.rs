@@ -248,8 +248,11 @@ fn run_with(
     std::fs::write(&config, config_text).map_err(|e| e.to_string())?;
     let log_path = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    // `-p` alone restores the previous run's tabs too; such runs start clean.
+    let no_restore: &[&str] = if args.contains(&"-p") { &["--no-restore"] } else { &[] };
     let mut child = Command::new(&ctx.bin)
         .args(args)
+        .args(no_restore)
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &ctx.secs(dump_at).to_string()])
         .env("BRINDLE_CONFIG", &config)
@@ -459,7 +462,7 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
     for shell in ["pwsh.exe", "powershell.exe"] {
         let config = format!(
-            "default_profile = \"si\"\nrestore_session = true\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+            "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
         );
         let label = shell.trim_end_matches(".exe");
@@ -553,7 +556,7 @@ fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
 }
 
 fn zones(ctx: &Ctx) -> Result<Outcome> {
-    let restore_config = format!("restore_session = true\n{CONFIG}");
+    let restore_config = CONFIG.to_string();
     let split = run_with(
         ctx,
         &restore_config,

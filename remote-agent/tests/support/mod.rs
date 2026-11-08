@@ -132,6 +132,7 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
     command
         .args([role, "--ready-fd", "3"])
         .env("BRINDLE_SERVER_DIR", dir)
+        .env("BRINDLE_NO_SCOPE", "1")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -956,6 +957,7 @@ pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
         cell_h: 0,
         scrollback: 1000,
         policy: client::Policy::Kill,
+        profile: None,
     }
 }
 

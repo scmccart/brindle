@@ -12,7 +12,7 @@
 //! |-----:|-----------------|---------------|----------------------------------------------------------------|
 //! |    1 | `DATA`          | both          | session, bytes                                                 |
 //! |    2 | `HELLO`         | client → core | `min, max, client_version, client_token`                       |
-//! |    3 | `SPAWN`         | client → core | `req, command, args, cwd, env, cols, rows, cell_w, cell_h, scrollback, policy` |
+//! |    3 | `SPAWN`         | client → core | `req, command, args, cwd, env, cols, rows, cell_w, cell_h, scrollback, policy, profile?` |
 //! |    4 | `RESIZE`        | client → core | `session, cols, rows, cell_w, cell_h`                          |
 //! |    5 | `CLOSE`         | client → core | `session`                                                      |
 //! |    6 | `ATTACH`        | client → core | `req, session, cols, rows`                                     |
@@ -25,11 +25,11 @@
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
-//! |   34 | `SPAWNED`       | core → client | `req, session, pid`                                            |
+//! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
 //! |   35 | `EXIT`          | core → client | `session, code?`                                               |
 //! |   36 | `REPLAY_START`  | core → client | `req?, session, pid`                                           |
 //! |   37 | `REPLAY_END`    | core → client | `session`                                                      |
-//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows}]` |
+//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?}]` |
 //! |   39 | `SERVER_STATUS` | core → client | `req, core_version, core_build, protocols, holder_protocols, pid, uptime_secs, clients, holders` |
 //! |   40 | `OK`            | core → client | `req`                                                          |
 //!
@@ -44,6 +44,14 @@
 //!   `STEP_DOWN` → `OK` or `ERROR`.
 //! - `RESIZE`, `CLOSE`, `DETACH` and `REPARENT` have no reply; a refused one
 //!   gets an `ERROR` with its `session`.
+//!
+//! Fields marked `?` were added within protocol 1. They are left out when
+//! empty, so messages that don't use them encode exactly as before.
+//! - `key` identifies a session across server lifetimes, where its id may
+//!   be reused (a new core starts its ids at 1).
+//! - `title` is the session's title as its emulator keeps it, `started` its
+//!   start time in unix seconds, and `profile` the client's name for what
+//!   started it, kept for clients that attach it later.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -152,13 +160,19 @@ pub struct Spawn {
     pub scrollback: u32,
     #[serde(default)]
     pub policy: Policy,
+    /// The client's name for what started the session (a profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spawned {
     pub req: RequestId,
     pub session: SessionId,
     pub pid: u32,
+    /// The session's key; empty from a core that predates keys.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,7 +258,7 @@ pub struct ErrorMessage {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session: SessionId,
     pub pid: u32,
@@ -260,6 +274,20 @@ pub struct SessionInfo {
     pub cols: u16,
     #[serde(default)]
     pub rows: u16,
+    /// Empty from a core that predates keys.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Unix seconds; 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub started: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +479,7 @@ pub(crate) mod samples {
                 cell_h: 18,
                 scrollback: 10_000,
                 policy: Policy::Detach,
+                profile: Some("Shell".into()),
             }),
             ToCore::Data(Data {
                 session: 7,
@@ -517,6 +546,7 @@ pub(crate) mod samples {
                 req: 1,
                 session: 7,
                 pid: 5000,
+                key: "9f2c41d07a5b3e86c1d4f0a2b7e95c13".into(),
             }),
             ToClient::Data(Data {
                 session: 7,
@@ -554,6 +584,10 @@ pub(crate) mod samples {
                     policy: Policy::Detach,
                     cols: 100,
                     rows: 30,
+                    key: "9f2c41d07a5b3e86c1d4f0a2b7e95c13".into(),
+                    title: "htop".into(),
+                    started: 1_794_000_000,
+                    profile: Some("Shell".into()),
                 }],
             }),
             ToClient::ServerStatus(ServerStatus {
@@ -696,6 +730,7 @@ mod tests {
                 cell_h: 0,
                 scrollback: 0,
                 policy: Policy::Kill,
+                profile: None,
             })
         );
         let frame = Frame::new(MSG_ERROR, br#"{"message":"m"}"#.to_vec()).unwrap();

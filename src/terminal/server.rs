@@ -17,7 +17,8 @@ use alacritty_terminal::term::Term;
 use parking_lot::Mutex;
 
 use super::shell_integration::{Marks, Parser};
-use super::{ChannelEvent, Listener};
+use super::{ChannelEvent, GridSize, Listener};
+use alacritty_terminal::grid::Dimensions as _;
 use crate::notify::osc::Scanner;
 use crate::remote::local::SessionSink;
 
@@ -27,8 +28,13 @@ pub struct Sink {
     marks: Arc<Mutex<Marks>>,
     listener: Listener,
     scanner: Scanner,
-    /// What the session runs, for the error line if it never starts.
-    program: String,
+    /// What starting the session does (`start "bash"`, `attach session 3`),
+    /// for the error line if it never starts.
+    doing: String,
+    /// The session's size, which the core renders an attach's replay at.
+    replay_size: Option<GridSize>,
+    /// A replay's bytes, held until it ends.
+    replay: Option<Vec<u8>>,
 }
 
 impl Sink {
@@ -37,13 +43,37 @@ impl Sink {
         parser: Arc<Mutex<Parser>>,
         marks: Arc<Mutex<Marks>>,
         listener: Listener,
-        program: String,
+        doing: String,
     ) -> Self {
-        Self { term, parser, marks, listener, scanner: Scanner::new(), program }
+        Self { term, parser, marks, listener, scanner: Scanner::new(), doing, replay_size: None, replay: None }
+    }
+
+    /// The first replay was rendered at `size` (an attached session's), so
+    /// it is fed at that size, then the term resizes back to its own.
+    pub fn replayed_at(mut self, size: GridSize) -> Self {
+        self.replay_size = Some(size);
+        self
     }
 
     fn send(&self, event: ChannelEvent) {
         self.listener.0.unbounded_send(event).ok();
+    }
+
+    /// Feeds a whole replay under the locks, so a resize from the UI can't
+    /// land in the middle of it. A replay must be fed at the size it was
+    /// rendered at, or its cursor and rows land elsewhere.
+    fn feed_replay(&mut self, bytes: &[u8]) {
+        let mut parser = self.parser.lock();
+        let mut term = self.term.lock_unfair();
+        let own = GridSize { cols: term.columns() as u16, rows: term.screen_lines() as u16, ..GridSize::default() };
+        let size = self.replay_size.take().filter(|s| s.cols > 0 && s.rows > 0 && (s.cols, s.rows) != (own.cols, own.rows));
+        if let Some(size) = size {
+            self.marks.lock().resize(&mut *term, size);
+        }
+        parser.advance(&mut *term, &self.marks, bytes);
+        if size.is_some() {
+            self.marks.lock().resize(&mut *term, own);
+        }
     }
 }
 
@@ -51,6 +81,10 @@ impl SessionSink for Sink {
     fn output(&mut self, bytes: &[u8]) {
         for found in self.scanner.scan(bytes) {
             self.send(ChannelEvent::Osc(found));
+        }
+        if let Some(replay) = &mut self.replay {
+            replay.extend_from_slice(bytes);
+            return;
         }
         {
             // Lock order: parser, then term, then marks (taken by `advance`).
@@ -64,7 +98,16 @@ impl SessionSink for Sink {
     }
 
     fn replay(&mut self, active: bool) {
-        self.send(ChannelEvent::Replay(active));
+        if active {
+            self.send(ChannelEvent::Replay(true));
+            self.replay = Some(Vec::new());
+            return;
+        }
+        if let Some(bytes) = self.replay.take() {
+            self.feed_replay(&bytes);
+            self.listener.send_event(AlacEvent::Wakeup);
+        }
+        self.send(ChannelEvent::Replay(false));
     }
 
     fn exited(&mut self, _code: Option<i32>) {
@@ -80,10 +123,10 @@ impl SessionSink for Sink {
     /// The tab shows the error, as a tab whose program can't start always
     /// has, and stays open.
     fn failed(&mut self, error: &anyhow::Error) {
-        log::error!("failed to launch {:?}: {error:#}", self.program);
+        log::error!("could not {}: {error:#}", self.doing);
         let text = format!(
-            "\x1b[31mBrindle could not start {:?}:\x1b[0m\r\n{}\r\n",
-            self.program,
+            "\x1b[31mBrindle could not {}:\x1b[0m\r\n{}\r\n",
+            self.doing,
             format!("{error:#}").replace('\n', "\r\n")
         );
         self.output(text.as_bytes());
@@ -110,7 +153,7 @@ mod tests {
             Arc::new(Mutex::new(Parser::new())),
             Arc::new(Mutex::new(Marks::default())),
             listener,
-            "sh".into(),
+            "start \"sh\"".into(),
         );
         (sink, rx, marker)
     }
@@ -154,6 +197,25 @@ mod tests {
             kinds(&mut rx),
             ["replay-start", "notice", "bell", "wakeup", "replay-end", "bell", "wakeup"]
         );
+    }
+
+    /// A replay rendered at the session's 40x5, whose cursor is on its last
+    /// row, into an 80x24 term: fed at 40x5 and resized back, the cursor
+    /// stays on the last line written, as a resize of the session would
+    /// leave it, not five rows from the top.
+    #[test]
+    fn a_replay_is_fed_at_the_sessions_size() {
+        let (sink, _rx, _) = sink();
+        let mut sink = sink.replayed_at(GridSize { cols: 40, rows: 5, ..GridSize::default() });
+        sink.replay(true);
+        sink.output(b"\x1bc1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n$ \x1b[5;3H");
+        sink.replay(false);
+        let term = sink.term.lock();
+        assert_eq!((term.columns(), term.screen_lines()), (80, 24));
+        let text = crate::terminal::screen_text(&term);
+        let prompt = text.lines().position(|line| line.starts_with('$')).expect("the prompt is on screen");
+        assert_eq!(term.grid().cursor.point.line.0 as usize, prompt, "{text}");
+        assert_eq!(term.grid().cursor.point.column.0, 2);
     }
 
     #[test]

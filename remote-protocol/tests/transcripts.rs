@@ -286,7 +286,7 @@ fn every_message_type_appears_in_a_transcript() {
         );
     }
     let holder_types =
-        (holder::MSG_HELLO..=holder::MSG_RESUME).chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
+        (holder::MSG_HELLO..=holder::MSG_SET_META).chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
     for msg_type in holder_types {
         assert!(
             seen.contains_key(&("holder", msg_type)),
@@ -298,6 +298,7 @@ fn every_message_type_appears_in_a_transcript() {
 // The transcripts.
 
 const TOKEN: &str = "6c1f0e9a2b7d4c35";
+const KEY: &str = "9f2c41d07a5b3e86c1d4f0a2b7e95c13";
 
 fn c(m: client::ToCore) -> Step {
     Step::Client(m)
@@ -346,7 +347,11 @@ fn output(session: u32, bytes: &[u8]) -> Step {
 }
 
 fn spawn(req: u64, command: &str, policy: Policy) -> Step {
-    c(client::ToCore::Spawn(client::Spawn {
+    c(client::ToCore::Spawn(spawn_message(req, command, policy)))
+}
+
+fn spawn_message(req: u64, command: &str, policy: Policy) -> client::Spawn {
+    client::Spawn {
         req,
         command: Some(command.into()),
         args: vec!["-l".into()],
@@ -361,7 +366,8 @@ fn spawn(req: u64, command: &str, policy: Policy) -> Step {
         cell_h: 18,
         scrollback: 10_000,
         policy,
-    }))
+        profile: None,
+    }
 }
 
 fn spawned(req: u64, session: u32, pid: u32) -> Step {
@@ -369,6 +375,7 @@ fn spawned(req: u64, session: u32, pid: u32) -> Step {
         req,
         session,
         pid,
+        key: String::new(),
     }))
 }
 
@@ -552,6 +559,7 @@ fn transcripts() -> Vec<Transcript> {
                             policy: Policy::Kill,
                             cols: 80,
                             rows: 24,
+                            ..Default::default()
                         },
                         client::SessionInfo {
                             session: 3,
@@ -562,6 +570,7 @@ fn transcripts() -> Vec<Transcript> {
                             policy: Policy::Detach,
                             cols: 100,
                             rows: 30,
+                            ..Default::default()
                         },
                     ],
                 })),
@@ -581,7 +590,7 @@ fn transcripts() -> Vec<Transcript> {
                     core_version: "0.3.0".into(),
                     core_build: "b1d0".into(),
                     protocols: client::PROTOCOLS,
-                    holder_protocols: holder::PROTOCOLS,
+                    holder_protocols: VersionRange::new(1, 1),
                     pid: 4242,
                     uptime_secs: 3600,
                     clients: 2,
@@ -804,6 +813,86 @@ fn transcripts() -> Vec<Transcript> {
                 ],
             ]
             .concat(),
+        },
+        Transcript {
+            name: "client-session-keys",
+            protocol: Protocol::Client,
+            about: "Fields added within protocol 1: a spawn's profile, a session's key, and the key, title, start time and profile in a list.",
+            steps: vec![
+                hello(TOKEN),
+                welcome(),
+                c(client::ToCore::Spawn(client::Spawn {
+                    profile: Some("Shell".into()),
+                    ..spawn_message(1, "/bin/bash", Policy::Detach)
+                })),
+                s(client::ToClient::Spawned(client::Spawned {
+                    req: 1,
+                    session: 7,
+                    pid: 5000,
+                    key: KEY.into(),
+                })),
+                c(client::ToCore::Detach(client::SessionRef { session: 7 })),
+                c(client::ToCore::List(client::Request { req: 2 })),
+                s(client::ToClient::Sessions(client::Sessions {
+                    req: 2,
+                    sessions: vec![client::SessionInfo {
+                        session: 7,
+                        pid: 5000,
+                        attached: false,
+                        command: "/bin/bash -l".into(),
+                        cwd: Some("/home/u".into()),
+                        policy: Policy::Detach,
+                        cols: 80,
+                        rows: 24,
+                        key: KEY.into(),
+                        title: "vim notes.md".into(),
+                        started: 1_794_000_000,
+                        profile: Some("Shell".into()),
+                    }],
+                })),
+                c(client::ToCore::Attach(client::Attach {
+                    req: 3,
+                    session: 7,
+                    cols: 100,
+                    rows: 30,
+                })),
+            ]
+            .into_iter()
+            .chain(replay(Some(3), 7, 5000, &[&b"\x1bc"[..], b"vim"]))
+            .collect(),
+        },
+        Transcript {
+            name: "holder-set-meta",
+            protocol: Protocol::Holder,
+            about: "H1 version 2: the core replaces a session's stored meta, and the next core gets it.",
+            steps: vec![
+                ch(holder::ToHolder::Hello(holder::Hello {
+                    min: 1,
+                    max: 2,
+                    core_build: "b1d0".into(),
+                    instance: 1,
+                })),
+                h(holder::ToCore::Welcome(holder::Welcome {
+                    protocol: 2,
+                    build: "b1d0".into(),
+                    pid: 4243,
+                    previous: Previous::None,
+                    sessions: Vec::new(),
+                })),
+                ch(holder::ToHolder::SetMeta(holder::SetMeta {
+                    session: 1,
+                    meta: json!({
+                        "command": "bash -l",
+                        "cwd": "/home/u",
+                        "key": KEY,
+                        "owner": "",
+                        "policy": "detach",
+                        "profile": "Shell",
+                        "scrollback": 10000,
+                        "started": 1_794_000_000u64,
+                    }),
+                })),
+            ],
         },
     ]
 }

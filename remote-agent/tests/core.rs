@@ -74,7 +74,7 @@ fn sessions_share_one_holder_that_is_neither_the_core_nor_the_client() {
 
     // The next client hears of the holder's protocol.
     let other = TestClient::hello(&dir.path, "other");
-    assert_eq!(other.welcome.as_ref().unwrap().holder_protocols, [1]);
+    assert_eq!(other.welcome.as_ref().unwrap().holder_protocols, [brindle_remote_protocol::holder::PROTOCOLS.max]);
 }
 
 #[test]
@@ -412,7 +412,10 @@ fn a_sigkilled_clients_kill_session_ends_with_its_children_and_detach_survives()
     assert_eq!((held.session, held.pid, held.exit), (kept, kept_pid, None));
     let meta = held.meta.as_object().unwrap();
     let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
-    assert_eq!(keys, ["command", "cwd", "owner", "policy", "scrollback"]);
+    assert_eq!(
+        keys,
+        ["command", "cwd", "key", "owner", "policy", "profile", "scrollback", "started"]
+    );
     assert_eq!(meta["policy"], "detach");
     assert_eq!(meta["owner"], "token-sigkill");
     assert_eq!(meta["command"], "cat");
@@ -850,4 +853,157 @@ fn rss_kib(pid: u32) -> u64 {
         .find_map(|line| line.strip_prefix("VmRSS:"))
         .and_then(|value| value.split_whitespace().next()?.parse().ok())
         .unwrap()
+}
+
+// terminal-server-on-close 2.1–2.4
+
+/// Input to `session` is refused because the session isn't attached to
+/// `client`: the core gave it no replay of it.
+fn not_given_back(client: &mut TestClient, session: brindle_remote_protocol::SessionId) {
+    client.input(session, b"x");
+    loop {
+        match client.recv() {
+            ToClient::Error(error) if error.session == Some(session) => return,
+            ToClient::ReplayStart(start) if start.session == session => {
+                panic!("session {session} was given back")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
+    let (dir, mut client) = core("keys");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut spawn = detach(client_shell("printf '\\033]2;build\\007ready.'; exec cat"));
+    spawn.profile = Some("Shell".into());
+    let reply = client.spawn_reply(spawn);
+    let ToClient::Spawned(spawned) = reply else { panic!("{reply:?}") };
+    assert_eq!(spawned.key.len(), 32, "{spawned:?}");
+    client.output_until(spawned.session, b"ready.");
+    let listed = client.list();
+    let info = listed.iter().find(|s| s.session == spawned.session).unwrap();
+    assert_eq!(info.key, spawned.key);
+    assert_eq!(info.title, "build");
+    assert_eq!(info.profile.as_deref(), Some("Shell"));
+    assert!(info.started >= before && info.started <= before + 60, "{info:?}");
+
+    // A fresh server starts its ids over; the key tells the sessions apart.
+    client.send(client::ToCore::Stop(client::Request { req: 900 }));
+    assert!(matches!(client.reply(900), ToClient::Ok(_)));
+    assert!(client.closes());
+    start_core(&dir.path, &[]).unwrap();
+    let mut again = TestClient::hello(&dir.path, "token-keys");
+    let reply = again.spawn_reply(detach(client_spawn("cat", &[])));
+    let ToClient::Spawned(second) = reply else { panic!("{reply:?}") };
+    assert_eq!(second.session, spawned.session);
+    assert_ne!(second.key, spawned.key);
+    again.send(client::ToCore::Stop(client::Request { req: 901 }));
+    assert!(matches!(again.reply(901), ToClient::Ok(_)));
+}
+
+#[test]
+fn an_explicit_detach_keeps_a_kill_session_and_clears_its_owner() {
+    let (dir, mut client) = core("explicit-detach");
+    let (session, pid) = client.spawn(client_spawn("cat", &[]));
+    client.detach(session);
+    let listed = client.list();
+    let info = listed.iter().find(|s| s.session == session).unwrap();
+    assert_eq!((info.attached, info.policy), (false, client::Policy::Detach));
+    drop(client);
+    thread::sleep(Duration::from_millis(500));
+    assert!(alive(pid), "the detached kill session ended with its client");
+
+    // Its old client gets nothing back; anyone may attach it.
+    let mut back = TestClient::hello(&dir.path, "token-explicit-detach");
+    not_given_back(&mut back, session);
+    let mut other = TestClient::hello(&dir.path, "other");
+    other.attach(session, 80, 24).unwrap();
+}
+
+#[test]
+fn owner_and_policy_changes_survive_a_core_restart() {
+    let mut dir = TempDir::new("set-meta-restart");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (left, left_pid) = a.spawn(client_spawn("cat", &[]));
+    let (taken, _) = a.spawn(detach(client_spawn("cat", &[])));
+    dir.track(parent(left_pid).unwrap());
+    a.detach(left);
+    a.detach(taken);
+    let mut b = TestClient::hello(&dir.path, "b");
+    b.attach(taken, 80, 24).unwrap();
+
+    kill_core_and_wait_for_another(&dir, &mut a);
+    assert!(b.closes());
+    // Past the grace period: `left` was `kill` at spawn, and only its
+    // stored policy (now `detach`) keeps it running.
+    thread::sleep(PAST_GRACE);
+    assert!(alive(left_pid), "the detached kill session ended after the restart");
+
+    let mut a = TestClient::hello(&dir.path, "a");
+    not_given_back(&mut a, left);
+    not_given_back(&mut a, taken);
+    let listed = a.list();
+    let info = listed.iter().find(|s| s.session == left).unwrap();
+    assert_eq!((info.attached, info.policy), (false, client::Policy::Detach));
+
+    let mut b = TestClient::hello(&dir.path, "b");
+    let (start, _) = b.reconnect_replay();
+    assert_eq!(start.session, taken);
+}
+
+#[test]
+fn an_attaching_client_owns_the_session_and_its_policy_applies_when_it_goes() {
+    let mut dir = TempDir::new("attach-owner");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (session, pid) = a.spawn(client_spawn("cat", &[]));
+    dir.track(parent(pid).unwrap());
+    // After a core restart the kill session waits for its owner; B takes it.
+    kill_core_and_wait_for_another(&dir, &mut a);
+    let mut b = TestClient::hello(&dir.path, "b");
+    b.attach(session, 80, 24).unwrap();
+    drop(b);
+    assert!(
+        eventually(Duration::from_secs(5), || !alive(pid)),
+        "the kill session outlived the client that attached it"
+    );
+}
+
+/// The systemd unit a process runs in, from its cgroup path.
+fn unit_of(pid: u32) -> String {
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    cgroup.trim().rsplit('/').next().unwrap_or_default().to_string()
+}
+
+#[test]
+fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
+    // `start_core` sets BRINDLE_NO_SCOPE=1 for the starter; "0" overrides it
+    // for the roles the core and holder start.
+    if let brindle_remote_protocol::scope::Decision::Plain(reason) =
+        brindle_remote_protocol::scope::current()
+    {
+        eprintln!("skipped: {reason}");
+        return;
+    }
+    let mut dir = TempDir::new("scopes");
+    start_core(&dir.path, &[SUPERVISED, ("BRINDLE_NO_SCOPE", "0")]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "scopes");
+    let (_, pid) = client.spawn(client_spawn("cat", &[]));
+    let holder = parent(pid).unwrap();
+    dir.track(holder);
+    let unit = unit_of(holder);
+    assert!(unit.starts_with("brindle-hold-") && unit.ends_with(".scope"), "holder in {unit}");
+    assert_eq!(unit_of(pid), unit, "the holder's programs share its scope");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let client = TestClient::hello(&dir.path, "scopes");
+    dir.track(client.core_pid());
+    let unit = unit_of(client.core_pid());
+    assert!(unit.starts_with("brindle-serve-") && unit.ends_with(".scope"), "core in {unit}");
 }

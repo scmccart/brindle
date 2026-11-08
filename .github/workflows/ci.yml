@@ -1,4 +1,4 @@
-# Unit tests, a release build, and the end-to-end suite on two tmux versions,
+# Unit tests, a release build, and the end-to-end suite on the latest tmux,
 # plus a Windows build and tests. The e2e jobs are advisory: they go red on
 # failure but aren't required checks. The release and Windows builds are the
 # reusable build-linux.yml and build-windows.yml, which releases run too.
@@ -7,6 +7,10 @@
 # Pushes to main and pull requests run it. A pull request that changes only
 # docs (Markdown, OpenSpec, the licenses) doesn't. Its required check, the
 # PR title, is a separate workflow (pr-title.yml) and still runs.
+#
+# The e2e suite also runs on the older tmux (Ubuntu's 3.6a, which polls pane
+# state instead of subscribing) only when started by hand:
+#   gh workflow run ci.yml --ref <branch> -f old-tmux=true
 
 name: CI
 
@@ -19,6 +23,11 @@ on:
       - "openspec/**"
       - "LICENSE-*"
   workflow_dispatch:
+    inputs:
+      old-tmux:
+        description: Also run the e2e suite on the older tmux (3.6a)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -158,15 +167,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tmux:
-          # Ubuntu's package, the desktop's version.
-          - version: "3.6a"
-            reports: tmux 3.6
-          # The latest release, built from source. tmux publishes no
-          # checksums, so the tarball's is pinned here.
-          - version: "3.8"
-            reports: tmux 3.8
-            sha256: e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e
+        # The latest release ({1}), built from source; tmux publishes no
+        # checksums, so the tarball's is pinned here. Ubuntu's package ({0}),
+        # the desktop's version, only with the old-tmux input. Push and pull
+        # request runs have no inputs, so they get the latest alone.
+        tmux: >-
+          ${{ fromJSON(format(inputs.old-tmux && '[{0},{1}]' || '[{1}]',
+            '{"version":"3.6a","reports":"tmux 3.6"}',
+            '{"version":"3.8","reports":"tmux 3.8","sha256":"e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e"}')) }}
         # Each tmux version's suite runs in 4 shards (every 4th case). The
         # count is here, in the job name and in the suite's --shard.
         shard: [1, 2, 3, 4]

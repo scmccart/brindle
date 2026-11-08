@@ -754,6 +754,7 @@ fn run_brindle(
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &dump_after.to_string()])
         .env("BRINDLE_CONFIG", &config_path)
+        .env("BRINDLE_STATE_DIR", crate::brindle::state_dir(ctx))
         .env("BRINDLE_REMOTE_AGENT", agent)
         .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env(

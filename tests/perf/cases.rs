@@ -42,6 +42,8 @@ fn spawn(ctx: &Ctx, socket: &str, label: &str, args: &[&str]) -> Result<Child> {
     Command::new(&ctx.bin)
         .args(args)
         .env("BRINDLE_CONFIG", &config_path)
+        // Every launch records the session; never in the real directory.
+        .env("BRINDLE_STATE_DIR", ctx.dir.join("state"))
         .env("DISPLAY", &ctx.display)
         .env_remove("WAYLAND_DISPLAY")
         .stdout(Stdio::piped())

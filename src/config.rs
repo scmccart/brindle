@@ -29,8 +29,10 @@ pub struct Config {
     pub copy_on_select: bool,
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
-    /// Reopen the last session's windows and tabs on a plain launch.
-    pub restore_session: bool,
+    /// The removed `restore_session` key, still accepted so old configs
+    /// load: restoring is always on now. Parsing logs that it's ignored.
+    #[serde(rename = "restore_session")]
+    removed_restore_session: Option<serde::de::IgnoredAny>,
     /// Draw a red bar beside prompts whose command failed (needs shell
     /// integration; see `shell-integration/`).
     pub mark_failed_commands: bool,
@@ -56,7 +58,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             copy_on_select: false,
             osc52_paste: false,
-            restore_session: false,
+            removed_restore_session: None,
             mark_failed_commands: true,
             tmux_session_end: TmuxSessionEnd::default(),
             notifications: NotificationConfig::default(),
@@ -331,7 +333,15 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)?;
+        if config.has_removed_restore_session() {
+            log::warn!("restore_session is no longer a setting and is ignored: Brindle always restores (--no-restore skips it once)");
+        }
         Ok(config.normalized())
+    }
+
+    /// Whether the file still sets the removed `restore_session` key.
+    pub fn has_removed_restore_session(&self) -> bool {
+        self.removed_restore_session.is_some()
     }
 
     /// Ensures there is at least one profile and that names are usable.
@@ -491,10 +501,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_session_setting() {
-        assert!(!Config::parse("").unwrap().restore_session);
-        assert!(!Config::parse(DEFAULT_CONFIG).unwrap().restore_session);
-        assert!(Config::parse("restore_session = true").unwrap().restore_session);
+    fn the_removed_restore_session_key_still_loads() {
+        assert!(!Config::parse("").unwrap().has_removed_restore_session());
+        assert!(!Config::parse(DEFAULT_CONFIG).unwrap().has_removed_restore_session());
+        assert!(!DEFAULT_CONFIG.contains("restore_session"));
+        // Any old value loads, with no error for the banner.
+        for old in ["restore_session = true", "restore_session = false"] {
+            assert!(Config::parse(old).unwrap().has_removed_restore_session(), "{old}");
+        }
     }
 
     #[test]

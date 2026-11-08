@@ -71,13 +71,17 @@ fn an_upgrade_to_the_same_binary_keeps_every_session() {
     assert!(b.closes());
     start_core(&dir.path, &[]).unwrap();
 
-    // Both clients come back with their tokens and get their sessions.
+    // Both clients come back with their tokens and get the sessions they
+    // were attached to; the one b detached stays detached, and attaching
+    // it gives its replay.
     let mut a = TestClient::hello(&dir.path, "a");
     assert_ne!(a.core_pid(), old_core);
     dir.track(a.core_pid());
     let mut b = TestClient::hello(&dir.path, "b");
     let got_a = replays(&mut a, 2);
-    let got_b = replays(&mut b, 2);
+    let mut got_b = replays(&mut b, 1);
+    let attached = b.attach(kept, 80, 24).unwrap();
+    got_b.insert(kept, attached);
     for (replays, id, pid) in [
         (&got_a, full, full_pid),
         (&got_a, later, later_pid),
@@ -238,9 +242,9 @@ fn a_failing_check_leaves_the_core_running_with_the_reason_in_its_log() {
         .welcome
         .unwrap()
         .holder_protocols;
-    assert_eq!(in_use, [1]);
+    assert_eq!(in_use, [2]);
 
-    let passed = cli(&dir.path, &["check", "--holder-protocols", "1"]);
+    let passed = cli(&dir.path, &["check", "--holder-protocols", "1,2"]);
     assert!(passed.status.success(), "{passed:?}");
     assert!(passed.stdout.is_empty() && passed.stderr.is_empty());
 

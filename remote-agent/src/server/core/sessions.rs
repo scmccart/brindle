@@ -8,8 +8,10 @@
 //!   program's exit. Without a client they keep running.
 //! - **Owners** are `client_token`s. A client whose `HELLO` carries a
 //!   session's owner token gets every such session that has no client.
-//!   A client that attaches becomes the owner, as far as this core knows:
-//!   H1 can't change the meta its holder keeps.
+//!   A client that attaches becomes the owner. `DETACH` clears the owner,
+//!   so no reconnect gives the session back, and makes a `kill` session
+//!   `detach`. Both changes go to the holder with `SET_META` (H1 version
+//!   2), so a later core sees them; a version 1 holder keeps the spawn's.
 //! - **Attach:** `ATTACH` gives a session with no client to the client,
 //!   after a replay of its screen (`REPLAY_START`, `DATA`…, `REPLAY_END`),
 //!   then applies the client's size. `DETACH` leaves it running with no
@@ -129,6 +131,33 @@ impl Session {
 }
 
 /// The command line `list` shows; empty for the login shell.
+/// A new session's key: 128 random bits as hex, from `/dev/urandom`. If
+/// that can't be read, the time, pid and a counter stand in: unique enough
+/// for telling one host's sessions apart.
+fn session_key() -> String {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut bytes = [0u8; 16];
+    let random = std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if random.is_err() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let tag = (u64::from(std::process::id()) << 32) | COUNTER.fetch_add(1, Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&nanos.to_le_bytes());
+        bytes[8..].copy_from_slice(&tag.to_le_bytes());
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 fn command_line(spawn: &client::Spawn) -> String {
     match &spawn.command {
         Some(command) => std::iter::once(command.as_str())
@@ -182,9 +211,12 @@ impl<L: EventLoop> Core<L> {
         let meta = SessionMeta {
             command: command_line(&spawn),
             cwd: spawn.cwd.clone(),
+            key: session_key(),
             owner: self.client_token(client).unwrap_or_default().to_string(),
             policy: spawn.policy,
+            profile: spawn.profile.clone(),
             scrollback: spawn.scrollback,
+            started: unix_now(),
         };
         self.send_holder(
             holder,
@@ -243,6 +275,7 @@ impl<L: EventLoop> Core<L> {
         session.pid = pid;
         let req = session.spawning.take().map(|spawn| spawn.req);
         let client = session.attached;
+        let key = session.meta.key.clone();
         log!("session {id}: pid {pid} ({:?})", session.meta.command);
         if let (Some(client), Some(req)) = (client, req) {
             self.send_client(
@@ -251,6 +284,7 @@ impl<L: EventLoop> Core<L> {
                     req,
                     session: id,
                     pid,
+                    key,
                 }),
             );
             if self.client_is_over(client) {
@@ -428,7 +462,10 @@ impl<L: EventLoop> Core<L> {
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.attached.is_none() && !session.hung_up && session.meta.owner == token
+                session.attached.is_none()
+                    && !session.hung_up
+                    && !session.meta.owner.is_empty()
+                    && session.meta.owner == token
             })
             .map(|(&id, _)| id)
             .collect();
@@ -661,7 +698,11 @@ impl<L: EventLoop> Core<L> {
         }
         log!("session {id}: attached to client {client}");
         if let Some(token) = self.client_token(client).map(str::to_string) {
-            self.sessions.get_mut(&id).expect("the session").meta.owner = token;
+            let session = self.sessions.get_mut(&id).expect("the session");
+            if session.meta.owner != token {
+                session.meta.owner = token;
+                self.store_meta(id);
+            }
         }
         self.replay(
             client,
@@ -671,14 +712,36 @@ impl<L: EventLoop> Core<L> {
         );
     }
 
-    /// `DETACH`: the session keeps running with no client.
+    /// `DETACH`: the session keeps running with no client, whatever its
+    /// policy: a `kill` session becomes `detach`. It also loses its owner,
+    /// so no reconnect gives it back to a client that let it go.
     pub(super) fn client_detach(&mut self, client: Token, id: SessionId) {
-        if self.client_session(client, id).is_none() {
+        let Some(session) = self.client_session(client, id) else {
             return;
-        }
+        };
         log!("session {id}: detached by client {client}");
+        session.meta.owner.clear();
+        session.meta.policy = Policy::Detach;
+        self.store_meta(id);
         self.detach_session(id);
         self.checkpoint(id);
+    }
+
+    /// Sends the session's meta to its holder (`SET_META`), so a later core
+    /// that adopts it knows its owner and policy. A holder driven in H1
+    /// version 1 can't take it: the change holds only in this core.
+    fn store_meta(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        let holder = session.holder;
+        let meta = session.meta.to_value();
+        match self.holders.get(&holder).and_then(|holder| holder.protocol()) {
+            Some(protocol) if protocol >= 2 => {
+                self.send_holder(holder, ToHolder::SetMeta(h1::SetMeta { session: id, meta }));
+            }
+            _ => log!("session {id}: its holder speaks H1 version 1; its owner and policy last only in this core"),
+        }
     }
 
     /// Gives a session with no client to `client`: `REPLAY_START`, the

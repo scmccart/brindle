@@ -1,6 +1,6 @@
-//! Several windows, in one Brindle or in two, stay independent: what is
-//! done in one window doesn't happen in another, and a session is shown
-//! by one window at most, whichever process opened it.
+//! Two Brindles beside each other (the second a debug run, which runs on
+//! its own) stay independent: what is done in one doesn't happen in the
+//! other, and a session is shown by one of them at most.
 
 use super::server;
 use crate::brindle::{Output, Run};
@@ -40,55 +40,6 @@ pub(super) fn two_processes<'a>(ctx: &Ctx, gap: f64, first: Run<'a>, second: Run
         (first.join().unwrap_or_else(|_| Err("first run panicked".into())), second)
     });
     Ok((first?, second?))
-}
-
-/// Window 1 is a shell, window 2 (ctrl-shift-n) the session. Tabs opened
-/// and closed in window 1 stay there, and the session gets no window.
-pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .profile("Shell")
-        .action("new_window")
-        .send("")
-        .action("new_tab_with_profile_1")
-        .action("new_tab_with_profile_1")
-        .action("close_tab")
-        .send("echo one\r")
-        .record_at(7.0, "clients", LIST_CLIENTS)
-        .dump_at(7.5)
-        .run()?;
-    ensure!(out.dump.tabs.len() == 2, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1.len() == 1, "windows: {:?}", out.dump.windows);
-    ensure!(tmux_windows(&server)? == 1, "tmux windows: {:?}", server.run(&["list-windows", "-t", "e2e"])?);
-    let clients = recorded_lines(ctx, "run", "clients")?;
-    ensure!(clients.len() == 1, "clients: {clients:?}");
-    Ok(Outcome::Pass)
-}
-
-/// Window 1 shows the session, window 2 a shell (ctrl-shift-n, "New
-/// window: Shell"). Splitting and adding tmux windows in window 1 leaves
-/// window 2 with its one tab.
-pub fn tmux_commands(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .send("")
-        .action("new_window")
-        .action("picker_down")
-        .action("picker_down")
-        .action("picker_confirm")
-        .action("tmux_split_right")
-        .action("tmux_new_window")
-        .record_at(8.5, "clients", LIST_CLIENTS)
-        .dump_at(9.0)
-        .run()?;
-    ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
-    ensure!(out.dump.tabs.len() == 2, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1 == ["bash"], "windows: {:?}", out.dump.windows);
-    let panes = server.run(&["list-panes", "-s", "-t", "e2e", "-F", "#{window_index}:#{pane_id}"])?;
-    ensure!(panes.lines().count() == 3, "panes: {panes:?}");
-    let clients = recorded_lines(ctx, "run", "clients")?;
-    ensure!(clients.len() == 1, "clients: {clients:?}");
-    Ok(Outcome::Pass)
 }
 
 /// A second Brindle launched with the session's profile while the first
@@ -192,25 +143,6 @@ pub fn second_process_shortcut(ctx: &Ctx) -> Result<Outcome> {
     let clients = recorded_lines(ctx, "second", "clients")?;
     ensure!(clients.len() == 1, "clients while both ran: {clients:?}");
     ensure!(first.dump.tabs.len() == 1 && first.dump.tabs[0].1, "first tabs: {:?}", first.dump.tabs);
-    Ok(Outcome::Pass)
-}
-
-/// ctrl-shift-n in a second Brindle opens the window, which asks: it has
-/// no tabs.
-pub fn second_process_new_window(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let first = Run::new(ctx, &server, "first").dump_at(9.0);
-    let second = Run::new(ctx, &server, "second")
-        .profile("Shell")
-        .action("new_window")
-        .record_at(3.5, "clients", LIST_CLIENTS)
-        .dump_at(4.0);
-    let (first, second) = two_processes(ctx, 3.0, first, second)?;
-    ensure!(second.dump.tabs.len() == 1, "second tabs: {:?}", second.dump.tabs);
-    ensure!(second.dump.windows == [(2, Vec::new())], "second's windows: {:?}", second.dump.windows);
-    let clients = recorded_lines(ctx, "second", "clients")?;
-    ensure!(clients.len() == 1, "clients while both ran: {clients:?}");
-    ensure!(first.dump.tabs.len() == 1, "first tabs: {:?}", first.dump.tabs);
     Ok(Outcome::Pass)
 }
 

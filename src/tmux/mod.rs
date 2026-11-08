@@ -573,37 +573,6 @@ fn tmux_process(
     Ok(crate::remote::TmuxProcess { command, initial_input: Vec::new() })
 }
 
-/// Whether session `name` exists on `profile`'s server. Runs tmux, so it
-/// belongs off the UI thread. Anything but a prompt success (a missing
-/// server, a tmux that won't start, a timeout) means no.
-pub fn session_exists(profile: &Profile, name: &str) -> bool {
-    let (program, args) = has_session_command(profile, name);
-    let Ok(process) = tmux_process(profile, &program, &args, None) else { return false };
-    let (mut command, input) = (process.command, process.initial_input);
-    command
-        .stdin(if input.is_empty() { Stdio::null() } else { Stdio::piped() })
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else { return false };
-    if !input.is_empty() && !child.stdin.take().is_some_and(|mut stdin| stdin.write_all(&input).is_ok()) {
-        child.kill().ok();
-        child.wait().ok();
-        return false;
-    }
-    let never_cancel = std::sync::atomic::AtomicBool::new(false);
-    crate::remote::wait_process(child, &never_cancel, std::time::Duration::from_secs(30)).is_ok_and(|status| status.success())
-}
-
-/// The command that succeeds when session `name` exists on `profile`'s
-/// server (an exact match, not a prefix).
-pub fn has_session_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
-    let tmux = tmux_command(profile);
-    let mut args = tmux.prefix;
-    args.extend(tmux.options);
-    args.extend(["has-session".into(), "-t".into(), format!("={name}")]);
-    (tmux.program, args)
-}
-
 /// Set on Brindle's control clients to Brindle's pid, so that another
 /// Brindle can tell them from other programs' clients. A server that one of
 /// them starts inherits it, and so do the shells in its panes, which is why
@@ -2161,18 +2130,10 @@ mod tests {
     }
 
     #[test]
-    fn wsl_session_checks_run_inside_wsl() {
-        let (program, args) = has_session_command(&wsl_profile("wsl", &["tmux"]), "logs");
-        assert_eq!(program, "wsl");
-        assert_eq!(args, ["--exec", "tmux", "has-session", "-t", "=logs"]);
-    }
-
-    #[test]
     fn a_program_that_isnt_wsl_is_unchanged() {
         let profile = wsl_profile("/opt/tmux/bin/tmux", &["-L", "x"]);
         let (_, args) = command_line(&profile, &AttachSpec::Named, Some(&PathBuf::from("/tmp")));
         assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-A", "-s", "main", "-c", "/tmp"]);
-        assert_eq!(has_session_command(&profile, "s").1, ["-L", "x", "has-session", "-t", "=s"]);
     }
 
     #[test]
@@ -2238,12 +2199,6 @@ mod tests {
         assert!(!other_brindle_client(&[13], 1, read));
         assert!(!other_brindle_client(&[99], 1, read), "unreadable");
         assert!(!other_brindle_client(&[], 1, read));
-    }
-
-    #[test]
-    fn has_session_matches_exactly() {
-        let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
-        assert_eq!(has_session_command(&profile, "work"), ("tmux".into(), vec!["-L".into(), "x".into(), "has-session".into(), "-t".into(), "=work".into()]));
     }
 
     #[test]
