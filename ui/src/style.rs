@@ -650,7 +650,7 @@ mod tests {
         let inner_right = SWITCH_TRACK_WIDTH.0 - SWITCH_TRACK_BORDER.0;
         assert_eq!(switch_thumb_offset(true).0 + SWITCH_THUMB_SIZE.0 + SWITCH_TRACK_BORDER.0, inner_right);
         // And it fits the track's height.
-        assert!(SWITCH_THUMB_SIZE.0 <= SWITCH_TRACK_HEIGHT.0 - 2. * SWITCH_TRACK_BORDER.0 + f32::EPSILON);
+        const { assert!(SWITCH_THUMB_SIZE.0 <= SWITCH_TRACK_HEIGHT.0 - 2. * SWITCH_TRACK_BORDER.0 + f32::EPSILON) };
     }
 
     /// A dialog is the background colour with a border, rounded-lg, and

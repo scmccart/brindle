@@ -339,6 +339,12 @@ impl Select {
         self.menu.is_open()
     }
 
+    /// The open menu's highlighted option, or `None` while the menu is
+    /// closed (or highlights nothing).
+    pub fn highlighted(&self, cx: &App) -> Option<usize> {
+        self.menu.view().and_then(|menu| menu.read(cx).nav.highlight)
+    }
+
     /// Opens the menu with the highlight on the selection (else the first
     /// enabled option) and gives it focus. Nothing happens when the select
     /// is disabled or the menu is already open.
