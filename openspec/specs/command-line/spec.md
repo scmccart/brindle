@@ -11,13 +11,22 @@ Brindle SHALL accept:
 - `-d/--working-directory <DIR>`;
 - `--config <FILE>`;
 - `-e/--command <CMD> [ARGS]...`, which runs CMD instead of the profile's program and must come last;
-- `--no-restore`, which skips session restore for this launch.
+- `--no-restore`, which skips session restore for this launch;
+- `--attach <ID>` (Linux), which opens a tab attached to the detached terminal server session `ID`.
 
 An unknown argument SHALL print usage and exit with status 2.
 
 #### Scenario: Run a command
 - **WHEN** the user runs `brindle -e htop`
-- **THEN** a window opens running htop, and closing htop closes the window
+- **THEN** a tab running htop opens and becomes active, and when htop exits its tab closes
+
+#### Scenario: Attach a session
+- **WHEN** `brindle-remote list` shows a detached session 7 running `htop`, and the user runs `brindle --attach 7`
+- **THEN** an active tab shows that `htop`, and the session is no longer detached
+
+#### Scenario: Attach a missing session
+- **WHEN** the user runs `brindle --attach 99` and there is no session 99, or it is attached elsewhere
+- **THEN** an active tab's message names session 99 and the reason
 
 ### Requirement: Informational options
 `--help`, `--version`, `--list-actions` (every bindable action name), `--list-themes` (the built-in themes) and `--shell-integration <bash|zsh|fish|pwsh>` (that shell's integration script) SHALL print their output and exit without opening a window. `--shell-integration` with a missing or unsupported shell SHALL print an error naming the supported shells and exit with status 2.
@@ -145,17 +154,6 @@ Brindle SHALL accept `--install-desktop` and `--uninstall-desktop`, with an opti
 - **WHEN** the user runs `brindle --prefix /usr/local`
 - **THEN** usage is printed and the exit status is 2
 
-### Requirement: Plain launch restores the session
-A launch without `-p`, `-d`, `-e` or `--no-restore` is a plain launch. With `restore_session` on, a plain launch SHALL restore the recorded session as defined by the `session-restore` capability. Any other launch SHALL open its single window as requested and SHALL NOT restore. The debug options (`--send`, `--action`, `--dump-screen-after`) SHALL NOT affect whether a launch is plain, and they act on the first restored window.
-
-#### Scenario: Profile launch skips restore
-- **WHEN** restore is on and the user runs `brindle -p tmux`
-- **THEN** one window opens with the tmux profile, and the recorded tabs are not reopened
-
-#### Scenario: Skip once
-- **WHEN** restore is on and the user runs `brindle --no-restore`
-- **THEN** one window opens with a single default-profile tab
-
 ### Requirement: Notification log for tests
 When the environment variable `BRINDLE_NOTIFY_LOG` names a file, Brindle SHALL append each notification it would show to that file instead of sending it to the desktop, one line per notification: the source (`bell`, `osc9`, `osc777` or `osc7501`), the title and the body, separated by tabs. The line SHALL be written before the notification counts as sent, so it is in the file even if Brindle quits right after, for example from `--dump-screen-after`.
 
@@ -199,3 +197,29 @@ When the environment variable `BRINDLE_SERVER_DIR` is set and not empty, Brindle
 #### Scenario: Managing from a tab
 - **WHEN** the user runs `brindle-remote list` in a local tab
 - **THEN** it lists the sessions of the server that tab runs in, that tab's own session included
+
+### Requirement: A launch restores, then opens what it asks for
+A launch that becomes the instance (see `session-restore`'s "One process owns the state") SHALL restore the recorded session and reattach detached sessions, as defined by `session-restore`, unless it has `--no-restore`. It SHALL then open what it asks for as the active tab: `-p` and `-d` a new tab with that profile or directory, `-e` a tab running the command, `--attach` a tab attached to that session. A launch with none of them SHALL open no further tab, or one default-profile tab when nothing was restored. The debug options (`--send`, `--action`, `--dump-screen-after`) act on the active tab after this.
+
+#### Scenario: Profile launch
+- **WHEN** Brindle quit with two tabs, and the user runs `brindle -p tmux`
+- **THEN** the window shows the two restored tabs and an active tab with the tmux profile
+
+#### Scenario: Skip once
+- **WHEN** the user runs `brindle --no-restore`
+- **THEN** the window opens with a single default-profile tab
+
+### Requirement: A launch goes to the running Brindle
+A launch without debug options while an instance runs (one with the same state directory) SHALL send its request to the instance and exit with status 0 once the instance has accepted it. The instance SHALL raise its window and open what the launch asked for, as "A launch restores, then opens what it asks for" says, without restoring again; a `-e` command SHALL start in the launching process's working directory. When the instance doesn't accept the request within 5 seconds, the launch SHALL print why and exit with status 1. The request channel SHALL be reachable only by the same user.
+
+#### Scenario: Second plain launch
+- **WHEN** Brindle runs with two tabs and the user launches `brindle` from the desktop
+- **THEN** the window is raised, it still has two tabs, and no second window opens
+
+#### Scenario: Command from a shell
+- **WHEN** Brindle runs and the user runs `brindle -e htop` in a shell in `/srv`
+- **THEN** the `brindle` command exits, and Brindle's window gains an active tab running htop in `/srv`
+
+#### Scenario: Attach from a shell
+- **WHEN** Brindle runs, session 7 is detached, and the user runs `brindle --attach 7`
+- **THEN** Brindle's window gains an active tab showing session 7
