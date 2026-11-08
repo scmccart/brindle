@@ -1478,6 +1478,9 @@ mod check {
                 std::process::exit(1);
             }
         };
+        // First, as the window opened: Tab must work from the start.
+        let check = tab_moves_focus(&mut c).await;
+        c.run_check("tab-moves-focus-through-the-gallery-and-wraps", check).await;
         let check = theme_switch(&mut c).await;
         c.run_check("theme-switch-redraws-in-dark-tokens", check).await;
         let check = button_mouse_click(&mut c).await;
@@ -1488,8 +1491,6 @@ mod check {
         c.run_check("button-disabled-runs-nothing-keeps-focus", check).await;
         let check = focus_visible(&mut c).await;
         c.run_check("focus-visible-pointer-then-keyboard", check).await;
-        let check = tab_moves_focus(&mut c).await;
-        c.run_check("tab-moves-focus-through-the-gallery-and-wraps", check).await;
         let check = ring_paints(&mut c).await;
         c.run_check("focus-ring-paints-outside-each-tabbed-control", check).await;
         let check = input_frame_press(&mut c).await;
