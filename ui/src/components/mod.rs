@@ -20,6 +20,7 @@ pub mod checkbox;
 pub mod dialog;
 pub mod input;
 pub mod popover;
+pub mod select;
 pub mod switch;
 
 use gpui::{BoxShadow, Hsla, Pixels, point, px};
@@ -29,6 +30,10 @@ pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use dialog::{Dialog, dialog_width};
 pub use input::Input;
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
+pub use select::{
+    Activation, Select, SelectEvent, SelectOption, Selection, TypedKey, initial_highlight, trigger_activation,
+    typed_key,
+};
 pub use switch::Switch;
 
 /// shadcn's `disabled:opacity-50`.

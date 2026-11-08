@@ -335,6 +335,102 @@ pub fn popover_style(t: &Tokens) -> PopoverStyle {
     }
 }
 
+/// The opacity of a decorative icon beside text: a select trigger's chevron
+/// and a command filter's search glass, shadcn's `opacity-50`.
+pub const MUTED_ICON_OPACITY: f32 = 0.5;
+
+/// A select menu's least width, shadcn's `min-w-[8rem]`. The menu is also
+/// at least as wide as its trigger.
+pub const SELECT_MENU_MIN_WIDTH: Rems = Rems(8.);
+
+/// A select menu's greatest height. shadcn's is whatever room the
+/// positioner finds; the crate caps it at `max-h-96` and lets `Anchored`
+/// flip or pin the menu.
+pub const SELECT_MENU_MAX_HEIGHT: Rems = Rems(24.);
+
+/// The tick beside the selected option, shadcn's `size-3.5`.
+pub const SELECT_TICK_SIZE: Rems = Rems(0.875);
+
+/// A select's resolved look: the trigger and the menu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectStyle {
+    /// The trigger's border, the input colour.
+    pub border: Hsla,
+    /// The trigger's text when it shows the selected option's label.
+    pub foreground: Hsla,
+    /// The trigger's text when it shows the placeholder.
+    pub placeholder: Hsla,
+    /// The menu panel.
+    pub menu_background: Hsla,
+    pub menu_foreground: Hsla,
+    pub menu_border: Hsla,
+    /// The highlighted option.
+    pub highlight: Hsla,
+    pub highlight_foreground: Hsla,
+    /// The trigger's and the menu's corners.
+    pub radius: Rems,
+    /// An option's corners.
+    pub option_radius: Rems,
+}
+
+/// shadcn's Select: the trigger `border-input`, its placeholder
+/// `text-muted-foreground`, the content `bg-popover text-popover-foreground
+/// rounded-md border`, and the item `focus:bg-accent
+/// focus:text-accent-foreground rounded-sm`.
+pub fn select_style(t: &Tokens) -> SelectStyle {
+    SelectStyle {
+        border: t.input,
+        foreground: t.foreground,
+        placeholder: t.muted_foreground,
+        menu_background: t.popover,
+        menu_foreground: t.popover_foreground,
+        menu_border: t.border,
+        highlight: t.accent,
+        highlight_foreground: t.accent_foreground,
+        radius: t.radius_md(),
+        option_radius: t.radius_sm(),
+    }
+}
+
+/// A command list's greatest height, shadcn's `max-h-[300px]`, in rems so
+/// it scales.
+pub const COMMAND_LIST_MAX_HEIGHT: Rems = Rems(18.75);
+
+/// A command list's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommandStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    /// The line under the filter input.
+    pub border: Hsla,
+    /// Group headings, item details and shortcuts.
+    pub muted: Hsla,
+    /// The highlighted item.
+    pub highlight: Hsla,
+    pub highlight_foreground: Hsla,
+    /// The list's corners.
+    pub radius: Rems,
+    /// An item's corners.
+    pub item_radius: Rems,
+}
+
+/// shadcn's Command: `bg-popover text-popover-foreground rounded-md`, the
+/// input row's `border-b`, headings and shortcuts in `text-muted-foreground`,
+/// and the item `data-[selected=true]:bg-accent
+/// data-[selected=true]:text-accent-foreground rounded-sm`.
+pub fn command_style(t: &Tokens) -> CommandStyle {
+    CommandStyle {
+        background: t.popover,
+        foreground: t.popover_foreground,
+        border: t.border,
+        muted: t.muted_foreground,
+        highlight: t.accent,
+        highlight_foreground: t.accent_foreground,
+        radius: t.radius_md(),
+        item_radius: t.radius_sm(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +689,55 @@ mod tests {
             );
         }
         assert_eq!(POPOVER_WIDTH, rems(18.));
+    }
+
+    /// A select's trigger is input-bordered with a muted placeholder; its
+    /// menu is the popover pair with the accent pair for the highlight.
+    #[test]
+    fn select_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(
+                select_style(&t),
+                SelectStyle {
+                    border: t.input,
+                    foreground: t.foreground,
+                    placeholder: t.muted_foreground,
+                    menu_background: t.popover,
+                    menu_foreground: t.popover_foreground,
+                    menu_border: t.border,
+                    highlight: t.accent,
+                    highlight_foreground: t.accent_foreground,
+                    radius: t.radius_md(),
+                    option_radius: t.radius_sm(),
+                }
+            );
+        }
+        // min-w-[8rem], max-h-96, a size-3.5 tick, opacity-50 icons.
+        assert_eq!((SELECT_MENU_MIN_WIDTH, SELECT_MENU_MAX_HEIGHT, SELECT_TICK_SIZE), (rems(8.), rems(24.), rems(0.875)));
+        assert_eq!(MUTED_ICON_OPACITY, 0.5);
+    }
+
+    /// A command list is the popover pair, muted headings and shortcuts,
+    /// and the accent pair for the highlight.
+    #[test]
+    fn command_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(
+                command_style(&t),
+                CommandStyle {
+                    background: t.popover,
+                    foreground: t.popover_foreground,
+                    border: t.border,
+                    muted: t.muted_foreground,
+                    highlight: t.accent,
+                    highlight_foreground: t.accent_foreground,
+                    radius: t.radius_md(),
+                    item_radius: t.radius_sm(),
+                }
+            );
+        }
+        // max-h-[300px] at the 16px root size.
+        assert_eq!(COMMAND_LIST_MAX_HEIGHT, rems(18.75));
     }
 
     #[test]
