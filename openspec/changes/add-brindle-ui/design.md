@@ -10,7 +10,7 @@
   - `deferred` (paints last; `with_priority` for z-order) and `anchored` (corner anchor, `SwitchAnchor` flip, `snap_to_window_with_margin`).
   - `on_mouse_down_out`, `occlude`, `FocusHandle` with `contains_focused`/`downgrade` → `WeakFocusHandle`.
   - `ManagedView` (`Focusable + EventEmitter<DismissEvent> + Render`, `window.rs:453`), `window.use_keyed_state`, `with_animation` (mount only), `App::observe_keystrokes`.
-  - Keyboard clicks: a focused element with `on_click` gets `ClickEvent::Keyboard` on enter or space key-up (`div.rs:2184`).
+  - Keyboard clicks: a focused element with `on_click` gets `ClickEvent::Keyboard` on enter or space key-*up* (`div.rs:2184`), for whatever has focus at the key-up, with no pairing to the key-down.
 - **What GPUI 0.2.2 lacks:**
   - a focus trap: `TabStopMap` is `pub(crate)`, and `focus_next` walks the whole window and wraps;
   - a layer stack, exit animations, a keyboard-vs-pointer focus signal, accessibility.
@@ -64,7 +64,7 @@ ui/                         package brindle-ui, lib brindle_ui
     dialog.rs popover.rs select.rs command.rs
   src/text_input.rs         moved from src/text_input.rs
   src/filter.rs             fuzzy_match/filter, moved from picker.rs
-  examples/gallery.rs
+  examples/gallery.rs       every component; `-- --check` drives the spec's scenarios
 ```
 
 - The dependency direction is `brindle → brindle-ui → gpui`, and the crate depends on nothing else.
@@ -83,7 +83,8 @@ ui/                         package brindle-ui, lib brindle_ui
 - **Focusable stateless controls take a `FocusHandle` from the owner** (`.focus(&handle)`), because a `RenderOnce` value can't keep one between frames.
   - Without a handle a control can't take keyboard focus, and pressing it doesn't move focus.
   - The owner then knows every stop, which the focus scope needs.
-- **Enter and space activation is GPUI's own keyboard click** (`ClickEvent::Keyboard`), so buttons need no activation action.
+- **Enter and space activate on key-down, and gpui's keyboard click is ignored.** gpui raises `ClickEvent::Keyboard` on the key-up, for whatever has focus then, unpaired with the key-down. The gallery's `--check` reproduced what that does to a closing overlay: enter in a command popover (key-down) confirms, the host closes and focus returns to the button that opened it, and the key-up clicks that button and opens the popover again (the same for a command dialog). So every control runs its `on_click` on the key-down it sees itself, through `components::activates`: `key_activation` takes a first press of bare enter or space for buttons and the dialog's close `X`, and space alone for the checkbox and the switch (enter passes, as in a web form); the handler gets a `ClickEvent::Keyboard` with empty bounds, the key stops there, and a held key activates once. From gpui the controls take mouse clicks only (`accepts_click`). Select already worked this way (below). There is still no activation action.
+  - **Alternative considered:** arming a per-window record on the key-down and accepting the key-up click only for the armed control. Rejected: a key-down whose key-up lands elsewhere (the opener's, once the popover has focus) leaves a stale record for the next unpaired key-up to redeem, which is the hazard again.
 - **Alternatives considered:**
   - Everything as entities: heavy, and it breaks builder ergonomics for simple controls.
   - Everything `RenderOnce` with `use_keyed_state`: the state is hidden, and overlay open/close has no hook for returning focus.
@@ -188,6 +189,14 @@ ui/                         package brindle-ui, lib brindle_ui
   - Select doesn't wrap and renders every option (lists are short), scrolling with `ScrollHandle::scroll_to_item`.
   - Command wraps (matching the palette today) and uses `gpui::list`/`ListState`, because rows have mixed heights (group headings) and palettes can be long.
 - **Filtering.** `fuzzy_match`/`filter` (case-insensitive subsequence) move from `picker.rs` to `brindle_ui::filter`, and `picker.rs` imports them, so the match rule lives in one place before `ui-command-palette`.
+- **Command highlights the first *enabled* match** on each change to the filter (`CommandRows::build`); a list whose matches are all disabled highlights nothing, and enter confirms nothing.
+
+### Select
+
+- **The trigger opens on enter and space key-down, not on gpui's keyboard click:** enter through `ListConfirm` (the trigger is in the `UiList` context), space through `on_key_down`, and a `ClickEvent::Keyboard` does nothing (`trigger_activation`). A pick on enter in the menu closes it and refocuses the trigger before the key-up, which would otherwise open the menu again; the same key-up pairing problem the controls above answer the same way.
+- **Home and End are inert on a closed trigger**, as in Radix. The trigger takes `ListFirst`/`ListLast` so a list around the select doesn't move instead.
+- **The menu is start-aligned under the trigger and at least as wide as it**, capped at `max-h-96` (24rem) and scrolled past that, with `Anchored` flipping it above when it doesn't fit below. shadcn's positioner sizes the menu to the room it finds instead.
+- **An option press counts as pointer input** (`set_modality(Pointer)` on mouse-down), so the trigger the pick refocuses shows no ring; a pick by enter leaves the keyboard modality and the ring.
 
 ### Focus visible
 
@@ -229,12 +238,12 @@ ui/                         package brindle-ui, lib brindle_ui
 - **Unit tests** cover every pure piece: `LayerStack`, `cycle`, `place`, `ListNav`, `Typeahead`, `filter`, `button_style` and the token constants. `TextInput`'s existing `EditState` tests move with it.
 - **gpui's `test-support` feature is deliberately rejected**, because it adds `backtrace` and other crates to `Cargo.lock`, against the lock rule.
 - **GUI behaviour** (focus trap, layered dismissal, placement on screen) is checked through Brindle's e2e suite in the migration changes, as each component is wired into a surface. That is CLAUDE.md's rule for GUI checks.
-- **`gallery` is for manual review only.** `cargo test --workspace` builds it, which keeps it compiling.
+- **The gallery has a `--check` mode** (`cargo run -p brindle-ui --example gallery -- --check`) that drives the Verify scenarios of tasks 4.x and 5.1–5.7 from inside the app, the way Brindle's `--action` and `--dump-screen-after` hooks do: key presses go through `Window::dispatch_keystroke` (gpui's own dispatch, bindings and all) and state is read from the components' entities and focus handles. `Window::dispatch_event` returns a type private to gpui, so key releases and pointer presses have no in-process hook; on Windows they are posted as `WM_KEYUP` and mouse messages to the gallery's own window at the bounds the components painted (messages to one window, not input to the desktop, the rule Brindle's e2e probes follow), and elsewhere those checks report `SKIP`. It prints `ok`/`FAIL`/`SKIP` per check and exits non-zero on a failure, a panic or a hang. It opens a window, so it isn't in CI; `cargo test --workspace` builds it, which keeps it compiling. Plain `cargo run -p brindle-ui --example gallery` is the interactive gallery for a person.
 - **The move is checked by the existing e2e cases** that read `--- input` lines. `TextInput::describe` stays `pub` for them.
 
 ## Risks / Trade-offs
 
-- [The behaviour of overlays and focus has no automated GUI check until the migrations] → Keep the GPUI glue minimal and the decisions in pure functions. Each migration change adds e2e cases for the components it adopts.
+- [The behaviour of overlays and focus has no GUI check in CI until the migrations] → Keep the GPUI glue minimal and the decisions in pure functions. The gallery's `--check` covers the spec's scenarios on a developer's desktop (it found the key-up click hazard above), and each migration change adds e2e cases for the components it adopts.
 - [The modality heuristic misreads mixed input, for example a key pressed while hovering] → It only affects whether a ring shows. A keystroke always makes rings visible, which is the safe side.
 - [Deferred dismissals apply one tick late] → Imperceptible. The alternative is double-closing nested overlays.
 - [The owner must list focus stops by hand, and a missed stop can't be tabbed to] → The gallery and each migration's e2e cases exercise Tab through every control. A debug assertion warns when the focused handle inside a scope isn't in its stops.

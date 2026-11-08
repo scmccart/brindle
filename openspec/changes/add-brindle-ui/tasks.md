@@ -39,8 +39,8 @@
 
 ## 6. Gallery and docs
 
-- [ ] 6.1 `ui/examples/gallery.rs`: calls `init`, binds `default_bindings()`, shows every component in every variant and size with a light/dark toggle, and the dialog/popover/select/command cases from group 5. Verify: `cargo test --workspace` builds it; a manual run (ask first on a desktop; `scripts/with-xvfb cargo run -p brindle-ui --example gallery` on Linux) shows each component and passes the checks listed in 5.1–5.7.
-- [ ] 6.2 Add `ui/README.md` (purpose, boundary rule, component kinds, how an app wires `init`/`default_bindings`/`UiTheme`/`Overlay`) and mention the gallery command in the root README's build section. Verify: the commands in both files run as written.
+- [x] 6.1 `ui/examples/gallery.rs`: calls `init`, binds `default_bindings()`, shows every component in every variant and size with a light/dark toggle, and the dialog/popover/select/command cases from group 5. Verify: `cargo test --workspace` builds it; a manual run (ask first on a desktop; `scripts/with-xvfb cargo run -p brindle-ui --example gallery` on Linux) shows each component and passes the checks listed in 5.1–5.7.
+- [x] 6.2 Add `ui/README.md` (purpose, boundary rule, component kinds, how an app wires `init`/`default_bindings`/`UiTheme`/`Overlay`) and mention the gallery command in the root README's build section. Verify: the commands in both files run as written.
 
 ## 7. Integration
 
