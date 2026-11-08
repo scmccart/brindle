@@ -247,8 +247,11 @@ fn run_with(
     std::fs::write(&config, config_text).map_err(|e| e.to_string())?;
     let log_path = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    // `-p` alone restores the previous run's tabs too; such runs start clean.
+    let no_restore: &[&str] = if args.contains(&"-p") { &["--no-restore"] } else { &[] };
     let mut child = Command::new(&ctx.bin)
         .args(args)
+        .args(no_restore)
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &ctx.secs(dump_at).to_string()])
         .env("BRINDLE_CONFIG", &config)
