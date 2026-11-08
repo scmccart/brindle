@@ -73,6 +73,11 @@ pub struct ButtonStyle {
     pub hover_foreground: Hsla,
     /// Underline the label on hover (the link variant).
     pub hover_underline: bool,
+    /// The focus ring's colour while it shows.
+    pub ring: Hsla,
+    /// The border's colour while the ring shows, for a variant that has a
+    /// border (shadcn's `focus-visible:border-ring`).
+    pub focus_border: Option<Hsla>,
     pub height: Rems,
     /// A fixed width, for the square icon size.
     pub width: Option<Rems>,
@@ -86,12 +91,20 @@ pub struct ButtonStyle {
     pub radius: Rems,
 }
 
-/// shadcn's `buttonVariants` for `variant` and `size`, in the colours of `t`.
+/// shadcn's `buttonVariants` (the new-york-v4 style) for `variant` and
+/// `size`, in the colours of `t`.
 ///
-/// shadcn's `dark:` refinements (the outline's input-coloured fill, the dimmed
-/// destructive) are left out: the variants read tokens only, not the set's
-/// [`Tokens::dark`] hint.
+/// In a dark set ([`Tokens::dark`]) the variants take shadcn's `dark:`
+/// refinements: the destructive fill at 60% and its ring at 40%, the
+/// outline's input-coloured border and translucent input fill, and the
+/// ghost's half-faded hover. Where a `dark:` class and a `hover:` or
+/// `focus-visible:` class set the same property, the colour is the one
+/// shadcn's compiled CSS shows: the two rules have the same specificity and
+/// the `dark:` one comes later, so it wins. The base's
+/// `dark:aria-invalid:ring-destructive/40` is left out, since a button has no
+/// invalid state here.
 pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> ButtonStyle {
+    let dark = t.dark;
     // (background, foreground, border, hover background, hover foreground)
     let (background, foreground, border, hover_background, hover_foreground) = match variant {
         // bg-primary text-primary-foreground hover:bg-primary/90
@@ -102,15 +115,26 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
             Some(t.primary.opacity(0.9)),
             t.primary_foreground,
         ),
-        // bg-destructive text-white hover:bg-destructive/90
-        ButtonVariant::Destructive => (
-            Some(t.destructive),
-            t.destructive_foreground,
-            None,
-            Some(t.destructive.opacity(0.9)),
-            t.destructive_foreground,
+        // bg-destructive text-white hover:bg-destructive/90, and
+        // dark:bg-destructive/60, which also holds on hover: a dark
+        // destructive button doesn't change on hover.
+        ButtonVariant::Destructive => {
+            let (fill, hover) = if dark {
+                (t.destructive.opacity(0.6), t.destructive.opacity(0.6))
+            } else {
+                (t.destructive, t.destructive.opacity(0.9))
+            };
+            (Some(fill), t.destructive_foreground, None, Some(hover), t.destructive_foreground)
+        }
+        // border bg-background hover:bg-accent hover:text-accent-foreground,
+        // and dark:border-input dark:bg-input/30 dark:hover:bg-input/50
+        ButtonVariant::Outline if dark => (
+            Some(t.input.opacity(0.3)),
+            t.foreground,
+            Some(t.input),
+            Some(t.input.opacity(0.5)),
+            t.accent_foreground,
         ),
-        // border bg-background hover:bg-accent hover:text-accent-foreground
         ButtonVariant::Outline => (
             Some(t.background),
             t.foreground,
@@ -126,17 +150,29 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
             Some(t.secondary.opacity(0.8)),
             t.secondary_foreground,
         ),
-        // hover:bg-accent hover:text-accent-foreground
+        // hover:bg-accent hover:text-accent-foreground, and
+        // dark:hover:bg-accent/50
         ButtonVariant::Ghost => (
             None,
             t.foreground,
             None,
-            Some(t.accent),
+            Some(if dark { t.accent.opacity(0.5) } else { t.accent }),
             t.accent_foreground,
         ),
         // text-primary underline-offset-4 hover:underline
         ButtonVariant::Link => (None, t.primary, None, None, t.primary),
     };
+
+    // focus-visible:ring-ring/50, which the destructive variant replaces
+    // with focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40.
+    let ring = match variant {
+        ButtonVariant::Destructive => t.destructive.opacity(if dark { 0.4 } else { 0.2 }),
+        _ => focus_ring(t),
+    };
+    // focus-visible:border-ring, except that the dark outline's
+    // dark:border-input wins and keeps the input colour.
+    let focus_border =
+        border.map(|border| if dark && variant == ButtonVariant::Outline { border } else { t.ring });
 
     // (height, width, px, px with an icon, gap)
     let (height, width, padding_x, padding_x_with_icon, gap) = match size {
@@ -157,6 +193,8 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
         hover_background,
         hover_foreground,
         hover_underline: variant == ButtonVariant::Link,
+        ring,
+        focus_border,
         height,
         width,
         padding_x,
@@ -252,9 +290,8 @@ pub struct SwitchStyle {
 /// the far end when on. In a dark set ([`Tokens::dark`]) the thumb takes
 /// shadcn's `dark:data-[state=unchecked]:bg-foreground
 /// dark:data-[state=checked]:bg-primary-foreground`, since a near-black
-/// thumb would all but vanish on the translucent unchecked track. That is
-/// the only `dark:` refinement modelled; the track's `dark:bg-input/80` is
-/// left out.
+/// thumb would all but vanish on the translucent unchecked track. The
+/// track's `dark:data-[state=unchecked]:bg-input/80` is left out.
 pub fn switch_style(checked: bool, t: &Tokens) -> SwitchStyle {
     let thumb = match (t.dark, checked) {
         (false, _) => t.background,
@@ -433,68 +470,108 @@ pub fn command_style(t: &Tokens) -> CommandStyle {
 
 #[cfg(test)]
 mod tests {
+    use gpui::hsla;
+
     use super::*;
 
     type Pick = fn(&Tokens) -> Hsla;
 
+    /// A token and the opacity it is drawn at.
+    type Faded = (Pick, f32);
+
     /// What each variant's colours must be, named by token.
     struct VariantRow {
         variant: ButtonVariant,
-        background: Option<Pick>,
+        background: Option<Faded>,
         foreground: Pick,
         border: Option<Pick>,
-        /// The token and the opacity it is drawn at on hover.
-        hover_background: Option<(Pick, f32)>,
+        hover_background: Option<Faded>,
         hover_foreground: Pick,
         hover_underline: bool,
+        ring: Faded,
+        focus_border: Option<Pick>,
     }
 
-    fn variant_rows() -> [VariantRow; 6] {
+    /// The rows for a light set, or with `dark` for a dark one, where
+    /// shadcn's `dark:` classes change the destructive, outline and ghost
+    /// variants.
+    fn variant_rows(dark: bool) -> [VariantRow; 6] {
+        // focus-visible:ring-ring/50
+        let ring: Faded = (|t| t.ring, 0.5);
         [
             VariantRow {
                 variant: ButtonVariant::Default,
-                background: Some(|t| t.primary),
+                background: Some((|t| t.primary, 1.0)),
                 foreground: |t| t.primary_foreground,
                 border: None,
                 hover_background: Some((|t| t.primary, 0.9)),
                 hover_foreground: |t| t.primary_foreground,
                 hover_underline: false,
+                ring,
+                focus_border: None,
             },
             VariantRow {
                 variant: ButtonVariant::Destructive,
-                background: Some(|t| t.destructive),
+                // dark:bg-destructive/60, on hover too.
+                background: Some((|t| t.destructive, if dark { 0.6 } else { 1.0 })),
                 foreground: |t| t.destructive_foreground,
                 border: None,
-                hover_background: Some((|t| t.destructive, 0.9)),
+                hover_background: Some((|t| t.destructive, if dark { 0.6 } else { 0.9 })),
                 hover_foreground: |t| t.destructive_foreground,
                 hover_underline: false,
+                // focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40
+                ring: (|t| t.destructive, if dark { 0.4 } else { 0.2 }),
+                focus_border: None,
             },
-            VariantRow {
-                variant: ButtonVariant::Outline,
-                background: Some(|t| t.background),
-                foreground: |t| t.foreground,
-                border: Some(|t| t.border),
-                hover_background: Some((|t| t.accent, 1.0)),
-                hover_foreground: |t| t.accent_foreground,
-                hover_underline: false,
+            if dark {
+                // dark:border-input dark:bg-input/30 dark:hover:bg-input/50,
+                // and the input border holds while focused.
+                VariantRow {
+                    variant: ButtonVariant::Outline,
+                    background: Some((|t| t.input, 0.3)),
+                    foreground: |t| t.foreground,
+                    border: Some(|t| t.input),
+                    hover_background: Some((|t| t.input, 0.5)),
+                    hover_foreground: |t| t.accent_foreground,
+                    hover_underline: false,
+                    ring,
+                    focus_border: Some(|t| t.input),
+                }
+            } else {
+                VariantRow {
+                    variant: ButtonVariant::Outline,
+                    background: Some((|t| t.background, 1.0)),
+                    foreground: |t| t.foreground,
+                    border: Some(|t| t.border),
+                    hover_background: Some((|t| t.accent, 1.0)),
+                    hover_foreground: |t| t.accent_foreground,
+                    hover_underline: false,
+                    ring,
+                    focus_border: Some(|t| t.ring),
+                }
             },
             VariantRow {
                 variant: ButtonVariant::Secondary,
-                background: Some(|t| t.secondary),
+                background: Some((|t| t.secondary, 1.0)),
                 foreground: |t| t.secondary_foreground,
                 border: None,
                 hover_background: Some((|t| t.secondary, 0.8)),
                 hover_foreground: |t| t.secondary_foreground,
                 hover_underline: false,
+                ring,
+                focus_border: None,
             },
             VariantRow {
                 variant: ButtonVariant::Ghost,
                 background: None,
                 foreground: |t| t.foreground,
                 border: None,
-                hover_background: Some((|t| t.accent, 1.0)),
+                // dark:hover:bg-accent/50
+                hover_background: Some((|t| t.accent, if dark { 0.5 } else { 1.0 })),
                 hover_foreground: |t| t.accent_foreground,
                 hover_underline: false,
+                ring,
+                focus_border: None,
             },
             VariantRow {
                 variant: ButtonVariant::Link,
@@ -504,12 +581,39 @@ mod tests {
                 hover_background: None,
                 hover_foreground: |t| t.primary,
                 hover_underline: true,
+                ring,
+                focus_border: None,
             },
         ]
     }
 
+    /// The style `row` and the size row describe, in the colours of `t`.
+    fn expected_style(row: &VariantRow, size_row: SizeRow, t: &Tokens) -> ButtonStyle {
+        let (_, height, width, px, px_icon, gap) = size_row;
+        let faded = |(pick, opacity): Faded| pick(t).opacity(opacity);
+        ButtonStyle {
+            background: row.background.map(faded),
+            foreground: (row.foreground)(t),
+            border: row.border.map(|pick| pick(t)),
+            hover_background: row.hover_background.map(faded),
+            hover_foreground: (row.hover_foreground)(t),
+            hover_underline: row.hover_underline,
+            ring: faded(row.ring),
+            focus_border: row.focus_border.map(|pick| pick(t)),
+            height: rems(height),
+            width: width.map(rems),
+            padding_x: rems(px),
+            padding_x_with_icon: rems(px_icon),
+            gap: rems(gap),
+            text_size: rems(0.875),
+            radius: t.radius_md(),
+        }
+    }
+
     /// (size, height, width, px, px with an icon, gap), in rems.
-    const SIZE_ROWS: [(ButtonSize, f32, Option<f32>, f32, f32, f32); 4] = [
+    type SizeRow = (ButtonSize, f32, Option<f32>, f32, f32, f32);
+
+    const SIZE_ROWS: [SizeRow; 4] = [
         (ButtonSize::Default, 2.25, None, 1.0, 0.75, 0.5),
         (ButtonSize::Sm, 2.0, None, 0.75, 0.625, 0.375),
         (ButtonSize::Lg, 2.5, None, 1.5, 1.0, 0.5),
@@ -518,34 +622,18 @@ mod tests {
 
     #[test]
     fn every_variant_and_size_against_both_sets() {
+        // The rows are chosen by the set, not by its hint, so a wrong hint
+        // fails here too.
         let sets = [
-            ("light", Tokens::neutral_light()),
-            ("dark", Tokens::neutral_dark()),
+            ("light", Tokens::neutral_light(), false),
+            ("dark", Tokens::neutral_dark(), true),
         ];
         let mut combinations = 0;
-        for (set, t) in &sets {
-            for row in variant_rows() {
-                for (size, height, width, px, px_icon, gap) in SIZE_ROWS {
-                    let case = format!("{set} {:?} {size:?}", row.variant);
-                    let style = button_style(row.variant, size, t);
-                    let expected = ButtonStyle {
-                        background: row.background.map(|pick| pick(t)),
-                        foreground: (row.foreground)(t),
-                        border: row.border.map(|pick| pick(t)),
-                        hover_background: row
-                            .hover_background
-                            .map(|(pick, opacity)| pick(t).opacity(opacity)),
-                        hover_foreground: (row.hover_foreground)(t),
-                        hover_underline: row.hover_underline,
-                        height: rems(height),
-                        width: width.map(rems),
-                        padding_x: rems(px),
-                        padding_x_with_icon: rems(px_icon),
-                        gap: rems(gap),
-                        text_size: rems(0.875),
-                        radius: t.radius_md(),
-                    };
-                    assert_eq!(style, expected, "{case}");
+        for (set, t, dark) in &sets {
+            for row in variant_rows(*dark) {
+                for size_row in SIZE_ROWS {
+                    let case = format!("{set} {:?} {:?}", row.variant, size_row.0);
+                    assert_eq!(button_style(row.variant, size_row.0, t), expected_style(&row, size_row, t), "{case}");
                     combinations += 1;
                 }
             }
@@ -555,19 +643,63 @@ mod tests {
         assert_eq!(ButtonVariant::ALL.len() * ButtonSize::ALL.len(), 24);
     }
 
+    /// The hint alone picks the `dark:` refinements: the dark colours with
+    /// the flag cleared follow the light rows.
+    #[test]
+    fn the_dark_hint_picks_the_dark_refinements() {
+        let dark_unflagged = Tokens { dark: false, ..Tokens::neutral_dark() };
+        for row in variant_rows(false) {
+            for size_row in SIZE_ROWS {
+                let (style, case) = (button_style(row.variant, size_row.0, &dark_unflagged), (row.variant, size_row.0));
+                assert_eq!(style, expected_style(&row, size_row, &dark_unflagged), "{case:?}");
+            }
+        }
+    }
+
+    /// The `dark:` values in the neutral dark set, as alphas: the input
+    /// colour is white at 15%, so `bg-input/30` is white at 4.5%.
+    #[test]
+    fn dark_refinements_in_the_neutral_dark_set() {
+        let t = Tokens::neutral_dark();
+        let style = |v| button_style(v, ButtonSize::Default, &t);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let white = |c: Hsla| c.l == 1. && c.s == 0.;
+
+        let outline = style(ButtonVariant::Outline);
+        let (fill, hover) = (outline.background.unwrap(), outline.hover_background.unwrap());
+        assert!(white(fill) && close(fill.a, 0.045), "dark:bg-input/30 is {fill:?}");
+        assert!(white(hover) && close(hover.a, 0.075), "dark:hover:bg-input/50 is {hover:?}");
+        assert_eq!(outline.border, Some(hsla(0., 0., 1., 0.15)));
+        assert_eq!(outline.focus_border, outline.border);
+
+        let destructive = style(ButtonVariant::Destructive);
+        let fill = destructive.background.unwrap();
+        assert_eq!((fill.h, fill.s, fill.l), (t.destructive.h, t.destructive.s, t.destructive.l));
+        assert!(close(fill.a, 0.6), "dark:bg-destructive/60 is {fill:?}");
+        assert_eq!(destructive.hover_background, Some(fill));
+        assert!(close(destructive.ring.a, 0.4), "dark:focus-visible:ring-destructive/40");
+        assert_eq!(Hsla { a: 1., ..destructive.ring }, t.destructive);
+
+        assert!(close(style(ButtonVariant::Ghost).hover_background.unwrap().a, 0.5), "dark:hover:bg-accent/50");
+        // The variants without dark: classes are as in a light set.
+        assert_eq!(style(ButtonVariant::Default).ring, focus_ring(&t));
+        assert_eq!(style(ButtonVariant::Secondary).hover_background, Some(t.secondary.opacity(0.8)));
+    }
+
     #[test]
     fn hover_fades_where_shadcn_uses_opacity() {
         for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
             let hover = |v| button_style(v, ButtonSize::Default, &t).hover_background.unwrap();
-            // bg-primary/90 and bg-destructive/90
+            // bg-primary/90, and bg-destructive/90 (a dark set's /60 holds on hover)
             let primary = hover(ButtonVariant::Default);
             assert_eq!((primary.h, primary.s, primary.l), (t.primary.h, t.primary.s, t.primary.l));
             assert!((primary.a - 0.9).abs() < 1e-6);
-            assert!((hover(ButtonVariant::Destructive).a - 0.9).abs() < 1e-6);
+            let destructive = if t.dark { 0.6 } else { 0.9 };
+            assert!((hover(ButtonVariant::Destructive).a - destructive).abs() < 1e-6);
             // bg-secondary/80
             assert!((hover(ButtonVariant::Secondary).a - 0.8).abs() < 1e-6);
-            // hover:bg-accent, opaque
-            assert_eq!(hover(ButtonVariant::Ghost), t.accent);
+            // hover:bg-accent, opaque, and dark:hover:bg-accent/50
+            assert_eq!(hover(ButtonVariant::Ghost), if t.dark { t.accent.opacity(0.5) } else { t.accent });
         }
     }
 
@@ -742,8 +874,10 @@ mod tests {
 
     #[test]
     fn tables_cover_every_variant_and_size() {
-        let rows: Vec<_> = variant_rows().iter().map(|r| r.variant).collect();
-        assert_eq!(rows, ButtonVariant::ALL);
+        for dark in [false, true] {
+            let rows: Vec<_> = variant_rows(dark).iter().map(|r| r.variant).collect();
+            assert_eq!(rows, ButtonVariant::ALL);
+        }
         let sizes: Vec<_> = SIZE_ROWS.iter().map(|r| r.0).collect();
         assert_eq!(sizes, ButtonSize::ALL);
     }

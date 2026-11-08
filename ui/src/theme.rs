@@ -43,10 +43,11 @@ pub struct Tokens {
     pub radius: Rems,
     /// Whether this is a dark set: a hint, not a colour. It is set by the
     /// token source, from the background's luminance for derived sets.
-    /// Only the switch's thumb reads it (shadcn's `dark:` thumb colours,
-    /// without which an unchecked thumb in `background` all but vanishes on
-    /// a dark set's translucent track); shadcn's other `dark:` refinements
-    /// are left out.
+    /// The switch's thumb reads it (shadcn's `dark:` thumb colours, without
+    /// which an unchecked thumb in `background` all but vanishes on a dark
+    /// set's translucent track), and so do the button variants (shadcn's
+    /// `dark:` button refinements; see [`crate::style::button_style`]).
+    /// shadcn's other components' `dark:` refinements are left out.
     pub dark: bool,
 }
 
