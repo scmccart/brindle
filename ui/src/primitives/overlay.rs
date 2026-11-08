@@ -1,13 +1,23 @@
 //! `Overlay<V>`: the open/close lifecycle of a managed view shown above
 //! everything else, such as a dialog or a popover's content.
 //!
-//! The owner keeps an `Overlay` in a field and renders it in its tree
-//! anywhere (`deferred` lifts it above the rest). [`Overlay::open`] records
-//! what has focus, pushes a layer, moves focus into the view and subscribes
-//! to its `DismissEvent`; on that event, or [`Overlay::close`], the layer is
-//! popped, the view dropped and focus given back if what had it still
-//! exists. While open, the view sits in a [`FocusScope`], so Tab cycles
-//! through its stops and never leaves it.
+//! The owner keeps an `Overlay` in a field and renders it in its tree.
+//! [`Overlay::open`] records what has focus, pushes a layer, moves focus
+//! into the view and subscribes to its `DismissEvent`; on that event, or
+//! [`Overlay::close`], the layer is popped, the view dropped and focus given
+//! back if what had it still exists. While open, the view sits in a
+//! [`FocusScope`], so Tab cycles through its stops and never leaves it.
+//!
+//! Where the owner renders it depends on the layer's depth (see
+//! [`wrap_in_deferred`]). The bottom layer goes through `deferred`, which
+//! lifts it above the window, so its owner renders it anywhere in its tree.
+//! gpui refuses a `defer_draw` while it draws the deferred elements
+//! (`window.rs`: "cannot call defer_draw during deferred drawing"), so a
+//! layer opened while another is open renders inline, inside the open
+//! layer's view, whose `deferred` already lifts it; within that subtree, tree
+//! order gives z-order. So the owner of a nested overlay renders it inside
+//! the parent layer's view, last in its tree and outside any clipping
+//! container, or what the parent renders after it paints over it.
 //!
 //! Escape and outside presses never close the view directly: they dispatch
 //! [`Dismiss`] to it, and the layer answers by emitting `DismissEvent` unless
@@ -119,11 +129,26 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         }
     }
 
-    /// The open view's element, or `None`: the view in its layer, deferred
-    /// so it paints above everything, deeper layers above shallower ones.
+    /// The open view's element, or `None`: the view in its layer. The bottom
+    /// layer is deferred, so it paints above everything; a layer above it
+    /// renders inline, inside the layer below's view (see the module doc).
     /// A modal overlay comes with its full-window backdrop; a non-modal
     /// one is placed where it is rendered.
     pub fn render(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        self.render_with(|panel| panel, window, cx)
+    }
+
+    /// [`Overlay::render`] with `place` applied to a non-modal view's panel
+    /// first: a popover wraps the panel in an `Anchored` to put it beside
+    /// its trigger. A modal view is centred by its backdrop, so `place` is
+    /// skipped. The result is deferred only for the bottom layer and
+    /// renders inline above it, so what `place` returns must work in both.
+    pub fn render_with(
+        &self,
+        place: impl FnOnce(AnyElement) -> AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
         let open = self.open.as_ref()?;
         let id = open.layer;
         let depth = layer::depth(window, id, cx).unwrap_or(0);
@@ -163,6 +188,8 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
             .child(FocusScope::new(&view).child(view));
         let element = if self.modal {
             let size = window.viewport_size();
+            // Absolute at the window's origin, so the backdrop covers the
+            // window from wherever it is rendered, inline included.
             anchored()
                 .position(Point::default())
                 .child(
@@ -178,10 +205,20 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                 )
                 .into_any_element()
         } else {
-            panel.into_any_element()
+            place(panel.into_any_element())
         };
-        Some(deferred(element).with_priority(depth).into_any_element())
+        Some(if wrap_in_deferred(depth) { deferred(element).into_any_element() } else { element })
     }
+}
+
+/// Whether the layer at `depth` renders through `deferred`: only the bottom
+/// one. gpui asserts that nothing calls `defer_draw` while it draws the
+/// deferred elements, and a layer above the bottom one is rendered inside
+/// the bottom layer's view, which is drawn then. Rendered inline there, it
+/// is lifted above the window with that view, and paints after what the
+/// view rendered before it.
+pub fn wrap_in_deferred(depth: usize) -> bool {
+    depth == 0
 }
 
 /// The default answer to a dismiss request, for a view shown outside an
@@ -218,6 +255,15 @@ mod tests {
         assert_eq!(initial_focus(None, &[], "own"), "own");
         // A designated handle wins even with no stops.
         assert_eq!(initial_focus(Some("initial"), &[], "own"), "initial");
+    }
+
+    /// Nested deferred draws panic in gpui, so only the bottom layer is
+    /// deferred; every layer above it renders inline inside it.
+    #[test]
+    fn only_the_bottom_layer_is_deferred() {
+        assert!(wrap_in_deferred(0));
+        assert!(!wrap_in_deferred(1));
+        assert!(!wrap_in_deferred(2));
     }
 
     #[test]

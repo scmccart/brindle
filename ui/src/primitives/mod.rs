@@ -8,4 +8,4 @@ pub mod overlay;
 
 pub use focus_scope::{FocusScope, FocusStops, TabDirection, cycle};
 pub use layer::{LayerEntry, LayerId, LayerStack};
-pub use overlay::{Overlay, dismiss_on_request, initial_focus, restore_focus};
+pub use overlay::{Overlay, dismiss_on_request, initial_focus, restore_focus, wrap_in_deferred};
