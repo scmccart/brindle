@@ -25,11 +25,15 @@ A local tab whose last remaining zone's program exits SHALL close. When a local 
 - **THEN** the new tab appears third and is active
 
 ### Requirement: Window closes with its last tab
-Closing the last tab of a window SHALL close the window. Closing the last window SHALL quit the application.
+Closing the last tab SHALL close the window, which quits Brindle. Closing the window, by its close button, the window manager or `Close Window`, SHALL quit Brindle, as defined by "Quitting keeps programs running".
 
 #### Scenario: Last tab closed
-- **WHEN** a window's only tab is closed
-- **THEN** the window closes
+- **WHEN** the window's only tab is closed
+- **THEN** the window closes and Brindle exits
+
+#### Scenario: Window closed with tabs
+- **WHEN** the window has two local tabs running `sleep 1000` and the user clicks its close button
+- **THEN** Brindle exits without asking, and both sessions are listed as detached
 
 ### Requirement: Switching and reordering tabs
 The user SHALL be able to:
@@ -163,32 +167,6 @@ On Windows these areas SHALL behave like a native caption. This includes Snap wh
 - **WHEN** the user clicks a tab, the new-tab button or the profile chevron in the strip on Windows
 - **THEN** that control responds as it does on Linux, and the window does not start moving
 
-### Requirement: Multiple windows
-The user SHALL be able to open additional windows (ctrl-shift-n), each with its own tabs, and quit everything with ctrl-shift-q. A new window SHALL open with one tab using the default profile. When the default profile is a control-mode profile whose session is already shown in any window of this Brindle, ctrl-shift-n SHALL NOT open a window directly; it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere" in `tmux-control-mode`. When another Brindle shows it instead, the new window SHALL open and ask there, as defined by "Session shown by another Brindle".
-
-#### Scenario: New window
-- **WHEN** the user presses ctrl-shift-n
-- **THEN** a second window opens with one tab using the default profile
-
-#### Scenario: Default session already open
-- **WHEN** the default profile is the control-mode profile for session `main`, a window shows `main`, and the user presses ctrl-shift-n
-- **THEN** no window opens yet, the current window offers "Go to main", "New tmux session…" and "New window: <profile>" rows, and `tmux list-clients` still shows one Brindle client for `main`
-
-#### Scenario: Default session shown by another Brindle
-- **WHEN** the default profile is the control-mode profile for session `main`, another Brindle shows `main`, and the user presses ctrl-shift-n
-- **THEN** a new window opens with no tabs and asks about `main`, and the current window stays as it was
-
-### Requirement: New tab with the default profile does not move between windows
-ctrl-shift-t (or the `+` button) in a tab that is not a control-mode tab SHALL open the default profile. When the default profile is a control-mode profile whose session is shown in the current window, its tab SHALL become active. When that session is shown in another window, Brindle SHALL ask what to do, as defined by "Choosing when a session is open elsewhere" in `tmux-control-mode`, and SHALL NOT switch windows unless the user chooses to.
-
-#### Scenario: Session in another window
-- **WHEN** the default profile's session `main` is shown in window A, and the user presses ctrl-shift-t in a local tab of window B
-- **THEN** window B asks what to do, offering "New tab: <profile>" rows, and window A is not raised
-
-#### Scenario: Session in this window
-- **WHEN** the current window shows session `main` and a local tab is active, and the user presses ctrl-shift-t
-- **THEN** a tab of `main` becomes active and no tab is added
-
 ### Requirement: Program status indicator
 A tab SHALL show a status dot while any zone of its local tab, or any pane of its tmux control-mode window, holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit beside the bell dot when both apply.
 
@@ -214,3 +192,36 @@ The status dot SHALL stay until the terminal's records change (a report, a clear
 #### Scenario: Activated while blocked
 - **WHEN** a background tab shows the yellow dot and the user activates it
 - **THEN** the dot remains until the program reports again
+
+### Requirement: New tab with the default profile
+ctrl-shift-t (or the `+` button) in a tab that is not a control-mode tab SHALL open the default profile. When the default profile is a control-mode profile whose session the window shows, its tab SHALL become active instead.
+
+#### Scenario: Session in the window
+- **WHEN** the window shows session `main` and a local tab is active, and the user presses ctrl-shift-t
+- **THEN** a tab of `main` becomes active and no tab is added
+
+### Requirement: One window
+Brindle SHALL show a single window. No command SHALL open another window; opening a profile, a tmux session or an attached session SHALL add a tab to that window.
+
+#### Scenario: No new window
+- **WHEN** the user presses ctrl-shift-n
+- **THEN** no window opens
+
+#### Scenario: Not in the command palette
+- **WHEN** the user opens the command palette and types `window`
+- **THEN** "Close Window" is listed and "New Window" is not
+
+### Requirement: Quitting keeps programs running
+Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every open local Linux terminal's program running detached, so the next launch brings it back (see `session-restore`), except `-e` command terminals, which end. Brindle SHALL NOT ask. When Brindle ends without quitting (a crash, a signal, the desktop stopping it), the same terminals SHALL keep running.
+
+#### Scenario: Quit
+- **WHEN** the window holds three local tabs and the user presses ctrl-shift-q
+- **THEN** Brindle exits without asking, and the three sessions are listed as detached with their pids unchanged
+
+#### Scenario: Crash
+- **WHEN** Brindle is killed with SIGKILL while a tab runs `sleep 1000`
+- **THEN** the `sleep` keeps running, detached
+
+#### Scenario: Command tab
+- **WHEN** a tab runs `brindle -e sleep 1000`'s command and the user quits
+- **THEN** that `sleep` is gone within a few seconds and no session is listed for it
