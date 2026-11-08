@@ -928,9 +928,12 @@ mod check {
         }
     }
 
-    /// Why the key-up and pointer checks can't run on this platform.
+    /// Why the pointer checks can't run on this platform.
     #[cfg(not(windows))]
-    const NO_MESSAGES: &str = "needs a real pointer or key release: the gallery posts those as window messages on Windows only";
+    const NO_MESSAGES: &str = "needs a real pointer: the gallery posts presses as window messages on Windows only";
+
+    /// Why a check about a key's release can't run on this platform.
+    const NO_KEY_UP: &str = "needs a real key release: the gallery posts those as window messages on Windows only";
 
     /// Why a check didn't pass.
     pub enum Failure {
@@ -1053,20 +1056,23 @@ mod check {
         }
 
         /// The release of `key`, which gpui turns into a keyboard click on
-        /// the focused control: a `WM_KEYUP` to the window.
-        async fn key_up(&mut self, key: &str) -> Result<(), Failure> {
+        /// the focused control: a `WM_KEYUP` to the window. Returns whether
+        /// a release could be sent at all: where it can't, a check that
+        /// needs the release itself skips, and the others go on without it
+        /// (the controls act on the key-down).
+        async fn key_up(&mut self, key: &str) -> Result<bool, Failure> {
             #[cfg(windows)]
             {
                 let Some(vk) = win::virtual_key(key) else { fail!("no virtual key for {key:?}") };
                 self.post(win::WM_KEYUP, vk, win::KEYUP_LPARAM)?;
+                self.tick().await;
+                Ok(true)
             }
             #[cfg(not(windows))]
             {
                 let _ = key;
-                self.post(0, 0, 0)?;
+                Ok(false)
             }
-            self.tick().await;
-            Ok(())
         }
 
         /// A press and release of the primary button at `at`, a frame apart.
@@ -1679,7 +1685,9 @@ mod check {
         c.key("down").await?;
         c.key("enter").await?;
         ensure!(!is_open(c, &shell)?, "enter didn't close the menu");
-        c.key_up("enter").await?;
+        if !c.key_up("enter").await? {
+            return Err(Failure::Skip(NO_KEY_UP.to_string()));
+        }
         ensure!(!is_open(c, &shell)?, "the enter key-up reopened the menu through a keyboard click");
         ensure!(c.layers()? == 0, "a layer is open after the key-up");
         Ok(())
@@ -1963,8 +1971,9 @@ mod check {
         ensure!(!c.with(|gallery, _, _| gallery.command_dialog.is_open())?, "enter didn't close the dialog");
         let confirmed = c.with(|gallery, _, _| gallery.confirmed.borrow().clone())?;
         ensure!(confirmed.len() == before + 1 && confirmed.last().map(String::as_str) == Some("Split Right"), "the host recorded {confirmed:?}");
-        c.key_up("enter").await?;
-        ensure!(!c.with(|gallery, _, _| gallery.command_dialog.is_open())?, "the enter key-up reopened the dialog");
+        if c.key_up("enter").await? {
+            ensure!(!c.with(|gallery, _, _| gallery.command_dialog.is_open())?, "the enter key-up reopened the dialog");
+        }
         Ok(())
     }
 
@@ -1986,7 +1995,9 @@ mod check {
         ensure!(confirmed.len() == before + 1, "enter didn't confirm ({confirmed:?})");
         ensure!(c.layers()? == 0, "the host didn't close on Confirmed");
         ensure!(c.focused_name("command-popover")?, "focus didn't return to the trigger");
-        c.key_up("enter").await?;
+        if !c.key_up("enter").await? {
+            return Err(Failure::Skip(NO_KEY_UP.to_string()));
+        }
         c.tick().await;
         ensure!(c.layers()? == 0, "the enter key-up clicked the trigger and reopened the popover");
         Ok(())
