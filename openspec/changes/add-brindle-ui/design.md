@@ -201,7 +201,7 @@ ui/                         package brindle-ui, lib brindle_ui
 ### Focus visible
 
 - **Modality per window** (`Keyboard | Pointer`), in a crate global.
-  - `init` registers `App::observe_keystrokes`, which sets `Keyboard`.
+  - `init` registers `App::observe_keystrokes`, which sets `Keyboard`. gpui runs the observer for a key an action took and for one no listener stopped, but not for a key a key-down listener stopped, so the handlers that stop keys (a control's activation on enter or space, a select's typeahead and space) set `Keyboard` themselves first.
   - Every crate component's mouse-down handler sets `Pointer` before focusing.
 - **The ring** shows when the control is focused and the modality is `Keyboard`. `Input` shows it whenever focused, as shadcn does.
 - **No keybindings are involved.** `init` registers only observers, so it is safe to call once at startup and survives reloads.
