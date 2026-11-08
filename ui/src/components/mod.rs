@@ -17,8 +17,12 @@
 //! opened it, and the key-up would then click that button and open the
 //! overlay again. Acting on the key-down each control sees itself, and on
 //! that alone, keeps one key to one effect ([`key_activation`],
-//! [`accepts_click`]). The key stops there, so a shortcut bound to it on an
-//! ancestor doesn't fire too, and a held key activates once.
+//! [`accepts_click`]). A key an ancestor binds to an action goes to that
+//! binding and never reaches the control (gpui matches bindings before key
+//! listeners); one the control takes stops there, so a typed space or
+//! newline reaches no input handler, and a held key activates once. The
+//! activation counts as keyboard input for the focus ring, since the
+//! keystroke observer behind that doesn't run for a key that was stopped.
 //!
 //! What every control shares is here: [`interaction`], the rule that a
 //! disabled control tracks no focus and gets no click handler, the half
@@ -41,6 +45,8 @@ use gpui::{
     App, Bounds, BoxShadow, ClickEvent, Hsla, KeyboardButton, KeyboardClickEvent, Modifiers, Pixels,
     StatefulInteractiveElement, Window, point, px,
 };
+
+use crate::primitives::focus_visible::{Modality, set_modality};
 
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
@@ -113,8 +119,8 @@ pub(crate) type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 
 /// Makes `element` run `on_click` on a mouse click, and on the key-down of
 /// one of `keys` while it has focus, as a `ClickEvent::Keyboard` for that
 /// key (its bounds are empty: the key, not the pointer, placed it). The
-/// key-down stops there. gpui's own keyboard click, on the key-up, is
-/// ignored (see the module doc).
+/// key-down counts as keyboard input for the ring and stops there. gpui's
+/// own keyboard click, on the key-up, is ignored (see the module doc).
 pub(crate) fn activates<E: StatefulInteractiveElement>(
     element: E,
     keys: &'static [KeyboardButton],
@@ -131,6 +137,10 @@ pub(crate) fn activates<E: StatefulInteractiveElement>(
         .on_key_down(move |event, window, cx| {
             let keystroke = &event.keystroke;
             if let Some(button) = key_activation(&keystroke.key, keystroke.modifiers, event.is_held, keys) {
+                // The observer that would record this doesn't run for a
+                // stopped key, and what the activation focuses (an opened
+                // overlay's first control) shows its ring for a key.
+                set_modality(window, Modality::Keyboard, cx);
                 let click = ClickEvent::Keyboard(KeyboardClickEvent { button, bounds: Bounds::default() });
                 on_key(&click, window, cx);
                 cx.stop_propagation();

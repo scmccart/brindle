@@ -1317,6 +1317,8 @@ mod check {
         c.run_check("select-clicking-the-selected-option-tells-nobody", check).await;
         let check = select_escape(&mut c).await;
         c.run_check("select-escape-closes-without-change-refocuses-trigger", check).await;
+        let check = select_space_keyboard_modality(&mut c).await;
+        c.run_check("select-space-opens-and-picks-as-keyboard-input", check).await;
         let check = select_typeahead_open(&mut c).await;
         c.run_check("select-open-typeahead-f-f-cycles-to-foot", check).await;
         let check = select_typeahead_closed(&mut c).await;
@@ -1395,6 +1397,10 @@ mod check {
     }
 
     async fn button_space_activates_once(c: &mut Checker) -> Check {
+        // A pointer press first, so the key has a modality to change.
+        let at = center(c.recorded("behind")?);
+        c.press(at).await?;
+        ensure!(c.modality()? == Modality::Pointer, "the press didn't set the pointer modality");
         let name = Gallery::button_name(ButtonVariant::Default, ButtonSize::Default);
         c.focus(&name).await?;
         let before = c.clicks(&name)?;
@@ -1402,10 +1408,40 @@ mod check {
         c.key_up("space").await?;
         let after = c.clicks(&name)?;
         ensure!(after == before + 1, "space ran the action {} times", after - before);
+        ensure!(c.modality()? == Modality::Keyboard, "space on a button didn't count as keyboard input (no ring would show)");
         c.key("enter").await?;
         c.key_up("enter").await?;
         let after_enter = c.clicks(&name)?;
         ensure!(after_enter == after + 1, "enter ran the action {} times", after_enter - after);
+        Ok(())
+    }
+
+    /// Space on a select's trigger and in its menu goes through the
+    /// select's own key handling, which must count as keyboard input too.
+    async fn select_space_keyboard_modality(c: &mut Checker) -> Check {
+        let at = center(c.recorded("behind")?);
+        c.press(at).await?;
+        let shell = shell_focused(c).await?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        ensure!(is_open(c, &shell)?, "space didn't open the menu");
+        ensure!(c.modality()? == Modality::Keyboard, "space on the trigger didn't count as keyboard input");
+        c.press(at).await?;
+        ensure!(!is_open(c, &shell)?, "the outside press didn't close the menu");
+        let trigger = trigger_handle(c, &shell)?;
+        ensure!(c.focused(&trigger)?, "focus didn't return to the trigger");
+        ensure!(c.modality()? == Modality::Pointer, "the outside press didn't set the pointer modality");
+        c.key("down").await?;
+        c.press(at).await?;
+        // Opened by key, closed by the pointer; now a pick by space.
+        c.key("space").await?;
+        c.key_up("space").await?;
+        c.key("down").await?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        ensure!(!is_open(c, &shell)?, "space in the menu didn't pick");
+        ensure!(selected(c, &shell)? == Some(1), "space didn't pick fish");
+        ensure!(c.modality()? == Modality::Keyboard, "a pick by space didn't count as keyboard input");
         Ok(())
     }
 

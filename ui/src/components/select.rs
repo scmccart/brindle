@@ -433,13 +433,16 @@ impl Select {
 
     fn last(&mut self, _: &ListLast, _: &mut Window, _: &mut Context<Self>) {}
 
-    /// Typeahead while the menu is closed, and space to open it.
+    /// Typeahead while the menu is closed, and space to open it. A key
+    /// taken here is stopped, which keeps it from the keystroke observer
+    /// that records keyboard input, so it is recorded here.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let keystroke = &event.keystroke;
         let searching = self.selection.is_searching(now);
         match typed_key(&keystroke.key, keystroke.key_char.as_deref(), keystroke.modifiers, searching) {
             TypedKey::Char(ch) => {
+                set_modality(window, Modality::Keyboard, cx);
                 let options = &self.options;
                 let labels: Vec<&str> = options.iter().map(|option| option.label.as_ref()).collect();
                 if let Some(ix) = self.selection.type_char(ch, now, &labels, |ix| !options[ix].disabled) {
@@ -449,6 +452,7 @@ impl Select {
                 cx.stop_propagation();
             }
             TypedKey::Space => {
+                set_modality(window, Modality::Keyboard, cx);
                 self.activate(Activation::Key, window, cx);
                 cx.stop_propagation();
             }
@@ -638,13 +642,16 @@ impl SelectMenu {
         }
     }
 
-    /// Typeahead over the options, and space to pick.
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// Typeahead over the options, and space to pick. A key taken here is
+    /// stopped, so it is recorded as keyboard input here (the trigger a
+    /// pick refocuses shows its ring).
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let keystroke = &event.keystroke;
         let searching = self.typeahead.is_searching(now);
         match typed_key(&keystroke.key, keystroke.key_char.as_deref(), keystroke.modifiers, searching) {
             TypedKey::Char(ch) => {
+                set_modality(window, Modality::Keyboard, cx);
                 self.typeahead.push(ch, now);
                 let options = &self.options;
                 let labels: Vec<&str> = options.iter().map(|option| option.label.as_ref()).collect();
@@ -656,6 +663,7 @@ impl SelectMenu {
                 cx.stop_propagation();
             }
             TypedKey::Space => {
+                set_modality(window, Modality::Keyboard, cx);
                 self.pick_highlight(cx);
                 cx.stop_propagation();
             }
