@@ -49,10 +49,16 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     let l = Some("UiLayer");
     let f = Some("UiFocusScope");
     let s = Some("UiList");
+    let c = Some("UiCommand");
     vec![
         // Escape asks the overlay to close. Bound in the layer around the
         // view, so an inner context that handles escape itself wins.
         KeyBinding::new("escape", Dismiss, l),
+        // A command list takes escape itself and reports it as cancelled,
+        // so one used inline (in no overlay) still sees it; a hosting view
+        // turns that into its own dismissal. Being nearer the focus than the
+        // layer's binding, it fires alone.
+        KeyBinding::new("escape", Dismiss, c),
         // Tab cycles through the view's stops and never leaves it.
         KeyBinding::new("tab", FocusNext, f),
         KeyBinding::new("shift-tab", FocusPrev, f),
@@ -125,6 +131,10 @@ mod tests {
         let layer = in_context(&bindings, "UiLayer");
         assert_eq!(layer.len(), 1);
         assert_eq!(layer[0].1, "brindle_ui::Dismiss");
+        // A command list binds escape to the same action, nearer the focus.
+        let command = in_context(&bindings, "UiCommand");
+        assert_eq!(command.len(), 1);
+        assert_eq!(command[0], layer[0]);
         let scope = in_context(&bindings, "UiFocusScope");
         let scope: Vec<&str> = scope.iter().map(|(_, name)| name.as_str()).collect();
         assert_eq!(scope, ["brindle_ui::FocusNext", "brindle_ui::FocusPrev"]);
@@ -144,6 +154,6 @@ mod tests {
             ]
         );
         // Every binding is in one of the crate's contexts.
-        assert_eq!(bindings.len(), text_input.len() + layer.len() + scope.len() + list.len());
+        assert_eq!(bindings.len(), text_input.len() + layer.len() + command.len() + scope.len() + list.len());
     }
 }

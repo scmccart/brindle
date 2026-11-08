@@ -350,6 +350,13 @@ impl TextInput {
         self
     }
 
+    /// Replaces the placeholder, for an owner that gets it after creating
+    /// the entity.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// Makes the input a tab stop, so `Window::focus_next` reaches it.
     pub fn tab_stop(mut self) -> Self {
         self.focus_handle = self.focus_handle.tab_stop(true);

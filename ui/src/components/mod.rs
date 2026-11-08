@@ -17,6 +17,7 @@
 
 pub mod button;
 pub mod checkbox;
+pub mod command;
 pub mod dialog;
 pub mod input;
 pub mod popover;
@@ -27,6 +28,7 @@ use gpui::{BoxShadow, Hsla, Pixels, point, px};
 
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
+pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
 pub use dialog::{Dialog, dialog_width};
 pub use input::Input;
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
