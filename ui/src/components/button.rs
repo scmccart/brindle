@@ -3,26 +3,25 @@
 //! A `RenderOnce` builder. The owner gives it a label and/or a leading
 //! [`Icon`], a variant and a size ([`button_style`] turns them into colours
 //! and lengths), an `on_click` handler and, to make it focusable, a
-//! `FocusHandle`. A click comes from the primary mouse button, or from enter
-//! or space while the button has focus (gpui's keyboard click). A disabled
-//! button is drawn at half opacity, has no click handler and tracks no
-//! focus, so a press on it runs nothing and moves focus nowhere
+//! `FocusHandle`. A click comes from the primary mouse button, or from the
+//! key-down of enter or space while the button has focus
+//! ([`activates`]; gpui's own keyboard click, on the key-up, is ignored). A
+//! disabled button is drawn at half opacity, has no click handler and
+//! tracks no focus, so a press on it runs nothing and moves focus nowhere
 //! ([`interaction`]). The ring shows when the button is focused from the
 //! keyboard ([`shows_ring`]).
 
 use gpui::{
     App, ClickEvent, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Refineable, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
+    Refineable, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder,
 };
 
-use crate::components::{DISABLED_OPACITY, interaction, ring_shadow};
+use crate::components::{ACTIVATION_KEYS, ClickHandler, DISABLED_OPACITY, activates, interaction, ring_shadow};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{ButtonSize, ButtonVariant, button_style, focus_ring};
 use crate::theme::ActiveTheme;
-
-type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// A button. Build it with [`Button::new`] or [`Button::icon_only`], refine
 /// its layout through `Styled` (width, margins, flex), and render it.
@@ -91,7 +90,8 @@ impl Button {
         self
     }
 
-    /// Runs on a primary click, and on enter or space while focused.
+    /// Runs on a primary click, and on the enter or space key-down while
+    /// focused (as a `ClickEvent::Keyboard`).
     pub fn on_click(mut self, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_click = Some(Box::new(on_click));
         self
@@ -147,13 +147,13 @@ impl RenderOnce for Button {
                     s
                 })
             })
-            // A press focuses the button as a pointer does (no ring); gpui
-            // registers enter and space for a focused tracked handle.
+            // A press focuses the button as a pointer does (no ring); enter
+            // and space reach it through the tracked handle.
             .when_some(focus, |d, handle| {
                 d.track_focus(&handle)
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             })
-            .when_some(on_click, |d, on_click| d.on_click(move |event, window, cx| on_click(event, window, cx)))
+            .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
             .children(self.icon)
             .children(self.label);
         // The owner's layout refinements win over the component's.

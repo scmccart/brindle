@@ -6,8 +6,19 @@
 //! handlers. A focusable control takes its `FocusHandle` from the owner
 //! (`.focus(&handle)`), since a `RenderOnce` value keeps nothing between
 //! frames; without one it can't take keyboard focus, and pressing it moves
-//! focus nowhere. Enter and space activate a focused control through gpui's
-//! own keyboard click, so there is no activation action.
+//! focus nowhere.
+//!
+//! Enter and space activate a focused control on **key-down**, through
+//! [`activates`], which hands the control's `on_click` a
+//! `ClickEvent::Keyboard`; gpui's own keyboard click is ignored. gpui fires
+//! that click on the key-*up*, for whatever has focus then, unpaired with
+//! the key-down: enter in a command list or a select's menu (key-down)
+//! confirms, the overlay closes and focus goes back to the button that
+//! opened it, and the key-up would then click that button and open the
+//! overlay again. Acting on the key-down each control sees itself, and on
+//! that alone, keeps one key to one effect ([`key_activation`],
+//! [`accepts_click`]). The key stops there, so a shortcut bound to it on an
+//! ancestor doesn't fire too, and a held key activates once.
 //!
 //! What every control shares is here: [`interaction`], the rule that a
 //! disabled control tracks no focus and gets no click handler, the half
@@ -24,7 +35,12 @@ pub mod popover;
 pub mod select;
 pub mod switch;
 
-use gpui::{BoxShadow, Hsla, Pixels, point, px};
+use std::rc::Rc;
+
+use gpui::{
+    App, Bounds, BoxShadow, ClickEvent, Hsla, KeyboardButton, KeyboardClickEvent, Modifiers, Pixels,
+    StatefulInteractiveElement, Window, point, px,
+};
 
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
@@ -56,4 +72,112 @@ pub fn interaction<F, C>(disabled: bool, focus: Option<F>, on_click: Option<C>) 
 /// with no blur or offset.
 pub(crate) fn ring_shadow(color: Hsla) -> BoxShadow {
     BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: RING_WIDTH }
+}
+
+/// The keys that activate a button: enter and space, as in a browser.
+pub const ACTIVATION_KEYS: [KeyboardButton; 2] = [KeyboardButton::Enter, KeyboardButton::Space];
+
+/// The key that toggles a checkbox or a switch: space alone. Enter passes,
+/// as for a checkbox in a web form, where enter submits the form instead.
+pub const TOGGLE_KEYS: [KeyboardButton; 1] = [KeyboardButton::Space];
+
+/// The key-down that activates a control, as the button it stands for:
+/// `key` is the keystroke's key, pressed with `modifiers`, `is_held` for a
+/// key repeat. Only a first press of a bare key in `keys` activates; a
+/// repeat, a modified key or any other key gives `None`, and the key goes
+/// on to whatever else handles it.
+pub fn key_activation(key: &str, modifiers: Modifiers, is_held: bool, keys: &[KeyboardButton]) -> Option<KeyboardButton> {
+    if is_held || modifiers.modified() {
+        return None;
+    }
+    let button = match key {
+        "enter" => KeyboardButton::Enter,
+        "space" => KeyboardButton::Space,
+        _ => return None,
+    };
+    keys.contains(&button).then_some(button)
+}
+
+/// Whether a control acts on a click gpui delivered: a mouse click, yes; a
+/// keyboard click, no. gpui raises that one on the key-up for whatever has
+/// focus then, and the control acted on the key-down it saw itself
+/// ([`key_activation`]), or saw nothing, because the key went to the
+/// control that had focus before.
+pub fn accepts_click(event: &ClickEvent) -> bool {
+    matches!(event, ClickEvent::Mouse(_))
+}
+
+/// A click handler, as the controls box theirs.
+pub(crate) type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+/// Makes `element` run `on_click` on a mouse click, and on the key-down of
+/// one of `keys` while it has focus, as a `ClickEvent::Keyboard` for that
+/// key (its bounds are empty: the key, not the pointer, placed it). The
+/// key-down stops there. gpui's own keyboard click, on the key-up, is
+/// ignored (see the module doc).
+pub(crate) fn activates<E: StatefulInteractiveElement>(
+    element: E,
+    keys: &'static [KeyboardButton],
+    on_click: ClickHandler,
+) -> E {
+    let on_click = Rc::new(on_click);
+    let on_key = on_click.clone();
+    element
+        .on_click(move |event, window, cx| {
+            if accepts_click(event) {
+                on_click(event, window, cx);
+            }
+        })
+        .on_key_down(move |event, window, cx| {
+            let keystroke = &event.keystroke;
+            if let Some(button) = key_activation(&keystroke.key, keystroke.modifiers, event.is_held, keys) {
+                let click = ClickEvent::Keyboard(KeyboardClickEvent { button, bounds: Bounds::default() });
+                on_key(&click, window, cx);
+                cx.stop_propagation();
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::MouseClickEvent;
+
+    /// A first press of bare enter or space activates a button; a checkbox
+    /// takes space alone. Repeats, modified keys and other keys pass.
+    #[test]
+    fn enter_and_space_key_downs_activate_once() {
+        let none = Modifiers::default();
+        assert_eq!(key_activation("enter", none, false, &ACTIVATION_KEYS), Some(KeyboardButton::Enter));
+        assert_eq!(key_activation("space", none, false, &ACTIVATION_KEYS), Some(KeyboardButton::Space));
+        // A held key repeats the key-down; it activated on the first.
+        assert_eq!(key_activation("enter", none, true, &ACTIVATION_KEYS), None);
+        // Modified keys are shortcuts.
+        for modifiers in [
+            Modifiers { shift: true, ..none },
+            Modifiers { control: true, ..none },
+            Modifiers { alt: true, ..none },
+            Modifiers { platform: true, ..none },
+        ] {
+            assert_eq!(key_activation("enter", modifiers, false, &ACTIVATION_KEYS), None);
+            assert_eq!(key_activation("space", modifiers, false, &ACTIVATION_KEYS), None);
+        }
+        // Other keys, and a key the control doesn't take.
+        assert_eq!(key_activation("a", none, false, &ACTIVATION_KEYS), None);
+        assert_eq!(key_activation("tab", none, false, &ACTIVATION_KEYS), None);
+        assert_eq!(key_activation("enter", none, false, &TOGGLE_KEYS), None);
+        assert_eq!(key_activation("space", none, false, &TOGGLE_KEYS), Some(KeyboardButton::Space));
+    }
+
+    /// The scenario: enter (key-down) in a command popover confirms, the
+    /// host closes and focus returns to the opener; gpui's keyboard click on
+    /// the key-up reaches the opener, which ignores it. Mouse clicks count.
+    #[test]
+    fn gpui_keyboard_clicks_are_ignored_and_mouse_clicks_taken() {
+        let key_up = ClickEvent::Keyboard(KeyboardClickEvent { button: KeyboardButton::Enter, bounds: Bounds::default() });
+        assert!(!accepts_click(&key_up));
+        let space_up = ClickEvent::Keyboard(KeyboardClickEvent { button: KeyboardButton::Space, bounds: Bounds::default() });
+        assert!(!accepts_click(&space_up));
+        assert!(accepts_click(&ClickEvent::Mouse(MouseClickEvent::default())));
+    }
 }

@@ -1,21 +1,23 @@
 //! `Checkbox`: shadcn's checkbox, controlled by its owner.
 //!
 //! The owner holds the value and passes it as `checked`; a primary click,
-//! or space while the checkbox has focus, asks the owner to flip it through
-//! `on_click(&new, …)` ([`toggle_request`]), and the box shows the new
-//! state once the owner re-renders with it. Enter doesn't toggle it, as
-//! with a checkbox in a web form, where enter submits ([`toggles`]). A
-//! disabled checkbox is drawn at half opacity, asks nothing and tracks no
-//! focus ([`interaction`]). The tick is [`Icon::Check`] in the primary
-//! foreground; the ring shows when it is focused from the keyboard.
+//! or the space key-down while the checkbox has focus ([`activates`] with
+//! [`TOGGLE_KEYS`]), asks the owner to flip it through `on_click(&new, …)`
+//! ([`toggle_request`]), and the box shows the new state once the owner
+//! re-renders with it. Enter doesn't toggle it, as with a checkbox in a web
+//! form, where enter submits ([`toggles`]), and passes to what is around
+//! the checkbox. A disabled checkbox is drawn at half opacity, asks nothing
+//! and tracks no focus ([`interaction`]). The tick is [`Icon::Check`] in the
+//! primary foreground; the ring shows when it is focused from the keyboard.
 
 use gpui::{
     App, ClickEvent, ElementId, FocusHandle, InteractiveElement, IntoElement, KeyboardButton, MouseButton,
-    ParentElement, Refineable, RenderOnce, StatefulInteractiveElement, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder,
+    ParentElement, Refineable, RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder,
 };
+// (`on_click` and the key-down come through `activates`, so the stateful
+// trait isn't named here.)
 
-use crate::components::{DISABLED_OPACITY, interaction, ring_shadow};
+use crate::components::{DISABLED_OPACITY, TOGGLE_KEYS, activates, interaction, ring_shadow};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{CHECKBOX_RADIUS, CHECKBOX_SIZE, CHECKBOX_TICK_SIZE, checkbox_style, focus_ring};
@@ -90,7 +92,9 @@ pub fn toggle_request(checked: bool, disabled: bool) -> Option<bool> {
 
 /// Whether a click toggles: a mouse click or space does, enter doesn't,
 /// as for a checkbox in a web form, where enter submits the form instead.
-/// `key` is the key of a keyboard click, `None` for a mouse click.
+/// `key` is the key of a keyboard click, `None` for a mouse click. The
+/// toggles take only space on key-down ([`TOGGLE_KEYS`]), so this is the
+/// same rule stated over the click that arrives.
 pub fn toggles(key: Option<KeyboardButton>) -> bool {
     key != Some(KeyboardButton::Enter)
 }
@@ -133,13 +137,17 @@ impl RenderOnce for Checkbox {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             })
             .when_some(on_click, |d, on_click| {
-                d.on_click(move |event, window, cx| {
-                    if toggles(click_key(event))
-                        && let Some(value) = toggle_request(checked, disabled)
-                    {
-                        on_click(&value, window, cx);
-                    }
-                })
+                activates(
+                    d,
+                    &TOGGLE_KEYS,
+                    Box::new(move |event, window, cx| {
+                        if toggles(click_key(event))
+                            && let Some(value) = toggle_request(checked, disabled)
+                        {
+                            on_click(&value, window, cx);
+                        }
+                    }),
+                )
             })
             .when(checked, |d| d.child(Icon::Check.size(CHECKBOX_TICK_SIZE)));
         // The owner's layout refinements win over the component's.

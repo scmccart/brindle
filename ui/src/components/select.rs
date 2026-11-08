@@ -24,9 +24,10 @@
 //! focus then, with no pairing to the key-down. A pick on enter key-down in
 //! the menu closes it and puts focus back on the trigger before that key-up
 //! arrives, which would open the menu again if the trigger acted on keyboard
-//! clicks. So the trigger acts on mouse clicks only, and enter and space
-//! open it on key-down: enter through the `ListConfirm` action (the trigger
-//! is in the `UiList` context) and space through `on_key_down`
+//! clicks. So, as every control of the crate (`components`' module doc),
+//! the trigger acts on mouse clicks only, and enter and space open it on
+//! key-down: enter through the `ListConfirm` action (the trigger is in the
+//! `UiList` context) and space through `on_key_down`
 //! ([`trigger_activation`], [`typed_key`]).
 //!
 //! [`Overlay`]: crate::primitives::overlay::Overlay

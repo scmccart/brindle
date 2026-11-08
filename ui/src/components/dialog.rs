@@ -60,19 +60,17 @@
 
 use gpui::{
     AnyElement, App, ClickEvent, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Refineable, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    ParentElement, Pixels, Refineable, RenderOnce, SharedString, StyleRefinement, Styled,
     Window, div, prelude::FluentBuilder, px, relative, rems,
 };
 
-use crate::components::ring_shadow;
+use crate::components::{ACTIVATION_KEYS, ClickHandler, activates, ring_shadow};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{
     DIALOG_CLOSE_OPACITY, DIALOG_CLOSE_RADIUS, DIALOG_EDGE_GAP, DIALOG_MAX_WIDTH, dialog_style, focus_ring,
 };
 use crate::theme::ActiveTheme;
-
-type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// A dialog panel. Its children are the body; refine its layout through
 /// `Styled` (a different width, say).
@@ -112,7 +110,7 @@ impl Dialog {
     }
 
     /// Shows the close `X`, which runs `on_close` on a primary click, and
-    /// on enter or space while it has focus.
+    /// on the enter or space key-down while it has focus.
     pub fn on_close(mut self, on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_close = Some(Box::new(on_close));
         self
@@ -183,7 +181,7 @@ impl RenderOnce for Dialog {
         let close = self.on_close.map(|on_close| {
             let focused = self.close_focus.as_ref().is_some_and(|handle| handle.is_focused(window));
             let ring_shown = shows_ring(focused, modality(window, cx), false);
-            div()
+            let close = div()
                 .id("ui-dialog-close")
                 .absolute()
                 .top_4()
@@ -199,9 +197,8 @@ impl RenderOnce for Dialog {
                 .when_some(self.close_focus, |d, handle| {
                     d.track_focus(&handle)
                         .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
-                })
-                .on_click(move |event, window, cx| on_close(event, window, cx))
-                .child(Icon::X.size(rems(1.)))
+                });
+            activates(close, &ACTIVATION_KEYS, on_close).child(Icon::X.size(rems(1.)))
         });
 
         // DialogContent: grid gap-4 rounded-lg border p-6 shadow-lg, in the

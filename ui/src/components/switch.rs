@@ -1,9 +1,10 @@
 //! `Switch`: shadcn's switch, a toggle drawn as a thumb sliding along a
 //! track, controlled by its owner like a [`Checkbox`].
 //!
-//! The owner passes the state as `checked`; a primary click, or space while
-//! the switch has focus, asks the owner to flip it through `on_click(&new,
-//! …)` ([`toggle_request`]), and the thumb moves once the owner re-renders
+//! The owner passes the state as `checked`; a primary click, or the space
+//! key-down while the switch has focus ([`activates`] with [`TOGGLE_KEYS`]),
+//! asks the owner to flip it through `on_click(&new, …)`
+//! ([`toggle_request`]), and the thumb moves once the owner re-renders
 //! with the new state ([`switch_style`] gives its position). A disabled
 //! switch is drawn at half opacity, asks nothing and tracks no focus. The
 //! ring shows when it is focused from the keyboard.
@@ -12,11 +13,11 @@
 
 use gpui::{
     App, ElementId, FocusHandle, InteractiveElement, IntoElement, MouseButton, ParentElement, Refineable, RenderOnce,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, transparent_black,
+    StyleRefinement, Styled, Window, div, prelude::FluentBuilder, transparent_black,
 };
 
 use crate::components::checkbox::{ToggleHandler, click_key, toggle_request, toggles};
-use crate::components::{DISABLED_OPACITY, interaction, ring_shadow};
+use crate::components::{DISABLED_OPACITY, TOGGLE_KEYS, activates, interaction, ring_shadow};
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{
     SWITCH_THUMB_SIZE, SWITCH_TRACK_BORDER, SWITCH_TRACK_HEIGHT, SWITCH_TRACK_WIDTH, focus_ring, switch_style,
@@ -111,13 +112,17 @@ impl RenderOnce for Switch {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             })
             .when_some(on_click, |d, on_click| {
-                d.on_click(move |event, window, cx| {
-                    if toggles(click_key(event))
-                        && let Some(value) = toggle_request(checked, disabled)
-                    {
-                        on_click(&value, window, cx);
-                    }
-                })
+                activates(
+                    d,
+                    &TOGGLE_KEYS,
+                    Box::new(move |event, window, cx| {
+                        if toggles(click_key(event))
+                            && let Some(value) = toggle_request(checked, disabled)
+                        {
+                            on_click(&value, window, cx);
+                        }
+                    }),
+                )
             })
             .child(
                 div()
