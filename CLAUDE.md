@@ -218,6 +218,12 @@ Data flows **terminal server session (Linux) / Windows pseudoconsole / tmux → 
 
 GPUI 0.2.2 doesn't cache views by default, so any `cx.notify()` re-renders the whole window. Keep I/O, allocation-heavy work and lock contention out of `render` and `prepaint`.
 
+## Delegation
+
+This section is for the session the user is driving. A subagent carrying out a routed brief runs its own builds and tests inline and does not delegate further.
+
+Delegate through the `route` skill (`/route:route`, from the route plugin): it picks the model and effort from the brief, so never give the Agent tool a model or effort the script did not choose, and never do inline what you would otherwise delegate while orchestrating. Chores whose output is large get a routing of their own even when nothing else is delegated, written as the commands to run and what to report, so they land on Haiku: `cargo build --release --locked`, full `cargo test` and e2e runs, CI log reads (`gh run view --log-failed`), `openspec archive`, and the version and `Cargo.lock` checks from `.github/workflows/ci.yml`. Do not fold them into an implementation brief. When route returns `split: true`, route the parts separately or say in the brief why they stay together.
+
 ## Specs
 
 Behaviour is specified with OpenSpec:
