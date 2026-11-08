@@ -17,6 +17,7 @@ cargo test -p brindle collector_matches_the_spike_transcript   # one test
 ```
 
 - **`Cargo.lock` was seeded from gpui 0.2.2's own lockfile.** Do not regenerate it, and avoid broad `cargo update`: a newer `libc` breaks `xattr`. Add new dependencies with care.
+- **One build warning is left on purpose:** `the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1` (E0365, a private `proc_macro` re-export). It is the latest release, and gpui 0.2.2 pulls it in through `stacksafe` 0.1 (`gpui` → `stacksafe` → `stacksafe-macro` → `proc-macro-error2`), so only a gpui upgrade removes it. Vendoring a patched copy was rejected. Brindle's own code builds with no warnings.
 - The GPUI and alacritty sources to read for API questions are in `~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2` and `.../alacritty_terminal-0.26.0`.
 - Zed's `terminal`/`terminal_view` crates are GPL-3.0. Use them only to learn the API shape and never copy code from them: Brindle is MIT OR Apache-2.0.
 
