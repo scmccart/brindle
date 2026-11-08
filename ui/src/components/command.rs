@@ -41,7 +41,7 @@ use crate::filter::filter;
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::nav::ListNav;
-use crate::style::{COMMAND_LIST_MAX_HEIGHT, MUTED_ICON_OPACITY, command_style};
+use crate::style::{COMMAND_LIST_MAX_HEIGHT, MUTED_ICON_OPACITY, command_row_insets, command_style};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::ActiveTheme;
 
@@ -133,6 +133,8 @@ pub enum CommandRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandRows {
     rows: Vec<CommandRow>,
+    /// The group each row belongs to, by row.
+    row_groups: Vec<usize>,
     /// The matching items' indices across the groups, by rank.
     matches: Vec<usize>,
     /// Whether each match is enabled, by rank.
@@ -154,6 +156,7 @@ impl CommandRows {
     /// highlighted.
     pub fn build(groups: &[CommandGroup], query: &str) -> Self {
         let mut rows = Vec::new();
+        let mut row_groups = Vec::new();
         let mut matches = Vec::new();
         let mut enabled = Vec::new();
         let mut first = 0;
@@ -162,10 +165,12 @@ impl CommandRows {
             if !hits.is_empty() {
                 if group.heading.is_some() {
                     rows.push(CommandRow::Heading(group_ix));
+                    row_groups.push(group_ix);
                 }
                 for hit in hits {
                     let item = first + hit;
                     rows.push(CommandRow::Item { item, rank: matches.len() });
+                    row_groups.push(group_ix);
                     matches.push(item);
                     enabled.push(!group.items[hit].disabled);
                 }
@@ -174,7 +179,7 @@ impl CommandRows {
         }
         let mut nav = ListNav::new(matches.len(), true);
         nav.first(|rank| enabled[rank]);
-        Self { rows, matches, enabled, nav }
+        Self { rows, row_groups, matches, enabled, nav }
     }
 
     pub fn rows(&self) -> &[CommandRow] {
@@ -190,6 +195,15 @@ impl CommandRows {
     /// no heading.
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
+    }
+
+    /// Whether `row` is the first and whether it is the last listed row of
+    /// its group, which take the group's padding above and below it.
+    pub fn group_edges(&self, row: usize) -> Option<(bool, bool)> {
+        let group = *self.row_groups.get(row)?;
+        let first = row == 0 || self.row_groups[row - 1] != group;
+        let last = self.row_groups.get(row + 1).is_none_or(|&next| next != group);
+        Some((first, last))
     }
 
     /// The matching items' indices across the groups, by rank.
@@ -411,15 +425,35 @@ impl Command {
         }
     }
 
-    /// One row of the list, built when the list lays it out.
-    fn render_row(&mut self, row: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// One row of the list, built when the list lays it out, inside its
+    /// group's padding ([`command_row_insets`]). gpui's list lays each row
+    /// out on its own at the list's width and ignores the list's horizontal
+    /// padding, so the row brings the group's, and fills the width between
+    /// (a flex row laid out alone would shrink to its content).
+    fn render_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some((first, last)) = self.rows.group_edges(row) else {
+            // The list asks for a row the filter has since removed.
+            return div().into_any_element();
+        };
+        let insets = command_row_insets(first, last);
+        div()
+            .w_full()
+            .px(insets.x)
+            .pt(insets.top)
+            .pb(insets.bottom)
+            .child(self.render_row_content(row, window, cx))
+            .into_any_element()
+    }
+
+    /// A row's heading or item, filling the group's inner width.
+    fn render_row_content(&mut self, row: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let style = command_style(cx.ui_theme());
         match self.rows.rows().get(row) {
-            // The list asks for a row the filter has since removed.
             None => div().into_any_element(),
             // CommandGroup's heading: px-2 py-1.5 text-xs font-medium
             // text-muted-foreground.
             Some(CommandRow::Heading(group)) => div()
+                .w_full()
                 .px_2()
                 .py_1p5()
                 .text_size(rems(0.75))
@@ -444,6 +478,7 @@ impl Command {
                 let (label, detail, shortcut) = (item.label.clone(), item.detail.clone(), item.shortcut.clone());
                 div()
                     .id(("ui-command-item", item_ix))
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -491,13 +526,14 @@ impl Render for Command {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let style = command_style(cx.ui_theme());
         let empty = self.rows.is_empty();
-        // CommandList: max-h-[300px] overflow-y-auto, the groups p-1. The
-        // list sizes itself to its rows up to the cap.
+        // CommandList: max-h-[300px] overflow-y-auto. Each row carries its
+        // group's p-1 (`render_row`). The list sizes itself to its rows up
+        // to the cap.
         let rows = (!empty).then(|| {
             list(self.list.clone(), cx.processor(Self::render_row))
+                .w_full()
                 .with_sizing_behavior(ListSizingBehavior::Infer)
                 .max_h(COMMAND_LIST_MAX_HEIGHT)
-                .p_1()
         });
 
         // Command: bg-popover text-popover-foreground flex flex-col
@@ -606,6 +642,36 @@ mod tests {
         // A match in several groups keeps each group's heading.
         let rows = CommandRows::build(&groups(), "ta");
         assert_eq!(rows.rows(), [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }]);
+    }
+
+    /// Each row knows whether it opens or closes its group, headings
+    /// counted, so the group's padding goes above its first row and below
+    /// its last; a filtered group's edges are its listed rows.
+    #[test]
+    fn rows_know_their_groups_edges() {
+        let rows = CommandRows::build(&groups(), "");
+        // Heading(0), New Tab, Close Tab, Heading(1), Split Right, Split Down, Reload Config.
+        let edges: Vec<_> = (0..rows.len()).map(|row| rows.group_edges(row)).collect();
+        assert_eq!(
+            edges,
+            [
+                Some((true, false)),
+                Some((false, false)),
+                Some((false, true)),
+                Some((true, false)),
+                Some((false, false)),
+                Some((false, true)),
+                // The unnamed group's one item is both.
+                Some((true, true)),
+            ]
+        );
+        assert_eq!(rows.group_edges(7), None);
+        // Filtered: Tabs keeps its heading and Close Tab, which is now last.
+        let rows = CommandRows::build(&groups(), "clo");
+        assert_eq!(rows.rows(), [Heading(0), Item { item: 1, rank: 0 }]);
+        assert_eq!(rows.group_edges(0), Some((true, false)));
+        assert_eq!(rows.group_edges(1), Some((false, true)));
+        assert_eq!(CommandRows::default().group_edges(0), None);
     }
 
     /// The spec's scenario: nothing matches, so no heading shows and the

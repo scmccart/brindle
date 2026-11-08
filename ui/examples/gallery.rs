@@ -395,7 +395,7 @@ impl Gallery {
 
     fn command_section(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
-        div().flex().flex_col().gap_3().child(heading("Command (inline)", cx)).child(
+        div().flex().flex_col().gap_3().child(heading("Command (inline)", cx)).child(recorded(
             div()
                 .w(px(420.))
                 .rounded(t.radius_md())
@@ -403,7 +403,9 @@ impl Gallery {
                 .border_color(t.border)
                 .shadow_sm()
                 .child(self.command.clone()),
-        )
+            "command",
+            &self.records,
+        ))
     }
 
     fn buttons_section(&self, cx: &mut Context<Self>) -> Div {
@@ -1334,8 +1336,13 @@ mod check {
         /// The colour the window shows at `at`, once the next frame is
         /// drawn: the gallery renders its own window with `PrintWindow`, off
         /// the main thread, which keeps handling messages meanwhile.
-        #[cfg(windows)]
         async fn pixel(&mut self, at: Point<Pixels>) -> Result<[u8; 3], Failure> {
+            Ok(self.pixels(&[at]).await?[0])
+        }
+
+        /// The colours at each of `points`, from one rendering of the window.
+        #[cfg(windows)]
+        async fn pixels(&mut self, points: &[Point<Pixels>]) -> Result<Vec<[u8; 3]>, Failure> {
             if self.hwnd == 0 {
                 return Err(Failure::Skip("the gallery window wasn't found by its title".to_string()));
             }
@@ -1347,13 +1354,19 @@ mod check {
                 .spawn(async move { win::capture(hwnd) })
                 .await
                 .ok_or_else(|| Failure::Skip("PrintWindow couldn't render the window".to_string()))?;
-            let x = (f32::from(at.x) * self.scale).floor() as usize;
-            let y = (f32::from(at.y) * self.scale).floor() as usize;
-            capture.rgb(x, y).ok_or_else(|| Failure::Fail(format!("{at:?} is outside the window")))
+            let scale = self.scale;
+            points
+                .iter()
+                .map(|at| {
+                    let x = (f32::from(at.x) * scale).floor() as usize;
+                    let y = (f32::from(at.y) * scale).floor() as usize;
+                    capture.rgb(x, y).ok_or_else(|| Failure::Fail(format!("{at:?} is outside the window")))
+                })
+                .collect()
         }
 
         #[cfg(not(windows))]
-        async fn pixel(&mut self, _at: Point<Pixels>) -> Result<[u8; 3], Failure> {
+        async fn pixels(&mut self, _points: &[Point<Pixels>]) -> Result<Vec<[u8; 3]>, Failure> {
             Err(Failure::Skip(NO_PIXELS.to_string()))
         }
 
@@ -1539,6 +1552,8 @@ mod check {
         c.run_check("command-nothing-matches-hides-headings", check).await;
         let check = command_wraps(&mut c).await;
         c.run_check("command-navigation-skips-disabled-and-wraps", check).await;
+        let check = command_rows_fill_the_width(&mut c).await;
+        c.run_check("command-rows-fill-the-group-width-under-a-filter-border", check).await;
         let check = command_enter_and_escape_inline(&mut c).await;
         c.run_check("command-inline-enter-confirms-escape-cancels", check).await;
         let check = command_dialog(&mut c).await;
@@ -2232,6 +2247,41 @@ mod check {
             let highlight = read(c)?;
             ensure!(highlight == Some(expected), "{key} highlighted {highlight:?}, expected {expected}");
         }
+        Ok(())
+    }
+
+    /// Reads the inline command list's pixels: the line under the filter
+    /// is drawn, and the highlighted row's background reaches across the
+    /// list to the group's padding at the right, not just past its text,
+    /// while the padding at the left stays clear.
+    async fn command_rows_fill_the_width(c: &mut Checker) -> Check {
+        let command = c.with(|gallery, _, cx| {
+            gallery.command.update(cx, |command, cx| command.set_query("", cx));
+            gallery.command.clone()
+        })?;
+        ensure!(c.read(&command, |command, _| command.highlighted())? == Some(0), "New Tab isn't highlighted");
+        let (popover, accent, border) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (t.popover, t.accent, t.border)
+        })?;
+        let (accent, border, panel) = (over(accent, popover), over(border, popover), over(popover, popover));
+        let close = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2);
+        let frame = c.reveal("command").await?;
+        // The frame's 1px border, then the filter row: h-9 with a 1px
+        // border at its bottom.
+        let under_filter = point(frame.center().x, frame.top() + px(1. + 35.5));
+        let line = c.pixel(under_filter).await?;
+        ensure!(close(line, border), "no border under the filter: {line:?} at {under_filter:?}, the border is {border:?}");
+        // Down the list, near the right edge and inside the left padding.
+        let (right, left) = (frame.right() - px(10.), frame.left() + px(3.));
+        let ys: Vec<Pixels> = (0..40).map(|step| frame.top() + px(40. + 2. * step as f32)).collect();
+        let points: Vec<_> = ys.iter().flat_map(|&y| [point(right, y), point(left, y)]).collect();
+        let shown = c.pixels(&points).await?;
+        for (at, colour) in points.iter().zip(&shown).skip(1).step_by(2) {
+            ensure!(!close(*colour, accent) || accent == panel, "the highlight reaches into the group's padding at {at:?}");
+        }
+        let highlight_right = shown.iter().step_by(2).any(|colour| close(*colour, accent));
+        ensure!(highlight_right, "the highlighted row's background doesn't reach the list's right side (x = {right:?})");
         Ok(())
     }
 

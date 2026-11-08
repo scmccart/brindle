@@ -470,6 +470,28 @@ pub fn select_style(t: &Tokens) -> SelectStyle {
 /// it scales.
 pub const COMMAND_LIST_MAX_HEIGHT: Rems = Rems(18.75);
 
+/// A command group's padding on every side, shadcn's CommandGroup `p-1`.
+pub const COMMAND_GROUP_PADDING: Rems = Rems(0.25);
+
+/// The space around one row of a command list, which stands for the group
+/// it is in: each row is inset by the group's padding at the sides, the
+/// group's first row also at the top and its last at the bottom. A row's
+/// background (the highlight) fills the group's inner width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommandRowInsets {
+    pub top: Rems,
+    pub bottom: Rems,
+    /// Left and right.
+    pub x: Rems,
+}
+
+/// The insets of a row that is or isn't its group's first and last row (a
+/// group of one row is both).
+pub fn command_row_insets(first_in_group: bool, last_in_group: bool) -> CommandRowInsets {
+    let edge = |at_edge: bool| if at_edge { COMMAND_GROUP_PADDING } else { Rems(0.) };
+    CommandRowInsets { top: edge(first_in_group), bottom: edge(last_in_group), x: COMMAND_GROUP_PADDING }
+}
+
 /// A command list's resolved look.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CommandStyle {
@@ -936,6 +958,27 @@ mod tests {
         }
         // max-h-[300px] at the 16px root size.
         assert_eq!(COMMAND_LIST_MAX_HEIGHT, rems(18.75));
+    }
+
+    /// Every row sits inside its group's `p-1` at the sides; only the
+    /// group's first row has it above and only its last below, so groups
+    /// are 2 x p-1 apart and the list's ends get one.
+    #[test]
+    fn command_rows_take_their_groups_padding() {
+        let p = rems(0.25);
+        let none = rems(0.);
+        // (first in group, last in group, top, bottom)
+        let cases = [
+            (true, false, p, none),
+            (false, false, none, none),
+            (false, true, none, p),
+            (true, true, p, p),
+        ];
+        for (first, last, top, bottom) in cases {
+            let insets = command_row_insets(first, last);
+            assert_eq!(insets, CommandRowInsets { top, bottom, x: p }, "first={first} last={last}");
+        }
+        assert_eq!(COMMAND_GROUP_PADDING, rems(0.25));
     }
 
     #[test]
