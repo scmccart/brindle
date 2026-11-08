@@ -17,6 +17,7 @@ use gpui::{
     point, px, relative, size,
 };
 
+use crate::primitives::focus_visible::focus_from_pointer;
 use crate::actions::{
     TextInputBackspace, TextInputCopy, TextInputCut, TextInputDelete, TextInputDeleteWordBack, TextInputEnd,
     TextInputHome, TextInputLeft, TextInputPaste, TextInputRight, TextInputSelectAll, TextInputSelectEnd, TextInputSelectHome,
@@ -349,6 +350,13 @@ impl TextInput {
         self
     }
 
+    /// Replaces the placeholder, for an owner that gets it after creating
+    /// the entity.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// Makes the input a tab stop, so `Window::focus_next` reaches it.
     pub fn tab_stop(mut self) -> Self {
         self.focus_handle = self.focus_handle.tab_stop(true);
@@ -485,7 +493,7 @@ impl TextInput {
     }
 
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
+        focus_from_pointer(&self.focus_handle, window, cx);
         let offset = self.offset_for_position(e.position);
         if e.click_count >= 2 {
             self.state.select_word_at(offset);

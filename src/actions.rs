@@ -102,26 +102,6 @@ actions!(
         SettingsChoiceNext,
         SettingsChoicePrev,
         SettingsToggle,
-        // Text inputs.
-        TextInputLeft,
-        TextInputRight,
-        TextInputWordLeft,
-        TextInputWordRight,
-        TextInputHome,
-        TextInputEnd,
-        TextInputSelectLeft,
-        TextInputSelectRight,
-        TextInputSelectWordLeft,
-        TextInputSelectWordRight,
-        TextInputSelectHome,
-        TextInputSelectAll,
-        TextInputSelectEnd,
-        TextInputBackspace,
-        TextInputDelete,
-        TextInputDeleteWordBack,
-        TextInputCopy,
-        TextInputCut,
-        TextInputPaste,
     ]
 );
 
@@ -235,25 +215,25 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("picker_confirm", None, || Box::new(PickerConfirm)),
     ("picker_cancel", None, || Box::new(PickerCancel)),
     ("picker_kill", None, || Box::new(PickerKill)),
-    ("text_input_left", None, || Box::new(TextInputLeft)),
-    ("text_input_right", None, || Box::new(TextInputRight)),
-    ("text_input_word_left", None, || Box::new(TextInputWordLeft)),
-    ("text_input_word_right", None, || Box::new(TextInputWordRight)),
-    ("text_input_home", None, || Box::new(TextInputHome)),
-    ("text_input_end", None, || Box::new(TextInputEnd)),
-    ("text_input_select_left", None, || Box::new(TextInputSelectLeft)),
-    ("text_input_select_right", None, || Box::new(TextInputSelectRight)),
-    ("text_input_select_word_left", None, || Box::new(TextInputSelectWordLeft)),
-    ("text_input_select_word_right", None, || Box::new(TextInputSelectWordRight)),
-    ("text_input_select_home", None, || Box::new(TextInputSelectHome)),
-    ("text_input_select_all", None, || Box::new(TextInputSelectAll)),
-    ("text_input_select_end", None, || Box::new(TextInputSelectEnd)),
-    ("text_input_backspace", None, || Box::new(TextInputBackspace)),
-    ("text_input_delete", None, || Box::new(TextInputDelete)),
-    ("text_input_delete_word_back", None, || Box::new(TextInputDeleteWordBack)),
-    ("text_input_copy", None, || Box::new(TextInputCopy)),
-    ("text_input_cut", None, || Box::new(TextInputCut)),
-    ("text_input_paste", None, || Box::new(TextInputPaste)),
+    ("text_input_left", None, || Box::new(brindle_ui::TextInputLeft)),
+    ("text_input_right", None, || Box::new(brindle_ui::TextInputRight)),
+    ("text_input_word_left", None, || Box::new(brindle_ui::TextInputWordLeft)),
+    ("text_input_word_right", None, || Box::new(brindle_ui::TextInputWordRight)),
+    ("text_input_home", None, || Box::new(brindle_ui::TextInputHome)),
+    ("text_input_end", None, || Box::new(brindle_ui::TextInputEnd)),
+    ("text_input_select_left", None, || Box::new(brindle_ui::TextInputSelectLeft)),
+    ("text_input_select_right", None, || Box::new(brindle_ui::TextInputSelectRight)),
+    ("text_input_select_word_left", None, || Box::new(brindle_ui::TextInputSelectWordLeft)),
+    ("text_input_select_word_right", None, || Box::new(brindle_ui::TextInputSelectWordRight)),
+    ("text_input_select_home", None, || Box::new(brindle_ui::TextInputSelectHome)),
+    ("text_input_select_all", None, || Box::new(brindle_ui::TextInputSelectAll)),
+    ("text_input_select_end", None, || Box::new(brindle_ui::TextInputSelectEnd)),
+    ("text_input_backspace", None, || Box::new(brindle_ui::TextInputBackspace)),
+    ("text_input_delete", None, || Box::new(brindle_ui::TextInputDelete)),
+    ("text_input_delete_word_back", None, || Box::new(brindle_ui::TextInputDeleteWordBack)),
+    ("text_input_copy", None, || Box::new(brindle_ui::TextInputCopy)),
+    ("text_input_cut", None, || Box::new(brindle_ui::TextInputCut)),
+    ("text_input_paste", None, || Box::new(brindle_ui::TextInputPaste)),
     ("none", None, || Box::new(NoAction)),
 ];
 
@@ -299,7 +279,6 @@ fn default_bindings() -> Vec<KeyBinding> {
     let x = Some("TmuxWindow");
     let z = Some("ZoneTree");
     let s = Some("SettingsDialog");
-    let i = Some("TextInput");
     let c = Some("SettingsChoice");
     let f = Some("FindBar");
     let mut bindings = vec![
@@ -391,40 +370,9 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("left", SettingsChoicePrev, c),
         KeyBinding::new("right", SettingsChoiceNext, c),
         KeyBinding::new("space", SettingsToggle, c),
-        // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
-        // to the palette or dialog around them.
-        KeyBinding::new("left", TextInputLeft, i),
-        KeyBinding::new("right", TextInputRight, i),
-        KeyBinding::new("ctrl-left", TextInputWordLeft, i),
-        KeyBinding::new("ctrl-right", TextInputWordRight, i),
-        KeyBinding::new("home", TextInputHome, i),
-        KeyBinding::new("end", TextInputEnd, i),
-        KeyBinding::new("ctrl-e", TextInputEnd, i),
-        KeyBinding::new("shift-left", TextInputSelectLeft, i),
-        KeyBinding::new("shift-right", TextInputSelectRight, i),
-        KeyBinding::new("ctrl-shift-left", TextInputSelectWordLeft, i),
-        KeyBinding::new("ctrl-shift-right", TextInputSelectWordRight, i),
-        KeyBinding::new("shift-home", TextInputSelectHome, i),
-        KeyBinding::new("shift-end", TextInputSelectEnd, i),
-        KeyBinding::new("ctrl-shift-e", TextInputSelectEnd, i),
-        // Select all, as in desktop text boxes; ctrl-shift-a is also the
-        // terminal's select-all key.
-        KeyBinding::new("ctrl-a", TextInputSelectAll, i),
-        KeyBinding::new("ctrl-shift-a", TextInputSelectAll, i),
-        KeyBinding::new("backspace", TextInputBackspace, i),
-        KeyBinding::new("shift-backspace", TextInputBackspace, i),
-        KeyBinding::new("delete", TextInputDelete, i),
-        KeyBinding::new("ctrl-backspace", TextInputDeleteWordBack, i),
-        KeyBinding::new("ctrl-w", TextInputDeleteWordBack, i),
-        KeyBinding::new("ctrl-insert", TextInputCopy, i),
-        KeyBinding::new("ctrl-shift-c", TextInputCopy, i),
-        KeyBinding::new("ctrl-c", TextInputCopy, i),
-        KeyBinding::new("shift-delete", TextInputCut, i),
-        KeyBinding::new("ctrl-x", TextInputCut, i),
-        KeyBinding::new("shift-insert", TextInputPaste, i),
-        KeyBinding::new("ctrl-shift-v", TextInputPaste, i),
-        KeyBinding::new("ctrl-v", TextInputPaste, i),
     ];
+    // The text inputs' keys, in the `TextInput` context.
+    bindings.extend(brindle_ui::default_bindings());
     for n in 1..=9 {
         let index = if n == 9 { usize::MAX } else { n - 1 };
         bindings.push(KeyBinding::new(&format!("alt-{n}"), ActivateTab(index), w));

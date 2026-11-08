@@ -18,7 +18,7 @@ use gpui::{
 use crate::actions::*;
 use crate::terminal::search::{self, COUNT_CAP, Count, SearchOptions, Step};
 use crate::terminal_view::TerminalView;
-use crate::text_input::{TextInput, TextInputEvent};
+use brindle_ui::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 /// Delay before counting after the query changes, so fast typing scans once.
