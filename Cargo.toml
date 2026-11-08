@@ -103,3 +103,8 @@ opt-level = 2
 [profile.release]
 strip = true
 lto = "thin"
+
+# proc-macro-error2 2.0.1 re-exports `proc_macro` privately, which a future Rust
+# rejects (E0365). Upstream has no fix; this copy drops the unused re-export.
+[patch.crates-io]
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
