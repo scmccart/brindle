@@ -120,7 +120,10 @@ ui/                         package brindle-ui, lib brindle_ui
 - **Only the top layer acts.** A layer's `on_mouse_down_out` and its `Dismiss` action (Escape, bound in the `UiLayer` context) act only when `stack.is_top(id)`.
   - A nested menu painted outside its dialog's bounds is the top layer, so presses in it never reach the dialog's outside-press logic.
 - **Decisions use the stack as it was when the event started.** Dismiss requests are queued and applied with `window.defer`. Otherwise, in one press, the menu would close first and the dialog would then see itself on top and close too.
-- **Z-order.** Overlays render through `deferred(...).with_priority(depth)`, so deeper layers paint above.
+- **Z-order.** Only the bottom layer renders through `deferred`, which lifts it above the window. A layer opened while another is open renders inline, with `Anchored` where it has a position, inside the open layer's view, whose `deferred` already lifts it; within that subtree, tree order gives z-order. `wrap_in_deferred(depth)` is the pure decision.
+  - **The gpui constraint.** gpui 0.2.2 asserts that nothing calls `defer_draw` while it draws the deferred elements (`window.rs`: "cannot call defer_draw during deferred drawing"), so a `deferred` inside another's subtree panics on its first frame. Nested overlays can't each be deferred.
+  - **The owner rule.** The owner of a nested overlay (a select's menu or a popover in a dialog) renders it inside the parent layer's view, last in that view's tree and outside any clipping container (`overflow_hidden`, a scrolled body): what the parent renders after it paints over it, and a content mask clips it. A nested modal still covers the window, since its backdrop is absolute at the window's origin.
+  - `Overlay::render_with(place)` wraps a non-modal panel (in an `Anchored`, say) before the deferred-or-inline decision, so a depth-0 popover is placed between `deferred` and its panel, and a nested one is placed inline the same way.
 - **Modal layers** cover the window with an `occlude`d backdrop. A press on the backdrop is an outside press for the panel.
 - **Alternatives considered:**
   - Rely on focus alone for Escape: it works, but the outside-press problem remains.
@@ -138,7 +141,7 @@ ui/                         package brindle-ui, lib brindle_ui
 - **Outside presses and Escape don't close the overlay directly.** They dispatch `Dismiss` to the overlay's view.
   - The default handler, via a `dismiss_on_request()` helper, emits `DismissEvent`.
   - A view can handle `Dismiss` itself to stay open, for example to show an error. This is the "closes only when it agrees" requirement.
-- **Placement in the tree.** Dialogs are rendered by their owner as `.children(self.dialog.render(window, cx))` anywhere in its tree, and `deferred` lifts them above everything.
+- **Placement in the tree.** A bottom-layer overlay is rendered by its owner as `.children(self.dialog.render(window, cx))` anywhere in its tree, and `deferred` lifts it above everything. A nested overlay's owner renders it inside the parent layer's view, last in its tree (the layer stack's "Z-order" bullet).
 - **Multiple overlays are allowed.** Brindle's "one overlay at a time" rule (the `settings-dialog` spec) stays Workspace policy, applied in `ui-settings-dialog`.
 
 ### Focus scope
