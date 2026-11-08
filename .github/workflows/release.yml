@@ -1,0 +1,89 @@
+# Releases, driven by Conventional Commits through release-please
+# (release-please-config.json, .release-please-manifest.json).
+#
+# Each push to main updates the release pull request, `chore(release): X.Y.Z`,
+# which bumps the four crates' versions, their Cargo.lock entries and
+# CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
+# release with that version's notes. This run then builds both platforms at
+# the tag with the same reusable workflows CI uses, attaches the Linux
+# archive, the Windows zip and SHA256SUMS, and publishes the release. A failed
+# build leaves the draft; rerunning the failed jobs completes it.
+#
+# release-please runs as a GitHub App (secrets RELEASE_APP_ID and
+# RELEASE_APP_PRIVATE_KEY): pull requests opened with GITHUB_TOKEN trigger no
+# workflows, and the release pull request needs CI and the title check.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One release run at a time, never cancelled midway.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-26.04
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ steps.token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  linux:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      ref: ${{ needs.release-please.outputs.tag }}
+
+  windows:
+    needs: [release-please, linux]
+    if: needs.release-please.outputs.created == 'true'
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      ref: ${{ needs.release-please.outputs.tag }}
+      winget-validate: false
+
+  publish:
+    needs: [release-please, linux, windows]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: brindle-*-x64
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attach the assets
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+      - name: Publish
+        run: gh release edit "$TAG" --draft=false

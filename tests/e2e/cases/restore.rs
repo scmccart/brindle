@@ -49,6 +49,8 @@ pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
     let (a, b) = (dir(ctx, "dir a")?, dir(ctx, "dir-b")?);
     let quote = |p: &Path| format!("'{}'", p.display());
     Run::new(ctx, &server, "record")
+        // The next run attaches the same shells, in their directories.
+        .keep_detached()
         .restore()
         .default_profile("Shell")
         .send(&format!("cd {}\r", quote(&a)))
@@ -122,7 +124,7 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
 /// quits without ever dumping, and waits for it to exit.
 fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &[&str]) -> Result {
     let config = ctx.dir.join("config.toml");
-    std::fs::write(&config, crate::brindle::config_with(&server.socket, "e2e", "Shell", "restore_session = true\n"))
+    std::fs::write(&config, crate::brindle::config_with(&server.socket, "e2e", "Shell", ""))
         .map_err(|e| e.to_string())?;
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
     let mut child = std::process::Command::new(&ctx.bin)
@@ -132,6 +134,7 @@ fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &
         .args(["--dump-screen-after", &ctx.secs(20.0).to_string()])
         .env("BRINDLE_CONFIG", &config)
         .env("BRINDLE_STATE_DIR", state_dir(ctx))
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env("DISPLAY", &ctx.display)
         .env_remove("WAYLAND_DISPLAY")
         .stdout(std::process::Stdio::null())

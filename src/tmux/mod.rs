@@ -20,6 +20,7 @@ use futures::channel::oneshot;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 
 use crate::config::{Config, Profile, TmuxMode};
+use crate::terminal::pace::{self, Pace};
 use crate::terminal::{DefaultColors, GridSize, PaletteHandler, Terminal};
 use crate::theme::{Color, Theme};
 use layout::{Inset, Layout, Rect};
@@ -74,6 +75,9 @@ enum Pending {
     Ignore,
     /// `#{version}`, asked before the first window list.
     Version,
+    /// `#{client_name}` of this control client, kept so a dropped remote
+    /// connection can detach it from the server.
+    ClientName,
     ListWindows,
     /// A `poll_command` reply.
     Poll,
@@ -89,6 +93,52 @@ enum Pending {
     PaletteClients { pane: PaneId, index: usize, reply: Vec<u8> },
     /// `#{pane-colours[index]}` for the same query.
     PaletteOption { pane: PaneId, reply: Vec<u8> },
+}
+
+/// A remote control client with no word from tmux this long gets a heartbeat.
+const HEARTBEAT_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// The connection is dead after this long without anything from tmux. A
+/// heartbeat has been outstanding for all but the first [`HEARTBEAT_AFTER`].
+const DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a [`LinkWatch`] check asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkAction {
+    Nothing,
+    /// Send a no-op command so a live link answers.
+    Heartbeat,
+    /// Nothing has arrived for too long.
+    Dead,
+}
+
+/// Tracks when a remote control client last heard from tmux. Anything
+/// received counts, so a busy session never needs a heartbeat's reply.
+#[derive(Debug)]
+struct LinkWatch {
+    last_heard: std::time::Instant,
+    heartbeat_sent: bool,
+}
+
+impl LinkWatch {
+    fn new(now: std::time::Instant) -> Self {
+        Self { last_heard: now, heartbeat_sent: false }
+    }
+
+    fn heard(&mut self, now: std::time::Instant) {
+        self.last_heard = now;
+        self.heartbeat_sent = false;
+    }
+
+    fn check(&mut self, now: std::time::Instant) -> LinkAction {
+        let silent = now.saturating_duration_since(self.last_heard);
+        if silent >= DEAD_AFTER {
+            LinkAction::Dead
+        } else if silent >= HEARTBEAT_AFTER && !std::mem::replace(&mut self.heartbeat_sent, true) {
+            LinkAction::Heartbeat
+        } else {
+            LinkAction::Nothing
+        }
+    }
 }
 
 /// What the writer thread is asked to do.
@@ -404,6 +454,11 @@ pub struct TmuxSession {
     poll_again: bool,
     /// Polls every second while attached on `StateSource::Poll`.
     poll_timer: Option<Task<()>>,
+    /// Watches a remote client's connection (remote profiles only).
+    link: Option<LinkWatch>,
+    link_timer: Option<Task<()>>,
+    /// This control client's name on the server, once known.
+    client_name: Option<String>,
     /// `release` has run: the session is being left.
     released: bool,
     /// Brindle is quitting: leaving the session must not change the window,
@@ -516,37 +571,6 @@ fn tmux_process(
     command.args(args).envs(crate::terminal::child_env(profile));
     crate::remote::hide_window(&mut command);
     Ok(crate::remote::TmuxProcess { command, initial_input: Vec::new() })
-}
-
-/// Whether session `name` exists on `profile`'s server. Runs tmux, so it
-/// belongs off the UI thread. Anything but a prompt success (a missing
-/// server, a tmux that won't start, a timeout) means no.
-pub fn session_exists(profile: &Profile, name: &str) -> bool {
-    let (program, args) = has_session_command(profile, name);
-    let Ok(process) = tmux_process(profile, &program, &args, None) else { return false };
-    let (mut command, input) = (process.command, process.initial_input);
-    command
-        .stdin(if input.is_empty() { Stdio::null() } else { Stdio::piped() })
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else { return false };
-    if !input.is_empty() && !child.stdin.take().is_some_and(|mut stdin| stdin.write_all(&input).is_ok()) {
-        child.kill().ok();
-        child.wait().ok();
-        return false;
-    }
-    let never_cancel = std::sync::atomic::AtomicBool::new(false);
-    crate::remote::wait_process(child, &never_cancel, std::time::Duration::from_secs(30)).is_ok_and(|status| status.success())
-}
-
-/// The command that succeeds when session `name` exists on `profile`'s
-/// server (an exact match, not a prefix).
-pub fn has_session_command(profile: &Profile, name: &str) -> (String, Vec<String>) {
-    let tmux = tmux_command(profile);
-    let mut args = tmux.prefix;
-    args.extend(tmux.options);
-    args.extend(["has-session".into(), "-t".into(), format!("={name}")]);
-    (tmux.program, args)
 }
 
 /// Set on Brindle's control clients to Brindle's pid, so that another
@@ -788,18 +812,23 @@ impl TmuxSession {
 
         let reader = cx.spawn(async move |this, cx| {
             let mut events = event_rx.ready_chunks(4096);
+            let mut pace = Pace::default();
             while let Some(batch) = events.next().await {
+                pace.wait(cx).await;
                 let alive = this.update(cx, |this, cx| {
-                    for event in batch {
-                        match event {
-                            Some(event) => this.handle_event(event, cx),
-                            None => this.on_detached("tmux exited".into(), cx),
+                    pace::drain(&mut events, batch, |batch| {
+                        for event in batch {
+                            match event {
+                                Some(event) => this.handle_event(event, cx),
+                                None => this.on_stream_ended(cx),
+                            }
                         }
-                    }
+                    });
                 });
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         });
 
@@ -828,6 +857,9 @@ impl TmuxSession {
             polling: false,
             poll_again: false,
             poll_timer: None,
+            link: None,
+            link_timer: None,
+            client_name: None,
             released: false,
             quitting: false,
             _reader: reader,
@@ -896,7 +928,72 @@ impl TmuxSession {
         if self.child.is_some() {
             self.io.borrow_mut().send(format!("display-message -p {}", protocol::quote("#{version}")), Pending::Version);
             self.list_windows();
+            if self.profile.remote.is_some() {
+                self.io
+                    .borrow_mut()
+                    .send(format!("display-message -p {}", protocol::quote("#{client_name}")), Pending::ClientName);
+                self.start_link_watch(cx);
+            }
         }
+    }
+
+    /// Checks a remote connection every few seconds (see [`LinkWatch`]).
+    fn start_link_watch(&mut self, cx: &mut Context<Self>) {
+        self.link = Some(LinkWatch::new(std::time::Instant::now()));
+        self.link_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                let alive = this.update(cx, |this, cx| {
+                    let action = this.link.as_mut().map(|link| link.check(std::time::Instant::now()));
+                    match action {
+                        Some(LinkAction::Heartbeat) => {
+                            this.io.borrow_mut().send("display-message -p ''".into(), Pending::Ignore);
+                        }
+                        Some(LinkAction::Dead) => this.on_connection_lost(cx),
+                        _ => {}
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The control stream closed. For a remote client that was attached and
+    /// not asked to go, that is a lost connection.
+    fn on_stream_ended(&mut self, cx: &mut Context<Self>) {
+        if self.profile.remote.is_some() && self.attached && !self.released && !self.detached {
+            self.on_connection_lost(cx);
+        } else {
+            self.on_detached("tmux exited".into(), cx);
+        }
+    }
+
+    /// The remote connection is dead: end the session as a detach, and ask
+    /// the server, over a new connection and in the background, to let go of
+    /// this client.
+    fn on_connection_lost(&mut self, cx: &mut Context<Self>) {
+        if self.detached {
+            return;
+        }
+        log::warn!("remote tmux connection lost");
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                child.kill().ok();
+                child.wait().ok();
+            });
+        }
+        if let Some(client) = self.client_name.take() {
+            let tmux = tmux_command(&self.profile);
+            match crate::remote::detach_command(&self.profile, &tmux.program, &tmux.options, &client) {
+                Ok(command) => {
+                    std::thread::spawn(move || crate::remote::detach_client(command));
+                }
+                Err(error) => log::debug!("cannot detach the dropped tmux client: {error:#}"),
+            }
+        }
+        self.on_detached("connection lost".into(), cx);
     }
 
     /// Another Brindle shows the session: it isn't attached here.
@@ -1081,6 +1178,8 @@ impl TmuxSession {
             return;
         }
         self.released = true;
+        self.link = None;
+        self.link_timer = None;
         self.stop_polling();
         self.unsubscribe();
         self.send("detach-client");
@@ -1129,6 +1228,9 @@ impl TmuxSession {
     // ---- incoming -----------------------------------------------------------------
 
     fn handle_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        if let Some(link) = &mut self.link {
+            link.heard(std::time::Instant::now());
+        }
         match event {
             Event::Response { ours: false, ok: false, body } if !self.attached => {
                 self.attach_error = attach_error(&body);
@@ -1142,6 +1244,13 @@ impl TmuxSession {
                         let source = StateSource::choose(version.as_deref());
                         log::debug!("tmux version {version:?}: following pane state by {source:?}");
                         self.state_source = Some(source);
+                    }
+                    Some(Pending::ClientName) => {
+                        self.client_name = body
+                            .first()
+                            .filter(|_| ok)
+                            .map(|l| String::from_utf8_lossy(l).trim().to_string())
+                            .filter(|name| !name.is_empty());
                     }
                     Some(Pending::ListWindows) if ok => self.on_window_list(body, cx),
                     Some(Pending::PaneState(pane)) => {
@@ -1583,6 +1692,8 @@ impl TmuxSession {
         }
         self.detached = true;
         self.stop_polling();
+        self.link = None;
+        self.link_timer = None;
         // Nothing more will be answered; dropping waiting user commands
         // closes their prompts.
         self.io.borrow_mut().pending.clear();
@@ -2019,18 +2130,10 @@ mod tests {
     }
 
     #[test]
-    fn wsl_session_checks_run_inside_wsl() {
-        let (program, args) = has_session_command(&wsl_profile("wsl", &["tmux"]), "logs");
-        assert_eq!(program, "wsl");
-        assert_eq!(args, ["--exec", "tmux", "has-session", "-t", "=logs"]);
-    }
-
-    #[test]
     fn a_program_that_isnt_wsl_is_unchanged() {
         let profile = wsl_profile("/opt/tmux/bin/tmux", &["-L", "x"]);
         let (_, args) = command_line(&profile, &AttachSpec::Named, Some(&PathBuf::from("/tmp")));
         assert_eq!(args, ["-u", "-L", "x", "-C", "new-session", "-A", "-s", "main", "-c", "/tmp"]);
-        assert_eq!(has_session_command(&profile, "s").1, ["-L", "x", "has-session", "-t", "=s"]);
     }
 
     #[test]
@@ -2096,12 +2199,6 @@ mod tests {
         assert!(!other_brindle_client(&[13], 1, read));
         assert!(!other_brindle_client(&[99], 1, read), "unreadable");
         assert!(!other_brindle_client(&[], 1, read));
-    }
-
-    #[test]
-    fn has_session_matches_exactly() {
-        let profile = Profile { name: "t".into(), tmux_args: vec!["-L".into(), "x".into()], ..Default::default() };
-        assert_eq!(has_session_command(&profile, "work"), ("tmux".into(), vec!["-L".into(), "x".into(), "has-session".into(), "-t".into(), "=work".into()]));
     }
 
     #[test]
@@ -2232,4 +2329,28 @@ mod tests {
         }
         assert!(!s.contains("\x1b[?1003h"));
     }
+
+#[test]
+fn link_watch_heartbeats_then_declares_death() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut watch = LinkWatch::new(t0);
+    assert_eq!(watch.check(t0 + Duration::from_secs(9)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(10)), LinkAction::Heartbeat);
+    // One heartbeat per silence.
+    assert_eq!(watch.check(t0 + Duration::from_secs(12)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(30)), LinkAction::Dead);
+}
+
+#[test]
+fn link_watch_resets_on_anything_heard() {
+    use std::time::{Duration, Instant};
+    let t0 = Instant::now();
+    let mut watch = LinkWatch::new(t0);
+    assert_eq!(watch.check(t0 + Duration::from_secs(11)), LinkAction::Heartbeat);
+    watch.heard(t0 + Duration::from_secs(25));
+    assert_eq!(watch.check(t0 + Duration::from_secs(34)), LinkAction::Nothing);
+    assert_eq!(watch.check(t0 + Duration::from_secs(36)), LinkAction::Heartbeat);
+    assert_eq!(watch.check(t0 + Duration::from_secs(40)), LinkAction::Nothing);
+}
 }

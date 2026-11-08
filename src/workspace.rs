@@ -12,7 +12,7 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowControlArea, WindowHandle, canvas, div, point, px,
+    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px,
 };
 use gpui::EntityId;
 
@@ -22,6 +22,7 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
 use crate::text_input::TextInput;
+use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
@@ -193,36 +194,19 @@ impl LaunchRequest {
     }
 }
 
-/// What a new window opens with.
+/// What a launch opens: the window's first content, or a tab a later
+/// request adds.
 pub enum Launch {
     Request(LaunchRequest),
     /// A window recorded by session restore.
     Restore(WindowState),
-    /// A new tmux session (named by tmux when `name` is `None`).
-    NewSession { profile: Profile, name: Option<String>, cwd: Option<PathBuf> },
+    /// `brindle --attach ID`: that detached session, or why it can't be.
+    Attach { session: u32, target: Result<SessionInfo, String> },
 }
 
-/// Where an action opens a profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Target {
-    Tab,
-    Window,
-}
-
-/// Where a tmux session is shown.
-#[derive(Clone)]
-enum SessionLocation {
-    Here(Entity<TmuxSession>),
-    Elsewhere(WindowHandle<Workspace>, Entity<TmuxSession>),
-    /// Another Brindle process shows the session with this name; it can't
-    /// be gone to from here.
-    OtherBrindle(String),
-}
-
-/// A row of the palette that asks about a session open elsewhere.
+/// A row of the palette that asks about a session another Brindle shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OpenChoice {
-    GoTo,
     NewSession,
     Profile(usize),
 }
@@ -236,9 +220,56 @@ enum PaletteKind {
     /// Asks what to do after a session that was all the window showed
     /// ended: row 0 closes the window, row n opens profile n - 1.
     SessionEnded { session: Entity<TmuxSession> },
-    /// Asks what to open instead of attaching a session another window
-    /// shows: `profile` was asked for, as `target`.
-    SessionOpenElsewhere { choices: Vec<OpenChoice>, profile: usize, location: SessionLocation, target: Target },
+    /// Asks what to open instead of attaching a session another Brindle
+    /// shows: `profile` was asked for.
+    SessionOpenElsewhere { choices: Vec<OpenChoice>, profile: usize },
+    /// The terminal server's detached sessions, by row: enter attaches one
+    /// into a new tab, `picker_kill` ends it.
+    Sessions { sessions: Vec<SessionInfo> },
+}
+
+/// Kills `kill` (if given), then lists the server's detached sessions,
+/// through the process's shared connection. Blocks: off the UI thread.
+fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        let connection = crate::remote::local::shared()?;
+        if let Some(id) = kill
+            && let Err(why) = connection.kill(id)
+        {
+            log::warn!("killing session {id}: {why:#}");
+        }
+        // A killed session stays listed until its program has exited.
+        Ok(connection.list()?.into_iter().filter(|s| !s.attached && Some(s.session) != kill).collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = kill;
+        Ok(Vec::new())
+    }
+}
+
+/// The sessions palette's rows: newest first, each with its directory and
+/// age at `now` (unix seconds).
+fn session_rows(sessions: &mut [SessionInfo], now: u64) -> Vec<PaletteRow> {
+    sessions.sort_by_key(|s| std::cmp::Reverse((s.started, s.session)));
+    sessions
+        .iter()
+        .map(|s| {
+            let age = crate::reattach::age(s.started, now);
+            let detail = match (&s.cwd, age) {
+                (Some(cwd), Some(age)) => format!("{cwd} · {age} ago"),
+                (Some(cwd), None) => cwd.clone(),
+                (None, Some(age)) => format!("{age} ago"),
+                (None, None) => String::new(),
+            };
+            PaletteRow {
+                label: crate::reattach::label(s).into(),
+                detail: (!detail.is_empty()).then(|| detail.into()),
+                shortcut: None,
+            }
+        })
+        .collect()
 }
 
 /// What is shown over the tabs; at most one at a time.
@@ -355,14 +386,33 @@ impl Workspace {
                 }
             }
         });
+        this.open(launch, window, cx);
+        this
+    }
+
+    /// Opens what a launch asks for in this window.
+    pub fn open(&mut self, launch: Launch, window: &mut Window, cx: &mut Context<Self>) {
         match launch {
-            Launch::Request(request) => this.launch(request, window, cx),
-            Launch::Restore(state) => this.restore(state, window, cx),
-            Launch::NewSession { profile, name, cwd } => {
-                this.create_session(profile, AttachSpec::New(name), cwd, None, window, cx);
+            Launch::Request(request) => self.launch(request, window, cx),
+            Launch::Restore(state) => self.restore(state, window, cx),
+            Launch::Attach { session, target } => self.launch_attach(session, target, window, cx),
+        }
+    }
+
+    /// The tab `brindle --attach` opens: the session attached, or a message
+    /// naming it and why not.
+    fn launch_attach(&mut self, session: u32, target: Result<SessionInfo, String>, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            Ok(info) => self.attach_detached_here(info, window, cx),
+            Err(why) => {
+                let config = Self::settings(cx).clone();
+                let profile = config.profiles[config.default_profile_index()].clone();
+                let text = format!("\x1b[31mBrindle could not attach session {session}:\x1b[0m\r\n{why}\r\n");
+                let theme = config.profile_theme(&profile);
+                let terminal = cx.new(|cx| Terminal::message(&text, theme, &config, cx));
+                self.insert_terminal_tab(profile, terminal, true, window, cx);
             }
         }
-        this
     }
 
     /// Opens a recorded window's tabs. Local tabs open in order; each tmux
@@ -376,10 +426,20 @@ impl Workspace {
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
-                RestoredTab::Local { profile, cwd, title, zones } => {
-                    match zones {
-                        Some(zones) => self.restore_local_zones(profile, zones, window, cx),
-                        None => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
+                RestoredTab::Local { profile, cwd, title, zones, session } => {
+                    let found = match zones {
+                        Some(_) => None,
+                        None => Self::take_detached(session.as_ref(), cx),
+                    };
+                    match (zones, found) {
+                        (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
+                        #[cfg(target_os = "linux")]
+                        (None, Some(info)) if config.profiles[profile].tmux == TmuxMode::None => {
+                            let profile = config.profiles[profile].clone();
+                            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
+                            self.insert_terminal_tab(profile, terminal, true, window, cx);
+                        }
+                        _ => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
                     }
                     let Some(tab) = self.tabs.get_mut(self.active) else { continue };
                     if let Some(title) = title {
@@ -433,9 +493,8 @@ impl Workspace {
         let (tree, leaves, active_id) = zones.into_tree();
         let terminals: Vec<_> = leaves
             .into_iter()
-            .map(|(id, cwd)| {
-                let cmd = command.clone();
-                let terminal = cx.new(|cx| Terminal::spawn(&profile, cmd, Some(cwd), &config, cx));
+            .map(|(id, cwd, session)| {
+                let terminal = Self::restored_terminal(&profile, command.clone(), cwd, session.as_ref(), &config, cx);
                 (id, terminal)
             })
             .collect();
@@ -445,9 +504,7 @@ impl Workspace {
         let view = cx.new(|cx| {
             ZoneTreeView::from_restored(p_clone, theme, font_size, tree, terminals, active_id, window, cx)
         });
-        let subscriptions = vec![cx.subscribe_in(&view, window, |this, view, event, window, cx| {
-            this.on_zone_tree_event(view, event, window, cx)
-        })];
+        let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
@@ -493,14 +550,17 @@ impl Workspace {
                 (_, TabContent::Zones(view)) => {
                     let z = view.read(cx);
                     let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
-                        z.zone_working_directory(id, cx)
+                        (z.zone_working_directory(id, cx), z.zone_server_session(id, cx))
                     });
+                    // A single zone's session is the tab's.
+                    let session = zones.is_none().then(|| z.zone_server_session(z.active_id(), cx)).flatten();
                     SnapshotTab::Local {
                         profile: tab.profile.name.clone(),
                         remote: tab.profile.remote.clone(),
                         cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
                         title: tab.manual_title.clone(),
                         zones,
+                        session,
                     }
                 }
             });
@@ -527,8 +587,7 @@ impl Workspace {
     /// Stores this window's snapshot, when session restore is on and this
     /// process owns the session.
     pub fn record_session(&self, window: &Window, cx: &mut Context<Self>) {
-        let enabled = Self::settings(cx).restore_session;
-        if !cx.update_global(|store: &mut SessionStore, _| store.is_owner(enabled)) {
+        if !cx.update_global(|store: &mut SessionStore, _| store.is_owner()) {
             return;
         }
         let state = self.snapshot(window, cx);
@@ -604,11 +663,102 @@ impl Workspace {
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
-        let subscriptions = vec![cx.subscribe_in(&view, window, |this, view, event, window, cx| {
-            this.on_zone_tree_event(view, event, window, cx)
-        })];
+        let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
+    }
+
+    /// A local tab showing `terminal` alone, inserted after the active tab,
+    /// and activated when `activate`.
+    fn insert_terminal_tab(
+        &mut self,
+        profile: Profile,
+        terminal: Entity<Terminal>,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let config = Self::settings(cx).clone();
+        let theme = self.tab_theme(&profile, &config);
+        let font_size = profile.font_size;
+        let p_clone = profile.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
+        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
+        let id = tab.id;
+        if activate {
+            self.insert_tab(tab, None, window, cx);
+        } else {
+            let at = self.tabs.len();
+            self.insert_tab_inactive(tab, Some(at), cx);
+        }
+        id
+    }
+
+    /// The detached session a restored zone recorded, when the launch's
+    /// listing still has it ([`crate::reattach::Detached`]).
+    fn take_detached(recorded: Option<&session::ServerSession>, cx: &mut App) -> Option<SessionInfo> {
+        let recorded = recorded?;
+        cx.try_global::<crate::reattach::Detached>()?;
+        cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take(recorded))
+    }
+
+    /// A terminal attached to the detached session `info`, closing as
+    /// `profile` says.
+    #[cfg(target_os = "linux")]
+    fn attached_terminal(info: &SessionInfo, profile: &Profile, config: &Config, cx: &mut Context<Self>) -> Entity<Terminal> {
+        // At the session's own size, so attaching resizes nothing; a core
+        // that predates sizes in `LIST` reports 0.
+        let default = crate::terminal::GridSize::default();
+        let (cols, rows) = if info.cols > 0 && info.rows > 0 { (info.cols, info.rows) } else { (default.cols, default.rows) };
+        let request = crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows };
+        let what = crate::reattach::label(info);
+        cx.new(|cx| Terminal::attach(request, what, profile, config, cx))
+    }
+
+    /// A restored zone's terminal: its recorded session attached when the
+    /// launch found it still detached, else `profile` spawned in `cwd`.
+    fn restored_terminal(
+        profile: &Profile,
+        command: Option<(String, Vec<String>)>,
+        cwd: PathBuf,
+        recorded: Option<&session::ServerSession>,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
+        // Only a profile's own program runs in a reattachable session.
+        let found = if command.is_none() { Self::take_detached(recorded, cx) } else { None };
+        #[cfg(target_os = "linux")]
+        if let Some(info) = found {
+            return Self::attached_terminal(&info, profile, config, cx);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = found;
+        cx.new(|cx| Terminal::spawn(profile, command, Some(cwd), config, cx))
+    }
+
+    /// Opens a tab for each of `sessions` (detached sessions nothing
+    /// restored took), after the others and in this order, each with the
+    /// profile its meta names (the default one when it's gone). The active
+    /// tab stays the same.
+    pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "linux")]
+        {
+            let config = Self::settings(cx).clone();
+            for info in sessions {
+                let index = info
+                    .profile
+                    .as_deref()
+                    .and_then(|name| config.profile_index(name))
+                    .unwrap_or_else(|| config.default_profile_index());
+                let profile = config.profiles[index].clone();
+                let terminal = Self::attached_terminal(&info, &profile, &config, cx);
+                let activate = self.tabs.is_empty();
+                self.insert_terminal_tab(profile, terminal, activate, window, cx);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (sessions, window, cx);
     }
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
@@ -635,10 +785,8 @@ impl Workspace {
         index
     }
 
-    /// Attaches `profile`'s session, or focuses it if this window already
-    /// shows it. A session another window shows is not attached again
-    /// (callers that may hit that ask first, see `open_profile`). Returns
-    /// the newly attached session.
+    /// Attaches `profile`'s session, or focuses it if the window already
+    /// shows it. Returns the newly attached session.
     fn attach_tmux(
         &mut self,
         profile: Profile,
@@ -646,18 +794,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<TmuxSession>> {
-        if let Some(key) = SessionKey::for_profile(&profile) {
-            match self.find_session(&key, window, cx) {
-                Some(SessionLocation::Here(session)) => {
-                    self.show_session(&session, window, cx);
-                    return None;
-                }
-                Some(SessionLocation::Elsewhere(..) | SessionLocation::OtherBrindle(_)) => {
-                    log::info!("tmux session {:?} is shown in another window; not attaching it again", profile.tmux_session_name());
-                    return None;
-                }
-                None => {}
-            }
+        if let Some(session) = SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, cx)) {
+            self.show_session(&session, window, cx);
+            return None;
         }
         Some(self.create_session(profile, AttachSpec::Named, cwd, None, window, cx))
     }
@@ -687,39 +826,14 @@ impl Workspace {
         session
     }
 
-    /// Where `key`'s session is shown: this window first, then the others.
-    fn find_session(&self, key: &SessionKey, window: &Window, cx: &App) -> Option<SessionLocation> {
-        let shows = |sessions: &[(Entity<TmuxSession>, Subscription)]| {
-            sessions.iter().map(|(s, _)| s).find(|s| s.read(cx).key().as_ref() == Some(key)).cloned()
-        };
-        if let Some(session) = shows(&self.tmux_sessions) {
-            return Some(SessionLocation::Here(session));
-        }
-        self.other_workspaces(window, cx).into_iter().find_map(|handle| {
-            // Another window's root is readable unless it is mid-update,
-            // which only this window can be.
-            let session = shows(&handle.read(cx).ok()?.tmux_sessions)?;
-            Some(SessionLocation::Elsewhere(handle, session))
-        })
+    /// The window's session for `key`, if it shows one.
+    fn find_session(&self, key: &SessionKey, cx: &App) -> Option<Entity<TmuxSession>> {
+        self.tmux_sessions.iter().map(|(s, _)| s).find(|s| s.read(cx).key().as_ref() == Some(key)).cloned()
     }
 
-    /// The sessions every window shows.
-    fn open_sessions(&self, window: &Window, cx: &App) -> Vec<SessionKey> {
-        let keys = |sessions: &[(Entity<TmuxSession>, Subscription)]| -> Vec<SessionKey> {
-            sessions.iter().filter_map(|(s, _)| s.read(cx).key()).collect()
-        };
-        let mut open = keys(&self.tmux_sessions);
-        for handle in self.other_workspaces(window, cx) {
-            if let Ok(ws) = handle.read(cx) {
-                open.extend(keys(&ws.tmux_sessions));
-            }
-        }
-        open
-    }
-
-    fn other_workspaces(&self, window: &Window, cx: &App) -> Vec<WindowHandle<Workspace>> {
-        let own = window.window_handle().window_id();
-        cx.windows().into_iter().filter(|w| w.window_id() != own).filter_map(|w| w.downcast::<Workspace>()).collect()
+    /// The sessions the window shows.
+    fn open_sessions(&self, cx: &App) -> Vec<SessionKey> {
+        self.tmux_sessions.iter().filter_map(|(s, _)| s.read(cx).key()).collect()
     }
 
     /// Activates `session`'s tab for tmux's current window, else its first.
@@ -733,113 +847,46 @@ impl Workspace {
         }
     }
 
-    /// Shows the session where it is, bringing its window up if that's
-    /// another one.
-    fn go_to_session(&mut self, location: SessionLocation, window: &mut Window, cx: &mut Context<Self>) {
-        match location {
-            SessionLocation::Here(session) => self.show_session(&session, window, cx),
-            SessionLocation::OtherBrindle(_) => {}
-            SessionLocation::Elsewhere(handle, session) => {
-                // Asked for while this window still has focus.
-                let token = notify::activation::request_token(window);
-                cx.defer(move |cx| {
-                    handle
-                        .update(cx, |ws, window, cx| {
-                            ws.show_session(&session, window, cx);
-                            notify::activation::raise(window, token.as_deref());
-                        })
-                        .ok();
-                });
-            }
-        }
-    }
-
-    /// Opens profile `ix` as `target` says, unless that would attach a
-    /// session another window shows (or, for a new window, any window):
-    /// then asks what to open instead.
-    fn open_profile(&mut self, ix: usize, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens profile `ix` in a new tab, or activates its tmux session's tab
+    /// when the window already shows it.
+    fn open_profile(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = Self::settings(cx).profiles.get(ix).cloned() else { return };
-        let location = SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, window, cx));
-        match (location, target) {
-            (None, Target::Tab) => self.launch(LaunchRequest::profile(ix), window, cx),
-            (None, Target::Window) => {
-                crate::open_window(Launch::Request(LaunchRequest::profile(ix)), cx);
-            }
-            (Some(SessionLocation::Here(session)), Target::Tab) => self.show_session(&session, window, cx),
-            (Some(location), target) => self.ask_session_open(ix, location, target, window, cx),
+        match SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, cx)) {
+            Some(session) => self.show_session(&session, window, cx),
+            None => self.launch(LaunchRequest::profile(ix), window, cx),
         }
     }
 
-    fn ask_session_open(
-        &mut self,
-        profile: usize,
-        location: SessionLocation,
-        target: Target,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let name = match &location {
-            SessionLocation::Here(session) | SessionLocation::Elsewhere(_, session) => {
-                session.read(cx).session_name.clone().unwrap_or_default()
-            }
-            SessionLocation::OtherBrindle(name) => name.clone(),
-        };
-        let open = self.open_sessions(window, cx);
-        let go_to = !matches!(location, SessionLocation::OtherBrindle(_));
-        let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &name, &open, target, go_to)
-            .into_iter()
-            .unzip();
-        let placeholder = match location {
-            SessionLocation::Here(_) => format!("tmux session \"{name}\" is open in this window"),
-            SessionLocation::Elsewhere(..) => format!("tmux session \"{name}\" is open in another window"),
-            SessionLocation::OtherBrindle(_) => format!("tmux session \"{name}\" is open in another Brindle"),
-        };
+    /// Asks what to open instead of profile `profile`'s session `name`,
+    /// which another Brindle shows.
+    fn ask_session_open(&mut self, profile: usize, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.open_sessions(cx);
+        let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &open).into_iter().unzip();
+        let placeholder = format!("tmux session \"{name}\" is open in another Brindle");
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx));
-        let kind = PaletteKind::SessionOpenElsewhere { choices, profile, location, target };
-        self.show_palette(palette, kind, window, cx);
+        self.show_palette(palette, PaletteKind::SessionOpenElsewhere { choices, profile }, window, cx);
     }
 
     /// Asks for a name, then creates that tmux session on `profile`'s
-    /// server, here or in a new window.
-    fn ask_new_session(&mut self, profile: Profile, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+    /// server, in the window.
+    fn ask_new_session(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle().downcast::<Workspace>();
         let cwd = self.active_cwd_for(&profile, cx);
         let submit: SubmitFn = Rc::new(move |name, cx| {
             let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
             let (reply, result) = oneshot::channel();
             let (profile, cwd) = (profile.clone(), cwd.clone());
-            match target {
-                // The palette is updating this window: attach once it's done.
-                Target::Tab => cx.defer(move |cx| {
-                    if let Some(handle) = handle {
-                        handle
-                            .update(cx, |ws, window, cx| {
-                                ws.create_session(profile, AttachSpec::New(name), cwd, Some(reply), window, cx);
-                            })
-                            .ok();
-                    }
-                }),
-                // Check the name first, so a taken one is reported here
-                // rather than in a window that opens only to fail.
-                Target::Window => cx
-                    .spawn(async move |cx| {
-                        if let Some(name) = &name {
-                            let (checked, checked_name) = (profile.clone(), name.clone());
-                            let taken = cx
-                                .background_executor()
-                                .spawn(async move { crate::tmux::session_exists(&checked, &checked_name) })
-                                .await;
-                            if taken {
-                                reply.send(Err(format!("duplicate session: {name}"))).ok();
-                                return;
-                            }
-                        }
-                        cx.update(|cx| crate::open_window(Launch::NewSession { profile, name, cwd }, cx)).ok();
-                        reply.send(Ok(())).ok();
-                    })
-                    .detach(),
-            }
+            // The palette is updating the window: attach once it's done.
+            cx.defer(move |cx| {
+                if let Some(handle) = handle {
+                    handle
+                        .update(cx, |ws, window, cx| {
+                            ws.create_session(profile, AttachSpec::New(name), cwd, Some(reply), window, cx);
+                        })
+                        .ok();
+                }
+            });
             result
         });
         let label = "New tmux session name (empty: tmux picks one)".into();
@@ -857,7 +904,7 @@ impl Workspace {
             .or_else(|| (default.tmux == TmuxMode::Control).then(|| default.clone()))
             .or_else(|| config.profiles.iter().find(|p| p.tmux == TmuxMode::Control).cloned());
         if let Some(profile) = profile {
-            self.ask_new_session(profile, Target::Tab, window, cx);
+            self.ask_new_session(profile, window, cx);
         }
     }
 
@@ -974,8 +1021,7 @@ impl Workspace {
                 let profile = session.read(cx).profile.name.clone();
                 match Self::settings(cx).profiles.iter().position(|p| p.name == profile) {
                     Some(ix) => {
-                        let location = SessionLocation::OtherBrindle(name.clone());
-                        self.ask_session_open(ix, location, Target::Tab, window, cx);
+                        self.ask_session_open(ix, &name, window, cx)
                     }
                     None => self.close_orphans(window, cx),
                 }
@@ -1034,8 +1080,7 @@ impl Workspace {
     }
 
     fn ask_session_ended(&mut self, session: Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
-        let open = self.open_sessions(window, cx);
-        let rows = session_ended_rows(&Self::settings(cx).profiles, &open);
+        let rows = session_ended_rows(&Self::settings(cx).profiles);
         let placeholder = format!("tmux session \"{}\" ended", session.read(cx).session_name.as_deref().unwrap_or("?"));
         let theme = self.active_theme(cx);
         let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx).modal());
@@ -1106,6 +1151,16 @@ impl Workspace {
             None => {}
         }
         self.close_orphans(window, cx);
+    }
+
+    fn zone_tab_subscriptions(
+        view: &Entity<ZoneTreeView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        vec![cx.subscribe_in(view, window, |this, view, event, window, cx| {
+            this.on_zone_tree_event(view, event, window, cx)
+        })]
     }
 
     fn on_zone_tree_event(
@@ -1205,6 +1260,7 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Removes tab `ix`, ending its terminals' programs.
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
@@ -1247,16 +1303,11 @@ impl Workspace {
             return;
         }
         let profile = Self::settings(cx).default_profile_index();
-        self.open_profile(profile, Target::Tab, window, cx);
+        self.open_profile(profile, window, cx);
     }
 
     fn new_tab_with_profile(&mut self, action: &NewTabWithProfile, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_profile(action.0, Target::Tab, window, cx);
-    }
-
-    fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
-        let profile = Self::settings(cx).default_profile_index();
-        self.open_profile(profile, Target::Window, window, cx);
+        self.open_profile(action.0, window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1346,6 +1397,7 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closing the window quits Brindle: its terminals' programs keep running.
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
         window.remove_window();
     }
@@ -1360,13 +1412,9 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, profile)| {
-                // Picking a session another window shows goes there; say so.
-                let shown = SessionKey::for_profile(profile).and_then(|key| self.find_session(&key, window, cx));
-                let state = match shown {
-                    Some(SessionLocation::Here(_)) => " · open in this window",
-                    Some(SessionLocation::Elsewhere(..)) => " · in another window (switches)",
-                    Some(SessionLocation::OtherBrindle(_)) | None => "",
-                };
+                // Picking a session the window shows activates its tab; say so.
+                let shown = SessionKey::for_profile(profile).and_then(|key| self.find_session(&key, cx));
+                let state = if shown.is_some() { " · open in this window" } else { "" };
                 PaletteRow {
                     label: profile.name.clone().into(),
                     detail: Some(format!("{}{state}", profile.description()).into()),
@@ -1436,6 +1484,7 @@ impl Workspace {
     ) {
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
             PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
+            PaletteEvent::Kill(ix) => this.palette_kill(*ix, window, cx),
             PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
         self.close_overlay(cx);
@@ -1473,32 +1522,17 @@ impl Workspace {
         match open.kind {
             PaletteKind::NewTab => {
                 self.dismiss_overlay(window, cx);
-                // The row said the session is open in another window, so
-                // going there is what was picked; nothing to ask.
-                let profile = Self::settings(cx).profiles.get(ix).cloned();
-                let location = profile
-                    .and_then(|p| SessionKey::for_profile(&p))
-                    .and_then(|key| self.find_session(&key, window, cx));
-                match location {
-                    Some(location @ SessionLocation::Elsewhere(..)) => self.go_to_session(location, window, cx),
-                    _ => self.open_profile(ix, Target::Tab, window, cx),
-                }
+                self.open_profile(ix, window, cx);
             }
-            PaletteKind::SessionOpenElsewhere { choices, profile, location, target } => {
+            PaletteKind::SessionOpenElsewhere { choices, profile } => {
                 self.dismiss_overlay(window, cx);
                 match choices.get(ix) {
-                    Some(OpenChoice::GoTo) => self.go_to_session(location, window, cx),
                     Some(OpenChoice::NewSession) => {
                         if let Some(profile) = Self::settings(cx).profiles.get(profile).cloned() {
-                            self.ask_new_session(profile, target, window, cx);
+                            self.ask_new_session(profile, window, cx);
                         }
                     }
-                    Some(&OpenChoice::Profile(other)) => match target {
-                        Target::Tab => self.launch_replacing_orphans(other, window, cx),
-                        Target::Window => {
-                            crate::open_window(Launch::Request(LaunchRequest::profile(other)), cx);
-                        }
-                    },
+                    Some(&OpenChoice::Profile(other)) => self.launch_replacing_orphans(other, window, cx),
                     None => {}
                 }
             }
@@ -1512,6 +1546,12 @@ impl Workspace {
             }
             // A prompt has no rows to confirm.
             PaletteKind::Prompt => {}
+            PaletteKind::Sessions { sessions } => {
+                self.dismiss_overlay(window, cx);
+                if let Some(info) = sessions.into_iter().nth(ix) {
+                    self.attach_detached_here(info, window, cx);
+                }
+            }
             PaletteKind::SessionEnded { session } => {
                 self.dismiss_overlay(window, cx);
                 let profile = ix.checked_sub(1).and_then(|p| Self::settings(cx).profiles.get(p).cloned());
@@ -1519,11 +1559,7 @@ impl Workspace {
                     // A control-mode session's tabs arrive later; keep the
                     // window open with the ended tabs until they do.
                     Some(profile) if profile.tmux == TmuxMode::Control => {
-                        let location = SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, window, cx));
-                        if let Some(location @ SessionLocation::Elsewhere(..)) = location {
-                            // "Go to <session>": this window has nothing left.
-                            self.go_to_session(location, window, cx);
-                        } else if let Some(new) = self.attach_tmux(profile, None, window, cx) {
+                        if let Some(new) = self.attach_tmux(profile, None, window, cx) {
                             self.replacing.insert(new.entity_id(), session);
                             return;
                         }
@@ -1534,6 +1570,83 @@ impl Workspace {
                 self.remove_session_tabs(&session, window, cx);
             }
         }
+    }
+
+    /// "Attach Session…": lists the detached sessions off the UI thread,
+    /// then shows them.
+    fn attach_session(&mut self, _: &AttachSession, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_palette_toggling(|k| matches!(k, PaletteKind::Sessions { .. }), window, cx) {
+            return;
+        }
+        self.refresh_sessions_palette(None, window, cx);
+    }
+
+    /// Kills `kill` first, if given, then lists the detached sessions and
+    /// shows them in the sessions palette. After a kill, only a sessions
+    /// palette still open is refreshed: one closed meanwhile stays closed.
+    fn refresh_sessions_palette(&mut self, kill: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        let listing = cx.background_executor().spawn(async move { detached_now(kill) });
+        cx.spawn_in(window, async move |this, cx| {
+            let listed = listing.await;
+            this.update_in(cx, |this, window, cx| {
+                let open = matches!(
+                    &this.overlay,
+                    Some(Overlay::Palette(OpenPalette { kind: PaletteKind::Sessions { .. }, .. }))
+                );
+                if kill.is_some() && !open {
+                    return;
+                }
+                let sessions = listed.unwrap_or_else(|why| {
+                    log::warn!("listing sessions: {why:#}");
+                    Vec::new()
+                });
+                this.show_sessions_palette(sessions, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_sessions_palette(&mut self, mut sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let rows = session_rows(&mut sessions, now);
+        let placeholder = if sessions.is_empty() { "No detached sessions" } else { "Attach a detached session" };
+        let theme = self.active_theme(cx);
+        let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx));
+        self.show_palette(palette, PaletteKind::Sessions { sessions }, window, cx);
+    }
+
+    /// `picker_kill` in the sessions palette: ends that session, and shows
+    /// the list again.
+    fn palette_kill(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Overlay::Palette(OpenPalette { kind: PaletteKind::Sessions { sessions }, .. })) = &self.overlay else {
+            return;
+        };
+        let Some(id) = sessions.get(ix).map(|s| s.session) else { return };
+        // Its row goes at once, so enter can't attach it meanwhile.
+        let rest = sessions.iter().filter(|s| s.session != id).cloned().collect();
+        self.show_sessions_palette(rest, window, cx);
+        self.refresh_sessions_palette(Some(id), window, cx);
+    }
+
+    /// Attaches a detached session into a new tab after the active one.
+    fn attach_detached_here(&mut self, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "linux")]
+        {
+            let config = Self::settings(cx).clone();
+            let index = info
+                .profile
+                .as_deref()
+                .and_then(|name| config.profile_index(name))
+                .unwrap_or_else(|| config.default_profile_index());
+            let profile = config.profiles[index].clone();
+            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
+            self.insert_terminal_tab(profile, terminal, true, window, cx);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (info, window, cx);
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -1745,21 +1858,12 @@ impl Workspace {
         }
     }
 
-    /// Debug hook for `--dump-screen-after`.
-    /// When this window was opened relative to the others.
-    pub fn creation_order(&self) -> u64 {
-        self.order
-    }
-
-    pub fn tab_titles(&self) -> Vec<String> {
-        self.tabs.iter().map(|t| t.title.to_string()).collect()
-    }
-
     /// The active terminal's visible screen text, for `--wait-for`.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
         Some(self.tabs.get(self.active)?.active_terminal(cx)?.read(cx).screen_text())
     }
 
+    /// Debug hook for `--dump-screen-after`.
     pub fn dump_active_screen(&self, window: &Window, cx: &App) -> String {
         let scale = window.scale_factor();
         let mut out = String::new();
@@ -1915,11 +2019,11 @@ impl Workspace {
         // On Windows the marked areas are native caption buttons: Windows
         // acts on them (and shows Snap Layouts on maximize), but only on a
         // press Brindle leaves unhandled, so they get no handlers there.
-        let control = |id, label, area, action: fn(&mut Window)| {
+        let control = |id, label, area, action: fn(&mut Window, &mut App)| {
             if cfg!(windows) {
                 face(id, label).window_control_area(area)
             } else {
-                button(id, label).on_click(move |_, window, _| action(window))
+                button(id, label).on_click(move |_, window, cx| action(window, cx))
             }
         };
         let window_controls = csd.then(|| {
@@ -1932,12 +2036,12 @@ impl Workspace {
                 .gap_1()
                 .pr_2()
                 .when(controls.minimize, |d| {
-                    d.child(control("minimize", "–", WindowControlArea::Min, |window| window.minimize_window()))
+                    d.child(control("minimize", "–", WindowControlArea::Min, |window, _| window.minimize_window()))
                 })
                 .when(controls.maximize, |d| {
-                    d.child(control("maximize", maximize, WindowControlArea::Max, |window| window.zoom_window()))
+                    d.child(control("maximize", maximize, WindowControlArea::Max, |window, _| window.zoom_window()))
                 })
-                .child(control("close-window", "×", WindowControlArea::Close, |window| window.remove_window()))
+                .child(control("close-window", "×", WindowControlArea::Close, |window, cx| window.dispatch_action(Box::new(CloseWindow), cx)))
         });
 
         div()
@@ -2097,44 +2201,23 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
 /// showed ended: "Close window", then a new tab with each profile.
 /// Rows for a window whose only session ended. A control-mode profile
 /// whose session another window shows goes there instead of a new tab.
-fn session_ended_rows(profiles: &[Profile], open: &[SessionKey]) -> Vec<PaletteRow> {
+fn session_ended_rows(profiles: &[Profile]) -> Vec<PaletteRow> {
     std::iter::once(PaletteRow { label: "Close window".into(), detail: None, shortcut: None })
-        .chain(profiles.iter().map(|profile| {
-            let shown = SessionKey::for_profile(profile).is_some_and(|key| open.contains(&key));
-            let label = if shown {
-                format!("Go to {}", profile.tmux_session_name())
-            } else {
-                format!("New tab: {}", profile.name)
-            };
-            PaletteRow { label: label.into(), detail: Some(profile.description().into()), shortcut: None }
+        .chain(profiles.iter().map(|profile| PaletteRow {
+            label: format!("New tab: {}", profile.name).into(),
+            detail: Some(profile.description().into()),
+            shortcut: None,
         }))
         .collect()
 }
 
-/// Rows for a profile whose session another window shows: go there (when
-/// `go_to`: not for another Brindle's), make a new session instead, or open
-/// another profile. Profiles that would ask the same question again are
-/// left out.
-fn session_open_rows(
-    profiles: &[Profile],
-    picked: usize,
-    session: &str,
-    open: &[SessionKey],
-    target: Target,
-    go_to: bool,
-) -> Vec<(PaletteRow, OpenChoice)> {
+/// Rows for a profile whose session another Brindle shows: make a new
+/// session instead, or open another profile. Profiles whose session the
+/// window shows (`open`) are left out.
+fn session_open_rows(profiles: &[Profile], picked: usize, open: &[SessionKey]) -> Vec<(PaletteRow, OpenChoice)> {
     let row = |label: String, detail: String| PaletteRow { label: label.into(), detail: Some(detail.into()), shortcut: None };
-    let verb = match target {
-        Target::Tab => "New tab",
-        Target::Window => "New window",
-    };
-    let mut rows = vec![
-        (PaletteRow { label: format!("Go to {session}").into(), detail: None, shortcut: None }, OpenChoice::GoTo),
-        (row("New tmux session…".into(), format!("with profile {}", profiles[picked].name)), OpenChoice::NewSession),
-    ];
-    if !go_to {
-        rows.remove(0);
-    }
+    let mut rows =
+        vec![(row("New tmux session…".into(), format!("with profile {}", profiles[picked].name)), OpenChoice::NewSession)];
     rows.extend(
         profiles
             .iter()
@@ -2142,7 +2225,7 @@ fn session_open_rows(
             .filter(|&(ix, profile)| {
                 ix != picked && SessionKey::for_profile(profile).is_none_or(|key| !open.contains(&key))
             })
-            .map(|(ix, profile)| (row(format!("{verb}: {}", profile.name), profile.description()), OpenChoice::Profile(ix))),
+            .map(|(ix, profile)| (row(format!("New tab: {}", profile.name), profile.description()), OpenChoice::Profile(ix))),
     );
     rows
 }
@@ -2221,7 +2304,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_profile_picker))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::open_settings))
-            .on_action(cx.listener(Self::new_window))
             .when(Settings::get(cx).config.profiles.iter().any(|p| p.tmux == TmuxMode::Control), |d| {
                 d.on_action(cx.listener(Self::tmux_new_session))
             })
@@ -2238,6 +2320,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::move_tab_right))
                     .on_action(cx.listener(Self::rename_tab))
                     .on_action(cx.listener(Self::close_window))
+                    .on_action(cx.listener(Self::attach_session))
                     .on_action(cx.listener(Self::increase_font_size))
                     .on_action(cx.listener(Self::decrease_font_size))
                     .on_action(cx.listener(Self::reset_font_size))
@@ -2354,23 +2437,11 @@ mod tests {
             "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n[[profiles]]\nname = \"Shell\"\n",
         )
         .unwrap();
-        let rows = session_ended_rows(&config.profiles, &[]);
+        let rows = session_ended_rows(&config.profiles);
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
         assert_eq!(labels, ["Close window", "New tab: tmux", "New tab: Shell"]);
         assert!(rows[0].detail.is_none());
         assert_eq!(rows[1].detail.as_ref().map(|d| d.to_string()), Some(config.profiles[0].description().to_string()));
-    }
-
-    #[test]
-    fn session_ended_rows_go_to_a_session_shown_elsewhere() {
-        let config = Config::parse(
-            "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n[[profiles]]\nname = \"Shell\"\n",
-        )
-        .unwrap();
-        let open = [SessionKey::for_profile(&config.profiles[0]).unwrap()];
-        let rows = session_ended_rows(&config.profiles, &open);
-        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
-        assert_eq!(labels, ["Close window", "Go to main", "New tab: Shell"]);
     }
 
     fn open_rows_config() -> Config {
@@ -2384,39 +2455,22 @@ mod tests {
     }
 
     #[test]
-    fn session_open_rows_offer_going_there_first() {
+    fn session_open_rows_offer_a_new_session_then_other_profiles() {
         let config = open_rows_config();
-        let open = [SessionKey::for_profile(&config.profiles[0]).unwrap()];
-        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Tab, true);
+        let rows = session_open_rows(&config.profiles, 0, &[]);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
-        assert_eq!(labels, ["Go to main", "New tmux session…", "New tab: Shell", "New tab: work", "New tab: classic"]);
+        assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: work", "New tab: classic"]);
         let choices: Vec<OpenChoice> = rows.into_iter().map(|(_, c)| c).collect();
-        assert_eq!(
-            choices,
-            [OpenChoice::GoTo, OpenChoice::NewSession, OpenChoice::Profile(1), OpenChoice::Profile(2), OpenChoice::Profile(3)]
-        );
+        assert_eq!(choices, [OpenChoice::NewSession, OpenChoice::Profile(1), OpenChoice::Profile(2), OpenChoice::Profile(3)]);
     }
 
     #[test]
-    fn session_open_rows_for_another_brindle_cannot_go_there() {
+    fn session_open_rows_skip_sessions_the_window_shows() {
         let config = open_rows_config();
         let open = [SessionKey::for_profile(&config.profiles[2]).unwrap()];
-        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Tab, false);
+        let rows = session_open_rows(&config.profiles, 0, &open);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
         assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: classic"]);
-        assert_eq!(rows[0].1, OpenChoice::NewSession);
-    }
-
-    #[test]
-    fn session_open_rows_for_a_new_window_skip_open_sessions() {
-        let config = open_rows_config();
-        let open = [
-            SessionKey::for_profile(&config.profiles[0]).unwrap(),
-            SessionKey::for_profile(&config.profiles[2]).unwrap(),
-        ];
-        let rows = session_open_rows(&config.profiles, 0, "main", &open, Target::Window, true);
-        let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
-        assert_eq!(labels, ["Go to main", "New tmux session…", "New window: Shell", "New window: classic"]);
     }
 
     #[test]

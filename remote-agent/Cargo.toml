@@ -1,6 +1,6 @@
 [package]
 name = "brindle-remote-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -10,8 +10,8 @@ name = "brindle-remote"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.145"
+brindle-remote-protocol = { path = "../remote-protocol" }
+brindle-term-core = { path = "../term-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

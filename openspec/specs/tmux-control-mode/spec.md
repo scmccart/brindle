@@ -6,7 +6,7 @@ Attach to a tmux session in control mode and present it natively: each tmux wind
 ## Requirements
 
 ### Requirement: Attach to a session
-Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux -u [tmux_args] -C new-session -A -s <session>`, creating the session if needed. For a WSL profile on Windows, the command line is the one defined by "Control mode through WSL on Windows". Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown by at most one Brindle window, also when several Brindle processes run (see "Session shown by another Brindle"). Opening a control profile whose session is already attached in the current window SHALL make one of its tabs active. When it is attached in another window, Brindle SHALL NOT attach it again. Picking the profile in the new-tab palette, which says beforehand that the session is open in another window, SHALL go to that session as "Go to <session>" does, without asking. The other ways of opening it SHALL ask what to do, as defined by "Choosing when a session is open elsewhere". Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
+Opening a profile with `tmux = "control"` SHALL attach to the profile's session through `tmux -u [tmux_args] -C new-session -A -s <session>`, creating the session if needed. For a WSL profile on Windows, the command line is the one defined by "Control mode through WSL on Windows". Each of the session's windows SHALL appear as a tab, in tmux's window order, with the tmux window name as the tab title. A session SHALL be shown at most once, also when several Brindle processes run (see "Session shown by another Brindle"). Opening a control profile whose session the window already shows SHALL make one of its tabs active instead of attaching it again. Two profiles that run the same tmux program with the same `tmux_args` and session name SHALL count as the same session.
 
 #### Scenario: Existing session with two windows
 - **WHEN** the user opens a control profile whose session has windows 0 and 1
@@ -17,12 +17,12 @@ Opening a profile with `tmux = "control"` SHALL attach to the profile's session 
 - **THEN** a tab of `main` becomes active, nothing is asked, and no second tmux client attaches
 
 #### Scenario: Session open in another window
-- **WHEN** window A shows session `main`, and the user picks the profile for `main` from the new-tab palette in window B
-- **THEN** nothing is asked, window A's tab for tmux's current window of `main` becomes active, Brindle asks the desktop to raise window A, and `tmux list-clients` shows one Brindle client for `main`
+- **WHEN** another Brindle (with its own state directory) shows session `main`, and the user picks the profile for `main` from the new-tab palette
+- **THEN** the window asks what to open instead, as "Asking about a session another Brindle shows" says, and `tmux list-clients` shows one Brindle client for `main`
 
 #### Scenario: Session open in another window, opened by shortcut
-- **WHEN** window A shows session `main`, and the user presses the ctrl-alt-N shortcut of the profile for `main` in window B
-- **THEN** window B asks what to do, window A is not raised, and `tmux list-clients` shows one Brindle client for `main`
+- **WHEN** the window shows session `main` in a background tab, and the user presses the ctrl-alt-N shortcut of the profile for `main`
+- **THEN** a tab of `main` becomes active, nothing is asked, and no second tmux client attaches
 
 ### Requirement: Panes drawn natively
 Each tab SHALL lay out its window's panes exactly on tmux's cell grid, with divider lines between panes. The part of a divider next to the active pane SHALL be highlighted. A zoomed window SHALL show only the zoomed pane, with a "zoomed" indicator.
@@ -305,17 +305,17 @@ Bells, OSC 9 and OSC 777 from a pane SHALL be handled as they are for a local ta
 
 ### Requirement: A session leaving the window's only tabs
 When a control-mode session detaches or ends and its tabs were all of the window's tabs, Brindle SHALL act on `tmux_session_end`:
-- `close_window` (the default) SHALL close the window, as closing its last tab does;
+- `close_window` (the default) SHALL close the window, as closing its last tab does, which quits Brindle;
 - `new_tab` SHALL open a tab with the default profile, or with the first profile that does not use tmux when the default is a control-mode profile, and then close the session's tabs; with no such profile, the window SHALL close;
 - `ask` SHALL ask the user, as defined by "Asking when a session leaves".
 
 #### Scenario: Last shell exits
 - **WHEN** `tmux_session_end` is unset, the window shows only a tmux session's single tab, and the user types `exit` in its last pane
-- **THEN** the window closes
+- **THEN** the window closes and Brindle exits
 
 #### Scenario: Last window closed
-- **WHEN** `tmux_session_end` is `close_window`, another Brindle window is open, and the user closes the only tab of a session with ctrl-shift-w
-- **THEN** the tmux window is killed and the window that showed it closes, while the other Brindle window stays open
+- **WHEN** `tmux_session_end` is `close_window`, the window's only tab is a session's only tmux window, and the user closes it with ctrl-shift-w
+- **THEN** the tmux window is killed, the window closes and Brindle exits
 
 #### Scenario: Detach closes the window
 - **WHEN** `tmux_session_end` is `close_window`, the window shows only tmux tabs, and the user presses ctrl-shift-d
@@ -330,7 +330,7 @@ When a control-mode session detaches or ends and its tabs were all of the window
 - **THEN** the tmux tab closes, the shell tab stays, and nothing is asked
 
 ### Requirement: Asking when a session leaves
-With `tmux_session_end = "ask"`, the session's tabs SHALL stay in the window, with their panes ended, while a palette offers "Close window" first and selected, followed by "New tab: <profile>" for every profile in config order. A control-mode profile whose session is open in another window SHALL be listed as "Go to <session>" instead; choosing it SHALL make that session's tab active in its window, ask the desktop to raise that window, and close this one. Choosing any other profile SHALL open a tab with it and close the session's tabs. Choosing "Close window", or pressing escape, SHALL close the window; a click outside the palette SHALL NOT dismiss it. Opening this palette SHALL close any other open overlay.
+With `tmux_session_end = "ask"`, the session's tabs SHALL stay in the window, with their panes ended, while a palette offers "Close window" first and selected, followed by "New tab: <profile>" for every profile in config order. Choosing a profile SHALL open a tab with it and close the session's tabs. Choosing "Close window", or pressing escape, SHALL close the window, which quits Brindle; a click outside the palette SHALL NOT dismiss it. Opening this palette SHALL close any other open overlay.
 
 #### Scenario: Choose a profile
 - **WHEN** `tmux_session_end` is `ask`, the window shows only a tmux session's tabs, the session ends, and the user selects "New tab: Shell" and presses enter
@@ -338,7 +338,7 @@ With `tmux_session_end = "ask"`, the session's tabs SHALL stay in the window, wi
 
 #### Scenario: Escape closes the window
 - **WHEN** the palette is asking after a session ended and the user presses escape
-- **THEN** the window closes
+- **THEN** the window closes and Brindle exits
 
 #### Scenario: Stray click
 - **WHEN** the palette is asking after a session ended and the user clicks on the ended tab behind it
@@ -349,43 +349,15 @@ With `tmux_session_end = "ask"`, the session's tabs SHALL stay in the window, wi
 - **THEN** the window closes
 
 #### Scenario: Profile whose session is open elsewhere
-- **WHEN** the palette is asking after session `work` ended, and another window shows session `main` of profile `tmux`
-- **THEN** the palette lists "Go to main" in place of "New tab: tmux"
+- **WHEN** the palette is asking after session `work` ended, and another Brindle shows session `main` of profile `tmux`
+- **THEN** the palette lists "New tab: tmux" as for any profile, and choosing it asks as "Asking about a session another Brindle shows" says
 
 ### Requirement: Quitting leaves windows as they were
-When Brindle quits while attached to a control-mode session, the session leaving SHALL NOT close a window, open a tab, or ask, so that session restore records each window with its tmux tabs.
+When Brindle quits while attached to a control-mode session, the session leaving SHALL NOT close the window, open a tab, or ask, so that session restore records the window with its tmux tabs.
 
 #### Scenario: Quit with only tmux tabs
-- **WHEN** `restore_session = true`, `tmux_session_end` is `close_window`, the only window shows only tmux tabs, and the user quits Brindle
-- **THEN** the next plain launch reattaches the session in a window, as it was
-
-### Requirement: Choosing when a session is open elsewhere
-When an action would attach a control-mode session that another window shows, Brindle SHALL show a palette in the current window instead, with the placeholder `tmux session "<session>" is open in another window` (`is open in this window` when ctrl-shift-n is pressed in the window that shows it). The actions are ctrl-alt-N, and opening the default profile with ctrl-shift-t, the `+` button or ctrl-shift-n (see `tabs`). The rows SHALL be, in order, with the first selected:
-- "Go to <session>": make that session's tab active in its window and ask the desktop to raise that window;
-- "New tmux session…": ask for a name, as "Create a new session" does, with the same profile;
-- "New tab: <profile>" for each other profile in config order, or "New window: <profile>" when the action was ctrl-shift-n. The profile the action opened, and control-mode profiles whose session is open in any window, SHALL NOT be listed.
-
-What a row opens SHALL go where the action would have opened the profile: a tab in the current window, or a new window for ctrl-shift-n. Escape or a click outside SHALL dismiss the palette without opening anything or raising any window.
-
-#### Scenario: Go to the session
-- **WHEN** window A shows session `main`, the user presses `tmux`'s ctrl-alt-N shortcut in window B, and presses enter in the palette that appears
-- **THEN** window A's tab for tmux's current window of `main` becomes active, Brindle asks the desktop to raise window A, and window B has no new tab
-
-#### Scenario: Another profile instead
-- **WHEN** the palette is asking about `main` after ctrl-shift-t, and the user chooses "New tab: Shell"
-- **THEN** a `Shell` tab opens in the current window
-
-#### Scenario: New window with another profile
-- **WHEN** the palette is asking about `main` after ctrl-shift-n, and the user chooses "New window: Shell"
-- **THEN** a new window opens with one `Shell` tab
-
-#### Scenario: New session from the palette
-- **WHEN** the palette is asking about `main` after ctrl-shift-n, the user chooses "New tmux session…" and enters `scratch`
-- **THEN** a new window opens showing session `scratch`, created on the same server as `main`
-
-#### Scenario: Dismissed
-- **WHEN** the palette is asking about `main` and the user presses escape
-- **THEN** the palette closes, no tab or window opens, and no other window is raised
+- **WHEN** `tmux_session_end` is `close_window`, the window shows only tmux tabs, and the user quits Brindle
+- **THEN** the next launch reattaches the session in the window, as it was
 
 ### Requirement: Create a new session
 A "tmux: New Session" command SHALL prompt for a session name, then create that session and attach it in the current window, beside the window's other tabs. An empty name SHALL let tmux choose the name. The new session SHALL start in the active tab's directory, except with a WSL profile on Windows, as defined by "No Windows directory reaches tmux in WSL". It SHALL use, in this order, the active tab's control-mode profile, the default profile if it is a control-mode profile, or the first control-mode profile. The command SHALL be available from every tab when the config has at least one control-mode profile, and SHALL NOT be listed otherwise. It has no default keybinding; its action name is `tmux_new_session`.
@@ -487,23 +459,23 @@ Brindle's control-mode clients SHALL tell tmux they handle UTF-8, whatever local
 - **THEN** Brindle runs `tmux -u -L work -C new-session -A -s <session>`, attaching on the `work` server
 
 ### Requirement: Session shown by another Brindle
-Before attaching a control-mode profile's session by name, Brindle SHALL ask tmux for the session's clients. When one of them is a control client of another running Brindle, Brindle SHALL NOT attach the session, and the window that would have shown it SHALL ask what to open instead. Clients of other programs, and control clients started from a shell, SHALL NOT count. When tmux can't list the session's clients, Brindle SHALL attach it as before. On Windows the check SHALL NOT be made, and Brindle SHALL attach the session as before.
+Before attaching a control-mode profile's session by name, Brindle SHALL ask tmux for the session's clients. When one of them is a control client of another running Brindle process (one with its own state directory, or a debug run), Brindle SHALL NOT attach the session, and the window SHALL ask what to open instead. Clients of other programs, and control clients started from a shell, SHALL NOT count. When tmux can't list the session's clients, Brindle SHALL attach it as before. On Windows the check SHALL NOT be made, and Brindle SHALL attach the session as before.
 
 #### Scenario: Second launch
-- **WHEN** one Brindle shows session `main`, and a second Brindle is launched whose default profile attaches `main`
-- **THEN** the second Brindle's window has no tabs and asks, and `tmux list-clients` shows one client for `main`
+- **WHEN** a Brindle with its own `BRINDLE_STATE_DIR` shows session `main`, and the user opens `main`'s profile
+- **THEN** the window asks, and `tmux list-clients` shows one Brindle client for `main`
 
 #### Scenario: Actions in the second Brindle
-- **WHEN** one Brindle shows session `main`, a second Brindle was launched with `main`'s profile, and the user opens a new tmux window there
-- **THEN** the first Brindle's tabs stay as they were and `main` keeps its windows
+- **WHEN** another Brindle shows session `main`, this Brindle asked about it, and the user opens a new tmux window in another session here
+- **THEN** the other Brindle's tabs stay as they were and `main` keeps its windows
 
 #### Scenario: Shortcut in the second Brindle
-- **WHEN** one Brindle shows session `main`, and the user presses the ctrl-alt-N shortcut of `main`'s profile in a local tab of a second Brindle
-- **THEN** the second Brindle asks in that window, its local tab stays, and `tmux list-clients` shows one client for `main`
+- **WHEN** another Brindle shows session `main`, and the user presses the ctrl-alt-N shortcut of `main`'s profile in a local tab
+- **THEN** Brindle asks in the window, its local tab stays, and `tmux list-clients` shows one Brindle client for `main`
 
 #### Scenario: Restored in the second Brindle
-- **WHEN** one Brindle shows session `main`, and a second Brindle restores a window whose tabs include `main`
-- **THEN** that window asks about `main` and the window's other tabs open as recorded
+- **WHEN** another Brindle shows session `main`, and a launch restores tabs that include `main`
+- **THEN** the window asks about `main`, and the other restored tabs open as recorded
 
 #### Scenario: Another program's control client
 - **WHEN** a `tmux -C attach -t main` started from a shell is attached, and the user opens `main`'s profile in Brindle
@@ -514,19 +486,19 @@ Before attaching a control-mode profile's session by name, Brindle SHALL ask tmu
 - **THEN** Brindle starts the session and attaches it
 
 ### Requirement: Asking about a session another Brindle shows
-When another Brindle shows the session, Brindle SHALL show a palette with the placeholder `tmux session "<session>" is open in another Brindle`. Its rows SHALL be "New tmux session…", as in "Choosing when a session is open elsewhere", then "New tab: <profile>" for each other profile in config order, leaving out control-mode profiles whose session this Brindle shows. The first row SHALL be selected. Both SHALL open in the window that asked. There SHALL be no "Go to" row.
+When another Brindle shows the session, Brindle SHALL show a palette with the placeholder `tmux session "<session>" is open in another Brindle`. Its rows SHALL be "New tmux session…", which asks for a name as "Create a new session" does and creates it with the same profile, then "New tab: <profile>" for each other profile in config order, leaving out control-mode profiles whose session the window shows. The first row SHALL be selected. Both SHALL open in the window. There SHALL be no "Go to" row. Escape or a click outside SHALL dismiss the palette without opening anything.
 
 #### Scenario: Rows
-- **WHEN** a second Brindle asks about `main`, and its profiles are `tmux` (session `main`) and `Shell`
+- **WHEN** Brindle asks about `main`, and its profiles are `tmux` (session `main`) and `Shell`
 - **THEN** the palette reads `tmux session "main" is open in another Brindle` and lists "New tmux session…" (selected), then "New tab: Shell"
 
 #### Scenario: Another profile instead
-- **WHEN** a second Brindle's window with no tabs asks about `main`, and the user chooses "New tab: Shell"
-- **THEN** a `Shell` tab opens in that window and no tmux client attaches `main`
+- **WHEN** Brindle asks about `main` with no tabs open, and the user chooses "New tab: Shell"
+- **THEN** a `Shell` tab opens and no tmux client attaches `main`
 
 #### Scenario: New session instead
-- **WHEN** a second Brindle asks about `main`, and the user chooses "New tmux session…" and enters `scratch`
-- **THEN** session `scratch` is created on the same server and shown in that window
+- **WHEN** Brindle asks about `main`, and the user chooses "New tmux session…" and enters `scratch`
+- **THEN** session `scratch` is created on the same server and shown in the window
 
 ### Requirement: Dismissing the question about another Brindle's session
 Escape or a click outside SHALL dismiss the palette without opening anything. When the window has no tabs, dismissing the palette, or the prompt its "New tmux session…" row opened, SHALL close the window. When the palette replaced a session that ended, the ended session's tabs SHALL close once what the user chose shows up, or when the palette or its prompt is dismissed.
@@ -579,3 +551,26 @@ A control-mode profile with a remote target SHALL run `tmux -u -C` on that targe
 #### Scenario: Container tmux windows
 - **WHEN** a Docker remote profile with `tmux = "control"` attaches to a session containing two windows
 - **THEN** both remote windows appear as native Brindle tabs and their panes accept input and resize as local control-mode panes do
+
+### Requirement: Dropped remote connection detaches the session
+A remote control-mode session SHALL detect that its connection is dead, whether the transport closed or went silent without closing, within a bounded time. It SHALL then end the session as a detach with a reason that says the connection was lost, close its transport, and make a bounded best-effort attempt to detach its own tmux client on the remote server over a new connection. The attempt SHALL NOT delay or block the window, and its failure SHALL NOT be reported as an error. The remote tmux session and its windows SHALL be left running.
+
+#### Scenario: Connection cut silently
+- **WHEN** a remote control session's connection stops delivering anything without closing, and does not recover
+- **THEN** within the detection limit the session is detached with a connection-lost reason and its panes are marked exited
+
+#### Scenario: Remote client released
+- **WHEN** a dropped session's host is reachable again by a new connection
+- **THEN** the session's old tmux client is detached on the server and `list-clients` no longer shows it
+
+#### Scenario: Host unreachable
+- **WHEN** the connection is dropped and the host stays unreachable
+- **THEN** the detach attempt gives up after its time limit, the window stays responsive, and no error is shown beyond the connection-lost reason
+
+#### Scenario: Slow but live link
+- **WHEN** the connection is slow but answers within the limit
+- **THEN** the session stays attached
+
+#### Scenario: Local sessions unaffected
+- **WHEN** a local control session is attached
+- **THEN** no heartbeat is sent and no connection-lost detection applies

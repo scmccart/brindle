@@ -14,7 +14,6 @@ actions!(
         MoveTabLeft,
         MoveTabRight,
         RenameTab,
-        NewWindow,
         CloseWindow,
         Copy,
         Paste,
@@ -76,6 +75,7 @@ actions!(
         TmuxCommand,
         TmuxNewSession,
         Quit,
+        AttachSession,
         /// Consumes a key without doing anything (see the ctrl-shift-d guard).
         Swallow,
         // Palette navigation.
@@ -83,6 +83,7 @@ actions!(
         PickerDown,
         PickerConfirm,
         PickerCancel,
+        PickerKill,
         // Settings dialog.
         SettingsUp,
         SettingsDown,
@@ -145,7 +146,6 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("move_tab_left", Some("Move Tab Left"), || Box::new(MoveTabLeft)),
     ("move_tab_right", Some("Move Tab Right"), || Box::new(MoveTabRight)),
     ("rename_tab", Some("Rename Tab"), || Box::new(RenameTab)),
-    ("new_window", Some("New Window"), || Box::new(NewWindow)),
     ("close_window", Some("Close Window"), || Box::new(CloseWindow)),
     ("copy", Some("Copy"), || Box::new(Copy)),
     ("paste", Some("Paste"), || Box::new(Paste)),
@@ -208,6 +208,7 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("tmux_rename_window", Some("tmux: Rename Window"), || Box::new(TmuxRenameWindow)),
     ("tmux_command", Some("tmux: Run Command"), || Box::new(TmuxCommand)),
     ("tmux_new_session", Some("tmux: New Session"), || Box::new(TmuxNewSession)),
+    ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
     // The settings dialog's own actions: unlabelled, so they stay out of the
     // command palette, but `--action` and user bindings can reach them.
@@ -233,6 +234,7 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("picker_down", None, || Box::new(PickerDown)),
     ("picker_confirm", None, || Box::new(PickerConfirm)),
     ("picker_cancel", None, || Box::new(PickerCancel)),
+    ("picker_kill", None, || Box::new(PickerKill)),
     ("text_input_left", None, || Box::new(TextInputLeft)),
     ("text_input_right", None, || Box::new(TextInputRight)),
     ("text_input_word_left", None, || Box::new(TextInputWordLeft)),
@@ -311,7 +313,6 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-tab", PrevTab, w),
         KeyBinding::new("ctrl-shift-pagedown", MoveTabRight, w),
         KeyBinding::new("ctrl-shift-pageup", MoveTabLeft, w),
-        KeyBinding::new("ctrl-shift-n", NewWindow, w),
         KeyBinding::new("ctrl-shift-q", Quit, w),
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, w),
         KeyBinding::new("ctrl-shift-space", OpenProfilePicker, w),
@@ -371,6 +372,7 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-n", PickerDown, p),
         KeyBinding::new("enter", PickerConfirm, p),
         KeyBinding::new("escape", PickerCancel, p),
+        KeyBinding::new("ctrl-shift-delete", PickerKill, p),
         KeyBinding::new("up", SettingsUp, s),
         KeyBinding::new("down", SettingsDown, s),
         KeyBinding::new("ctrl-p", SettingsUp, s),

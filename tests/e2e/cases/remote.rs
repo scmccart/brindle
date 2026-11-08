@@ -196,6 +196,65 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A remote control session whose transport goes silent without closing
+/// (the local `docker exec` is stopped) is detached as a lost connection
+/// within the detection limit, and leaves no client on the server.
+pub fn tmux_connection_lost(ctx: &Ctx) -> Result<Outcome> {
+    if let Some(outcome) = docker_outcome()? {
+        return Ok(outcome);
+    }
+    let Some(agent) = remote_agent(ctx)? else {
+        return Ok(Outcome::Skip(
+            "Linux remote helper was not built; run `cargo build -p brindle-remote-agent`".into(),
+        ));
+    };
+    let image = fixture_image(ctx)?;
+    let container = Container::start(ctx, &image, false)?;
+    setup_tmux(ctx, &container)?;
+    let config = format!(
+        "{}\n[[profiles]]\n\
+         name = {profile:?}\n\
+         tmux = \"control\"\n\
+         tmux_session = {session:?}\n\
+         tmux_args = [\"-L\", {socket:?}, \"-f\", \"/dev/null\"]\n\
+         remote = {{ type = \"container\", engine = \"docker\", container = {container_name:?} }}\n",
+        brindle::config_with("remote-unused", "e2e", TMUX_PROFILE, "tmux_session_end = \"ask\"\n"),
+        profile = TMUX_PROFILE,
+        session = TMUX_SESSION,
+        socket = TMUX_SOCKET,
+        container_name = container.name,
+    );
+    // Stop the local `docker exec` that carries the control stream once the
+    // session is up: the pipe stays open and says nothing.
+    let pattern = format!("docker exec -i .*{}", container.name);
+    let freeze_after = ctx.secs(8.0);
+    let freezer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f64(freeze_after));
+        Command::new("pkill").args(["-STOP", "-f", &pattern]).status().ok();
+    });
+    let steps = vec!["--wait-for".into(), "REMOTE_TMUX_ALPHA".into()];
+    let dump = run_brindle(ctx, "container-tmux-lost", &config, TMUX_PROFILE, &steps, &agent, freeze_after + 50.0);
+    freezer.join().ok();
+    let dump = dump?;
+    ensure!(
+        dump.palette.len() > 1,
+        "the lost connection should end the session and ask what to do: tabs {:?}, palette {:?}",
+        dump.tabs,
+        dump.palette
+    );
+    // The server lets go of the client (by our detach, or the closed pipe).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let clients = container.exec(&["tmux", "-L", TMUX_SOCKET, "list-clients"]).unwrap_or_default();
+        if clients.trim().is_empty() {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "a tmux client is still attached: {clients:?}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(Outcome::Pass)
+}
+
 /// An SSH endpoint starts without a cached helper. Brindle must upload it
 /// through the generated key before the remote interactive shell can run.
 pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {
@@ -695,7 +754,9 @@ fn run_brindle(
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &dump_after.to_string()])
         .env("BRINDLE_CONFIG", &config_path)
+        .env("BRINDLE_STATE_DIR", crate::brindle::state_dir(ctx))
         .env("BRINDLE_REMOTE_AGENT", agent)
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env(
             "BRINDLE_NOTIFY_LOG",
             ctx.dir.join(format!("{label}.notify")),

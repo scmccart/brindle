@@ -15,10 +15,6 @@ copy_on_select = false
 # Let programs read your clipboard through OSC 52. Writing is always allowed
 # (that is what tmux `set-clipboard on` uses).
 osc52_paste = false
-# Reopen the windows and tabs you had (profiles, directories, tmux control-mode
-# sessions) when Brindle is launched without -p/-d/-e. Scrollback is not kept.
-# `brindle --no-restore` skips it once.
-restore_session = false
 # With shell integration loaded (see the README, or run
 # `brindle --shell-integration bash|zsh|fish`), draw a red bar beside prompts
 # whose command exited non-zero.

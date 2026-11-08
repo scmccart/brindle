@@ -85,8 +85,8 @@ pub fn apply(ctx: &Ctx) -> Result<Outcome> {
 /// default, so it is selected) and moves focus to its theme choice.
 fn edit_tmux_theme(run: Run) -> Run {
     let run = run.action("open_settings").action("settings_section_next").action("settings_edit");
-    // Name, Command, Arguments, Directory, Environment, then Theme.
-    (0..5).fold(run, |run, _| run.action("settings_down"))
+    // Name, Remote, Command, Arguments, Directory, Environment, then Theme.
+    (0..6).fold(run, |run, _| run.action("settings_down"))
 }
 
 /// After the theme choice has focus: "follow global" wraps back to the last
@@ -160,7 +160,7 @@ pub fn profile_rename(ctx: &Ctx) -> Result<Outcome> {
         .send("work")
         .action("settings_confirm")
         .action("settings_edit");
-    let run = (0..5).fold(run, |run, _| run.action("settings_down"));
+    let run = (0..6).fold(run, |run, _| run.action("settings_down"));
     let out = choose_alt_theme(run).action("settings_confirm").capture_at(16.3).dump_at(16.8).run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(settings.contains("section=Profiles mode=list selected=\"work\""), "dialog state: {settings:?}");

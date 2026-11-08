@@ -22,6 +22,7 @@ pub fn all() -> Vec<Case> {
         display("windows-passthrough", passthrough),
         display("windows-glyph-width", glyph_width),
         display("windows-close-mid-output", close_mid_output),
+        display("windows-flood-responsive", flood_responsive),
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
@@ -247,8 +248,11 @@ fn run_with(
     std::fs::write(&config, config_text).map_err(|e| e.to_string())?;
     let log_path = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+    // `-p` alone restores the previous run's tabs too; such runs start clean.
+    let no_restore: &[&str] = if args.contains(&"-p") { &["--no-restore"] } else { &[] };
     let mut child = Command::new(&ctx.bin)
         .args(args)
+        .args(no_restore)
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &ctx.secs(dump_at).to_string()])
         .env("BRINDLE_CONFIG", &config)
@@ -458,7 +462,7 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
     for shell in ["pwsh.exe", "powershell.exe"] {
         let config = format!(
-            "default_profile = \"si\"\nrestore_session = true\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+            "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
         );
         let label = shell.trim_end_matches(".exe");
@@ -538,8 +542,21 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A tab that prints without pause must not starve the window: every GPUI
+/// main-thread wake is a posted message, and Windows hands out `WM_PAINT`
+/// and `WM_QUIT` only when none is waiting. The dump comes on time only if
+/// the window kept getting idle gaps.
+fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
+    let started = Instant::now();
+    let ran = run(ctx, "flood", &["-p", "cmd", "--send", "for /L %i in (1,0,2) do @echo flood %i\r"], &[], 6.0, None)?;
+    let took = started.elapsed().as_secs_f64();
+    ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
+    ensure!(ran.dump.screen.iter().any(|line| line.starts_with("flood ")), "screen {:?}", ran.dump.screen);
+    Ok(Outcome::Pass)
+}
+
 fn zones(ctx: &Ctx) -> Result<Outcome> {
-    let restore_config = format!("restore_session = true\n{CONFIG}");
+    let restore_config = CONFIG.to_string();
     let split = run_with(
         ctx,
         &restore_config,

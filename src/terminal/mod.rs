@@ -1,10 +1,14 @@
 //! The terminal model: an alacritty `Term` grid plus the backend feeding it.
 //!
-//! Two backends exist:
-//! - `Pty`: a local child process on a pseudo-terminal, driven by
+//! The backends:
+//! - `Server` (Linux): a session of the local terminal server
+//!   ([`crate::remote::local`]), whose output the connection's reader
+//!   thread parses.
+//! - `Pty` (Windows): a local child process on a pseudoconsole, driven by
 //!   alacritty's I/O thread.
 //! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
+//! - `Agent`: a PTY owned by the remote Linux helper.
 
 // Used by the Windows PTY; tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -14,12 +18,18 @@ mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
+pub mod pace;
 pub mod process;
+#[cfg(windows)]
 mod pty;
-pub mod shell_integration;
+// Read through by the Windows PTY; tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod scan;
 pub mod search;
-pub mod status;
+#[cfg(target_os = "linux")]
+mod server;
+// Moved to `brindle-term-core`, which the server core shares.
+pub use brindle_term_core::{shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -29,20 +39,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
+#[cfg(windows)]
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
-#[cfg(unix)]
-use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
-use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::StreamExt as _;
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
+use self::pace::Pace;
 use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
@@ -53,8 +63,43 @@ use crate::theme::{Color, Theme};
 /// What reaches the UI thread from the emulator and output scanner.
 pub enum ChannelEvent {
     Alac(AlacEvent),
-    /// A sequence the scanner found in PTY output (on alacritty's I/O thread).
+    /// A sequence the scanner found in the output (on the thread reading it).
     Osc(Found),
+    /// A replay of a server session starts (`true`) or ends. In between,
+    /// the state updates but no attention is raised.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Replay(bool),
+    /// The server session can't be got back; the reason is on the screen.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Lost,
+}
+
+/// One update's worth of [`ChannelEvent`]s, with its `Wakeup`s and title
+/// changes counted once each. A flood sends a `Wakeup` per read, and a
+/// program can retitle the console for every command (cmd does, in a
+/// loop); each `TitleChanged` can cost process snapshots, when the title is
+/// a console one and the tab falls back to the foreground process's name.
+struct Batch {
+    /// The other events, in order.
+    rest: Vec<ChannelEvent>,
+    woke: bool,
+    /// The last title change: `Some(None)` is a reset.
+    title: Option<Option<String>>,
+}
+
+impl Batch {
+    fn coalesce(events: Vec<ChannelEvent>) -> Self {
+        let mut batch = Self { rest: Vec::with_capacity(events.len()), woke: false, title: None };
+        for event in events {
+            match event {
+                ChannelEvent::Alac(AlacEvent::Wakeup) => batch.woke = true,
+                ChannelEvent::Alac(AlacEvent::Title(title)) => batch.title = Some(Some(title)),
+                ChannelEvent::Alac(AlacEvent::ResetTitle) => batch.title = Some(None),
+                other => batch.rest.push(other),
+            }
+        }
+        batch
+    }
 }
 
 #[derive(Clone)]
@@ -155,12 +200,16 @@ pub enum TerminalEvent {
 }
 
 enum Backend {
+    /// A pseudoconsole Brindle owns.
+    #[cfg(windows)]
     Pty {
         sender: EventLoopSender,
         process: process::PtyProcess,
-        #[cfg(windows)]
         console: Arc<conpty::Pseudoconsole>,
     },
+    /// A session of the local terminal server.
+    #[cfg(target_os = "linux")]
+    Server { session: crate::remote::local::Session, closing: Closing },
     /// A tmux pane whose stream and input are owned by `TmuxSession`.
     Remote {
         scanner: Scanner,
@@ -174,6 +223,32 @@ enum Backend {
         foreground_name: Option<String>,
         cwd: Option<std::path::PathBuf>,
     },
+}
+
+/// What happens to a local Linux terminal's program when Brindle goes away
+/// without closing it (quit, a crash, the desktop stopping Brindle). The
+/// user closing the terminal always ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// It keeps running, detached, and the next launch attaches it.
+    Keeps,
+    /// It ends: a command given instead of the profile's program (`-e`, a
+    /// classic tmux attach), which is never restored or reattached.
+    Ends,
+}
+
+impl Closing {
+    pub fn new(command_override: bool) -> Self {
+        if command_override { Self::Ends } else { Self::Keeps }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn policy(self) -> crate::remote::protocol::client::Policy {
+        match self {
+            Self::Ends => crate::remote::protocol::client::Policy::Kill,
+            Self::Keeps => crate::remote::protocol::client::Policy::Detach,
+        }
+    }
 }
 
 /// Answers a remote terminal's palette query (OSC 4): given the index and
@@ -192,6 +267,9 @@ pub struct Terminal {
     size: GridSize,
     title: Option<String>,
     exited: bool,
+    /// Between a server replay's start and end: events that would raise
+    /// attention are dropped ([`quiet`]).
+    replaying: bool,
     /// Program status records (OSC 7501).
     status: status::Records,
     pub theme: Theme,
@@ -235,19 +313,37 @@ impl Terminal {
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(1024);
+            let mut pace = Pace::default();
             while let Some(events) = rx.next().await {
+                pace.wait(cx).await;
                 let alive = this.update(cx, |this, cx| {
-                    for event in events {
-                        match event {
-                            ChannelEvent::Alac(event) => this.handle_event(event, cx),
-                            ChannelEvent::Osc(found) => this.handle_found(found, cx),
+                    // Titles and wakeups count once per update, as in one batch.
+                    let (mut title, mut woke) = (None, false);
+                    pace::drain(&mut rx, events, |events| {
+                        let batch = Batch::coalesce(events);
+                        for event in batch.rest {
+                            match event {
+                                ChannelEvent::Alac(event) => this.handle_event(event, cx),
+                                ChannelEvent::Osc(found) => this.handle_found(found, cx),
+                                ChannelEvent::Replay(active) => this.replaying = active,
+                                ChannelEvent::Lost => this.mark_lost(cx),
+                            }
                         }
+                        title = batch.title.or(title.take());
+                        woke |= batch.woke;
+                    });
+                    if let Some(title) = title {
+                        this.set_title(title, cx);
+                    }
+                    if woke {
+                        this.handle_event(AlacEvent::Wakeup, cx);
                     }
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         })
     }
@@ -258,36 +354,41 @@ impl Terminal {
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(64);
+            let mut pace = Pace::default();
             while let Some(events) = rx.next().await {
+                pace.wait(cx).await;
                 let alive = this.update(cx, |this, cx| {
-                    // Consecutive output goes through one `feed`, in order
-                    // relative to the other events.
-                    let mut output: Vec<u8> = Vec::new();
-                    for event in events {
-                        match event {
-                            crate::remote::client::Event::Output(bytes) => {
-                                if output.is_empty() {
-                                    output = bytes;
-                                } else {
-                                    output.extend_from_slice(&bytes);
+                    pace::drain(&mut rx, events, |events| {
+                        // Consecutive output goes through one `feed`, in order
+                        // relative to the other events.
+                        let mut output: Vec<u8> = Vec::new();
+                        for event in events {
+                            match event {
+                                crate::remote::client::Event::Output(bytes) => {
+                                    if output.is_empty() {
+                                        output = bytes;
+                                    } else {
+                                        output.extend_from_slice(&bytes);
+                                    }
                                 }
-                            }
-                            other => {
-                                if !output.is_empty() {
-                                    this.feed(&std::mem::take(&mut output), cx);
+                                other => {
+                                    if !output.is_empty() {
+                                        this.feed(&std::mem::take(&mut output), cx);
+                                    }
+                                    this.handle_remote_event(other, cx);
                                 }
-                                this.handle_remote_event(other, cx);
                             }
                         }
-                    }
-                    if !output.is_empty() {
-                        this.feed(&output, cx);
-                    }
+                        if !output.is_empty() {
+                            this.feed(&output, cx);
+                        }
+                    });
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+                pace.updated();
             }
         })
     }
@@ -316,6 +417,7 @@ impl Terminal {
             size,
             title: None,
             exited: false,
+            replaying: false,
             status: status::Records::default(),
             theme,
             default_colors: DefaultColors::default(),
@@ -340,8 +442,10 @@ impl Terminal {
         }
     }
 
-    /// Spawns `profile`'s program on a new PTY. If that fails, the terminal
-    /// shows the error instead so the tab explains what went wrong.
+    /// Spawns `profile`'s program on a new PTY: in a session of the local
+    /// terminal server on Linux, on Brindle's own pseudoconsole on Windows.
+    /// If that fails, the terminal shows the error instead so the tab
+    /// explains what went wrong.
     fn spawn_pty(
         profile: &Profile,
         command_override: Option<(String, Vec<String>)>,
@@ -349,6 +453,11 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A command given instead of the profile's program (`-e`, or a classic
+        // tmux attach) is never restored or reattached, so it ends with its
+        // tab and with Brindle. Everything else keeps running when Brindle
+        // goes away without closing it.
+        let closing = Closing::new(command_override.is_some());
         let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
             Some(program) => (program.clone(), profile.args.clone()),
             None => default_program(&profile.args),
@@ -359,12 +468,19 @@ impl Terminal {
             .or_else(dirs::home_dir)
             .filter(|dir| dir.is_dir());
 
-        #[cfg(unix)]
-        let options = tty::Options {
-            shell: Some(tty::Shell::new(program.clone(), args)),
-            working_directory,
-            drain_on_exit: true,
-            env: child_env(profile),
+        #[cfg(target_os = "linux")]
+        let request = crate::remote::local::SpawnRequest {
+            command: program.clone(),
+            args,
+            cwd: working_directory.map(|dir| dir.to_string_lossy().into_owned()),
+            env: server_env(std::env::vars_os(), profile),
+            cols: GridSize::default().cols,
+            rows: GridSize::default().rows,
+            cell_w: GridSize::default().cell_width,
+            cell_h: GridSize::default().cell_height,
+            scrollback: u32::try_from(config.scrollback_lines).unwrap_or(u32::MAX),
+            policy: closing.policy(),
+            profile: Some(profile.name.clone()),
         };
         #[cfg(windows)]
         let command = conpty::Command {
@@ -380,17 +496,19 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        #[cfg(unix)]
-        let spawned = (|| -> anyhow::Result<Backend> {
-            let pty = tty::new(&options, size.into(), 0)?;
-            let child_pid = pty.child().id();
-            let master_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
-            let pty = pty::MarkedPty::new(pty, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx)?;
-            let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
-            let sender = event_loop.channel();
-            event_loop.spawn();
-            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid, master_fd) })
-        })();
+        // Returns at once: the session starts in the background, and a
+        // failure is shown in the terminal then.
+        #[cfg(target_os = "linux")]
+        let spawned: anyhow::Result<Backend> = {
+            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("start {program:?}"));
+            let session = crate::remote::local::Session::start(request, Box::new(sink));
+            Ok(Backend::Server { session, closing })
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let spawned: anyhow::Result<Backend> = {
+            let _ = (listener, args, working_directory, closing);
+            Err(anyhow::anyhow!("local terminals run in the terminal server, which needs Linux"))
+        };
         #[cfg(windows)]
         let spawned = (|| -> anyhow::Result<Backend> {
             let spawned = conpty::spawn(&command, size.into())?;
@@ -411,6 +529,35 @@ impl Terminal {
                 Self::message(&text, theme, config, cx)
             }
         }
+    }
+
+    /// Attaches a detached session of the local terminal server: its replay,
+    /// quiet (no bell or notification), then its live output. It closes as
+    /// a spawned profile terminal does. Returns at once, like a spawn; a
+    /// refused attach shows in the terminal.
+    #[cfg(target_os = "linux")]
+    pub fn attach(
+        request: crate::remote::local::AttachRequest,
+        what: String,
+        profile: &Profile,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (tx, rx) = unbounded();
+        let output = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, output.clone());
+        // The session's size: the replay is rendered at it, and the first
+        // layout resizes the session only if the window's grid differs.
+        let size = GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() };
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
+        let parser = Arc::new(Mutex::new(Parser::new()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("attach session {} ({what})", request.session))
+            .replayed_at(size);
+        let session = crate::remote::local::Session::attach(request, Box::new(sink));
+        let backend = Backend::Server { session, closing: Closing::Keeps };
+        let theme = config.profile_theme(profile);
+        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
     }
 
     fn spawn_remote(
@@ -475,7 +622,10 @@ impl Terminal {
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let scanner = match &mut self.backend {
             Backend::Remote { scanner, .. } | Backend::Agent { scanner, .. } => scanner,
+            #[cfg(windows)]
             Backend::Pty { .. } => return,
+            #[cfg(target_os = "linux")]
+            Backend::Server { .. } => return,
         };
         let found = scanner.scan(bytes);
         {
@@ -587,16 +737,37 @@ impl Terminal {
         }
     }
 
+    /// The server session can't be got back (its line is on the screen): the
+    /// terminal has ended, but the tab stays open on its last screen, so no
+    /// `Exited`.
+    fn mark_lost(&mut self, cx: &mut Context<Self>) {
+        self.replaying = false;
+        if !self.exited {
+            self.exited = true;
+            if self.status.end_activity() {
+                cx.emit(TerminalEvent::Status(None));
+            }
+        }
+    }
+
     /// The program status records (OSC 7501).
     pub fn status(&self) -> &status::Records {
         &self.status
+    }
+
+    /// Emits an event the output caused, quietly during a replay.
+    fn emit_from_output(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
+        let event = if self.replaying { quiet(event) } else { Some(event) };
+        if let Some(event) = event {
+            cx.emit(event);
+        }
     }
 
     /// Acts on a sequence the scanner found in the output, in stream order.
     fn handle_found(&mut self, found: Found, cx: &mut Context<Self>) {
         let changed = match found {
             Found::Notice(notice) => {
-                cx.emit(TerminalEvent::Notify(notice));
+                self.emit_from_output(TerminalEvent::Notify(notice), cx);
                 return;
             }
             Found::Status(status::Message::Query) => {
@@ -608,7 +779,7 @@ impl Terminal {
             Found::Status(message) => {
                 let update = self.status.apply(&message);
                 if update.changed {
-                    cx.emit(TerminalEvent::Status(update.notice));
+                    self.emit_from_output(TerminalEvent::Status(update.notice), cx);
                 }
                 return;
             }
@@ -659,7 +830,7 @@ impl Terminal {
             }
             AlacEvent::PtyWrite(text) => self.reply(text.into_bytes()),
             AlacEvent::TextAreaSizeRequest(format) => self.reply(format(self.size.into()).into_bytes()),
-            AlacEvent::Bell => cx.emit(TerminalEvent::Bell),
+            AlacEvent::Bell => self.emit_from_output(TerminalEvent::Bell, cx),
             AlacEvent::Exit | AlacEvent::ChildExit(_) => self.mark_exited(cx),
             _ => {}
         }
@@ -688,9 +859,12 @@ impl Terminal {
             return;
         }
         match &self.backend {
+            #[cfg(windows)]
             Backend::Pty { sender, .. } => {
                 sender.send(Msg::Input(bytes)).ok();
             }
+            #[cfg(target_os = "linux")]
+            Backend::Server { session, .. } => session.input(&bytes),
             Backend::Remote { input, .. } => input(&bytes),
             Backend::Agent { handle, .. } => handle.input(bytes.into_owned()),
         }
@@ -731,7 +905,12 @@ impl Terminal {
         self.marks.lock().resize(&mut *term, size);
         drop(term);
         match &self.backend {
+            #[cfg(windows)]
             Backend::Pty { sender, .. } => _ = sender.send(Msg::Resize(size.into())),
+            #[cfg(target_os = "linux")]
+            Backend::Server { session, .. } => {
+                session.resize(size.cols, size.rows, size.cell_width, size.cell_height)
+            }
             Backend::Agent { handle, .. } => handle.resize(size),
             Backend::Remote { .. } => {}
         }
@@ -870,7 +1049,12 @@ impl Terminal {
     /// titles. `snapshot` is the title tick's look at all processes.
     pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
         match &self.backend {
+            #[cfg(windows)]
             Backend::Pty { process, .. } => process.foreground_name(snapshot),
+            #[cfg(target_os = "linux")]
+            Backend::Server { session, .. } => {
+                session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
+            }
             Backend::Agent { handle, foreground_name, .. } => {
                 handle.query_process();
                 foreground_name.clone()
@@ -898,12 +1082,13 @@ impl Terminal {
     /// if it still exists.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         match &self.backend {
-            Backend::Pty { process, .. } => {
-                if cfg!(windows) {
-                    self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
-                } else {
-                    process.working_directory()
-                }
+            #[cfg(windows)]
+            Backend::Pty { .. } => {
+                self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Server { session, .. } => {
+                session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
             }
             Backend::Agent { cwd, .. } => {
                 self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
@@ -917,18 +1102,44 @@ impl Terminal {
         screen_text(&self.term.lock())
     }
 
-    pub fn shutdown(&mut self) {
+    /// The user closed the terminal: its program ends. Once is enough:
+    /// later calls, and the drop, do nothing.
+    pub fn close(&mut self) {
+        self.leave(true);
+    }
+
+    /// Ends the terminal's connection to its program: `close` ends the
+    /// program; otherwise a local Linux terminal's program is left as its
+    /// [`Closing`] says, and any other terminal's ends.
+    fn leave(&mut self, close: bool) {
         match &self.backend {
+            #[cfg(windows)]
             Backend::Pty { sender, .. } => _ = sender.send(Msg::Shutdown),
+            #[cfg(target_os = "linux")]
+            Backend::Server { session, closing } => match (close, closing) {
+                (false, Closing::Keeps) => session.detach(),
+                _ => session.close(),
+            },
             Backend::Agent { handle, .. } => handle.close(),
             Backend::Remote { .. } => {}
+        }
+        let _ = close;
+    }
+
+    /// The terminal server session (id and key) this terminal shows, once
+    /// it exists and while its program runs.
+    #[cfg(target_os = "linux")]
+    pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
+        match &self.backend {
+            Backend::Server { session, .. } if !self.exited => session.id_and_key(),
+            _ => None,
         }
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.shutdown();
+        self.leave(false);
     }
 }
 
@@ -1076,6 +1287,17 @@ fn palette_color(t: &Theme, defaults: DefaultColors, index: usize) -> Color {
     }
 }
 
+/// What a server replay may emit. A replay recreates a session's state, so
+/// it may change status dots and titles, but it raises no attention: no
+/// bell, no notification, and no status notice.
+fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
+    match event {
+        TerminalEvent::Bell | TerminalEvent::Notify(_) => None,
+        TerminalEvent::Status(Some(_)) => Some(TerminalEvent::Status(None)),
+        other => Some(other),
+    }
+}
+
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
 
@@ -1110,6 +1332,27 @@ pub fn child_env(profile: &Profile) -> HashMap<String, String> {
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
     env.extend(profile.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// The whole environment of a local server session's program: `vars`
+/// (Brindle's own environment) with [`child_env`] applied over it. The
+/// server adds nothing, so this is what the program sees. Variables that
+/// aren't UTF-8 can't travel in `SPAWN` and are left out, as are the
+/// startup-notification tokens that were for Brindle's own launch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn server_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    profile: &Profile,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env: std::collections::BTreeMap<String, String> = vars
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    for key in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+        env.remove(key);
+    }
+    env.extend(child_env(profile));
     env
 }
 
@@ -1154,6 +1397,35 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     #[test]
+    fn batch_counts_wakeups_and_titles_once() {
+        let title = |t: &str| ChannelEvent::Alac(AlacEvent::Title(t.into()));
+        let events = vec![
+            ChannelEvent::Alac(AlacEvent::Wakeup),
+            title("one"),
+            ChannelEvent::Alac(AlacEvent::Bell),
+            ChannelEvent::Alac(AlacEvent::Wakeup),
+            title("two"),
+            ChannelEvent::Replay(true),
+        ];
+        let batch = Batch::coalesce(events);
+        assert!(batch.woke);
+        assert_eq!(batch.title, Some(Some("two".to_string())));
+        assert!(matches!(batch.rest[..], [ChannelEvent::Alac(AlacEvent::Bell), ChannelEvent::Replay(true)]));
+    }
+
+    #[test]
+    fn batch_keeps_the_last_title_change() {
+        let batch = Batch::coalesce(vec![
+            ChannelEvent::Alac(AlacEvent::Title("x".into())),
+            ChannelEvent::Alac(AlacEvent::ResetTitle),
+        ]);
+        assert_eq!(batch.title, Some(None));
+        let quiet = Batch::coalesce(vec![ChannelEvent::Alac(AlacEvent::Bell)]);
+        assert!(!quiet.woke);
+        assert_eq!(quiet.title, None);
+    }
+
+    #[test]
     fn default_colors_replace_the_theme() {
         let t = Theme::default();
         let none = DefaultColors::default();
@@ -1184,6 +1456,63 @@ mod tests {
         listener.send_event(AlacEvent::Wakeup);
         assert_eq!(marker.generation(), 2);
         assert!(marker.at() >= before && marker.at() <= Instant::now());
+    }
+
+    #[test]
+    fn profile_terminals_outlive_brindle_and_commands_end_with_it() {
+        assert_eq!(Closing::new(false), Closing::Keeps);
+        // `-e` and classic tmux attaches are never restored.
+        assert_eq!(Closing::new(true), Closing::Ends);
+        #[cfg(target_os = "linux")]
+        {
+            use crate::remote::protocol::client::Policy;
+            assert_eq!(Closing::Keeps.policy(), Policy::Detach);
+            assert_eq!(Closing::Ends.policy(), Policy::Kill);
+        }
+    }
+
+    #[test]
+    fn a_replay_raises_no_attention_but_keeps_its_state() {
+        use crate::notify::osc::Source;
+        let notice = Notice { source: Source::Osc9, title: "t".into(), body: "b".into() };
+        assert_eq!(quiet(TerminalEvent::Bell), None);
+        assert_eq!(quiet(TerminalEvent::Notify(notice.clone())), None);
+        assert_eq!(quiet(TerminalEvent::Status(Some(notice))), Some(TerminalEvent::Status(None)));
+        assert_eq!(quiet(TerminalEvent::Status(None)), Some(TerminalEvent::Status(None)));
+        assert_eq!(quiet(TerminalEvent::TitleChanged), Some(TerminalEvent::TitleChanged));
+        assert_eq!(quiet(TerminalEvent::Exited), Some(TerminalEvent::Exited));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_sessions_get_brindles_environment_with_the_profiles_over_it() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        let profile = Profile {
+            env: [("FOO".into(), "profile".into()), ("EXTRA".into(), "1".into())].into(),
+            ..Profile::default_shell()
+        };
+        let own = [
+            ("PATH", "/usr/bin"),
+            ("FOO", "brindle"),
+            ("TERM", "dumb"),
+            ("XDG_ACTIVATION_TOKEN", "for-brindle"),
+            ("DESKTOP_STARTUP_ID", "for-brindle"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let not_utf8 = (OsString::from("RAW"), OsString::from_vec(vec![0xff, 0xfe]));
+        let env = server_env(own.into_iter().chain([not_utf8]), &profile);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        // The profile wins over Brindle's own, and Brindle's defaults apply.
+        assert_eq!(env.get("FOO").map(String::as_str), Some("profile"));
+        assert_eq!(env.get("EXTRA").map(String::as_str), Some("1"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("Brindle"));
+        assert!(!env.contains_key("XDG_ACTIVATION_TOKEN") && !env.contains_key("DESKTOP_STARTUP_ID"));
+        assert!(!env.contains_key("RAW"));
+        // Without profile entries, Brindle's own value is what the program sees.
+        let env = server_env([(OsString::from("FOO"), OsString::from("2"))], &Profile::default_shell());
+        assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
     }
 
     #[test]

@@ -7,10 +7,12 @@ mod config;
 mod config_edit;
 mod desktop;
 mod find_bar;
+mod instance;
 mod latency;
 mod notify;
 mod picker;
 mod primary;
+mod reattach;
 mod remote;
 mod session;
 mod settings;
@@ -35,7 +37,7 @@ use gpui::{
     WindowDecorations, WindowOptions, px, size,
 };
 
-use crate::actions::{NewWindow, Quit, ReloadConfig};
+use crate::actions::{Quit, ReloadConfig};
 use crate::config::Config;
 use crate::latency::Latency;
 use crate::settings::Settings;
@@ -50,12 +52,15 @@ USAGE:
 
 OPTIONS:
     -e, --command <CMD> [ARGS]   Run CMD instead of the profile's shell (must be last)
-    -p, --profile <NAME>         Profile to open (default: config's default_profile)
+    -p, --profile <NAME>         Open a tab with this profile (default: config's
+                                 default_profile)
     -d, --working-directory <DIR>
                                  Start in DIR
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
-        --no-restore             Don't reopen the last session this time
-                                 (with restore_session = true in the config)
+        --no-restore             Reopen nothing this time: no saved tabs, no
+                                 detached sessions
+        --attach <ID>            Open a tab attached to the terminal server's
+                                 detached session ID (see brindle-remote list)
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
         --shell-integration <SHELL>
@@ -128,20 +133,45 @@ struct Args {
     latency_bench: Option<usize>,
     desktop: Option<desktop::Request>,
     no_restore: bool,
+    /// `--attach`: the terminal server session the window opens with.
+    attach: Option<u32>,
 }
 
 impl Args {
-    /// A launch that may restore the session: no profile, directory or
-    /// command was asked for. Debug steps don't count.
-    fn is_plain(&self) -> bool {
-        self.profile.is_none() && self.cwd.is_none() && self.command.is_none() && !self.no_restore
+    /// Whether the launch asks for a tab of its own: a profile, directory or
+    /// command (`--attach` is its own request).
+    fn asks_for_a_tab(&self) -> bool {
+        self.profile.is_some() || self.cwd.is_some() || self.command.is_some()
+    }
+
+    /// A run driven by debug options, which runs on its own beside a
+    /// running Brindle instead of handing it the request.
+    fn is_debug_run(&self) -> bool {
+        !self.steps.is_empty() || self.dump_after.is_some() || self.latency_log.is_some() || self.latency_bench.is_some()
+    }
+
+    /// This launch as a request to the running Brindle.
+    fn instance_request(&self) -> instance::Request {
+        let here = std::env::current_dir().ok();
+        instance::Request {
+            profile: self.profile.clone(),
+            // Relative to where this launch runs, not the instance.
+            cwd: self.cwd.as_ref().map(|d| here.as_ref().map(|h| h.join(d)).unwrap_or_else(|| d.clone())),
+            command: self.command.as_ref().map(|(program, args)| std::iter::once(program.clone()).chain(args.iter().cloned()).collect()),
+            attach: self.attach,
+            launch_dir: here,
+            activation_token: instance::Request::launch_token(),
+        }
     }
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
     let mut args = Args::default();
     let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
-    let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -200,6 +230,13 @@ fn parse_args() -> Args {
                 }
             }
             "--no-restore" => args.no_restore = true,
+            "--attach" if cfg!(not(target_os = "linux")) => {
+                usage_error("--attach needs the terminal server, which runs only on Linux")
+            }
+            "--attach" => match it.next().and_then(|id| id.parse().ok()) {
+                Some(id) => args.attach = Some(id),
+                None => usage_error("--attach needs a session id (brindle-remote list prints them)"),
+            },
             "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
             "--action" => args.steps.extend(it.next().map(Step::Action)),
             "--hover" | "--click" => {
@@ -280,7 +317,6 @@ pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Wo
     };
     match cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(launch, window, cx))) {
         Ok(handle) => {
-            handle.update(cx, |_, window, cx| notify::activation::track_input(window, cx)).ok();
             cx.activate(true);
             Some(handle)
         }
@@ -335,52 +371,109 @@ fn watch_config(cx: &mut App) {
     .detach();
 }
 
-/// `--- window N tabs=[…]` for each window but `dumped`, in creation order
-/// (N counts all windows from 1).
-fn dump_other_windows(dumped: gpui::WindowHandle<Workspace>, cx: &mut App) -> String {
-    let mut windows: Vec<(u64, gpui::WindowHandle<Workspace>)> = cx
-        .windows()
-        .into_iter()
-        .filter_map(|w| w.downcast::<Workspace>())
-        .filter_map(|w| Some((w.read(cx).ok()?.creation_order(), w)))
-        .collect();
-    windows.sort_by_key(|(order, _)| *order);
-    let mut out = String::new();
-    for (n, (_, handle)) in windows.into_iter().enumerate() {
-        if handle.window_id() == dumped.window_id() {
-            continue;
-        }
-        if let Ok(ws) = handle.read(cx) {
-            out.push_str(&format!("--- window {} tabs={:?}\n", n + 1, ws.tab_titles()));
-        }
-    }
-    out
+/// A later launch's request, handed from the instance socket's thread to
+/// the UI thread.
+struct Forwarded {
+    request: instance::Request,
+    /// For `--attach`: the server's sessions, listed on the socket's thread.
+    listing: Option<Option<Vec<remote::protocol::client::SessionInfo>>>,
+    reply: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
-/// The windows to restore, if session restore is on, this process owns the
-/// state and the state file is usable. Problems are logged and ignored.
-fn restorable_windows(cx: &mut App) -> Vec<WindowState> {
-    let enabled = Settings::get(cx).config.restore_session;
-    if !cx.update_global(|store: &mut SessionStore, _| store.is_owner(enabled)) {
-        return Vec::new();
+/// Opens later launches' requests in `window` and raises it.
+fn take_launches(
+    window: gpui::WindowHandle<Workspace>,
+    mut requests: futures::channel::mpsc::UnboundedReceiver<Forwarded>,
+    cx: &mut App,
+) {
+    use futures::StreamExt as _;
+    cx.spawn(async move |cx| {
+        while let Some(Forwarded { request, listing, reply }) = requests.next().await {
+            let result = window
+                .update(cx, |ws, window, cx| {
+                    if let Some(launch) = forwarded_launch(&request, listing, &Settings::get(cx).config) {
+                        ws.open(launch, window, cx);
+                    }
+                    notify::activation::raise(window, request.activation_token.as_deref());
+                })
+                .map_err(|_| "Brindle's window is gone".to_string());
+            reply.send(result).ok();
+        }
+    })
+    .detach();
+}
+
+/// What a later launch's request opens: nothing for a plain launch, which
+/// only raises the window.
+fn forwarded_launch(
+    request: &instance::Request,
+    listing: Option<Option<Vec<remote::protocol::client::SessionInfo>>>,
+    config: &Config,
+) -> Option<Launch> {
+    if let Some(session) = request.attach {
+        let target = match listing.flatten() {
+            Some(listing) => reattach::attach_target(session, &listing),
+            None => Err("Brindle could not list the terminal server's sessions".into()),
+        };
+        return Some(Launch::Attach { session, target });
     }
-    match session::load(&session::state_dir()) {
-        Ok(Some(state)) => session::dedupe_windows(state.windows, &Settings::get(cx).config),
-        Ok(None) => Vec::new(),
+    if request.profile.is_none() && request.cwd.is_none() && request.command.is_none() {
+        return None;
+    }
+    let profile = match &request.profile {
+        Some(name) => config.profile_index(name).unwrap_or_else(|| {
+            log::warn!("no profile named {name:?}");
+            config.default_profile_index()
+        }),
+        None => config.default_profile_index(),
+    };
+    let command = request.command.as_ref().and_then(|c| c.split_first()).map(|(p, rest)| (p.clone(), rest.to_vec()));
+    // A command starts where it was typed, unless `-d` says otherwise.
+    let cwd = request.cwd.clone().or_else(|| command.as_ref().and(request.launch_dir.clone()));
+    Some(Launch::Request(LaunchRequest { profile, command, cwd }))
+}
+
+/// The running terminal server's sessions, attached or not: none when no
+/// server runs (none is started), `None` when listing fails (logged).
+fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
+    #[cfg(target_os = "linux")]
+    match remote::local::running_sessions(Duration::from_secs(2)) {
+        Ok(sessions) => Some(sessions),
         Err(why) => {
-            log::warn!("{why}");
-            Vec::new()
+            log::warn!("not attaching detached sessions: {why:#}");
+            None
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    Some(Vec::new())
+}
+
+/// The recorded windows, merged into the one window Brindle has, without
+/// the zones whose sessions are gone (when `listed`: the `Detached` global
+/// holds the launch's listing); `None` when the state file is missing,
+/// unusable (logged) or leaves nothing to restore.
+fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
+    let state = match session::load(&session::state_dir()) {
+        Ok(state) => state?,
+        Err(why) => {
+            log::warn!("{why}");
+            return None;
+        }
+    };
+    let window = session::merge_windows(session::dedupe_windows(state.windows, &Settings::get(cx).config))?;
+    if !listed {
+        return Some(window);
+    }
+    let detached = cx.global::<reattach::Detached>();
+    session::drop_lost_zones(window, |recorded| detached.has(recorded))
 }
 
 /// Writes the session state when it changes (off the UI thread), and once
 /// more, synchronously, when Brindle quits.
 fn record_session(cx: &mut App) {
     fn pending(cx: &mut App) -> Option<String> {
-        let enabled = Settings::get(cx).config.restore_session;
         cx.update_global(|store: &mut SessionStore, _| {
-            if store.is_owner(enabled) { store.pending_write() } else { None }
+            if store.is_owner() { store.pending_write() } else { None }
         })
     }
     fn write(text: &str, generation: u64) {
@@ -429,6 +522,60 @@ fn main() {
         return;
     }
 
+    // One Brindle per state directory: the process that takes the session
+    // lock is the instance, and a later launch hands it its request and
+    // exits. A debug run beside it runs on its own instead.
+    let state_dir = session::state_dir();
+    let lock = match session::Lock::acquire(&state_dir) {
+        Ok(lock) => Some(lock),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && !args.is_debug_run() => {
+            match instance::forward(&state_dir, &args.instance_request()) {
+                Ok(()) => std::process::exit(0),
+                // The running Brindle may have quit meanwhile.
+                Err(why) => match session::Lock::acquire(&state_dir) {
+                    Ok(lock) => {
+                        log::info!("the running Brindle went away ({why}); starting");
+                        Some(lock)
+                    }
+                    Err(_) => {
+                        console_output();
+                        eprintln!("brindle: {why}");
+                        std::process::exit(1);
+                    }
+                },
+            }
+        }
+        Err(err) => {
+            log::info!(
+                "another Brindle owns the session in {} ({err}); not restoring or recording",
+                state_dir.display()
+            );
+            None
+        }
+    };
+    let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
+    let mut socket = None;
+    if lock.is_some() {
+        let handler = move |request: instance::Request| {
+            // Listed here, off the UI thread.
+            let listing = request.attach.map(|_| running_sessions());
+            let (reply, answer) = std::sync::mpsc::channel();
+            forwarded
+                .unbounded_send(Forwarded { request, listing, reply })
+                .map_err(|_| "Brindle is quitting".to_string())?;
+            answer
+                .recv_timeout(instance::FORWARD_LIMIT)
+                .map_err(|_| "Brindle didn't take the request in time".to_string())?
+        };
+        match instance::listen(&state_dir, Box::new(handler)) {
+            Ok(path) => {
+                log::debug!("taking launches at {}", path.display());
+                socket = Some(path);
+            }
+            Err(err) => log::warn!("later launches can't reach this Brindle: {err}"),
+        }
+    }
+
     // Before any window: windows, shortcuts and toasts share one identity.
     #[cfg(windows)]
     win::set_app_id();
@@ -468,44 +615,81 @@ fn main() {
             .detach();
         }
 
+        // Deferred, like ReloadConfig: the prompt opens in a window.
         cx.on_action(|_: &Quit, cx| cx.quit());
         // Global listeners run inside the dispatching window's update, where
         // `reload_config` couldn't update that window; defer until it's back.
         cx.on_action(|_: &ReloadConfig, cx| cx.defer(reload_config));
-        // Windows handle NewWindow themselves (it may ask first); this is
-        // for a dispatch no window took.
-        cx.on_action(|_: &NewWindow, cx| {
-            let profile = Settings::get(cx).config.default_profile_index();
-            open_window(Launch::Request(LaunchRequest::profile(profile)), cx);
-        });
         cx.on_window_closed(|cx| {
             let live: Vec<u64> = cx.windows().iter().map(|w| w.window_id().as_u64()).collect();
             cx.update_global(|store: &mut SessionStore, _| store.prune(&live));
             if live.is_empty() {
-                cx.quit();
+                // Not inside the close: when the window manager closed the
+                // window, GPUI's X11 client is still borrowed here, and
+                // quitting needs it.
+                cx.spawn(async |cx| cx.update(|cx| cx.quit()).ok()).detach();
             }
         })
         .detach();
 
-        cx.set_global(SessionStore::default());
-        let restored = if args.is_plain() { restorable_windows(cx) } else { Vec::new() };
-        let mut windows = Vec::new();
-        if restored.is_empty() {
-            let launch = LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() };
-            windows.extend(open_window(Launch::Request(launch), cx));
-        } else {
-            log::info!("restoring {} window(s) from {}", restored.len(), session::state_path(&session::state_dir()).display());
-            for state in restored {
-                windows.extend(open_window(Launch::Restore(state), cx));
-            }
+        cx.set_global(SessionStore::new(lock));
+        // The next instance would replace it anyway; this keeps the runtime
+        // directory tidy.
+        #[cfg(unix)]
+        if let Some(socket) = socket {
+            cx.on_app_quit(move |_| {
+                std::fs::remove_file(&socket).ok();
+                async {}
+            })
+            .detach();
         }
-        // Debug steps and the dump act on the first window.
-        let Some(&window) = windows.first() else {
+        #[cfg(not(unix))]
+        let _ = socket;
+        // The Brindle that owns the session state restores it and attaches
+        // the server's detached sessions (restored zones take theirs, the
+        // rest become tabs), unless `--no-restore`. Then it opens what the
+        // launch asked for as the active tab.
+        let restoring = !args.no_restore && cx.update_global(|store: &mut SessionStore, _| store.is_owner());
+        let listed = if restoring || args.attach.is_some() { running_sessions() } else { Some(Vec::new()) };
+        let detached = listed
+            .iter()
+            .flatten()
+            .filter(|s| restoring && !s.attached && Some(s.session) != args.attach)
+            .cloned()
+            .collect();
+        cx.set_global(reattach::Detached::new(detached));
+        // Without a listing, nothing tells a lost zone from a live one, so
+        // none is dropped.
+        let restored = if restoring { restorable_window(listed.is_some(), cx) } else { None };
+        let request = match args.attach {
+            Some(session) => Some(Launch::Attach { session, target: reattach::attach_target(session, listed.as_deref().unwrap_or_default()) }),
+            None if args.asks_for_a_tab() => {
+                Some(Launch::Request(LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() }))
+            }
+            None => None,
+        };
+        let (first, request) = match restored {
+            Some(state) => {
+                log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(&session::state_dir()).display());
+                (Launch::Restore(state), request)
+            }
+            None => (request.unwrap_or_else(|| Launch::Request(LaunchRequest::profile(profile))), None),
+        };
+        let Some(window) = open_window(first, cx) else {
             cx.quit();
             return;
         };
+        let rest = cx.update_global(|detached: &mut reattach::Detached, _| detached.take_rest());
+        if !rest.is_empty() {
+            log::info!("attaching {} detached session(s)", rest.len());
+            window.update(cx, |ws, window, cx| ws.attach_detached(rest, window, cx)).ok();
+        }
+        if let Some(request) = request {
+            window.update(cx, |ws, window, cx| ws.open(request, window, cx)).ok();
+        }
         watch_config(cx);
         record_session(cx);
+        take_launches(window, requests, cx);
 
         let steps = args.steps.clone();
         let latency_bench = args.latency_bench;
@@ -552,7 +736,6 @@ fn main() {
                         print!("{}", ws.dump_active_screen(window, cx));
                     })
                     .ok();
-                cx.update(|cx| print!("{}", dump_other_windows(window, cx))).ok();
                 cx.update(|cx| cx.quit()).ok();
             })
             .detach();
@@ -626,5 +809,77 @@ async fn latency_bench_run(window: gpui::WindowHandle<Workspace>, samples: usize
         }
         cx.background_executor().timer(gap()).await;
         i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn profile_directory_and_command_ask_for_a_tab() {
+        for args in [&[][..], &["--send", "x", "--dump-screen-after", "3"], &["--no-restore"]] {
+            assert!(!parse(args).asks_for_a_tab(), "{args:?}");
+        }
+        for args in [&["-p", "tmux"][..], &["-d", "/tmp"], &["-e", "htop"]] {
+            assert!(parse(args).asks_for_a_tab(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn debug_options_make_a_debug_run() {
+        assert!(!parse(&["-p", "tmux", "-e", "htop"]).is_debug_run());
+        for args in [&["--send", "x"][..], &["--action", "new_tab"], &["--dump-screen-after", "2"], &["--latency-bench", "5"]] {
+            assert!(parse(args).is_debug_run(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_launch_becomes_a_request_for_the_instance() {
+        let request = parse(&["-p", "tmux", "-d", "rel", "-e", "htop", "-d", "1"]).instance_request();
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(request.profile.as_deref(), Some("tmux"));
+        assert_eq!(request.cwd, Some(here.join("rel")), "-d is made absolute here");
+        assert_eq!(request.command, Some(vec!["htop".into(), "-d".into(), "1".into()]));
+        assert_eq!(request.launch_dir, Some(here));
+    }
+
+    #[test]
+    fn forwarded_requests_open_tabs() {
+        let config = Config::parse("default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap();
+        let request = |r: instance::Request| forwarded_launch(&r, None, &config);
+        assert!(request(instance::Request { launch_dir: Some("/x".into()), ..Default::default() }).is_none(), "a plain launch only raises");
+        let Some(Launch::Request(tab)) = request(instance::Request {
+            command: Some(vec!["htop".into()]),
+            launch_dir: Some("/srv".into()),
+            ..Default::default()
+        }) else {
+            panic!("a command opens a tab")
+        };
+        assert_eq!((tab.profile, tab.command, tab.cwd), (0, Some(("htop".into(), vec![])), Some("/srv".into())));
+        let Some(Launch::Request(tab)) =
+            request(instance::Request { profile: Some("b".into()), launch_dir: Some("/srv".into()), ..Default::default() })
+        else {
+            panic!("a profile opens a tab")
+        };
+        assert_eq!((tab.profile, tab.cwd), (1, None), "only a command starts where it was typed");
+        let Some(Launch::Attach { session: 7, target: Err(_) }) =
+            request(instance::Request { attach: Some(7), ..Default::default() })
+        else {
+            panic!("--attach without a listing says why")
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_takes_a_session_id() {
+        let args = parse(&["--attach", "7", "--dump-screen-after", "2"]);
+        assert_eq!(args.attach, Some(7));
+        assert!(!args.asks_for_a_tab());
+        assert_eq!(parse(&[]).attach, None);
     }
 }

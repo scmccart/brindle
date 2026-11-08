@@ -120,6 +120,8 @@ enum Event {
     Record(Vec<String>, String),
     /// Rewrites the config with another theme (Brindle reloads it).
     Theme(&'static str),
+    /// Runs a check or an action, given Brindle's pid; an error fails the run.
+    Call(Box<dyn FnOnce(u32) -> Result + Send>),
 }
 
 /// One run of Brindle attached to a test server's session.
@@ -136,17 +138,72 @@ pub struct Run<'a> {
     expect_exit: bool,
     /// The window has no tabs at the dump, only a palette.
     without_tabs: bool,
+    /// A timeline call kills Brindle, so it prints no dump.
+    expect_killed: bool,
+    /// Another Brindle binary than `ctx.bin`.
+    bin: Option<std::path::PathBuf>,
     steps: Vec<String>,
     env: Vec<(String, String)>,
     env_remove: Vec<String>,
     timeline: Vec<(f64, Event)>,
     dump_at: f64,
     capture_at: Option<f64>,
-    /// Session restore: a plain launch (no `-p`) with `restore_session`
-    /// on and the state in `<case dir>/state`.
+    /// Session restore: a plain launch (no `-p` or `--no-restore`), with the state in
+    /// `<case dir>/state` as for every run.
     restore: bool,
     default_profile: &'static str,
     args: Vec<String>,
+    /// `-e`'s command and arguments, when set.
+    command: Vec<String>,
+    /// Leave the sessions this run left detached for the next run to
+    /// attach, instead of hanging them up when it exits.
+    keep_detached: bool,
+}
+
+/// Hangs up the case server's detached sessions and waits for them to go,
+/// so the case's next Brindle (which attaches detached sessions at launch)
+/// starts with only the tabs it asks for.
+fn hang_up_detached(ctx: &Ctx) -> Result {
+    // Only Linux tabs run in the terminal server.
+    if cfg!(not(target_os = "linux")) {
+        return Ok(());
+    }
+    let list = || -> Result<Vec<String>> {
+        let out = Command::new(&ctx.helper)
+            .arg("list")
+            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("running {}: {e}", ctx.helper.display()))?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // `id<TAB>pid<TAB>attached|detached<TAB>…`
+        Ok(text
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                (fields.get(2) == Some(&"detached")).then(|| fields[0].to_string())
+            })
+            .collect())
+    };
+    let detached = list()?;
+    for id in &detached {
+        Command::new(&ctx.helper)
+            .args(["kill", id])
+            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
+            .stdin(Stdio::null())
+            .output()
+            .ok();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !detached.is_empty() {
+        let left = list()?;
+        if !left.iter().any(|id| detached.contains(id)) {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "detached sessions {left:?} didn't end");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 pub struct Output {
@@ -166,6 +223,8 @@ impl<'a> Run<'a> {
             top: String::new(),
             expect_exit: false,
             without_tabs: false,
+            expect_killed: false,
+            bin: None,
             steps: Vec::new(),
             env: Vec::new(),
             env_remove: Vec::new(),
@@ -175,6 +234,8 @@ impl<'a> Run<'a> {
             restore: false,
             default_profile: "tmux",
             args: Vec::new(),
+            command: Vec::new(),
+            keep_detached: false,
         }
     }
 
@@ -193,6 +254,21 @@ impl<'a> Run<'a> {
     /// An extra command-line argument.
     pub fn arg(mut self, arg: &str) -> Self {
         self.args.push(arg.to_string());
+        self
+    }
+
+    /// Keeps the sessions this run leaves detached (a quit leaves every
+    /// local tab's), for the case to check or the next run to attach;
+    /// otherwise they are hung up when Brindle exits.
+    pub fn keep_detached(mut self) -> Self {
+        self.keep_detached = true;
+        self
+    }
+
+    /// `-e COMMAND ARGS…`, placed after every other argument, since `-e`
+    /// takes the rest of the command line.
+    pub fn command(mut self, argv: &[&str]) -> Self {
+        self.command = argv.iter().map(|a| a.to_string()).collect();
         self
     }
 
@@ -258,6 +334,35 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Expects a [`Run::call_at`] to kill Brindle before the dump: the run
+    /// fails if Brindle exits successfully instead. The dump is empty.
+    pub fn expect_killed(mut self) -> Self {
+        self.expect_killed = true;
+        self
+    }
+
+    /// Runs another Brindle binary.
+    pub fn bin(mut self, path: &std::path::Path) -> Self {
+        self.bin = Some(path.to_path_buf());
+        self
+    }
+
+    /// Waits for `text` on the active terminal's screen before the next
+    /// step (`--wait-for`, at most 30 s). It takes a step's interval even
+    /// when the text is already there, so it also spaces steps out.
+    pub fn wait_for(mut self, text: &str) -> Self {
+        self.steps.extend(["--wait-for".to_string(), text.to_string()]);
+        self
+    }
+
+    /// Calls `call` with Brindle's pid `secs` after Brindle starts (stretched
+    /// like the other timeline events), on the timeline thread. Its error
+    /// fails the run; later events wait for it to return.
+    pub fn call_at(mut self, secs: f64, call: impl FnOnce(u32) -> Result + Send + 'static) -> Self {
+        self.timeline.push((secs, Event::Call(Box::new(call))));
+        self
+    }
+
     /// Expects the dumped window to have no tabs, only an open palette, so
     /// the dump has no screen.
     pub fn without_tabs(mut self) -> Self {
@@ -315,19 +420,17 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        let mut top = self.top.clone();
-        if self.restore {
-            top.push_str("restore_session = true\n");
-        }
-        let text = config_with(&self.server.socket, "e2e", self.default_profile, &top) + &self.extra_config;
+        let text = config_with(&self.server.socket, "e2e", self.default_profile, &self.top) + &self.extra_config;
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
-        let mut command = Command::new(&ctx.bin);
-        if self.restore {
-            command.env("BRINDLE_STATE_DIR", state_dir(ctx));
-        } else {
-            command.args(["-p", self.profile]);
+        let mut command = Command::new(self.bin.as_ref().unwrap_or(&ctx.bin));
+        // Every run has its own state directory: every launch records the
+        // session now, and must never touch the real one.
+        command.env("BRINDLE_STATE_DIR", state_dir(ctx));
+        if !self.restore {
+            // `-p` alone restores too; these runs start clean.
+            command.args(["-p", self.profile, "--no-restore"]);
         }
         for key in &self.env_remove {
             command.env_remove(key);
@@ -337,7 +440,11 @@ impl<'a> Run<'a> {
             .args(&self.steps)
             .args(ctx.step_interval())
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
+            .args(if self.command.is_empty() { &[][..] } else { &["-e"][..] })
+            .args(&self.command)
             .env("BRINDLE_CONFIG", &config_path)
+            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
+            .env("BRINDLE_NO_SCOPE", "1")
             .env("DISPLAY", &ctx.display)
             .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -354,6 +461,7 @@ impl<'a> Run<'a> {
         let slow = ctx.secs(1.0);
         let config_for_reload = config_path.clone();
         let (case_dir, label) = (ctx.dir.clone(), self.label);
+        let brindle_pid = child.id();
         let events = std::thread::spawn(move || -> Vec<String> {
             let mut errors = Vec::new();
             for (secs, event) in timeline {
@@ -390,6 +498,11 @@ impl<'a> Run<'a> {
                             errors.push(format!("rewriting config: {e}"));
                         }
                     }
+                    Event::Call(call) => {
+                        if let Err(e) = call(brindle_pid) {
+                            errors.push(e);
+                        }
+                    }
                 }
             }
             errors
@@ -420,7 +533,14 @@ impl<'a> Run<'a> {
         ctx.save(&format!("{}.dump", self.label), &stdout);
         let errors = events.join().unwrap_or_default();
         ensure!(errors.is_empty(), "timeline: {}", errors.join("; "));
+        if !self.keep_detached {
+            hang_up_detached(ctx)?;
+        }
         let dump = Dump::parse(&stdout);
+        if self.expect_killed {
+            ensure!(!status.success(), "Brindle exited by itself ({status}); see {}.log", self.label);
+            return Ok(Output { dump, image });
+        }
         if self.expect_exit {
             ensure!(
                 dump.tabs.is_empty() && dump.size.is_none(),
@@ -443,7 +563,7 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The session-restore state directory of runs made with [`Run::restore`].
+/// The session-restore state directory of every run in the case.
 pub fn state_dir(ctx: &Ctx) -> std::path::PathBuf {
     ctx.dir.join("state")
 }
@@ -488,9 +608,6 @@ pub struct Dump {
     pub zone_list: Vec<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
-    /// The tab titles of the other windows (`--- window N tabs=[…]`), by
-    /// window number.
-    pub windows: Vec<(usize, Vec<String>)>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -547,11 +664,6 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- input ") {
                 dump.input = parse_input(rest);
                 in_screen = false;
-            } else if let Some(rest) = line.strip_prefix("--- window ") {
-                if let Some(window) = parse_window(rest) {
-                    dump.windows.push(window);
-                }
-                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- find ") {
                 dump.find = Some(rest.to_string());
                 in_screen = false;
@@ -574,14 +686,6 @@ impl Dump {
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
-}
-
-/// `2 tabs=["bash", "w0"]` (titles without commas or quotes).
-fn parse_window(text: &str) -> Option<(usize, Vec<String>)> {
-    let (number, tabs) = text.split_once(" tabs=")?;
-    let inner = tabs.strip_prefix('[')?.strip_suffix(']')?;
-    let titles = inner.split(", ").filter(|t| !t.is_empty()).map(|t| t.trim_matches('"').to_string()).collect();
-    Some((number.parse().ok()?, titles))
 }
 
 /// Undoes the Rust `{:?}` quoting of a string (the escapes it produces
@@ -710,8 +814,5 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.find_field("count") == Some("11"), "count {:?}", dump.find_field("count"));
     ensure!(dump.find_field("focused") == Some("10,0"), "focused {:?}", dump.find_field("focused"));
     ensure!(dump.find_field("nope").is_none(), "missing field");
-    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- window 2 tabs=[\"bash\", \"w0\"]\n--- window 3 tabs=[]\n");
-    ensure!(dump.screen == ["hi"], "screen before windows {:?}", dump.screen);
-    ensure!(dump.windows == [(2, vec!["bash".to_string(), "w0".to_string()]), (3, vec![])], "windows {:?}", dump.windows);
     Ok(())
 }

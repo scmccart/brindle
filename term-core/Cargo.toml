@@ -1,0 +1,12 @@
+[package]
+name = "brindle-term-core"
+version = "0.3.0"
+edition = "2024"
+description = "The GPUI-free terminal state Brindle and its server share: the shell-integration parser and the program status records"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+base64 = "0.22"
+parking_lot = "0.12"
