@@ -188,6 +188,17 @@ only needed for the tmux profiles.
 `cargo build` also builds the `brindle-remote` helper into the same directory,
 where `brindle` finds it for the [terminal server](#terminal-server).
 
+`ui/` is `brindle-ui`, the shared component crate (see [`ui/README.md`](ui/README.md)).
+Its gallery shows every component, in light and dark:
+
+```sh
+cargo run -p brindle-ui --example gallery              # opens the gallery window
+cargo run -p brindle-ui --example gallery -- --check   # drives the components' spec scenarios, prints ok/FAIL/SKIP per check
+```
+
+Both open a window. `--check` exits non-zero when a check fails; its pointer
+and key-release checks run on Windows and are skipped elsewhere.
+
 `rust-toolchain.toml` pins the Rust version that CI and releases build with.
 rustup installs it on the first `cargo` run in the checkout.
 
