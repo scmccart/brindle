@@ -72,6 +72,13 @@ impl LayerStack {
         self.layers.iter().position(|layer| layer.id == id)
     }
 
+    /// Whether a non-modal layer is open below `id`. A layer above one
+    /// can't be deferred: the one below is drawn deferred, and gpui refuses
+    /// a `defer_draw` while it draws the deferred elements.
+    pub fn non_modal_below(&self, id: LayerId) -> bool {
+        self.depth(id).is_some_and(|depth| self.layers[..depth].iter().any(|layer| !layer.modal))
+    }
+
     pub fn contains(&self, id: LayerId) -> bool {
         self.depth(id).is_some()
     }
@@ -165,14 +172,17 @@ pub fn is_top(window: &Window, id: LayerId, cx: &mut App) -> bool {
     layers.stack.is_top(id)
 }
 
+/// The stack of `window`, or `None` when it has no open layers. Read-only
+/// (it prunes nothing), so it can be called while rendering.
+pub fn stack<'a>(window: &Window, cx: &'a App) -> Option<&'a LayerStack> {
+    let layers = cx.try_global::<Layers>()?.windows.get(&window.window_handle().window_id())?;
+    Some(&layers.stack)
+}
+
 /// The paint priority of `id` in `window`, or `None` when it isn't open.
 /// Read-only, so it can be called while rendering.
 pub fn depth(window: &Window, id: LayerId, cx: &App) -> Option<usize> {
-    cx.try_global::<Layers>()?
-        .windows
-        .get(&window.window_handle().window_id())?
-        .stack
-        .depth(id)
+    stack(window, cx)?.depth(id)
 }
 
 #[cfg(test)]
@@ -218,6 +228,27 @@ mod tests {
         let d = stack.push(false);
         assert_ne!(d, b);
         assert_eq!(stack.depth(d), Some(2));
+    }
+
+    #[test]
+    fn non_modal_below_looks_at_the_layers_under_a_layer_only() {
+        let mut stack = LayerStack::new();
+        let dialog = stack.push(true);
+        let popover = stack.push(false);
+        let menu = stack.push(false);
+        // Nothing is below the bottom layer, and only a modal is below the popover.
+        assert!(!stack.non_modal_below(dialog));
+        assert!(!stack.non_modal_below(popover));
+        // The popover is below the menu.
+        assert!(stack.non_modal_below(menu));
+        // A modal above a non-modal has one below it.
+        let second_dialog = stack.push(true);
+        assert!(stack.non_modal_below(second_dialog));
+        // Closing the popover frees the menu.
+        stack.remove(popover);
+        assert!(!stack.non_modal_below(menu));
+        // An unknown layer has nothing below it.
+        assert!(!stack.non_modal_below(popover));
     }
 
     /// A press outside both a popover and the dialog it was opened from

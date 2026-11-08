@@ -8,16 +8,18 @@
 //! back if what had it still exists. While open, the view sits in a
 //! [`FocusScope`], so Tab cycles through its stops and never leaves it.
 //!
-//! Where the owner renders it depends on the layer's depth (see
-//! [`wrap_in_deferred`]). The bottom layer goes through `deferred`, which
-//! lifts it above the window, so its owner renders it anywhere in its tree.
-//! gpui refuses a `defer_draw` while it draws the deferred elements
-//! (`window.rs`: "cannot call defer_draw during deferred drawing"), so a
-//! layer opened while another is open renders inline, inside the open
-//! layer's view, whose `deferred` already lifts it; within that subtree, tree
-//! order gives z-order. So the owner of a nested overlay renders it inside
-//! the parent layer's view, last in its tree and outside any clipping
-//! container, or what the parent renders after it paints over it.
+//! Where the owner renders it depends on the layer's kind, because gpui
+//! refuses a `defer_draw` while it draws the deferred elements
+//! (`window.rs`: "cannot call defer_draw during deferred drawing"), so the
+//! layers can't all go through `deferred` (see [`wrap_in_deferred`]). A
+//! modal view is never deferred: the app renders it last in its window's
+//! tree, where tree order paints it above the rest and its backdrop blocks
+//! what is beneath. A non-modal view (a popover) is deferred, which lifts it
+//! above the window from wherever its trigger is, a dialog's body included.
+//! Only a non-modal view opened over another non-modal layer renders
+//! inline, since that layer's view is drawn deferred: its owner renders it
+//! last in the parent layer's view and outside any clipping container, or
+//! what the parent renders after it paints over it.
 //!
 //! Escape and outside presses never close the view directly: they dispatch
 //! [`Dismiss`] to it, and the layer answers by emitting `DismissEvent` unless
@@ -33,7 +35,7 @@ use gpui::{
 
 use crate::actions::Dismiss;
 use crate::primitives::focus_scope::{FocusScope, FocusStops};
-use crate::primitives::layer::{self, LayerId};
+use crate::primitives::layer::{self, LayerId, LayerStack};
 
 /// A modal layer's backdrop: black at 50%, shadcn's `bg-black/50`. It isn't
 /// a token.
@@ -129,11 +131,11 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         }
     }
 
-    /// The open view's element, or `None`: the view in its layer. The bottom
-    /// layer is deferred, so it paints above everything; a layer above it
-    /// renders inline, inside the layer below's view (see the module doc).
-    /// A modal overlay comes with its full-window backdrop; a non-modal
-    /// one is placed where it is rendered.
+    /// The open view's element, or `None`: the view in its layer. A modal
+    /// overlay comes with its full-window backdrop and renders inline, so
+    /// its owner places it last in the window's tree; a non-modal one is
+    /// deferred, which lifts it above the window, unless a non-modal layer
+    /// is open below it (see the module doc and [`wrap_in_deferred`]).
     pub fn render(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         self.render_with(|panel| panel, window, cx)
     }
@@ -141,8 +143,8 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     /// [`Overlay::render`] with `place` applied to a non-modal view's panel
     /// first: a popover wraps the panel in an [`Anchored`] to put it beside
     /// its trigger. A modal view is centred by its backdrop, so `place` is
-    /// skipped. The result is deferred only for the bottom layer and
-    /// renders inline above it, so what `place` returns must work in both.
+    /// skipped. The result is deferred or inline by [`wrap_in_deferred`],
+    /// so what `place` returns must work in both.
     ///
     /// [`Anchored`]: crate::primitives::placement::Anchored
     pub fn render_with(
@@ -153,7 +155,9 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     ) -> Option<AnyElement> {
         let open = self.open.as_ref()?;
         let id = open.layer;
-        let depth = layer::depth(window, id, cx).unwrap_or(0);
+        let stack = layer::stack(window, cx);
+        let depth = stack.and_then(|stack| stack.depth(id)).unwrap_or(0);
+        let lifted = stack.is_some_and(|stack| wrap_in_deferred(stack, id));
         let view = open.view.clone();
         let panel = div()
             .key_context("UiLayer")
@@ -191,7 +195,7 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         let element = if self.modal {
             let size = window.viewport_size();
             // Absolute at the window's origin, so the backdrop covers the
-            // window from wherever it is rendered, inline included.
+            // window from wherever in the tree it is rendered.
             anchored()
                 .position(Point::default())
                 .child(
@@ -209,18 +213,26 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         } else {
             place(panel.into_any_element())
         };
-        Some(if wrap_in_deferred(depth) { deferred(element).into_any_element() } else { element })
+        Some(if lifted { deferred(element).with_priority(depth).into_any_element() } else { element })
     }
 }
 
-/// Whether the layer at `depth` renders through `deferred`: only the bottom
-/// one. gpui asserts that nothing calls `defer_draw` while it draws the
-/// deferred elements, and a layer above the bottom one is rendered inside
-/// the bottom layer's view, which is drawn then. Rendered inline there, it
-/// is lifted above the window with that view, and paints after what the
-/// view rendered before it.
-pub fn wrap_in_deferred(depth: usize) -> bool {
-    depth == 0
+/// Whether the layer `id` of `stack` renders through `deferred`, which lifts
+/// it above the window, or inline, where tree order places it.
+///
+/// gpui asserts that nothing calls `defer_draw` while it draws the deferred
+/// elements, so the layers can't all be deferred:
+/// - A modal layer never is. Its owner, the app, renders it last in the
+///   window's tree, so it paints above the rest, and its backdrop blocks
+///   what is beneath. A layer opened from inside it can then be deferred.
+/// - A non-modal layer is deferred unless a non-modal layer is open below
+///   it, whose view is drawn deferred and would hold the nested call. Then
+///   it renders inline in the parent layer's view, which its owner renders
+///   last there.
+///
+/// A layer not in the stack renders inline, which is legal anywhere.
+pub fn wrap_in_deferred(stack: &LayerStack, id: LayerId) -> bool {
+    stack.get(id).is_some_and(|layer| !layer.modal && !stack.non_modal_below(id))
 }
 
 /// The default answer to a dismiss request, for a view shown outside an
@@ -259,13 +271,60 @@ mod tests {
         assert_eq!(initial_focus(Some("initial"), &[], "own"), "initial");
     }
 
-    /// Nested deferred draws panic in gpui, so only the bottom layer is
-    /// deferred; every layer above it renders inline inside it.
+    /// Nested deferred draws panic in gpui, so a modal layer, rendered last
+    /// in the window's tree, is never deferred, and a non-modal one is
+    /// unless a non-modal layer below it is already drawn deferred.
     #[test]
-    fn only_the_bottom_layer_is_deferred() {
-        assert!(wrap_in_deferred(0));
-        assert!(!wrap_in_deferred(1));
-        assert!(!wrap_in_deferred(2));
+    fn modal_layers_are_never_deferred() {
+        let mut stack = LayerStack::new();
+        let dialog = stack.push(true);
+        assert!(!wrap_in_deferred(&stack, dialog));
+        // Nor above a non-modal layer.
+        let mut stack = LayerStack::new();
+        stack.push(false);
+        let dialog = stack.push(true);
+        assert!(!wrap_in_deferred(&stack, dialog));
+    }
+
+    #[test]
+    fn a_non_modal_layer_alone_is_deferred() {
+        let mut stack = LayerStack::new();
+        let popover = stack.push(false);
+        assert!(wrap_in_deferred(&stack, popover));
+    }
+
+    /// A select's menu in a dialog: the dialog isn't deferred, so the menu
+    /// can be, and it paints above the dialog's footer.
+    #[test]
+    fn a_non_modal_layer_above_a_modal_one_is_deferred() {
+        let mut stack = LayerStack::new();
+        let dialog = stack.push(true);
+        let menu = stack.push(false);
+        assert!(wrap_in_deferred(&stack, menu));
+        assert!(!wrap_in_deferred(&stack, dialog));
+    }
+
+    /// A popover opened from inside a popover renders inline, inside the
+    /// parent popover's deferred view.
+    #[test]
+    fn a_non_modal_layer_above_a_non_modal_one_renders_inline() {
+        let mut stack = LayerStack::new();
+        let popover = stack.push(false);
+        let nested = stack.push(false);
+        assert!(wrap_in_deferred(&stack, popover));
+        assert!(!wrap_in_deferred(&stack, nested));
+        // With a dialog between them too: the lower popover is still drawn deferred.
+        let mut stack = LayerStack::new();
+        let popover = stack.push(false);
+        stack.push(true);
+        let menu = stack.push(false);
+        assert!(wrap_in_deferred(&stack, popover));
+        assert!(!wrap_in_deferred(&stack, menu));
+        // Closing the lower popover lifts the one above it.
+        stack.remove(popover);
+        assert!(wrap_in_deferred(&stack, menu));
+        // A layer that isn't open renders inline.
+        assert!(!wrap_in_deferred(&stack, popover));
     }
 
     #[test]
