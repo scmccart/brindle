@@ -9,7 +9,7 @@
 
 - [x] 2.1 Move `src/text_input.rs` to `ui/src/text_input.rs` and its 19 `TextInput*` actions to `ui/src/actions.rs` (`actions!(brindle_ui, …)`). Add `brindle_ui::default_bindings()` returning the `TextInput`-context bindings moved out of `src/actions.rs`. Verify: the moved `EditState` and `scroll_for_caret` tests pass with `cargo test -p brindle-ui`.
 - [x] 2.2 In Brindle, chain `brindle_ui::default_bindings()` into `actions::default_bindings()`, point the `text_input_*` `ACTIONS` entries at `brindle_ui::TextInput*`, and repoint imports in `picker.rs`, `find_bar.rs`, `settings_dialog.rs`, `settings_dialog/profiles.rs`, `workspace.rs` and `tmux/mod.rs` (every file that names `text_input` or `TextInput`). Verify: `cargo test --workspace` passes (including `default_bindings_parse` and the ACTIONS round-trip test), and `brindle --list-actions` lists the same `text_input_*` names as before.
-- [ ] 2.3 Move `fuzzy_match`/`filter` from `picker.rs` to `ui/src/filter.rs` with their tests, and import them in `picker.rs`. Verify: `cargo test --workspace` passes.
+- [x] 2.3 Move `fuzzy_match`/`filter` from `picker.rs` to `ui/src/filter.rs` with their tests, and import them in `picker.rs`. Verify: `cargo test --workspace` passes.
 - [ ] 2.4 Verify the move changed no behaviour: on Linux (via the Remote Control session) `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- palette settings find` passes, and on Windows `BRINDLE_E2E=1 cargo test --test e2e` passes (ask before running on the desktop).
 
 ## 3. Tokens, styles and icons

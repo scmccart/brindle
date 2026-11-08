@@ -5,6 +5,7 @@
 //! own keybindings.
 
 pub mod actions;
+pub mod filter;
 pub mod text_input;
 
 pub use actions::*;
