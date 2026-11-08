@@ -457,6 +457,7 @@ impl Terminal {
         // tmux attach) is never restored or reattached, so it ends with its
         // tab and with Brindle. Everything else keeps running when Brindle
         // goes away without closing it.
+        #[cfg_attr(windows, allow(unused_variables))]
         let closing = Closing::new(command_override.is_some());
         let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
             Some(program) => (program.clone(), profile.args.clone()),
