@@ -9,10 +9,14 @@
 //! list and has the focus; typing filters the items by [`filter`]'s
 //! case-insensitive subsequence match, keeping their order, hiding groups
 //! left with no items and showing a message when nothing matches. Each
-//! change to the filter highlights the first match ([`CommandRows`]).
+//! change to the filter highlights the first match ([`CommandRows`]). A
+//! group can take a separator above it ([`CommandGroup::separator`]),
+//! shadcn's `CommandSeparator`: a line across the list, shown only while
+//! the groups on both sides of it list items.
 //!
 //! The list is a `gpui::list`, since headings and items differ in height
-//! and palettes can be long. Up and down (also ctrl-p/ctrl-n) move the
+//! and palettes can be long. Separators are rows too, but have no rank, so
+//! the highlight passes over them. Up and down (also ctrl-p/ctrl-n) move the
 //! highlight over the enabled matches and wrap at the ends; home and end go
 //! to the text input's own bindings, which are nearer the focus. The pointer
 //! highlights the item under it, and the highlight is scrolled into view
@@ -41,7 +45,9 @@ use crate::filter::filter;
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::nav::ListNav;
-use crate::style::{COMMAND_LIST_MAX_HEIGHT, MUTED_ICON_OPACITY, command_row_insets, command_style};
+use crate::style::{
+    COMMAND_LIST_MAX_HEIGHT, COMMAND_SEPARATOR_HEIGHT, MUTED_ICON_OPACITY, command_row_insets, command_style,
+};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::ActiveTheme;
 
@@ -104,17 +110,28 @@ impl From<SharedString> for CommandItem {
 pub struct CommandGroup {
     pub heading: Option<SharedString>,
     pub items: Vec<CommandItem>,
+    /// A separator above the group, between it and the group before:
+    /// shadcn's `<CommandSeparator />` written before this
+    /// `<CommandGroup>`. It shows only while both groups list items, so it
+    /// does nothing on the first group.
+    pub separator: bool,
 }
 
 impl CommandGroup {
     /// A group under `heading`.
     pub fn new(heading: impl Into<SharedString>, items: impl IntoIterator<Item = impl Into<CommandItem>>) -> Self {
-        Self { heading: Some(heading.into()), items: items.into_iter().map(Into::into).collect() }
+        Self { heading: Some(heading.into()), items: items.into_iter().map(Into::into).collect(), separator: false }
     }
 
     /// A group with no heading.
     pub fn unnamed(items: impl IntoIterator<Item = impl Into<CommandItem>>) -> Self {
-        Self { heading: None, items: items.into_iter().map(Into::into).collect() }
+        Self { heading: None, items: items.into_iter().map(Into::into).collect(), separator: false }
+    }
+
+    /// Whether a separator sits above the group.
+    pub fn separator(mut self, separator: bool) -> Self {
+        self.separator = separator;
+        self
     }
 }
 
@@ -126,6 +143,9 @@ pub enum CommandRow {
     /// A matching item: its index across the groups, and its rank among
     /// the matches, which the highlight counts in.
     Item { item: usize, rank: usize },
+    /// The separator above the group at this index among the groups. It
+    /// belongs to no group and has no rank.
+    Separator(usize),
 }
 
 /// The filtered list: its rows, the matching items and the highlight. Pure,
@@ -133,8 +153,8 @@ pub enum CommandRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandRows {
     rows: Vec<CommandRow>,
-    /// The group each row belongs to, by row.
-    row_groups: Vec<usize>,
+    /// The group each row belongs to, by row; none for a separator.
+    row_groups: Vec<Option<usize>>,
     /// The matching items' indices across the groups, by rank.
     matches: Vec<usize>,
     /// Whether each match is enabled, by rank.
@@ -152,29 +172,39 @@ impl Default for CommandRows {
 impl CommandRows {
     /// Filters `groups` by `query` (`filter`'s subsequence match, in order).
     /// A group with no matching item is left out, heading and all; a group
-    /// with no heading lists its items alone. The first enabled match is
-    /// highlighted.
+    /// with no heading lists its items alone. A group's separator is listed
+    /// above it only when the group just before it lists items too, so a
+    /// separator is never first, last or next to another. The first enabled
+    /// match is highlighted.
     pub fn build(groups: &[CommandGroup], query: &str) -> Self {
         let mut rows = Vec::new();
         let mut row_groups = Vec::new();
         let mut matches = Vec::new();
         let mut enabled = Vec::new();
         let mut first = 0;
+        // Whether the group before the current one listed items.
+        let mut previous_listed = false;
         for (group_ix, group) in groups.iter().enumerate() {
             let hits = filter(query, group.items.iter().map(|item| item.label.as_ref()));
-            if !hits.is_empty() {
+            let listed = !hits.is_empty();
+            if listed {
+                if group.separator && previous_listed {
+                    rows.push(CommandRow::Separator(group_ix));
+                    row_groups.push(None);
+                }
                 if group.heading.is_some() {
                     rows.push(CommandRow::Heading(group_ix));
-                    row_groups.push(group_ix);
+                    row_groups.push(Some(group_ix));
                 }
                 for hit in hits {
                     let item = first + hit;
                     rows.push(CommandRow::Item { item, rank: matches.len() });
-                    row_groups.push(group_ix);
+                    row_groups.push(Some(group_ix));
                     matches.push(item);
                     enabled.push(!group.items[hit].disabled);
                 }
             }
+            previous_listed = listed;
             first += group.items.len();
         }
         let mut nav = ListNav::new(matches.len(), true);
@@ -186,7 +216,7 @@ impl CommandRows {
         &self.rows
     }
 
-    /// How many rows the list shows, headings included.
+    /// How many rows the list shows, headings and separators included.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -198,11 +228,12 @@ impl CommandRows {
     }
 
     /// Whether `row` is the first and whether it is the last listed row of
-    /// its group, which take the group's padding above and below it.
+    /// its group, which take the group's padding above and below it. None
+    /// for a separator, which belongs to no group, and past the end.
     pub fn group_edges(&self, row: usize) -> Option<(bool, bool)> {
-        let group = *self.row_groups.get(row)?;
-        let first = row == 0 || self.row_groups[row - 1] != group;
-        let last = self.row_groups.get(row + 1).is_none_or(|&next| next != group);
+        let group = (*self.row_groups.get(row)?)?;
+        let first = row == 0 || self.row_groups[row - 1] != Some(group);
+        let last = self.row_groups.get(row + 1).is_none_or(|&next| next != Some(group));
         Some((first, last))
     }
 
@@ -430,7 +461,15 @@ impl Command {
     /// out on its own at the list's width and ignores the list's horizontal
     /// padding, so the row brings the group's, and fills the width between
     /// (a flex row laid out alone would shrink to its content).
+    ///
+    /// A separator is in no group and takes no padding: CommandSeparator's
+    /// `-mx-1 h-px bg-border` spans the list past the groups' `p-1`, and the
+    /// groups beside it bring the space above and below.
     fn render_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(CommandRow::Separator(_)) = self.rows.rows().get(row) {
+            let style = command_style(cx.ui_theme());
+            return div().w_full().h(COMMAND_SEPARATOR_HEIGHT).bg(style.separator).into_any_element();
+        }
         let Some((first, last)) = self.rows.group_edges(row) else {
             // The list asks for a row the filter has since removed.
             return div().into_any_element();
@@ -449,7 +488,8 @@ impl Command {
     fn render_row_content(&mut self, row: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let style = command_style(cx.ui_theme());
         match self.rows.rows().get(row) {
-            None => div().into_any_element(),
+            // `render_row` draws separators.
+            None | Some(CommandRow::Separator(_)) => div().into_any_element(),
             // CommandGroup's heading: px-2 py-1.5 text-xs font-medium
             // text-muted-foreground.
             Some(CommandRow::Heading(group)) => div()
@@ -590,7 +630,7 @@ impl Render for Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use CommandRow::{Heading, Item};
+    use CommandRow::{Heading, Item, Separator};
 
     fn groups() -> Vec<CommandGroup> {
         vec![
@@ -741,6 +781,195 @@ mod tests {
         assert!(!rows.is_empty());
     }
 
+    /// `groups()` with a separator above Panes and above the unnamed group,
+    /// as shadcn writes `<CommandSeparator />` between groups.
+    fn separated() -> Vec<CommandGroup> {
+        let mut groups = groups();
+        groups[1].separator = true;
+        groups[2].separator = true;
+        groups
+    }
+
+    /// The spec's scenario: with no filter, a separator sits between Tabs'
+    /// last row and Panes' heading, and another above the unnamed group.
+    #[test]
+    fn separators_list_between_groups() {
+        let rows = CommandRows::build(&separated(), "");
+        assert_eq!(
+            rows.rows(),
+            [
+                Heading(0),
+                Item { item: 0, rank: 0 },
+                Item { item: 1, rank: 1 },
+                Separator(1),
+                Heading(1),
+                Item { item: 2, rank: 2 },
+                Item { item: 3, rank: 3 },
+                Separator(2),
+                Item { item: 4, rank: 4 },
+            ]
+        );
+        // Separators are rows, not matches.
+        assert_eq!(rows.matches(), [0, 1, 2, 3, 4]);
+        assert_eq!(rows.len(), 9);
+        // A separator belongs to no group, so the groups beside it keep
+        // their padding at that edge: Close Tab is Tabs' last row, the Panes
+        // heading its first.
+        let edges: Vec<_> = (0..rows.len()).map(|row| rows.group_edges(row)).collect();
+        assert_eq!(
+            edges,
+            [
+                Some((true, false)),
+                Some((false, false)),
+                Some((false, true)),
+                None,
+                Some((true, false)),
+                Some((false, false)),
+                Some((false, true)),
+                None,
+                Some((true, true)),
+            ]
+        );
+        // Without the flags, nothing changes from before.
+        assert!(!CommandRows::build(&groups(), "").rows().iter().any(|row| matches!(row, Separator(_))));
+    }
+
+    /// The spec's scenario: a separator shows only while the groups on both
+    /// sides of it list items, so a filter that empties either hides it.
+    #[test]
+    fn separators_hide_beside_an_empty_group() {
+        // Panes only: Tabs above its separator is gone, so the Panes heading
+        // is first, and the unnamed group below the other is gone too.
+        let rows = CommandRows::build(&separated(), "spr");
+        assert_eq!(rows.rows(), [Heading(1), Item { item: 2, rank: 0 }]);
+        assert_eq!(rows.highlighted_row(), Some(1));
+        // Tabs and the unnamed group, but not Panes between them: both
+        // separators are beside Panes, so neither shows.
+        let rows = CommandRows::build(&separated(), "e");
+        assert_eq!(
+            rows.rows(),
+            [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }, Item { item: 4, rank: 2 }]
+        );
+        // Tabs and Panes: one separator, and none last.
+        let rows = CommandRows::build(&separated(), "t");
+        assert_eq!(
+            rows.rows(),
+            [
+                Heading(0),
+                Item { item: 0, rank: 0 },
+                Item { item: 1, rank: 1 },
+                Separator(1),
+                Heading(1),
+                Item { item: 2, rank: 2 },
+                Item { item: 3, rank: 3 },
+            ]
+        );
+        // The unnamed group alone: no separator first.
+        let rows = CommandRows::build(&separated(), "rel");
+        assert_eq!(rows.rows(), [Item { item: 4, rank: 0 }]);
+        // Nothing matches: nothing, separators included, is listed.
+        assert!(CommandRows::build(&separated(), "zzz").rows().is_empty());
+        // A separator on the first group has nothing above it.
+        let first = [CommandGroup::new("Tabs", ["New Tab"]).separator(true)];
+        assert_eq!(CommandRows::build(&first, "").rows(), [Heading(0), Item { item: 0, rank: 0 }]);
+        // A group with no items lists nothing, and neither does the
+        // separator above it or the one below.
+        let empty = [
+            CommandGroup::new("Tabs", ["New Tab"]),
+            CommandGroup::new("None", Vec::<CommandItem>::new()).separator(true),
+            CommandGroup::unnamed(["Reload Config"]).separator(true),
+        ];
+        assert_eq!(
+            CommandRows::build(&empty, "").rows(),
+            [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }]
+        );
+    }
+
+    /// Over many filters of a list where every group has a separator, a
+    /// separator is never first or last, never beside another, and always
+    /// stands between rows of the group before it and the group it is
+    /// above.
+    #[test]
+    fn separators_are_never_first_last_or_doubled() {
+        let mut groups = vec![
+            CommandGroup::new("Tabs", ["New Tab", "Close Tab"]),
+            CommandGroup::new("Panes", ["Split Right", "Split Down"]),
+            CommandGroup::unnamed(["Reload Config"]),
+            CommandGroup::new("Sessions", ["Attach", "Detach"]),
+            CommandGroup::new("Empty", Vec::<CommandItem>::new()),
+            CommandGroup::new("Window", ["Close Window"]),
+        ];
+        for group in &mut groups {
+            group.separator = true;
+        }
+        let group_of = |rows: &CommandRows, row: usize| match rows.rows()[row] {
+            Heading(group) => Some(group),
+            Item { item, .. } => {
+                let mut first = 0;
+                groups.iter().position(|group| {
+                    first += group.items.len();
+                    item < first
+                })
+            }
+            Separator(_) => None,
+        };
+        let queries = ["", "e", "t", "s", "spr", "rel", "a", "c", "d", "w", "o", "zzz", "ta", "cl"];
+        for query in queries {
+            let rows = CommandRows::build(&groups, query);
+            let list = rows.rows();
+            for (row, kind) in list.iter().enumerate() {
+                let Separator(group) = *kind else { continue };
+                assert!(row > 0 && row + 1 < list.len(), "{query:?}: a separator at the end, {list:?}");
+                assert_eq!(group_of(&rows, row - 1), Some(group - 1), "{query:?}: {list:?}");
+                assert_eq!(group_of(&rows, row + 1), Some(group), "{query:?}: {list:?}");
+            }
+            // Every pair of adjacent listed groups has its separator.
+            let separators = list.iter().filter(|row| matches!(row, Separator(_))).count();
+            let listed: Vec<_> = (0..list.len()).filter_map(|row| group_of(&rows, row)).collect();
+            let adjacent = listed.windows(2).filter(|pair| pair[1] == pair[0] + 1).count();
+            assert_eq!(separators, adjacent, "{query:?}: {list:?}");
+        }
+    }
+
+    /// The spec's scenario: up and down pass over separators, which the
+    /// highlight never lands on and `row_of` never names.
+    #[test]
+    fn navigation_passes_over_separators() {
+        let mut rows = CommandRows::build(&separated(), "");
+        assert_eq!(rows.highlighted_row(), Some(1));
+        // Close Tab (row 2), then over the separator and Panes' heading to
+        // Split Right (row 5).
+        assert_eq!(rows.down(), Some(2));
+        assert_eq!(rows.down(), Some(5));
+        assert_eq!(rows.highlighted_item(), Some(2));
+        assert_eq!(rows.up(), Some(2));
+        // Split Down (row 6), then over the second separator to Reload
+        // Config (row 8), and round to New Tab.
+        assert_eq!(rows.down(), Some(5));
+        assert_eq!(rows.down(), Some(6));
+        assert_eq!(rows.down(), Some(8));
+        assert_eq!(rows.highlighted_item(), Some(4));
+        assert_eq!(rows.down(), Some(1));
+        assert_eq!(rows.up(), Some(8));
+        assert_eq!(rows.last(), Some(8));
+        assert_eq!(rows.first(), Some(1));
+        for rank in 0..rows.matches().len() {
+            let row = rows.row_of(rank).expect("every match has a row");
+            assert!(matches!(rows.rows()[row], Item { rank: r, .. } if r == rank), "rank {rank} names row {row}");
+        }
+        // Disabled items beside a separator are skipped too.
+        let groups = [
+            CommandGroup::new("Tabs", [CommandItem::new("New Tab"), CommandItem::new("Close Tab").disabled(true)]),
+            CommandGroup::new("Panes", [CommandItem::new("Split Right").disabled(true), CommandItem::new("Split Down")])
+                .separator(true),
+        ];
+        let mut rows = CommandRows::build(&groups, "");
+        assert_eq!(rows.rows()[3], Separator(1));
+        assert_eq!(rows.down(), Some(6));
+        assert_eq!(rows.highlighted_item(), Some(3));
+        assert_eq!(rows.down(), Some(1));
+    }
+
     #[test]
     fn items_and_groups_from_labels() {
         let item: CommandItem = "Close Tab".into();
@@ -753,5 +982,8 @@ mod tests {
         assert_eq!(group.heading.as_ref().map(|s| s.as_ref()), Some("Panes"));
         assert_eq!(group.items, [item]);
         assert_eq!(CommandGroup::unnamed(["a"]).heading, None);
+        // No separator unless asked for.
+        assert!(!group.separator);
+        assert!(CommandGroup::unnamed(["a"]).separator(true).separator);
     }
 }

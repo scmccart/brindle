@@ -91,7 +91,8 @@ fn main() {
 
 /// The command list the gallery shows, inline and in its hosts. Items are
 /// numbered across the groups: New Tab 0, Close Tab 1, Split Right 2, Split
-/// Down 3, Attach 4 (disabled), Reload Config 5.
+/// Down 3, Attach 4 (disabled), Reload Config 5. A separator sits between
+/// each two groups, as shadcn's demo puts `<CommandSeparator />` there.
 fn command_groups() -> Vec<CommandGroup> {
     vec![
         CommandGroup::new(
@@ -105,8 +106,9 @@ fn command_groups() -> Vec<CommandGroup> {
                 CommandItem::new("Split Down").detail("a zone below"),
                 CommandItem::new("Attach").detail("no detached session").disabled(true),
             ],
-        ),
-        CommandGroup::unnamed(["Reload Config"]),
+        )
+        .separator(true),
+        CommandGroup::unnamed(["Reload Config"]).separator(true),
     ]
 }
 
@@ -1555,6 +1557,8 @@ mod check {
         c.run_check("command-navigation-skips-disabled-and-wraps", check).await;
         let check = command_rows_fill_the_width(&mut c).await;
         c.run_check("command-rows-fill-the-group-width-under-a-filter-border", check).await;
+        let check = command_separator_spans_the_list(&mut c).await;
+        c.run_check("command-separator-spans-the-list-between-groups", check).await;
         let check = command_enter_and_escape_inline(&mut c).await;
         c.run_check("command-inline-enter-confirms-escape-cancels", check).await;
         let check = command_dialog(&mut c).await;
@@ -2283,6 +2287,67 @@ mod check {
         }
         let highlight_right = shown.iter().step_by(2).any(|colour| close(*colour, accent));
         ensure!(highlight_right, "the highlighted row's background doesn't reach the list's right side (x = {right:?})");
+        Ok(())
+    }
+
+    /// Reads the inline command list's pixels: below the highlighted New
+    /// Tab, the separator between Tabs and Panes is a thin line in the
+    /// border colour that reaches into the groups' padding at both sides
+    /// (shadcn's `-mx-1`), where the highlight stops short.
+    async fn command_separator_spans_the_list(c: &mut Checker) -> Check {
+        let command = c.with(|gallery, _, cx| {
+            gallery.command.update(cx, |command, cx| command.set_query("", cx));
+            gallery.command.clone()
+        })?;
+        let rows = c.read(&command, |command, _| command.rows().rows().to_vec())?;
+        ensure!(rows.contains(&brindle_ui::CommandRow::Separator(1)), "no separator is listed above Panes: {rows:?}");
+        ensure!(c.read(&command, |command, _| command.highlighted())? == Some(0), "New Tab isn't highlighted");
+        let (popover, accent, border) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (t.popover, t.accent, t.border)
+        })?;
+        let (accent, border, panel) = (over(accent, popover), over(border, popover), over(popover, popover));
+        let close = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2);
+        let frame = c.reveal("command").await?;
+        // Every device row from below the filter's line (the frame's 1px
+        // border, then h-9 with its own border at the bottom), at the
+        // list's centre and 3px in from each side of the frame: 2px into
+        // the groups' 4px p-1.
+        let scale = c.scale;
+        let top = frame.top() + px(1. + 36. + 1.);
+        let ys: Vec<Pixels> = (0..(200. * scale) as usize).map(|step| top + px(step as f32 / scale)).collect();
+        let (left, centre, right) = (frame.left() + px(3.), frame.center().x, frame.right() - px(3.));
+        let points: Vec<_> = ys.iter().flat_map(|&y| [point(left, y), point(centre, y), point(right, y)]).collect();
+        let shown = c.pixels(&points).await?;
+        let lines: Vec<&[[u8; 3]]> = shown.chunks(3).collect();
+        let Some(highlight) = lines.iter().position(|line| close(line[1], accent)) else {
+            fail!("the highlighted New Tab wasn't found at x = {centre:?} below {top:?}")
+        };
+        let border_across = |line: &&[[u8; 3]]| line.iter().all(|&colour| close(colour, border));
+        let found = lines.iter().enumerate().skip(highlight).find(|(_, line)| border_across(line));
+        let Some((at, _)) = found else {
+            let seen: Vec<_> = lines[highlight..]
+                .iter()
+                .map(|line| line[1])
+                .filter(|&colour| !close(colour, panel) && !close(colour, accent))
+                .take(8)
+                .collect();
+            fail!(
+                "below New Tab no device row is the border colour {border:?} at both sides and the centre; colours at the centre other than the panel's: {seen:?}"
+            )
+        };
+        // A line, not a box: 2px above and below it, the groups' padding
+        // shows the panel.
+        let margin = (2. * scale).round() as usize;
+        let (above, below) = (at.checked_sub(margin).and_then(|row| lines.get(row)), lines.get(at + margin));
+        for (side, line) in [("above", above), ("below", below)] {
+            let colour = line.map(|line| line[1]);
+            ensure!(
+                colour.is_some_and(|colour| close(colour, panel)),
+                "2px {side} the separator at {:?} the centre is {colour:?}, not the panel {panel:?}",
+                ys[at]
+            );
+        }
         Ok(())
     }
 

@@ -5,7 +5,7 @@
 //! applies the result. Sizes are in rems (GPUI's `h_9` is `rems(2.25)`, as
 //! Tailwind's `h-9` is 2.25rem), so they scale with the window's text size.
 
-use gpui::{Corners, Edges, Hsla, Pixels, Rems, rems};
+use gpui::{Corners, Edges, Hsla, Pixels, Rems, px, rems};
 
 use crate::theme::Tokens;
 
@@ -492,6 +492,10 @@ pub fn command_row_insets(first_in_group: bool, last_in_group: bool) -> CommandR
     CommandRowInsets { top: edge(first_in_group), bottom: edge(last_in_group), x: COMMAND_GROUP_PADDING }
 }
 
+/// A command separator's height, shadcn's `h-px`: one pixel, not a rem
+/// step, as in Tailwind.
+pub const COMMAND_SEPARATOR_HEIGHT: Pixels = px(1.);
+
 /// A command list's resolved look.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CommandStyle {
@@ -504,6 +508,8 @@ pub struct CommandStyle {
     /// The highlighted item.
     pub highlight: Hsla,
     pub highlight_foreground: Hsla,
+    /// The line between two groups.
+    pub separator: Hsla,
     /// The list's corners.
     pub radius: Rems,
     /// An item's corners.
@@ -513,7 +519,8 @@ pub struct CommandStyle {
 /// shadcn's Command: `bg-popover text-popover-foreground rounded-md`, the
 /// input row's `border-b`, headings and shortcuts in `text-muted-foreground`,
 /// and the item `data-[selected=true]:bg-accent
-/// data-[selected=true]:text-accent-foreground rounded-sm`.
+/// data-[selected=true]:text-accent-foreground rounded-sm`, and
+/// CommandSeparator's `bg-border`.
 pub fn command_style(t: &Tokens) -> CommandStyle {
     CommandStyle {
         background: t.popover,
@@ -522,6 +529,7 @@ pub fn command_style(t: &Tokens) -> CommandStyle {
         muted: t.muted_foreground,
         highlight: t.accent,
         highlight_foreground: t.accent_foreground,
+        separator: t.border,
         radius: t.radius_md(),
         item_radius: t.radius_sm(),
     }
@@ -938,7 +946,8 @@ mod tests {
     }
 
     /// A command list is the popover pair, muted headings and shortcuts,
-    /// and the accent pair for the highlight.
+    /// the accent pair for the highlight, and separators in the border
+    /// colour, like the line under the filter.
     #[test]
     fn command_colours_come_from_the_tokens() {
         for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
@@ -951,13 +960,15 @@ mod tests {
                     muted: t.muted_foreground,
                     highlight: t.accent,
                     highlight_foreground: t.accent_foreground,
+                    separator: t.border,
                     radius: t.radius_md(),
                     item_radius: t.radius_sm(),
                 }
             );
         }
-        // max-h-[300px] at the 16px root size.
+        // max-h-[300px] at the 16px root size, and h-px.
         assert_eq!(COMMAND_LIST_MAX_HEIGHT, rems(18.75));
+        assert_eq!(COMMAND_SEPARATOR_HEIGHT, px(1.));
     }
 
     /// Every row sits inside its group's `p-1` at the sides; only the
