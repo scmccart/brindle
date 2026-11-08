@@ -28,6 +28,9 @@ actions!(
         // Overlays. `Dismiss` asks the view of the layer with focus to
         // close; it closes only when it agrees (by emitting `DismissEvent`).
         Dismiss,
+        // Focus scopes: Tab and shift-Tab among a view's listed stops.
+        FocusNext,
+        FocusPrev,
     ]
 );
 
@@ -37,10 +40,14 @@ actions!(
 pub fn default_bindings() -> Vec<KeyBinding> {
     let i = Some("TextInput");
     let l = Some("UiLayer");
+    let f = Some("UiFocusScope");
     vec![
         // Escape asks the overlay to close. Bound in the layer around the
         // view, so an inner context that handles escape itself wins.
         KeyBinding::new("escape", Dismiss, l),
+        // Tab cycles through the view's stops and never leaves it.
+        KeyBinding::new("tab", FocusNext, f),
+        KeyBinding::new("shift-tab", FocusPrev, f),
         // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
         // to the palette or dialog around them.
         KeyBinding::new("left", TextInputLeft, i),
@@ -100,7 +107,10 @@ mod tests {
         let layer = in_context(&bindings, "UiLayer");
         assert_eq!(layer.len(), 1);
         assert_eq!(layer[0].1, "brindle_ui::Dismiss");
+        let scope = in_context(&bindings, "UiFocusScope");
+        let scope: Vec<&str> = scope.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(scope, ["brindle_ui::FocusNext", "brindle_ui::FocusPrev"]);
         // Every binding is in one of the crate's contexts.
-        assert_eq!(bindings.len(), text_input.len() + layer.len());
+        assert_eq!(bindings.len(), text_input.len() + layer.len() + scope.len());
     }
 }

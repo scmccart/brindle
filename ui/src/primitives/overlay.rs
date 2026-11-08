@@ -6,7 +6,8 @@
 //! what has focus, pushes a layer, moves focus into the view and subscribes
 //! to its `DismissEvent`; on that event, or [`Overlay::close`], the layer is
 //! popped, the view dropped and focus given back if what had it still
-//! exists.
+//! exists. While open, the view sits in a [`FocusScope`], so Tab cycles
+//! through its stops and never leaves it.
 //!
 //! Escape and outside presses never close the view directly: they dispatch
 //! [`Dismiss`] to it, and the layer answers by emitting `DismissEvent` unless
@@ -21,7 +22,7 @@ use gpui::{
 };
 
 use crate::actions::Dismiss;
-use crate::primitives::focus_scope::FocusStops;
+use crate::primitives::focus_scope::{FocusScope, FocusStops};
 use crate::primitives::layer::{self, LayerId};
 
 /// A modal layer's backdrop: black at 50%, shadcn's `bg-black/50`. It isn't
@@ -158,7 +159,8 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                     window.defer(cx, move |window, cx| target.dispatch_action(&Dismiss, window, cx));
                 }
             })
-            .child(view);
+            // Tab stays inside the view.
+            .child(FocusScope::new(&view).child(view));
         let element = if self.modal {
             let size = window.viewport_size();
             anchored()
