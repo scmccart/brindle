@@ -44,7 +44,7 @@
 
 ## 7. Integration
 
-- [ ] 7.1 Full check: `cargo test --workspace --locked` and `cargo build --release --locked` on Windows and, via the Linux Remote Control session, on Linux with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Verify: all pass, and `scripts/lint-commits` passes for the branch's commits (scope `ui`).
+- [x] 7.1 Full check: `cargo test --workspace --locked` and `cargo build --release --locked` on Windows and, via the Linux Remote Control session, on Linux with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Verify: all pass, and `scripts/lint-commits` passes for the branch's commits (scope `ui`).
 
 ## Workflow follow-up
 
