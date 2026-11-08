@@ -1769,6 +1769,10 @@ impl Workspace {
     /// `None`, puts their configured theme back. tmux isn't told: color
     /// reports are only sent on a real config change.
     pub fn set_theme_preview(&mut self, preview: Option<Theme>, cx: &mut Context<Self>) {
+        match &preview {
+            Some(theme) => Settings::set_ui_theme(theme, cx),
+            None => Settings::apply_ui_theme(cx),
+        }
         self.theme_preview = preview;
         self.apply_tab_themes(cx);
         cx.notify();
