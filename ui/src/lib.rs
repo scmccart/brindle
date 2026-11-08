@@ -7,6 +7,7 @@
 use gpui::App;
 
 pub mod actions;
+pub mod components;
 pub mod filter;
 pub mod icon;
 pub mod primitives;
@@ -15,6 +16,7 @@ pub mod text_input;
 pub mod theme;
 
 pub use actions::*;
+pub use components::*;
 pub use icon::{Icon, IconElement};
 pub use primitives::*;
 pub use style::{ButtonSize, ButtonStyle, ButtonVariant, button_style};

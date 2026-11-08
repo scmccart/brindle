@@ -29,7 +29,7 @@
 
 ## 5. Components
 
-- [ ] 5.1 `Button` (`RenderOnce`): variant, size, `disabled`, `.focus(&handle)`, `on_click` (GPUI keyboard click covers enter/space), ring per 4.6, `Styled` passthrough for layout, optional leading `Icon`. Verify: unit test that a disabled button resolves to no click handler and no tracked focus; gallery check.
+- [x] 5.1 `Button` (`RenderOnce`): variant, size, `disabled`, `.focus(&handle)`, `on_click` (GPUI keyboard click covers enter/space), ring per 4.6, `Styled` passthrough for layout, optional leading `Icon`. Verify: unit test that a disabled button resolves to no click handler and no tracked focus; gallery check.
 - [ ] 5.2 `Input` (`RenderOnce` around `Entity<TextInput>`): input-colour border, ring when its `TextInput` is focused, destructive border when `invalid(true)`, press anywhere focuses the input. Verify: unit test of the border-colour choice (normal/focused/invalid); gallery check.
 - [ ] 5.3 `Checkbox` and `Switch` (`RenderOnce`, controlled): `checked`, `disabled`, `.focus(&handle)`, `on_click(|new: &bool, …|)`, `Icon::Check` for the tick, switch thumb position from state. Verify: unit test that the requested value is `!checked` and that disabled requests nothing; gallery check.
 - [ ] 5.4 `Dialog` chrome (`RenderOnce`): title, description, body, footer, close `X` button, used inside a `ManagedView` opened through a modal `Overlay`; entry animation keyed by open count. Verify: gallery dialog with an input, a select and two buttons; Tab cycles through all of them and wraps; Escape and a backdrop press close it and focus returns to the opening button; a dialog that handles `Dismiss` itself stays open.
