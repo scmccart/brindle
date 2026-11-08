@@ -51,6 +51,17 @@ impl Settings {
         Self { config, config_error, zoom: 0.0, font, ui_font_family }
     }
 
+    /// Makes the config's global theme the active `brindle-ui` token set.
+    pub fn apply_ui_theme(cx: &mut App) {
+        let theme = Self::get(cx).config.theme(None);
+        Self::set_ui_theme(&theme, cx);
+    }
+
+    /// Makes `theme` the active token set (a preview, or the config's theme).
+    pub fn set_ui_theme(theme: &crate::theme::Theme, cx: &mut App) {
+        brindle_ui::UiTheme::set(theme.ui_tokens(), cx);
+    }
+
     pub fn get(cx: &App) -> &Self {
         cx.global::<Self>()
     }
@@ -101,4 +112,60 @@ fn resolve_ui_family(cx: &App) -> String {
         .find(|want| installed.iter().any(|have| have == *want))
         .map(|s| s.to_string())
         .unwrap_or_else(|| ".SystemUIFont".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::builtin_theme;
+    use brindle_ui::ActiveTheme;
+    use std::{sync::mpsc, thread, time::Duration};
+
+    /// Runs `check` inside a headless GPUI app, which needs no display. The
+    /// headless event loop doesn't return on `quit`, so the app lives on its
+    /// own thread, leaked once the verdict is in.
+    fn in_headless_app(check: impl FnOnce(&mut App) + Send + 'static) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            gpui::Application::headless().run(move |cx: &mut App| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(cx)));
+                tx.send(outcome.map_err(|e| {
+                    e.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default()
+                }))
+                .ok();
+            });
+        });
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => panic!("{message}"),
+            Err(_) => panic!("the headless app never ran the check"),
+        }
+    }
+
+    /// A preview re-themes the components, and cancelling it (applying the
+    /// config's theme again) brings back the tokens from before.
+    #[test]
+    fn cancelling_a_preview_restores_the_tokens() {
+        in_headless_app(|cx| {
+            let config = Config::default();
+            let config_theme = config.theme(None);
+            cx.set_global(Settings::new(config, None, cx));
+
+            Settings::apply_ui_theme(cx);
+            let before = *cx.ui_theme();
+            assert_eq!(before, config_theme.ui_tokens());
+
+            let preview = builtin_theme("brindle-light").unwrap();
+            assert_ne!(preview, config_theme);
+            Settings::set_ui_theme(&preview, cx);
+            assert_eq!(*cx.ui_theme(), preview.ui_tokens());
+            assert_ne!(*cx.ui_theme(), before);
+
+            Settings::apply_ui_theme(cx);
+            assert_eq!(*cx.ui_theme(), before);
+        });
+    }
 }

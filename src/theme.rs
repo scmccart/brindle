@@ -50,6 +50,40 @@ impl Color {
         Color { r: lerp(self.r, other.r), g: lerp(self.g, other.g), b: lerp(self.b, other.b) }
     }
 
+    /// WCAG relative luminance (linearised sRGB), for contrast ratios.
+    pub fn relative_luminance(self) -> f32 {
+        let lin = |v: u8| {
+            let c = v as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(self.r) + 0.7152 * lin(self.g) + 0.0722 * lin(self.b)
+    }
+
+    /// WCAG contrast ratio against `other`, in `[1, 21]`.
+    pub fn contrast(self, other: Color) -> f32 {
+        let (a, b) = (self.relative_luminance(), other.relative_luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Black or white, whichever reads better on `self`.
+    pub fn on_color(self) -> Color {
+        let (black, white) = (Color::hex(0x000000), Color::hex(0xffffff));
+        if self.contrast(black) >= self.contrast(white) { black } else { white }
+    }
+
+    /// `self` as text on `bg`: unchanged when it reaches `min` contrast,
+    /// else pushed towards black or white until it does.
+    pub fn legible_on(self, bg: Color, min: f32) -> Color {
+        if self.contrast(bg) >= min {
+            return self;
+        }
+        let target = bg.on_color();
+        (1..=20)
+            .map(|i| self.mix(target, i as f32 / 20.0))
+            .find(|c| c.contrast(bg) >= min)
+            .unwrap_or(target)
+    }
+
     pub fn luminance(self) -> f32 {
         (0.2126 * self.r as f32 + 0.7152 * self.g as f32 + 0.0722 * self.b as f32) / 255.0
     }
@@ -186,6 +220,45 @@ impl Theme {
 
     pub fn hover_background(&self) -> Color {
         self.chrome_background().mix(self.foreground, 0.08)
+    }
+
+    /// The `brindle-ui` token set for this theme: chrome background and
+    /// border, the theme's foreground and accent, and its red as destructive.
+    /// Every text/background pair is kept legible (4.5:1, muted 3:1).
+    pub fn ui_tokens(&self) -> brindle_ui::Tokens {
+        let bg = self.chrome_background();
+        let fg = self.foreground.legible_on(bg, 4.5);
+        let raised = bg.mix(fg, 0.04);
+        let surface = bg.mix(fg, 0.08);
+        let accent = self.accent();
+        let destructive = self.ansi[1];
+        let border = self.chrome_border();
+        let mut tokens = if self.is_dark() {
+            brindle_ui::Tokens::neutral_dark()
+        } else {
+            brindle_ui::Tokens::neutral_light()
+        };
+        tokens.background = bg.hsla();
+        tokens.foreground = fg.hsla();
+        tokens.card = raised.hsla();
+        tokens.card_foreground = fg.hsla();
+        tokens.popover = raised.hsla();
+        tokens.popover_foreground = fg.hsla();
+        tokens.primary = accent.hsla();
+        tokens.primary_foreground = accent.on_color().hsla();
+        tokens.secondary = surface.hsla();
+        tokens.secondary_foreground = fg.legible_on(surface, 4.5).hsla();
+        tokens.muted = surface.hsla();
+        tokens.muted_foreground = self.muted_foreground().legible_on(bg, 3.0).hsla();
+        tokens.accent = bg.mix(fg, 0.12).hsla();
+        tokens.accent_foreground = fg.legible_on(bg.mix(fg, 0.12), 4.5).hsla();
+        tokens.destructive = destructive.hsla();
+        tokens.destructive_foreground = destructive.on_color().hsla();
+        tokens.border = border.hsla();
+        tokens.input = border.hsla();
+        tokens.ring = accent.hsla();
+        tokens.dark = self.is_dark();
+        tokens
     }
 }
 
@@ -335,5 +408,43 @@ mod tests {
         let theme: Theme = toml::from_str("background = \"#000000\"").unwrap();
         assert_eq!(theme.background, Color::hex(0));
         assert_eq!(theme.foreground, builtin_theme("brindle-dark").unwrap().foreground);
+    }
+
+    fn color_of(h: Hsla) -> Color {
+        let c = h.to_rgb();
+        let b = |v: f32| (v * 255.0).round() as u8;
+        Color { r: b(c.r), g: b(c.g), b: b(c.b) }
+    }
+
+    #[test]
+    fn ui_tokens_follow_accent_red_and_darkness() {
+        let theme = builtin_theme("tokyo-night").unwrap();
+        let t = theme.ui_tokens();
+        assert_eq!(color_of(t.primary), theme.accent());
+        assert_eq!(color_of(t.ring), theme.accent());
+        assert_eq!(color_of(t.destructive), theme.ansi[1]);
+        assert_eq!(color_of(t.background), theme.chrome_background());
+        assert!(t.dark);
+        assert!(!builtin_theme("brindle-light").map_or(false, |l| l.ui_tokens().dark));
+    }
+
+    #[test]
+    fn ui_tokens_are_legible_for_every_builtin() {
+        for name in BUILTIN_THEMES {
+            let t = builtin_theme(name).unwrap().ui_tokens();
+            let pairs = [
+                ("foreground", t.foreground, t.background, 4.5),
+                ("muted_foreground", t.muted_foreground, t.background, 3.0),
+                ("primary_foreground", t.primary_foreground, t.primary, 4.5),
+                ("destructive_foreground", t.destructive_foreground, t.destructive, 4.5),
+                ("popover_foreground", t.popover_foreground, t.popover, 4.5),
+                ("secondary_foreground", t.secondary_foreground, t.secondary, 4.5),
+                ("accent_foreground", t.accent_foreground, t.accent, 4.5),
+            ];
+            for (label, fg, bg, min) in pairs {
+                let ratio = color_of(fg).contrast(color_of(bg));
+                assert!(ratio >= min, "{name}: {label} contrast {ratio:.2} < {min}");
+            }
+        }
     }
 }

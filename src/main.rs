@@ -338,6 +338,7 @@ pub(crate) fn reload_config_renaming(cx: &mut App, renames: &[(String, String)])
     let mut settings = Settings::new(config, error, cx);
     settings.zoom = zoom;
     cx.set_global(settings);
+    Settings::apply_ui_theme(cx);
     actions::bind_keys(cx);
     for window in cx.windows() {
         if let Some(window) = window.downcast::<Workspace>() {
@@ -590,6 +591,7 @@ fn main() {
             None => settings.config.default_profile_index(),
         };
         cx.set_global(settings);
+        Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
         actions::bind_keys(cx);
         // RUST_LOG=brindle=debug shows every keystroke and what it ran.
