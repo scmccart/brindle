@@ -23,7 +23,7 @@
 ## Capabilities
 
 ### New Capabilities
-- None expected.
+- `ui-theme-tokens`: component tokens derived from the terminal theme and kept current.
 
 ### Modified Capabilities
 - `configuration` (tentative): only if themes gain optional UI token overrides (see open questions).
