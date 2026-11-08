@@ -680,6 +680,7 @@ dependencies = [
  "base64",
  "brindle-remote-protocol",
  "brindle-term-core",
+ "brindle-ui",
  "dirs 5.0.1",
  "embed-resource",
  "env_logger",
@@ -731,6 +732,13 @@ dependencies = [
  "alacritty_terminal",
  "base64",
  "parking_lot",
+]
+
+[[package]]
+name = "brindle-ui"
+version = "0.3.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]

@@ -1,0 +1,10 @@
+[package]
+name = "brindle-ui"
+version = "0.3.0"
+edition = "2024"
+description = "Brindle's shared UI components on GPUI, modelled on shadcn/ui: tokens, overlay primitives, components and the text input"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+gpui = "0.2.2"

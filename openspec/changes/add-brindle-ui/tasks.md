@@ -2,7 +2,7 @@
 
 ## 1. Crate scaffold
 
-- [ ] 1.1 Create `ui/` (`brindle-ui`, lib `brindle_ui`, version equal to the other workspace crates, dependency `gpui = "0.2.2"` only, MIT OR Apache-2.0) with an empty `lib.rs`. Add it to workspace `members` and `default-members` and to `brindle`'s dependencies. Verify: `cargo build --locked` fails only because of the new path entry; then `cargo build` and the `git diff Cargo.lock` show only `brindle-ui` added (no third-party crate added or bumped).
+- [x] 1.1 Create `ui/` (`brindle-ui`, lib `brindle_ui`, version equal to the other workspace crates, dependency `gpui = "0.2.2"` only, MIT OR Apache-2.0) with an empty `lib.rs`. Add it to workspace `members` and `default-members` and to `brindle`'s dependencies. Verify: `cargo build --locked` fails only because of the new path entry; then `cargo build` and the `git diff Cargo.lock` show only `brindle-ui` added (no third-party crate added or bumped).
 - [ ] 1.2 Update CLAUDE.md: "four workspace crates" becomes five (the CI `test` job description) and "bumps all four crates" becomes five (the `release.yml` paragraph), and the Architecture section gains a `brindle-ui` entry stating the boundary (depends on gpui only; tokens, primitives, components, `TextInput`). Verify: CI's version check command from `.github/workflows/ci.yml` (`cargo metadata --no-deps … | jq`) prints one version for all five crates, and `release-please-config.json`'s `rust` release type picks up the new member the way it does `term-core` (no per-crate entry exists for the others, so none is added).
 
 ## 2. Move TextInput and the filter
