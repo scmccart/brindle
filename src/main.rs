@@ -20,7 +20,6 @@ mod settings_dialog;
 mod terminal;
 mod terminal_element;
 mod terminal_view;
-mod text_input;
 mod theme;
 mod tmux;
 mod tmux_view;

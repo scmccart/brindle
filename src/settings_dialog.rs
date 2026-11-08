@@ -21,7 +21,7 @@ use crate::actions::{
     SettingsNew, SettingsNextField, SettingsPrevField, SettingsUp,
 };
 use crate::config_edit;
-use crate::text_input::{TextInput, TextInputEvent};
+use brindle_ui::{TextInput, TextInputEvent};
 use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 mod profiles;

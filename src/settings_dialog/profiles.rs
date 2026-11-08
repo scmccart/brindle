@@ -862,7 +862,7 @@ use crate::actions::{
     SettingsChoiceNext, SettingsChoicePrev, SettingsDuplicate, SettingsMoveDown, SettingsMoveUp, SettingsSectionNext,
     SettingsSectionPrev, SettingsToggle,
 };
-use crate::text_input::{TextInput, TextInputEvent};
+use brindle_ui::{TextInput, TextInputEvent};
 
 /// The fields shown as a choice or checkbox rather than text.
 const CHOICE_FIELDS: [Field; 5] = [Field::Theme, Field::Tmux, Field::Default, Field::Remote, Field::Engine];

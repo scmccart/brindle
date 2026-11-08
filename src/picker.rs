@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use crate::actions::{PickerCancel, PickerConfirm, PickerDown, PickerKill, PickerUp};
-use crate::text_input::{TextInput, TextInputEvent};
+use brindle_ui::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 pub enum PaletteEvent {

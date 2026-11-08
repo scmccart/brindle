@@ -21,7 +21,7 @@ use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
-use crate::text_input::TextInput;
+use brindle_ui::TextInput;
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
