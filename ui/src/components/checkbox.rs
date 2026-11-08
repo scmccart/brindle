@@ -50,6 +50,12 @@ impl Checkbox {
         }
     }
 
+    /// The state the owner holds, when it isn't given to [`Checkbox::new`].
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
     /// A disabled checkbox is drawn muted, asks nothing and takes no focus.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;

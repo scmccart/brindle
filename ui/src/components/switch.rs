@@ -49,6 +49,12 @@ impl Switch {
         }
     }
 
+    /// The state the owner holds, when it isn't given to [`Switch::new`].
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
     /// A disabled switch is drawn muted, asks nothing and takes no focus.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
