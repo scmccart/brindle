@@ -30,14 +30,16 @@
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
-    IntoElement, ListAlignment, ListSizingBehavior, ListState, MouseMoveEvent, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, list, prelude::FluentBuilder, px, rems,
+    IntoElement, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseMoveEvent, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, list, prelude::FluentBuilder,
+    px, rems,
 };
 
 use crate::actions::{Dismiss, ListConfirm, ListDown, ListFirst, ListLast, ListUp};
 use crate::components::DISABLED_OPACITY;
 use crate::filter::filter;
 use crate::icon::Icon;
+use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::nav::ListNav;
 use crate::style::{COMMAND_LIST_MAX_HEIGHT, MUTED_ICON_OPACITY, command_style};
 use crate::text_input::{TextInput, TextInputEvent};
@@ -454,6 +456,12 @@ impl Command {
                     .when(disabled, |d| d.opacity(DISABLED_OPACITY))
                     .when(!disabled, |d| {
                         d.on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.hover(rank, cx)))
+                            // A press is pointer input, so whatever a host
+                            // gives focus back to after the confirmation
+                            // shows no ring.
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                set_modality(window, Modality::Pointer, cx)
+                            })
                             .on_click(cx.listener(move |_, _, _, cx| cx.emit(CommandEvent::Confirmed(item_ix))))
                     })
                     .child(

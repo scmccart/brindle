@@ -6,10 +6,10 @@
 //! The trigger shows the selected option's label, or the placeholder, and
 //! a chevron; it fills its parent's width. Activating it (a click, enter or
 //! space), or pressing up or down (also ctrl-p/ctrl-n) while it has focus,
-//! opens the menu below it with the selection highlighted; home and end
-//! select the first and last enabled option without opening it, as a native
-//! select does. Typing while the menu is closed moves the selection by
-//! typeahead ([`Selection::type_char`]); while it is open, the highlight.
+//! opens the menu below it with the selection highlighted; home and end do
+//! nothing while it is closed. Typing while the menu is closed moves the
+//! selection by typeahead ([`Selection::type_char`]); while it is open, the
+//! highlight.
 //!
 //! The menu is a non-modal [`Overlay`] placed with [`Anchored`]: below the
 //! trigger, start-aligned, at least as wide as it, flipping above when it
@@ -46,7 +46,7 @@ use crate::components::popover::{TriggerAction, follows_trigger, trigger_action}
 use crate::components::{DISABLED_OPACITY, ring_shadow};
 use crate::icon::Icon;
 use crate::primitives::focus_scope::FocusStops;
-use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
+use crate::primitives::focus_visible::{Modality, focus_from_pointer, modality, set_modality, shows_ring};
 use crate::primitives::nav::{ListNav, Typeahead};
 use crate::primitives::overlay::Overlay;
 use crate::primitives::placement::{Align, Anchored, Side, anchor_trigger};
@@ -420,24 +420,11 @@ impl Select {
         self.activate(Activation::Key, window, cx);
     }
 
-    /// Home and end select the first and last enabled option.
-    fn choose_end(&mut self, first: bool, cx: &mut Context<Self>) {
-        let options = &self.options;
-        let enabled = |ix: usize| !options[ix].disabled;
-        let mut nav = ListNav::new(options.len(), false);
-        let target = if first { nav.first(enabled) } else { nav.last(enabled) };
-        if let Some(ix) = target {
-            self.choose(ix, cx);
-        }
-    }
+    /// Home and end do nothing on the closed trigger, as in Radix. They are
+    /// taken so that a list around the select doesn't move instead.
+    fn first(&mut self, _: &ListFirst, _: &mut Window, _: &mut Context<Self>) {}
 
-    fn first(&mut self, _: &ListFirst, _: &mut Window, cx: &mut Context<Self>) {
-        self.choose_end(true, cx);
-    }
-
-    fn last(&mut self, _: &ListLast, _: &mut Window, cx: &mut Context<Self>) {
-        self.choose_end(false, cx);
-    }
+    fn last(&mut self, _: &ListLast, _: &mut Window, _: &mut Context<Self>) {}
 
     /// Typeahead while the menu is closed, and space to open it.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -699,6 +686,11 @@ impl Render for SelectMenu {
                     .when(option.disabled, |d| d.opacity(DISABLED_OPACITY))
                     .when(!option.disabled, |d| {
                         d.on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.hover(ix, cx)))
+                            // A press is pointer input, so the trigger the
+                            // pick gives focus back to shows no ring.
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                set_modality(window, Modality::Pointer, cx)
+                            })
                             .on_click(cx.listener(move |_, _, _, cx| cx.emit(MenuEvent::Picked(ix))))
                     })
                     .child(div().flex_1().min_w_0().truncate().child(option.label.clone()))
