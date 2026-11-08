@@ -16,10 +16,10 @@ use gpui::{
     prelude::FluentBuilder,
 };
 
-use crate::components::{DISABLED_OPACITY, RING_OPACITY, interaction, ring_shadow};
+use crate::components::{DISABLED_OPACITY, interaction, ring_shadow};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
-use crate::style::{ButtonSize, ButtonVariant, button_style};
+use crate::style::{ButtonSize, ButtonVariant, button_style, focus_ring};
 use crate::theme::ActiveTheme;
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -107,7 +107,7 @@ impl Styled for Button {
 impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = cx.ui_theme();
-        let ring = t.ring;
+        let (ring, ring_color) = (t.ring, focus_ring(t));
         let style = button_style(self.variant, self.size, t);
         let (focus, on_click) = interaction(self.disabled, self.focus, self.on_click);
         let focused = focus.as_ref().is_some_and(|handle| handle.is_focused(window));
@@ -133,7 +133,7 @@ impl RenderOnce for Button {
             .when_some(style.border, |d, border| d.border_1().border_color(border))
             // `focus-visible:border-ring` recolours the border a variant
             // has; the shadow is the ring itself.
-            .when(ring_shown, |d| d.border_color(ring).shadow(vec![ring_shadow(ring, RING_OPACITY)]))
+            .when(ring_shown, |d| d.border_color(ring).shadow(vec![ring_shadow(ring_color)]))
             .when(self.disabled, |d| d.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |d| {
                 d.cursor_pointer().hover(move |mut s| {

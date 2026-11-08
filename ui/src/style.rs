@@ -9,6 +9,17 @@ use gpui::{Hsla, Rems, rems};
 
 use crate::theme::Tokens;
 
+/// The focus ring's opacity, shadcn's `ring-ring/50`.
+pub const RING_OPACITY: f32 = 0.5;
+
+/// The ring's opacity on an invalid input, shadcn's `ring-destructive/20`.
+pub const INVALID_RING_OPACITY: f32 = 0.2;
+
+/// The focus ring's colour: the ring token at [`RING_OPACITY`].
+pub fn focus_ring(t: &Tokens) -> Hsla {
+    t.ring.opacity(RING_OPACITY)
+}
+
 /// shadcn's button variants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ButtonVariant {
@@ -156,6 +167,33 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
     }
 }
 
+/// An input frame's resolved colours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputStyle {
+    /// The frame's border: the input colour, the ring colour while the ring
+    /// shows, and the destructive colour when invalid, which wins.
+    pub border: Hsla,
+    /// The ring while it shows: the ring colour at half opacity, or the
+    /// destructive colour at a fifth when invalid.
+    pub ring: Option<Hsla>,
+}
+
+/// shadcn's Input frame: `border-input`, `focus-visible:border-ring
+/// focus-visible:ring-ring/50`, and `aria-invalid:border-destructive
+/// aria-invalid:ring-destructive/20`. `ring` is whether the ring shows,
+/// which for a text input is whenever it is focused.
+pub fn input_style(ring: bool, invalid: bool, t: &Tokens) -> InputStyle {
+    let border = if invalid {
+        t.destructive
+    } else if ring {
+        t.ring
+    } else {
+        t.input
+    };
+    let ring = ring.then(|| if invalid { t.destructive.opacity(INVALID_RING_OPACITY) } else { focus_ring(t) });
+    InputStyle { border, ring }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +331,26 @@ mod tests {
             assert!((hover(ButtonVariant::Secondary).a - 0.8).abs() < 1e-6);
             // hover:bg-accent, opaque
             assert_eq!(hover(ButtonVariant::Ghost), t.accent);
+        }
+    }
+
+    /// The input's border: the input colour, the ring colour while the ring
+    /// shows, and the destructive colour when invalid, ring or not.
+    #[test]
+    fn input_border_is_input_ring_or_destructive() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            // (ring shown, invalid, expected border, expected ring)
+            let cases: [(bool, bool, Hsla, Option<Hsla>); 4] = [
+                (false, false, t.input, None),
+                (true, false, t.ring, Some(t.ring.opacity(0.5))),
+                (false, true, t.destructive, None),
+                (true, true, t.destructive, Some(t.destructive.opacity(0.2))),
+            ];
+            for (ring, invalid, border, ring_color) in cases {
+                let style = input_style(ring, invalid, &t);
+                assert_eq!(style, InputStyle { border, ring: ring_color }, "ring={ring} invalid={invalid}");
+            }
+            assert_eq!(focus_ring(&t), t.ring.opacity(RING_OPACITY));
         }
     }
 

@@ -16,19 +16,18 @@
 //! focusing moves no layout.
 
 pub mod button;
+pub mod input;
 
 use gpui::{BoxShadow, Hsla, Pixels, point, px};
 
 pub use button::Button;
+pub use input::Input;
 
 /// shadcn's `disabled:opacity-50`.
 pub const DISABLED_OPACITY: f32 = 0.5;
 
 /// The ring's width, shadcn's `ring-[3px]`. In pixels, as shadcn's is.
 pub const RING_WIDTH: Pixels = px(3.);
-
-/// The ring's opacity, shadcn's `ring-ring/50`.
-pub const RING_OPACITY: f32 = 0.5;
 
 /// A disabled control takes no part: it tracks no focus, so neither a press
 /// nor Tab can focus it, and it gets no click handler, so nothing runs.
@@ -37,9 +36,9 @@ pub fn interaction<F, C>(disabled: bool, focus: Option<F>, on_click: Option<C>) 
     if disabled { (None, None) } else { (focus, on_click) }
 }
 
-/// The focus ring as a box shadow: `color` (the ring token, or the
-/// destructive colour on an invalid input) at `opacity`, [`RING_WIDTH`]
-/// around the control, with no blur or offset.
-pub(crate) fn ring_shadow(color: Hsla, opacity: f32) -> BoxShadow {
-    BoxShadow { color: color.opacity(opacity), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: RING_WIDTH }
+/// The focus ring as a box shadow in `color` (`style::focus_ring`, or an
+/// invalid input's destructive ring), [`RING_WIDTH`] around the control,
+/// with no blur or offset.
+pub(crate) fn ring_shadow(color: Hsla) -> BoxShadow {
+    BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: RING_WIDTH }
 }

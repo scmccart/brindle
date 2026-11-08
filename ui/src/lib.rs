@@ -19,7 +19,7 @@ pub use actions::*;
 pub use components::*;
 pub use icon::{Icon, IconElement};
 pub use primitives::*;
-pub use style::{ButtonSize, ButtonStyle, ButtonVariant, button_style};
+pub use style::{ButtonSize, ButtonStyle, ButtonVariant, InputStyle, button_style, focus_ring, input_style};
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Tokens, UiTheme};
 
