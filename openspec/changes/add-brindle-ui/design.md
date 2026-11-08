@@ -99,7 +99,11 @@ ui/                         package brindle-ui, lib brindle_ui
 - **`chart-*` and `sidebar-*` are left out** until something needs them.
 - **Neutral light and dark sets.** `Tokens::neutral_light()` / `neutral_dark()` hold shadcn's neutral oklch values, converted to sRGB once when writing them and stored as hex constants. A unit test pins a few against shadcn's published values.
 - **Light and dark are separate sets.** `UiTheme` holds one token set, and the app chooses which.
-- **A `dark: bool` hint.** `Tokens::dark` is false in `neutral_light()` and true in `neutral_dark()`. It is set by the token source, from the background's luminance for derived sets (`ui-tokens-from-theme`). It isn't a colour: only the switch reads it, for shadcn's dark thumb colours (`dark:data-[state=unchecked]:bg-foreground`, `dark:data-[state=checked]:bg-primary-foreground`). Without them an unchecked thumb in `background` is near black on the dark set's white-at-15% track and all but vanishes. shadcn's other `dark:` refinements (the outline button's input fill, the dimmed destructive, the switch track's `bg-input/80`) are left out.
+- **A `dark: bool` hint.** `Tokens::dark` is false in `neutral_light()` and true in `neutral_dark()`. It is set by the token source, from the background's luminance for derived sets (`ui-tokens-from-theme`). It isn't a colour. Two style functions read it:
+  - the switch, for shadcn's dark thumb colours (`dark:data-[state=unchecked]:bg-foreground`, `dark:data-[state=checked]:bg-primary-foreground`). Without them an unchecked thumb in `background` is near black on the dark set's white-at-15% track and all but vanishes;
+  - `button_style`, for the `dark:` classes in new-york-v4's `buttonVariants` (see "Variants as enums").
+
+  shadcn's other components' `dark:` refinements (the switch track's `bg-input/80`, the input's and checkbox's `bg-input/30`, the invalid ring's `/40`) are left out.
 - **Hover and active states use opacity, as shadcn does** (`bg-primary/90` → `primary.opacity(0.9)`), not extra tokens.
 - **Radius steps** are derived as in shadcn: sm = radius − 4px, md = radius − 2px, lg = radius, xl = radius + 4px.
 - **Access.** `UiTheme` is a GPUI `Global` read through an `ActiveTheme` trait (`cx.ui_theme()`). Replacing the global and notifying the window redraws everything (spec: "Components draw from the active tokens").
@@ -114,7 +118,13 @@ ui/                         package brindle-ui, lib brindle_ui
 ### Variants as enums
 
 - `ButtonVariant { Default, Destructive, Outline, Secondary, Ghost, Link }` and `ButtonSize { Default, Sm, Lg, Icon }`.
-- A pure `button_style(variant, size, &Tokens) -> ButtonStyle` (background, foreground, border, hover background, height, padding, text size) plays the role of shadcn's `cva` table.
+- A pure `button_style(variant, size, &Tokens) -> ButtonStyle` (background, foreground, border, hover background, focus ring and focused border, height, padding, text size) plays the role of shadcn's `cva` table.
+- **Dark refinements.** In a dark set (`Tokens::dark`) it applies the `dark:` classes of new-york-v4's `buttonVariants` (`ui.shadcn.com/r/styles/new-york-v4/button.json`):
+  - destructive: `dark:bg-destructive/60` and `dark:focus-visible:ring-destructive/40`. Its ring is `focus-visible:ring-destructive/20` in a light set, since tailwind-merge drops the base's `ring-ring/50` for it;
+  - outline: `dark:border-input dark:bg-input/30 dark:hover:bg-input/50`;
+  - ghost: `dark:hover:bg-accent/50`.
+- Where a `dark:` class and a `hover:` or `focus-visible:` class set the same property, the result is what Tailwind v4's compiled CSS gives: the selectors have the same specificity and `dark:` (`&:is(.dark *)`) comes later, so it wins. A dark destructive button therefore keeps its 60% fill on hover, and a focused dark outline button keeps its input border under the ring.
+- The base's `dark:aria-invalid:ring-destructive/40` is left out: buttons have no invalid state.
 - Tests cover every combination, so a token typo shows up as a failing test, not a wrong pixel.
 
 ### Layer stack
