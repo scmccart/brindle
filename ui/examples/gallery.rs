@@ -15,7 +15,9 @@
 //! gpui), so on Windows they are posted as `WM_KEYUP` and mouse messages to
 //! the gallery's own window, at the bounds the components painted: messages
 //! to one window, not input to the desktop (the rule Brindle's e2e probes
-//! follow). Elsewhere those checks are skipped. It prints one `ok NAME`,
+//! follow). Where a check is about what is drawn (the focus ring), the
+//! gallery renders its own window with `PrintWindow`, also on Windows only.
+//! Elsewhere those checks are skipped. It prints one `ok NAME`,
 //! `FAIL NAME: why` or `SKIP NAME: why` line per check and exits non-zero
 //! when any check failed or the app panicked.
 
@@ -25,7 +27,7 @@ use std::rc::Rc;
 
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem, Dialog,
-    Dismiss, FocusStops, Icon, Input, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Switch,
+    Dismiss, FocusScope, FocusStops, Icon, Input, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Switch,
     TextInput, Tokens, UiTheme,
 };
 use gpui::{
@@ -137,7 +139,10 @@ fn label(text: impl Into<SharedString>, cx: &App) -> Div {
 // ---- the gallery ---------------------------------------------------------------
 
 /// The window's root view: every component, and the slots of its overlays.
+/// Its root is a focus scope over every enabled control ([`FocusStops`]),
+/// so Tab and shift-Tab move through them as on a web page.
 pub struct Gallery {
+    focus: FocusHandle,
     dark: bool,
     handles: HashMap<String, FocusHandle>,
     clicks: Counts,
@@ -194,6 +199,10 @@ impl Gallery {
         let off = cx.new(|cx| Select::new(["unavailable"], Some(0), cx));
         off.update(cx, |select, cx| select.set_disabled(true, window, cx));
         let command = cx.new(|cx| Command::new(command_groups(), cx));
+        // Focus starts on the gallery itself, inside its focus scope, so the
+        // first Tab reaches the first control.
+        let focus = cx.focus_handle();
+        window.focus(&focus);
         let subscriptions = vec![
             cx.subscribe(&shell, |this, _, event: &SelectEvent, cx| {
                 let SelectEvent::Changed(ix) = *event;
@@ -213,6 +222,7 @@ impl Gallery {
             }),
         ];
         Self {
+            focus,
             dark: false,
             handles,
             clicks: Counts::default(),
@@ -296,11 +306,13 @@ impl Gallery {
             .justify_between()
             .child(div().text_size(px(20.)).font_weight(gpui::FontWeight::SEMIBOLD).child("brindle-ui gallery"))
             .child(
-                div().flex().items_center().gap_2().child(label("Dark", cx)).child(
+                div().flex().items_center().gap_2().child(label("Dark", cx)).child(recorded(
                     Switch::new("theme", self.dark)
                         .focus(&self.handle("theme"))
                         .on_click(cx.listener(|this, dark: &bool, _, cx| this.set_dark(*dark, cx))),
-                ),
+                    "theme",
+                    &self.records,
+                )),
             )
     }
 
@@ -333,11 +345,13 @@ impl Gallery {
                     .flex_wrap()
                     .items_center()
                     .gap_3()
-                    .child(
+                    .child(recorded(
                         Button::new("open-dialog", "Open dialog")
                             .focus(&self.handle("open-dialog"))
                             .on_click(cx.listener(|this, _, window, cx| this.open_dialog(false, window, cx))),
-                    )
+                        "open-dialog",
+                        &self.records,
+                    ))
                     .child(
                         Button::new("open-stubborn", "Open stubborn dialog")
                             .variant(ButtonVariant::Secondary)
@@ -469,14 +483,16 @@ impl Gallery {
                     .items_center()
                     .gap_4()
                     .child(label("Checkbox", cx))
-                    .child(
+                    .child(recorded(
                         Checkbox::new("checkbox", self.checked)
                             .focus(&self.handle("checkbox"))
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.checked = *checked;
                                 cx.notify();
                             })),
-                    )
+                        "checkbox",
+                        &self.records,
+                    ))
                     .child(recorded(
                         Checkbox::new("checkbox-off", true)
                             .disabled(true)
@@ -563,6 +579,32 @@ impl Gallery {
     }
 }
 
+impl Focusable for Gallery {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl FocusStops for Gallery {
+    /// The enabled controls, top to bottom and left to right, then the
+    /// corner popovers' triggers.
+    fn stops(&self, cx: &App) -> Vec<FocusHandle> {
+        let named = |names: &[&str]| names.iter().map(|name| self.handle(name)).collect::<Vec<_>>();
+        let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-command-dialog", "command-popover", "behind"]);
+        stops.push(self.shell.focus_handle(cx));
+        stops.push(self.editor.focus_handle(cx));
+        stops.push(self.command.focus_handle(cx));
+        for variant in ButtonVariant::ALL {
+            stops.extend(ButtonSize::ALL.iter().map(|size| self.handle(&Self::button_name(variant, *size))));
+        }
+        stops.extend(named(&["icon-label"]));
+        stops.push(self.name.focus_handle(cx));
+        stops.push(self.email.focus_handle(cx));
+        stops.extend(named(&["checkbox", "switch", "corner-0", "corner-1", "corner-2", "corner-3"]));
+        stops
+    }
+}
+
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.ui_theme();
@@ -584,18 +626,24 @@ impl Render for Gallery {
             .child(self.inputs_section(cx))
             .child(self.toggles_section(cx))
             .child(self.status(cx));
-        div()
-            .relative()
-            .size_full()
-            .bg(t.background)
-            .text_color(t.foreground)
-            .text_size(px(14.))
-            .child(content)
-            .children(self.corner_triggers())
-            // Modal layers render last in the root: tree order is their
-            // z-order, and nothing lifts them.
-            .children(self.dialog.render(window, cx))
-            .children(self.command_dialog.render(window, cx))
+        // The scope's Tab binding is reached only from focus inside it, so
+        // the gallery's own handle, focused at start and by the checks'
+        // reset, sits inside, as a page's body does.
+        FocusScope::new(&cx.entity()).size_full().child(
+            div()
+                .track_focus(&self.focus)
+                .relative()
+                .size_full()
+                .bg(t.background)
+                .text_color(t.foreground)
+                .text_size(px(14.))
+                .child(content)
+                .children(self.corner_triggers())
+                // Modal layers render last in the root: tree order is their
+                // z-order, and nothing lifts them.
+                .children(self.dialog.render(window, cx))
+                .children(self.command_dialog.render(window, cx)),
+        )
     }
 }
 
@@ -916,6 +964,116 @@ mod check {
             unsafe { PostMessageW(hwnd, msg, wparam, lparam) != 0 }
         }
 
+        /// What the window shows, as `PrintWindow` renders it: its client
+        /// area in physical pixels, BGRA, top row first.
+        pub struct Capture {
+            pub width: usize,
+            pub height: usize,
+            bgra: Vec<u8>,
+        }
+
+        impl Capture {
+            /// The colour at `(x, y)`, as RGB.
+            pub fn rgb(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+                if x >= self.width || y >= self.height {
+                    return None;
+                }
+                let at = (y * self.width + x) * 4;
+                Some([self.bgra[at + 2], self.bgra[at + 1], self.bgra[at]])
+            }
+        }
+
+        #[repr(C)]
+        struct Rect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+
+        /// A `BITMAPINFO` for 32-bit pixels, with room for the colour masks
+        /// `GetDIBits` may write after the header.
+        #[repr(C)]
+        struct BitmapInfo {
+            size: u32,
+            width: i32,
+            height: i32,
+            planes: u16,
+            bit_count: u16,
+            compression: u32,
+            size_image: u32,
+            x_pels_per_meter: i32,
+            y_pels_per_meter: i32,
+            clr_used: u32,
+            clr_important: u32,
+            colors: [u32; 3],
+        }
+
+        /// `PW_CLIENTONLY | PW_RENDERFULLCONTENT`: the client area, with
+        /// what DirectComposition shows (gpui's swap chain) included.
+        const PRINT_FLAGS: u32 = 0x1 | 0x2;
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+            fn GetDC(hwnd: isize) -> isize;
+            fn ReleaseDC(hwnd: isize, dc: isize) -> i32;
+            fn PrintWindow(hwnd: isize, dc: isize, flags: u32) -> i32;
+        }
+
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn CreateCompatibleDC(dc: isize) -> isize;
+            fn CreateCompatibleBitmap(dc: isize, width: i32, height: i32) -> isize;
+            fn SelectObject(dc: isize, object: isize) -> isize;
+            fn GetDIBits(dc: isize, bitmap: isize, start: u32, lines: u32, bits: *mut u8, info: *mut BitmapInfo, usage: u32) -> i32;
+            fn DeleteObject(object: isize) -> i32;
+            fn DeleteDC(dc: isize) -> i32;
+        }
+
+        /// Renders the window `hwnd` into memory: the gallery reading its
+        /// own pixels. Call it off the window's thread, which must keep
+        /// handling messages meanwhile.
+        pub fn capture(hwnd: isize) -> Option<Capture> {
+            let mut rect = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+            if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+                return None;
+            }
+            let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            unsafe {
+                let screen = GetDC(0);
+                let dc = CreateCompatibleDC(screen);
+                let bitmap = CreateCompatibleBitmap(screen, width, height);
+                let previous = SelectObject(dc, bitmap);
+                let printed = PrintWindow(hwnd, dc, PRINT_FLAGS) != 0;
+                SelectObject(dc, previous);
+                let mut info = BitmapInfo {
+                    size: 40,
+                    width,
+                    // Negative: top row first.
+                    height: -height,
+                    planes: 1,
+                    bit_count: 32,
+                    compression: 0,
+                    size_image: 0,
+                    x_pels_per_meter: 0,
+                    y_pels_per_meter: 0,
+                    clr_used: 0,
+                    clr_important: 0,
+                    colors: [0; 3],
+                };
+                let mut bgra = vec![0u8; width as usize * height as usize * 4];
+                let lines = GetDIBits(dc, bitmap, 0, height as u32, bgra.as_mut_ptr(), &mut info, 0);
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                ReleaseDC(0, screen);
+                (printed && lines == height).then_some(Capture { width: width as usize, height: height as usize, bgra })
+            }
+        }
+
         /// The virtual-key code of a key the checks release.
         pub fn virtual_key(key: &str) -> Option<usize> {
             Some(match key {
@@ -931,6 +1089,10 @@ mod check {
     /// Why the pointer checks can't run on this platform.
     #[cfg(not(windows))]
     const NO_MESSAGES: &str = "needs a real pointer: the gallery posts presses as window messages on Windows only";
+
+    /// Why a check of what the window shows can't run on this platform.
+    #[cfg(not(windows))]
+    const NO_PIXELS: &str = "reads the window's pixels, which the gallery does on Windows only";
 
     /// Why a check about a key's release can't run on this platform.
     const NO_KEY_UP: &str = "needs a real key release: the gallery posts those as window messages on Windows only";
@@ -1169,6 +1331,32 @@ mod check {
             Ok(bounds)
         }
 
+        /// The colour the window shows at `at`, once the next frame is
+        /// drawn: the gallery renders its own window with `PrintWindow`, off
+        /// the main thread, which keeps handling messages meanwhile.
+        #[cfg(windows)]
+        async fn pixel(&mut self, at: Point<Pixels>) -> Result<[u8; 3], Failure> {
+            if self.hwnd == 0 {
+                return Err(Failure::Skip("the gallery window wasn't found by its title".to_string()));
+            }
+            self.tick().await;
+            let hwnd = self.hwnd;
+            let capture = self
+                .cx
+                .background_executor()
+                .spawn(async move { win::capture(hwnd) })
+                .await
+                .ok_or_else(|| Failure::Skip("PrintWindow couldn't render the window".to_string()))?;
+            let x = (f32::from(at.x) * self.scale).floor() as usize;
+            let y = (f32::from(at.y) * self.scale).floor() as usize;
+            capture.rgb(x, y).ok_or_else(|| Failure::Fail(format!("{at:?} is outside the window")))
+        }
+
+        #[cfg(not(windows))]
+        async fn pixel(&mut self, _at: Point<Pixels>) -> Result<[u8; 3], Failure> {
+            Err(Failure::Skip(NO_PIXELS.to_string()))
+        }
+
         fn viewport(&mut self) -> Result<gpui::Size<Pixels>, Failure> {
             self.with(|_, window, _| window.viewport_size())
         }
@@ -1207,7 +1395,8 @@ mod check {
             Err(Failure::Skip(format!("the pointer found no menu row for option {target}")))
         }
 
-        /// Closes whatever a check left open and clears focus.
+        /// Closes whatever a check left open and puts focus back on the
+        /// gallery itself, on no control.
         async fn reset(&mut self) -> Result<(), Failure> {
             for _ in 0..4 {
                 if self.layers()? == 0 {
@@ -1218,7 +1407,8 @@ mod check {
             self.with(|gallery, window, cx| {
                 gallery.close_all(window, cx);
                 gallery.scroll.set_offset(point(px(0.), px(0.)));
-                window.blur();
+                // Back to the gallery itself, as a page's body.
+                window.focus(&gallery.focus);
                 window.refresh();
             })?;
             self.tick().await;
@@ -1285,6 +1475,10 @@ mod check {
         c.run_check("button-disabled-runs-nothing-keeps-focus", check).await;
         let check = focus_visible(&mut c).await;
         c.run_check("focus-visible-pointer-then-keyboard", check).await;
+        let check = tab_moves_focus(&mut c).await;
+        c.run_check("tab-moves-focus-through-the-gallery-and-wraps", check).await;
+        let check = ring_paints(&mut c).await;
+        c.run_check("focus-ring-paints-outside-each-tabbed-control", check).await;
         let check = input_frame_press(&mut c).await;
         c.run_check("input-press-in-frame-focuses-text-input", check).await;
         let check = checkbox_space(&mut c).await;
@@ -1462,6 +1656,86 @@ mod check {
         ensure!(c.modality()? == Modality::Pointer, "a press didn't set the pointer modality");
         c.key("tab").await?;
         ensure!(c.modality()? == Modality::Keyboard, "a key didn't set the keyboard modality");
+        // Tab moved on, to the control after the pressed button.
+        let shell = c.with(|gallery, _, cx| gallery.shell.focus_handle(cx))?;
+        ensure!(c.focused(&shell)?, "Tab after pressing a button didn't move focus to the next control");
+        Ok(())
+    }
+
+    /// Tab from nothing focused reaches the first control and goes on;
+    /// shift-Tab goes back and wraps from the first to the last. Without a
+    /// focus scope over the gallery Tab moved nothing, so no control could
+    /// show a ring for it.
+    async fn tab_moves_focus(c: &mut Checker) -> Check {
+        c.key("tab").await?;
+        ensure!(c.focused_name("theme")?, "Tab with no control focused didn't focus the first control (the Dark switch)");
+        c.key("tab").await?;
+        ensure!(c.focused_name("open-dialog")?, "a second Tab didn't reach the Open dialog button");
+        ensure!(c.modality()? == Modality::Keyboard, "tabbing didn't leave the keyboard modality (no ring would show)");
+        c.key("shift-tab").await?;
+        ensure!(c.focused_name("theme")?, "shift-Tab didn't go back to the Dark switch");
+        c.key("shift-tab").await?;
+        ensure!(c.focused_name("corner-3")?, "shift-Tab from the first control didn't wrap to the last");
+        Ok(())
+    }
+
+    /// The controls whose ring [`ring_paints`] reads, by recorded name, in
+    /// Tab order.
+    const RING_CONTROLS: [(&str, &str); 6] = [
+        ("theme", "a switch"),
+        ("open-dialog", "a button"),
+        ("command-popover", "a popover trigger"),
+        ("shell", "a select trigger"),
+        ("name-input", "an input"),
+        ("checkbox", "a checkbox"),
+    ];
+
+    /// `fg` drawn over `bg`, as 8-bit RGB.
+    fn over(fg: gpui::Hsla, bg: gpui::Hsla) -> [u8; 3] {
+        let (fg, bg): (gpui::Rgba, gpui::Rgba) = (fg.into(), bg.into());
+        let mix = |f: f32, b: f32| ((f * fg.a + b * (1. - fg.a)) * 255.).round() as u8;
+        [mix(fg.r, bg.r), mix(fg.g, bg.g), mix(fg.b, bg.b)]
+    }
+
+    fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+        a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 12)
+    }
+
+    /// Tab to each kind of control and read the window just outside its top
+    /// edge: the ring's colour while it has focus, the background once Tab
+    /// moves on. A ring the platform's renderer doesn't draw (as a box
+    /// shadow with no blur wasn't, on Windows) fails here, where reading
+    /// the modality alone passed.
+    async fn ring_paints(c: &mut Checker) -> Check {
+        let (background, ring) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (t.background, brindle_ui::focus_ring(t))
+        })?;
+        let (background, ring) = (over(background, background), over(ring, background));
+        for (name, what) in RING_CONTROLS {
+            let handle = c.with(move |gallery, _, cx| match name {
+                "shell" => gallery.shell.focus_handle(cx),
+                "name-input" => gallery.name.focus_handle(cx),
+                _ => gallery.handle(name),
+            })?;
+            let mut tabs = 0;
+            while !c.focused(&handle)? {
+                ensure!(tabs < 80, "Tab never reached {what} ({name})");
+                c.key("tab").await?;
+                tabs += 1;
+            }
+            ensure!(c.modality()? == Modality::Keyboard, "tabbing to {what} left the pointer modality");
+            let bounds = c.reveal(name).await?;
+            let at = point(bounds.center().x, bounds.top() - px(1.5));
+            let shown = c.pixel(at).await?;
+            ensure!(
+                near(shown, ring),
+                "{what} ({name}) focused by Tab shows {shown:?} just above it at {at:?}, not the ring {ring:?} (background {background:?})"
+            );
+            c.key("tab").await?;
+            let after = c.pixel(at).await?;
+            ensure!(near(after, background), "the ring stayed on {what} ({name}) after Tab moved on: {after:?}");
+        }
         Ok(())
     }
 

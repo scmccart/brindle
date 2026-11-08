@@ -17,7 +17,7 @@ use gpui::{
     prelude::FluentBuilder,
 };
 
-use crate::components::{ACTIVATION_KEYS, ClickHandler, DISABLED_OPACITY, activates, interaction, ring_shadow};
+use crate::components::{ACTIVATION_KEYS, ClickHandler, DISABLED_OPACITY, FocusRing, activates, inert_press, interaction};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{ButtonSize, ButtonVariant, button_style};
@@ -130,12 +130,9 @@ impl RenderOnce for Button {
             .when_some(style.background, |d, background| d.bg(background))
             .when_some(style.border, |d, border| d.border_1().border_color(border))
             // `focus-visible:border-ring` recolours the border a variant
-            // has; the shadow is the ring itself.
-            .when(ring_shown, |d| {
-                d.when_some(style.focus_border, |d, border| d.border_color(border))
-                    .shadow(vec![ring_shadow(style.ring)])
-            })
-            .when(self.disabled, |d| d.opacity(DISABLED_OPACITY))
+            // has; the ring goes outside it.
+            .when(ring_shown, |d| d.when_some(style.focus_border, |d, border| d.border_color(border)))
+            .when(self.disabled, |d| inert_press(d.opacity(DISABLED_OPACITY)))
             .when(!self.disabled, |d| {
                 d.cursor_pointer().hover(move |mut s| {
                     s = s.text_color(style.hover_foreground);
@@ -157,9 +154,10 @@ impl RenderOnce for Button {
             .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
             .children(self.icon)
             .children(self.label);
-        // The owner's layout refinements win over the component's.
+        // The owner's layout refinements win over the component's. The ring
+        // follows the corners they leave.
         button.style().refine(&self.style);
-        button
+        button.focus_ring(ring_shown, style.ring, window)
     }
 }
 

@@ -63,9 +63,16 @@ pub fn set_modality(window: &mut Window, modality: Modality, cx: &mut App) {
 /// does only that: an outside press on a non-modal overlay focuses what
 /// it hit this way, and the overlay's deferred close then puts focus back
 /// where the overlay found it.
+///
+/// It prevents the press's default, as gpui's own focus transfer does, so
+/// an ancestor that tracks focus (a dialog's view, an app's root) doesn't
+/// take focus back as the press bubbles up to it. A press in an input's
+/// padding is outside the text input's own element, which is why that
+/// matters.
 pub fn focus_from_pointer(handle: &FocusHandle, window: &mut Window, cx: &mut App) {
     set_modality(window, Modality::Pointer, cx);
     window.focus(handle);
+    window.prevent_default();
 }
 
 /// Whether a control shows the focus ring: when it is focused and focus

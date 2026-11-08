@@ -10,10 +10,10 @@
 
 use gpui::{
     App, CursorStyle, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Refineable,
-    RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder, rems,
+    RenderOnce, StyleRefinement, Styled, Window, div, rems,
 };
 
-use crate::components::ring_shadow;
+use crate::components::FocusRing;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::input_style;
 use crate::text_input::TextInput;
@@ -69,13 +69,16 @@ impl RenderOnce for Input {
             .text_size(rems(0.875))
             .text_color(t.foreground)
             .cursor(CursorStyle::IBeam)
-            .when_some(style.ring, |d, ring| d.shadow(vec![ring_shadow(ring)]))
             // The padding is part of the field: a press there focuses the
             // text input too.
             .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             .child(self.input);
         // The owner's layout refinements win over the component's.
         frame.style().refine(&self.style);
-        frame
+        // The ring follows the corners the owner leaves.
+        match style.ring {
+            Some(ring) => frame.focus_ring(true, ring, window),
+            None => frame,
+        }
     }
 }

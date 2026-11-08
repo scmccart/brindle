@@ -8,6 +8,11 @@
 //! context) and moves focus with the pure [`cycle`]. [`Overlay`] wraps every
 //! view it shows in one, and uses the stops for the initial focus too.
 //!
+//! The binding is reached only from focus inside the scope: with nothing
+//! focused gpui dispatches keys from the window's root, above it. A view
+//! that scopes a whole window tracks a handle of its own inside the scope
+//! and focuses it at start, as a page's body.
+//!
 //! [`Overlay`]: crate::primitives::overlay::Overlay
 
 use gpui::{

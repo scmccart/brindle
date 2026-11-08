@@ -36,7 +36,7 @@ use gpui::{
 };
 
 use crate::actions::{Dismiss, ListConfirm, ListDown, ListFirst, ListLast, ListUp};
-use crate::components::DISABLED_OPACITY;
+use crate::components::{DISABLED_OPACITY, inert_press};
 use crate::filter::filter;
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{Modality, set_modality};
@@ -453,14 +453,17 @@ impl Command {
                     .text_size(rems(0.875))
                     .whitespace_nowrap()
                     .when(highlighted, |d| d.bg(style.highlight).text_color(style.highlight_foreground))
-                    .when(disabled, |d| d.opacity(DISABLED_OPACITY))
+                    // A press keeps focus in the filter, rather than letting
+                    // it bubble to an ancestor that tracks focus.
+                    .when(disabled, |d| inert_press(d.opacity(DISABLED_OPACITY)))
                     .when(!disabled, |d| {
                         d.on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| this.hover(rank, cx)))
                             // A press is pointer input, so whatever a host
                             // gives focus back to after the confirmation
                             // shows no ring.
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                set_modality(window, Modality::Pointer, cx)
+                                set_modality(window, Modality::Pointer, cx);
+                                window.prevent_default();
                             })
                             .on_click(cx.listener(move |_, _, _, cx| cx.emit(CommandEvent::Confirmed(item_ix))))
                     })

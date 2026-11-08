@@ -5,7 +5,7 @@
 //! applies the result. Sizes are in rems (GPUI's `h_9` is `rems(2.25)`, as
 //! Tailwind's `h-9` is 2.25rem), so they scale with the window's text size.
 
-use gpui::{Hsla, Rems, rems};
+use gpui::{Corners, Edges, Hsla, Pixels, Rems, rems};
 
 use crate::theme::Tokens;
 
@@ -18,6 +18,43 @@ pub const INVALID_RING_OPACITY: f32 = 0.2;
 /// The focus ring's colour: the ring token at [`RING_OPACITY`].
 pub fn focus_ring(t: &Tokens) -> Hsla {
     t.ring.opacity(RING_OPACITY)
+}
+
+/// Where the focus ring's box goes, relative to the control it rings: a
+/// border `width` wide, drawn just outside the control's border box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RingGeometry {
+    /// How far each edge of the ring's box lies outside the control's
+    /// padding box, which is what an absolutely positioned child's insets
+    /// are measured from (taffy, as CSS): the control's border plus the
+    /// ring's width.
+    pub outset: Edges<Pixels>,
+    /// The ring box's corners: the control's, grown by the ring's width,
+    /// so the ring's inner edge follows the control's outer edge.
+    pub radii: Corners<Pixels>,
+    /// The ring's border width.
+    pub width: Pixels,
+}
+
+/// The ring around a control with these `border` widths and corner `radii`
+/// (shadcn's `ring-[3px]`, a box shadow with a spread and no blur, which
+/// sits outside the border box and never under the control).
+pub fn ring_geometry(border: Edges<Pixels>, radii: Corners<Pixels>, width: Pixels) -> RingGeometry {
+    RingGeometry {
+        outset: Edges {
+            top: border.top + width,
+            right: border.right + width,
+            bottom: border.bottom + width,
+            left: border.left + width,
+        },
+        radii: Corners {
+            top_left: radii.top_left + width,
+            top_right: radii.top_right + width,
+            bottom_right: radii.bottom_right + width,
+            bottom_left: radii.bottom_left + width,
+        },
+        width,
+    }
 }
 
 /// shadcn's button variants.
@@ -721,6 +758,35 @@ mod tests {
             }
             assert_eq!(focus_ring(&t), t.ring.opacity(RING_OPACITY));
         }
+    }
+
+    /// The ring lies just outside each control's border box: its box is
+    /// outset from the padding box by the border plus the ring's width, and
+    /// its corners grow by that width, so it never overlaps the control.
+    #[test]
+    fn ring_sits_outside_the_border_box() {
+        use gpui::px;
+        let edges = |w: f32| Edges::all(px(w));
+        let corners = |r: f32| Corners::all(px(r));
+        // (control, border, radius, expected outset, expected radius)
+        let cases = [
+            // A button without a border (default, ghost, link variants), rounded-md.
+            ("borderless button", edges(0.), corners(8.), edges(3.), corners(11.)),
+            // An outline button, an input, a select trigger, a checkbox.
+            ("1px border", edges(1.), corners(8.), edges(4.), corners(11.)),
+            // The dialog's close button: rounded-xs, no border.
+            ("close button", edges(0.), corners(2.), edges(3.), corners(5.)),
+            // A switch: rounded-full (gpui's 9999px, clamped when painted).
+            ("switch", edges(1.), corners(9999.), edges(4.), corners(10002.)),
+        ];
+        for (control, border, radii, outset, ring_radii) in cases {
+            let ring = ring_geometry(border, radii, px(3.));
+            assert_eq!(ring, RingGeometry { outset, radii: ring_radii, width: px(3.) }, "{control}");
+        }
+        // Uneven sides keep their own widths.
+        let border = Edges { top: px(0.), right: px(1.), bottom: px(2.), left: px(0.) };
+        let ring = ring_geometry(border, Corners::default(), px(3.));
+        assert_eq!(ring.outset, Edges { top: px(3.), right: px(4.), bottom: px(5.), left: px(3.) });
     }
 
     /// A checkbox is a primary square with a primary-foreground tick when

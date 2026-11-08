@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::components::checkbox::{ToggleHandler, click_key, toggle_request, toggles};
-use crate::components::{DISABLED_OPACITY, TOGGLE_KEYS, activates, interaction, ring_shadow};
+use crate::components::{DISABLED_OPACITY, FocusRing, TOGGLE_KEYS, activates, inert_press, interaction};
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{
     SWITCH_THUMB_SIZE, SWITCH_TRACK_BORDER, SWITCH_TRACK_HEIGHT, SWITCH_TRACK_WIDTH, focus_ring, switch_style,
@@ -104,8 +104,9 @@ impl RenderOnce for Switch {
             .border(SWITCH_TRACK_BORDER)
             .border_color(transparent_black())
             .bg(style.track)
-            .when(ring_shown, |d| d.border_color(ring).shadow(vec![ring_shadow(ring_color)]))
-            .when(disabled, |d| d.opacity(DISABLED_OPACITY).cursor_not_allowed())
+            .when(ring_shown, |d| d.border_color(ring))
+            .focus_ring(ring_shown, ring_color, window)
+            .when(disabled, |d| inert_press(d.opacity(DISABLED_OPACITY).cursor_not_allowed()))
             .when(!disabled, |d| d.cursor_pointer())
             .when_some(focus, |d, handle| {
                 d.track_focus(&handle)

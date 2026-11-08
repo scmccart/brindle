@@ -64,7 +64,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder, px, relative, rems,
 };
 
-use crate::components::{ACTIVATION_KEYS, ClickHandler, activates, ring_shadow};
+use crate::components::{ACTIVATION_KEYS, ClickHandler, FocusRing, activates};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{
@@ -193,7 +193,7 @@ impl RenderOnce for Dialog {
                 .opacity(DIALOG_CLOSE_OPACITY)
                 .cursor_pointer()
                 .hover(|s| s.opacity(1.))
-                .when(ring_shown, |d| d.shadow(vec![ring_shadow(ring_color)]))
+                .focus_ring(ring_shown, ring_color, window)
                 .when_some(self.close_focus, |d, handle| {
                     d.track_focus(&handle)
                         .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))

@@ -44,7 +44,7 @@ use gpui::{
 
 use crate::actions::{ListConfirm, ListDown, ListFirst, ListLast, ListUp};
 use crate::components::popover::{TriggerAction, follows_trigger, trigger_action};
-use crate::components::{DISABLED_OPACITY, ring_shadow};
+use crate::components::{DISABLED_OPACITY, FocusRing, inert_press};
 use crate::icon::Icon;
 use crate::primitives::focus_scope::FocusStops;
 use crate::primitives::focus_visible::{Modality, focus_from_pointer, modality, set_modality, shows_ring};
@@ -493,8 +493,9 @@ impl Render for Select {
             .text_size(rems(0.875))
             .whitespace_nowrap()
             .text_color(text_color)
-            .when(ring_shown, |d| d.border_color(ring).shadow(vec![ring_shadow(ring_color)]))
-            .when(disabled, |d| d.opacity(DISABLED_OPACITY).cursor_not_allowed())
+            .when(ring_shown, |d| d.border_color(ring))
+            .focus_ring(ring_shown, ring_color, window)
+            .when(disabled, |d| inert_press(d.opacity(DISABLED_OPACITY).cursor_not_allowed()))
             .when(!disabled, |d| {
                 d.cursor_pointer()
                     .key_context("UiList")

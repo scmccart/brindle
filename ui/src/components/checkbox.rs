@@ -17,7 +17,7 @@ use gpui::{
 // (`on_click` and the key-down come through `activates`, so the stateful
 // trait isn't named here.)
 
-use crate::components::{DISABLED_OPACITY, TOGGLE_KEYS, activates, interaction, ring_shadow};
+use crate::components::{DISABLED_OPACITY, FocusRing, TOGGLE_KEYS, activates, inert_press, interaction};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{CHECKBOX_RADIUS, CHECKBOX_SIZE, CHECKBOX_TICK_SIZE, checkbox_style, focus_ring};
@@ -129,8 +129,9 @@ impl RenderOnce for Checkbox {
             .border_color(style.border)
             .when_some(style.background, |d, background| d.bg(background))
             .text_color(style.tick)
-            .when(ring_shown, |d| d.border_color(ring).shadow(vec![ring_shadow(ring_color)]))
-            .when(disabled, |d| d.opacity(DISABLED_OPACITY).cursor_not_allowed())
+            .when(ring_shown, |d| d.border_color(ring))
+            .focus_ring(ring_shown, ring_color, window)
+            .when(disabled, |d| inert_press(d.opacity(DISABLED_OPACITY).cursor_not_allowed()))
             .when(!disabled, |d| d.cursor_pointer())
             .when_some(focus, |d, handle| {
                 d.track_focus(&handle)

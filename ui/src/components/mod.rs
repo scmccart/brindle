@@ -26,9 +26,9 @@
 //!
 //! What every control shares is here: [`interaction`], the rule that a
 //! disabled control tracks no focus and gets no click handler, the half
-//! opacity it is drawn at, and the focus ring, a 3px box shadow in the ring
-//! colour (shadcn's `ring-[3px] ring-ring/50`) that takes no room, so
-//! focusing moves no layout.
+//! opacity it is drawn at, and the focus ring (`FocusRing`), a 3px band in
+//! the ring colour just outside the control (shadcn's `ring-[3px]
+//! ring-ring/50`) that takes no room, so focusing moves no layout.
 
 pub mod button;
 pub mod checkbox;
@@ -42,11 +42,12 @@ pub mod switch;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, BoxShadow, ClickEvent, Hsla, KeyboardButton, KeyboardClickEvent, Modifiers, Pixels,
-    StatefulInteractiveElement, Window, point, px,
+    App, Bounds, ClickEvent, Hsla, InteractiveElement, KeyboardButton, KeyboardClickEvent, Modifiers, MouseButton,
+    ParentElement, Pixels, Refineable, StatefulInteractiveElement, Style, Styled, Window, div, px,
 };
 
 use crate::primitives::focus_visible::{Modality, set_modality};
+use crate::style::ring_geometry;
 
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
@@ -73,12 +74,55 @@ pub fn interaction<F, C>(disabled: bool, focus: Option<F>, on_click: Option<C>) 
     if disabled { (None, None) } else { (focus, on_click) }
 }
 
-/// The focus ring as a box shadow in `color` (`style::focus_ring`, or an
-/// invalid input's destructive ring), [`RING_WIDTH`] around the control,
-/// with no blur or offset.
-pub(crate) fn ring_shadow(color: Hsla) -> BoxShadow {
-    BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: RING_WIDTH }
+/// Makes a press on a disabled control move focus nowhere. Without a
+/// listener it would bubble to an ancestor that tracks focus (a dialog's
+/// view, an app's root), which gpui focuses on a press nothing inside
+/// prevented.
+pub(crate) fn inert_press<E: InteractiveElement>(element: E) -> E {
+    element.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
 }
+
+/// Draws the focus ring around a control: shadcn's `ring-[3px]`.
+///
+/// The ring is an absolutely positioned child with a [`RING_WIDTH`] border
+/// in `color` (`style::focus_ring`, or an invalid input's destructive ring),
+/// placed by [`ring_geometry`] from the border widths and corner radii the
+/// control has set so far, so call it after those. It takes no room, has no
+/// hitbox, and only draws outside the control's border box.
+///
+/// It isn't a box shadow, which is how CSS draws it: gpui 0.2.2's DirectX
+/// (Windows) and Blade (Linux) shadow shaders divide by the blur radius,
+/// so a shadow with none comes out with a NaN alpha and isn't seen; only
+/// the Metal one draws a sharp shadow. And a gpui shadow fills the whole
+/// dilated box, under the control too, where CSS clips it to the outside,
+/// so a transparent control (ghost, link, an input) would be tinted.
+pub(crate) trait FocusRing: ParentElement + Styled + Sized {
+    fn focus_ring(mut self, shown: bool, color: Hsla, window: &Window) -> Self {
+        if !shown {
+            return self;
+        }
+        let rem_size = window.rem_size();
+        let mut style = Style::default();
+        style.refine(self.style());
+        let ring = ring_geometry(style.border_widths.to_pixels(rem_size), style.corner_radii.to_pixels(rem_size), RING_WIDTH);
+        let mut frame = div()
+            .absolute()
+            .top(-ring.outset.top)
+            .right(-ring.outset.right)
+            .bottom(-ring.outset.bottom)
+            .left(-ring.outset.left)
+            .border(ring.width)
+            .border_color(color);
+        let corners = &mut frame.style().corner_radii;
+        corners.top_left = Some(ring.radii.top_left.into());
+        corners.top_right = Some(ring.radii.top_right.into());
+        corners.bottom_right = Some(ring.radii.bottom_right.into());
+        corners.bottom_left = Some(ring.radii.bottom_left.into());
+        self.child(frame)
+    }
+}
+
+impl<E: ParentElement + Styled + Sized> FocusRing for E {}
 
 /// The keys that activate a button: enter and space, as in a browser.
 pub const ACTIVATION_KEYS: [KeyboardButton; 2] = [KeyboardButton::Enter, KeyboardButton::Space];

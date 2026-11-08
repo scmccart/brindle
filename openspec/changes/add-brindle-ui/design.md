@@ -168,6 +168,7 @@ ui/                         package brindle-ui, lib brindle_ui
 - **The scope keeps its own ordered list of stops,** because GPUI's tab order is private and window-wide.
   - An overlay view implements `FocusStops` (`fn stops(&self, cx) -> Vec<FocusHandle>`, enabled controls only, in order). The `FocusScope` element binds Tab and shift-Tab (`FocusNext`/`FocusPrev` in the `UiFocusScope` context) and moves focus with a pure `cycle(len, current: Option<usize>, dir)`.
   - When focus is on none of the stops, Tab goes to the first and shift-Tab to the last.
+  - Tab reaches the scope only from focus inside it: with nothing focused, gpui dispatches keys from the window's root, above the scope. An app that scopes its whole window (the gallery does) tracks a handle of its own inside the scope and focuses it at start, as a page's body.
 - **Alternatives considered:**
   - Calling `window.focus_next()` repeatedly until focus re-enters the scope: it briefly focuses outside handles, and a terminal behind the dialog would send focus-in/focus-out reports to its program.
   - A render-time registry of stops: it depends on child-view render order, which GPUI doesn't promise.
@@ -214,6 +215,9 @@ ui/                         package brindle-ui, lib brindle_ui
   - `init` registers `App::observe_keystrokes`, which sets `Keyboard`. gpui runs the observer for a key an action took and for one no listener stopped, but not for a key a key-down listener stopped, so the handlers that stop keys (a control's activation on enter or space, a select's typeahead and space) set `Keyboard` themselves first.
   - Every crate component's mouse-down handler sets `Pointer` before focusing.
 - **The ring** shows when the control is focused and the modality is `Keyboard`. `Input` shows it whenever focused, as shadcn does.
+- **The ring is a border just outside the control, not a box shadow.** It is an absolutely positioned child with a 3px border, outset from the control's padding box by its border plus 3px and with its corner radii grown by 3px (`style::ring_geometry`), so it takes no room and catches no presses.
+  - **Why not a shadow, as CSS draws it:** gpui 0.2.2's DirectX (Windows) and Blade (Linux) shadow shaders divide by the blur radius, so a shadow with none gets a NaN alpha and isn't drawn; only the Metal shader special-cases it. The gallery's `--check` passed while no ring showed, since it read only the modality; it now reads the window's pixels around each tabbed control. A small blur would avoid the NaN, but a gpui shadow fills the whole dilated box, under the control too, where CSS clips it to the outside, so a transparent control (ghost, link, an input) would be tinted.
+- **A pointer press keeps the focus it gives.** `focus_from_pointer` prevents the press's default, as gpui's own focus transfer does, and a disabled control (and a command row, which leaves focus in the filter) prevents it without focusing anything, so an ancestor that tracks focus (a dialog's view, an app's root) doesn't take focus as the press bubbles up.
 - **No keybindings are involved.** `init` registers only observers, so it is safe to call once at startup and survives reloads.
 
 ### Actions and default bindings
