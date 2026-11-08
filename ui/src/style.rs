@@ -89,7 +89,8 @@ pub struct ButtonStyle {
 /// shadcn's `buttonVariants` for `variant` and `size`, in the colours of `t`.
 ///
 /// shadcn's `dark:` refinements (the outline's input-coloured fill, the dimmed
-/// destructive) are left out: a token set doesn't say whether it is dark.
+/// destructive) are left out: the variants read tokens only, not the set's
+/// [`Tokens::dark`] hint.
 pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> ButtonStyle {
     // (background, foreground, border, hover background, hover foreground)
     let (background, foreground, border, hover_background, hover_foreground) = match variant {
@@ -248,12 +249,21 @@ pub struct SwitchStyle {
 
 /// shadcn's Switch: the track `data-[state=checked]:bg-primary
 /// data-[state=unchecked]:bg-input`, the thumb `bg-background`, moved to
-/// the far end when on. shadcn's `dark:` thumb colours are left out, since
-/// a token set doesn't say whether it is dark.
+/// the far end when on. In a dark set ([`Tokens::dark`]) the thumb takes
+/// shadcn's `dark:data-[state=unchecked]:bg-foreground
+/// dark:data-[state=checked]:bg-primary-foreground`, since a near-black
+/// thumb would all but vanish on the translucent unchecked track. That is
+/// the only `dark:` refinement modelled; the track's `dark:bg-input/80` is
+/// left out.
 pub fn switch_style(checked: bool, t: &Tokens) -> SwitchStyle {
+    let thumb = match (t.dark, checked) {
+        (false, _) => t.background,
+        (true, false) => t.foreground,
+        (true, true) => t.primary_foreground,
+    };
     SwitchStyle {
         track: if checked { t.primary } else { t.input },
-        thumb: t.background,
+        thumb,
         thumb_offset: switch_thumb_offset(checked),
     }
 }
@@ -443,15 +453,39 @@ mod tests {
         assert_eq!((CHECKBOX_SIZE, CHECKBOX_RADIUS, CHECKBOX_TICK_SIZE), (rems(1.), rems(0.25), rems(0.875)));
     }
 
-    /// A switch's track is primary when on and input-coloured when off,
-    /// and the thumb moves from one end of the track to the other.
+    /// A switch's track is primary when on and input-coloured when off. The
+    /// thumb is the background in a light set; in a dark one it is the
+    /// foreground when off and the primary foreground when on, shadcn's
+    /// `dark:` thumb colours.
+    #[test]
+    fn switch_colours_for_each_state_and_set() {
+        // (set, checked, expected track, expected thumb)
+        let cases: [(&str, Tokens, bool, Pick, Pick); 4] = [
+            ("light", Tokens::neutral_light(), false, |t| t.input, |t| t.background),
+            ("light", Tokens::neutral_light(), true, |t| t.primary, |t| t.background),
+            ("dark", Tokens::neutral_dark(), false, |t| t.input, |t| t.foreground),
+            ("dark", Tokens::neutral_dark(), true, |t| t.primary, |t| t.primary_foreground),
+        ];
+        for (set, t, checked, track, thumb) in cases {
+            let style = switch_style(checked, &t);
+            assert_eq!((style.track, style.thumb), (track(&t), thumb(&t)), "{set} checked={checked}");
+        }
+        // The hint alone picks the thumb: the dark colours with the flag
+        // cleared are the light rule's.
+        let dark_unflagged = Tokens { dark: false, ..Tokens::neutral_dark() };
+        assert_eq!(switch_style(false, &dark_unflagged).thumb, dark_unflagged.background);
+        assert_eq!(switch_style(true, &dark_unflagged).thumb, dark_unflagged.background);
+        // The unchecked dark thumb stands out from the track behind it.
+        let dark = Tokens::neutral_dark();
+        assert!(switch_style(false, &dark).thumb.l > 0.9);
+    }
+
+    /// The thumb moves from one end of the track to the other.
     #[test]
     fn switch_thumb_sits_at_the_end_for_its_state() {
         for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
             let on = switch_style(true, &t);
             let off = switch_style(false, &t);
-            assert_eq!((on.track, on.thumb), (t.primary, t.background));
-            assert_eq!((off.track, off.thumb), (t.input, t.background));
             assert_eq!(off.thumb_offset, rems(0.));
             // shadcn: translate-x-[calc(100%-2px)], the thumb's width less the borders.
             assert_eq!(on.thumb_offset, rems(0.875));

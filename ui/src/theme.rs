@@ -2,8 +2,9 @@
 //!
 //! [`Tokens`] holds one set of colours and the corner radius. The app picks a
 //! set, puts it in the [`UiTheme`] global, and components read it through
-//! [`ActiveTheme::ui_theme`]. Light and dark are separate sets: nothing in a
-//! set says which it is.
+//! [`ActiveTheme::ui_theme`]. Light and dark are separate sets; a set's
+//! [`Tokens::dark`] hint says which it is, for the few colours shadcn picks
+//! with a `dark:` variant instead of a token.
 //!
 //! Hover and pressed states aren't tokens. Components fade a token instead, as
 //! shadcn does (`bg-primary/90` is `primary.opacity(0.9)`).
@@ -40,6 +41,13 @@ pub struct Tokens {
     /// The base corner radius (`--radius`); see [`Tokens::radius_md`] and
     /// its siblings for the steps components use.
     pub radius: Rems,
+    /// Whether this is a dark set: a hint, not a colour. It is set by the
+    /// token source, from the background's luminance for derived sets.
+    /// Only the switch's thumb reads it (shadcn's `dark:` thumb colours,
+    /// without which an unchecked thumb in `background` all but vanishes on
+    /// a dark set's translucent track); shadcn's other `dark:` refinements
+    /// are left out.
+    pub dark: bool,
 }
 
 /// A colour from a `0xRRGGBB` constant.
@@ -79,6 +87,7 @@ impl Tokens {
             input: hex(0xe5e5e5),                  // oklch(0.922 0 0)
             ring: hex(0xa1a1a1),                   // oklch(0.708 0 0)
             radius: rems(0.625),
+            dark: false,
         }
     }
 
@@ -106,6 +115,7 @@ impl Tokens {
             input: hsla(0., 0., 1., 0.15),         // oklch(1 0 0 / 15%)
             ring: hex(0x737373),                   // oklch(0.556 0 0)
             radius: rems(0.625),
+            dark: true,
         }
     }
 
@@ -232,6 +242,17 @@ mod tests {
         assert_eq!(dark.input, hsla(0., 0., 1., 0.15));
         // Opaque in the light set.
         assert_eq!(Tokens::neutral_light().border.a, 1.0);
+    }
+
+    /// The `dark` hint follows the background: the dark set's is near black,
+    /// the light set's white.
+    #[test]
+    fn the_dark_hint_matches_the_background() {
+        let light = Tokens::neutral_light();
+        let dark = Tokens::neutral_dark();
+        assert!(!light.dark);
+        assert!(dark.dark);
+        assert!(light.background.l > 0.5 && dark.background.l < 0.5);
     }
 
     #[test]

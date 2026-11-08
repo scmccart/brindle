@@ -96,7 +96,8 @@ ui/                         package brindle-ui, lib brindle_ui
 - **`destructive_foreground` is kept** even though shadcn v4 dropped it, because text on a destructive button needs a colour.
 - **`chart-*` and `sidebar-*` are left out** until something needs them.
 - **Neutral light and dark sets.** `Tokens::neutral_light()` / `neutral_dark()` hold shadcn's neutral oklch values, converted to sRGB once when writing them and stored as hex constants. A unit test pins a few against shadcn's published values.
-- **Light and dark aren't modelled in the struct.** `UiTheme` holds one token set, and the app chooses which.
+- **Light and dark are separate sets.** `UiTheme` holds one token set, and the app chooses which.
+- **A `dark: bool` hint.** `Tokens::dark` is false in `neutral_light()` and true in `neutral_dark()`. It is set by the token source, from the background's luminance for derived sets (`ui-tokens-from-theme`). It isn't a colour: only the switch reads it, for shadcn's dark thumb colours (`dark:data-[state=unchecked]:bg-foreground`, `dark:data-[state=checked]:bg-primary-foreground`). Without them an unchecked thumb in `background` is near black on the dark set's white-at-15% track and all but vanishes. shadcn's other `dark:` refinements (the outline button's input fill, the dimmed destructive, the switch track's `bg-input/80`) are left out.
 - **Hover and active states use opacity, as shadcn does** (`bg-primary/90` → `primary.opacity(0.9)`), not extra tokens.
 - **Radius steps** are derived as in shadcn: sm = radius − 4px, md = radius − 2px, lg = radius, xl = radius + 4px.
 - **Access.** `UiTheme` is a GPUI `Global` read through an `ActiveTheme` trait (`cx.ui_theme()`). Replacing the global and notifying the window redraws everything (spec: "Components draw from the active tokens").
