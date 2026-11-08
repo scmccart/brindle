@@ -16,12 +16,16 @@
 //! focusing moves no layout.
 
 pub mod button;
+pub mod checkbox;
 pub mod input;
+pub mod switch;
 
 use gpui::{BoxShadow, Hsla, Pixels, point, px};
 
 pub use button::Button;
+pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use input::Input;
+pub use switch::Switch;
 
 /// shadcn's `disabled:opacity-50`.
 pub const DISABLED_OPACITY: f32 = 0.5;

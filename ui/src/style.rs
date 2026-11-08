@@ -194,6 +194,77 @@ pub fn input_style(ring: bool, invalid: bool, t: &Tokens) -> InputStyle {
     InputStyle { border, ring }
 }
 
+/// A checkbox's side, shadcn's `size-4`.
+pub const CHECKBOX_SIZE: Rems = Rems(1.);
+
+/// A checkbox's corner radius, shadcn's `rounded-[4px]`.
+pub const CHECKBOX_RADIUS: Rems = Rems(0.25);
+
+/// The tick's size, shadcn's `size-3.5`.
+pub const CHECKBOX_TICK_SIZE: Rems = Rems(0.875);
+
+/// A checkbox's resolved colours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CheckboxStyle {
+    /// The fill: the primary colour when checked, none when not.
+    pub background: Option<Hsla>,
+    /// The border: the primary colour when checked, the input colour when not.
+    pub border: Hsla,
+    /// The tick.
+    pub tick: Hsla,
+}
+
+/// shadcn's Checkbox: `border-input`, and when checked `bg-primary
+/// border-primary text-primary-foreground`.
+pub fn checkbox_style(checked: bool, t: &Tokens) -> CheckboxStyle {
+    CheckboxStyle {
+        background: checked.then_some(t.primary),
+        border: if checked { t.primary } else { t.input },
+        tick: t.primary_foreground,
+    }
+}
+
+/// A switch track's width, shadcn's `w-8`.
+pub const SWITCH_TRACK_WIDTH: Rems = Rems(2.);
+
+/// A switch track's height, shadcn's `h-[1.15rem]`.
+pub const SWITCH_TRACK_HEIGHT: Rems = Rems(1.15);
+
+/// A switch track's border, shadcn's 1px `border`, in rems so it scales.
+pub const SWITCH_TRACK_BORDER: Rems = Rems(0.0625);
+
+/// A switch thumb's diameter, shadcn's `size-4`.
+pub const SWITCH_THUMB_SIZE: Rems = Rems(1.);
+
+/// A switch's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwitchStyle {
+    /// The track: the primary colour when on, the input colour when off.
+    pub track: Hsla,
+    pub thumb: Hsla,
+    /// How far the thumb sits from the track's inner left edge.
+    pub thumb_offset: Rems,
+}
+
+/// shadcn's Switch: the track `data-[state=checked]:bg-primary
+/// data-[state=unchecked]:bg-input`, the thumb `bg-background`, moved to
+/// the far end when on. shadcn's `dark:` thumb colours are left out, since
+/// a token set doesn't say whether it is dark.
+pub fn switch_style(checked: bool, t: &Tokens) -> SwitchStyle {
+    SwitchStyle {
+        track: if checked { t.primary } else { t.input },
+        thumb: t.background,
+        thumb_offset: switch_thumb_offset(checked),
+    }
+}
+
+/// Where the thumb sits inside the track's border: against the left end
+/// when off, against the right end when on (shadcn's
+/// `translate-x-[calc(100%-2px)]`).
+pub fn switch_thumb_offset(checked: bool) -> Rems {
+    if checked { Rems(SWITCH_TRACK_WIDTH.0 - 2. * SWITCH_TRACK_BORDER.0 - SWITCH_THUMB_SIZE.0) } else { Rems(0.) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +423,44 @@ mod tests {
             }
             assert_eq!(focus_ring(&t), t.ring.opacity(RING_OPACITY));
         }
+    }
+
+    /// A checkbox is a primary square with a primary-foreground tick when
+    /// checked, and an input-coloured outline when not.
+    #[test]
+    fn checkbox_fills_with_primary_when_checked() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(
+                checkbox_style(true, &t),
+                CheckboxStyle { background: Some(t.primary), border: t.primary, tick: t.primary_foreground }
+            );
+            assert_eq!(
+                checkbox_style(false, &t),
+                CheckboxStyle { background: None, border: t.input, tick: t.primary_foreground }
+            );
+        }
+        // size-4, rounded-[4px], a size-3.5 tick.
+        assert_eq!((CHECKBOX_SIZE, CHECKBOX_RADIUS, CHECKBOX_TICK_SIZE), (rems(1.), rems(0.25), rems(0.875)));
+    }
+
+    /// A switch's track is primary when on and input-coloured when off,
+    /// and the thumb moves from one end of the track to the other.
+    #[test]
+    fn switch_thumb_sits_at_the_end_for_its_state() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let on = switch_style(true, &t);
+            let off = switch_style(false, &t);
+            assert_eq!((on.track, on.thumb), (t.primary, t.background));
+            assert_eq!((off.track, off.thumb), (t.input, t.background));
+            assert_eq!(off.thumb_offset, rems(0.));
+            // shadcn: translate-x-[calc(100%-2px)], the thumb's width less the borders.
+            assert_eq!(on.thumb_offset, rems(0.875));
+        }
+        // On, the thumb ends against the track's inner right edge.
+        let inner_right = SWITCH_TRACK_WIDTH.0 - SWITCH_TRACK_BORDER.0;
+        assert_eq!(switch_thumb_offset(true).0 + SWITCH_THUMB_SIZE.0 + SWITCH_TRACK_BORDER.0, inner_right);
+        // And it fits the track's height.
+        assert!(SWITCH_THUMB_SIZE.0 <= SWITCH_TRACK_HEIGHT.0 - 2. * SWITCH_TRACK_BORDER.0 + f32::EPSILON);
     }
 
     #[test]
