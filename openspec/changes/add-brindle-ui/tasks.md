@@ -14,7 +14,7 @@
 
 ## 3. Tokens, styles and icons
 
-- [ ] 3.1 Add `Tokens` (`theme.rs`) with the fields in design.md, `neutral_light()`/`neutral_dark()` as hex constants converted from shadcn's neutral oklch values, radius steps, the `UiTheme` global and the `ActiveTheme` trait (`cx.ui_theme()`). Verify: a unit test pins `background`, `primary`, `border` and `ring` of both sets to the converted values, and one that `neutral_dark().border` is foreground-white at 10% opacity.
+- [x] 3.1 Add `Tokens` (`theme.rs`) with the fields in design.md, `neutral_light()`/`neutral_dark()` as hex constants converted from shadcn's neutral oklch values, radius steps, the `UiTheme` global and the `ActiveTheme` trait (`cx.ui_theme()`). Verify: a unit test pins `background`, `primary`, `border` and `ring` of both sets to the converted values, and one that `neutral_dark().border` is foreground-white at 10% opacity.
 - [ ] 3.2 Add `ButtonVariant`/`ButtonSize` and the pure `button_style()` (`style.rs`) using the rem scale (`h_9` default, `h_8` sm, `h_10` lg, `size_9` icon). Verify: a table test covers all 24 combinations against both token sets (colours come from the expected tokens, hover is the 90% opacity form where shadcn uses `/90`).
 - [ ] 3.3 Add `Icon` (`Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`) painted with `PathBuilder` in the current text colour, sized in rems. Verify: unit test that each icon's path points stay inside its unit box; visual check in the gallery (task 6.1).
 

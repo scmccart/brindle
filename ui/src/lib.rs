@@ -7,6 +7,8 @@
 pub mod actions;
 pub mod filter;
 pub mod text_input;
+pub mod theme;
 
 pub use actions::*;
 pub use text_input::{TextInput, TextInputEvent};
+pub use theme::{ActiveTheme, Tokens, UiTheme};
