@@ -78,6 +78,7 @@ ui/                         package brindle-ui, lib brindle_ui
   - Values are controlled: the owner holds them, passes `.checked(bool)` and gets `.on_click(|new: &bool, window, cx|)`.
   - Builders implement GPUI's `Styled` for layout refinements (width, margin, flex) and their own `disabled(bool)`.
 - **Anything with state of its own is an `Entity`** the owner creates, keeps and subscribes to: `TextInput`, `Select`, `Command`, and the content of every overlay.
+  - `Popover` is the exception: a `RenderOnce` builder whose open state (its `Overlay` and the content entity in it) lives in keyed state, since its owner only renders it (see "Popover").
   - This matches `TextInput` today, where the owner keeps `Entity<TextInput>` and subscribes to `TextInputEvent::Changed`.
 - **Focusable stateless controls take a `FocusHandle` from the owner** (`.focus(&handle)`), because a `RenderOnce` value can't keep one between frames.
   - Without a handle a control can't take keyboard focus, and pressing it doesn't move focus.
@@ -142,6 +143,9 @@ ui/                         package brindle-ui, lib brindle_ui
   3. focuses the entity's designated initial handle, else its first stop, else its own handle;
   4. subscribes to `DismissEvent`.
 - **On `DismissEvent`, or `Overlay::close`:** it pops the layer, drops the entity, and focuses the recorded handle if it still upgrades. Otherwise it leaves focus alone for the owner.
+  - **The restore is unconditional,** as the spec's "Focus returns when an overlay closes" requires, however the overlay closed. So an outside press on a non-modal layer that lands on another focusable control focuses that control during the press, and the deferred close then focuses the recorded handle (the trigger) again. The pressed control still gets its click, since click handlers don't need focus, but not focus: a second press focuses it.
+  - Focus listeners compare the focus path between frames, and both moves happen before the next frame, so neither the pressed control nor the trigger sees a focus change: a terminal behind a popover sends no focus-in or focus-out report.
+  - Radix's non-modal popover differs: it leaves focus where an outside press put it.
 - **Outside presses and Escape don't close the overlay directly.** They dispatch `Dismiss` to the overlay's view.
   - The default handler, via a `dismiss_on_request()` helper, emits `DismissEvent`.
   - A view can handle `Dismiss` itself to stay open, for example to show an error. This is the "closes only when it agrees" requirement.
@@ -162,6 +166,18 @@ ui/                         package brindle-ui, lib brindle_ui
 - **A crate element (`Anchored`), not GPUI's `anchored`,** because `anchored` knows only corners: it can't centre or shift along one axis.
 - The element lays out its child, then calls a pure `place(trigger, size, viewport, side, align, offset, margin) -> Point`. That function flips to the opposite side when the child doesn't fit, then clamps into the viewport less the margin.
 - **The trigger's bounds** are recorded each frame with `on_children_prepainted` on the trigger wrapper and kept in the popover's keyed state. An opening overlay uses the bounds from the frame that was clicked, which are current.
+  - Recording runs while the frame is drawn, so it notifies nothing. When the trigger moved under an open panel (a resize, say), it asks for one more frame (`request_animation_frame`), whose render places the panel against the new bounds.
+
+### Popover
+
+- **`Popover` is a `RenderOnce` with keyed state** (by its id): the non-modal `Overlay` holding the content view, the trigger's bounds, and whether the popover was open at the last press on the trigger. The content closure builds a fresh view on each opening.
+- **The trigger toggles through its own click.** The trigger closure gets a `PopoverTrigger` and wires its `on_click()` into the trigger's `on_click`, so a button toggles the popover on its click and on enter or space. A handler on the wrapper wouldn't do: gpui's keyboard click reaches only the focused element's own click handlers.
+- **A press on the trigger is an outside press.** It asks an open popover to dismiss, and the dismissal applies before the click on release, which would then find the popover closed and open it again.
+  - The wrapper records on mouse-down (bubble phase: after the panel's outside-press handler, before the deferred dismissal) whether the popover was open. The pure `trigger_action(open, mouse, pressed_open)` turns the click that follows into nothing.
+  - A popover still open when its trigger is clicked (its content refused the dismissal) closes, since activating the trigger again closes it.
+  - Keyboard clicks and calls from code ignore the record, which a press dragged off the trigger can leave behind.
+  - **Alternative considered:** exempting the trigger's bounds from outside presses, as Radix does. It needs a press predicate through `Overlay`'s outside-press handler, and a trigger press would no longer request dismissal, against the spec's "Outside presses dismiss the topmost overlay".
+- **The panel is `PopoverContent`** (shadcn's `bg-popover`, border, `rounded-md`, `w-72`, `p-4`, `shadow-md`), which the content view renders as a dialog's view renders `Dialog`. It must sit inside the layer's panel: a frame wrapped round the panel from outside would leave its padding outside the panel's bounds, where a press counts as outside.
 
 ### List navigation and typeahead
 

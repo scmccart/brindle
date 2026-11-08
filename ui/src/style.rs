@@ -312,6 +312,29 @@ pub fn dialog_style(t: &Tokens) -> DialogStyle {
     }
 }
 
+/// A popover panel's width, shadcn's `w-72`.
+pub const POPOVER_WIDTH: Rems = Rems(18.);
+
+/// A popover panel's resolved colours and radius.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopoverStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub radius: Rems,
+}
+
+/// shadcn's PopoverContent: `bg-popover text-popover-foreground rounded-md
+/// border`.
+pub fn popover_style(t: &Tokens) -> PopoverStyle {
+    PopoverStyle {
+        background: t.popover,
+        foreground: t.popover_foreground,
+        border: t.border,
+        radius: t.radius_md(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +576,23 @@ mod tests {
         // sm:max-w-lg, 1rem from each side, opacity-70, rounded-xs.
         assert_eq!((DIALOG_MAX_WIDTH, DIALOG_EDGE_GAP, DIALOG_CLOSE_RADIUS), (rems(32.), rems(1.), rems(0.125)));
         assert_eq!(DIALOG_CLOSE_OPACITY, 0.7);
+    }
+
+    /// A popover is the popover pair with a border, rounded-md, w-72.
+    #[test]
+    fn popover_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(
+                popover_style(&t),
+                PopoverStyle {
+                    background: t.popover,
+                    foreground: t.popover_foreground,
+                    border: t.border,
+                    radius: t.radius_md(),
+                }
+            );
+        }
+        assert_eq!(POPOVER_WIDTH, rems(18.));
     }
 
     #[test]
