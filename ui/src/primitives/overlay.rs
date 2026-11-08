@@ -27,10 +27,19 @@
 //! (to show an error, say). Only the top layer acts, and the dismissal from
 //! a press is deferred to the end of the event, so a press outside a
 //! popover and the dialog under it closes the popover alone.
+//!
+//! Every opening fades in over [`ENTER_DURATION`], a modal layer's backdrop
+//! with it. The animation is keyed by the slot's open count
+//! ([`enter_animation_id`]), so each opening replays it, even one that
+//! reopens the slot within a frame. There is no exit animation, and no
+//! zoom: gpui 0.2.2 can't transform a `div`.
+
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, Focusable, Hsla, InteractiveElement, IntoElement,
-    ManagedView, ParentElement, Point, Styled, Subscription, WeakFocusHandle, Window, anchored, deferred, div, hsla,
+    Animation, AnimationExt, AnyElement, App, Context, DismissEvent, ElementId, Entity, EventEmitter, Focusable, Hsla,
+    InteractiveElement, IntoElement, ManagedView, ParentElement, Point, Styled, Subscription, WeakFocusHandle, Window,
+    anchored, deferred, div, ease_in_out, hsla,
 };
 
 use crate::actions::Dismiss;
@@ -43,11 +52,24 @@ fn backdrop() -> Hsla {
     hsla(0., 0., 0., 0.5)
 }
 
+/// How long an opening overlay takes to fade in (design.md's Animation:
+/// shadcn's `fade-in-0`, at 150 ms).
+pub const ENTER_DURATION: Duration = Duration::from_millis(150);
+
+/// The id of the entry animation for a slot's `opens`-th opening. gpui
+/// keeps an animation's start time in the element state of its id, so a
+/// new id per opening starts it over.
+pub fn enter_animation_id(opens: u64) -> ElementId {
+    ("ui-layer-enter", opens).into()
+}
+
 /// The slot an owner keeps for one overlay view. Its view's `focus_handle`
 /// must be tracked in the view's tree (`track_focus`), as GPUI's own focus
 /// needs: the dismiss request from a press is dispatched to it.
 pub struct Overlay<V: ManagedView + FocusStops> {
     modal: bool,
+    /// How many times the slot has opened, which keys the entry animation.
+    opens: u64,
     open: Option<Open<V>>,
 }
 
@@ -63,13 +85,13 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     /// A slot for a modal view: it covers the window with a backdrop that
     /// blocks the pointer, and centres the view over it.
     pub fn modal() -> Self {
-        Self { modal: true, open: None }
+        Self { modal: true, opens: 0, open: None }
     }
 
     /// A slot for a non-modal view (a popover): it blocks the pointer only
     /// within its own bounds.
     pub fn non_modal() -> Self {
-        Self { modal: false, open: None }
+        Self { modal: false, opens: 0, open: None }
     }
 
     pub fn is_modal(&self) -> bool {
@@ -116,6 +138,7 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                 cx.notify();
             }
         });
+        self.opens += 1;
         self.open = Some(Open { view, layer, restore, _subscription: subscription });
         cx.notify();
     }
@@ -192,6 +215,10 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
             })
             // Tab stays inside the view.
             .child(FocusScope::new(&view).child(view));
+        // Opacity applies to a div's whole subtree: a modal layer fades in
+        // with its backdrop, a non-modal one by itself.
+        let enter = Animation::new(ENTER_DURATION).with_easing(ease_in_out);
+        let enter_id = enter_animation_id(self.opens);
         let element = if self.modal {
             let size = window.viewport_size();
             // Absolute at the window's origin, so the backdrop covers the
@@ -207,11 +234,12 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(panel),
+                        .child(panel)
+                        .with_animation(enter_id, enter, |backdrop, delta| backdrop.opacity(delta)),
                 )
                 .into_any_element()
         } else {
-            place(panel.into_any_element())
+            place(panel.with_animation(enter_id, enter, |panel, delta| panel.opacity(delta)).into_any_element())
         };
         Some(if lifted { deferred(element).with_priority(depth).into_any_element() } else { element })
     }
@@ -325,6 +353,15 @@ mod tests {
         assert!(wrap_in_deferred(&stack, menu));
         // A layer that isn't open renders inline.
         assert!(!wrap_in_deferred(&stack, popover));
+    }
+
+    /// Each opening gets its own animation id, so the fade replays even
+    /// when a slot reopens before a frame drops the old one's state.
+    #[test]
+    fn each_opening_has_its_own_entry_animation() {
+        assert_ne!(enter_animation_id(1), enter_animation_id(2));
+        assert_eq!(enter_animation_id(3), enter_animation_id(3));
+        assert_eq!(ENTER_DURATION, Duration::from_millis(150));
     }
 
     #[test]

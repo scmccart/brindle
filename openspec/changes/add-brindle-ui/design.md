@@ -203,7 +203,9 @@ ui/                         package brindle-ui, lib brindle_ui
 
 ### Animation
 
-- Dialog and popover entry use `with_animation` (150 ms fade, and for dialogs a 95%→100% zoom), keyed by an open counter so each opening replays.
+- Dialog and popover entry use `with_animation`: a 150 ms fade, keyed by an open counter so each opening replays.
+  - `Overlay` applies it, since it owns the open/close lifecycle: it counts its openings (`enter_animation_id(opens)`) and fades the panel, or for a modal layer the backdrop with the panel in it, as shadcn fades both. A counter rather than a fixed id, because element state lives as long as the element is rendered in consecutive frames: a slot closed and reopened between two frames would keep a fixed id's start time and not replay.
+  - **No zoom.** shadcn's `zoom-in-95` isn't available: gpui 0.2.2 transforms only `svg` (`with_transformation`), not a `div`. Scaling the rem size for the panel would approximate it, but reflows and re-rasterizes its text at a new size every frame for the animation's length, so it isn't done.
 - **No exit animation.** GPUI animates only on mount, so animating out needs the element kept mounted until a timer fires (a Presence primitive). That is deferred until a migration wants it.
 
 ### Testing

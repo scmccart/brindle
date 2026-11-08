@@ -275,6 +275,43 @@ pub fn switch_thumb_offset(checked: bool) -> Rems {
     if checked { Rems(SWITCH_TRACK_WIDTH.0 - 2. * SWITCH_TRACK_BORDER.0 - SWITCH_THUMB_SIZE.0) } else { Rems(0.) }
 }
 
+/// A dialog's widest, shadcn's `sm:max-w-lg`.
+pub const DIALOG_MAX_WIDTH: Rems = Rems(32.);
+
+/// The least room between a dialog and each side of the window: shadcn's
+/// `max-w-[calc(100%-2rem)]`, halved.
+pub const DIALOG_EDGE_GAP: Rems = Rems(1.);
+
+/// The close button's opacity at rest, shadcn's `opacity-70`. It is opaque
+/// on hover.
+pub const DIALOG_CLOSE_OPACITY: f32 = 0.7;
+
+/// The close button's corner radius, shadcn's `rounded-xs` (2px).
+pub const DIALOG_CLOSE_RADIUS: Rems = Rems(0.125);
+
+/// A dialog panel's resolved colours and radius.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DialogStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub radius: Rems,
+    /// The description's text.
+    pub description: Hsla,
+}
+
+/// shadcn's DialogContent (`bg-background rounded-lg border`), in the
+/// foreground colour, with DialogDescription's `text-muted-foreground`.
+pub fn dialog_style(t: &Tokens) -> DialogStyle {
+    DialogStyle {
+        background: t.background,
+        foreground: t.foreground,
+        border: t.border,
+        radius: t.radius_lg(),
+        description: t.muted_foreground,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +532,27 @@ mod tests {
         assert_eq!(switch_thumb_offset(true).0 + SWITCH_THUMB_SIZE.0 + SWITCH_TRACK_BORDER.0, inner_right);
         // And it fits the track's height.
         assert!(SWITCH_THUMB_SIZE.0 <= SWITCH_TRACK_HEIGHT.0 - 2. * SWITCH_TRACK_BORDER.0 + f32::EPSILON);
+    }
+
+    /// A dialog is the background colour with a border, rounded-lg, and
+    /// its description is muted.
+    #[test]
+    fn dialog_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(
+                dialog_style(&t),
+                DialogStyle {
+                    background: t.background,
+                    foreground: t.foreground,
+                    border: t.border,
+                    radius: t.radius_lg(),
+                    description: t.muted_foreground,
+                }
+            );
+        }
+        // sm:max-w-lg, 1rem from each side, opacity-70, rounded-xs.
+        assert_eq!((DIALOG_MAX_WIDTH, DIALOG_EDGE_GAP, DIALOG_CLOSE_RADIUS), (rems(32.), rems(1.), rems(0.125)));
+        assert_eq!(DIALOG_CLOSE_OPACITY, 0.7);
     }
 
     #[test]

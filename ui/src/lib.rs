@@ -20,8 +20,8 @@ pub use components::*;
 pub use icon::{Icon, IconElement};
 pub use primitives::*;
 pub use style::{
-    ButtonSize, ButtonStyle, ButtonVariant, CheckboxStyle, InputStyle, SwitchStyle, button_style, checkbox_style,
-    focus_ring, input_style, switch_style, switch_thumb_offset,
+    ButtonSize, ButtonStyle, ButtonVariant, CheckboxStyle, DialogStyle, InputStyle, SwitchStyle, button_style,
+    checkbox_style, dialog_style, focus_ring, input_style, switch_style, switch_thumb_offset,
 };
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Tokens, UiTheme};
