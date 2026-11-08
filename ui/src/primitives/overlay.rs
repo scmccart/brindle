@@ -139,10 +139,12 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     }
 
     /// [`Overlay::render`] with `place` applied to a non-modal view's panel
-    /// first: a popover wraps the panel in an `Anchored` to put it beside
+    /// first: a popover wraps the panel in an [`Anchored`] to put it beside
     /// its trigger. A modal view is centred by its backdrop, so `place` is
     /// skipped. The result is deferred only for the bottom layer and
     /// renders inline above it, so what `place` returns must work in both.
+    ///
+    /// [`Anchored`]: crate::primitives::placement::Anchored
     pub fn render_with(
         &self,
         place: impl FnOnce(AnyElement) -> AnyElement,
