@@ -174,3 +174,18 @@ While the filter input has focus, up and down (also ctrl-p and ctrl-n) SHALL mov
 #### Scenario: Wrapping
 - **WHEN** the last item is highlighted and the user presses down
 - **THEN** the first item is highlighted
+
+### Requirement: Command separators
+A command list's owner SHALL be able to place a separator between two adjacent groups. A separator SHALL be drawn as a 1px line in the border colour across the full width of the list, past the groups' padding. A separator SHALL show only while both groups beside it list items under the current filter, so it SHALL never show above the first row, below the last row, or next to another separator. A separator SHALL NOT be highlighted or confirmed, and up and down SHALL pass over it.
+
+#### Scenario: Separator between groups
+- **WHEN** a command list has groups `Tabs` and `Panes` with a separator between them, and the filter is empty
+- **THEN** a line in the border colour spans the list's width between the last row of `Tabs` and the heading of `Panes`
+
+#### Scenario: A group beside the separator is filtered out
+- **WHEN** a command list has groups `Tabs` and `Panes` with a separator between them, and the user types text that matches items in `Panes` only
+- **THEN** no separator shows, and the `Panes` heading is the first row
+
+#### Scenario: Moving past a separator
+- **WHEN** the last item of `Tabs` is highlighted, a separator follows `Tabs`, and the user presses down
+- **THEN** the first enabled item of the next group is highlighted
