@@ -1,15 +1,11 @@
-//! One window per tmux session: attaching a session another window shows
-//! asks first, new windows don't mirror it, "tmux: New Session" creates
-//! sessions, and restore attaches each session once.
+//! One window shows each tmux session once: opening a profile whose
+//! session it shows switches to its tab, "tmux: New Session" creates
+//! sessions, and restoring an old state file with several windows attaches
+//! each session once, in the one window.
 
 use super::server;
-use crate::brindle::{Output, Run, state_dir};
+use crate::brindle::{Run, state_dir};
 use crate::{Ctx, Outcome, Result, ensure};
-
-/// The palette's row labels, without details and shortcuts.
-fn rows(out: &Output) -> Vec<String> {
-    out.dump.palette.iter().skip(1).map(|r| r.split("  ").next().unwrap_or(r).to_string()).collect()
-}
 
 /// How many clients `list-clients` recorded for the session.
 fn clients(ctx: &Ctx, label: &str) -> Result<usize> {
@@ -17,112 +13,6 @@ fn clients(ctx: &Ctx, label: &str) -> Result<usize> {
 }
 
 const LIST_CLIENTS: &[&str] = &["list-clients", "-t", "e2e"];
-
-/// Window 1 is a shell; ctrl-shift-n opens window 2 on the session (the
-/// default profile). Picking that profile again in window 1 asks; "Go to"
-/// leaves window 1 as it was and attaches nothing.
-pub fn open_elsewhere_goto(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let ask = |label| {
-        Run::new(ctx, &server, label)
-            .profile("Shell")
-            .action("new_window")
-            .send("")
-            .action("new_tab_with_profile_2")
-    };
-    let out = ask("ask").record_at(5.0, "clients", LIST_CLIENTS).dump_at(5.5).run()?;
-    let rows = rows(&out);
-    ensure!(rows.first().is_some_and(|r| r == "Go to e2e"), "palette: {:?}", out.dump.palette);
-    ensure!(rows.iter().any(|r| r == "New tmux session…"), "palette: {:?}", out.dump.palette);
-    ensure!(out.dump.tabs.len() == 1, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.len() == 1, "windows: {:?}", out.dump.windows);
-    ensure!(clients(ctx, "ask")? == 1, "clients: {:?}", Run::recorded(ctx, "ask", "clients")?);
-
-    let out = ask("goto").action("picker_confirm").record_at(6.0, "clients", LIST_CLIENTS).dump_at(6.5).run()?;
-    ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
-    ensure!(out.dump.tabs.len() == 1, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1.len() == 1, "windows: {:?}", out.dump.windows);
-    ensure!(clients(ctx, "goto")? == 1, "clients: {:?}", Run::recorded(ctx, "goto", "clients")?);
-    Ok(Outcome::Pass)
-}
-
-/// Picking that profile in window 1's picker, whose row says it switches,
-/// goes to window 2 without asking.
-pub fn picker_goes_to_session(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .profile("Shell")
-        .action("new_window")
-        .send("")
-        .action("open_profile_picker")
-        .send("")
-        .action("picker_down")
-        .action("picker_confirm")
-        .record_at(8.0, "clients", LIST_CLIENTS)
-        .dump_at(8.5)
-        .run()?;
-    ensure!(out.dump.palette.is_empty(), "a palette is open: {:?}", out.dump.palette);
-    ensure!(out.dump.tabs.len() == 1, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1.len() == 1, "windows: {:?}", out.dump.windows);
-    ensure!(clients(ctx, "run")? == 1, "clients: {:?}", Run::recorded(ctx, "run", "clients")?);
-    Ok(Outcome::Pass)
-}
-
-/// ctrl-shift-n with the default profile's session open asks instead of
-/// mirroring it; choosing another profile opens that in the new window.
-pub fn new_window_asks(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let ask = |label| Run::new(ctx, &server, label).send("").action("new_window");
-    let out = ask("ask").dump_at(4.0).run()?;
-    ensure!(rows(&out) == ["Go to e2e", "New tmux session…", "New window: Shell"], "palette: {:?}", out.dump.palette);
-    ensure!(out.dump.windows.is_empty(), "a window opened: {:?}", out.dump.windows);
-
-    let out = ask("shell")
-        .action("picker_down")
-        .action("picker_down")
-        .action("picker_confirm")
-        .record_at(6.5, "clients", LIST_CLIENTS)
-        .dump_at(7.0)
-        .run()?;
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1.len() == 1, "windows: {:?}", out.dump.windows);
-    ensure!(out.dump.windows[0].1[0] == "bash", "window 2 tabs: {:?}", out.dump.windows);
-    ensure!(clients(ctx, "shell")? == 1, "clients: {:?}", Run::recorded(ctx, "shell", "clients")?);
-    Ok(Outcome::Pass)
-}
-
-/// Escape on that palette opens nothing.
-pub fn open_elsewhere_dismiss(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .send("")
-        .action("new_window")
-        .action("picker_cancel")
-        .dump_at(5.0)
-        .run()?;
-    ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
-    ensure!(out.dump.windows.is_empty(), "a window opened: {:?}", out.dump.windows);
-    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
-    Ok(Outcome::Pass)
-}
-
-/// "New tmux session…" from the ctrl-shift-n palette opens a new window on
-/// a new session of the same server.
-pub fn new_window_new_session(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .send("")
-        .action("new_window")
-        .action("picker_down")
-        .action("picker_confirm")
-        .send("scratch")
-        .action("picker_confirm")
-        .dump_at(9.0)
-        .run()?;
-    server.run(&["has-session", "-t", "=scratch"]).map_err(|e| format!("no session scratch: {e}"))?;
-    ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
-    ensure!(out.dump.windows.len() == 1 && out.dump.windows[0].1.len() == 1, "windows: {:?}", out.dump.windows);
-    Ok(Outcome::Pass)
-}
 
 /// The profile picker says when a control-mode profile's session is open.
 pub fn profile_picker_state(ctx: &Ctx) -> Result<Outcome> {
@@ -162,7 +52,6 @@ pub fn new_session(ctx: &Ctx) -> Result<Outcome> {
     server.run(&["has-session", "-t", "=work"]).map_err(|e| format!("no session work: {e}"))?;
     ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
     ensure!(out.dump.tabs.len() == 2, "tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows.is_empty(), "a window opened: {:?}", out.dump.windows);
     Ok(Outcome::Pass)
 }
 
@@ -188,9 +77,46 @@ pub fn new_session_duplicate(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// A state file recording the session in two windows attaches it once:
-/// the second window keeps only its local tab.
-pub fn restore_dedupe(ctx: &Ctx) -> Result<Outcome> {
+/// With a shell tab and the session's tab, ctrl-alt-2 (the session's
+/// profile) from the shell, and then picking the profile in the picker,
+/// switch to the session's tab: no second tab, no second client.
+pub fn shown_switches(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    let shortcut = Run::new(ctx, &server, "shortcut")
+        .profile("Shell")
+        .action("new_tab_with_profile_2")
+        .send("")
+        .action("prev_tab")
+        .action("new_tab_with_profile_2")
+        .record_at(6.0, "clients", LIST_CLIENTS)
+        .dump_at(6.5)
+        .run()?;
+    ensure!(shortcut.dump.palette.is_empty(), "a palette is open: {:?}", shortcut.dump.palette);
+    ensure!(shortcut.dump.tabs.len() == 2 && shortcut.dump.tabs[1].1, "tabs: {:?}", shortcut.dump.tabs);
+    ensure!(clients(ctx, "shortcut")? == 1, "clients: {:?}", Run::recorded(ctx, "shortcut", "clients")?);
+
+    let picker = Run::new(ctx, &server, "picker")
+        .profile("Shell")
+        .action("new_tab_with_profile_2")
+        .send("")
+        .action("prev_tab")
+        .action("open_profile_picker")
+        .send("")
+        .action("picker_down")
+        .action("picker_confirm")
+        .record_at(8.0, "clients", LIST_CLIENTS)
+        .dump_at(8.5)
+        .run()?;
+    ensure!(picker.dump.palette.is_empty(), "a palette is open: {:?}", picker.dump.palette);
+    ensure!(picker.dump.tabs.len() == 2 && picker.dump.tabs[1].1, "tabs: {:?}", picker.dump.tabs);
+    ensure!(clients(ctx, "picker")? == 1, "clients: {:?}", Run::recorded(ctx, "picker", "clients")?);
+    Ok(Outcome::Pass)
+}
+
+/// A state file from before Brindle had one window, recording the session
+/// in two windows, comes back as one window: the session once, then the
+/// second window's local tab.
+pub fn restore_merge(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let dir = state_dir(ctx);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -200,8 +126,8 @@ pub fn restore_dedupe(ctx: &Ctx) -> Result<Outcome> {
     let state = format!("version = 1\n\n{}{tmux}\n{}{tmux}{local}", window(0), window(1));
     std::fs::write(dir.join("session.toml"), state).map_err(|e| e.to_string())?;
     let out = Run::new(ctx, &server, "run").restore().record_at(4.5, "clients", LIST_CLIENTS).dump_at(5.0).run()?;
-    ensure!(out.dump.tabs.len() == 1, "window 1 tabs: {:?}", out.dump.tabs);
-    ensure!(out.dump.windows == [(2, vec!["bash".to_string()])], "windows: {:?}", out.dump.windows);
+    let titles: Vec<&str> = out.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
+    ensure!(titles.len() == 2 && titles[1] == "bash", "tabs: {:?}", out.dump.tabs);
     ensure!(clients(ctx, "run")? == 1, "clients: {:?}", Run::recorded(ctx, "run", "clients")?);
     Ok(Outcome::Pass)
 }

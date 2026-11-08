@@ -179,7 +179,7 @@ enum Backend {
     },
     /// A session of the local terminal server.
     #[cfg(target_os = "linux")]
-    Server { session: crate::remote::local::Session },
+    Server { session: crate::remote::local::Session, closing: Closing },
     /// A tmux pane whose stream and input are owned by `TmuxSession`.
     Remote {
         scanner: Scanner,
@@ -193,6 +193,32 @@ enum Backend {
         foreground_name: Option<String>,
         cwd: Option<std::path::PathBuf>,
     },
+}
+
+/// What happens to a local Linux terminal's program when Brindle goes away
+/// without closing it (quit, a crash, the desktop stopping Brindle). The
+/// user closing the terminal always ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closing {
+    /// It keeps running, detached, and the next launch attaches it.
+    Keeps,
+    /// It ends: a command given instead of the profile's program (`-e`, a
+    /// classic tmux attach), which is never restored or reattached.
+    Ends,
+}
+
+impl Closing {
+    pub fn new(command_override: bool) -> Self {
+        if command_override { Self::Ends } else { Self::Keeps }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn policy(self) -> crate::remote::protocol::client::Policy {
+        match self {
+            Self::Ends => crate::remote::protocol::client::Policy::Kill,
+            Self::Keeps => crate::remote::protocol::client::Policy::Detach,
+        }
+    }
 }
 
 /// Answers a remote terminal's palette query (OSC 4): given the index and
@@ -376,6 +402,11 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A command given instead of the profile's program (`-e`, or a classic
+        // tmux attach) is never restored or reattached, so it ends with its
+        // tab and with Brindle. Everything else keeps running when Brindle
+        // goes away without closing it.
+        let closing = Closing::new(command_override.is_some());
         let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
             Some(program) => (program.clone(), profile.args.clone()),
             None => default_program(&profile.args),
@@ -397,6 +428,8 @@ impl Terminal {
             cell_w: GridSize::default().cell_width,
             cell_h: GridSize::default().cell_height,
             scrollback: u32::try_from(config.scrollback_lines).unwrap_or(u32::MAX),
+            policy: closing.policy(),
+            profile: Some(profile.name.clone()),
         };
         #[cfg(windows)]
         let command = conpty::Command {
@@ -416,12 +449,13 @@ impl Terminal {
         // failure is shown in the terminal then.
         #[cfg(target_os = "linux")]
         let spawned: anyhow::Result<Backend> = {
-            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, program.clone());
-            Ok(Backend::Server { session: crate::remote::local::Session::start(request, Box::new(sink)) })
+            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("start {program:?}"));
+            let session = crate::remote::local::Session::start(request, Box::new(sink));
+            Ok(Backend::Server { session, closing })
         };
         #[cfg(all(unix, not(target_os = "linux")))]
         let spawned: anyhow::Result<Backend> = {
-            let _ = (listener, args, working_directory);
+            let _ = (listener, args, working_directory, closing);
             Err(anyhow::anyhow!("local terminals run in the terminal server, which needs Linux"))
         };
         #[cfg(windows)]
@@ -444,6 +478,35 @@ impl Terminal {
                 Self::message(&text, theme, config, cx)
             }
         }
+    }
+
+    /// Attaches a detached session of the local terminal server: its replay,
+    /// quiet (no bell or notification), then its live output. It closes as
+    /// a spawned profile terminal does. Returns at once, like a spawn; a
+    /// refused attach shows in the terminal.
+    #[cfg(target_os = "linux")]
+    pub fn attach(
+        request: crate::remote::local::AttachRequest,
+        what: String,
+        profile: &Profile,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (tx, rx) = unbounded();
+        let output = Arc::new(OutputMarker::default());
+        let listener = Listener(tx, output.clone());
+        // The session's size: the replay is rendered at it, and the first
+        // layout resizes the session only if the window's grid differs.
+        let size = GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() };
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
+        let parser = Arc::new(Mutex::new(Parser::new()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("attach session {} ({what})", request.session))
+            .replayed_at(size);
+        let session = crate::remote::local::Session::attach(request, Box::new(sink));
+        let backend = Backend::Server { session, closing: Closing::Keeps };
+        let theme = config.profile_theme(profile);
+        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
     }
 
     fn spawn_remote(
@@ -938,7 +1001,7 @@ impl Terminal {
             #[cfg(windows)]
             Backend::Pty { process, .. } => process.foreground_name(snapshot),
             #[cfg(target_os = "linux")]
-            Backend::Server { session } => {
+            Backend::Server { session, .. } => {
                 session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
             }
             Backend::Agent { handle, foreground_name, .. } => {
@@ -973,7 +1036,7 @@ impl Terminal {
                 self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
             }
             #[cfg(target_os = "linux")]
-            Backend::Server { session } => {
+            Backend::Server { session, .. } => {
                 session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
             }
             Backend::Agent { cwd, .. } => {
@@ -988,21 +1051,44 @@ impl Terminal {
         screen_text(&self.term.lock())
     }
 
-    pub fn shutdown(&mut self) {
+    /// The user closed the terminal: its program ends. Once is enough:
+    /// later calls, and the drop, do nothing.
+    pub fn close(&mut self) {
+        self.leave(true);
+    }
+
+    /// Ends the terminal's connection to its program: `close` ends the
+    /// program; otherwise a local Linux terminal's program is left as its
+    /// [`Closing`] says, and any other terminal's ends.
+    fn leave(&mut self, close: bool) {
         match &self.backend {
             #[cfg(windows)]
             Backend::Pty { sender, .. } => _ = sender.send(Msg::Shutdown),
             #[cfg(target_os = "linux")]
-            Backend::Server { session, .. } => session.close(),
+            Backend::Server { session, closing } => match (close, closing) {
+                (false, Closing::Keeps) => session.detach(),
+                _ => session.close(),
+            },
             Backend::Agent { handle, .. } => handle.close(),
             Backend::Remote { .. } => {}
+        }
+        let _ = close;
+    }
+
+    /// The terminal server session (id and key) this terminal shows, once
+    /// it exists and while its program runs.
+    #[cfg(target_os = "linux")]
+    pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
+        match &self.backend {
+            Backend::Server { session, .. } if !self.exited => session.id_and_key(),
+            _ => None,
         }
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.shutdown();
+        self.leave(false);
     }
 }
 
@@ -1290,6 +1376,19 @@ mod tests {
         listener.send_event(AlacEvent::Wakeup);
         assert_eq!(marker.generation(), 2);
         assert!(marker.at() >= before && marker.at() <= Instant::now());
+    }
+
+    #[test]
+    fn profile_terminals_outlive_brindle_and_commands_end_with_it() {
+        assert_eq!(Closing::new(false), Closing::Keeps);
+        // `-e` and classic tmux attaches are never restored.
+        assert_eq!(Closing::new(true), Closing::Ends);
+        #[cfg(target_os = "linux")]
+        {
+            use crate::remote::protocol::client::Policy;
+            assert_eq!(Closing::Keeps.policy(), Policy::Detach);
+            assert_eq!(Closing::Ends.policy(), Policy::Kill);
+        }
     }
 
     #[test]

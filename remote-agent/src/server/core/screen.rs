@@ -43,6 +43,11 @@ impl Screen {
         }
     }
 
+    /// The program's title; empty when it set none or the emulator broke.
+    pub(super) fn title(&self) -> String {
+        self.emulator.as_ref().and_then(Emulator::title).unwrap_or_default()
+    }
+
     /// Feeds the session's output.
     pub(super) fn feed(&mut self, id: SessionId, bytes: &[u8]) {
         self.since_checkpoint += bytes.len() as u64;

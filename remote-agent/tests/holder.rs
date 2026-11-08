@@ -37,7 +37,7 @@ fn a_new_holder_is_detached_and_welcomes_its_first_core() {
     let adopted = core.hello(1);
     let welcome = adopted.welcome();
     dir.track(welcome.pid);
-    assert_eq!(welcome.protocol, 1);
+    assert_eq!(welcome.protocol, h1::PROTOCOLS.max);
     assert_eq!(welcome.previous, Previous::None);
     assert!(welcome.sessions.is_empty());
     assert!(!welcome.build.is_empty());
@@ -416,6 +416,38 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
 }
 
 #[test]
+fn set_meta_replaces_what_the_next_core_gets() {
+    let (dir, mut first, _) = holder("set-meta");
+    assert_eq!(h1::PROTOCOLS.max, 2, "SET_META is H1 version 2");
+    let mut request = shell(1, "read x");
+    request.meta = meta().meta;
+    first.spawn(request);
+    let updated = h1::SessionMeta {
+        policy: brindle_remote_protocol::client::Policy::Detach,
+        ..h1::SessionMeta::default()
+    }
+    .to_value();
+    first.send(ToHolder::SetMeta(h1::SetMeta {
+        session: 1,
+        meta: updated.clone(),
+    }));
+    // An unknown session is no error: it may just have ended.
+    first.send(ToHolder::SetMeta(h1::SetMeta {
+        session: 99,
+        meta: updated.clone(),
+    }));
+    first.input(1, b"");
+    drop(first);
+
+    let mut second = TestCore::connect_to(&dir);
+    let adopted = second.hello(2);
+    let welcome = adopted.welcome();
+    assert_eq!(welcome.protocol, 2);
+    assert_eq!(welcome.sessions[0].meta, updated);
+    second.input(1, b"\n");
+}
+
+#[test]
 fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
     let (dir, mut core, _) = holder("covers");
     core.spawn(spawn(1, "cat", &[]));
@@ -589,7 +621,7 @@ fn a_holder_without_a_core_starts_one_from_its_own_binary_even_after_it_was_repl
     );
     let logs = dir.logs();
     assert!(!logs.contains("replaced binary ran"), "{logs}");
-    assert!(logs.contains("started /proc/self/exe --version"), "{logs}");
+    assert!(logs.contains(&format!("started /proc/{holder_pid}/exe --version")), "{logs}");
 
     // A core that connects stops the retries and keeps the session.
     let mut core = TestCore::connect_to(&dir);

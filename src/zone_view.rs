@@ -504,6 +504,21 @@ impl ZoneTreeView {
         zone.content.as_terminal_view().read(cx).terminal.read(cx).working_directory()
     }
 
+    /// The terminal server session zone `id` shows, for session restore.
+    pub fn zone_server_session(&self, id: ZoneId, cx: &App) -> Option<crate::session::ServerSession> {
+        #[cfg(target_os = "linux")]
+        {
+            let zone = self.zones.get(&id)?;
+            let (id, key) = zone.content.as_terminal_view().read(cx).terminal.read(cx).server_session()?;
+            Some(crate::session::ServerSession { id, key })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, cx);
+            None
+        }
+    }
+
     /// Automatic title for the active zone (used for the tab's automatic title).
     pub fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
         let Some(zone) = self.zones.get(&self.active) else {
@@ -560,17 +575,18 @@ impl ZoneTreeView {
         cx.notify();
     }
 
-    /// Shuts down every zone's terminal when the tab itself is removed.
+    /// Closes every zone's terminal, ending its program, when the user
+    /// closes the tab.
     pub fn shutdown_all(&mut self, cx: &mut Context<Self>) {
         self.shutting_down = true;
-        let terminals: Vec<Entity<Terminal>> = self
-            .zones
-            .values()
-            .map(|z| z.content.as_terminal_view().read(cx).terminal.clone())
-            .collect();
-        for terminal in terminals {
-            terminal.update(cx, |t, _| t.shutdown());
+        for terminal in self.terminals(cx) {
+            terminal.update(cx, |t, _| t.close());
         }
+    }
+
+    /// Every zone's terminal.
+    pub fn terminals(&self, cx: &App) -> Vec<Entity<Terminal>> {
+        self.zones.values().map(|z| z.content.as_terminal_view().read(cx).terminal.clone()).collect()
     }
 
     pub fn describe_zones(&self) -> String {
@@ -646,9 +662,10 @@ impl ZoneTreeView {
         cx.notify();
     }
 
+    /// Closes zone `target`, ending its terminal's program.
     pub fn close_zone_by_id(&mut self, target: ZoneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(removed) = self.zones.remove(&target) else { return };
-        removed.content.as_terminal_view().read(cx).terminal.clone().update(cx, |t, _| t.shutdown());
+        removed.content.as_terminal_view().read(cx).terminal.clone().update(cx, |t, _| t.close());
 
         if self.zones.is_empty() {
             cx.emit(TerminalEvent::Exited);

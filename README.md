@@ -117,26 +117,43 @@ beside `brindle`. Without it, a new tab says so and tries again for the next
 one. The release archive and `scripts/install.sh` ship it. Windows tabs don't
 use the server yet.
 
-Tabs close their session with them (this release never leaves a session
-running on purpose). A session also ends when its program exits, and if
-Brindle's connection drops (say the core crashes) the tabs reconnect and get
-their screens back; a session the server no longer has shows a red "session
-lost" line and the tab stays open.
+Closing a zone or a tab ends its programs. Quitting Brindle (ctrl-shift-q,
+closing its window, a crash, or the desktop stopping it at logout) leaves
+every local tab's programs running in the server, detached, and the next
+launch attaches them again. A command run with `brindle -e` ends at quit instead. A session
+also ends when its program exits, and if Brindle's connection drops (say the
+core crashes) the tabs reconnect and get their screens back; a session the
+server no longer has shows a red "session lost" line and the tab stays open.
+
+Every launch except `--no-restore` attaches the detached sessions, quietly (a
+replayed bell or notification doesn't fire again): restored zones take back
+their own sessions ([session restore](#session-restore)), and any others
+(sessions a `--no-restore` launch left, say) open as tabs after them, oldest
+first. To pick one by hand, "Attach Session…" in the command palette lists
+the detached sessions, newest first, with their directory and age: enter
+attaches one into a new tab, ctrl-shift-delete ends the selected one.
+`brindle --attach ID` opens session `ID` (from `brindle-remote list`) as a
+tab, or a tab saying why it can't.
+
+The server's roles run in systemd scopes of their own
+(`brindle-serve-*.scope`, `brindle-hold-*.scope`) when there is a systemd
+user manager, so logging out of a desktop that stops Brindle's app scope
+doesn't take the sessions with it. `BRINDLE_NO_SCOPE=1` starts them without
+one.
 
 When a Brindle whose `brindle-remote` is newer than the running core (after a
 reinstall, say) opens its first local tab, it hands the sessions over to a core
-of the new build, so tabs in other Brindle windows and their programs carry
-on. `brindle-remote status` then shows the
-old holders draining until their sessions end.
+of the new build, and their programs carry on. `brindle-remote status` then
+shows the old holders draining until their sessions end.
 
 These commands manage the server of that directory, and never start one:
 
 ```sh
-brindle-remote list [--json]     # id, pid, attached/detached, command, directory
+brindle-remote list [--json]     # id, pid, attached/detached, policy, age, title, command, directory
 brindle-remote kill ID           # hang one session up (kill --all for every one)
 brindle-remote status [--json]   # the core's version, pid and uptime, and its holders
 brindle-remote stop              # hang every session up; the core and holders exit
-brindle-remote check --holder-protocols 1   # whether this binary can take those holders over
+brindle-remote check --holder-protocols 1,2   # whether this binary can take those holders over
 ```
 
 With no server running, `list` prints nothing and `status` says so.
@@ -323,8 +340,8 @@ PREFIX=/usr/local scripts/install.sh   # system-wide; builds as you, uses sudo o
 
 The script always installs under `$PREFIX/share`, even if `XDG_DATA_HOME` is
 set; `brindle --install-desktop` on its own follows `XDG_DATA_HOME`. To update,
-re-run the script. Windows that are already open keep running the
-old build; new windows get the new one.
+re-run the script. A Brindle that is already running keeps running the
+old build until it quits; launching it again only raises it.
 
 With cargo, the binary registers itself:
 
@@ -383,9 +400,18 @@ writes its WinGet manifest.
 
 ```
 brindle [-p PROFILE] [-d DIR] [--no-restore] [-e COMMAND ARGS...]
+brindle --attach ID                 # Linux: a detached terminal server session
 brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish
 brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
+
+Brindle has one window. Launching it again while it runs (from the desktop or
+a shell) hands the launch to the running Brindle and exits: the window comes
+to the front, and `-p`, `-d`, `-e` or `--attach` open their tab there as the
+active one, with `-e` starting in the directory it was typed in. A launch with
+the debug options (`--send`, `--action`, `--dump-screen-after`, …) runs on its
+own instead, restoring nothing and recording nothing. Brindles with different
+`BRINDLE_STATE_DIR`s are separate.
 
 On first launch Brindle writes a commented config to
 `~/.config/brindle/config.toml`. The file is reloaded automatically when it changes.
@@ -407,7 +433,6 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
-| ctrl-shift-n | new window (asks first if it would show a tmux session another window shows) |
 | ctrl-shift-, | settings (general options, profiles, theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
 
@@ -480,30 +505,34 @@ get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.
 
 ### Session restore
 
-With `restore_session = true` in the config (it is off by default), launching
-`brindle` with none of `-p`, `-d` or `-e` reopens the windows and tabs you had
-when it last quit:
+Every launch reopens the tabs you had when Brindle last quit (the old
+`restore_session` setting is ignored; restoring is always on), then opens
+what it asked for (`-p`, `-d`, `-e` or `--attach`) as the active tab:
 
-- each window's size, its tabs in order, and its active tab;
+- the window's size, its tabs in order, and its active tab;
 - each tab's profile and zone split tree, with each zone in its shell's last directory and the active zone focused;
 - classic tmux tabs, which reattach to their session;
 - control-mode sessions, attached once each. Their windows come back as tabs
   where they were, and tmux's current window and panes are left as they are.
-  A session recorded in more than one window comes back in the first of them
-  only, and a window left with nothing else isn't reopened.
 
-Scrollback and running programs are not restored: shells start fresh in
-their directory. `brindle --no-restore` skips restoring once.
+On Linux, a local tab or zone gets its terminal server session back: the same
+program, still running, with its screen and scrollback. A zone whose session
+has ended since (after a reboot or `brindle-remote stop`, say) isn't restored:
+the other side of its split takes its place, and a tab with nothing left is
+dropped. When nothing at all is left, Brindle opens one tab with the default
+profile. On Windows, and for remote profiles, shells start fresh in the
+recorded directory. A state file written by more than one window (before
+Brindle had one) comes back as one window, with the first window's size.
+`brindle --no-restore` skips restoring once, and leaves the detached
+sessions alone.
 
 The state is written to `~/.local/state/brindle/session.toml`
 (`$XDG_STATE_HOME/brindle/`, or `$BRINDLE_STATE_DIR` when it is set) a second
 or two after anything changes, and again on quit, so a crash or logout loses
 at most the last couple of seconds. If a profile or directory has gone
 since then, the default profile or the home directory is used. A tmux session
-that no longer exists is created again. Closing a window's last tab forgets
-that window, and quitting keeps everything that is open. While one Brindle is
-running, launching another one opens a normal window and doesn't touch the
-saved session.
+that no longer exists is created again. Closing the last tab forgets the
+tabs, and quitting keeps everything that is open.
 
 ### Shell integration
 
@@ -639,12 +668,11 @@ exiting, its tabs close. If they were all the window had, `tmux_session_end`
 decides what happens next:
 
 - `"close_window"` (the default): the window closes, as when a local tab's shell
-  exits. Closing the last window quits Brindle.
+  exits, which quits Brindle.
 - `"new_tab"`: a tab with your default profile opens in their place, or with the
   first non-tmux profile if the default is a control-mode one.
 - `"ask"`: a palette offers "Close window", or a new tab with any profile.
-  Escape closes the window. A control-mode profile whose session another
-  window shows is offered as "Go to <session>" instead.
+  Escape closes the window.
 
 It can also be changed in the settings dialog's General section.
 
@@ -665,23 +693,15 @@ tmux_args = ["tmux"]
 start in tmux's default directory, because a Windows tab's directory means
 nothing inside WSL.
 
-Each session is shown by one window at most. Picking a control-mode profile
-whose session this window shows just switches to its tab. The new-tab palette
-marks a control-mode profile whose session is open with "open in this window"
-or "in another window (switches)", and picking the latter switches
-to that window's tab and brings the window up. Anywhere you can't see that
-note, Brindle doesn't attach the session a second time or switch windows by
-itself: a palette asks what to do instead. That happens with the profile's
-ctrl-alt-N, when ctrl-shift-t would open it as the default profile, and when
-ctrl-shift-n would (for a new window, a session shown in any window counts).
-Its rows are:
+Each session is shown at most once. Picking a control-mode profile whose
+session the window shows switches to its tab, and the new-tab palette marks
+such a profile with "open in this window"; ctrl-alt-N and ctrl-shift-t do the
+same. Brindle doesn't attach a session that another Brindle (a debug run, or
+one with another `BRINDLE_STATE_DIR`) shows: a palette asks what to do
+instead, with these rows:
 
-- "Go to <session>": switch to that session's tab and bring its window up
-  (on Wayland the desktop may only flag the window instead, when the
-  switch didn't come from a key press or click);
 - "New tmux session…": create a new session instead (see below);
-- "New tab: <profile>" for your other profiles ("New window: …" after
-  ctrl-shift-n).
+- "New tab: <profile>" for your other profiles.
 
 Escape or a click outside does nothing. Profiles with the same `command`,
 `tmux_args` and `tmux_session` count as the same session.

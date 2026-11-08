@@ -12,6 +12,8 @@
 pub mod build_id;
 pub mod client;
 pub mod holder;
+#[cfg(unix)]
+pub mod scope;
 pub mod server_dir;
 pub mod version;
 mod wire;

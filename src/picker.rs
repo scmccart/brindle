@@ -11,13 +11,15 @@ use gpui::{
     Task, Window, div, px,
 };
 
-use crate::actions::{PickerCancel, PickerConfirm, PickerDown, PickerUp};
+use crate::actions::{PickerCancel, PickerConfirm, PickerDown, PickerKill, PickerUp};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 
 pub enum PaletteEvent {
     /// A row was chosen; the index is into the rows the palette was built with.
     Confirmed(usize),
+    /// `picker_kill` on a row (only the sessions palette acts on it).
+    Kill(usize),
     Dismissed,
 }
 
@@ -221,6 +223,14 @@ impl Palette {
         self.move_selection(true, cx);
     }
 
+    fn kill(&mut self, _: &PickerKill, _: &mut Window, cx: &mut Context<Self>) {
+        if let Mode::List(list) = &self.mode
+            && let Some(&ix) = list.matches.get(list.selected)
+        {
+            cx.emit(PaletteEvent::Kill(ix));
+        }
+    }
+
     fn confirm(&mut self, _: &PickerConfirm, _: &mut Window, cx: &mut Context<Self>) {
         match &mut self.mode {
             Mode::List(list) => {
@@ -359,6 +369,7 @@ impl Render for Palette {
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 if this.dismiss_on_click_outside {

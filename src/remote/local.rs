@@ -19,7 +19,7 @@ mod connection;
 mod session;
 mod upgrade;
 
-pub use connection::{Connection, SessionSink, SpawnRequest};
+pub use connection::{AttachRequest, Connection, SessionSink, SpawnRequest};
 pub use session::Session;
 
 use std::io::{self, Read as _};
@@ -27,7 +27,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
 
 use super::protocol::client::{self, Hello, ToClient, ToCore, Welcome};
-use super::protocol::{Frame, server_dir};
+use super::protocol::{Frame, scope, server_dir};
 
 /// How long the starter waits for a new core's ready byte (design.md).
 const START_LIMIT: Duration = Duration::from_secs(2);
@@ -84,6 +84,34 @@ pub fn shared() -> Result<Arc<Connection>> {
     let connection = Connection::start(endpoint, client_token(), connected)?;
     *current = Some(connection.clone());
     Ok(connection)
+}
+
+/// The sessions of a core that is already running, attached or not, for a
+/// launch to attach: none when no core is listening (it never starts one).
+/// It blocks, for about `limit` at most past the `HELLO`; it runs once,
+/// before any window opens.
+pub fn running_sessions(limit: Duration) -> Result<Vec<client::SessionInfo>> {
+    let endpoint = Endpoint::from_env()?;
+    let Some(stream) = try_connect(&endpoint)? else {
+        return Ok(Vec::new());
+    };
+    // A token of its own: this connection owns nothing and gets no replays.
+    let token = format!("{}-list", client_token());
+    let Connected { mut stream, .. } = hello(stream, &token)?;
+    stream.set_read_timeout(Some(limit))?;
+    stream.set_write_timeout(Some(limit))?;
+    let req = 1;
+    ToCore::List(client::Request { req }).encode()?.write_to(&mut stream)?;
+    loop {
+        let frame = Frame::read_from(&mut stream).context("listing the terminal server's sessions")?;
+        match ToClient::decode(&frame)? {
+            ToClient::Sessions(sessions) if sessions.req == req => {
+                return Ok(sessions.sessions);
+            }
+            ToClient::Error(error) if error.req == Some(req) => bail!("listing sessions: {}", error.message),
+            _ => {}
+        }
+    }
 }
 
 /// Where the server is and what starts it.
@@ -185,9 +213,13 @@ pub fn start_core(endpoint: &Endpoint) -> Result<()> {
     // SAFETY: freshly created and not owned elsewhere.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let write_fd = write.as_raw_fd();
-    let mut command = Command::new(&endpoint.helper);
+    let decision = scope::current();
+    if let scope::Decision::Plain(reason) = &decision {
+        log::info!("starting the terminal server without a scope of its own: {reason}");
+    }
+    let args = ["serve".into(), "--ready-fd".into(), "3".into()];
+    let mut command = scope::command(&decision, "serve", endpoint.helper.as_os_str(), &args);
     command
-        .args(["serve", "--ready-fd", "3"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

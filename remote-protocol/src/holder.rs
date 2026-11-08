@@ -22,6 +22,7 @@
 //! |   11 | `REPARENT`         | core → holder | `session, hwnd` (a Linux holder answers `ERROR`)                 |
 //! |   12 | `PAUSE`            | core → holder | `session`                                                        |
 //! |   13 | `RESUME`           | core → holder | `session`                                                        |
+//! |   14 | `SET_META`         | core → holder | `session, meta` (version 2)                                      |
 //! |   32 | `WELCOME`          | holder → core | `protocol, build, pid, previous, sessions: [{session, pid, cols, rows, exit, meta, truncated}]` |
 //! |   33 | `OUTPUT`           | holder → core | session, bytes                                                   |
 //! |   34 | `SPAWNED`          | holder → core | `session, pid`                                                   |
@@ -80,7 +81,7 @@ use crate::wire::{self, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The H1 versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 1);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 2);
 
 pub const MSG_HELLO: u8 = 1;
 pub const MSG_SPAWN: u8 = 2;
@@ -95,6 +96,8 @@ pub const MSG_GOODBYE: u8 = 10;
 pub const MSG_REPARENT: u8 = 11;
 pub const MSG_PAUSE: u8 = 12;
 pub const MSG_RESUME: u8 = 13;
+/// H1 version 2.
+pub const MSG_SET_META: u8 = 14;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_OUTPUT: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -225,6 +228,12 @@ pub struct Goodbye {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetMeta {
+    pub session: SessionId,
+    pub meta: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reparent {
     pub session: SessionId,
     pub hwnd: u64,
@@ -325,6 +334,8 @@ pub enum ToHolder {
     /// Stop reading the session's PTY until `RESUME`.
     Pause(SessionRef),
     Resume(SessionRef),
+    /// Replace the session's stored meta (H1 version 2).
+    SetMeta(SetMeta),
 }
 
 impl ToHolder {
@@ -345,6 +356,7 @@ impl ToHolder {
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
             Self::Pause(m) => wire::json(MSG_PAUSE, m),
             Self::Resume(m) => wire::json(MSG_RESUME, m),
+            Self::SetMeta(m) => wire::json(MSG_SET_META, m),
         }
     }
 
@@ -369,6 +381,7 @@ impl ToHolder {
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
             MSG_PAUSE => Self::Pause(wire::from_json("PAUSE", frame)?),
             MSG_RESUME => Self::Resume(wire::from_json("RESUME", frame)?),
+            MSG_SET_META => Self::SetMeta(wire::from_json("SET_META", frame)?),
             other => return Err(wire::unknown_type("core-to-holder", other)),
         })
     }
@@ -627,11 +640,19 @@ pub struct SessionMeta {
     /// The program and its arguments, for `list`; empty for the login shell.
     pub command: String,
     pub cwd: Option<String>,
-    /// The owning client's `client_token`.
+    /// Random, so a session can be told apart from a later one that got
+    /// its id from another core; empty for sessions spawned before keys.
+    pub key: String,
+    /// The owning client's `client_token`; empty for a session explicitly
+    /// detached, which no reconnect gets back.
     pub owner: String,
     pub policy: crate::client::Policy,
+    /// The client's name for what started it (a profile).
+    pub profile: Option<String>,
     /// The emulator's scrollback limit, in lines.
     pub scrollback: u32,
+    /// Unix seconds; 0 when unknown.
+    pub started: u64,
 }
 
 impl SessionMeta {
@@ -657,9 +678,12 @@ impl SessionMeta {
         Self {
             command: parse(object, "command"),
             cwd: parse(object, "cwd"),
+            key: parse(object, "key"),
             owner: parse(object, "owner"),
             policy: parse(object, "policy"),
+            profile: parse(object, "profile"),
             scrollback: parse(object, "scrollback"),
+            started: parse(object, "started"),
         }
     }
 }
@@ -738,6 +762,10 @@ pub(crate) mod samples {
             }),
             ToHolder::Pause(SessionRef { session: 1 }),
             ToHolder::Resume(SessionRef { session: 1 }),
+            ToHolder::SetMeta(SetMeta {
+                session: 1,
+                meta: meta(),
+            }),
         ]
     }
 
@@ -816,7 +844,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToHolder::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_HELLO..=MSG_RESUME {
+        for expected in MSG_HELLO..=MSG_SET_META {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -878,13 +906,16 @@ mod tests {
         let meta = SessionMeta {
             command: "bash -l".into(),
             cwd: Some("/home/u".into()),
+            key: "9f2c41d0".into(),
             owner: "4f1c9a".into(),
             policy: crate::client::Policy::Detach,
+            profile: Some("Shell".into()),
             scrollback: 10_000,
+            started: 1_794_000_000,
         };
         assert_eq!(
             serde_json::to_string(&meta.to_value()).unwrap(),
-            r#"{"command":"bash -l","cwd":"/home/u","owner":"4f1c9a","policy":"detach","scrollback":10000}"#
+            r#"{"command":"bash -l","cwd":"/home/u","key":"9f2c41d0","owner":"4f1c9a","policy":"detach","profile":"Shell","scrollback":10000,"started":1794000000}"#
         );
         assert_eq!(SessionMeta::from_value(&meta.to_value()), meta);
         assert_eq!(SessionMeta::from_value(&samples::meta()).owner, "4f1c9a");
@@ -999,12 +1030,12 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, 14, 255] {
+        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, 15, 255] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             let error = ToHolder::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_INPUT, MSG_REPARENT, MSG_RESUME, 41, 255] {
+        for msg_type in [0, MSG_HELLO, MSG_INPUT, MSG_REPARENT, MSG_RESUME, MSG_SET_META, 41, 255] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             assert!(ToCore::decode(&frame).is_err());
         }
@@ -1117,10 +1148,12 @@ mod tests {
             core_build: String::new(),
             instance: 0,
         };
-        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(1));
-        let error = answer_hello(&hello(2, 2), PROTOCOLS).unwrap_err();
+        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(2));
+        // A core that speaks only version 1 still gets it.
+        assert_eq!(answer_hello(&hello(1, 1), PROTOCOLS), Ok(1));
+        let error = answer_hello(&hello(3, 3), PROTOCOLS).unwrap_err();
         assert!(
-            error.message.contains("offered 2, supported 1"),
+            error.message.contains("offered 3, supported 1–2"),
             "{}",
             error.message
         );

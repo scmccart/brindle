@@ -30,7 +30,7 @@ usage: brindle-remote <command>
   serve [--ready-fd N]              run the terminal server's core
   hold [--ready-fd N]               run a holder (started by the core)
   check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
-  list [--json]                     the server's sessions: id, pid, state, command, directory
+  list [--json]                     the server's sessions: id, pid, state, policy, age, title, command, directory
   kill ID | kill --all              hang up one session, or all of them
   status [--json]                   the core and its holders
   stop                              hang up every session and stop the server
@@ -77,15 +77,19 @@ fn list(json: bool) -> Result<(), String> {
         let text = serde_json::to_string_pretty(&sessions.sessions).map_err(|e| e.to_string())?;
         println!("{text}");
     } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
         for session in &sessions.sessions {
-            println!("{}", list_line(session));
+            println!("{}", list_line(session, now));
         }
     }
     Ok(())
 }
 
-/// One `list` line: id, pid, attached or detached, command, directory.
-fn list_line(session: &SessionInfo) -> String {
+/// One `list` line: id, pid, attached or detached, policy, age (`-` from a
+/// core that doesn't report it), title (`-` when none), command, directory.
+fn list_line(session: &SessionInfo, now: u64) -> String {
     let state = if session.attached {
         "attached"
     } else {
@@ -96,8 +100,17 @@ fn list_line(session: &SessionInfo) -> String {
     } else {
         &session.command
     };
+    let policy = match session.policy {
+        client::Policy::Kill => "kill",
+        client::Policy::Detach => "detach",
+    };
+    let age = match session.started {
+        0 => "-".to_string(),
+        started => uptime(now.saturating_sub(started)),
+    };
+    let title = if session.title.is_empty() { "-" } else { &session.title };
     format!(
-        "{}\t{}\t{state}\t{command}\t{}",
+        "{}\t{}\t{state}\t{policy}\t{age}\t{title}\t{command}\t{}",
         session.session,
         session.pid,
         session.cwd.as_deref().unwrap_or("-")
@@ -314,12 +327,24 @@ mod tests {
             policy: client::Policy::Kill,
             cols: 80,
             rows: 24,
+            title: "htop".into(),
+            started: 1000,
+            ..Default::default()
         };
-        assert_eq!(list_line(&session), "3\t4242\tattached\thtop -d 5\t/home/u");
+        assert_eq!(
+            list_line(&session, 1065),
+            "3\t4242\tattached\tkill\t1m05s\thtop\thtop -d 5\t/home/u"
+        );
         session.attached = false;
+        session.policy = client::Policy::Detach;
         session.command.clear();
         session.cwd = None;
-        assert_eq!(list_line(&session), "3\t4242\tdetached\t(login shell)\t-");
+        session.title.clear();
+        session.started = 0;
+        assert_eq!(
+            list_line(&session, 1065),
+            "3\t4242\tdetached\tdetach\t-\t-\t(login shell)\t-"
+        );
     }
 
     #[test]

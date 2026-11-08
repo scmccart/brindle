@@ -73,15 +73,20 @@ fn list_shows_one_line_per_session() {
     client.list();
 
     let output = succeeded(cli(&dir.path, &["list"]));
-    let lines: Vec<Vec<String>> = stdout(&output)
+    let mut lines: Vec<Vec<String>> = stdout(&output)
         .lines()
         .map(|line| line.split('\t').map(String::from).collect())
         .collect();
+    // The age (column 5) depends on the clock: a few seconds at most.
+    for line in &mut lines {
+        let age = line.remove(4);
+        assert!(age.ends_with('s') && !age.contains('m'), "{age}");
+    }
     assert_eq!(
         lines,
         [
-            [&*first.to_string(), &*first_pid.to_string(), "attached", "cat", "/"],
-            [&*second.to_string(), &*second_pid.to_string(), "detached", "sleep 1000", "/tmp"],
+            [&*first.to_string(), &*first_pid.to_string(), "attached", "kill", "-", "cat", "/"],
+            [&*second.to_string(), &*second_pid.to_string(), "detached", "detach", "-", "sleep 1000", "/tmp"],
         ]
     );
 
@@ -129,7 +134,7 @@ fn status_shows_the_core_and_each_holder() {
     assert_eq!(status["core_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["core_build"], welcome.core_build.as_str());
     assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 1 }));
-    assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 1 }));
+    assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 2 }));
     assert_eq!(status["pid"], client.core_pid());
     assert!(status["uptime_secs"].is_u64());
     // The test client and the command's own connection.
@@ -140,7 +145,7 @@ fn status_shows_the_core_and_each_holder() {
         serde_json::json!([{
             "pid": holder,
             "build": welcome.core_build,
-            "protocol": 1,
+            "protocol": 2,
             "sessions": 1,
             "draining": false,
         }])

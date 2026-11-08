@@ -31,10 +31,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::SessionId;
+use brindle_remote_protocol::{SessionId, scope};
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
     Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
@@ -70,10 +70,10 @@ const READS_PER_EVENT: usize = 4;
 const TICK_FAST: Duration = Duration::from_millis(50);
 const TICK_SLOW: Duration = Duration::from_millis(500);
 
-/// The core the holder starts, run from its own binary. Tests replace the
-/// arguments with `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated);
-/// `{ready_fd}` stands for the ready pipe's fd number.
-const CORE_PROGRAM: &str = "/proc/self/exe";
+/// The core the holder starts is run from its own binary
+/// (`/proc/<pid>/exe`, see [`scope::command`]). Tests replace the arguments
+/// with `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated); `{ready_fd}`
+/// stands for the ready pipe's fd number.
 const DEFAULT_CORE_ARGS: &[&str] = &["serve", "--ready-fd", "{ready_fd}"];
 const CORE_ARGS_ENV: &str = "BRINDLE_TEST_HOLDER_CORE_ARGS";
 /// The fd the started core's ready pipe gets.
@@ -737,6 +737,13 @@ impl<L: EventLoop> Holder<L> {
             ToHolder::Reparent(reparent) => self.send_error(Some(reparent.session), "unsupported"),
             ToHolder::Pause(target) => self.set_paused(target.session, true),
             ToHolder::Resume(target) => self.set_paused(target.session, false),
+            // The next core's `WELCOME` carries it. An unknown session may
+            // just have ended.
+            ToHolder::SetMeta(update) => {
+                if let Some(session) = self.sessions.get_mut(&update.session) {
+                    session.held.meta = update.meta;
+                }
+            }
         }
     }
 
@@ -1093,12 +1100,17 @@ impl<L: EventLoop> Holder<L> {
             .iter()
             .map(|arg| arg.replace("{ready_fd}", &CORE_READY_FD.to_string()).into())
             .collect();
-        let mut command = Command::new(CORE_PROGRAM);
-        command.args(&args);
+        let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
+        let decision = scope::current();
+        if let scope::Decision::Plain(reason) = &decision {
+            log!("starting the core without a scope of its own: {reason}");
+        }
+        let mut command = scope::command(&decision, "serve", &program, &args);
         let ready_read = match daemon::spawn_with_ready_pipe(&mut command, CORE_READY_FD) {
             Ok((child, ready_read)) => {
                 log!(
-                    "no core for a while; started {CORE_PROGRAM} {} as pid {}",
+                    "no core for a while; started {} {} as pid {}",
+                    program.to_string_lossy(),
                     self.core_args.join(" "),
                     child.id()
                 );

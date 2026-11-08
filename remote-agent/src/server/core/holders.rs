@@ -7,11 +7,10 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::SessionId;
-use brindle_remote_protocol::client;
+use brindle_remote_protocol::{SessionId, client, scope};
 use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHolder, Welcome};
 
 use super::clients::error;
@@ -545,12 +544,17 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Starts `brindle-remote hold` from the core's own binary, which
-    /// `/proc/self/exe` names even after an install replaced the file.
+    /// `/proc/<pid>/exe` names even after an install replaced the file, in a
+    /// systemd scope of its own when there is a user manager.
     fn start_holder(&mut self) {
-        let mut command = Command::new("/proc/self/exe");
-        command
-            .args(["hold", "--ready-fd", &HOLDER_READY_FD.to_string()])
-            .env("BRINDLE_SERVER_DIR", &self.dir);
+        let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
+        let args = ["hold".into(), "--ready-fd".into(), HOLDER_READY_FD.to_string().into()];
+        let decision = scope::current();
+        if let scope::Decision::Plain(reason) = &decision {
+            log!("starting a holder without a scope of its own: {reason}");
+        }
+        let mut command = scope::command(&decision, "hold", &program, &args);
+        command.env("BRINDLE_SERVER_DIR", &self.dir);
         let (child, ready) = match daemon::spawn_with_ready_pipe(&mut command, HOLDER_READY_FD) {
             Ok(started) => started,
             Err(error) => {

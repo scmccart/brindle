@@ -22,7 +22,7 @@ mod toast;
 /// get the foreground, which Brindle doesn't do.)
 #[cfg(windows)]
 pub mod activation {
-    use gpui::{App, Window};
+    use gpui::Window;
     use windows::Win32::UI::WindowsAndMessaging::{
         FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
@@ -47,28 +47,16 @@ pub mod activation {
             }
         }
     }
-
-    pub fn request_token(_window: &Window) -> Option<String> {
-        None
-    }
-
-    pub fn track_input(_window: &Window, _cx: &mut App) {}
 }
 
 /// Raising a window elsewhere: plain activation, with no tokens.
 #[cfg(not(any(target_os = "linux", windows)))]
 pub mod activation {
-    use gpui::{App, Window};
+    use gpui::Window;
 
     pub fn raise(window: &mut Window, _token: Option<&str>) {
         window.activate_window();
     }
-
-    pub fn request_token(_window: &Window) -> Option<String> {
-        None
-    }
-
-    pub fn track_input(_window: &Window, _cx: &mut App) {}
 }
 
 use std::collections::{HashMap, VecDeque};

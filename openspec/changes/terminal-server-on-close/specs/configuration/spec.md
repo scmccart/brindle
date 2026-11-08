@@ -18,11 +18,11 @@ Session restore is always on (see `session-restore`). A config that still sets `
 
 #### Scenario: Session restore enabled
 - **WHEN** the config contains `restore_session = true`
-- **THEN** Brindle loads the config without an error banner, logs that `restore_session` is ignored, and a plain launch restores as it always does
+- **THEN** Brindle loads the config without an error banner, logs that `restore_session` is ignored, and a launch restores as it always does
 
 #### Scenario: Old restore setting
 - **WHEN** the config contains `restore_session = false`
-- **THEN** Brindle loads the config without an error banner, logs that `restore_session` is ignored, and a plain launch still restores
+- **THEN** Brindle loads the config without an error banner, logs that `restore_session` is ignored, and a launch still restores
 
 #### Scenario: Failed-command marks disabled
 - **WHEN** `mark_failed_commands = false` and the config is reloaded

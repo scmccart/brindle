@@ -39,6 +39,10 @@ impl<L: EventLoop> Core<L> {
                 policy: session.meta.policy,
                 cols: session.cols,
                 rows: session.rows,
+                key: session.meta.key.clone(),
+                title: session.screen.title(),
+                started: session.meta.started,
+                profile: session.meta.profile.clone(),
             })
             .collect();
         self.send_client(client, ToClient::Sessions(Sessions { req, sessions }));

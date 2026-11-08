@@ -8,10 +8,10 @@ The `Attach Session…` command (Linux) SHALL open a palette listing the local t
 - **THEN** the palette says there are no detached sessions
 
 ### Requirement: Sessions palette actions
-In the sessions palette, enter SHALL attach the selected session into a new tab of this window, after the active tab, and make it active. `picker_kill` (ctrl-shift-delete) SHALL end the selected session and refresh the list.
+In the sessions palette, enter SHALL attach the selected session into a new tab after the active tab, and make it active. `picker_kill` (ctrl-shift-delete) SHALL end the selected session and refresh the list.
 
-#### Scenario: Attach a closed tab's session
-- **WHEN** the user closed a `detach` tab running `top`, then runs "Attach Session…" and presses enter on its row
+#### Scenario: Attach a detached session
+- **WHEN** a `--no-restore` launch left a session running `top` detached, and the user runs "Attach Session…" and presses enter on its row
 - **THEN** a new active tab shows that `top`, with its screen as it was
 
 #### Scenario: Kill from the palette

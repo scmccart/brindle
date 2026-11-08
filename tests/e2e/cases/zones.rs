@@ -135,6 +135,8 @@ pub fn restore(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let (a, b) = (dir(ctx, "zone-a")?, dir(ctx, "zone-b")?);
     Run::new(ctx, &server, "record")
+        // The next run attaches the same shells, in their directories.
+        .keep_detached()
         .restore()
         .default_profile("Shell")
         .send(&format!("cd '{}'\r", a.display()))

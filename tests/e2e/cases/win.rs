@@ -458,7 +458,7 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
     for shell in ["pwsh.exe", "powershell.exe"] {
         let config = format!(
-            "default_profile = \"si\"\nrestore_session = true\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+            "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
         );
         let label = shell.trim_end_matches(".exe");
@@ -539,7 +539,7 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
 }
 
 fn zones(ctx: &Ctx) -> Result<Outcome> {
-    let restore_config = format!("restore_session = true\n{CONFIG}");
+    let restore_config = CONFIG.to_string();
     let split = run_with(
         ctx,
         &restore_config,
