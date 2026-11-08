@@ -25,6 +25,9 @@ actions!(
         TextInputCopy,
         TextInputCut,
         TextInputPaste,
+        // Overlays. `Dismiss` asks the view of the layer with focus to
+        // close; it closes only when it agrees (by emitting `DismissEvent`).
+        Dismiss,
     ]
 );
 
@@ -33,7 +36,11 @@ actions!(
 /// restores them.
 pub fn default_bindings() -> Vec<KeyBinding> {
     let i = Some("TextInput");
+    let l = Some("UiLayer");
     vec![
+        // Escape asks the overlay to close. Bound in the layer around the
+        // view, so an inner context that handles escape itself wins.
+        KeyBinding::new("escape", Dismiss, l),
         // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
         // to the palette or dialog around them.
         KeyBinding::new("left", TextInputLeft, i),
@@ -74,11 +81,26 @@ pub fn default_bindings() -> Vec<KeyBinding> {
 mod tests {
     use super::*;
 
+    /// The bindings in a context, as `(keystrokes, action name)`.
+    fn in_context(bindings: &[KeyBinding], context: &str) -> Vec<(String, String)> {
+        bindings
+            .iter()
+            .filter(|b| b.predicate().is_some_and(|p| p.to_string() == context))
+            .map(|b| (format!("{:?}", b.keystrokes()), b.action().name().to_string()))
+            .collect()
+    }
+
     #[test]
     fn default_bindings_parse() {
         // KeyBinding::new panics on a keystroke it can't parse.
         let bindings = default_bindings();
-        assert_eq!(bindings.len(), 29);
-        assert!(bindings.iter().all(|b| b.action().name().starts_with("brindle_ui::TextInput")));
+        let text_input = in_context(&bindings, "TextInput");
+        assert_eq!(text_input.len(), 29);
+        assert!(text_input.iter().all(|(_, name)| name.starts_with("brindle_ui::TextInput")));
+        let layer = in_context(&bindings, "UiLayer");
+        assert_eq!(layer.len(), 1);
+        assert_eq!(layer[0].1, "brindle_ui::Dismiss");
+        // Every binding is in one of the crate's contexts.
+        assert_eq!(bindings.len(), text_input.len() + layer.len());
     }
 }
