@@ -3,7 +3,7 @@
 
 use super::{cells, server};
 use crate::brindle::{Run, theme};
-use crate::capture::Rgb;
+use crate::capture::{PxRect, Rgb};
 use crate::tmux::TmuxServer;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -81,5 +81,73 @@ pub fn borders(ctx: &Ctx) -> Result<Outcome> {
     };
     run("styled", true)?;
     run("default", false)?;
+    Ok(Outcome::Pass)
+}
+
+/// A tmux profile whose theme (`e2e-alt`) differs from the global `e2e`
+/// one, which the window chrome's tokens come from.
+fn alt_profile(server: &TmuxServer) -> String {
+    format!(
+        "\n[[profiles]]\nname = \"tmux-alt\"\ntmux = \"control\"\ntmux_session = \"e2e\"\n\
+         tmux_args = [\"-L\", \"{}\", \"-f\", \"/dev/null\"]\ntheme = \"e2e-alt\"\n",
+        server.socket
+    )
+}
+
+/// With no border styles, a divider away from the active pane and the
+/// zoomed badge take the chrome's tokens (the global theme's), not the
+/// tab's theme: the divider is the `border` token 15% towards the
+/// foreground and the badge sits on `secondary`. The old colours, from the
+/// tab's theme, were #464040 and #945410.
+pub fn chrome_fallback(ctx: &Ctx) -> Result<Outcome> {
+    let server = split()?;
+    server.run(&["split-window", "-v", "-t", "%1"])?;
+    server.run(&["select-pane", "-t", "%0"])?;
+    let out = Run::new(ctx, &server, "divider")
+        .profile("tmux-alt")
+        .config(&alt_profile(&server))
+        .capture_at(3.5)
+        .dump_at(5.0)
+        .run()?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let cells = cells(&server, &out, "%0")?;
+    let [right, ..] = server.geometry("%1")?;
+    let [_, lower, ..] = server.geometry("%2")?;
+    // The horizontal divider doesn't border the active pane. It is one
+    // pixel row in the middle of its cell row, so each row is looked at.
+    let cell = cells.rect(right + 2, lower - 1, 20, 1);
+    let rows: Vec<Option<Rgb>> = (cell.y0..cell.y1).map(|y| image.dominant(PxRect { y0: y, y1: y + 1, ..cell })).collect();
+    ensure!(
+        rows.iter().any(|c| c.is_some_and(|c| c.near(theme::TMUX_DIVIDER, 2))),
+        "divider: rows {:?} in {cell:?}, want one of {}",
+        rows.iter().map(|c| c.map(Rgb::hex)).collect::<Vec<_>>(),
+        theme::TMUX_DIVIDER.hex()
+    );
+
+    let server = split()?;
+    server.run(&["resize-pane", "-Z", "-t", "%0"])?;
+    let out = Run::new(ctx, &server, "zoomed")
+        .profile("tmux-alt")
+        .config(&alt_profile(&server))
+        .capture_at(3.5)
+        .dump_at(5.0)
+        .run()?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let grid = out.dump.grid()?;
+    // The badge is 4 px below the tab's top (the grid's, less the 6 px
+    // padding) and 8 px in from its right; sample inside it, clear of its
+    // rounded corners.
+    let scale = grid.scale;
+    let (right, top) = (image.width as f32 / scale - 8.0, grid.y - 6.0 + 4.0);
+    let px = |v: f32| (v * scale).round().max(0.0) as u32;
+    let badge = PxRect { x0: px(right - 40.0), y0: px(top + 3.0), x1: px(right - 6.0), y1: px(top + 10.0) };
+    let got = image.dominant(badge);
+    ensure!(
+        got.is_some_and(|c| c.near(theme::CHROME_SECONDARY, 2)),
+        "badge: dominant {:?} in {badge:?}, want {}; found {}",
+        got.map(Rgb::hex),
+        theme::CHROME_SECONDARY.hex(),
+        image.summary(badge)
+    );
     Ok(Outcome::Pass)
 }

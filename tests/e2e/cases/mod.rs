@@ -92,6 +92,7 @@ fn unix() -> Vec<Case> {
         display("styles-tint", styles::tint),
         display("styles-active-pane", styles::active_pane),
         display("styles-borders", styles::borders),
+        display("styles-chrome-fallback", styles::chrome_fallback),
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),

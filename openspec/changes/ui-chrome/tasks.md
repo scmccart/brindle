@@ -62,9 +62,9 @@
 
 ## 10. tmux chrome and theme.rs
 
-- [ ] 10.1 Recolour the tmux zoomed badge with the `secondary` token pair and take the divider fallback from the tokens (`border` mixed with `foreground`), read in `render`; keep canvas-painted title lines and `theme.accent()` for the active divider; verify the `tmux-*` and title-line e2e cases pass under `scripts/with-xvfb`
-- [ ] 10.2 Make `chrome_background`, `chrome_border`, `muted_foreground` and `hover_background` private to `src/theme.rs` and delete the unused; verify `grep -rn "chrome_background\|chrome_border\|hover_background\|\.muted_foreground()" src --include=*.rs` outside `theme.rs` is empty, `cargo build` is warning-free and the contrast test passes
-- [ ] 10.3 Update CLAUDE.md's architecture bullets (`workspace.rs` strip on `Tabs`, `zone_view.rs` headers, the `brindle-ui` component list, tokens as the only chrome colour source); verify the text matches the code
+- [x] 10.1 Recolour the tmux zoomed badge with the `secondary` token pair and take the divider fallback from the tokens (`border` mixed with `foreground`), read in `render`; keep canvas-painted title lines and `theme.accent()` for the active divider; verify the `tmux-*` and title-line e2e cases pass under `scripts/with-xvfb`
+- [x] 10.2 Make `chrome_background`, `chrome_border`, `muted_foreground` and `hover_background` private to `src/theme.rs` and delete the unused; verify `grep -rn "chrome_background\|chrome_border\|hover_background\|\.muted_foreground()" src --include=*.rs` outside `theme.rs` is empty, `cargo build` is warning-free and the contrast test passes
+- [x] 10.3 Update CLAUDE.md's architecture bullets (`workspace.rs` strip on `Tabs`, `zone_view.rs` headers, the `brindle-ui` component list, tokens as the only chrome colour source); verify the text matches the code
 
 ## 11. Integration checks
 

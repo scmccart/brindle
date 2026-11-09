@@ -42,13 +42,18 @@ pub mod theme {
     pub const MAGENTA: Rgb = ANSI[5];
 
     /// The window chrome's `background` token for the `e2e` theme: its
-    /// background mixed 35% towards black (`Theme::chrome_background`),
-    /// which the tab strip is drawn in.
+    /// background mixed 35% towards black (`Theme::ui_tokens`), which the
+    /// tab strip is drawn in.
     pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
     /// The `border` token for the `e2e` theme: its background mixed 12%
-    /// towards its foreground (`Theme::chrome_border`), which zone headers
-    /// and dividers are drawn in.
+    /// towards its foreground, which zone headers and dividers are drawn in.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
+    /// The `secondary` token for the `e2e` theme: `CHROME_BACKGROUND` mixed
+    /// 8% towards the foreground, which tmux's zoomed badge is drawn on.
+    pub const CHROME_SECONDARY: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    /// A tmux divider with no border style: `CHROME_BORDER` mixed 15%
+    /// towards the foreground token.
+    pub const TMUX_DIVIDER: Rgb = Rgb(0x3c, 0x40, 0x42);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
