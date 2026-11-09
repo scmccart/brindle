@@ -30,9 +30,9 @@
 
 ## 5. Find bar
 
-- [ ] 5.1 Rebuild `render_find_bar` on `Input`, two `Toggle`s, ghost `IconXs` `Button`s (previous, next, close) and a `Separator`, in a popover-styled panel with token colours and tooltips (name and the bound key through the keymap); keep `occlude`, the `FindBar` key context, the click-to-focus handler and `describe_find`; verify `cargo build` is warning-free and `cargo test --workspace` passes
-- [ ] 5.2 Show the invalid expression as the `Input`'s invalid state plus a destructive message, and the count in the muted foreground; verify the existing `scrollback-search` e2e cases still pass (`scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- find`) and a case checks the destructive border colour by capture
-- [ ] 5.3 Remove the find bar's use of `Theme::accent`, `chrome_background`, `chrome_border`, `muted_foreground`; verify `grep` finds none in `src/find_bar.rs`
+- [x] 5.1 Rebuild `render_find_bar` on `Input`, two `Toggle`s, ghost `IconXs` `Button`s (previous, next, close) and a `Separator`, in a popover-styled panel with token colours and tooltips (name and the bound key through the keymap); keep `occlude`, the `FindBar` key context, the click-to-focus handler and `describe_find`; verify `cargo build` is warning-free and `cargo test --workspace` passes
+- [x] 5.2 Show the invalid expression as the `Input`'s invalid state plus a destructive message, and the count in the muted foreground; verify the existing `scrollback-search` e2e cases still pass (`scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- search`) and a case checks the destructive border colour by capture
+- [x] 5.3 Remove the find bar's use of `Theme::accent`, `chrome_background`, `chrome_border`, `muted_foreground`; verify `grep` finds none in `src/find_bar.rs`
 
 ## 6. Tab strip
 

@@ -2337,7 +2337,7 @@ fn session_open_rows(profiles: &[Profile], picked: usize, open: &[SessionKey]) -
     rows
 }
 
-fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
+pub(crate) fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
     Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
 }

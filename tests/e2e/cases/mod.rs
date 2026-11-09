@@ -150,6 +150,7 @@ fn unix() -> Vec<Case> {
         display("search-step", search::step),
         display("search-long-query", search::long_query),
         display("search-input-selection", search::input_selection),
+        display("search-invalid-regex", search::invalid_regex),
         display("search-close-restores", search::close_restores),
         display("search-tmux-pane", search::tmux_pane),
         display("reattach-alt-screen", reattach::alt_screen),
