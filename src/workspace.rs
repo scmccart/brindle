@@ -10,9 +10,9 @@ use futures::channel::oneshot;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
+    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px,
+    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
 use gpui::EntityId;
 
@@ -21,7 +21,10 @@ use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
-use brindle_ui::{Overlay as UiOverlay, TextInput};
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Icon, Modality, Overlay as UiOverlay, TabActivate, TabList,
+    TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
+};
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
@@ -146,6 +149,16 @@ impl Tab {
             TabContent::Zones(view) => view.read(cx).theme.clone(),
             TabContent::Tmux { view, .. } => view.read(cx).theme.clone(),
         }
+    }
+
+    /// The tab's terminal background and foreground, which its face in the
+    /// strip takes while it is active, so it joins the terminal below.
+    fn terminal_colors(&self, cx: &App) -> (Hsla, Hsla) {
+        let theme = match &self.content {
+            TabContent::Zones(view) => &view.read(cx).theme,
+            TabContent::Tmux { view, .. } => &view.read(cx).theme,
+        };
+        (theme.background.hsla(), theme.foreground.hsla())
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
@@ -328,29 +341,6 @@ fn ignores_outside_press(tag: PaletteTag) -> bool {
     }
 }
 
-#[derive(Clone)]
-struct DraggedTab {
-    id: u64,
-    title: SharedString,
-    theme: Theme,
-}
-
-impl Render for DraggedTab {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let t = &self.theme;
-        div()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(t.background.hsla())
-            .border_1()
-            .border_color(t.accent().hsla())
-            .text_sm()
-            .text_color(t.foreground.hsla())
-            .child(self.title.clone())
-    }
-}
-
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
@@ -371,6 +361,11 @@ pub struct Workspace {
     /// the settings its tabs preview: theme and font size.
     profile_preview: Option<(String, Profile)>,
     focus_handle: FocusHandle,
+    /// The tab strip's focus, as a tab list: one keyboard stop, reached
+    /// only through `FocusTabStrip` (a press on a tab leaves focus in its
+    /// terminal). Focus rests on the active tab; arrows, home and end
+    /// switch tabs, and enter or escape give focus back to the terminal.
+    strip_focus: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
     last_title: SharedString,
@@ -409,6 +404,7 @@ impl Workspace {
             theme_preview: None,
             profile_preview: None,
             focus_handle: cx.focus_handle(),
+            strip_focus: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
             _title_refresh: Task::ready(()),
@@ -1297,9 +1293,22 @@ impl Workspace {
         }
     }
 
+    /// Makes tab `index` the active one and, unless an overlay is open,
+    /// gives its terminal focus.
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+        if !self.select(index, cx) {
             return;
+        }
+        if !self.has_overlay() {
+            self.focus_active_tab(window, cx);
+        }
+    }
+
+    /// Shows tab `index` (clamped) without moving focus: its bell clears and
+    /// a tmux window becomes its session's current one. False with no tabs.
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.tabs.is_empty() {
+            return false;
         }
         self.active = index.min(self.tabs.len() - 1);
         let tab = &mut self.tabs[self.active];
@@ -1308,10 +1317,49 @@ impl Workspace {
             let window_id = view.read(cx).window_id;
             session.update(cx, |s, _| s.select_window(window_id));
         }
-        let focus = tab.focus_handle(cx);
-        if !self.has_overlay() {
-            window.focus(&focus);
+        cx.notify();
+        true
+    }
+
+    /// Focuses the active tab's terminal (the tab's own focus handle).
+    fn focus_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            window.focus(&tab.focus_handle(cx));
         }
+    }
+
+    /// The strip asked to activate a tab. A pointer press activates it and
+    /// puts focus in its terminal, as a key or a click elsewhere would; an
+    /// arrow, home or end while the strip has focus only shows the tab, so
+    /// focus stays on the strip, resting on the new active tab.
+    fn activate_from_strip(&mut self, request: &TabActivate, window: &mut Window, cx: &mut Context<Self>) {
+        match request.by {
+            Modality::Pointer => self.activate(request.index, window, cx),
+            Modality::Keyboard => {
+                self.select(request.index, cx);
+            }
+        }
+    }
+
+    /// `FocusTabStrip`: focus moves to the strip, on the active tab. Nothing
+    /// happens while an overlay holds focus, or with no tabs.
+    fn focus_tab_strip(&mut self, _: &FocusTabStrip, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_overlay() || self.tabs.is_empty() {
+            return;
+        }
+        window.focus(&self.strip_focus);
+        cx.notify();
+    }
+
+    /// A key while the strip has focus, after the tab list took its own
+    /// (arrows, home, end): enter and escape return focus to the active
+    /// tab's terminal. Anything else goes on to the window's bindings.
+    fn strip_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.strip_focus.is_focused(window) || !returns_from_strip(&event.keystroke.key, event.keystroke.modifiers) {
+            return;
+        }
+        cx.stop_propagation();
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -1442,12 +1490,14 @@ impl Workspace {
         self.open_prompt(PromptRequest { label, initial, submit }, window, cx);
     }
 
-    fn drop_tab(&mut self, dragged: &DraggedTab, target: usize, cx: &mut Context<Self>) {
-        let Some(from) = self.tabs.iter().position(|t| t.id == dragged.id) else { return };
-        let active_id = self.tabs[self.active].id;
-        let tab = self.tabs.remove(from);
-        let to = target.min(self.tabs.len());
-        self.tabs.insert(to, tab);
+    /// A tab dragged onto another: the tab at `from` takes `to`'s place
+    /// (after it when it came from the left, before it from the right), and
+    /// the active tab stays active wherever it ends up.
+    fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(active_id) = self.tabs.get(self.active).map(|t| t.id) else { return };
+        if !reorder(&mut self.tabs, from, to) {
+            return;
+        }
         self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
         cx.notify();
     }
@@ -2009,9 +2059,9 @@ impl Workspace {
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
     /// active tab's active terminal), `palette` (inside an open palette),
     /// `settings stop=NAME` (inside the settings dialog, on the control
-    /// `NAME`), `none`, or `other`; then
-    /// the window's `modality=keyboard|pointer`, which decides whether the
-    /// focused control shows its ring.
+    /// `NAME`), `tabs` (the tab strip, on the active tab), `none`, or
+    /// `other`; then the window's `modality=keyboard|pointer`, which
+    /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
         let terminal = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
@@ -2022,6 +2072,8 @@ impl Workspace {
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
+        } else if self.strip_focus.is_focused(window) {
+            "tabs".to_string()
         } else if window.focused(cx).is_none() {
             "none".to_string()
         } else {
@@ -2036,124 +2088,155 @@ impl Workspace {
 
     // ---- rendering --------------------------------------------------------------
 
+    /// The tab strip, which is also the window's title bar: a `TabList` in
+    /// the `Attached` variant, the new-tab and profile buttons, the caption
+    /// (empty space) and, with client decorations, the window controls.
+    ///
+    /// It is drawn in the window's chrome tokens (`cx.ui_theme()`, from the
+    /// global theme), whatever the active tab's profile theme; only the
+    /// active tab's face takes its terminal's background and foreground,
+    /// so it joins the terminal below. The strip is one keyboard stop
+    /// (`strip_focus`), reached through `FocusTabStrip`: the list takes the
+    /// arrows, home and end, and the wrapper around it enter and escape. A
+    /// press on a tab activates it and leaves focus in its terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.active_theme(cx);
-        let t = &theme;
-        let chrome = t.chrome_background();
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let accent = t.accent().hsla();
-        let border = t.chrome_border().hsla();
+        let tokens = *cx.ui_theme();
         let decorations = window.window_decorations();
         // Windows always shows Brindle's own caption (see `window_control_area`
         // below); GPUI reports server decorations there.
         let csd = matches!(decorations, Decorations::Client { .. }) || cfg!(windows);
 
-        let status_color = |state: State| match state {
-            State::Blocked => t.ansi[3].hsla(),
-            State::Error => t.ansi[1].hsla(),
-            State::Done => t.ansi[2].hsla(),
-            State::Working | State::Idle => muted,
+        // Status dots take the global theme's ANSI colours (the previewed
+        // theme's while the settings dialog shows one), not the tab's;
+        // working is the muted foreground.
+        let global = match &self.theme_preview {
+            Some(theme) => theme.clone(),
+            None => Self::settings(cx).theme(None),
         };
-        let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
-            let active = ix == self.active;
-            let title = tab.title.clone();
-            let bell = tab.bell;
-            let status = tab.status.map(status_color);
-            let tmux = tab.is_tmux();
-            let dragged = DraggedTab { id: tab.id, title: title.clone(), theme: theme.clone() };
-            div()
-                .id(("tab", tab.id as usize))
-                .group("tab")
-                .relative()
-                .flex()
-                .flex_shrink()
-                .min_w(px(80.0))
-                .max_w(px(240.0))
-                .h(px(TAB_BAR_HEIGHT - 8.0))
-                .items_center()
-                .gap_1p5()
-                .pl_3()
-                .pr_1()
-                .rounded_t_md()
-                .text_sm()
-                .cursor(CursorStyle::Arrow)
-                .when(active, |d| d.bg(t.background.hsla()).text_color(fg))
-                .when(!active, |d| d.text_color(muted).hover(|d| d.bg(t.hover_background().hsla())))
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.activate(ix, window, cx);
-                    cx.stop_propagation();
-                }))
-                .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
-                    this.close_tab_at(ix, window, cx);
-                    cx.stop_propagation();
-                }))
-                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(accent))
-                .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| this.drop_tab(dragged, ix, cx)))
-                .when(active, |d| {
-                    d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).rounded_t_md().bg(accent))
-                })
-                .when(tmux, |d| {
-                    d.child(div().text_xs().text_color(accent).child("⧉"))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(title),
-                )
-                .when_some(status, |d, color| d.child(div().size(px(6.0)).rounded_full().bg(color)))
-                .when(bell, |d| d.child(div().size(px(6.0)).rounded_full().bg(accent)))
-                .child(
-                    div()
-                        .id(("close", ix))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.0))
-                        .rounded_sm()
-                        .text_color(muted)
-                        .when(!active, |d| d.invisible().group_hover("tab", |d| d.visible()))
-                        .hover(|d| d.bg(t.hover_background().mix(t.foreground, 0.1).hsla()).text_color(fg))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, window, cx| this.close_tab_at(ix, window, cx)))
-                        .child("×"),
-                )
-        });
+        let status_color = |state: State| match state {
+            State::Blocked => global.ansi[3].hsla(),
+            State::Error => global.ansi[1].hsla(),
+            State::Done => global.ansi[2].hsla(),
+            State::Working | State::Idle => tokens.muted_foreground,
+        };
+        let dot = |color: Hsla| div().flex_none().size(px(6.0)).rounded_full().bg(color);
 
-        let face = |id: &'static str, label: &'static str| {
+        // A tooltip naming a control and the key bound to its action in this
+        // window, looked up when the tooltip is shown (a rebound key shows
+        // correctly, and a render pays only for the closure).
+        let focus = self.focus_handle.clone();
+        let tip = move |label: &'static str, action: Box<dyn Action>| {
+            let (focus, action): (FocusHandle, Rc<dyn Action>) = (focus.clone(), Rc::from(action));
+            move |window: &mut Window, _: &mut App| Tooltip::new(label).shortcut_opt(shortcut(&*action, &focus, window))
+        };
+        let close_tip = tip("Close tab", Box::new(CloseTab));
+
+        let triggers: Vec<TabTrigger> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, tab)| {
+                let mut trigger =
+                    TabTrigger::new(("tab", tab.id as usize), tab.title.clone()).closable(true).close_tooltip(close_tip.clone());
+                if ix == self.active {
+                    let (surface, text) = tab.terminal_colors(cx);
+                    trigger = trigger.surface(surface).text_color(text);
+                }
+                if tab.is_tmux() {
+                    trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)).color(tokens.primary));
+                }
+                if let Some(state) = tab.status {
+                    trigger = trigger.adornment(dot(status_color(state)));
+                }
+                if tab.bell {
+                    trigger = trigger.adornment(dot(tokens.primary));
+                }
+                trigger
+            })
+            .collect();
+        let list = TabList::new("tabs")
+            .variant(TabVariant::Attached)
+            .active(self.active)
+            .children(triggers)
+            .focus(&self.strip_focus)
+            .trigger_width(TabWidth::new(rems(5.), rems(15.)))
+            .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
+            .on_close(cx.listener(|this, ix: &usize, window, cx| this.close_tab_at(*ix, window, cx)))
+            .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_tab_to(request.from, request.to, cx)))
+            .flex_shrink()
+            .min_w_0()
+            .overflow_hidden();
+
+        // A press on a strip button stops here: it doesn't start a window
+        // move (the strip's own press handler, below) and moves focus
+        // nowhere (a `Button` without a handle lets a press bubble to the
+        // workspace, which tracks focus).
+        let inert = |id: &'static str, control: AnyElement| {
+            div()
+                .id(id)
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(control)
+        };
+        let button = |id: &'static str, icon: Icon| {
+            Button::icon_only(id, icon)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::IconXs)
+                .text_color(tokens.muted_foreground)
+        };
+        let new_tab = button("new-tab", Icon::Plus)
+            .tooltip_with(tip("New tab", Box::new(NewTab)))
+            .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)));
+        let profiles = button("profiles", Icon::ChevronDown)
+            .tooltip_with(tip("New tab from profile…", Box::new(OpenProfilePicker)))
+            .on_click(cx.listener(|this, _, window, cx| this.open_profile_picker(&OpenProfilePicker, window, cx)));
+
+        // The caption buttons stay hand-built faces, in the ghost icon
+        // button's size and hover colours, drawing icons rather than text
+        // glyphs (which fall back to whatever font the platform picks). On
+        // Windows the marked areas are native caption buttons: Windows acts
+        // on them (and shows Snap Layouts on maximize), but only on a press
+        // Brindle leaves unhandled, so they get no handlers there.
+        let caption = button_style(ButtonVariant::Ghost, ButtonSize::IconXs, &tokens);
+        let face = move |id: &'static str, icon: Icon| {
             div()
                 .id(id)
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(px(26.0))
-                .rounded_md()
-                .text_color(muted)
+                .h(caption.height)
+                .w(caption.width.unwrap_or(caption.height))
+                .rounded(caption.radius)
+                .text_color(tokens.muted_foreground)
                 .cursor(CursorStyle::Arrow)
-                .hover(|d| d.bg(t.hover_background().hsla()).text_color(fg))
-                .child(label)
+                .hover(move |mut s| {
+                    s = s.text_color(caption.hover_foreground);
+                    if let Some(background) = caption.hover_background {
+                        s = s.bg(background);
+                    }
+                    s
+                })
+                .child(icon.size(caption.icon_size))
         };
-        let button = |id, label| face(id, label).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-
-        // On Windows the marked areas are native caption buttons: Windows
-        // acts on them (and shows Snap Layouts on maximize), but only on a
-        // press Brindle leaves unhandled, so they get no handlers there.
-        let control = |id, label, area, action: fn(&mut Window, &mut App)| {
+        let control = |id, icon, area, action: fn(&mut Window, &mut App)| {
             if cfg!(windows) {
-                face(id, label).window_control_area(area)
+                face(id, icon).window_control_area(area)
             } else {
-                button(id, label).on_click(move |_, window, cx| action(window, cx))
+                face(id, icon)
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_click(move |_, window, cx| action(window, cx))
             }
         };
         let window_controls = csd.then(|| {
             let controls = window.window_controls();
-            let maximize = if window.is_maximized() { "❐" } else { "□" };
+            let maximize = if window.is_maximized() { Icon::Copy } else { Icon::Square };
             div()
                 .flex()
                 .flex_none()
@@ -2161,12 +2244,14 @@ impl Workspace {
                 .gap_1()
                 .pr_2()
                 .when(controls.minimize, |d| {
-                    d.child(control("minimize", "–", WindowControlArea::Min, |window, _| window.minimize_window()))
+                    d.child(control("minimize", Icon::Minus, WindowControlArea::Min, |window, _| window.minimize_window()))
                 })
                 .when(controls.maximize, |d| {
                     d.child(control("maximize", maximize, WindowControlArea::Max, |window, _| window.zoom_window()))
                 })
-                .child(control("close-window", "×", WindowControlArea::Close, |window, cx| window.dispatch_action(Box::new(CloseWindow), cx)))
+                .child(control("close-window", Icon::X, WindowControlArea::Close, |window, cx| {
+                    window.dispatch_action(Box::new(CloseWindow), cx)
+                }))
         });
 
         div()
@@ -2177,9 +2262,9 @@ impl Workspace {
             .h(px(TAB_BAR_HEIGHT))
             .pl_2()
             .gap_0p5()
-            .bg(chrome.hsla())
+            .bg(tokens.background)
             .border_b_1()
-            .border_color(border)
+            .border_color(tokens.border)
             // On Windows, Windows acts on caption presses only when Brindle
             // leaves them unhandled, and GPUI counts a press as handled when
             // it moves focus, which it does for any focusable element under
@@ -2198,7 +2283,17 @@ impl Workspace {
                 })
                 .on_mouse_down(MouseButton::Right, |e, window, _| window.show_window_menu(e.position))
             })
-            .child(div().flex().flex_shrink().min_w_0().items_end().gap_0p5().overflow_hidden().children(tabs))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink()
+                    .min_w_0()
+                    .items_end()
+                    // Enter and escape while the strip has focus go back to
+                    // the terminal; the list has already taken its own keys.
+                    .on_key_down(cx.listener(Self::strip_key_down))
+                    .child(list),
+            )
             .child(
                 div()
                     .flex()
@@ -2207,12 +2302,8 @@ impl Workspace {
                     .h(px(TAB_BAR_HEIGHT - 4.0))
                     .gap_0p5()
                     .pl_1()
-                    .child(button("new-tab", "+").on_click(cx.listener(|this, _, window, cx| {
-                        this.new_tab(&NewTab, window, cx)
-                    })))
-                    .child(button("profiles", "⌄").on_click(cx.listener(|this, _, window, cx| {
-                        this.open_profile_picker(&OpenProfilePicker, window, cx)
-                    }))),
+                    .child(inert("new-tab-press", new_tab.into_any_element()))
+                    .child(inert("profiles-press", profiles.into_any_element())),
             )
             // Windows hit-tests this as the caption: drag, double-click,
             // the system menu and Snap. Only empty space is marked, since a
@@ -2230,6 +2321,26 @@ impl Workspace {
     }
 }
 
+
+/// Moves `items[from]` to `to`'s place: after it when it came from the
+/// left (the items between move left), before it when it came from the
+/// right, which is where a tab dropped on another lands. False, moving
+/// nothing, for a drop on itself or an index out of range.
+fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
+/// Whether a key pressed while the tab strip has focus sends focus back to
+/// the active tab's terminal: enter or escape with no modifier held. The
+/// tab list itself takes the arrows, home and end.
+fn returns_from_strip(key: &str, modifiers: Modifiers) -> bool {
+    !modifiers.modified() && matches!(key, "enter" | "escape")
+}
 
 /// Trims a submitted `Rename Tab` value: a non-empty string sets a manual
 /// title, and an empty one clears it.
@@ -2426,6 +2537,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::move_tab_left))
                     .on_action(cx.listener(Self::move_tab_right))
                     .on_action(cx.listener(Self::rename_tab))
+                    .on_action(cx.listener(Self::focus_tab_strip))
                     .on_action(cx.listener(Self::close_window))
                     .on_action(cx.listener(Self::attach_session))
                     .on_action(cx.listener(Self::increase_font_size))
@@ -2445,7 +2557,7 @@ impl Render for Workspace {
                 Decorations::Client { tiling } => Some(tiling),
                 Decorations::Server => None,
             }, |d, tiling| {
-                d.border_color(theme.chrome_border().hsla())
+                d.border_color(cx.ui_theme().border)
                     .when(!(tiling.top || tiling.left), |d| d.rounded_tl(rounding))
                     .when(!(tiling.top || tiling.right), |d| d.rounded_tr(rounding))
                     .when(!(tiling.bottom || tiling.left), |d| d.rounded_bl(rounding))
@@ -2558,6 +2670,36 @@ mod tests {
         assert_eq!(PaletteTag::of(&PaletteKind::Prompt), PaletteTag::Prompt);
         assert_eq!(PaletteTag::of(&PaletteKind::NewTab), PaletteTag::NewTab);
         assert_eq!(PaletteTag::of(&PaletteKind::Sessions { sessions: Vec::new() }), PaletteTag::Sessions);
+    }
+
+    /// The spec's drag scenario: the first tab dropped on the third lands in
+    /// the third place; one dropped from the right lands before its target;
+    /// a drop on itself or out of range moves nothing.
+    #[test]
+    fn reorder_puts_the_moved_item_in_the_targets_place() {
+        let mut items = vec!['a', 'b', 'c', 'd'];
+        assert!(reorder(&mut items, 0, 2));
+        assert_eq!(items, ['b', 'c', 'a', 'd']);
+        assert!(reorder(&mut items, 3, 1));
+        assert_eq!(items, ['b', 'd', 'c', 'a']);
+        assert!(!reorder(&mut items, 2, 2));
+        assert!(!reorder(&mut items, 4, 0));
+        assert!(!reorder(&mut items, 0, 4));
+        assert_eq!(items, ['b', 'd', 'c', 'a']);
+    }
+
+    /// Enter and escape alone leave the strip; the list's own keys, tab
+    /// (the focus scope's) and modified keys don't.
+    #[test]
+    fn enter_and_escape_leave_the_strip() {
+        let none = Modifiers::default();
+        assert!(returns_from_strip("enter", none));
+        assert!(returns_from_strip("escape", none));
+        for key in ["left", "right", "home", "end", "pageup", "pagedown", "tab", "space", "a"] {
+            assert!(!returns_from_strip(key, none), "{key}");
+        }
+        assert!(!returns_from_strip("enter", Modifiers::shift()));
+        assert!(!returns_from_strip("escape", Modifiers::control()));
     }
 
     /// The sessions palette says "No detached sessions" only when there

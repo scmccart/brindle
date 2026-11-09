@@ -78,6 +78,10 @@ actions!(
         AttachSession,
         /// Consumes a key without doing anything (see the ctrl-shift-d guard).
         Swallow,
+        /// Puts keyboard focus on the tab strip, a tab list: arrows, home and
+        /// end then switch tabs, and enter or escape return focus to the
+        /// terminal. Hidden (no label, no default key).
+        FocusTabStrip,
         // The sessions palette: end the highlighted session. (The palettes'
         // other keys are the command list's and the overlay's.)
         PickerKill,
@@ -185,6 +189,9 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("tmux_new_session", Some("tmux: New Session"), || Box::new(TmuxNewSession)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
+    // The tab strip as a keyboard stop: unlabelled, for `--action` and user
+    // bindings (its keys are the tab list's own).
+    ("focus_tab_strip", None, || Box::new(FocusTabStrip)),
     // The settings dialog's own actions: unlabelled, so they stay out of the
     // command palette, but `--action` and user bindings can reach them.
     ("settings_up", None, || Box::new(SettingsUp)),

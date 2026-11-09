@@ -173,13 +173,15 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// (maximizing) and a press on maximize (restoring), which it does only when
 /// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels: the strip is 38 high; the buttons are 26 wide, 4 apart,
-    // 8 from the right edge, and centered in it; tabs sit at the bottom.
+    // Logical pixels: the strip is 38 high; the buttons are 24 wide (the
+    // `IconXs` button size), 4 apart, 8 from the right edge, and centered
+    // in it; tabs sit at the bottom, 11 in (the strip's and the list's
+    // padding), at least 80 wide.
     let points = [
-        ("close", -(8.0 + 13.0), 19.0),
-        ("max", -(8.0 + 26.0 + 4.0 + 13.0), 19.0),
-        ("min", -(8.0 + 2.0 * (26.0 + 4.0) + 13.0), 19.0),
-        ("strip", -(8.0 + 3.0 * 26.0 + 2.0 * 4.0 + 60.0), 19.0),
+        ("close", -(8.0 + 12.0), 19.0),
+        ("max", -(8.0 + 24.0 + 4.0 + 12.0), 19.0),
+        ("min", -(8.0 + 2.0 * (24.0 + 4.0) + 12.0), 19.0),
+        ("strip", -(8.0 + 3.0 * 24.0 + 2.0 * 4.0 + 60.0), 19.0),
         ("tab", 48.0, 23.0),
     ];
     // The scale comes from a first run's dump.

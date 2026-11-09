@@ -41,6 +41,11 @@ pub mod theme {
     pub const BLUE: Rgb = ANSI[4];
     pub const MAGENTA: Rgb = ANSI[5];
 
+    /// The window chrome's `background` token for the `e2e` theme: its
+    /// background mixed 35% towards black (`Theme::chrome_background`),
+    /// which the tab strip is drawn in.
+    pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
+
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
     pub const SEARCH_MATCH_FG: Rgb = Rgb(0xf0, 0xf0, 0xf0);
@@ -624,7 +629,7 @@ pub struct Dump {
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
     /// Where keyboard focus is (`--- focus`): `terminal`, `palette`,
-    /// `settings`, `none` or `other`.
+    /// `settings`, `tabs` (the tab strip), `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
     /// `list`, `session_end`, `close`, a field's or a button's label.
