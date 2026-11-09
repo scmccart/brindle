@@ -77,7 +77,7 @@ pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
 pub use tabs::{
     DraggedTab, DropSide, TabActivate, TabContextMenu, TabKey, TabList, TabMove, TabTrigger, TriggerPress, drop_side,
-    tab_key, tab_target, trigger_press,
+    tab_key, tab_target, trigger_label, trigger_press,
 };
 pub use toggle::Toggle;
 pub use tooltip::{Tooltip, TooltipFor, TooltipView};

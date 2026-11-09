@@ -2266,16 +2266,8 @@ impl Workspace {
         // Status dots take the global theme's ANSI colours (the previewed
         // theme's while the settings dialog shows one), not the tab's;
         // working is the muted foreground.
-        let global = match &self.theme_preview {
-            Some(theme) => theme.clone(),
-            None => Self::settings(cx).theme(None),
-        };
-        let status_color = |state: State| match state {
-            State::Blocked => global.ansi[3].hsla(),
-            State::Error => global.ansi[1].hsla(),
-            State::Done => global.ansi[2].hsla(),
-            State::Working | State::Idle => tokens.muted_foreground,
-        };
+        let global = Settings::chrome_theme(cx).clone();
+        let status_color = |state: State| global.status_color(state, tokens.muted_foreground);
         let dot = |color: Hsla| div().flex_none().size(px(6.0)).rounded_full().bg(color);
 
         // A tooltip naming a control and the key bound to its action in this

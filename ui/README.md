@@ -110,7 +110,9 @@ rule, not a convenience.
       its menu (`TabContextMenu`: the index and the press, for
       `ContextMenu::open_on_press`) and goes no further. `trigger_width`
       (`TabWidth::new(min, max)`) lets triggers shrink to the minimum and
-      grow with their label to the maximum, cutting it with an ellipsis.
+      grow with their label to the maximum, cutting it with an ellipsis
+      (`trigger_label`, public for other one-line labels in a flex row,
+      since gpui 0.2.2's `truncate` cuts nothing in a flex item).
       With `on_move`, a trigger dragged onto another of the same list
       (`DraggedTab`, previewed as a pill with its label) asks to move there,
       and a 2px primary bar marks the side it will land on (`drop_side`).

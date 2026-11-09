@@ -6,6 +6,8 @@ use std::fmt;
 use gpui::{Hsla, Rgba};
 use serde::{Deserialize, Deserializer};
 
+use crate::terminal::status::State;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color {
     pub r: u8,
@@ -200,6 +202,19 @@ impl Theme {
         }
     }
 
+    /// A program status dot's colour in window chrome (the strip and zone
+    /// headers draw them from the chrome's theme, not a tab's): yellow for
+    /// blocked, red for error, green for done, and `muted` (the
+    /// muted-foreground token) for working.
+    pub fn status_color(&self, state: State, muted: Hsla) -> Hsla {
+        match state {
+            State::Blocked => self.ansi[3].hsla(),
+            State::Error => self.ansi[1].hsla(),
+            State::Done => self.ansi[2].hsla(),
+            State::Working | State::Idle => muted,
+        }
+    }
+
     pub fn is_dark(&self) -> bool {
         self.background.luminance() < 0.5
     }
@@ -370,6 +385,19 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Status dots: the theme's yellow, red and green, and the muted colour
+    /// given for working (and idle, which shows no dot).
+    #[test]
+    fn status_colors_come_from_the_ansi_palette() {
+        let theme = builtin_theme("tokyo-night").unwrap();
+        let muted = Color::hex(0x123456).hsla();
+        assert_eq!(theme.status_color(State::Blocked, muted), theme.ansi[3].hsla());
+        assert_eq!(theme.status_color(State::Error, muted), theme.ansi[1].hsla());
+        assert_eq!(theme.status_color(State::Done, muted), theme.ansi[2].hsla());
+        assert_eq!(theme.status_color(State::Working, muted), muted);
+        assert_eq!(theme.status_color(State::Idle, muted), muted);
+    }
 
     #[test]
     fn parse_colors() {

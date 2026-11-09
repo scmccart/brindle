@@ -57,8 +57,8 @@
 
 ## 9. Zone headers and dividers
 
-- [ ] 9.1 Rebuild the zone header on token colours, ghost `IconXs` `Button`s (`Columns2`, `Rows2`, `X`) with tooltips (presses stop at the button as in 6.3, since the header's own press focuses the zone; the title uses the same truncation helper as 6.1), keeping the 28px height, the 2px active line in `primary`, status dot and the focus-on-press handler; recolour the dividers from the `border` token; verify the `zones` e2e cases pass and a capture case samples header, active line and divider colours
-- [ ] 9.2 Remove the headers' uses of the four chrome helpers; verify `grep` finds none in `src/zone_view.rs`
+- [x] 9.1 Rebuild the zone header on token colours, ghost `IconXs` `Button`s (`Columns2`, `Rows2`, `X`) with tooltips (presses stop at the button as in 6.3, since the header's own press focuses the zone; the title uses the same truncation helper as 6.1), keeping the 28px height, the 2px active line in `primary`, status dot and the focus-on-press handler; recolour the dividers from the `border` token; verify the `zones` e2e cases pass and a capture case samples header, active line and divider colours
+- [x] 9.2 Remove the headers' uses of the four chrome helpers; verify `grep` finds none in `src/zone_view.rs`
 
 ## 10. tmux chrome and theme.rs
 

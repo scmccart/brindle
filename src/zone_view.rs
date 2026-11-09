@@ -6,12 +6,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use brindle_ui::ContextMenuTarget as _;
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenuTarget as _, Icon, Tokens, Tooltip, TooltipFor as _,
+    trigger_label,
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
+    Action, AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Window, div, px, size,
+    SharedString, Size, Styled, Subscription, Window, div, px, size,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +28,7 @@ use crate::terminal_element::cell_metrics;
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use crate::tmux::Direction;
-use crate::workspace::terminal_automatic_title;
+use crate::workspace::{shortcut, terminal_automatic_title};
 
 /// Height of the native zone header bar shown when a tab has 2+ zones.
 pub const ZONE_HEADER_HEIGHT: f32 = 28.0;
@@ -346,6 +349,8 @@ pub struct Zone {
 
 pub struct ZoneTreeView {
     pub profile: Profile,
+    /// The tab's theme, for its terminals. The headers and dividers are
+    /// chrome, drawn in the window's tokens (`cx.ui_theme()`) instead.
     pub theme: Theme,
     pub font_size_override: Option<f32>,
     tree: ZoneTree,
@@ -843,13 +848,16 @@ impl ZoneTreeView {
 
     // ---- rendering --------------------------------------------------------------
 
-    fn render_tree(&self, node: &ZoneTree, cx: &mut Context<Self>) -> AnyElement {
+    /// The split tree under `node`, its chrome (dividers and headers) in the
+    /// window's tokens, which come from the global theme: a tab's own theme
+    /// colours only its terminals.
+    fn render_tree(&self, node: &ZoneTree, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         match node {
-            ZoneTree::Leaf(id) => self.render_leaf(*id, cx),
+            ZoneTree::Leaf(id) => self.render_leaf(*id, tokens, cx),
             ZoneTree::Split { axis, first, second } => {
-                let border = self.theme.chrome_border().hsla();
-                let first_el = self.render_tree(first, cx);
-                let second_el = self.render_tree(second, cx);
+                let border = tokens.border;
+                let first_el = self.render_tree(first, tokens, cx);
+                let second_el = self.render_tree(second, tokens, cx);
                 let divider = match axis {
                     SplitAxis::Horizontal => div().flex_none().w(px(ZONE_DIVIDER_SIZE)).h_full().bg(border),
                     SplitAxis::Vertical => div().flex_none().h(px(ZONE_DIVIDER_SIZE)).w_full().bg(border),
@@ -869,7 +877,9 @@ impl ZoneTreeView {
         }
     }
 
-    fn render_leaf(&self, id: ZoneId, cx: &mut Context<Self>) -> AnyElement {
+    /// Zone `id`: its terminal, under a header when the tab has 2+ zones.
+    /// The header is the zone's first child (see `menu_anchor`).
+    fn render_leaf(&self, id: ZoneId, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(zone) = self.zones.get(&id) else {
             return div().size_full().into_any_element();
         };
@@ -879,38 +889,48 @@ impl ZoneTreeView {
         }
 
         let active = id == self.active;
-        let t = &self.theme;
-        let chrome = t.chrome_background().hsla();
-        let border = t.chrome_border().hsla();
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let accent = t.accent().hsla();
-        let hover_bg = t.hover_background().mix(t.foreground, 0.1).hsla();
-
-        let status_color = zone.status.map(|state| match state {
-            State::Blocked => t.ansi[3].hsla(),
-            State::Error => t.ansi[1].hsla(),
-            State::Done => t.ansi[2].hsla(),
-            State::Working | State::Idle => muted,
-        });
+        // Status dots in the chrome theme's colours, like the strip's.
+        let status_color =
+            zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
         let title = zone.title.clone();
 
-        let header_btn = |btn_id: (&'static str, usize), label: &'static str| {
-            div()
-                .id(btn_id)
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(20.0))
-                .rounded_sm()
-                .text_xs()
-                .text_color(muted)
-                .cursor(CursorStyle::Arrow)
-                .hover(move |d| d.bg(hover_bg).text_color(fg))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(label)
+        // A tooltip naming a button and the key bound to its action, looked
+        // up when it is shown. The zone actions are bound in `ZoneTree`, so
+        // the lookup starts at this zone's terminal, which is inside it.
+        let focus = view.read(cx).focus_handle.clone();
+        let tip = |label: &'static str, action: Box<dyn Action>| {
+            let (focus, action): (FocusHandle, Rc<dyn Action>) = (focus.clone(), Rc::from(action));
+            move |window: &mut Window, _: &mut App| Tooltip::new(label).shortcut_opt(shortcut(&*action, &focus, window))
         };
+        let button = |name: &'static str, icon: Icon| {
+            Button::icon_only((name, id.0 as usize), icon)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::IconXs)
+                .text_color(tokens.muted_foreground)
+        };
+        // A press on a header button stops at its wrapper: the header's own
+        // press focuses the zone, and a `Button` without a focus handle
+        // would let the press bubble to the zone tree, which tracks focus
+        // and would take it from the terminal.
+        let inert = |name: &'static str, control: Button| {
+            div()
+                .id((name, id.0 as usize))
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(control)
+        };
+        let split_right = button("zone-split-right", Icon::Columns2)
+            .tooltip_with(tip("Split right", Box::new(SplitZoneRight)))
+            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Horizontal, window, cx)));
+        let split_down = button("zone-split-down", Icon::Rows2)
+            .tooltip_with(tip("Split down", Box::new(SplitZoneDown)))
+            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Vertical, window, cx)));
+        let close = button("zone-close", Icon::X)
+            .tooltip_with(tip("Close zone", Box::new(CloseZone)))
+            .on_click(cx.listener(move |this, _, window, cx| this.close_zone_by_id(id, window, cx)));
 
         let header = div()
             .id(("zone-header", id.0 as usize))
@@ -920,15 +940,14 @@ impl ZoneTreeView {
             .items_center()
             .h(px(ZONE_HEADER_HEIGHT))
             .pl_2p5()
-            .pr_1()
+            .pr_0p5()
             .gap_1p5()
-            .bg(chrome)
+            .bg(tokens.background)
             .border_b_1()
-            .border_color(border)
+            .border_color(tokens.border)
             .text_xs()
+            .text_color(if active { tokens.foreground } else { tokens.muted_foreground })
             .cursor(CursorStyle::Arrow)
-            .when(active, |d| d.text_color(fg))
-            .when(!active, |d| d.text_color(muted))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                 this.focus_zone(id, window, cx);
                 cx.stop_propagation();
@@ -939,47 +958,23 @@ impl ZoneTreeView {
                 this.open_menu(id, event.position, Some(event.clone()), window, cx);
             }))
             .when(active, |d| {
-                d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(accent))
+                d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(tokens.primary))
             })
             .when_some(status_color, |d, color| {
                 d.child(div().flex_none().size(px(6.0)).rounded_full().bg(color))
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(title),
-            )
+            // gpui 0.2.2's `text_ellipsis` on a flex item cuts nothing; the
+            // tab strip's label helper does.
+            .child(trigger_label(title))
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .gap_0p5()
-                    .child(
-                        header_btn(("zone-split-right", id.0 as usize), "◫").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.split_zone(id, SplitAxis::Horizontal, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        header_btn(("zone-split-down", id.0 as usize), "⬒").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.split_zone(id, SplitAxis::Vertical, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        header_btn(("zone-close", id.0 as usize), "×").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.close_zone_by_id(id, window, cx);
-                            },
-                        )),
-                    ),
+                    .child(inert("zone-split-right-press", split_right))
+                    .child(inert("zone-split-down-press", split_down))
+                    .child(inert("zone-close-press", close)),
             );
 
         let laid_out = self.laid_out.clone();
@@ -1007,7 +1002,8 @@ impl Render for ZoneTreeView {
         let tree = self.tree.clone();
         // Headers are recorded again as this frame lays them out.
         self.laid_out.borrow_mut().headers.clear();
-        let content = self.render_tree(&tree, cx);
+        let tokens = *cx.ui_theme();
+        let content = self.render_tree(&tree, &tokens, cx);
         let laid_out = self.laid_out.clone();
         div()
             .on_children_prepainted(move |bounds, _, _| laid_out.borrow_mut().tree = bounds.first().copied())

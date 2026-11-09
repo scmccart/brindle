@@ -698,7 +698,11 @@ fn one_line_ellipsis<E: Styled>(element: E) -> E {
 /// cut text alone would measure a few pixels short of it (the ellipsis
 /// replaces whole glyphs), and the trigger would change width as its text
 /// did. The text shown is laid over that copy at the label's final width.
-fn trigger_label(text: SharedString) -> gpui::Div {
+///
+/// Public for other one-line labels in a flex row that must give way to
+/// what is beside them (an app's pane header title, say): give the result
+/// the colour and size, and it takes the room left.
+pub fn trigger_label(text: SharedString) -> gpui::Div {
     div()
         .relative()
         .flex_1()

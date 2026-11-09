@@ -181,6 +181,7 @@ fn unix() -> Vec<Case> {
         display("zones-split-and-focus", zones::split_and_focus),
         display("zones-close", zones::close),
         display("zones-restore", zones::restore),
+        display("zones-header-colors", zones::header_colors),
         display("tabs-strip-colors", tabs::strip_colors),
         display("tabs-strip-keys", tabs::strip_keys),
         display("tabs-actions-keep-focus", tabs::actions_keep_focus),

@@ -45,6 +45,10 @@ pub mod theme {
     /// background mixed 35% towards black (`Theme::chrome_background`),
     /// which the tab strip is drawn in.
     pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    /// The `border` token for the `e2e` theme: its background mixed 12%
+    /// towards its foreground (`Theme::chrome_border`), which zone headers
+    /// and dividers are drawn in.
+    pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
