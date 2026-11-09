@@ -381,6 +381,21 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Presses a key (`tab`, `shift-tab`, `enter`) through Brindle's own key
+    /// dispatch: its bindings, key listeners and keystroke observers, as a
+    /// real key press reaches them. In-process, not OS input.
+    pub fn key(mut self, keystroke: &str) -> Self {
+        self.steps.extend(["--key".to_string(), keystroke.to_string()]);
+        self
+    }
+
+    /// Counts focus as moved by `pointer` or `keyboard` from this step on,
+    /// as a pointer press on a control or a key press would.
+    pub fn modality(mut self, modality: &str) -> Self {
+        self.steps.extend(["--modality".to_string(), modality.to_string()]);
+        self
+    }
+
     /// Runs a tmux command `secs` after Brindle starts.
     pub fn at(mut self, secs: f64, args: &[&str]) -> Self {
         self.timeline.push((secs, Event::Tmux(args.iter().map(|a| a.to_string()).collect())));
@@ -608,6 +623,15 @@ pub struct Dump {
     pub zone_list: Vec<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
+    /// Where keyboard focus is (`--- focus`): `terminal`, `settings`, `none`
+    /// or `other`.
+    pub focus: Option<String>,
+    /// The focused settings-dialog control (`--- focus settings stop=…`):
+    /// `list`, `session_end`, `close`, a field's or a button's label.
+    pub focus_stop: Option<String>,
+    /// The window's focus-visible modality (`modality=`): `keyboard` or
+    /// `pointer`.
+    pub modality: Option<String>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -666,6 +690,13 @@ impl Dump {
                 in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- find ") {
                 dump.find = Some(rest.to_string());
+                in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- focus ") {
+                let (rest, modality) = rest.rsplit_once(" modality=").map_or((rest, None), |(r, m)| (r, Some(m)));
+                let (place, stop) = rest.split_once(" stop=").map_or((rest, None), |(p, s)| (p, unquote(s)));
+                dump.focus = Some(place.to_string());
+                dump.focus_stop = stop;
+                dump.modality = modality.map(str::to_string);
                 in_screen = false;
             } else if !dump.palette.is_empty() && dump.input.is_none() && !in_screen {
                 dump.palette.push(line.to_string());
@@ -814,5 +845,19 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.find_field("count") == Some("11"), "count {:?}", dump.find_field("count"));
     ensure!(dump.find_field("focused") == Some("10,0"), "focused {:?}", dump.find_field("focused"));
     ensure!(dump.find_field("nope").is_none(), "missing field");
+    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- focus terminal modality=keyboard\n");
+    ensure!(dump.screen == ["hi"], "screen before focus {:?}", dump.screen);
+    ensure!(dump.focus.as_deref() == Some("terminal"), "focus {:?}", dump.focus);
+    ensure!(dump.focus_stop.is_none(), "stop {:?}", dump.focus_stop);
+    ensure!(dump.modality.as_deref() == Some("keyboard"), "modality {:?}", dump.modality);
+    let dump = Dump::parse(
+        "--- palette list query=\"\"\nrow\n--- input text=\"\" cursor=0 selection=0..0\n--- focus other modality=pointer\n",
+    );
+    ensure!(dump.palette == ["list query=\"\"", "row"], "palette before focus {:?}", dump.palette);
+    ensure!(dump.focus.as_deref() == Some("other"), "focus after the palette {:?}", dump.focus);
+    ensure!(dump.modality.as_deref() == Some("pointer"), "modality {:?}", dump.modality);
+    let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
+    ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
+    ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
     Ok(())
 }

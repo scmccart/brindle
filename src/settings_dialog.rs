@@ -11,17 +11,20 @@ use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, CursorStyle, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+};
+
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Dialog, Dismiss, FocusRing as _, FocusStops, Input, Select,
+    SelectEvent, TextInput, TextInputEvent, Tokens,
 };
 
 use crate::actions::{
-    SettingsCancel, SettingsChoiceNext, SettingsChoicePrev, SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit,
-    SettingsNew, SettingsNextField, SettingsPrevField, SettingsUp,
+    SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit, SettingsFirst, SettingsLast, SettingsNew, SettingsUp,
 };
 use crate::config_edit;
-use brindle_ui::{TextInput, TextInputEvent};
 use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 mod profiles;
@@ -204,8 +207,6 @@ struct Editor {
     name: String,
     /// One field per [`SLOTS`] entry.
     colors: Vec<String>,
-    /// 0 is the name; `n` is `colors[n - 1]`.
-    focused: usize,
     /// The theme as of the last valid edit of every field.
     current: Theme,
     /// The fields as the editor opened, to tell unsaved edits.
@@ -222,7 +223,7 @@ impl Editor {
             .map(|slot| slot.get(&current).map(|c| c.to_string()).unwrap_or_default())
             .collect();
         let initial = std::iter::once(name.clone()).chain(colors.iter().cloned()).collect();
-        Self { original, return_to, name, colors, focused: 0, current, initial }
+        Self { original, return_to, name, colors, current, initial }
     }
 
     /// Parses color field `ix`: `Ok(None)` is a cleared optional color.
@@ -269,16 +270,30 @@ impl Editor {
         }
     }
 
-    fn move_focus(&mut self, forward: bool) {
-        self.focused = if forward { (self.focused + 1) % FIELD_COUNT } else { (self.focused + FIELD_COUNT - 1) % FIELD_COUNT };
-    }
+}
 
-    fn focused_label(&self) -> &'static str {
-        match self.focused {
-            0 => "name",
-            n => SLOTS[n - 1].label(),
-        }
+/// A theme editor field's name in the `--dump-screen-after` line: `name`
+/// for field 0, else its color's label.
+fn field_label(field: usize) -> &'static str {
+    match field {
+        0 => "name",
+        n => SLOTS.get(n - 1).map_or("", |slot| slot.label()),
     }
+}
+
+/// The selection foreground's field (its color slot plus one for the name).
+fn selection_foreground_field() -> usize {
+    SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1
+}
+
+/// What kind of view a section shows: its list (General counts as one), an
+/// editor, or the delete confirmation. A change of section or kind moves
+/// focus to the new view's first control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeKind {
+    List,
+    Editor,
+    ConfirmDelete,
 }
 
 #[derive(Clone, Debug)]
@@ -407,8 +422,30 @@ impl Model {
                     }
                 }
             }
-            Mode::Editor(editor) => editor.move_focus(forward),
-            Mode::ConfirmDelete => {}
+            // The editor's fields are focus stops: the view moves focus.
+            Mode::Editor(_) | Mode::ConfirmDelete => {}
+        }
+    }
+
+    /// Home and end in a list: selects its first entry, or its `last`
+    /// (themes skip the unreadable ones, as up and down do).
+    pub fn select_edge(&mut self, last: bool) {
+        match self.section {
+            Section::General => {}
+            Section::Profiles => {
+                if let Some(ix) = if last { self.profiles.entries.len().checked_sub(1) } else { Some(0) } {
+                    self.profiles.select(ix);
+                    self.error = None;
+                }
+            }
+            Section::Theme => {
+                let readable = |ix: &usize| self.entries[*ix].theme.is_ok();
+                let mut ixs = 0..self.entries.len();
+                let found = if last { ixs.rfind(readable) } else { ixs.find(readable) };
+                if let Some(ix) = found {
+                    self.select(ix);
+                }
+            }
         }
     }
 
@@ -698,33 +735,42 @@ impl Model {
         Some((0..FIELD_COUNT).map(|field| editor.field(field).to_string()).collect())
     }
 
-    pub fn focused_field(&self) -> Option<usize> {
-        match &self.mode {
-            Mode::Editor(editor) => Some(editor.focused),
-            _ => None,
-        }
-    }
-
-    pub fn focus_field(&mut self, field: usize) {
-        if let Mode::Editor(editor) = &mut self.mode {
-            editor.focused = field.min(FIELD_COUNT - 1);
-        }
-    }
-
     /// Clears the selection foreground; returns its field.
     pub fn clear_selection_foreground(&mut self) -> Option<usize> {
         let Mode::Editor(editor) = &mut self.mode else { return None };
-        let field = SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1;
-        editor.focused = field;
+        let field = selection_foreground_field();
         editor.set_field(field, "");
         Some(field)
     }
 
+    /// Whether the editor's selection foreground holds a color, so Clear
+    /// has something to clear.
+    fn selection_foreground_set(&self) -> bool {
+        match &self.mode {
+            Mode::Editor(editor) => Slot::SelectionForeground.get(&editor.current).is_some(),
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
     pub fn in_list(&self) -> bool {
+        self.mode_kind() == ModeKind::List
+    }
+
+    /// What the current section shows.
+    pub fn mode_kind(&self) -> ModeKind {
         match self.section {
-            Section::General => true,
-            Section::Theme => matches!(self.mode, Mode::List),
-            Section::Profiles => matches!(self.profiles.mode, profiles::Mode::List),
+            Section::General => ModeKind::List,
+            Section::Theme => match self.mode {
+                Mode::List => ModeKind::List,
+                Mode::Editor(_) => ModeKind::Editor,
+                Mode::ConfirmDelete => ModeKind::ConfirmDelete,
+            },
+            Section::Profiles => match self.profiles.mode {
+                profiles::Mode::List => ModeKind::List,
+                profiles::Mode::Editor(_) => ModeKind::Editor,
+                profiles::Mode::ConfirmDelete => ModeKind::ConfirmDelete,
+            },
         }
     }
 
@@ -771,6 +817,11 @@ impl Model {
     }
 
     /// Cycles through the sections (ctrl-tab).
+    /// Home and end in the section list: the first or the `last` section.
+    pub fn edge_section(&mut self, last: bool) -> bool {
+        self.select_section(if last { SECTIONS[SECTIONS.len() - 1] } else { SECTIONS[0] })
+    }
+
     pub fn next_section(&mut self, forward: bool) -> bool {
         let ix = SECTIONS.iter().position(|s| *s == self.section).unwrap_or(0);
         let n = SECTIONS.len();
@@ -840,14 +891,6 @@ impl Model {
         self.session_end
     }
 
-    /// left/right on the General section's choice: writes the next value.
-    pub fn step_session_end(&mut self, forward: bool) -> Outcome {
-        let all = TmuxSessionEnd::ALL;
-        let ix = all.iter().position(|v| *v == self.session_end).unwrap_or(0);
-        let n = all.len();
-        self.set_session_end(all[if forward { (ix + 1) % n } else { (ix + n - 1) % n }])
-    }
-
     /// Writes `tmux_session_end`; the value changes only if the write did.
     pub fn set_session_end(&mut self, value: TmuxSessionEnd) -> Outcome {
         if self.section != Section::General || value == self.session_end {
@@ -862,8 +905,9 @@ impl Model {
         }
     }
 
-    /// Debug description for `--dump-screen-after`.
-    pub fn describe(&self) -> String {
+    /// Debug description for `--dump-screen-after`. `field` names the
+    /// focused control, which an editor reports as its `field=`.
+    pub fn describe(&self, field: &str) -> String {
         if self.section == Section::General {
             return format!(
                 "--- settings section=General tmux_session_end={:?} error={:?}\n",
@@ -872,7 +916,7 @@ impl Model {
             );
         }
         if self.section == Section::Profiles {
-            return self.profiles.describe(&self.error);
+            return self.profiles.describe(&self.error, field);
         }
         let section = "Theme";
         match &self.mode {
@@ -885,7 +929,7 @@ impl Model {
             Mode::Editor(editor) => format!(
                 "--- settings section={section} mode=editor name={:?} field={:?} invalid={:?} can_save={} error={:?}\n",
                 editor.name,
-                editor.focused_label(),
+                field,
                 editor.invalid_colors().iter().map(|&ix| SLOTS[ix].label()).collect::<Vec<_>>(),
                 self.editor_can_save(),
                 self.error
@@ -909,14 +953,130 @@ pub enum SettingsEvent {
     /// The config file was written; reload it, with these profile renames
     /// (old, new) applied to open tabs.
     ConfigWritten(Vec<(String, String)>),
-    /// Close the dialog, ending any preview.
+}
+
+/// The dialog's buttons, each with its own focus handle. A button the
+/// theme and profile views share (New, Save, …) shares its handle too, since
+/// only one of them shows at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Btn {
+    New,
+    Duplicate,
+    Edit,
+    Delete,
+    Up,
+    Down,
+    Cancel,
+    Apply,
     Close,
+    Keep,
+    ConfirmDelete,
+    Clear,
+    Discard,
+    Save,
+}
+
+const BUTTONS: [Btn; 14] = [
+    Btn::New,
+    Btn::Duplicate,
+    Btn::Edit,
+    Btn::Delete,
+    Btn::Up,
+    Btn::Down,
+    Btn::Cancel,
+    Btn::Apply,
+    Btn::Close,
+    Btn::Keep,
+    Btn::ConfirmDelete,
+    Btn::Clear,
+    Btn::Discard,
+    Btn::Save,
+];
+
+impl Btn {
+    /// The element id, unique among the buttons of one view.
+    fn id(self) -> &'static str {
+        match self {
+            Btn::New => "new",
+            Btn::Duplicate => "duplicate",
+            Btn::Edit => "edit",
+            Btn::Delete => "delete",
+            Btn::Up => "move-up",
+            Btn::Down => "move-down",
+            Btn::Cancel => "cancel",
+            Btn::Apply => "apply",
+            Btn::Close => "close",
+            Btn::Keep => "delete-no",
+            Btn::ConfirmDelete => "delete-yes",
+            Btn::Clear => "clear-selection-fg",
+            Btn::Discard => "discard",
+            Btn::Save => "save",
+        }
+    }
+
+    /// What a focused button reports as the editor's `field=` in the dump.
+    fn label(self) -> &'static str {
+        match self {
+            Btn::New => "New",
+            Btn::Duplicate => "Duplicate",
+            Btn::Edit => "Edit",
+            Btn::Delete => "Delete",
+            Btn::Up => "Move up",
+            Btn::Down => "Move down",
+            Btn::Cancel => "Cancel",
+            Btn::Apply => "Apply",
+            Btn::Close => "Close",
+            Btn::Keep => "Keep",
+            Btn::ConfirmDelete => "Delete",
+            Btn::Clear => "Clear",
+            Btn::Discard => "Discard",
+            Btn::Save => "Save",
+        }
+    }
+}
+
+/// The footer buttons of each view, in Tab order (left to right).
+fn footer_buttons(section: Section, kind: ModeKind) -> &'static [Btn] {
+    match (section, kind) {
+        (Section::General, _) => &[Btn::Close],
+        (_, ModeKind::ConfirmDelete) => &[Btn::Keep, Btn::ConfirmDelete],
+        (_, ModeKind::Editor) => &[Btn::Discard, Btn::Save],
+        (Section::Theme, ModeKind::List) => &[Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply],
+        (Section::Profiles, ModeKind::List) => {
+            &[Btn::New, Btn::Duplicate, Btn::Edit, Btn::Delete, Btn::Up, Btn::Down, Btn::Close]
+        }
+    }
+}
+
+/// What enter does when the focused control is `on_button` (a button or
+/// the dialog's close `X`) or not: a button takes enter itself, on its
+/// key-down, so the dialog's binding lets the key through to it instead of
+/// running the section's confirm. gpui matches the binding first, so
+/// without this a focused Discard would save.
+fn enter_confirms(on_button: bool) -> bool {
+    !on_button
+}
+
+/// A choice field: the General section's session-end setting, or one of the
+/// profile editor's selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Choice {
+    SessionEnd,
+    Profile(profiles::Field),
 }
 
 pub struct SettingsDialog {
     focus_handle: FocusHandle,
+    /// The close `X` in the corner.
+    close_handle: FocusHandle,
+    /// The theme list or the profile list, whichever is shown: one Tab
+    /// stop, whose keys move the selection.
+    list_handle: FocusHandle,
+    /// The section list: the first Tab stop, whose keys switch sections.
+    sections_handle: FocusHandle,
+    buttons: Vec<(Btn, FocusHandle)>,
     model: Model,
-    /// The dialog's own colors: the previewed theme.
+    /// The theme the tabs last previewed, to tell when it changes.
     theme: Theme,
     list_scroll: ScrollHandle,
     editor_scroll: ScrollHandle,
@@ -925,36 +1085,86 @@ pub struct SettingsDialog {
     _field_subscriptions: Vec<Subscription>,
     /// What the last profile preview showed: name, theme and font size.
     profile_previewed: Option<(String, Option<String>, Option<f32>)>,
-    /// The profile editor's text inputs and its choice and checkbox focus
-    /// handles (tab stops); empty unless it is open.
+    /// The profile editor's text inputs and selects; empty unless it is
+    /// open.
     profile_inputs: Vec<(profiles::Field, Entity<TextInput>)>,
-    choice_handles: Vec<(profiles::Field, FocusHandle)>,
+    profile_selects: Vec<(profiles::Field, Entity<Select>)>,
+    _profile_subscriptions: Vec<Subscription>,
+    /// The profile editor's default checkbox.
+    default_handle: FocusHandle,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
     /// The General section's choice field.
-    session_end_handle: FocusHandle,
+    session_end: Entity<Select>,
+    _session_end_changed: Subscription,
+    /// The section and kind of view focus was last placed for.
+    placed_for: (Section, ModeKind),
+    /// The focused handle an editor last scrolled into view.
+    scrolled_to: Option<FocusHandle>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsDialog {}
+impl EventEmitter<DismissEvent> for SettingsDialog {}
 
-/// The General section opens with its choice focused, so left and right
-/// work at once.
 impl Focusable for SettingsDialog {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        match self.model.section() {
-            Section::General => self.session_end_handle.clone(),
-            _ => self.focus_handle.clone(),
+        self.focus_handle.clone()
+    }
+}
+
+impl FocusStops for SettingsDialog {
+    /// The section list (one stop), then the view's fields (or its list,
+    /// one stop), then its footer buttons, then the close `X`.
+    fn stops(&self, cx: &App) -> Vec<FocusHandle> {
+        let mut stops = vec![self.sections_handle.clone()];
+        let (section, kind) = (self.model.section(), self.model.mode_kind());
+        match (section, kind) {
+            (Section::General, _) => stops.push(self.session_end.focus_handle(cx)),
+            (Section::Theme | Section::Profiles, ModeKind::List) => stops.push(self.list_handle.clone()),
+            (Section::Theme, ModeKind::Editor) => {
+                for (field, input) in self.fields.iter().enumerate() {
+                    stops.push(input.focus_handle(cx));
+                    if field == selection_foreground_field() && self.enabled(Btn::Clear) {
+                        stops.push(self.button_handle(Btn::Clear));
+                    }
+                }
+            }
+            (Section::Profiles, ModeKind::Editor) => stops.extend(self.profile_field_stops(cx)),
+            _ => {}
         }
+        stops.extend(
+            footer_buttons(section, kind).iter().filter(|b| self.enabled(**b)).map(|b| self.button_handle(*b)),
+        );
+        stops.push(self.close_handle.clone());
+        stops
+    }
+
+    /// The General section opens with its choice focused, so enter, space,
+    /// up and down open its menu at once.
+    fn initial_focus(&self, cx: &App) -> Option<FocusHandle> {
+        (self.model.section() == Section::General).then(|| self.session_end.focus_handle(cx))
     }
 }
 
 impl SettingsDialog {
-    pub fn new(model: Model, theme: Theme, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Model, theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = model.preview().unwrap_or(theme);
         let list_scroll = ScrollHandle::new();
         list_scroll.scroll_to_item(model.selected);
+        let labels = TmuxSessionEnd::ALL.map(session_end_label);
+        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == model.session_end());
+        let session_end = cx.new(|cx| Select::new(labels, current, cx));
+        let session_end_changed = cx.subscribe_in(&session_end, window, |this, _, event: &SelectEvent, window, cx| {
+            let SelectEvent::Changed(ix) = *event;
+            this.apply_choice(Choice::SessionEnd, ix, window, cx);
+        });
+        let placed_for = (model.section(), model.mode_kind());
         Self {
             focus_handle: cx.focus_handle(),
+            close_handle: cx.focus_handle(),
+            list_handle: cx.focus_handle(),
+            sections_handle: cx.focus_handle(),
+            buttons: BUTTONS.iter().map(|&b| (b, cx.focus_handle())).collect(),
             model,
             theme,
             list_scroll,
@@ -963,15 +1173,22 @@ impl SettingsDialog {
             _field_subscriptions: Vec::new(),
             profile_previewed: None,
             profile_inputs: Vec::new(),
-            choice_handles: Vec::new(),
+            profile_selects: Vec::new(),
+            _profile_subscriptions: Vec::new(),
+            default_handle: cx.focus_handle(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
-            session_end_handle: cx.focus_handle(),
+            session_end,
+            _session_end_changed: session_end_changed,
+            placed_for,
+            scrolled_to: None,
         }
     }
 
-    pub fn describe(&self) -> String {
-        self.model.describe()
+    /// The dialog's `--dump-screen-after` line, with the focused control
+    /// as an editor's `field=`.
+    pub fn describe(&self, window: &Window, cx: &App) -> String {
+        self.model.describe(self.focused_label(window, cx))
     }
 
     /// The editor input that has keyboard focus.
@@ -980,32 +1197,204 @@ impl SettingsDialog {
         inputs.find(|f| f.read(cx).is_focused(window)).cloned()
     }
 
+    /// The name of the focused control: an editor field's label, a
+    /// button's, `list` for a list, `close` for the `X`, `session_end` for
+    /// General's choice, or empty.
+    pub fn focused_label(&self, window: &Window, cx: &App) -> &'static str {
+        if self.sections_handle.is_focused(window) {
+            return "sections";
+        }
+        if self.list_handle.is_focused(window) {
+            return "list";
+        }
+        let session_end = self.session_end.read(cx);
+        if session_end.is_open() || session_end.focus_handle(cx).is_focused(window) {
+            return "session_end";
+        }
+        if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
+            return field_label(field);
+        }
+        if let Some((field, _)) = self.profile_inputs.iter().find(|(_, i)| i.read(cx).is_focused(window)) {
+            return field.label();
+        }
+        // A select whose menu is open still counts as the focused field.
+        let select_focused = |s: &Entity<Select>| {
+            let s = s.read(cx);
+            s.is_open() || s.focus_handle(cx).is_focused(window)
+        };
+        if let Some((field, _)) = self.profile_selects.iter().find(|(_, s)| select_focused(s)) {
+            return field.label();
+        }
+        if self.default_handle.is_focused(window) {
+            return profiles::Field::Default.label();
+        }
+        if let Some((b, _)) = self.buttons.iter().find(|(_, h)| h.is_focused(window)) {
+            return b.label();
+        }
+        if self.close_handle.is_focused(window) {
+            return "close";
+        }
+        ""
+    }
+
+    fn button_handle(&self, b: Btn) -> FocusHandle {
+        self.buttons.iter().find(|(btn, _)| *btn == b).map(|(_, h)| h.clone()).expect("every button has a handle")
+    }
+
+    /// Whether a button or the close `X` has focus.
+    fn button_focused(&self, window: &Window) -> bool {
+        self.close_handle.is_focused(window) || self.buttons.iter().any(|(_, h)| h.is_focused(window))
+    }
+
+    /// Whether button `b` can be pressed (and focused) in the current view.
+    fn enabled(&self, b: Btn) -> bool {
+        let model = &self.model;
+        let profiles = &model.profiles;
+        let editable = profiles.read_only.is_none();
+        let profile_ok = profiles.selected_entry().is_some_and(|e| e.profile.is_ok());
+        match (model.section(), b) {
+            (Section::Theme, Btn::Delete) => model.selected_entry().is_some_and(|e| e.custom),
+            (Section::Theme, Btn::Clear) => model.selection_foreground_set(),
+            (Section::Theme, Btn::Save) => model.editor_can_save(),
+            (Section::Profiles, Btn::New) => editable,
+            (Section::Profiles, Btn::Duplicate | Btn::Edit) => editable && profile_ok,
+            (Section::Profiles, Btn::Delete) => editable && profiles.entries.len() > 1,
+            (Section::Profiles, Btn::Up) => editable && profiles.selected > 0,
+            (Section::Profiles, Btn::Down) => editable && profiles.selected + 1 < profiles.entries.len(),
+            (Section::Profiles, Btn::Save) => matches!(profiles.editor_result(), Some(Ok(_))),
+            _ => true,
+        }
+    }
+
+    /// The editor's field stops, in order; the first takes focus when the
+    /// editor opens. Empty outside an editor.
+    fn field_stops(&self, cx: &App) -> Vec<FocusHandle> {
+        match (self.model.section(), self.model.mode_kind()) {
+            (Section::Theme, ModeKind::Editor) => self.fields.iter().map(|f| f.focus_handle(cx)).collect(),
+            (Section::Profiles, ModeKind::Editor) => self.profile_field_stops(cx),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Where focus goes when a view opens: General's choice, a list, an
+    /// editor's name, or (asking to confirm a delete) the dialog itself.
+    fn default_focus(&self, cx: &App) -> FocusHandle {
+        match (self.model.section(), self.model.mode_kind()) {
+            (Section::General, _) => self.session_end.focus_handle(cx),
+            (_, ModeKind::List) => self.list_handle.clone(),
+            _ => self.field_stops(cx).into_iter().next().unwrap_or_else(|| self.focus_handle.clone()),
+        }
+    }
+
+    /// Whether a select's menu is open; it holds focus while it is.
+    fn menu_open(&self, cx: &App) -> bool {
+        self.session_end.read(cx).is_open() || self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
+    }
+
+    /// Moves focus to the new view's first control when the section or the
+    /// kind of view changed, and off a control the view no longer shows
+    /// (or shows disabled).
+    fn place_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = (self.model.section(), self.model.mode_kind());
+        let moved = view != self.placed_for;
+        self.placed_for = view;
+        if !moved && self.menu_open(cx) {
+            return;
+        }
+        // On the section list, focus stays while the sections change under
+        // it, by key or click: the user is still choosing a section.
+        if self.sections_handle.is_focused(window) {
+            return;
+        }
+        let stops = self.stops(cx);
+        let valid = window.focused(cx).is_some_and(|f| f == self.focus_handle || stops.contains(&f));
+        if moved || !valid {
+            window.focus(&self.default_focus(cx));
+        }
+    }
+
     /// After any change: preview the theme the model now shows, keep the
-    /// editor's inputs and focus in step with the model, and redraw.
+    /// editor's inputs, the selects and focus in step with the model, and
+    /// redraw.
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview(cx);
         self.sync_fields(window, cx);
-        if self.model.section() != Section::General && self.session_end_handle.is_focused(window) {
-            window.focus(&self.focus_handle);
-        }
+        self.sync_selects(cx);
+        self.place_focus(window, cx);
         match self.model.section() {
-            Section::General => {
-                if !self.session_end_handle.is_focused(window) {
-                    window.focus(&self.session_end_handle);
+            Section::General => {}
+            Section::Theme => {
+                if matches!(self.model.mode, Mode::List) {
+                    self.list_scroll.scroll_to_item(self.model.selected);
                 }
             }
-            Section::Theme => match &self.model.mode {
-                Mode::List => self.list_scroll.scroll_to_item(self.model.selected),
-                Mode::Editor(editor) => self.scroll_to_field(editor.focused),
-                Mode::ConfirmDelete => {}
-            },
-            Section::Profiles => match &self.model.profiles.mode {
-                profiles::Mode::List => self.profile_list_scroll.scroll_to_item(self.model.profiles.selected),
-                profiles::Mode::Editor(editor) => self.scroll_to_profile_field(editor.focused),
-                profiles::Mode::ConfirmDelete => {}
-            },
+            Section::Profiles => {
+                if matches!(self.model.profiles.mode, profiles::Mode::List) {
+                    self.profile_list_scroll.scroll_to_item(self.model.profiles.selected);
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// Shows the model's values in the selects: a refused write leaves the
+    /// model as it was, and a reload or a newly opened editor sets them.
+    fn sync_selects(&mut self, cx: &mut Context<Self>) {
+        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == self.model.session_end());
+        if self.session_end.read(cx).selected() != current {
+            self.session_end.update(cx, |s, cx| s.set_selected(current, cx));
+        }
+        let Some(editor) = self.model.profiles.editor() else { return };
+        for (field, select) in &self.profile_selects {
+            let current = editor.choice_index(*field);
+            if select.read(cx).selected() != current {
+                select.update(cx, |s, cx| s.set_selected(current, cx));
+            }
+        }
+    }
+
+    /// The select behind a choice field.
+    fn choice_select(&self, choice: Choice) -> Option<Entity<Select>> {
+        match choice {
+            Choice::SessionEnd => Some(self.session_end.clone()),
+            Choice::Profile(field) => self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s.clone()),
+        }
+    }
+
+    /// Option `ix` of a choice field was chosen: write the setting, or
+    /// change the edited profile.
+    fn apply_choice(&mut self, choice: Choice, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        match choice {
+            Choice::SessionEnd => {
+                let Some(&value) = TmuxSessionEnd::ALL.get(ix) else { return };
+                let outcome = self.model.set_session_end(value);
+                self.outcome(outcome, window, cx);
+            }
+            Choice::Profile(field) => self.edit_profile(window, cx, |e| e.choose(field, ix)),
+        }
+    }
+
+    /// The slot a choice field's select is laid out in. It adds no keys: a
+    /// choice changes only through the select's menu (`SelectEvent::Changed`).
+    fn choice_slot(&self, choice: Choice) -> gpui::Div {
+        div().children(self.choice_select(choice))
+    }
+
+    /// Scrolls an editor's focused field into view when focus moved, by
+    /// Tab, a click or the keys.
+    fn follow_focus(&mut self, window: &Window, cx: &App) {
+        let focused = window.focused(cx);
+        if focused == self.scrolled_to {
+            return;
+        }
+        if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
+            // The name sits above the scrolling color rows.
+            if field > 0 {
+                self.editor_scroll.scroll_to_item(field - 1);
+            }
+        }
+        self.scroll_to_focused_profile_field(window, cx);
+        self.scrolled_to = focused;
     }
 
     fn preview(&mut self, cx: &mut Context<Self>) {
@@ -1024,21 +1413,17 @@ impl SettingsDialog {
     }
 
     /// Creates the inputs when the editor opens and drops them when it
-    /// closes, and moves focus to the model's focused field (or back to the
-    /// dialog, for the list's shortcuts).
+    /// closes. Focus follows in `place_focus`.
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_profile_fields(window, cx);
         let Some(texts) = self.model.editor_fields() else {
-            if !self.fields.is_empty() {
-                self.fields.clear();
-                self._field_subscriptions.clear();
-                window.focus(&self.focus_handle);
-            }
+            self.fields.clear();
+            self._field_subscriptions.clear();
             return;
         };
         if self.fields.is_empty() {
             for (field, text) in texts.iter().enumerate() {
-                let input = cx.new(|cx| TextInput::new(text, cx).tab_stop());
+                let input = cx.new(|cx| TextInput::new(text, cx));
                 let changed = cx.subscribe_in(&input, window, move |this, input, _: &TextInputEvent, _, cx| {
                     let text = input.read(cx).text().to_string();
                     this.model.set_field(field, &text);
@@ -1048,31 +1433,6 @@ impl SettingsDialog {
                 self._field_subscriptions.push(changed);
                 self.fields.push(input);
             }
-        }
-        if let Some(input) = self.model.focused_field().and_then(|field| self.fields.get(field))
-            && !input.read(cx).is_focused(window)
-        {
-            window.focus(&input.focus_handle(cx));
-        }
-    }
-
-    /// Tells the model which input has focus (after tab, or a click on an
-    /// input), so the highlight and the dump follow it.
-    fn sync_focus_from_window(&mut self, window: &Window, cx: &App) {
-        self.sync_profile_focus_from_window(window, cx);
-        let focused = self.fields.iter().position(|f| f.read(cx).is_focused(window));
-        if let Some(field) = focused
-            && Some(field) != self.model.focused_field()
-        {
-            self.model.focus_field(field);
-            self.scroll_to_field(field);
-        }
-    }
-
-    /// The scrolling body holds the color rows; the name sits above it.
-    fn scroll_to_field(&self, field: usize) {
-        if field > 0 {
-            self.editor_scroll.scroll_to_item(field - 1);
         }
     }
 
@@ -1086,48 +1446,74 @@ impl SettingsDialog {
             }
             Outcome::Applied => {
                 cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
-                cx.emit(SettingsEvent::Close);
+                cx.emit(DismissEvent);
             }
-            Outcome::Close => cx.emit(SettingsEvent::Close),
+            Outcome::Close => cx.emit(DismissEvent),
         }
     }
 
+    /// Up and down move a list's selection. In an editor they do nothing
+    /// (tab moves between fields), and a focused select takes them first,
+    /// to open its menu.
     fn up(&mut self, _: &SettingsUp, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.move_selection(false);
-        self.changed(window, cx);
+        self.move_up_down(false, window, cx);
     }
 
     fn down(&mut self, _: &SettingsDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.move_selection(true);
+        self.move_up_down(true, window, cx);
+    }
+
+    /// Home and end in a list.
+    fn first(&mut self, _: &SettingsFirst, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.select_edge(false);
         self.changed(window, cx);
     }
 
-    /// Tab: the inputs are the window's only tab stops while the dialog is
-    /// open.
-    fn next_field(&mut self, _: &SettingsNextField, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.in_list() {
-            window.focus_next();
-            self.sync_focus_from_window(window, cx);
-            cx.notify();
-        }
+    fn last(&mut self, _: &SettingsLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.select_edge(true);
+        self.changed(window, cx);
     }
 
-    fn prev_field(&mut self, _: &SettingsPrevField, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.in_list() {
-            window.focus_prev();
-            self.sync_focus_from_window(window, cx);
-            cx.notify();
+    fn move_up_down(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.mode_kind() == ModeKind::Editor {
+            // Nothing to move: the key goes on, unhandled.
+            cx.propagate();
+            return;
         }
+        self.model.move_selection(forward);
+        self.changed(window, cx);
     }
 
+    /// Enter: the section's confirm (apply, edit, save, delete, close), but
+    /// not on a focused button, which takes the key itself.
     fn confirm(&mut self, _: &SettingsConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        // On the section list, the focused section is already the shown
+        // one (activation follows focus), so enter has nothing to do.
+        if self.sections_handle.is_focused(window) {
+            return;
+        }
+        if !enter_confirms(self.button_focused(window)) {
+            // On to the button's own key-down handler.
+            cx.propagate();
+            return;
+        }
         let outcome = self.model.confirm();
         self.outcome(outcome, window, cx);
     }
 
-    fn cancel(&mut self, _: &SettingsCancel, window: &mut Window, cx: &mut Context<Self>) {
+    /// Escape (through the overlay's `Dismiss`, after an open select menu
+    /// took its own) or the close `X`: closes in a list and in General,
+    /// discards in an editor. Handling `Dismiss` here keeps the dialog open
+    /// unless the model says it is done.
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_cancel(window, cx);
+    }
+
+    /// Escape or the close `X`: closes in a list and in General, discards in
+    /// an editor.
+    fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.cancel() {
-            cx.emit(SettingsEvent::Close);
+            cx.emit(DismissEvent);
         } else {
             self.changed(window, cx);
         }
@@ -1148,16 +1534,6 @@ impl SettingsDialog {
         self.changed(window, cx);
     }
 
-    fn session_end_next(&mut self, _: &SettingsChoiceNext, window: &mut Window, cx: &mut Context<Self>) {
-        let outcome = self.model.step_session_end(true);
-        self.outcome(outcome, window, cx);
-    }
-
-    fn session_end_prev(&mut self, _: &SettingsChoicePrev, window: &mut Window, cx: &mut Context<Self>) {
-        let outcome = self.model.step_session_end(false);
-        self.outcome(outcome, window, cx);
-    }
-
     fn key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.key(&e.keystroke) {
             cx.stop_propagation();
@@ -1167,85 +1543,21 @@ impl SettingsDialog {
 
     // ---- rendering ----
 
-    fn field_box(&self, focused: bool, invalid: bool) -> gpui::Div {
-        let t = &self.theme;
-        let border = if invalid {
-            t.ansi[1].hsla()
-        } else if focused {
-            t.accent().hsla()
-        } else {
-            t.chrome_border().mix(t.foreground, 0.15).hsla()
-        };
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .h(px(26.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(t.background.hsla())
-            .text_color(t.foreground.hsla())
-    }
-
-    /// The focusable box around a choice field, in the `SettingsChoice` key
-    /// context (left/right, space); the caller adds the actions.
-    fn choice_frame(
-        &self,
-        id: &'static str,
-        focused: bool,
-        handle: Option<&FocusHandle>,
-    ) -> gpui::Stateful<gpui::Div> {
-        self.field_box(focused, false)
-            .id(id)
-            .key_context("SettingsChoice")
-            .cursor(CursorStyle::PointingHand)
-            .when_some(handle, |d, handle| d.track_focus(handle))
-    }
-
-    fn render_general(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let panel = t.chrome_background();
-        let current = self.model.session_end();
-        let segments = TmuxSessionEnd::ALL
-            .iter()
-            .map(|&value| {
-                div()
-                    .id(session_end_label(value))
-                    .px_3()
-                    .rounded_sm()
-                    .when(value == current, |d| d.bg(panel.mix(t.accent(), 0.3).hsla()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let outcome = this.model.set_session_end(value);
-                        this.outcome(outcome, window, cx);
-                    }))
-                    .child(session_end_label(value))
-            })
-            .collect::<Vec<_>>();
-        let focused = self.session_end_handle.is_focused(window);
-        let choice = self
-            .choice_frame("tmux-session-end", focused, Some(&self.session_end_handle))
-            // The frame's own `flex_1` sets a zero basis; size it to its options.
-            .flex_none()
-            .flex_basis(gpui::Length::Auto)
-            .gap_1()
-            .on_action(cx.listener(Self::session_end_next))
-            .on_action(cx.listener(Self::session_end_prev))
-            .on_click(cx.listener(|this, _, window, _| window.focus(&this.session_end_handle)))
-            .children(segments);
+    fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.ui_theme();
+        // Wide enough for the longest option, "Open a new tab".
+        let choice = self.choice_slot(Choice::SessionEnd).w(px(280.0));
         let body = div()
             .flex()
             .flex_col()
             .flex_1()
             .gap_2()
-            .child(div().text_color(t.foreground.hsla()).child("When a tmux session ends and its tabs were the window's only tabs"))
+            .child(div().text_color(t.foreground).child("When a tmux session ends and its tabs were the window's only tabs"))
             .child(div().flex().child(choice))
             .child(
                 div()
                     .text_xs()
-                    .text_color(t.muted_foreground().hsla())
+                    .text_color(t.muted_foreground)
                     .child("Applies to detaching (ctrl-shift-d), closing the last tab, and the last shell exiting. Saved at once."),
             );
         // Changes are already saved, so Close is all the footer needs.
@@ -1253,56 +1565,66 @@ impl SettingsDialog {
             .flex()
             .items_center()
             .child(div().flex_1())
-            .child(self.button("general-close", "Close", false, true, cx, |_, _, cx| cx.emit(SettingsEvent::Close)));
+            .child(self.button(Btn::Close, "Close", ButtonVariant::Default, cx, |_, _, cx| cx.emit(DismissEvent)));
         div().flex().flex_col().flex_1().min_h_0().gap_2().child(body).child(footer).into_any_element()
     }
 
-    fn button(
-        &self,
-        id: &'static str,
-        label: impl Into<SharedString>,
-        primary: bool,
-        enabled: bool,
-        cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
-        let t = &self.theme;
-        let panel = t.chrome_background();
-        let accent = t.accent();
+    /// The frame around the theme or profile list: one Tab stop
+    /// (`list_handle`) in the `SettingsList` key context, whose keys move
+    /// the selection, with the focus ring when it got focus from the
+    /// keyboard. A press in it focuses it, as a pointer press on a control
+    /// does. The ring is on this frame, not on the scrolling list inside,
+    /// which would clip it.
+    fn list_frame(&self, list: impl IntoElement, window: &Window, cx: &App) -> gpui::Div {
+        let ring = brindle_ui::focus_ring(cx.ui_theme());
+        let shown = brindle_ui::shows_ring(self.list_handle.is_focused(window), brindle_ui::modality(window, cx), false);
+        let handle = self.list_handle.clone();
         div()
-            .id(id)
-            .flex_none()
-            .px_3()
-            .py_1()
+            .key_context("SettingsList")
+            .track_focus(&self.list_handle)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| brindle_ui::focus_from_pointer(&handle, window, cx))
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .rounded_md()
-            .border_1()
-            .border_color(t.chrome_border().hsla())
-            .text_color(if enabled { t.foreground.hsla() } else { t.muted_foreground().hsla() })
-            .when(primary && enabled, |d| d.bg(panel.mix(accent, 0.3).hsla()).border_color(accent.hsla()))
-            .when(enabled, |d| {
-                d.hover(|d| d.bg(panel.mix(t.foreground, 0.1).hsla()))
-                    .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
-            })
-            .child(label.into())
+            .focus_ring(shown, ring, window)
+            .child(list)
     }
 
-    fn swatch(&self, color: Option<Color>, size: f32) -> impl IntoElement {
-        let t = &self.theme;
+    /// A footer button: small, focusable through its own handle, disabled
+    /// when [`Self::enabled`] says so.
+    fn button(
+        &self,
+        b: Btn,
+        label: impl Into<SharedString>,
+        variant: ButtonVariant,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Button {
+        Button::new(b.id(), label)
+            .variant(variant)
+            .size(ButtonSize::Sm)
+            .disabled(!self.enabled(b))
+            .focus(&self.button_handle(b))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)))
+    }
+
+    fn swatch(color: Option<Color>, size: f32, t: &Tokens) -> impl IntoElement {
         div()
             .flex_none()
             .size(px(size))
             .rounded_sm()
             .border_1()
-            .border_color(t.chrome_border().mix(t.foreground, 0.2).hsla())
+            .border_color(t.input)
             .when_some(color, |d, c| d.bg(c.hsla()))
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let panel = t.chrome_background();
-        let accent = t.accent();
+    fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.ui_theme();
+        let fg = t.foreground;
+        let muted = t.muted_foreground;
         let model = &self.model;
 
         let rows = model.entries.iter().enumerate().map(|(ix, entry)| {
@@ -1318,9 +1640,9 @@ impl SettingsDialog {
                 .px_3()
                 .py_1p5()
                 .rounded_md()
-                .when(selected, |d| d.bg(panel.mix(accent, 0.22).hsla()))
+                .when(selected, |d| d.bg(t.accent))
                 .when(readable, |d| {
-                    d.hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla())).on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                    d.when(!selected, |d| d.hover(|d| d.bg(t.accent.opacity(0.5)))).on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         this.model.select(ix);
                         if e.click_count() >= 2 {
                             let outcome = this.model.confirm();
@@ -1343,7 +1665,7 @@ impl SettingsDialog {
                         .child(div().px_1().text_xs().text_color(theme.foreground.hsla()).child("Aa"))
                         .children((1..7).map(|i| div().size(px(8.0)).rounded_full().bg(theme.ansi[i].hsla()))),
                 ),
-                Err(_) => row.child(div().w(px(84.0)).flex_none().text_xs().text_color(t.ansi[1].hsla()).child("unreadable")),
+                Err(_) => row.child(div().w(px(84.0)).flex_none().text_xs().text_color(t.destructive).child("unreadable")),
             };
             row.child(
                 div()
@@ -1357,47 +1679,34 @@ impl SettingsDialog {
                     }),
             )
             .when(entry.custom, |d| d.child(div().flex_none().text_xs().text_color(muted).child("custom")))
-            .when(active, |d| d.child(div().flex_none().text_xs().text_color(accent.hsla()).child("● active")))
+            .when(active, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● active")))
         })
         .collect::<Vec<_>>();
 
-        let custom_selected = model.selected_entry().is_some_and(|e| e.custom);
         let confirming = matches!(model.mode, Mode::ConfirmDelete);
         let footer = if confirming {
             let name = model.selected_entry().map(|e| e.name.clone()).unwrap_or_default();
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().min_w_0().text_color(fg).child(SharedString::from(format!("Delete {name:?}?"))))
-                .child(self.button("delete-no", "Keep", false, true, cx, |this, window, cx| {
-                    this.model.cancel();
-                    this.changed(window, cx);
-                }))
-                .child(self.button("delete-yes", "Delete (enter)", true, true, cx, |this, window, cx| {
-                    let outcome = this.model.confirm();
-                    this.outcome(outcome, window, cx);
-                }))
+            self.confirm_footer(format!("Delete {name:?}?"), cx)
         } else {
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(self.button("new", "New (n)", false, true, cx, |this, window, cx| {
+                .child(self.button(Btn::New, "New (n)", ButtonVariant::Outline, cx, |this, window, cx| {
                     this.model.start_new();
                     this.changed(window, cx);
                 }))
-                .child(self.button("edit", "Edit (e)", false, true, cx, |this, window, cx| {
+                .child(self.button(Btn::Edit, "Edit (e)", ButtonVariant::Outline, cx, |this, window, cx| {
                     this.model.start_edit();
                     this.changed(window, cx);
                 }))
-                .child(self.button("delete", "Delete (d)", false, custom_selected, cx, |this, window, cx| {
+                .child(self.button(Btn::Delete, "Delete (d)", ButtonVariant::Destructive, cx, |this, window, cx| {
                     this.model.request_delete();
                     this.changed(window, cx);
                 }))
                 .child(div().flex_1())
-                .child(self.button("cancel", "Cancel", false, true, cx, |_, _, cx| cx.emit(SettingsEvent::Close)))
-                .child(self.button("apply", "Apply", true, true, cx, |this, window, cx| {
+                .child(self.button(Btn::Cancel, "Cancel", ButtonVariant::Outline, cx, |_, _, cx| cx.emit(DismissEvent)))
+                .child(self.button(Btn::Apply, "Apply", ButtonVariant::Default, cx, |this, window, cx| {
                     let outcome = this.model.confirm();
                     this.outcome(outcome, window, cx);
                 }))
@@ -1410,7 +1719,7 @@ impl SettingsDialog {
             .min_h_0()
             .gap_2()
             .child(div().text_xs().text_color(muted).child("Pick a theme to preview it; Apply makes it the default."))
-            .child(
+            .child(self.list_frame(
                 div()
                     .id("theme-list")
                     .flex()
@@ -1420,45 +1729,42 @@ impl SettingsDialog {
                     .overflow_y_scroll()
                     .track_scroll(&self.list_scroll)
                     .children(rows),
-            )
+                window,
+                cx,
+            ))
             .child(footer)
             .into_any_element()
     }
 
-    fn render_field(&self, field: usize, focused: bool, invalid: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = &self.theme;
-        let border = if invalid {
-            t.ansi[1].hsla()
-        } else if focused {
-            t.accent().hsla()
-        } else {
-            t.chrome_border().mix(t.foreground, 0.15).hsla()
-        };
+    /// The confirmation footer of a delete: the question, Keep, and Delete.
+    pub(super) fn confirm_footer(&self, question: String, cx: &mut Context<Self>) -> gpui::Div {
+        let fg = cx.ui_theme().foreground;
         div()
-            .id(("field", field))
             .flex()
-            .flex_1()
-            .min_w_0()
             .items_center()
-            .h(px(26.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(t.background.hsla())
-            .text_color(t.foreground.hsla())
-            // Clicks on the padding focus the input too.
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.model.focus_field(field);
+            .gap_2()
+            .child(div().flex_1().min_w_0().text_color(fg).child(SharedString::from(question)))
+            .child(self.button(Btn::Keep, "Keep", ButtonVariant::Outline, cx, |this, window, cx| {
+                this.model.cancel();
                 this.changed(window, cx);
             }))
-            .when_some(self.fields.get(field).cloned(), |d, input| d.child(input))
+            .child(self.button(Btn::ConfirmDelete, "Delete (enter)", ButtonVariant::Destructive, cx, |this, window, cx| {
+                let outcome = this.model.confirm();
+                this.outcome(outcome, window, cx);
+            }))
+    }
+
+    /// Editor field `field`'s input, framed, red when `invalid`.
+    fn render_field(&self, field: usize, invalid: bool) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .children(self.fields.get(field).map(|input| Input::new(input).invalid(invalid)))
     }
 
     fn render_editor(&self, editor: &Editor, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let muted = t.muted_foreground().hsla();
-        let red: Hsla = t.ansi[1].hsla();
+        let t = *cx.ui_theme();
+        let muted = t.muted_foreground;
         let name_error = editor.name_result(&self.model.other_names(editor)).err();
 
         let label = |text: SharedString| div().w(px(150.0)).flex_none().text_color(muted).child(text);
@@ -1472,14 +1778,16 @@ impl SettingsDialog {
                 .items_center()
                 .gap_2()
                 .child(label(slot.label().into()))
-                .child(self.swatch(color, 18.0))
-                .child(self.render_field(field, editor.focused == field, invalid, cx))
+                .child(Self::swatch(color, 18.0, &t))
+                .child(self.render_field(field, invalid))
                 .when(slot.optional(), |d| {
-                    d.child(self.button("clear-selection-fg", "Clear", false, color.is_some(), cx, |this, window, cx| {
+                    d.child(self.button(Btn::Clear, "Clear", ButtonVariant::Outline, cx, |this, window, cx| {
                         if let Some(field) = this.model.clear_selection_foreground()
-                            && let Some(input) = this.fields.get(field)
+                            && let Some(input) = this.fields.get(field).cloned()
                         {
                             input.update(cx, |input, cx| input.set_text("", cx));
+                            // Clear is disabled now: focus its field.
+                            window.focus(&input.focus_handle(cx));
                         }
                         this.changed(window, cx);
                     }))
@@ -1491,23 +1799,22 @@ impl SettingsDialog {
             Some(name) => format!("Edit {name:?}"),
             None => "New theme".to_string(),
         };
-        let can_save = self.model.editor_can_save();
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .gap_2()
-            .child(div().text_color(t.foreground.hsla()).child(SharedString::from(title)))
+            .child(div().text_color(t.foreground).child(SharedString::from(title)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(label("Name".into()))
-                    .child(self.render_field(0, editor.focused == 0, name_error.is_some(), cx)),
+                    .child(self.render_field(0, name_error.is_some())),
             )
-            .when_some(name_error, |d, e| d.child(div().text_xs().text_color(red).child(SharedString::from(e))))
+            .when_some(name_error, |d, e| d.child(div().text_xs().text_color(t.destructive).child(SharedString::from(e))))
             .child(
                 div()
                     .id("editor-fields")
@@ -1526,101 +1833,113 @@ impl SettingsDialog {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("tab moves between fields · #rrggbb or #rgb"))
-                    .child(self.button("discard", "Discard", false, true, cx, |this, window, cx| {
-                        this.model.cancel();
-                        this.changed(window, cx);
-                    }))
-                    .child(self.button("save", "Save", true, can_save, cx, |this, window, cx| {
-                        let outcome = this.model.confirm();
-                        this.outcome(outcome, window, cx);
-                    })),
+                    .child(self.editor_buttons(cx)),
             )
             .into_any_element()
+    }
+
+    /// An editor's Discard and Save.
+    pub(super) fn editor_buttons(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex()
+            .flex_none()
+            .gap_2()
+            .child(self.button(Btn::Discard, "Discard", ButtonVariant::Outline, cx, |this, window, cx| {
+                this.model.cancel();
+                this.changed(window, cx);
+            }))
+            .child(self.button(Btn::Save, "Save", ButtonVariant::Default, cx, |this, window, cx| {
+                let outcome = this.model.confirm();
+                this.outcome(outcome, window, cx);
+            }))
     }
 }
 
 impl Render for SettingsDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A click on an input focuses it directly; focus changes redraw.
-        self.sync_focus_from_window(window, cx);
-        let t = self.theme.clone();
+        // Focus moves by Tab, clicks and keys; scroll an editor after it.
+        self.follow_focus(window, cx);
+        let t = *cx.ui_theme();
         let content = match (self.model.section(), &self.model.mode) {
-            (Section::General, _) => self.render_general(window, cx),
-            (Section::Profiles, _) => self.render_profiles(cx),
+            (Section::General, _) => self.render_general(cx),
+            (Section::Profiles, _) => self.render_profiles(window, cx),
             (Section::Theme, Mode::Editor(editor)) => {
                 let editor = editor.clone();
                 self.render_editor(&editor, cx)
             }
-            (Section::Theme, _) => self.render_list(cx),
+            (Section::Theme, _) => self.render_list(window, cx),
         };
-        let panel = t.chrome_background();
         let current = self.model.section();
+        // The section list is a vertical tab list: one Tab stop whose
+        // focused tab is the shown section, ringed while focus came from
+        // the keyboard.
+        let ring = brindle_ui::focus_ring(&t);
+        let ring_shown =
+            brindle_ui::shows_ring(self.sections_handle.is_focused(window), brindle_ui::modality(window, cx), false);
         let sections = SECTIONS.iter().map(|&section| {
             div()
                 .id(section.label())
+                .relative()
                 .px_3()
                 .py_1p5()
                 .rounded_md()
-                .when(section == current, |d| d.bg(panel.mix(t.accent(), 0.22).hsla()))
-                .when(section != current, |d| d.hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla())))
-                .text_color(t.foreground.hsla())
+                .when(section == current, |d| d.bg(t.accent).text_color(t.accent_foreground))
+                .when(section != current, |d| d.text_color(t.foreground).hover(|d| d.bg(t.accent.opacity(0.5))))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.model.select_section(section);
                     this.changed(window, cx);
                 }))
+                .focus_ring(ring_shown && section == current, ring, window)
                 .child(section.label())
         });
+        let sections_handle = self.sections_handle.clone();
         div()
             .key_context("SettingsDialog")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::next_field))
-            .on_action(cx.listener(Self::prev_field))
+            .on_action(cx.listener(Self::first))
+            .on_action(cx.listener(Self::last))
             .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::new_theme))
             .on_action(cx.listener(Self::edit_theme))
             .on_action(cx.listener(Self::delete_theme))
             .on_action(cx.listener(Self::section_next))
             .on_action(cx.listener(Self::section_prev))
+            .on_action(cx.listener(Self::section_first))
+            .on_action(cx.listener(Self::section_last))
             .on_action(cx.listener(Self::duplicate))
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::move_down))
             .on_key_down(cx.listener(Self::key_down))
-            // A stray click outside shouldn't throw away an edit in progress.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            // Hide the terminal behind from the mouse, so its I-beam cursor
-            // doesn't show over the dialog.
-            .occlude()
+            // The overlay's backdrop already blocks the pointer and ignores
+            // presses outside; the cursor stays an arrow over the panel.
             .cursor(CursorStyle::Arrow)
-            .w(px(760.0))
-            .h(px(460.0))
-            .flex()
-            .flex_col()
-            .bg(panel.hsla())
-            .border_1()
-            .border_color(t.chrome_border().hsla())
-            .rounded_lg()
-            .shadow_lg()
             .text_sm()
             .child(
-                div()
-                    .flex_none()
-                    .px_4()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(t.chrome_border().hsla())
-                    .text_color(t.foreground.hsla())
-                    .child("Settings"),
-            )
-            .child(
+                Dialog::new()
+                    .title("Settings")
+                    .w(px(760.0))
+                    .h(px(460.0))
+                    .p_4()
+                    .gap_3()
+                    .close_focus(&self.close_handle)
+                    .on_close(cx.listener(|this, _: &ClickEvent, window, cx| this.request_cancel(window, cx)))
+                    .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .child(
                         div()
+                            .key_context("SettingsSections")
+                            .track_focus(&self.sections_handle)
+                            // A press on a section focuses the list, as a
+                            // press on a tab focuses it, without a ring.
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                brindle_ui::focus_from_pointer(&sections_handle, window, cx)
+                            })
                             .flex()
                             .flex_col()
                             .flex_none()
@@ -1628,7 +1947,7 @@ impl Render for SettingsDialog {
                             .p_2()
                             .gap_1()
                             .border_r_1()
-                            .border_color(t.chrome_border().hsla())
+                            .border_color(t.border)
                             .children(sections),
                     )
                     .child(
@@ -1648,12 +1967,13 @@ impl Render for SettingsDialog {
                                         .py_1()
                                         .rounded_md()
                                         .text_xs()
-                                        .bg(t.ansi[1].mix(panel, 0.75).hsla())
-                                        .text_color(t.foreground.hsla())
+                                        .bg(t.destructive.opacity(0.25))
+                                        .text_color(t.foreground)
                                         .child(SharedString::from(e)),
                                 )
                             }),
                     ),
+            ),
             )
     }
 }
@@ -1728,14 +2048,13 @@ background = "nope"
 
     /// Edits field `field` as its input would: the model gets the new text.
     fn type_into(model: &mut Model, field: usize, text: &str) {
-        model.focus_field(field);
         model.set_field(field, text);
     }
 
     fn editor(model: &Model) -> &Editor {
         match &model.mode {
             Mode::Editor(e) => e,
-            _ => panic!("not editing: {}", model.describe()),
+            _ => panic!("not editing: {}", model.describe("")),
         }
     }
 
@@ -1765,6 +2084,38 @@ background = "nope"
         model.select(5);
         assert_eq!(model.selected_entry().unwrap().name, "solarized-dark");
         assert_eq!(model.preview(), builtin_theme("solarized-dark"));
+    }
+
+    /// The section list's keys: down and up step and wrap (Radix's `loop`),
+    /// home and end go to the ends.
+    #[test]
+    fn section_keys_step_wrap_and_reach_the_ends() {
+        let f = Fixture::new("section-keys", CONFIG);
+        let mut model = f.general("mine");
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Profiles);
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Theme);
+        assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::General);
+        assert!(model.edge_section(true));
+        assert_eq!(model.section(), Section::Theme);
+        assert!(model.edge_section(false));
+        assert_eq!(model.section(), Section::General);
+    }
+
+    #[test]
+    fn home_and_end_select_the_lists_edges() {
+        let f = Fixture::new("edges", CONFIG);
+        let mut model = f.model("mine");
+        model.select_edge(true);
+        assert_eq!(model.selected_entry().unwrap().name, "spare");
+        model.select_edge(false);
+        assert_eq!(model.selected_entry().unwrap().name, "brindle-dark");
+        // In General there is no list: nothing changes.
+        let mut general = f.general("mine");
+        general.select_edge(true);
+        assert_eq!(general.section(), Section::General);
     }
 
     #[test]
@@ -1836,13 +2187,13 @@ background = "nope"
         assert!(model.editor_can_save());
         // Field 3 is the cursor: an invalid value keeps the previous color.
         let cursor = model.preview().unwrap().cursor;
-        model.move_selection(true);
-        assert_eq!(editor(&model).focused_label(), "Cursor");
+        assert_eq!(field_label(3), "Cursor");
         let text = model.editor_fields().unwrap()[3].clone();
         model.set_field(3, &text[..text.len() - 1]);
         assert_eq!(model.preview().unwrap().cursor, cursor);
         assert!(!model.editor_can_save());
-        assert!(model.describe().contains("invalid=[\"Cursor\"]"), "{}", model.describe());
+        let line = model.describe("Cursor");
+        assert!(line.contains("field=\"Cursor\" invalid=[\"Cursor\"]"), "{line}");
         model.set_field(3, &format!("{}x", &text[..text.len() - 1]));
         assert_eq!(model.confirm(), Outcome::Nothing);
         assert!(model.error.is_some());
@@ -1931,12 +2282,84 @@ background = "nope"
         assert_eq!(fields.len(), FIELD_COUNT);
         assert_eq!(fields[0], "mine");
         assert_eq!(fields[2], "#000000");
-        assert_eq!(model.focused_field(), Some(0));
-        // Typing belongs to the inputs; list shortcuts are off.
+        assert_eq!((field_label(0), field_label(1)), ("name", "Foreground"));
+        // Typing belongs to the inputs; list shortcuts are off, and up and
+        // down leave the editor (the view moves focus between fields).
         assert!(!model.key(&Keystroke::parse("n").unwrap()));
+        model.move_selection(true);
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        type_into(&mut model, 6, "#abcdef");
+        assert!(model.selection_foreground_set());
         assert_eq!(model.clear_selection_foreground(), Some(6));
+        assert_eq!(selection_foreground_field(), 6);
         assert_eq!(model.editor_fields().unwrap()[6], "");
-        assert_eq!(model.focused_field(), Some(6));
+        assert!(!model.selection_foreground_set());
+    }
+
+    /// Escape (the overlay's dismiss request) per section and mode: it
+    /// closes the dialog from a list and from General, and otherwise leaves
+    /// the editor or the confirmation for the list, keeping the dialog.
+    #[test]
+    fn escape_outcome_per_mode() {
+        // A second profile, so one can be asked about deleting.
+        let config = CONFIG.replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"Work\"\n");
+        let f = Fixture::new("escape", &config);
+        let mut model = f.general("mine");
+        assert_eq!(model.mode_kind(), ModeKind::List);
+        assert!(model.cancel(), "General closes");
+
+        model.select_section(Section::Theme);
+        assert!(model.cancel(), "the theme list closes");
+        model.start_edit();
+        type_into(&mut model, 2, "#123456");
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        assert!(!model.cancel(), "the theme editor discards");
+        assert_eq!(model.mode_kind(), ModeKind::List);
+        model.select(7);
+        key(&mut model, "d");
+        assert_eq!(model.mode_kind(), ModeKind::ConfirmDelete);
+        assert!(!model.cancel(), "the theme delete question goes back to the list");
+        assert_eq!(model.mode_kind(), ModeKind::List);
+
+        model.select_section(Section::Profiles);
+        assert!(model.cancel(), "the profile list closes");
+        key(&mut model, "e");
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        assert!(!model.cancel(), "the profile editor discards");
+        assert_eq!(model.mode_kind(), ModeKind::List);
+        key(&mut model, "d");
+        assert_eq!(model.mode_kind(), ModeKind::ConfirmDelete);
+        assert!(!model.cancel(), "the profile delete question goes back to the list");
+        assert_eq!(model.mode_kind(), ModeKind::List);
+        // Nothing was written.
+        assert_eq!(f.text(), config);
+    }
+
+    /// Enter on a focused button (or the close `X`) is the button's: the
+    /// dialog's confirm doesn't run for it.
+    #[test]
+    fn enter_on_a_button_is_the_buttons() {
+        assert!(enter_confirms(false));
+        assert!(!enter_confirms(true));
+    }
+
+    /// Each view's buttons, in Tab order, and the dump label of each.
+    #[test]
+    fn footer_buttons_per_view() {
+        assert_eq!(footer_buttons(Section::General, ModeKind::List), [Btn::Close]);
+        assert_eq!(
+            footer_buttons(Section::Theme, ModeKind::List),
+            [Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply]
+        );
+        for section in [Section::Theme, Section::Profiles] {
+            assert_eq!(footer_buttons(section, ModeKind::Editor), [Btn::Discard, Btn::Save]);
+            assert_eq!(footer_buttons(section, ModeKind::ConfirmDelete), [Btn::Keep, Btn::ConfirmDelete]);
+        }
+        assert_eq!(footer_buttons(Section::Profiles, ModeKind::List).last(), Some(&Btn::Close));
+        // Ids are unique, so the shared handles never meet in one view.
+        let ids: std::collections::HashSet<_> = BUTTONS.iter().map(|b| b.id()).collect();
+        assert_eq!(ids.len(), BUTTONS.len());
+        assert_eq!(Btn::Discard.label(), "Discard");
     }
 
     #[test]
@@ -1950,7 +2373,7 @@ background = "nope"
         assert!(model.next_section(false));
         assert_eq!(model.section(), Section::Profiles);
         assert_eq!(model.selected_entry().unwrap().name, "mine");
-        assert!(model.describe().starts_with("--- settings section=Profiles mode=list selected=\"Shell\""), "{}", model.describe());
+        assert!(model.describe("").starts_with("--- settings section=Profiles mode=list selected=\"Shell\""), "{}", model.describe(""));
         // Escape in the profile list closes the dialog.
         assert!(model.cancel());
         // A dirty profile editor holds the section; a clean one doesn't.
@@ -2000,20 +2423,19 @@ background = "nope"
     }
 
     #[test]
-    fn general_steps_write_tmux_session_end() {
+    fn general_choices_write_tmux_session_end() {
         let f = Fixture::new("general-write", CONFIG);
         let mut model = f.general("mine");
         assert_eq!(
-            model.describe(),
+            model.describe(""),
             "--- settings section=General tmux_session_end=\"close_window\" error=None\n"
         );
-        assert_eq!(model.step_session_end(true), Outcome::Written);
+        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Written);
         assert_eq!(model.session_end(), TmuxSessionEnd::NewTab);
         assert!(f.text().starts_with("# test config\ntheme = \"mine\"\ntmux_session_end = \"new_tab\"\n"), "{}", f.text());
-        assert_eq!(model.step_session_end(true), Outcome::Written);
-        assert_eq!(model.step_session_end(true), Outcome::Written);
+        assert_eq!(model.set_session_end(TmuxSessionEnd::CloseWindow), Outcome::Written);
         assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
-        assert_eq!(model.step_session_end(false), Outcome::Written);
+        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Written);
         assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
         assert!(f.text().contains("tmux_session_end = \"ask\""));
         // Choosing the current value writes nothing.
@@ -2029,10 +2451,10 @@ background = "nope"
         let text = "theme = \"mine\"\n[oops\n";
         let f = Fixture::new("general-malformed", text);
         let mut model = f.general("mine");
-        assert_eq!(model.step_session_end(true), Outcome::Nothing);
+        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
         assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
         assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
-        assert!(model.describe().contains("error=Some("));
+        assert!(model.describe("").contains("error=Some("));
         assert_eq!(f.text(), text);
     }
 
@@ -2071,7 +2493,7 @@ background = "nope"
         // An unused one goes after confirming.
         model.select(7);
         key(&mut model, "delete");
-        assert!(model.describe().contains("mode=confirm-delete theme=\"spare\""));
+        assert!(model.describe("").contains("mode=confirm-delete theme=\"spare\""));
         assert!(!model.cancel());
         assert_eq!(f.text(), CONFIG);
         key(&mut model, "d");

@@ -162,6 +162,8 @@ pub struct Gallery {
     /// What the inline command list reported, in order.
     command_log: Vec<String>,
     dialog: Overlay<DemoDialog>,
+    /// A dialog whose slot ignores presses on the backdrop.
+    sticky_dialog: Overlay<DemoDialog>,
     command_dialog: Overlay<CommandHost>,
     confirmed: Confirmed,
     /// Each corner popover's panel bounds while it is open.
@@ -179,7 +181,7 @@ impl Gallery {
             .collect();
         names.extend(
             [
-                "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-command-dialog",
+                "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
                 "switch-off", "theme",
             ]
@@ -240,6 +242,7 @@ impl Gallery {
             command,
             command_log: Vec::new(),
             dialog: Overlay::modal(),
+            sticky_dialog: Overlay::modal().ignore_outside_press(),
             command_dialog: Overlay::modal(),
             confirmed: Confirmed::default(),
             corners: Default::default(),
@@ -286,6 +289,12 @@ impl Gallery {
         self.dialog.open(view, |this| &mut this.dialog, window, cx);
     }
 
+    /// Opens the plain demo dialog in the slot that ignores backdrop presses.
+    pub fn open_sticky_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| DemoDialog::new(false, cx));
+        self.sticky_dialog.open(view, |this| &mut this.sticky_dialog, window, cx);
+    }
+
     pub fn open_command_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let confirmed = self.confirmed.clone();
         let view = cx.new(|cx| CommandHost::new(Chrome::Dialog, confirmed, cx));
@@ -295,6 +304,7 @@ impl Gallery {
     /// Closes what the gallery owns a slot for (the checks' reset).
     pub fn close_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog.close(window, cx);
+        self.sticky_dialog.close(window, cx);
         self.command_dialog.close(window, cx);
         self.shell.update(cx, |select, cx| select.close(window, cx));
         self.editor.update(cx, |select, cx| select.close(window, cx));
@@ -359,6 +369,12 @@ impl Gallery {
                             .variant(ButtonVariant::Secondary)
                             .focus(&self.handle("open-stubborn"))
                             .on_click(cx.listener(|this, _, window, cx| this.open_dialog(true, window, cx))),
+                    )
+                    .child(
+                        Button::new("open-sticky", "Open sticky dialog")
+                            .variant(ButtonVariant::Secondary)
+                            .focus(&self.handle("open-sticky"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_sticky_dialog(window, cx))),
                     )
                     .child(
                         Button::new("open-command-dialog", "Command dialog")
@@ -594,7 +610,7 @@ impl FocusStops for Gallery {
     /// corner popovers' triggers.
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         let named = |names: &[&str]| names.iter().map(|name| self.handle(name)).collect::<Vec<_>>();
-        let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-command-dialog", "command-popover", "behind"]);
+        let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog", "command-popover", "behind"]);
         stops.push(self.shell.focus_handle(cx));
         stops.push(self.editor.focus_handle(cx));
         stops.push(self.command.focus_handle(cx));
@@ -646,6 +662,7 @@ impl Render for Gallery {
                 // Modal layers render last in the root: tree order is their
                 // z-order, and nothing lifts them.
                 .children(self.dialog.render(window, cx))
+                .children(self.sticky_dialog.render(window, cx))
                 .children(self.command_dialog.render(window, cx)),
         )
     }
@@ -1256,6 +1273,29 @@ mod check {
             Ok(())
         }
 
+        /// One press-drag-release gesture: the primary button goes down at
+        /// `from`, the pointer moves to `to` with it held, and it comes up
+        /// there, a frame (and a hover tick) apart.
+        async fn drag(&mut self, from: Point<Pixels>, to: Point<Pixels>) -> Result<(), Failure> {
+            let (down, up) = (self.mouse_lparam(from), self.mouse_lparam(to));
+            #[cfg(windows)]
+            {
+                self.post(win::WM_LBUTTONDOWN, win::MK_LBUTTON, down)?;
+                self.tick().await;
+                self.post(win::WM_MOUSEMOVE, win::MK_LBUTTON, up)?;
+                self.cx.background_executor().timer(HOVER_TICK).await;
+                self.tick().await;
+                self.post(win::WM_LBUTTONUP, 0, up)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = up;
+                self.post(0, 0, down)?;
+            }
+            self.tick().await;
+            Ok(())
+        }
+
         /// Moves the pointer to `at`, and gives the message a moment.
         async fn hover(&mut self, at: Point<Pixels>) -> Result<(), Failure> {
             let lparam = self.mouse_lparam(at);
@@ -1499,8 +1539,8 @@ mod check {
         c.run_check("input-press-in-frame-focuses-text-input", check).await;
         let check = checkbox_space(&mut c).await;
         c.run_check("checkbox-space-toggles-enter-does-not", check).await;
-        let check = switch_space(&mut c).await;
-        c.run_check("switch-space-toggles", check).await;
+        let check = switch_space_and_enter(&mut c).await;
+        c.run_check("switch-space-and-enter-toggle", check).await;
         let check = checkbox_disabled(&mut c).await;
         c.run_check("checkbox-disabled-asks-nothing", check).await;
         let check = dialog_opens_focusing_input(&mut c).await;
@@ -1515,8 +1555,24 @@ mod check {
         c.run_check("dialog-blocks-the-button-beneath-and-asks-to-dismiss", check).await;
         let check = dialog_stubborn(&mut c).await;
         c.run_check("dialog-handling-dismiss-stays-open-until-discard", check).await;
+        let check = sticky_backdrop_press_keeps_it_open(&mut c).await;
+        c.run_check("sticky-dialog-backdrop-press-keeps-it-open-and-blocks-beneath", check).await;
+        let check = sticky_escape_still_closes(&mut c).await;
+        c.run_check("sticky-dialog-escape-still-closes", check).await;
+        let check = sticky_menu_outside_press_closes_menu_only(&mut c).await;
+        c.run_check("sticky-dialog-menu-outside-press-closes-menu-only", check).await;
         let check = select_opens_on_down(&mut c).await;
         c.run_check("select-down-opens-highlighting-the-selection", check).await;
+        let check = select_closed_trigger_keys(&mut c).await;
+        c.run_check("select-closed-trigger-keys-match-radix", check).await;
+        let check = select_press_opens_and_release_on_trigger_stays(&mut c).await;
+        c.run_check("select-press-opens-release-on-trigger-stays-open", check).await;
+        let check = select_press_drag_release_picks(&mut c).await;
+        c.run_check("select-press-drag-release-picks-foot", check).await;
+        let check = select_drag_off_and_release_closes(&mut c).await;
+        c.run_check("select-dragged-release-outside-or-on-trigger-closes", check).await;
+        let check = select_outside_press_reaches_nothing(&mut c).await;
+        c.run_check("select-outside-press-closes-menu-only-reaches-nothing", check).await;
         let check = select_nav_skips_disabled(&mut c).await;
         c.run_check("select-nav-skips-disabled-and-does-not-wrap", check).await;
         let check = select_enter_picks(&mut c).await;
@@ -1803,7 +1859,7 @@ mod check {
         Ok(())
     }
 
-    async fn switch_space(c: &mut Checker) -> Check {
+    async fn switch_space_and_enter(c: &mut Checker) -> Check {
         c.focus("switch").await?;
         let before = c.with(|gallery, _, _| gallery.switched)?;
         c.key("space").await?;
@@ -1813,6 +1869,14 @@ mod check {
         c.key("space").await?;
         c.key_up("space").await?;
         ensure!(c.with(|gallery, _, _| gallery.switched)? == before, "space again didn't flip it back");
+        // Enter too, as Radix's switch (a plain button) takes it, unlike a
+        // checkbox.
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(c.with(|gallery, _, _| gallery.switched)? == !before, "enter didn't ask the owner to flip the switch");
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(c.with(|gallery, _, _| gallery.switched)? == before, "enter again didn't flip it back (or flipped twice)");
         Ok(())
     }
 
@@ -1915,6 +1979,62 @@ mod check {
         Ok(())
     }
 
+    /// Opens the sticky dialog (its slot ignores backdrop presses) from its
+    /// button with the keyboard and returns the view.
+    async fn open_sticky(c: &mut Checker) -> Result<Entity<super::DemoDialog>, Failure> {
+        c.focus("open-sticky").await?;
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        let view = c.with(|gallery, _, _| gallery.sticky_dialog.view().cloned())?;
+        let Some(view) = view else { fail!("enter on open-sticky didn't open the dialog") };
+        ensure!(c.layers()? == 1, "the dialog isn't the one open layer ({} open)", c.layers()?);
+        Ok(view)
+    }
+
+    async fn sticky_backdrop_press_keeps_it_open(c: &mut Checker) -> Check {
+        let behind = c.recorded("behind")?;
+        let before = c.clicks("behind")?;
+        open_sticky(c).await?;
+        let focus = c.with(|_, window, cx| window.focused(cx))?;
+        ensure!(focus.is_some(), "nothing has focus in the open dialog");
+        let viewport = c.viewport()?;
+        c.press(backdrop_point(viewport)).await?;
+        ensure!(c.with(|gallery, _, _| gallery.sticky_dialog.is_open())?, "a backdrop press closed the dialog");
+        ensure!(c.layers()? == 1, "{} layers open, expected the dialog alone", c.layers()?);
+        // Focus stays where it was.
+        ensure!(c.with(|_, window, cx| window.focused(cx))? == focus, "the backdrop press moved focus");
+        // The backdrop still blocks the pointer.
+        c.press(center(behind)).await?;
+        ensure!(c.clicks("behind")? == before, "the button beneath the backdrop ran its action");
+        ensure!(c.with(|gallery, _, _| gallery.sticky_dialog.is_open())?, "the dialog closed");
+        Ok(())
+    }
+
+    async fn sticky_escape_still_closes(c: &mut Checker) -> Check {
+        open_sticky(c).await?;
+        c.key("escape").await?;
+        ensure!(!c.with(|gallery, _, _| gallery.sticky_dialog.is_open())?, "escape didn't close the dialog");
+        ensure!(c.layers()? == 0, "a layer is still open");
+        ensure!(c.focused_name("open-sticky")?, "focus didn't return to the opener");
+        Ok(())
+    }
+
+    async fn sticky_menu_outside_press_closes_menu_only(c: &mut Checker) -> Check {
+        let dialog = open_sticky(c).await?;
+        let (shell, bounds) = c.read(&dialog, |dialog, _| (dialog.shell.clone(), dialog.shell_bounds.get()))?;
+        let Some(trigger) = bounds else { fail!("the dialog's select recorded no painted bounds") };
+        c.key("tab").await?;
+        c.key("down").await?;
+        ensure!(c.layers()? == 2, "the menu didn't open over the dialog");
+        // The dialog's own body, in the name row above the select.
+        let in_body = Point { x: trigger.origin.x + px(8.), y: trigger.origin.y - px(30.) };
+        c.press(in_body).await?;
+        ensure!(!is_open(c, &shell)?, "the press in the dialog's body didn't close the menu");
+        ensure!(c.with(|gallery, _, _| gallery.sticky_dialog.is_open())?, "the dialog closed with the menu");
+        ensure!(c.layers()? == 1, "{} layers open, expected the dialog alone", c.layers()?);
+        Ok(())
+    }
+
     async fn dialog_stubborn(c: &mut Checker) -> Check {
         let dialog = open_dialog(c, true).await?;
         c.key("escape").await?;
@@ -1979,6 +2099,126 @@ mod check {
         ensure!(is_open(c, &shell)?, "down didn't open the menu");
         ensure!(c.layers()? == 1, "the menu isn't a layer");
         ensure!(highlighted(c, &shell)? == Some(0), "the selection (bash) isn't highlighted");
+        Ok(())
+    }
+
+    /// The closed trigger's key table, as in Radix: enter, space, up and
+    /// down open the menu on the selected option; left, right, home and end
+    /// do nothing (no menu, no change, focus stays on the trigger). The
+    /// selection is fish, so "on the selected option" isn't the first one.
+    async fn select_closed_trigger_keys(c: &mut Checker) -> Check {
+        let shell = shell_focused(c).await?;
+        c.with(|gallery, _, cx| gallery.shell.update(cx, |select, cx| select.set_selected(Some(1), cx)))?;
+        let trigger = trigger_handle(c, &shell)?;
+        let before = changes(c)?;
+        for (key, opens) in [
+            ("enter", true),
+            ("space", true),
+            ("up", true),
+            ("down", true),
+            ("left", false),
+            ("right", false),
+            ("home", false),
+            ("end", false),
+        ] {
+            c.focus_handle(&trigger).await?;
+            c.key(key).await?;
+            let open = is_open(c, &shell)?;
+            ensure!(open == opens, "{key}: the menu is {}", if open { "open" } else { "closed" });
+            if opens {
+                let highlight = highlighted(c, &shell)?;
+                ensure!(highlight == Some(1), "{key}: the menu highlights {highlight:?}, not the selection (fish)");
+                c.key("escape").await?;
+                ensure!(!is_open(c, &shell)?, "escape after {key} didn't close the menu");
+            } else {
+                ensure!(c.focused(&trigger)?, "{key} moved focus off the trigger");
+            }
+            ensure!(selected(c, &shell)? == Some(1), "{key} changed the selection");
+            ensure!(changes(c)? == before, "{key}: the owner heard {:?}", &changes(c)?[before.len()..]);
+        }
+        Ok(())
+    }
+
+    /// Radix's pointer: the trigger opens on the press, and a release that
+    /// didn't move (over the trigger) leaves the menu open on the selection.
+    /// A second press, on the trigger the menu's layer now covers, is an
+    /// outside press: it closes the menu and doesn't reopen it.
+    async fn select_press_opens_and_release_on_trigger_stays(c: &mut Checker) -> Check {
+        let shell = shell_focused(c).await?;
+        let before = changes(c)?;
+        let at = center(c.recorded("shell")?);
+        c.press(at).await?;
+        ensure!(is_open(c, &shell)?, "a press and release on the trigger didn't leave the menu open");
+        ensure!(highlighted(c, &shell)? == Some(0), "the menu doesn't highlight the selection (bash)");
+        c.press(at).await?;
+        ensure!(!is_open(c, &shell)?, "a press on the trigger of an open menu didn't close it");
+        ensure!(c.layers()? == 0, "{} layers open after the second press", c.layers()?);
+        ensure!(selected(c, &shell)? == Some(0) && changes(c)? == before, "the presses changed the selection");
+        let trigger = trigger_handle(c, &shell)?;
+        ensure!(c.focused(&trigger)?, "focus didn't return to the trigger");
+        Ok(())
+    }
+
+    /// One gesture: press on the trigger, drag onto foot, release. The
+    /// row is found first with the menu opened by key, since a search by
+    /// hovering would need the button up.
+    async fn select_press_drag_release_picks(c: &mut Checker) -> Check {
+        let shell = shell_focused(c).await?;
+        let before = changes(c)?.len();
+        let trigger = c.recorded("shell")?;
+        c.key("down").await?;
+        let row = c.option_row(&shell, trigger, 2).await?;
+        c.key("escape").await?;
+        ensure!(!is_open(c, &shell)?, "escape didn't close the menu opened to find the row");
+        c.drag(center(trigger), row).await?;
+        ensure!(!is_open(c, &shell)?, "the release over foot didn't close the menu");
+        ensure!(selected(c, &shell)? == Some(2), "the gesture didn't pick foot");
+        let changes = changes(c)?;
+        ensure!(changes[before..] == [2], "the owner heard {:?}", &changes[before..]);
+        let handle = trigger_handle(c, &shell)?;
+        ensure!(c.focused(&handle)?, "focus didn't return to the trigger");
+        Ok(())
+    }
+
+    /// The gesture dragged off the menu onto a button and released there:
+    /// the menu closes without a change, and the button isn't clicked. As
+    /// in Radix, the same goes for a release over the trigger itself once
+    /// the pointer moved more than 10px.
+    async fn select_drag_off_and_release_closes(c: &mut Checker) -> Check {
+        let shell = shell_focused(c).await?;
+        let before = changes(c)?;
+        let clicks = c.clicks("behind")?;
+        let bounds = c.recorded("shell")?;
+        let behind = center(c.recorded("behind")?);
+        c.drag(center(bounds), behind).await?;
+        ensure!(!is_open(c, &shell)?, "the release away from the menu didn't close it");
+        ensure!(selected(c, &shell)? == Some(0) && changes(c)? == before, "the release changed the selection");
+        ensure!(c.clicks("behind")? == clicks, "the release clicked the button under it");
+        // Along the trigger, well past 10px, and released on it.
+        let y = bounds.center().y;
+        let (from, to) = (point(bounds.left() + px(8.), y), point(bounds.right() - px(8.), y));
+        ensure!(to.x - from.x > px(20.), "the trigger is too narrow to drag along");
+        c.drag(from, to).await?;
+        ensure!(!is_open(c, &shell)?, "a dragged release over the trigger didn't close the menu");
+        ensure!(selected(c, &shell)? == Some(0) && changes(c)? == before, "the release changed the selection");
+        Ok(())
+    }
+
+    /// While the menu is open its layer blocks the pointer outside it: a
+    /// press on a button only closes the menu (Radix's
+    /// `disableOutsidePointerEvents`).
+    async fn select_outside_press_reaches_nothing(c: &mut Checker) -> Check {
+        let shell = shell_focused(c).await?;
+        c.key("down").await?;
+        ensure!(is_open(c, &shell)?, "down didn't open the menu");
+        let before = c.clicks("behind")?;
+        let at = center(c.recorded("behind")?);
+        c.press(at).await?;
+        ensure!(!is_open(c, &shell)?, "the outside press didn't close the menu");
+        ensure!(c.clicks("behind")? == before, "the outside press clicked the button beneath");
+        let trigger = trigger_handle(c, &shell)?;
+        ensure!(c.focused(&trigger)?, "focus didn't return to the trigger");
+        ensure!(!c.focused_name("behind")?, "the button beneath took focus");
         Ok(())
     }
 

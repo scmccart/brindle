@@ -447,16 +447,23 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-, | settings (general options, profiles, theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
 
-The settings dialog has three sections: General, Profiles and Theme; ctrl-tab
-moves between them. It opens on General, which holds what a window does when
-its tmux session ends ([tmux control mode](#tmux-control-mode)); left/right
-changes it, and the change is saved at once.
+The settings dialog has three sections: General, Profiles and Theme. The section
+list is the dialog's first Tab stop (shift-tab from where the dialog opens):
+there up/down change the section at once (wrapping) and home/end go to the
+first or last, then tab goes into the section. ctrl-tab and ctrl-pagedown
+(next) and ctrl-shift-tab and ctrl-pageup (previous) change it from anywhere in
+the dialog. An editor with unsaved changes keeps its section until you save or
+discard. It opens on General, which holds what a window does when
+its tmux session ends ([tmux control mode](#tmux-control-mode)); pick it from
+the select's menu (enter, space, up or down opens it), and the change is saved
+at once.
 
-In the Theme section, up/down previews a theme and enter applies it as the
-default; escape puts the previous theme back. `n` makes a new theme (a copy of
+In the Theme section, the theme list has focus: up/down (and home/end) preview a
+theme and enter applies it as the default; escape puts the previous theme back.
+Tab moves from the list to its buttons and back, as in the profile list. `n` makes a new theme (a copy of
 the selected one), `e` edits a custom theme and `d` deletes one. Built-in themes
-can't be changed, so editing one starts from a copy. In the editor, tab moves
-between fields and every valid color shows on the tabs as you type. Saving
+can't be changed, so editing one starts from a copy. In the editor, every valid
+color shows on the tabs as you type. Saving
 updates `config.toml` in place: your comments and the rest of the file are kept.
 
 The Profiles section lists your profiles with their ctrl-alt-N numbers. Enter or `e` edits one, `n` makes a new one, `c` duplicates
@@ -466,6 +473,16 @@ editor covers every profile setting, including the remote target (`none`, `ssh` 
 tmux arguments are written as shell words. A profile's theme and font size show
 on its open tabs while you edit; the other settings apply to new tabs. Renaming
 a profile keeps its open tabs linked to it and updates `default_profile`.
+
+In both editors, tab and shift-tab move through the fields, then the buttons and
+the dialog's close button, then the section list, and wrap around without
+leaving the dialog (up and
+down don't move between fields). Enter saves from a text field or a checkbox;
+on a focused button, enter or space presses that button alone. A choice field (a profile's theme, tmux mode, remote kind or container
+engine) works like a select: enter, space, up or down opens its menu, where
+up/down move, enter picks and escape closes the menu; left and right do nothing.
+Otherwise escape discards the editor's changes and goes back to the list. A
+click outside the dialog doesn't close it.
 
 Plain `ctrl-<letter>` always goes to the program, so tmux's prefix works as usual.
 

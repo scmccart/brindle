@@ -21,7 +21,7 @@ use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
-use brindle_ui::TextInput;
+use brindle_ui::{Overlay as UiOverlay, TextInput};
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
@@ -272,10 +272,10 @@ fn session_rows(sessions: &mut [SessionInfo], now: u64) -> Vec<PaletteRow> {
         .collect()
 }
 
-/// What is shown over the tabs; at most one at a time.
+/// What is shown over the tabs besides the settings dialog (which has its
+/// own modal slot); at most one overlay, this or the dialog, at a time.
 enum Overlay {
     Palette(OpenPalette),
-    Settings { dialog: Entity<SettingsDialog>, _subscription: Subscription },
 }
 
 struct OpenPalette {
@@ -311,6 +311,10 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     overlay: Option<Overlay>,
+    /// The settings dialog's modal slot. A press on its backdrop does
+    /// nothing, so a stray click never throws away a preview or an edit.
+    settings: UiOverlay<SettingsDialog>,
+    _settings_subscriptions: Vec<Subscription>,
     /// A theme being previewed by the settings dialog, shown on the tabs
     /// that follow the global theme.
     theme_preview: Option<Theme>,
@@ -349,6 +353,8 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             overlay: None,
+            settings: UiOverlay::modal().ignore_outside_press(),
+            _settings_subscriptions: Vec::new(),
             theme_preview: None,
             profile_preview: None,
             focus_handle: cx.focus_handle(),
@@ -1254,7 +1260,7 @@ impl Workspace {
             session.update(cx, |s, _| s.select_window(window_id));
         }
         let focus = tab.focus_handle(cx);
-        if self.overlay.is_none() {
+        if !self.has_overlay() {
             window.focus(&focus);
         }
         cx.notify();
@@ -1467,7 +1473,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.overlay.is_none() {
+        if !self.has_overlay() {
             return false;
         }
         let same = matches!(&self.overlay, Some(Overlay::Palette(open)) if is(&open.kind));
@@ -1487,7 +1493,7 @@ impl Workspace {
             PaletteEvent::Kill(ix) => this.palette_kill(*ix, window, cx),
             PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
-        self.close_overlay(cx);
+        self.close_overlay(window, cx);
         window.focus(&palette.focus_handle(cx));
         self.overlay = Some(Overlay::Palette(OpenPalette { palette, kind, _subscription: subscription }));
         cx.notify();
@@ -1650,7 +1656,7 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.overlay, Some(Overlay::Settings { .. })) {
+        if self.settings.is_open() {
             self.dismiss_overlay(window, cx);
             return;
         }
@@ -1664,8 +1670,8 @@ impl Workspace {
             config.tmux_session_end,
         );
         let theme = config.theme(None);
-        let dialog = cx.new(|cx| SettingsDialog::new(model, theme, cx));
-        let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
+        let dialog = cx.new(|cx| SettingsDialog::new(model, theme, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |this, _, event, _, cx| match event {
             SettingsEvent::Preview(theme) => this.set_theme_preview(Some(theme.clone()), cx),
             // Deferred by GPUI, so the reload sees this window idle.
             SettingsEvent::ProfilePreview(preview) => this.set_profile_preview(preview.clone(), cx),
@@ -1674,17 +1680,28 @@ impl Workspace {
                 let renames = renames.clone();
                 cx.defer(move |cx| crate::reload_config_renaming(cx, &renames));
             }
-            SettingsEvent::Close => this.dismiss_overlay(window, cx),
         });
-        self.close_overlay(cx);
-        window.focus(&dialog.focus_handle(cx));
-        self.overlay = Some(Overlay::Settings { dialog, _subscription: subscription });
+        // The slot closes itself on the dialog's `DismissEvent`; this ends
+        // the previews, as closing it any other way does.
+        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| this.end_previews(cx));
+        // A palette goes first, with focus back on the tab, so that is the
+        // focus the dialog records and puts back when it closes (the
+        // palette's input is gone by then).
+        if self.overlay.is_some() {
+            self.dismiss_overlay(window, cx);
+        }
+        self._settings_subscriptions = vec![subscription, dismissed];
+        self.settings.open(dialog, |this| &mut this.settings, window, cx);
         cx.notify();
+    }
+
+    fn has_overlay(&self) -> bool {
+        self.overlay.is_some() || self.settings.is_open()
     }
 
     /// Closes whatever overlay is open and gives focus back to the tab.
     fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_overlay(cx);
+        self.close_overlay(window, cx);
         if let Some(tab) = self.tabs.get(self.active) {
             window.focus(&tab.focus_handle(cx));
         }
@@ -1693,8 +1710,15 @@ impl Workspace {
 
     /// Drops the open overlay. Closing the settings dialog this way cancels
     /// it, ending any preview.
-    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = None;
+        self.settings.close(window, cx);
+        self._settings_subscriptions.clear();
+        self.end_previews(cx);
+    }
+
+    /// Stops the settings dialog's theme and profile previews.
+    fn end_previews(&mut self, cx: &mut Context<Self>) {
         if self.theme_preview.is_some() {
             self.set_theme_preview(None, cx);
         }
@@ -1824,7 +1848,7 @@ impl Workspace {
                 let input = open.palette.read(cx).input();
                 input.read(cx).is_focused(window).then(|| input.clone())
             }
-            Some(Overlay::Settings { dialog, .. }) => dialog.read(cx).focused_input(window, cx),
+            None if self.settings.is_open() => self.settings.view()?.read(cx).focused_input(window, cx),
             None => {
                 let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
                 input.read(cx).is_focused(window).then_some(input)
@@ -1904,13 +1928,41 @@ impl Workspace {
         }
         match &self.overlay {
             Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe(cx)),
-            Some(Overlay::Settings { dialog, .. }) => out.push_str(&dialog.read(cx).describe()),
             None => {}
+        }
+        if let Some(dialog) = self.settings.view() {
+            out.push_str(&dialog.read(cx).describe(window, cx));
         }
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
         }
+        out.push_str(&format!("--- focus {}\n", self.describe_focus(window, cx)));
         out
+    }
+
+    /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
+    /// active tab's active terminal), `settings stop=NAME` (inside the
+    /// settings dialog, on the control `NAME`), `none`, or `other`; then
+    /// the window's `modality=keyboard|pointer`, which decides whether the
+    /// focused control shows its ring.
+    fn describe_focus(&self, window: &Window, cx: &App) -> String {
+        let terminal = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
+        let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
+            "terminal".to_string()
+        } else if let Some(dialog) =
+            self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
+        {
+            format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
+        } else if window.focused(cx).is_none() {
+            "none".to_string()
+        } else {
+            "other".to_string()
+        };
+        let modality = match brindle_ui::modality(window, cx) {
+            brindle_ui::Modality::Keyboard => "keyboard",
+            brindle_ui::Modality::Pointer => "pointer",
+        };
+        format!("{place} modality={modality}")
     }
 
     // ---- rendering --------------------------------------------------------------
@@ -2103,7 +2155,6 @@ impl Workspace {
     fn render_overlay(&self) -> Option<AnyElement> {
         let overlay = match self.overlay.as_ref()? {
             Overlay::Palette(open) => open.palette.clone().into_any_element(),
-            Overlay::Settings { dialog, .. } => dialog.clone().into_any_element(),
         };
         Some(
             div()
@@ -2300,7 +2351,7 @@ impl Render for Workspace {
 
         // While the settings dialog previews a theme, only the overlay
         // toggles act, so nothing (such as a new tab) changes underneath it.
-        let settings_open = matches!(self.overlay, Some(Overlay::Settings { .. }));
+        let settings_open = self.settings.is_open();
         let body = div()
             .id("workspace")
             .key_context("Workspace")
@@ -2375,7 +2426,9 @@ impl Render for Workspace {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
-            .when_some(self.render_overlay(), |d, overlay| d.child(overlay));
+            .when_some(self.render_overlay(), |d, overlay| d.child(overlay))
+            // Last in the tree, so the modal backdrop paints above the rest.
+            .children(self.settings.render(window, cx));
 
         // With client-side decorations we draw a transparent margin around the
         // window for the shadow and the resize handles.

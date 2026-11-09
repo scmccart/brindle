@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, AppContext as _, Application, BorrowAppContext as _, Bounds, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, px, size,
+    App, AppContext as _, Application, BorrowAppContext as _, Bounds, Keystroke, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
 
 use crate::actions::{Quit, ReloadConfig};
@@ -78,6 +78,10 @@ DEBUGGING:
         --send <TEXT>            Type TEXT into the focused text field, else
                                  the active tab (\\r = Enter)
         --action <NAME>          Run an action (see --list-actions)
+        --key <KEYSTROKE>        Press a key (e.g. tab, shift-tab, enter) through the
+                                 app's own key dispatch; in-process, not OS input
+        --modality <M>           Count focus as moved by the pointer or the keyboard
+                                 from now on, which decides whether focus rings show
         --hover [MODS-]COL,ROW   Move the mouse over a cell of the active terminal
                                  (e.g. ctrl-3,0); in-process, not OS input
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
@@ -112,6 +116,13 @@ enum Step {
     /// `--wait-for`: the text the active terminal must show before the
     /// steps after it run.
     WaitFor(String),
+    /// `--key`: a keystroke through gpui's own key dispatch (bindings, key
+    /// listeners, keystroke observers), as a real key press reaches them.
+    Key(String),
+    /// `--modality`: how focus counts as moved in the window from now on,
+    /// as after a pointer press on a control (`pointer`) or a key press
+    /// (`keyboard`); it decides whether focus rings show.
+    Modality(brindle_ui::Modality),
 }
 
 /// How long a `--wait-for` step waits before giving up.
@@ -245,6 +256,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
             }
             "--find" => args.steps.extend(it.next().map(Step::Find)),
             "--wait-for" => args.steps.extend(it.next().map(|s| Step::WaitFor(unescape(&s)))),
+            "--key" => args.steps.extend(it.next().map(Step::Key)),
+            "--modality" => match it.next().as_deref() {
+                Some("pointer") => args.steps.push(Step::Modality(brindle_ui::Modality::Pointer)),
+                Some("keyboard") => args.steps.push(Step::Modality(brindle_ui::Modality::Keyboard)),
+                _ => usage_error("--modality needs pointer or keyboard"),
+            },
             "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
                 _ => usage_error("--step-interval needs a positive number of seconds"),
@@ -594,6 +611,9 @@ fn main() {
         Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
         actions::bind_keys(cx);
+        // brindle-ui's keystroke observer: a key sets keyboard modality, so
+        // focus rings come back after a click had hidden them.
+        brindle_ui::init(cx);
         // RUST_LOG=brindle=debug shows every keystroke and what it ran.
         cx.observe_keystrokes(|e, _, _| {
             let action = e.action.as_ref().map(|a| a.name()).unwrap_or("no action");
@@ -703,6 +723,19 @@ fn main() {
                     wait_for_text(window, text, cx).await;
                     continue;
                 }
+                if let Step::Key(key) = &step {
+                    // Not inside the workspace's update: the key's actions
+                    // update it themselves.
+                    let key = key.clone();
+                    cx.update_window(window.into(), move |_, window, cx| match Keystroke::parse(&key) {
+                        Ok(keystroke) => {
+                            window.dispatch_keystroke(keystroke, cx);
+                        }
+                        Err(err) => log::error!("--key: bad keystroke {key:?}: {err:?}"),
+                    })
+                    .ok();
+                    continue;
+                }
                 window
                     .update(cx, |ws, window, cx| match &step {
                         Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
@@ -713,7 +746,8 @@ fn main() {
                         },
                         Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
                         Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
-                        Step::WaitFor(_) => {}
+                        Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
+                        Step::WaitFor(_) | Step::Key(_) => {}
                     })
                     .ok();
             }
@@ -837,6 +871,14 @@ mod tests {
         for args in [&["--send", "x"][..], &["--action", "new_tab"], &["--dump-screen-after", "2"], &["--latency-bench", "5"]] {
             assert!(parse(args).is_debug_run(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn key_and_modality_steps_keep_their_order() {
+        let args = parse(&["--key", "shift-tab", "--modality", "pointer", "--action", "x", "--modality", "keyboard"]);
+        assert!(args.is_debug_run());
+        let steps: Vec<String> = args.steps.iter().map(|s| format!("{s:?}")).collect();
+        assert_eq!(steps, [r#"Key("shift-tab")"#, "Modality(Pointer)", r#"Action("x")"#, "Modality(Keyboard)"]);
     }
 
     #[test]

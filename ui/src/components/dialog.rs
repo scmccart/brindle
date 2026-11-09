@@ -60,8 +60,8 @@
 
 use gpui::{
     AnyElement, App, ClickEvent, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Refineable, RenderOnce, SharedString, StyleRefinement, Styled,
-    Window, div, prelude::FluentBuilder, px, relative, rems,
+    ParentElement, Pixels, Refineable, RenderOnce, SharedString, Size, StyleRefinement, Styled,
+    Window, div, prelude::FluentBuilder, px, relative, rems, size,
 };
 
 use crate::components::{ACTIVATION_KEYS, ClickHandler, FocusRing, activates};
@@ -141,8 +141,27 @@ impl Styled for Dialog {
 /// 1rem from each side in a narrower window.
 pub fn dialog_width(viewport_width: Pixels, rem_size: Pixels) -> Pixels {
     let max = DIALOG_MAX_WIDTH.to_pixels(rem_size);
-    let room = viewport_width - DIALOG_EDGE_GAP.to_pixels(rem_size) * 2.;
-    room.min(max).max(px(0.))
+    dialog_room(viewport_width, rem_size).min(max)
+}
+
+/// The most a dialog can take of a window `extent` wide (or high): the
+/// window less 1rem on each side, never negative.
+pub fn dialog_room(extent: Pixels, rem_size: Pixels) -> Pixels {
+    (extent - DIALOG_EDGE_GAP.to_pixels(rem_size) * 2.).max(px(0.))
+}
+
+/// Keeps a dialog inside the window when its owner set its own size: the
+/// width is capped at the `room` the window leaves, as shadcn's
+/// `max-w-[calc(100%-2rem)]` caps its `w-full`, and so is a height the
+/// owner set (shadcn sets none, and its page scrolls instead). A maximum
+/// the owner set is kept.
+fn fit_to_window(style: &mut StyleRefinement, owner: &StyleRefinement, room: Size<Pixels>) {
+    if owner.max_size.width.is_none() {
+        style.max_size.width = Some(room.width.into());
+    }
+    if owner.size.height.is_some() && owner.max_size.height.is_none() {
+        style.max_size.height = Some(room.height.into());
+    }
 }
 
 impl RenderOnce for Dialog {
@@ -220,8 +239,13 @@ impl RenderOnce for Dialog {
             .children(self.body)
             .children(footer)
             .children(close);
-        // The owner's layout refinements win over the component's.
+        // The owner's layout refinements win over the component's, but a
+        // size the owner set still stops 1rem short of the window's edges.
         dialog.style().refine(&self.style);
+        let viewport = window.viewport_size();
+        let rem = window.rem_size();
+        let room = size(dialog_room(viewport.width, rem), dialog_room(viewport.height, rem));
+        fit_to_window(dialog.style(), &self.style, room);
         dialog
     }
 }
@@ -244,6 +268,39 @@ mod tests {
         assert_eq!(dialog_width(px(20.), rem), px(0.));
         // It scales with the root text size.
         assert_eq!(dialog_width(px(2400.), px(32.)), px(1024.));
+    }
+
+    /// An owner's explicit size (the settings dialog's 760x460) is capped at
+    /// the window less 2rem; an owner's own maximum is kept.
+    #[test]
+    fn an_explicit_size_still_fits_the_window() {
+        let rem = px(16.);
+        assert_eq!(dialog_room(px(600.), rem), px(568.));
+        assert_eq!(dialog_room(px(20.), rem), px(0.));
+
+        let mut owner = StyleRefinement::default();
+        owner.size.width = Some(px(760.).into());
+        owner.size.height = Some(px(460.).into());
+        let mut style = StyleRefinement::default();
+        style.refine(&owner);
+        let room = size(dialog_room(px(600.), rem), dialog_room(px(400.), rem));
+        fit_to_window(&mut style, &owner, room);
+        assert_eq!(style.size.width, Some(px(760.).into()));
+        assert_eq!(style.max_size.width, Some(px(568.).into()));
+        assert_eq!(style.max_size.height, Some(px(368.).into()));
+
+        owner.max_size.width = Some(px(900.).into());
+        let mut style = StyleRefinement::default();
+        style.refine(&owner);
+        fit_to_window(&mut style, &owner, room);
+        assert_eq!(style.max_size.width, Some(px(900.).into()));
+        assert_eq!(style.max_size.height, Some(px(368.).into()));
+
+        // With no height of the owner's, the height is left to the content.
+        let mut style = StyleRefinement::default();
+        fit_to_window(&mut style, &StyleRefinement::default(), room);
+        assert_eq!(style.max_size.width, Some(px(568.).into()));
+        assert_eq!(style.max_size.height, None);
     }
 
     #[test]

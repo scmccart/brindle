@@ -2,13 +2,16 @@
 //!
 //! The owner holds the value and passes it as `checked`; a primary click,
 //! or the space key-down while the checkbox has focus ([`activates`] with
-//! [`TOGGLE_KEYS`]), asks the owner to flip it through `on_click(&new, …)`
+//! [`CHECKBOX_KEYS`]), asks the owner to flip it through `on_click(&new, …)`
 //! ([`toggle_request`]), and the box shows the new state once the owner
-//! re-renders with it. Enter doesn't toggle it, as with a checkbox in a web
-//! form, where enter submits ([`toggles`]), and passes to what is around
-//! the checkbox. A disabled checkbox is drawn at half opacity, asks nothing
-//! and tracks no focus ([`interaction`]). The tick is [`Icon::Check`] in the
-//! primary foreground; the ring shows when it is focused from the keyboard.
+//! re-renders with it. Enter doesn't toggle it, as in Radix, whose checkbox
+//! blocks enter ([`toggles`]), and passes to what is around the checkbox
+//! (a [`Switch`] takes enter). A disabled checkbox is drawn at half
+//! opacity, asks nothing and tracks no focus ([`interaction`]). The tick is
+//! [`Icon::Check`] in the primary foreground; the ring shows when it is
+//! focused from the keyboard.
+//!
+//! [`Switch`]: crate::components::Switch
 
 use gpui::{
     App, ClickEvent, ElementId, FocusHandle, InteractiveElement, IntoElement, KeyboardButton, MouseButton,
@@ -17,7 +20,7 @@ use gpui::{
 // (`on_click` and the key-down come through `activates`, so the stateful
 // trait isn't named here.)
 
-use crate::components::{DISABLED_OPACITY, FocusRing, TOGGLE_KEYS, activates, inert_press, interaction};
+use crate::components::{CHECKBOX_KEYS, DISABLED_OPACITY, FocusRing, activates, inert_press, interaction};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{CHECKBOX_RADIUS, CHECKBOX_SIZE, CHECKBOX_TICK_SIZE, checkbox_style, focus_ring};
@@ -90,13 +93,15 @@ pub fn toggle_request(checked: bool, disabled: bool) -> Option<bool> {
     (!disabled).then_some(!checked)
 }
 
-/// Whether a click toggles: a mouse click or space does, enter doesn't,
-/// as for a checkbox in a web form, where enter submits the form instead.
-/// `key` is the key of a keyboard click, `None` for a mouse click. The
-/// toggles take only space on key-down ([`TOGGLE_KEYS`]), so this is the
-/// same rule stated over the click that arrives.
-pub fn toggles(key: Option<KeyboardButton>) -> bool {
-    key != Some(KeyboardButton::Enter)
+/// Whether a click toggles a control that takes `keys`: a mouse click
+/// always does, a keyboard click only for one of `keys` ([`CHECKBOX_KEYS`]:
+/// space; [`SWITCH_KEYS`]: enter and space). `key` is the key of a keyboard
+/// click, `None` for a mouse click. The controls take only their keys on
+/// key-down, so this is the same rule stated over the click that arrives.
+///
+/// [`SWITCH_KEYS`]: crate::components::SWITCH_KEYS
+pub fn toggles(keys: &[KeyboardButton], key: Option<KeyboardButton>) -> bool {
+    key.is_none_or(|key| keys.contains(&key))
 }
 
 /// The key behind a click, `None` for a mouse click.
@@ -140,9 +145,9 @@ impl RenderOnce for Checkbox {
             .when_some(on_click, |d, on_click| {
                 activates(
                     d,
-                    &TOGGLE_KEYS,
+                    &CHECKBOX_KEYS,
                     Box::new(move |event, window, cx| {
-                        if toggles(click_key(event))
+                        if toggles(&CHECKBOX_KEYS, click_key(event))
                             && let Some(value) = toggle_request(checked, disabled)
                         {
                             on_click(&value, window, cx);
@@ -171,11 +176,16 @@ mod tests {
         assert_eq!(toggle_request(true, true), None);
     }
 
-    /// Mouse clicks and space toggle; enter doesn't.
+    /// A checkbox: mouse clicks and space toggle, enter doesn't. A switch:
+    /// mouse clicks, space and enter all toggle, as Radix's button does.
     #[test]
-    fn space_and_the_mouse_toggle_but_enter_does_not() {
-        assert!(toggles(None));
-        assert!(toggles(Some(KeyboardButton::Space)));
-        assert!(!toggles(Some(KeyboardButton::Enter)));
+    fn space_and_the_mouse_toggle_and_enter_only_a_switch() {
+        use crate::components::SWITCH_KEYS;
+        assert!(toggles(&CHECKBOX_KEYS, None));
+        assert!(toggles(&CHECKBOX_KEYS, Some(KeyboardButton::Space)));
+        assert!(!toggles(&CHECKBOX_KEYS, Some(KeyboardButton::Enter)));
+        assert!(toggles(&SWITCH_KEYS, None));
+        assert!(toggles(&SWITCH_KEYS, Some(KeyboardButton::Space)));
+        assert!(toggles(&SWITCH_KEYS, Some(KeyboardButton::Enter)));
     }
 }

@@ -56,8 +56,8 @@ pub use dialog::{Dialog, dialog_width};
 pub use input::Input;
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
-    Activation, Select, SelectEvent, SelectOption, Selection, TypedKey, initial_highlight, trigger_activation,
-    typed_key,
+    Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,
+    TypedKey, closed_trigger_key, initial_highlight, menu_release, moved_off, trigger_activation, typed_key,
 };
 pub use switch::Switch;
 
@@ -96,7 +96,11 @@ pub(crate) fn inert_press<E: InteractiveElement>(element: E) -> E {
 /// the Metal one draws a sharp shadow. And a gpui shadow fills the whole
 /// dilated box, under the control too, where CSS clips it to the outside,
 /// so a transparent control (ghost, link, an input) would be tinted.
-pub(crate) trait FocusRing: ParentElement + Styled + Sized {
+///
+/// Public so an app can ring a focusable element of its own (a list, say)
+/// the way the components ring theirs, deciding `shown` with
+/// [`shows_ring`](crate::shows_ring).
+pub trait FocusRing: ParentElement + Styled + Sized {
     fn focus_ring(mut self, shown: bool, color: Hsla, window: &Window) -> Self {
         if !shown {
             return self;
@@ -127,9 +131,14 @@ impl<E: ParentElement + Styled + Sized> FocusRing for E {}
 /// The keys that activate a button: enter and space, as in a browser.
 pub const ACTIVATION_KEYS: [KeyboardButton; 2] = [KeyboardButton::Enter, KeyboardButton::Space];
 
-/// The key that toggles a checkbox or a switch: space alone. Enter passes,
-/// as for a checkbox in a web form, where enter submits the form instead.
-pub const TOGGLE_KEYS: [KeyboardButton; 1] = [KeyboardButton::Space];
+/// The key that toggles a checkbox: space alone. Enter passes to what is
+/// around it, as in Radix, whose checkbox blocks enter (WAI-ARIA's checkbox
+/// pattern has no enter).
+pub const CHECKBOX_KEYS: [KeyboardButton; 1] = [KeyboardButton::Space];
+
+/// The keys that toggle a switch: enter and space, as for a button, since
+/// Radix's switch is a plain `<button>` and takes both.
+pub const SWITCH_KEYS: [KeyboardButton; 2] = ACTIVATION_KEYS;
 
 /// The key-down that activates a control, as the button it stands for:
 /// `key` is the keystroke's key, pressed with `modifiers`, `is_held` for a
@@ -197,8 +206,8 @@ mod tests {
     use super::*;
     use gpui::MouseClickEvent;
 
-    /// A first press of bare enter or space activates a button; a checkbox
-    /// takes space alone. Repeats, modified keys and other keys pass.
+    /// A first press of bare enter or space activates a button and a
+    /// switch; a checkbox takes space alone. Repeats, modified keys and other keys pass.
     #[test]
     fn enter_and_space_key_downs_activate_once() {
         let none = Modifiers::default();
@@ -219,8 +228,12 @@ mod tests {
         // Other keys, and a key the control doesn't take.
         assert_eq!(key_activation("a", none, false, &ACTIVATION_KEYS), None);
         assert_eq!(key_activation("tab", none, false, &ACTIVATION_KEYS), None);
-        assert_eq!(key_activation("enter", none, false, &TOGGLE_KEYS), None);
-        assert_eq!(key_activation("space", none, false, &TOGGLE_KEYS), Some(KeyboardButton::Space));
+        // A checkbox takes space alone; a switch takes enter too.
+        assert_eq!(key_activation("enter", none, false, &CHECKBOX_KEYS), None);
+        assert_eq!(key_activation("space", none, false, &CHECKBOX_KEYS), Some(KeyboardButton::Space));
+        assert_eq!(key_activation("enter", none, false, &SWITCH_KEYS), Some(KeyboardButton::Enter));
+        assert_eq!(key_activation("space", none, false, &SWITCH_KEYS), Some(KeyboardButton::Space));
+        assert_eq!(key_activation("enter", none, true, &SWITCH_KEYS), None);
     }
 
     /// The scenario: enter (key-down) in a command popover confirms, the

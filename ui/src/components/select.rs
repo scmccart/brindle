@@ -4,46 +4,54 @@
 //! the trigger goes and subscribes to: [`SelectEvent::Changed`] is emitted
 //! only when the selected option actually changes ([`Selection::pick`]).
 //! The trigger shows the selected option's label, or the placeholder, and
-//! a chevron; it fills its parent's width. Activating it (a click, enter or
-//! space), or pressing up or down (also ctrl-p/ctrl-n) while it has focus,
-//! opens the menu below it with the selection highlighted; home and end do
-//! nothing while it is closed. Typing while the menu is closed moves the
-//! selection by typeahead ([`Selection::type_char`]); while it is open, the
-//! highlight.
+//! a chevron; it fills its parent's width. A primary press on it, enter or
+//! space, or up or down (also ctrl-p/ctrl-n) while it has focus, opens the
+//! menu below it with the selection highlighted; home and end do nothing
+//! while it is closed ([`closed_trigger_key`]). Typing while the menu is
+//! closed moves the selection by typeahead ([`Selection::type_char`]);
+//! while it is open, the highlight.
 //!
 //! The menu is a non-modal [`Overlay`] placed with [`Anchored`]: below the
 //! trigger, start-aligned, at least as wide as it, flipping above when it
 //! doesn't fit. It is deferred, so it paints above the window from wherever
 //! the select is, a dialog's body included. Its highlight doesn't wrap, moves
 //! over enabled options only, follows the pointer and is scrolled into view.
-//! Enter, space or a click on an option picks it and closes the menu; Escape
-//! and an outside press close it without a change. Focus goes back to the
-//! trigger either way, through the overlay.
+//! Enter or space picks the highlighted option and a primary *release* over
+//! an option picks that one, closing the menu; Escape and an outside press
+//! close it without a change. Focus goes back to the trigger either way,
+//! through the overlay.
 //!
-//! gpui's keyboard click fires on enter and space *key-up*, for whatever has
-//! focus then, with no pairing to the key-down. A pick on enter key-down in
-//! the menu closes it and puts focus back on the trigger before that key-up
-//! arrives, which would open the menu again if the trigger acted on keyboard
-//! clicks. So, as every control of the crate (`components`' module doc),
-//! the trigger acts on mouse clicks only, and enter and space open it on
-//! key-down: enter through the `ListConfirm` action (the trigger is in the
-//! `UiList` context) and space through `on_key_down`
+//! The pointer follows Radix. The trigger opens on the press, so a press on
+//! the trigger, a drag onto an option and a release picks it in one gesture;
+//! a release that hardly moved ([`moved_off`]) leaves the menu open, and one
+//! that moved and lands outside the menu, the trigger included, closes it
+//! ([`menu_release`]). While the menu is open its layer blocks the pointer
+//! outside it ([`Overlay::block_outside_pointer`]), so an outside press only
+//! closes the menu and reaches nothing beneath, the trigger included.
+//!
+//! The trigger has no click handler, so gpui's keyboard click (on enter and
+//! space *key-up*, for whatever has focus then) never reaches it: a pick on
+//! enter key-down in the menu puts focus back on the trigger before that
+//! key-up, which must not open the menu again. Enter and space open it on
+//! key-down instead: enter through the `ListConfirm` action (the trigger is
+//! in the `UiList` context) and space through `on_key_down`
 //! ([`trigger_activation`], [`typed_key`]).
 //!
+//! [`Overlay::block_outside_pointer`]: crate::primitives::overlay::Overlay::block_outside_pointer
 //! [`Overlay`]: crate::primitives::overlay::Overlay
 //! [`Anchored`]: crate::primitives::placement::Anchored
 
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext, Bounds, ClickEvent, Context, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    div, prelude::FluentBuilder, px, rems,
+    App, AppContext, Bounds, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    prelude::FluentBuilder, px, rems,
 };
 
 use crate::actions::{ListConfirm, ListDown, ListFirst, ListLast, ListUp};
-use crate::components::popover::{TriggerAction, follows_trigger, trigger_action};
+use crate::components::popover::{TriggerAction, follows_trigger};
 use crate::components::{DISABLED_OPACITY, FocusRing, inert_press};
 use crate::icon::Icon;
 use crate::primitives::focus_scope::FocusStops;
@@ -198,27 +206,98 @@ pub fn typed_key(key: &str, key_char: Option<&str>, modifiers: Modifiers, search
 /// How a select's trigger was activated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
-    /// A primary mouse click.
-    MouseClick,
-    /// gpui's keyboard click, on enter or space key-up.
-    KeyboardClick,
+    /// A primary pointer press, as Radix opens a mouse trigger on
+    /// pointer-down (not on the click that follows).
+    Press,
     /// Enter or a bare space on key-down.
     Key,
 }
 
-/// What activating the trigger does when the menu is `open` now and the
-/// trigger was `pressed_open` by the press behind a mouse click
-/// (`trigger_action`, as for a popover).
+/// What activating the trigger does when the menu is `open` now. A press
+/// or a key opens a closed menu. A key on an open menu closes it (the open
+/// menu has focus, so this is for completeness); a press can't reach the
+/// trigger while the menu is open (its layer blocks the pointer outside
+/// it), and does nothing if it does.
+pub fn trigger_activation(open: bool, activation: Activation) -> TriggerAction {
+    match (open, activation) {
+        (false, _) => TriggerAction::Open,
+        (true, Activation::Key) => TriggerAction::Close,
+        (true, Activation::Press) => TriggerAction::Stay,
+    }
+}
+
+/// How far, in either axis, the pointer may move between the press that
+/// opened the menu and its release before the release counts as a drag:
+/// Radix's 10px.
+pub const DRAG_THRESHOLD: Pixels = px(10.);
+
+/// Whether the pointer moved from the trigger press at `press` to the
+/// release at `release` by more than [`DRAG_THRESHOLD`] in either axis.
+pub fn moved_off(press: Point<Pixels>, release: Point<Pixels>) -> bool {
+    (release.x - press.x).abs() > DRAG_THRESHOLD || (release.y - press.y).abs() > DRAG_THRESHOLD
+}
+
+/// Where a primary release over an open menu lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseOver {
+    /// An enabled option.
+    Option(usize),
+    /// The menu, but no enabled option (its padding, a disabled option).
+    Menu,
+    /// Outside the menu, the select's own trigger included.
+    Outside,
+}
+
+/// What a release does to an open menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuRelease {
+    Pick(usize),
+    Stay,
+    /// Close without a change.
+    Close,
+}
+
+/// What a primary release `over` part of the window does to the open
+/// menu. `gesture` is `Some(moved)` when the release ends the press that
+/// opened the menu, `moved` from [`moved_off`]; `None` for any other
+/// release (a click in a menu already open).
 ///
-/// A keyboard click does nothing: it fires on key-up for whatever has focus
-/// then, so the one that follows a pick in the menu (enter key-down, which
-/// closes the menu and focuses the trigger) would open the menu again. Enter
-/// and space act on key-down instead.
-pub fn trigger_activation(open: bool, activation: Activation, pressed_open: bool) -> TriggerAction {
-    match activation {
-        Activation::KeyboardClick => TriggerAction::Stay,
-        Activation::MouseClick => trigger_action(open, true, pressed_open),
-        Activation::Key => trigger_action(open, false, pressed_open),
+/// As in Radix's `SelectContent` pointer-up handler: the press that opened
+/// the menu, released within [`DRAG_THRESHOLD`] of where it began, does
+/// nothing (wherever it lands); moved further, it picks an option it is
+/// released on, and closes the menu when released outside it, over the
+/// trigger as anywhere else. Any later release on an enabled option picks
+/// it.
+pub fn menu_release(gesture: Option<bool>, over: ReleaseOver) -> MenuRelease {
+    match (gesture, over) {
+        (Some(false), _) => MenuRelease::Stay,
+        (_, ReleaseOver::Option(ix)) => MenuRelease::Pick(ix),
+        (Some(true), ReleaseOver::Outside) => MenuRelease::Close,
+        _ => MenuRelease::Stay,
+    }
+}
+
+/// A list action reaching the trigger (it is in the `UiList` context).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListKey {
+    Up,
+    Down,
+    First,
+    Last,
+    Confirm,
+}
+
+/// What a list action does on the trigger, which has focus only while the
+/// menu is closed (the open menu takes it). As in Radix: up and down open
+/// the menu, enter activates (opens) it on key-down, and home and end do
+/// nothing. Space and typeahead come through `on_key_down` ([`typed_key`]);
+/// left and right are bound to nothing and typed as nothing, so they do
+/// nothing either.
+pub fn closed_trigger_key(key: ListKey) -> TriggerAction {
+    match key {
+        ListKey::Up | ListKey::Down => TriggerAction::Open,
+        ListKey::Confirm => trigger_activation(false, Activation::Key),
+        ListKey::First | ListKey::Last => TriggerAction::Stay,
     }
 }
 
@@ -243,9 +322,6 @@ pub struct Select {
     menu: Overlay<SelectMenu>,
     /// The trigger's bounds, in window coordinates, from the last frame.
     trigger: Option<Bounds<Pixels>>,
-    /// Whether the menu was open when the last pointer press on the trigger
-    /// came (`trigger_action`).
-    pressed_open: bool,
     /// The open menu's picks.
     _picks: Option<Subscription>,
 }
@@ -274,9 +350,8 @@ impl Select {
             placeholder: SharedString::default(),
             disabled: false,
             focus: cx.focus_handle(),
-            menu: Overlay::non_modal(),
+            menu: Overlay::non_modal().block_outside_pointer(),
             trigger: None,
-            pressed_open: false,
             _picks: None,
         }
     }
@@ -350,6 +425,13 @@ impl Select {
     /// enabled option) and gives it focus. Nothing happens when the select
     /// is disabled or the menu is already open.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_from(None, window, cx);
+    }
+
+    /// [`Select::open`], from a pointer press on the trigger at `press` when
+    /// given: the menu then reads the release that ends that press as the
+    /// end of a press-drag-release gesture ([`menu_release`]).
+    fn open_from(&mut self, press: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled || self.menu.is_open() {
             return;
         }
@@ -357,7 +439,7 @@ impl Select {
         let selected = self.selection.selected();
         let highlight = initial_highlight(selected, options.len(), |ix| !options[ix].disabled);
         let min_width = self.trigger.map_or(px(0.), |bounds| bounds.size.width);
-        let menu = cx.new(|cx| SelectMenu::new(options, selected, highlight, min_width, cx));
+        let menu = cx.new(|cx| SelectMenu::new(options, selected, highlight, min_width, press, cx));
         self._picks = Some(cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
             let MenuEvent::Picked(ix) = *event;
             // Close first, so focus is back on the trigger when the owner
@@ -387,51 +469,54 @@ impl Select {
     }
 
     fn activate(&mut self, activation: Activation, window: &mut Window, cx: &mut Context<Self>) {
-        let pressed_open = std::mem::take(&mut self.pressed_open);
-        match trigger_activation(self.menu.is_open(), activation, pressed_open) {
+        match trigger_activation(self.menu.is_open(), activation) {
             TriggerAction::Open => self.open(window, cx),
             TriggerAction::Close => self.close(window, cx),
             TriggerAction::Stay => {}
         }
     }
 
-    fn click(&mut self, event: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let activation = match event {
-            ClickEvent::Mouse(_) => Activation::MouseClick,
-            ClickEvent::Keyboard(_) => Activation::KeyboardClick,
-        };
-        self.activate(activation, window, cx);
-    }
-
-    fn mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Bubbles after the open menu's outside-press handler asked it to
-        // dismiss, and before that dismissal applies.
-        self.pressed_open = self.menu.is_open();
+    /// A primary press on the trigger focuses it (as pointer input) and
+    /// opens the menu at once, as Radix does on pointer-down; the release
+    /// is the menu's to read.
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         focus_from_pointer(&self.focus, window, cx);
+        if trigger_activation(self.menu.is_open(), Activation::Press) == TriggerAction::Open {
+            self.open_from(Some(event.position), window, cx);
+        }
     }
 
-    fn open_on(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open(window, cx);
+    /// A list action on the trigger, by [`closed_trigger_key`]. Home and end
+    /// are taken even though they do nothing, so that a list around the
+    /// select doesn't move instead.
+    fn list_key(&mut self, key: ListKey, window: &mut Window, cx: &mut Context<Self>) {
+        match closed_trigger_key(key) {
+            TriggerAction::Open => self.open(window, cx),
+            TriggerAction::Close => self.close(window, cx),
+            TriggerAction::Stay => {}
+        }
     }
 
     fn up(&mut self, _: &ListUp, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_on(window, cx);
+        self.list_key(ListKey::Up, window, cx);
     }
 
     fn down(&mut self, _: &ListDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_on(window, cx);
+        self.list_key(ListKey::Down, window, cx);
     }
 
     /// Enter on the closed trigger, on key-down.
     fn confirm(&mut self, _: &ListConfirm, window: &mut Window, cx: &mut Context<Self>) {
-        self.activate(Activation::Key, window, cx);
+        self.list_key(ListKey::Confirm, window, cx);
     }
 
-    /// Home and end do nothing on the closed trigger, as in Radix. They are
-    /// taken so that a list around the select doesn't move instead.
-    fn first(&mut self, _: &ListFirst, _: &mut Window, _: &mut Context<Self>) {}
+    fn first(&mut self, _: &ListFirst, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_key(ListKey::First, window, cx);
+    }
 
-    fn last(&mut self, _: &ListLast, _: &mut Window, _: &mut Context<Self>) {}
+    fn last(&mut self, _: &ListLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_key(ListKey::Last, window, cx);
+    }
 
     /// Typeahead while the menu is closed, and space to open it. A key
     /// taken here is stopped, which keeps it from the keystroke observer
@@ -500,9 +585,8 @@ impl Render for Select {
                 d.cursor_pointer()
                     .key_context("UiList")
                     .track_focus(&self.focus)
+                    // The press opens; no click handler (see the module doc).
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-                    // Mouse clicks only; see the module doc.
-                    .on_click(cx.listener(Self::click))
                     .on_action(cx.listener(Self::up))
                     .on_action(cx.listener(Self::down))
                     .on_action(cx.listener(Self::first))
@@ -558,6 +642,9 @@ struct SelectMenu {
     scroll: ScrollHandle,
     /// The trigger's width, which the menu is at least as wide as.
     min_width: Pixels,
+    /// Where the trigger press that opened the menu came, until a release
+    /// ends it or another press in the menu starts anew.
+    gesture: Option<Point<Pixels>>,
 }
 
 impl EventEmitter<MenuEvent> for SelectMenu {}
@@ -581,6 +668,7 @@ impl SelectMenu {
         selected: Option<usize>,
         highlight: Option<usize>,
         min_width: Pixels,
+        gesture: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut nav = ListNav::new(options.len(), false);
@@ -589,7 +677,31 @@ impl SelectMenu {
         if let Some(ix) = highlight {
             scroll.scroll_to_item(ix);
         }
-        Self { options, selected, nav, typeahead: Typeahead::new(), focus: cx.focus_handle(), scroll, min_width }
+        Self {
+            options,
+            selected,
+            nav,
+            typeahead: Typeahead::new(),
+            focus: cx.focus_handle(),
+            scroll,
+            min_width,
+            gesture,
+        }
+    }
+
+    /// A primary release `over` part of the window at `at`: ends the
+    /// opening gesture, if any, and picks, stays or closes ([`menu_release`]).
+    fn release(&mut self, over: ReleaseOver, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let gesture = self.gesture.take().map(|press| moved_off(press, at));
+        match menu_release(gesture, over) {
+            MenuRelease::Pick(ix) => {
+                if !self.options[ix].disabled {
+                    cx.emit(MenuEvent::Picked(ix));
+                }
+            }
+            MenuRelease::Close => cx.emit(DismissEvent),
+            MenuRelease::Stay => {}
+        }
     }
 
     /// Moves the highlight with `step` and scrolls it into view.
@@ -707,7 +819,14 @@ impl Render for SelectMenu {
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                 set_modality(window, Modality::Pointer, cx)
                             })
-                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(MenuEvent::Picked(ix))))
+                            // A release picks, wherever the press came
+                            // (the trigger's included: one gesture).
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                                    this.release(ReleaseOver::Option(ix), event.position, cx)
+                                }),
+                            )
                     })
                     .child(div().flex_1().min_w_0().truncate().child(option.label.clone()))
                     .when(selected == Some(ix), |d| {
@@ -729,6 +848,16 @@ impl Render for SelectMenu {
             .on_action(cx.listener(Self::last))
             .on_action(cx.listener(Self::confirm))
             .on_key_down(cx.listener(Self::key_down))
+            // A press in the menu starts anew: the opening press is over.
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.gesture = None))
+            // A release outside the menu, the trigger included. The layer
+            // blocks the pointer out there, so nothing beneath sees it.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.release(ReleaseOver::Outside, event.position, cx)
+                }),
+            )
             .child(
                 div()
                     .id("ui-select-menu")
@@ -843,26 +972,113 @@ mod tests {
         assert_eq!(typed_key("a", Some("ab"), none, false), TypedKey::Ignore);
     }
 
-    /// The trigger acts on mouse clicks and key-downs; the keyboard click
-    /// that follows a key-down does nothing, so a pick on enter doesn't
-    /// reopen the menu.
+    /// The trigger acts on a press and on key-downs (it has no click
+    /// handler, so gpui's keyboard click on key-up never reaches it).
     #[test]
-    fn the_trigger_ignores_keyboard_clicks() {
+    fn the_trigger_opens_on_a_press_or_a_key() {
         use TriggerAction::{Close, Open, Stay};
-        for pressed_open in [false, true] {
-            for open in [false, true] {
-                assert_eq!(trigger_activation(open, Activation::KeyboardClick, pressed_open), Stay);
+        assert_eq!(trigger_activation(false, Activation::Press), Open);
+        assert_eq!(trigger_activation(false, Activation::Key), Open);
+        assert_eq!(trigger_activation(true, Activation::Key), Close);
+        // The open menu's layer blocks presses on the trigger; one that
+        // got through does nothing.
+        assert_eq!(trigger_activation(true, Activation::Press), Stay);
+    }
+
+    /// Radix's 10px: a release that moved no further than that, in both
+    /// axes, ends the opening press where it began.
+    #[test]
+    fn a_release_moved_off_past_ten_pixels() {
+        let at = |x: f32, y: f32| Point { x: px(x), y: px(y) };
+        assert!(!moved_off(at(100., 100.), at(100., 100.)));
+        assert!(!moved_off(at(100., 100.), at(110., 90.)));
+        assert!(moved_off(at(100., 100.), at(111., 100.)));
+        assert!(moved_off(at(100., 100.), at(100., 89.)));
+    }
+
+    /// The pointer table, Radix's: one gesture (press on the trigger, drag
+    /// onto an option, release) picks; released within 10px of the press,
+    /// the menu stays, over the trigger or anywhere; moved further and
+    /// released outside the menu (the trigger included), it closes. A later
+    /// click in an open menu picks an option and does nothing else.
+    #[test]
+    fn menu_releases_follow_radix() {
+        use MenuRelease::{Close, Pick, Stay};
+        use ReleaseOver::{Menu, Option, Outside};
+        // The opening press, released without moving: nothing, wherever
+        // (the trigger it was pressed on is outside the menu).
+        for over in [Option(2), Menu, Outside] {
+            assert_eq!(menu_release(Some(false), over), Stay, "{over:?}");
+        }
+        // Dragged, then released: over the trigger is outside too.
+        assert_eq!(menu_release(Some(true), Option(2)), Pick(2));
+        assert_eq!(menu_release(Some(true), Menu), Stay);
+        assert_eq!(menu_release(Some(true), Outside), Close);
+        // Any other release: an option picks, nothing else acts.
+        assert_eq!(menu_release(None, Option(0)), Pick(0));
+        for over in [Menu, Outside] {
+            assert_eq!(menu_release(None, over), Stay, "{over:?}");
+        }
+    }
+
+    /// What a key press does on the closed trigger, the way gpui gets there:
+    /// the crate's bindings in `contexts` (the trigger's `UiList` last) pick
+    /// the list action [`closed_trigger_key`] answers, and an unbound key
+    /// goes to the trigger's `on_key_down` ([`typed_key`]: a bare space
+    /// activates on key-down, anything else typed is typeahead, which the
+    /// table's keys never are).
+    fn on_closed_trigger(contexts: &[&str], key: &str, key_char: Option<&str>) -> TriggerAction {
+        use crate::actions::default_bindings;
+        use gpui::{Action, KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(default_bindings());
+        let contexts: Vec<KeyContext> = contexts.iter().map(|c| KeyContext::parse(c).unwrap()).collect();
+        let press = Keystroke { modifiers: Modifiers::default(), key: key.into(), key_char: key_char.map(Into::into) };
+        let (bindings, pending) = keymap.bindings_for_input(&[press], &contexts);
+        assert!(!pending, "{key} starts a longer binding");
+        if let Some(binding) = bindings.first() {
+            let action = binding.action();
+            let keys: [(&dyn Action, ListKey); 5] = [
+                (&ListUp, ListKey::Up),
+                (&ListDown, ListKey::Down),
+                (&ListFirst, ListKey::First),
+                (&ListLast, ListKey::Last),
+                (&ListConfirm, ListKey::Confirm),
+            ];
+            let Some((_, list_key)) = keys.iter().find(|(a, _)| action.partial_eq(*a)) else {
+                panic!("{key} is bound to {} on the trigger", action.name());
+            };
+            return closed_trigger_key(*list_key);
+        }
+        match typed_key(key, key_char, Modifiers::default(), false) {
+            TypedKey::Space => trigger_activation(false, Activation::Key),
+            TypedKey::Char(ch) => panic!("{key} types {ch:?}"),
+            TypedKey::Ignore => TriggerAction::Stay,
+        }
+    }
+
+    /// The closed trigger's keys, pinned to Radix's: enter, space, up and
+    /// down open the menu (on the selection, `initial_highlight`); left,
+    /// right, home and end do nothing. On its own and inside a dialog's
+    /// layer and focus scope, whose bindings must not take any of them.
+    #[test]
+    fn closed_trigger_keys_match_radix() {
+        use TriggerAction::{Open, Stay};
+        let table = [
+            ("enter", Some("\n"), Open),
+            ("space", Some(" "), Open),
+            ("space", None, Open),
+            ("up", None, Open),
+            ("down", None, Open),
+            ("left", None, Stay),
+            ("right", None, Stay),
+            ("home", None, Stay),
+            ("end", None, Stay),
+        ];
+        for contexts in [&["UiList"][..], &["UiLayer", "UiFocusScope", "UiList"]] {
+            for (key, key_char, expected) in table {
+                assert_eq!(on_closed_trigger(contexts, key, key_char), expected, "{key} ({key_char:?}) in {contexts:?}");
             }
         }
-        // A mouse click toggles, except one whose press closed the menu.
-        assert_eq!(trigger_activation(false, Activation::MouseClick, false), Open);
-        assert_eq!(trigger_activation(false, Activation::MouseClick, true), Stay);
-        assert_eq!(trigger_activation(true, Activation::MouseClick, false), Close);
-        // Enter or space on key-down opens, and a stale press record
-        // counts for nothing.
-        assert_eq!(trigger_activation(false, Activation::Key, false), Open);
-        assert_eq!(trigger_activation(false, Activation::Key, true), Open);
-        assert_eq!(trigger_activation(true, Activation::Key, false), Close);
     }
 
     #[test]
