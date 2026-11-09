@@ -105,7 +105,10 @@ rule, not a convenience.
       `disabled` (half opacity, skipped, asks nothing) and `closable`: a
       ghost `IconXs` close button shown on the active trigger and on a
       hovered one, whose press asks to close and doesn't activate; a middle
-      press on a closable trigger asks to close it too. `trigger_width`
+      press on a closable trigger asks to close it too. With
+      `on_context_menu`, a secondary press on an enabled trigger asks for
+      its menu (`TabContextMenu`: the index and the press, for
+      `ContextMenu::open_on_press`) and goes no further. `trigger_width`
       (`TabWidth::new(min, max)`) lets triggers shrink to the minimum and
       grow with their label to the maximum, cutting it with an ellipsis.
       With `on_move`, a trigger dragged onto another of the same list
@@ -481,6 +484,16 @@ needs:
   trigger does nothing on a middle press; a browser's tab strip closes on
   the middle release (`auxclick`). Reason: tab strips close on a middle
   click, and Brindle's strip has always done it on the press.
+- **A secondary press asks for the trigger's menu** (an addition): with
+  `on_context_menu`, a secondary press on an enabled trigger tells the owner
+  which trigger and hands it the press, moves no focus and goes no further
+  (an ancestor's secondary press, such as a strip's window menu, doesn't
+  run); without the handler it bubbles on as before. It neither activates
+  the trigger nor opens a menu itself: the owner does both, typically
+  activating the trigger and opening a `ContextMenu` on the press. Radix's
+  Tabs have no menu; one would wrap the trigger in a `ContextMenu.Trigger`.
+  Reason: a tab strip's tabs have a menu (rename, move, close), and the list
+  draws the triggers, so it is the only place that can hear the press.
 - **Adornments and a tooltip** (additions): a leading element (an icon),
   trailing adornments (status and bell dots) and a tooltip on the trigger and
   on its close button. Radix's trigger takes any children, so the slots are

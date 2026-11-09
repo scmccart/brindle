@@ -29,7 +29,7 @@ use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
     ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
     MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
-    Switch, TabActivate, TabList, TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Toggle, ToggleSize,
+    Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Toggle, ToggleSize,
     ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
@@ -292,7 +292,7 @@ pub struct Gallery {
     /// The tab lists' tabs and active indices, by list name.
     tabs: HashMap<&'static str, TabsDemo>,
     /// What the tab lists asked for, in order: `list:activate:N:pointer`,
-    /// `list:close:N`, `list:move:A->B`.
+    /// `list:close:N`, `list:move:A->B`, `list:menu:N`.
     tab_log: Vec<String>,
     /// Each corner popover's panel bounds while it is open.
     corners: [Rc<Cell<Option<Bounds<Pixels>>>>; 4],
@@ -1066,6 +1066,18 @@ impl Gallery {
         list.trigger_width(demo_tab_width())
             .on_close(cx.listener(move |this, ix: &usize, _, cx| this.close_tab(name, *ix, cx)))
             .on_move(cx.listener(move |this, request: &TabMove, _, cx| this.move_tab(name, request, cx)))
+            .on_context_menu(cx.listener(move |this, request: &TabContextMenu, window, cx| {
+                this.tab_menu(name, request, window, cx)
+            }))
+    }
+
+    /// A secondary press on a tab of `name`: the tab menu opens at the
+    /// pointer, in the shared context menu (the gallery's demo menu is a tab
+    /// menu already). The tab isn't activated, as a strip may choose to.
+    fn tab_menu(&mut self, name: &str, request: &TabContextMenu, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_log.push(format!("{name}:menu:{}", request.index));
+        self.context_menu.update(cx, |menu, cx| menu.open_on_press(&request.event, context_entries(), window, cx));
+        cx.notify();
     }
 
     /// The tab lists in each variant: the pill and line ones as shadcn's,
@@ -2365,6 +2377,8 @@ mod check {
         c.run_check("tabs-close-button-closes-without-activating", check).await;
         let check = tabs_middle_click(&mut c).await;
         c.run_check("tabs-middle-press-asks-to-close-a-closable-trigger", check).await;
+        let check = tabs_context_menu(&mut c).await;
+        c.run_check("tabs-secondary-press-asks-for-the-trigger-menu", check).await;
         let check = tabs_drag(&mut c).await;
         let check = pointer_away_after(&mut c, check).await;
         c.run_check("tabs-drag-first-onto-third-moves-it-with-a-drop-bar", check).await;
@@ -4349,6 +4363,41 @@ mod check {
         ensure!(tab_log(c)?.len() == before + 1, "a middle press on a trigger that doesn't close asked for something");
         ensure!(tabs_of(c, "line")?.tabs.len() == 4, "a middle press closed a trigger that doesn't close");
         ensure!(c.focused_name("toggle")?, "the middle press on the line list moved focus");
+        Ok(())
+    }
+
+    /// A secondary press on a trigger of a list with `on_context_menu` asks
+    /// its owner for that trigger's menu, which the gallery opens at the
+    /// pointer: nothing is activated or closed, the release within 10px
+    /// leaves the menu open, and escape gives focus back. On a list without
+    /// the handler the press asks for nothing.
+    async fn tabs_context_menu(c: &mut Checker) -> Check {
+        set_tab_active(c, "attached", 0).await?;
+        let at = center(trigger(c, "attached", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["attached:menu:2"], "the secondary press made the owner hear {:?}", &log[before..]);
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the secondary press opened no menu");
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not the pointer's {at:?}",
+            bounds.origin
+        );
+        c.button_up(MouseButton::Right, at).await?;
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the release of the opening press closed the menu");
+        ensure!(tab_active(c, "attached")? == 0, "the secondary press activated a trigger");
+        c.key("escape").await?;
+        ensure!(open_menu(c, Which::Context)?.is_none(), "escape left the menu open");
+        ensure!(c.focused_name("toggle")?, "escape didn't give focus back to the toggle");
+        let at = center(trigger(c, "line", 0).await?);
+        c.button_down(MouseButton::Right, at).await?;
+        c.button_up(MouseButton::Right, at).await?;
+        ensure!(tab_log(c)?.len() == before + 1, "a secondary press on a list without a menu asked for something");
+        ensure!(open_menu(c, Which::Context)?.is_none(), "a secondary press on a list without a menu opened one");
         Ok(())
     }
 

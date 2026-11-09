@@ -27,6 +27,8 @@
 //!   shown on the active trigger and on a hovered one, whose click asks the
 //!   owner to close the trigger and doesn't activate it;
 //! - a middle press on a closable trigger asks the owner to close it;
+//! - with `on_context_menu`, a secondary press on an enabled trigger asks
+//!   the owner for its menu ([`TabContextMenu`]) and goes no further;
 //! - leading and trailing adornments (an icon, status dots), and a tooltip
 //!   on the trigger and on its close button;
 //! - a minimum and maximum width ([`TabWidth`]) with the label cut by an
@@ -138,6 +140,41 @@ pub struct TabActivate {
 pub struct TabMove {
     pub from: usize,
     pub to: usize,
+}
+
+/// A secondary press on the trigger at `index`: the owner is asked for its
+/// menu. `event` is the press, for a [`ContextMenu`] opened on it
+/// ([`ContextMenu::open_on_press`]), whose release ends the gesture.
+///
+/// [`ContextMenu`]: crate::components::context_menu::ContextMenu
+/// [`ContextMenu::open_on_press`]: crate::components::context_menu::ContextMenu::open_on_press
+#[derive(Clone, Debug)]
+pub struct TabContextMenu {
+    pub index: usize,
+    pub event: MouseDownEvent,
+}
+
+/// What a press of `button` on a trigger asks of its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerPress {
+    Activate,
+    Close,
+    ContextMenu,
+}
+
+/// What a press of `button` on a trigger does: a primary press activates
+/// an enabled trigger, a middle press closes a closable one (`closes`: it
+/// is closable, enabled and the list has `on_close`), and a secondary
+/// press asks for an enabled trigger's menu when the list has
+/// `on_context_menu` (`has_menu`). `None`: the press bubbles on, as on a
+/// disabled trigger.
+pub fn trigger_press(button: MouseButton, disabled: bool, closes: bool, has_menu: bool) -> Option<TriggerPress> {
+    match button {
+        MouseButton::Left if !disabled => Some(TriggerPress::Activate),
+        MouseButton::Middle if closes => Some(TriggerPress::Close),
+        MouseButton::Right if !disabled && has_menu => Some(TriggerPress::ContextMenu),
+        _ => None,
+    }
 }
 
 /// What a dragged trigger carries, and its preview while dragging: the
@@ -269,6 +306,7 @@ impl TooltipFor for TabTrigger {
 type ActivateHandler = Rc<dyn Fn(&TabActivate, &mut Window, &mut App) + 'static>;
 type CloseHandler = Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
 type MoveHandler = Rc<dyn Fn(&TabMove, &mut Window, &mut App) + 'static>;
+type MenuHandler = Rc<dyn Fn(&TabContextMenu, &mut Window, &mut App) + 'static>;
 type BoundsHandler = Box<dyn Fn(&[Bounds<Pixels>], &mut Window, &mut App) + 'static>;
 
 /// A tab list. Build it with [`TabList::new`], give it its triggers, the
@@ -285,6 +323,7 @@ pub struct TabList {
     on_activate: Option<ActivateHandler>,
     on_close: Option<CloseHandler>,
     on_move: Option<MoveHandler>,
+    on_context_menu: Option<MenuHandler>,
     on_bounds: Option<BoundsHandler>,
     style: StyleRefinement,
 }
@@ -303,6 +342,7 @@ impl TabList {
             on_activate: None,
             on_close: None,
             on_move: None,
+            on_context_menu: None,
             on_bounds: None,
             style: StyleRefinement::default(),
         }
@@ -365,6 +405,19 @@ impl TabList {
         self
     }
 
+    /// Asked for a trigger's menu, on a secondary press on an enabled
+    /// trigger ([`TabContextMenu`]). The press goes no further and moves
+    /// focus nowhere, so an ancestor's own secondary press (a window menu)
+    /// doesn't run; the owner opens the menu, typically a [`ContextMenu`]
+    /// with `open_on_press`, and decides whether to activate the trigger
+    /// first. Without a handler a secondary press bubbles on.
+    ///
+    /// [`ContextMenu`]: crate::components::context_menu::ContextMenu
+    pub fn on_context_menu(mut self, handler: impl Fn(&TabContextMenu, &mut Window, &mut App) + 'static) -> Self {
+        self.on_context_menu = Some(Rc::new(handler));
+        self
+    }
+
     /// Told where each trigger was laid out, in window coordinates and in
     /// trigger order, on every frame (during prepaint, so it must not
     /// notify): for placing something beside a trigger, a menu say.
@@ -391,6 +444,7 @@ struct ListContext {
     on_activate: Option<ActivateHandler>,
     on_close: Option<CloseHandler>,
     on_move: Option<MoveHandler>,
+    on_context_menu: Option<MenuHandler>,
 }
 
 /// The group a trigger's close button looks to for the hover that shows it.
@@ -413,6 +467,7 @@ impl RenderOnce for TabList {
             on_activate: self.on_activate.clone(),
             on_close: self.on_close,
             on_move: self.on_move,
+            on_context_menu: self.on_context_menu,
         };
         let enabled: Rc<[bool]> = self.triggers.iter().map(|trigger| !trigger.disabled).collect();
         let triggers: Vec<AnyElement> = self
@@ -476,6 +531,7 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
     let on_activate = list.on_activate.clone().filter(|_| !disabled);
     let on_close = list.on_close.clone().filter(|_| trigger.closable && !disabled);
     let on_move = list.on_move.clone().filter(|_| !disabled);
+    let on_context_menu = list.on_context_menu.clone().filter(|_| !disabled);
     let closes = on_close.is_some();
     let border_width = if style.border.is_some() { px(1.) } else { px(0.) };
 
@@ -541,8 +597,8 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         .on_any_mouse_down(move |event: &MouseDownEvent, window, cx| {
             // No press on a trigger moves focus; the owner decides.
             window.prevent_default();
-            match event.button {
-                MouseButton::Left if !disabled => {
+            match trigger_press(event.button, disabled, closes, on_context_menu.is_some()) {
+                Some(TriggerPress::Activate) => {
                     // It goes no further: a tab strip's own press (a window
                     // move) mustn't start under a tab.
                     cx.stop_propagation();
@@ -551,13 +607,22 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
                         on_activate(&TabActivate { index: ix, by: Modality::Pointer }, window, cx);
                     }
                 }
-                MouseButton::Middle => {
+                Some(TriggerPress::Close) => {
                     if let Some(on_close) = &on_close {
                         cx.stop_propagation();
                         on_close(&ix, window, cx);
                     }
                 }
-                _ => {}
+                Some(TriggerPress::ContextMenu) => {
+                    // It goes no further: a tab strip's own secondary press
+                    // (the window menu) mustn't open under a tab.
+                    cx.stop_propagation();
+                    set_modality(window, Modality::Pointer, cx);
+                    if let Some(on_context_menu) = &on_context_menu {
+                        on_context_menu(&TabContextMenu { index: ix, event: event.clone() }, window, cx);
+                    }
+                }
+                None => {}
             }
         })
         .when_some(style.top_line, |d, line| {
@@ -749,6 +814,32 @@ mod tests {
                 assert!(tab_key(key, Modifiers::default()).is_some());
             }
         }
+    }
+
+    /// What each button does on a trigger: primary activates an enabled
+    /// one, middle closes a closable one, secondary asks for the menu of an
+    /// enabled one when the owner has `on_context_menu`, and anything else
+    /// (a disabled trigger's press, a secondary press with no handler, the
+    /// navigation buttons) bubbles on.
+    #[test]
+    fn presses_by_button() {
+        use MouseButton::*;
+        assert_eq!(trigger_press(Left, false, false, false), Some(TriggerPress::Activate));
+        assert_eq!(trigger_press(Left, true, false, true), None);
+        assert_eq!(trigger_press(Middle, false, true, true), Some(TriggerPress::Close));
+        assert_eq!(trigger_press(Middle, false, false, true), None);
+        assert_eq!(trigger_press(Right, false, true, true), Some(TriggerPress::ContextMenu));
+        assert_eq!(trigger_press(Right, false, true, false), None);
+        assert_eq!(trigger_press(Right, true, false, true), None);
+        assert_eq!(trigger_press(Navigate(gpui::NavigationDirection::Back), false, true, true), None);
+    }
+
+    #[test]
+    fn the_list_keeps_its_menu_handler() {
+        let list = TabList::new("tabs").child(TabTrigger::new(("tab", 0usize), "bash"));
+        assert!(list.on_context_menu.is_none());
+        let list = list.on_context_menu(|_, _, _| {});
+        assert!(list.on_context_menu.is_some());
     }
 
     #[test]

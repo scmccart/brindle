@@ -49,11 +49,11 @@
 
 ## 8. Context menus on tabs and zone headers
 
-- [ ] 8.1 Add hidden actions `OpenTabMenu` and `OpenZoneMenu` to the `ACTIONS` table (config names, no palette label, no default key); verify `--list-actions` lists them and the actions test passes
-- [ ] 8.2 Add the `context_menu` overlay slot to `Workspace`, a right-press hook on `TabTrigger` (it has none yet; a right press now only bubbles) and the handler on it (activate, open at the pointer, stop propagation so the window menu doesn't open), the local and tmux item lists, item dispatch through `window.dispatch_action` after refocusing the tab, and Move Left/Right disabled at the ends; verify unit tests of the item builder (local, tmux, first and last tab)
-- [ ] 8.3 Add the zone header right-press handler and menu (Split Right/Down disabled via `can_split_zone` for the axis, Close Zone); verify a unit test of the item builder and the focus-zone-first behaviour
-- [ ] 8.4 Print an open menu in `--dump-screen-after` (`--- menu items=… highlighted=N`, `--- focus menu`) and document it in CLAUDE.md's verification section; verify with e2e cases `tab-menu` and `zone-menu` that drive `--action open_tab_menu`, `--key down`, `--key enter` and check: items, disabled ends, Move Tab Left reorders, Rename Tab opens the prompt, Escape restores focus to the terminal, a tmux tab offers Rename Window and Close Tab ends the tmux window
-- [ ] 8.5 Add "right-click opens the tab and zone menus, a hover shows a tooltip, on Linux and on Windows" to CLAUDE.md's manual-check list and mention the tab menu in README.md; verify both files show the lines
+- [x] 8.1 Add hidden actions `OpenTabMenu` and `OpenZoneMenu` to the `ACTIONS` table (config names, no palette label, no default key); verify `--list-actions` lists them and the actions test passes
+- [x] 8.2 Add the `context_menu` overlay slot to `Workspace`, a right-press hook on `TabTrigger` (it has none yet; a right press now only bubbles) and the handler on it (activate, open at the pointer, stop propagation so the window menu doesn't open), the local and tmux item lists, item dispatch through `window.dispatch_action` after refocusing the tab, and Move Left/Right disabled at the ends; verify unit tests of the item builder (local, tmux, first and last tab)
+- [x] 8.3 Add the zone header right-press handler and menu (Split Right/Down disabled via `can_split_zone` for the axis, Close Zone); verify a unit test of the item builder and e2e cases of the menu's items acting on the zone it was opened for (focus-zone-first on a real right-press has no harness here, since a secondary press can't be posted on Linux and gpui's test support isn't enabled; it is a manual check in 11.4)
+- [x] 8.4 Print an open menu in `--dump-screen-after` (`--- menu items=… highlighted=N`, `--- focus menu`) and document it in CLAUDE.md's verification section; verify with e2e cases `tab-menu` and `zone-menu` that drive `--action open_tab_menu`, `--key down`, `--key enter` and check: items, disabled ends, Move Tab Left reorders, Rename Tab opens the prompt, Escape restores focus to the terminal, a tmux tab offers Rename Window and Close Tab ends the tmux window
+- [x] 8.5 Add "right-click opens the tab and zone menus, a hover shows a tooltip, on Linux and on Windows" to CLAUDE.md's manual-check list and mention the tab menu in README.md; verify both files show the lines
 
 ## 9. Zone headers and dividers
 
@@ -71,7 +71,7 @@
 - [ ] 11.1 Run `cargo test --workspace`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (both tmux versions via the CI matrix if available); verify all pass
 - [ ] 11.2 Compare `latency-shell` and `latency-tmux` before and after (`BRINDLE_PERF_BASELINE`, asking before opening windows on `:0`); verify no regression beyond noise
 - [ ] 11.3 On Windows, run the `win` e2e cases and check by hand that a tab and the new-tab button respond, empty strip space drags, the caption buttons and Snap Layouts work, and right-click on a tab opens the tab menu and not the system menu; verify each by observation
-- [ ] 11.4 Hand the user the manual checks via `scripts/run-throwaway`: tab drag-reorder, the `⌄` profile menu and ctrl-shift-space palette, right-click menus on a tab and a zone header, tooltips on strip, header and find bar buttons, keyboard walk of the strip, a profile theme differing from the global one; verify with their report
+- [ ] 11.4 Hand the user the manual checks via `scripts/run-throwaway`: tab drag-reorder, the `⌄` profile menu and ctrl-shift-space palette, right-click menus on a tab and a zone header (a right-click on a background tab activates it, and on an unfocused zone's header focuses that zone first, before the menu acts on it; a right-click on a tab doesn't also open the window menu), tooltips on strip, header and find bar buttons, keyboard walk of the strip, a profile theme differing from the global one; verify with their report
 
 ## Workflow follow-up
 

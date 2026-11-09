@@ -29,10 +29,12 @@ mod settings;
 mod shell;
 mod status;
 mod styles;
+mod tab_menu;
 mod tabs;
 mod titles;
 mod tmux;
 mod windows;
+mod zone_menu;
 mod zones;
 
 use crate::capture::Cells;
@@ -186,6 +188,13 @@ fn unix() -> Vec<Case> {
         display("profile-menu-pick", profile_menu::pick),
         display("profile-menu-shown", profile_menu::shown),
         display("profile-menu-palette-exclusive", profile_menu::palette_exclusive),
+        display("tab-menu-items", tab_menu::items),
+        display("tab-menu-choose", tab_menu::choose),
+        display("tab-menu-exclusive", tab_menu::exclusive),
+        display("tab-menu-tmux", tab_menu::tmux),
+        display("zone-menu-items", zone_menu::items),
+        display("zone-menu-choose", zone_menu::choose),
+        display("zone-menu-too-small", zone_menu::too_small),
         display("local-server-session", local_server::session),
         display("local-server-close", local_server::close),
         display("local-server-quit", local_server::quit),

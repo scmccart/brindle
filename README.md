@@ -439,6 +439,7 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-p | command palette (every command, with its shortcut) |
 | ctrl-shift-space | new tab with a profile (a list you can filter by typing) |
 | the strip's `⌄` | profile menu (see below) |
+| right-click a tab / a zone header | tab menu / zone menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
 | ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
 | shift-pageup/down, shift-home/end | scrollback |
@@ -456,10 +457,21 @@ Choosing a control-mode profile whose session the window already shows switches
 to that tab instead (the menu says "open in this window"), just as the
 ctrl-shift-space list does; that list is the one to use to filter by name.
 
-Two actions have no default key, for working without a mouse: bind
-`open_profile_menu` to open the profile menu below `⌄`, and `focus_tab_strip`
-to put keyboard focus on the tab strip, where left/right (wrapping), home and
-end switch tabs and enter or escape go back to the terminal.
+Right-clicking a tab makes it the active tab and opens its menu at the pointer:
+Rename Tab (Rename Window on a tmux window's tab), Move Tab Left, Move Tab
+Right (each disabled at its end of the strip) and Close Tab, which on a tmux tab
+closes that tmux window. Right-clicking a zone header focuses that zone and
+opens its menu: Split Zone Right, Split Zone Down (each disabled where the zone
+is too small to split) and Close Zone. Each item shows its key and does what
+the key does; the menus take the profile menu's keys.
+
+Four actions have no default key, for working without a mouse: bind
+`open_profile_menu` to open the profile menu below `⌄`, `open_tab_menu` to open
+the active tab's menu below it, `open_zone_menu` to open the active zone's menu
+below its header (at the top-left of a tab with one zone, which has no header),
+and `focus_tab_strip` to put keyboard focus on the tab strip, where left/right
+(wrapping), home and end switch tabs and enter or escape go back to the
+terminal.
 
 The settings dialog has three sections: General, Profiles and Theme. The section
 list is the dialog's first Tab stop (shift-tab from where the dialog opens):

@@ -1,6 +1,7 @@
 //! A Brindle window: the tab strip (which doubles as the title bar), the
 //! active tab's content, and the palettes.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,8 +10,9 @@ use futures::channel::oneshot;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels, Point,
+    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Bounds, Context, CursorStyle, Decorations, Entity,
+    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
@@ -22,9 +24,9 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem, Modality,
-    Overlay as UiOverlay, TabActivate, TabList, TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Tooltip,
-    TooltipFor as _, button_style,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
+    Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabVariant, TabWidth,
+    TextInput, Tooltip, TooltipFor as _, button_style,
 };
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
@@ -38,7 +40,7 @@ use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
-use crate::zone_view::ZoneTreeView;
+use crate::zone_view::{ZoneMenuRequest, ZoneTreeView};
 
 const TAB_BAR_HEIGHT: f32 = 38.0;
 const RESIZE_BORDER: f32 = 6.0;
@@ -361,6 +363,16 @@ pub struct Workspace {
     /// since they say which sessions the window shows.
     profile_menu: Entity<DropdownMenu>,
     _profile_menu_subscription: Subscription,
+    /// The tab and zone header menus' slot, the fourth overlay (one of the
+    /// four is open at most). It opens on the tab or zone it is for, which
+    /// is active and focused by then, so its items run their actions there.
+    context_menu: Entity<ContextMenu>,
+    /// The open context menu's entries and what its items run.
+    context_menu_items: Option<ActionMenu>,
+    _context_menu_subscription: Subscription,
+    /// Where the strip's tabs were laid out in the last frame, in window
+    /// coordinates, for placing a tab menu opened from a key.
+    tab_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// A theme being previewed by the settings dialog, shown on the tabs
     /// that follow the global theme.
     theme_preview: Option<Theme>,
@@ -407,6 +419,12 @@ impl Workspace {
             let MenuEvent::Selected(ix) = *event;
             this.open_profile(ix, window, cx);
         });
+        let context_menu = cx.new(|_| ContextMenu::new());
+        let context_menu_subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, event: &MenuEvent, window, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                this.context_menu_selected(ix, window, cx);
+            });
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
@@ -417,6 +435,10 @@ impl Workspace {
             _settings_subscriptions: Vec::new(),
             profile_menu,
             _profile_menu_subscription: profile_menu_subscription,
+            context_menu,
+            context_menu_items: None,
+            _context_menu_subscription: context_menu_subscription,
+            tab_bounds: Rc::default(),
             theme_preview: None,
             profile_preview: None,
             focus_handle,
@@ -1225,9 +1247,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Subscription> {
-        vec![cx.subscribe_in(view, window, |this, view, event, window, cx| {
-            this.on_zone_tree_event(view, event, window, cx)
-        })]
+        vec![
+            cx.subscribe_in(view, window, |this, view, event, window, cx| this.on_zone_tree_event(view, event, window, cx)),
+            cx.subscribe_in(view, window, |this, view, request: &ZoneMenuRequest, window, cx| {
+                this.open_zone_menu(view, request, window, cx)
+            }),
+        ]
+    }
+
+    /// A zone asked for its header menu (it has focus by now). The menu
+    /// opens only in the active tab, whose zones are the ones shown.
+    fn open_zone_menu(
+        &mut self,
+        view: &Entity<ZoneTreeView>,
+        request: &ZoneMenuRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = matches!(self.tabs.get(self.active).map(|t| &t.content), Some(TabContent::Zones(v)) if v == view);
+        if !shown {
+            return;
+        }
+        let menu = ActionMenu::new(request.rows.clone(), |action| tab_shortcut(action, false, cx));
+        self.open_context_menu(menu, request.at, request.press.as_ref(), window, cx);
     }
 
     fn on_zone_tree_event(
@@ -1563,6 +1605,70 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `OpenTabMenu`: the active tab's menu, below its face in the strip
+    /// (below the strip's start before the strip was first drawn).
+    fn open_tab_menu(&mut self, _: &OpenTabMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let face = self.tab_bounds.borrow().get(self.active).copied();
+        let at = face.map_or_else(|| point(px(0.), px(TAB_BAR_HEIGHT)), |face| face.bottom_left());
+        self.open_tab_menu_at(self.active, at, None, window, cx);
+    }
+
+    /// Tab `ix`'s menu, at `at` (window coordinates), from the secondary
+    /// `press` on its face when one asked. The tab becomes the active one
+    /// and its terminal takes focus first, so the items, which run the tab
+    /// actions, act on it.
+    fn open_tab_menu_at(
+        &mut self,
+        ix: usize,
+        at: Point<Pixels>,
+        press: Option<&MouseDownEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.select(ix, cx);
+        let is_tmux = self.tabs[ix].is_tmux();
+        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, self.tabs.len()), |action| tab_shortcut(action, is_tmux, cx));
+        self.open_context_menu(menu, at, press, window, cx);
+    }
+
+    /// Opens `menu` in the context menu slot at `at`, or at the pointer of
+    /// `press`, replacing any overlay. Focus goes to the active tab first:
+    /// the menu gives it back there on closing, and a chosen item's action
+    /// runs from there.
+    fn open_context_menu(
+        &mut self,
+        menu: ActionMenu,
+        at: Point<Pixels>,
+        press: Option<&MouseDownEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_overlay(window, cx);
+        self.focus_active_tab(window, cx);
+        let entries = menu.entries.clone();
+        self.context_menu_items = Some(menu);
+        self.context_menu.update(cx, |context_menu, cx| match press {
+            Some(event) => context_menu.open_on_press(event, entries, window, cx),
+            None => context_menu.open(at, entries, window, cx),
+        });
+        cx.notify();
+    }
+
+    /// An item of the tab or zone menu was chosen. The menu has closed and
+    /// given focus back to the tab; its action runs from there, exactly as
+    /// its keybinding would (as the command palette runs one).
+    fn context_menu_selected(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.context_menu_items.take().and_then(|menu| menu.action(ix).map(|a| a.boxed_clone())) else {
+            return;
+        };
+        self.focus_active_tab(window, cx);
+        cx.notify();
+        window.dispatch_action(action, cx);
+    }
+
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_palette_toggling(|k| matches!(k, PaletteKind::Commands { .. }), window, cx) {
             return;
@@ -1844,9 +1950,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Whether a palette, the settings dialog or the profile menu is open.
+    /// Whether a palette, the settings dialog, the profile menu or a tab or
+    /// zone menu is open.
     fn has_overlay(&self, cx: &App) -> bool {
-        self.palette.is_open() || self.settings.is_open() || self.profile_menu.read(cx).is_open()
+        self.palette.is_open()
+            || self.settings.is_open()
+            || self.profile_menu.read(cx).is_open()
+            || self.context_menu.read(cx).is_open()
+    }
+
+    /// The open menu: the profile menu, or a tab or zone menu.
+    fn open_menu(&self, cx: &App) -> Option<Entity<brindle_ui::Menu>> {
+        self.profile_menu.read(cx).menu().or_else(|| self.context_menu.read(cx).menu()).cloned()
     }
 
     /// Closes whatever overlay is open and gives focus back to the tab.
@@ -1867,6 +1982,7 @@ impl Workspace {
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
+        self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.end_previews(cx);
     }
 
@@ -2083,7 +2199,7 @@ impl Workspace {
         if let Some(dialog) = self.settings.view() {
             out.push_str(&dialog.read(cx).describe(window, cx));
         }
-        if let Some(menu) = self.profile_menu.read(cx).menu() {
+        if let Some(menu) = self.open_menu(cx) {
             let menu = menu.read(cx);
             out.push_str(&describe_menu(menu.entries(), menu.highlighted()));
         }
@@ -2098,7 +2214,7 @@ impl Workspace {
     /// active tab's active terminal), `palette` (inside an open palette),
     /// `settings stop=NAME` (inside the settings dialog, on the control
     /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
-    /// menu, such as the profile menu), `none`, or
+    /// menu: the profile menu, or a tab or zone menu), `none`, or
     /// `other`; then the window's `modality=keyboard|pointer`, which
     /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
@@ -2113,12 +2229,7 @@ impl Workspace {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
         } else if self.strip_focus.is_focused(window) {
             "tabs".to_string()
-        } else if self
-            .profile_menu
-            .read(cx)
-            .menu()
-            .is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx))
-        {
+        } else if self.open_menu(cx).is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx)) {
             "menu".to_string()
         } else if window.focused(cx).is_none() {
             "none".to_string()
@@ -2209,6 +2320,21 @@ impl Workspace {
             .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
             .on_close(cx.listener(|this, ix: &usize, window, cx| this.close_tab_at(*ix, window, cx)))
             .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_tab_to(request.from, request.to, cx)))
+            // A right-click on a tab opens its menu at the pointer; the press
+            // goes no further, so the strip's window menu doesn't open too.
+            // (On Windows a tab isn't a caption area: only the empty
+            // `caption` element is, so the system menu doesn't open either.)
+            .on_context_menu(cx.listener(|this, request: &TabContextMenu, window, cx| {
+                this.open_tab_menu_at(request.index, request.event.position, Some(&request.event), window, cx)
+            }))
+            .on_trigger_bounds({
+                let tab_bounds = self.tab_bounds.clone();
+                move |bounds, _, _| {
+                    let mut recorded = tab_bounds.borrow_mut();
+                    recorded.clear();
+                    recorded.extend_from_slice(bounds);
+                }
+            })
             .flex_shrink()
             .min_w_0()
             .overflow_hidden();
@@ -2502,6 +2628,50 @@ fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
         .collect()
 }
 
+/// The menu of tab `ix` of `count`: Rename Tab (a tmux tab's is tmux's
+/// Rename Window, shown as "Rename Window"), Move Tab Left (disabled on the
+/// first tab), Move Tab Right (disabled on the last), a separator and Close
+/// Tab, which on a tmux tab closes that tmux window.
+fn tab_menu_rows(is_tmux: bool, ix: usize, count: usize) -> Vec<ActionRow> {
+    let rename = if is_tmux { ActionRow::item(TmuxRenameWindow, true) } else { ActionRow::item(RenameTab, true) };
+    vec![
+        rename,
+        ActionRow::item(MoveTabLeft, ix > 0),
+        ActionRow::item(MoveTabRight, ix + 1 < count),
+        ActionRow::Separator,
+        ActionRow::item(CloseTab, true),
+    ]
+}
+
+/// The keys that run `action` in a terminal of a local or tmux tab, as the
+/// keymap resolves them in that terminal's contexts (`Workspace`, then
+/// `ZoneTree` or `TmuxWindow`, then `Terminal`, where user bindings go).
+/// Unlike [`shortcut`] it needs no drawn frame, so a background tab that a
+/// right-click just activated shows its keys.
+fn tab_shortcut(action: &dyn Action, is_tmux: bool, cx: &App) -> Option<SharedString> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    tab_keys(&keymap, action, is_tmux)
+}
+
+/// [`tab_shortcut`] in `keymap`.
+fn tab_keys(keymap: &gpui::Keymap, action: &dyn Action, is_tmux: bool) -> Option<SharedString> {
+    let contexts: Vec<gpui::KeyContext> = ["Workspace", if is_tmux { "TmuxWindow" } else { "ZoneTree" }, "Terminal"]
+        .into_iter()
+        .filter_map(|name| gpui::KeyContext::parse(name).ok())
+        .collect();
+    keymap
+        .bindings_for_action(action)
+        .rev()
+        .find(|binding| {
+            // The binding counts only when its keys reach it there, rather
+            // than another binding of the same keys.
+            let (found, _) = keymap.bindings_for_input(binding.keystrokes(), &contexts);
+            found.first().is_some_and(|first| first.action().partial_eq(binding.action()))
+        })
+        .map(keys_text)
+}
+
 /// The strip's `⌄` button, as the profile menu's trigger builds it each
 /// frame: a ghost icon button with no `on_click` (the dropdown takes the
 /// press) and no focus handle (a press moves focus nowhere), whose tooltip
@@ -2678,6 +2848,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::move_tab_left))
                     .on_action(cx.listener(Self::move_tab_right))
                     .on_action(cx.listener(Self::rename_tab))
+                    .on_action(cx.listener(Self::open_tab_menu))
                     .on_action(cx.listener(Self::focus_tab_strip))
                     .on_action(cx.listener(Self::close_window))
                     .on_action(cx.listener(Self::attach_session))
@@ -2735,7 +2906,9 @@ impl Render for Workspace {
             // (one of the two is open at most; the profile menu is drawn
             // deferred from the strip, and only while neither is open).
             .children(self.palette.render(window, cx))
-            .children(self.settings.render(window, cx));
+            .children(self.settings.render(window, cx))
+            // The tab and zone menus: drawn deferred, taking no room here.
+            .child(self.context_menu.clone());
 
         // With client-side decorations we draw a transparent margin around the
         // window for the shadow and the resize handles.
@@ -2989,6 +3162,56 @@ mod tests {
             "--- menu items=Shell|[Off]|-|tmux highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\ntmux\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|tmux highlighted=3\n"));
+    }
+
+    /// The first line `--- menu` prints for the menu of tab `ix` of `count`,
+    /// with the default keys.
+    fn tab_menu_line(is_tmux: bool, ix: usize, count: usize) -> String {
+        let keymap = gpui::Keymap::new(default_bindings());
+        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, count), |action| tab_keys(&keymap, action, is_tmux));
+        describe_menu(&menu.entries, None)
+    }
+
+    /// The spec's tab menu: Move Tab Left disabled on the first tab, Move
+    /// Tab Right on the last (both on a lone tab), a tmux tab's Rename
+    /// Window in place of Rename Tab, and each item's default key. The menu
+    /// of the third of four tabs has both moves enabled.
+    #[test]
+    fn tab_menu_items() {
+        assert_eq!(
+            tab_menu_line(false, 0, 3),
+            "--- menu items=Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab highlighted=none\n\
+             Rename Tab\nMove Tab Left  [ctrl-shift-pageup]\nMove Tab Right  [ctrl-shift-pagedown]\n\
+             Close Tab  [ctrl-shift-w]\n"
+        );
+        assert!(tab_menu_line(false, 2, 4).starts_with("--- menu items=Rename Tab|Move Tab Left|Move Tab Right|-|Close Tab "));
+        assert!(tab_menu_line(false, 2, 3).starts_with("--- menu items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "));
+        assert!(
+            tab_menu_line(false, 0, 1).starts_with("--- menu items=Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab ")
+        );
+        assert!(tab_menu_line(true, 1, 3).starts_with("--- menu items=Rename Window|Move Tab Left|Move Tab Right|-|Close Tab "));
+        let tmux = ActionMenu::new(tab_menu_rows(true, 0, 2), |_| None);
+        assert!(tmux.action(0).is_some_and(|a| a.partial_eq(&TmuxRenameWindow)));
+        assert!(tmux.action(1).is_none(), "Move Tab Left on the first tab runs nothing");
+        assert!(tmux.action(4).is_some_and(|a| a.partial_eq(&CloseTab)));
+    }
+
+    /// A tab menu's keys come from the keymap for the tab's own contexts,
+    /// so a binding in the `Terminal` context (where user bindings go) shows,
+    /// a binding only another context has doesn't, and a key that a later
+    /// binding takes for something else isn't shown for the earlier one.
+    #[test]
+    fn tab_menu_keys_follow_the_tab_contexts() {
+        let mut bindings = default_bindings();
+        bindings.push(gpui::KeyBinding::new("f2", RenameTab, Some("Terminal")));
+        bindings.push(gpui::KeyBinding::new("f3", TmuxRenameWindow, Some("TmuxWindow")));
+        bindings.push(gpui::KeyBinding::new("ctrl-shift-w", Swallow, Some("Terminal")));
+        let keymap = gpui::Keymap::new(bindings);
+        assert_eq!(tab_keys(&keymap, &RenameTab, false), Some("f2".into()));
+        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, true), Some("f3".into()));
+        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, false), None);
+        assert_eq!(tab_keys(&keymap, &CloseTab, false), None);
+        assert_eq!(tab_keys(&keymap, &MoveTabLeft, true), Some("ctrl-shift-pageup".into()));
     }
 
     #[test]
