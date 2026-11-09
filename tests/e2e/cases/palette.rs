@@ -4,10 +4,12 @@
 //! cases press real keys through gpui's keymap: dismissal and focus
 //! return, the one-overlay rule with the settings dialog, Tab staying in
 //! the palette, wrapping, home and end in the filter, and a prompt reached
-//! from the list.
+//! from the list. `palette-fits-window` checks the panel's size in window
+//! captures.
 
 use super::server;
-use crate::brindle::{Input, Output, Run, matches_tmux};
+use crate::brindle::{Input, Output, Run, matches_tmux, state_dir, theme};
+use crate::capture::Image;
 use crate::{Ctx, Outcome, Result, ensure};
 
 /// "tmux: Split Right" from the palette splits the active pane, and focus
@@ -209,6 +211,86 @@ pub fn prompt_focus(ctx: &Ctx) -> Result<Outcome> {
     expect_focus(&out, "terminal", "after submitting")?;
     let name = server.run(&["display-message", "-p", "-t", "e2e", "#{window_name}"])?;
     ensure!(name.trim() == "renamed", "window name {name:?}");
+    Ok(Outcome::Pass)
+}
+
+// ---- the panel's size, in window captures ----
+
+/// The command list's cap (300 px) under the filter row (36 px), inside
+/// the panel's 1 px border, with a few pixels to spare.
+const PANEL_MAX_HEIGHT: f32 = 345.0;
+
+/// The rows of `image` that hold a horizontal run of the `border` token at
+/// least `min_run` pixels long: the panel's top and bottom edges and the
+/// line under its filter. Nothing else in the window is drawn in that
+/// colour at that length; the tab strip's border is dimmed by the backdrop.
+fn border_rows(image: &Image, min_run: u32) -> Vec<u32> {
+    (0..image.height)
+        .filter(|&y| {
+            let (mut run, mut longest) = (0, 0);
+            for x in 0..image.width {
+                run = if image.pixel(x, y).near(theme::CHROME_BORDER, 6) { run + 1 } else { 0 };
+                longest = longest.max(run);
+            }
+            longest >= min_run
+        })
+        .collect()
+}
+
+/// The open command palette's panel lies inside the window, well short of
+/// its height, and at most as tall as the capped list and the filter: its
+/// top and bottom edges are both in the capture, with the filter's line
+/// between them. `size` is the window's expected logical size, checked
+/// first, so a restore that didn't apply can't pass as another size.
+fn expect_panel_fits(out: &Output, size: Option<(f32, f32)>) -> Result {
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = out.dump.grid()?.scale;
+    let (width, height) = (image.width as f32 / scale, image.height as f32 / scale);
+    if let Some((want_w, want_h)) = size {
+        ensure!(
+            (width - want_w).abs() <= 30.0 && (height - want_h).abs() <= 30.0,
+            "window is {width}x{height}, want about {want_w}x{want_h}"
+        );
+    }
+    // The dialog is 32rem wide, or the window less 1rem on each side; the
+    // run along its top or bottom edge stops short of its rounded corners.
+    let panel_width = (width - 32.0).min(512.0);
+    let rows = border_rows(image, (panel_width * 0.85 * scale) as u32);
+    ensure!(rows.len() >= 2, "{width}x{height}: panel edges at rows {rows:?}, want its top and bottom in the window");
+    let (top, bottom) = (rows[0], rows[rows.len() - 1]);
+    ensure!(top > 0 && bottom + 1 < image.height, "{width}x{height}: panel rows {top}..={bottom} reach the window's edge");
+    let extent = (bottom - top) as f32 / scale;
+    ensure!(
+        extent <= PANEL_MAX_HEIGHT && extent <= height * 0.85,
+        "{width}x{height}: the panel is {extent} px tall (rows {top}..={bottom}), want at most {PANEL_MAX_HEIGHT} and 85% of the window"
+    );
+    // Not every command fits under the cap, so the list is at it.
+    ensure!(extent >= 300.0, "{width}x{height}: the panel is only {extent} px tall, want the list at its 300 px cap");
+    Ok(())
+}
+
+/// The command palette, which lists more commands than its 300 px list
+/// shows, stays inside the window: at the default size and in a smaller
+/// window (restored at 560x440), its panel is the filter and the capped
+/// list, centred, not stretched past the window's top and bottom by every
+/// row's height.
+pub fn fits_window(ctx: &Ctx) -> Result<Outcome> {
+    let server = server()?;
+    fn open(run: Run<'_>) -> Run<'_> {
+        run.action("open_command_palette").capture_at(step_time(1) + 1.5).dump_at(step_time(1) + 2.0)
+    }
+    let normal = open(Run::new(ctx, &server, "normal").profile("Shell")).run()?;
+    expect_panel_fits(&normal, None)?;
+
+    let dir = state_dir(ctx);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let state = format!(
+        "version = 1\n\n[[windows]]\nwidth = 560.0\nheight = 440.0\nactive = 0\n\n[[windows.tabs]]\nkind = \"local\"\nprofile = \"Shell\"\ncwd = \"{}\"\n",
+        ctx.dir.display()
+    );
+    std::fs::write(dir.join("session.toml"), state).map_err(|e| e.to_string())?;
+    let small = open(Run::new(ctx, &server, "small").restore().default_profile("Shell")).run()?;
+    expect_panel_fits(&small, Some((560.0, 440.0)))?;
     Ok(Outcome::Pass)
 }
 

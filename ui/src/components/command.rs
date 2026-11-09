@@ -576,11 +576,21 @@ impl Render for Command {
         // CommandList: max-h-[300px] overflow-y-auto. Each row carries its
         // group's p-1 (`render_row`). The list sizes itself to its rows up
         // to the cap.
+        //
+        // The cap is also on a plain wrapper: gpui's list is a scroll
+        // container, and taffy counts a scroll container at its uncapped
+        // content height when it sizes a column from its content
+        // (`determine_container_main_size`), so with the cap on the list
+        // alone a long list stretched whatever holds it (a dialog) to every
+        // row's height, far past the window. A wrapper that doesn't scroll
+        // contributes its capped height.
         let rows = (!empty).then(|| {
-            list(self.list.clone(), cx.processor(Self::render_row))
-                .w_full()
-                .with_sizing_behavior(ListSizingBehavior::Infer)
-                .max_h(COMMAND_LIST_MAX_HEIGHT)
+            div().flex().flex_col().w_full().max_h(COMMAND_LIST_MAX_HEIGHT).child(
+                list(self.list.clone(), cx.processor(Self::render_row))
+                    .w_full()
+                    .with_sizing_behavior(ListSizingBehavior::Infer)
+                    .max_h(COMMAND_LIST_MAX_HEIGHT),
+            )
         });
 
         // Command: bg-popover text-popover-foreground flex flex-col

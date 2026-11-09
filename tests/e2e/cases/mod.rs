@@ -171,6 +171,7 @@ fn unix() -> Vec<Case> {
         display("palette-wrap", palette::wrap),
         display("palette-home-end", palette::home_end),
         display("palette-prompt-focus", palette::prompt_focus),
+        display("palette-fits-window", palette::fits_window),
         display("commands-break-pane", commands::break_pane),
         display("commands-layouts", commands::layouts),
         display("commands-rotate-swap", commands::rotate_swap),
