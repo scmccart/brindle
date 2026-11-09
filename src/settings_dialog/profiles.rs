@@ -271,11 +271,8 @@ pub struct ProfileEditor {
     return_to: usize,
     initial: Values,
     values: Values,
-    pub focused: Field,
     /// "Follow global" (`None`), then every theme by name.
     pub theme_choices: Vec<Option<String>>,
-    /// The choice list that is open under its field.
-    pub open_choice: Option<Field>,
 }
 
 impl ProfileEditor {
@@ -302,9 +299,7 @@ impl ProfileEditor {
             return_to,
             initial: values.clone(),
             values,
-            focused: Field::Name,
             theme_choices,
-            open_choice: None,
         }
     }
 
@@ -351,61 +346,70 @@ impl ProfileEditor {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn remote_kind(&self) -> RemoteKind {
         self.values.remote
     }
 
+    #[cfg(test)]
     pub fn engine(&self) -> &str {
         &self.values.engine
     }
 
     pub fn choose_remote(&mut self, kind: RemoteKind) {
         self.values.remote = kind;
-        // A hidden field can't keep focus.
-        if !self.visible_fields().contains(&self.focused) {
-            self.focused = Field::Remote;
-        }
     }
 
-    pub fn choose_engine(&mut self, engine: &str) {
-        self.values.engine = engine.to_string();
-    }
-
-    pub fn move_focus(&mut self, forward: bool) {
-        let visible = self.visible_fields();
-        let ix = visible.iter().position(|f| *f == self.focused).unwrap_or(0);
-        let n = visible.len();
-        self.focused = visible[if forward { (ix + 1) % n } else { (ix + n - 1) % n }];
-    }
-
-    /// left/right on a choice field.
-    pub fn cycle(&mut self, field: Field, forward: bool) {
-        fn step<T: PartialEq + Clone>(items: &[T], current: &T, forward: bool) -> T {
-            let ix = items.iter().position(|i| i == current).unwrap_or(0);
-            let n = items.len();
-            items[if forward { (ix + 1) % n } else { (ix + n - 1) % n }].clone()
-        }
+    /// How many options choice field `field` has (0 for other fields).
+    #[cfg(test)]
+    pub fn choice_count(&self, field: Field) -> usize {
         match field {
-            Field::Theme => self.values.theme = step(&self.theme_choices, &self.values.theme, forward),
-            Field::Tmux => self.values.tmux = step(&TMUX_MODES, &self.values.tmux, forward),
+            Field::Theme => self.theme_choices.len(),
+            Field::Tmux => TMUX_MODES.len(),
+            Field::Remote => REMOTE_KINDS.len(),
+            Field::Engine => ENGINES.len(),
+            _ => 0,
+        }
+    }
+
+    /// The option choice field `field` shows, as an index into its options
+    /// (`theme_choices`, [`TMUX_MODES`], [`REMOTE_KINDS`], [`ENGINES`]).
+    pub fn choice_index(&self, field: Field) -> Option<usize> {
+        match field {
+            Field::Theme => self.theme_choices.iter().position(|t| *t == self.values.theme),
+            Field::Tmux => TMUX_MODES.iter().position(|m| *m == self.values.tmux),
+            Field::Remote => REMOTE_KINDS.iter().position(|k| *k == self.values.remote),
+            Field::Engine => ENGINES.iter().position(|e| *e == self.values.engine),
+            _ => None,
+        }
+    }
+
+    /// Chooses option `ix` of choice field `field`, as its select does. An
+    /// index out of range changes nothing.
+    pub fn choose(&mut self, field: Field, ix: usize) {
+        match field {
+            Field::Theme => {
+                if let Some(theme) = self.theme_choices.get(ix) {
+                    self.values.theme = theme.clone();
+                }
+            }
+            Field::Tmux => {
+                if let Some(&mode) = TMUX_MODES.get(ix) {
+                    self.values.tmux = mode;
+                }
+            }
             Field::Remote => {
-                let kind = step(&REMOTE_KINDS, &self.values.remote, forward);
-                self.choose_remote(kind);
+                if let Some(&kind) = REMOTE_KINDS.get(ix) {
+                    self.choose_remote(kind);
+                }
             }
             Field::Engine => {
-                let engines = ENGINES.map(str::to_string);
-                self.values.engine = step(&engines, &self.values.engine, forward);
+                if let Some(engine) = ENGINES.get(ix) {
+                    self.values.engine = engine.to_string();
+                }
             }
             _ => {}
         }
-    }
-
-    pub fn choose_theme(&mut self, theme: Option<String>) {
-        self.values.theme = theme;
-    }
-
-    pub fn choose_tmux(&mut self, mode: TmuxMode) {
-        self.values.tmux = mode;
     }
 
     pub fn toggle_default(&mut self) {
@@ -648,8 +652,8 @@ impl ProfilesState {
                 let n = self.entries.len();
                 self.selected = if forward { (self.selected + 1) % n } else { (self.selected + n - 1) % n };
             }
-            Mode::Editor(editor) => editor.move_focus(forward),
-            Mode::ConfirmDelete => {}
+            // The editor's fields are focus stops: the view moves focus.
+            Mode::Editor(_) | Mode::ConfirmDelete => {}
         }
     }
 
@@ -813,8 +817,9 @@ impl ProfilesState {
         Ok(Done::Written)
     }
 
-    /// Debug description for `--dump-screen-after`.
-    pub fn describe(&self, error: &Option<String>) -> String {
+    /// Debug description for `--dump-screen-after`. `field` names the
+    /// focused control, reported as the editor's `field=`.
+    pub fn describe(&self, error: &Option<String>, field: &str) -> String {
         let section = "Profiles";
         match &self.mode {
             Mode::List => format!(
@@ -832,7 +837,7 @@ impl ProfilesState {
                 format!(
                     "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} tmux={:?} default={} invalid={:?} can_save={} error={:?}\n",
                     editor.text(Field::Name),
-                    editor.focused.label(),
+                    field,
                     editor.theme().unwrap_or("follow global"),
                     tmux_label(editor.tmux()),
                     editor.is_default(),
@@ -853,88 +858,123 @@ impl ProfilesState {
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AppContext as _, Context, Focusable as _, Hsla, InteractiveElement, IntoElement,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
-use super::{Section, SettingsDialog};
+use super::{Btn, Choice, Section, SettingsDialog};
 use crate::actions::{
-    SettingsChoiceNext, SettingsChoicePrev, SettingsDuplicate, SettingsMoveDown, SettingsMoveUp, SettingsSectionNext,
-    SettingsSectionPrev, SettingsToggle,
+    SettingsDuplicate, SettingsMoveDown, SettingsMoveUp, SettingsSectionFirst, SettingsSectionLast, SettingsSectionNext,
+    SettingsSectionPrev,
 };
-use brindle_ui::{TextInput, TextInputEvent};
+use brindle_ui::{ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, TextInput, TextInputEvent};
 
-/// The fields shown as a choice or checkbox rather than text.
-const CHOICE_FIELDS: [Field; 5] = [Field::Theme, Field::Tmux, Field::Default, Field::Remote, Field::Engine];
+/// The fields shown as a select rather than text.
+const SELECT_FIELDS: [Field; 4] = [Field::Theme, Field::Tmux, Field::Remote, Field::Engine];
 
 impl SettingsDialog {
-    /// Creates the profile editor's inputs and focus handles when it opens,
-    /// drops them when it closes, and focuses the model's field.
+    /// Creates the profile editor's inputs and selects when it opens and
+    /// drops them when it closes. Focus follows in `place_focus`.
     pub(super) fn sync_profile_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editing = self.model.section() == Section::Profiles && self.model.profiles.editor().is_some();
         if !editing {
-            if !self.profile_inputs.is_empty() {
-                self.profile_inputs.clear();
-                self.choice_handles.clear();
-                self._field_subscriptions.clear();
-                window.focus(&self.focus_handle);
+            // A dropped select would leave an open menu's layer behind.
+            for (_, select) in std::mem::take(&mut self.profile_selects) {
+                select.update(cx, |s, cx| s.close(window, cx));
             }
+            self.profile_inputs.clear();
+            self._profile_subscriptions.clear();
             return;
         }
-        if self.profile_inputs.is_empty() {
-            let editor = self.model.profiles.editor().expect("editing").clone();
-            for field in TEXT_FIELDS {
-                let text = editor.text(field).to_string();
-                let input = cx.new(|cx| TextInput::new(&text, cx).with_placeholder(field.placeholder()).tab_stop());
-                let changed = cx.subscribe_in(&input, window, move |this, input, _: &TextInputEvent, _, cx| {
-                    let text = input.read(cx).text().to_string();
-                    if let Some(editor) = this.model.profiles.editor_mut() {
-                        editor.set_text(field, &text);
-                    }
-                    this.model.error = None;
-                    this.preview(cx);
-                    cx.notify();
-                });
-                self._field_subscriptions.push(changed);
-                self.profile_inputs.push((field, input));
-            }
-            self.choice_handles = CHOICE_FIELDS.iter().map(|&f| (f, cx.focus_handle().tab_stop(true))).collect();
+        if !self.profile_inputs.is_empty() {
+            return;
         }
-        let Some(focused) = self.model.profiles.editor().map(|e| e.focused) else { return };
-        let handle = self
-            .profile_inputs
-            .iter()
-            .find(|(f, _)| *f == focused)
-            .map(|(_, i)| i.focus_handle(cx))
-            .or_else(|| self.choice_handles.iter().find(|(f, _)| *f == focused).map(|(_, h)| h.clone()));
-        if let Some(handle) = handle
-            && !handle.is_focused(window)
-        {
-            window.focus(&handle);
+        let editor = self.model.profiles.editor().expect("editing").clone();
+        for field in TEXT_FIELDS {
+            let text = editor.text(field).to_string();
+            let input = cx.new(|cx| TextInput::new(&text, cx).with_placeholder(field.placeholder()));
+            let changed = cx.subscribe_in(&input, window, move |this, input, _: &TextInputEvent, _, cx| {
+                let text = input.read(cx).text().to_string();
+                if let Some(editor) = this.model.profiles.editor_mut() {
+                    editor.set_text(field, &text);
+                }
+                this.model.error = None;
+                this.preview(cx);
+                cx.notify();
+            });
+            self._profile_subscriptions.push(changed);
+            self.profile_inputs.push((field, input));
         }
-    }
-
-    /// Tells the model which profile field has focus after tab or a click.
-    pub(super) fn sync_profile_focus_from_window(&mut self, window: &Window, cx: &gpui::App) {
-        let inputs = self.profile_inputs.iter().map(|(f, i)| (*f, i.read(cx).is_focused(window)));
-        let choices = self.choice_handles.iter().map(|(f, h)| (*f, h.is_focused(window)));
-        let focused = inputs.chain(choices).find(|(_, focused)| *focused).map(|(f, _)| f);
-        if let Some(field) = focused
-            && let Some(editor) = self.model.profiles.editor_mut()
-            && editor.focused != field
-        {
-            editor.focused = field;
-            self.scroll_to_profile_field(field);
+        for field in SELECT_FIELDS {
+            let labels = self.choice_labels(&editor, field);
+            let selected = editor.choice_index(field);
+            let select = cx.new(|cx| Select::new(labels, selected, cx));
+            let changed = cx.subscribe_in(&select, window, move |this, _, event: &SelectEvent, window, cx| {
+                let SelectEvent::Changed(ix) = *event;
+                this.apply_choice(Choice::Profile(field), ix, window, cx);
+            });
+            self._profile_subscriptions.push(changed);
+            self.profile_selects.push((field, select));
         }
     }
 
-    pub(super) fn scroll_to_profile_field(&self, field: Field) {
-        if let Some(editor) = self.model.profiles.editor() {
-            // The name sits above the scrolling body.
-            let rows = editor.visible_fields();
-            if let Some(ix) = rows.iter().position(|f| *f == field).filter(|ix| *ix > 0) {
-                self.profile_editor_scroll.scroll_to_item(ix - 1);
+    /// The options of select field `field`, in the editor's order.
+    fn choice_labels(&self, editor: &ProfileEditor, field: Field) -> Vec<SharedString> {
+        match field {
+            Field::Theme => {
+                let known = |name: &str| self.model.entries.iter().any(|e| e.theme.is_ok() && e.name == name);
+                editor
+                    .theme_choices
+                    .iter()
+                    .map(|theme| match theme {
+                        None => "follow global".into(),
+                        Some(name) if known(name) => name.clone().into(),
+                        Some(name) => format!("{name} (missing)").into(),
+                    })
+                    .collect()
             }
+            Field::Tmux => TMUX_MODES.iter().map(|&m| tmux_label(m).into()).collect(),
+            Field::Remote => REMOTE_KINDS.iter().map(|&k| remote_label(k).into()).collect(),
+            Field::Engine => ENGINES.iter().map(|&e| e.into()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn profile_input(&self, field: Field) -> Option<&Entity<TextInput>> {
+        self.profile_inputs.iter().find(|(f, _)| *f == field).map(|(_, i)| i)
+    }
+
+    fn profile_select(&self, field: Field) -> Option<&Entity<Select>> {
+        self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s)
+    }
+
+    /// The focus handle of a shown profile field, `None` for the default
+    /// checkbox while it can't be changed (it takes no focus then).
+    fn profile_field_handle(&self, editor: &ProfileEditor, field: Field, cx: &App) -> Option<FocusHandle> {
+        match field {
+            Field::Default => (!editor.default_locked()).then(|| self.default_handle.clone()),
+            f if SELECT_FIELDS.contains(&f) => self.profile_select(f).map(|s| s.focus_handle(cx)),
+            f => self.profile_input(f).map(|i| i.focus_handle(cx)),
+        }
+    }
+
+    /// The profile editor's field stops: its shown fields, in order.
+    pub(super) fn profile_field_stops(&self, cx: &App) -> Vec<FocusHandle> {
+        let Some(editor) = self.model.profiles.editor() else { return Vec::new() };
+        editor.visible_fields().into_iter().filter_map(|f| self.profile_field_handle(editor, f, cx)).collect()
+    }
+
+    /// Scrolls the profile editor's focused field into view.
+    pub(super) fn scroll_to_focused_profile_field(&self, window: &Window, cx: &App) {
+        let Some(editor) = self.model.profiles.editor() else { return };
+        // The name sits above the scrolling body.
+        let rows = editor.visible_fields();
+        let focused = rows.iter().position(|&f| {
+            self.profile_field_handle(editor, f, cx).is_some_and(|h| h.is_focused(window))
+                || (SELECT_FIELDS.contains(&f) && self.profile_select(f).is_some_and(|s| s.read(cx).is_open()))
+        });
+        if let Some(ix) = focused.filter(|ix| *ix > 0) {
+            self.profile_editor_scroll.scroll_to_item(ix - 1);
         }
     }
 
@@ -947,6 +987,16 @@ impl SettingsDialog {
 
     pub(super) fn section_prev(&mut self, _: &SettingsSectionPrev, window: &mut Window, cx: &mut Context<Self>) {
         self.model.next_section(false);
+        self.changed(window, cx);
+    }
+
+    pub(super) fn section_first(&mut self, _: &SettingsSectionFirst, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.edge_section(false);
+        self.changed(window, cx);
+    }
+
+    pub(super) fn section_last(&mut self, _: &SettingsSectionLast, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.edge_section(true);
         self.changed(window, cx);
     }
 
@@ -966,7 +1016,12 @@ impl SettingsDialog {
     }
 
     /// Runs `f` on the profile editor, then previews and redraws.
-    fn edit_profile(&mut self, window: &mut Window, cx: &mut Context<Self>, f: impl FnOnce(&mut ProfileEditor)) {
+    pub(super) fn edit_profile(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut ProfileEditor),
+    ) {
         if let Some(editor) = self.model.profiles.editor_mut() {
             f(editor);
             self.model.error = None;
@@ -974,40 +1029,22 @@ impl SettingsDialog {
         self.changed(window, cx);
     }
 
-    fn choice_next(&mut self, _: &SettingsChoiceNext, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_profile(window, cx, |e| e.cycle(e.focused, true));
-    }
-
-    fn choice_prev(&mut self, _: &SettingsChoicePrev, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_profile(window, cx, |e| e.cycle(e.focused, false));
-    }
-
-    /// Space: ticks the default checkbox, or opens or closes a choice list.
-    fn toggle(&mut self, _: &SettingsToggle, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_profile(window, cx, |e| match e.focused {
-            Field::Default => e.toggle_default(),
-            field => e.open_choice = if e.open_choice == Some(field) { None } else { Some(field) },
-        });
-    }
-
     // ---- rendering ----
 
-    pub(super) fn render_profiles(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_profiles(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.model.profiles.mode {
             Mode::Editor(editor) => {
                 let editor = editor.clone();
                 self.render_profile_editor(&editor, cx)
             }
-            _ => self.render_profile_list(cx),
+            _ => self.render_profile_list(window, cx),
         }
     }
 
-    fn render_profile_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let panel = t.chrome_background();
-        let accent = t.accent();
+    fn render_profile_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.ui_theme();
+        let fg = t.foreground;
+        let muted = t.muted_foreground;
         let state = &self.model.profiles;
         let default = state.default_index();
 
@@ -1030,8 +1067,8 @@ impl SettingsDialog {
                     .px_3()
                     .py_1p5()
                     .rounded_md()
-                    .when(selected, |d| d.bg(panel.mix(accent, 0.22).hsla()))
-                    .hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla()))
+                    .when(selected, |d| d.bg(t.accent))
+                    .when(!selected, |d| d.hover(|d| d.bg(t.accent.opacity(0.5))))
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         this.model.select(ix);
                         if e.click_count() >= 2 {
@@ -1060,66 +1097,48 @@ impl SettingsDialog {
                             )
                             .child(div().text_xs().text_color(muted).child(SharedString::from(detail))),
                     )
-                    .when(ix == default, |d| d.child(div().flex_none().text_xs().text_color(accent.hsla()).child("● default")))
+                    .when(ix == default, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● default")))
             })
             .collect::<Vec<_>>();
 
         let confirming = matches!(state.mode, Mode::ConfirmDelete);
-        let editable = state.read_only.is_none();
         let footer = if confirming {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().min_w_0().text_color(fg).child(SharedString::from(state.delete_question())))
-                .child(self.button("profile-delete-no", "Keep", false, true, cx, |this, window, cx| {
-                    this.model.cancel();
-                    this.changed(window, cx);
-                }))
-                .child(self.button("profile-delete-yes", "Delete (enter)", true, true, cx, |this, window, cx| {
-                    let outcome = this.model.confirm();
-                    this.outcome(outcome, window, cx);
-                }))
+            self.confirm_footer(state.delete_question(), cx)
         } else {
-            let selected_ok = state.selected_entry().is_some_and(|e| e.profile.is_ok());
+            let outline = ButtonVariant::Outline;
             div()
                 .flex()
                 .flex_wrap()
                 .items_center()
                 .gap_2()
-                .child(self.button("profile-new", "New (n)", false, editable, cx, |this, window, cx| {
+                .child(self.button(Btn::New, "New (n)", outline, cx, |this, window, cx| {
                     this.model.start_new();
                     this.changed(window, cx);
                 }))
-                .child(self.button("profile-duplicate", "Duplicate (c)", false, editable && selected_ok, cx, |this, window, cx| {
+                .child(self.button(Btn::Duplicate, "Duplicate (c)", outline, cx, |this, window, cx| {
                     this.model.start_duplicate();
                     this.changed(window, cx);
                 }))
-                .child(self.button("profile-edit", "Edit (e)", false, editable && selected_ok, cx, |this, window, cx| {
+                .child(self.button(Btn::Edit, "Edit (e)", outline, cx, |this, window, cx| {
                     this.model.start_edit();
                     this.changed(window, cx);
                 }))
-                .child(self.button("profile-delete", "Delete (d)", false, editable && state.entries.len() > 1, cx, |this, window, cx| {
+                .child(self.button(Btn::Delete, "Delete (d)", ButtonVariant::Destructive, cx, |this, window, cx| {
                     this.model.request_delete();
                     this.changed(window, cx);
                 }))
-                .child(self.button("profile-up", "↑", false, editable && state.selected > 0, cx, |this, window, cx| {
+                .child(self.button(Btn::Up, "↑", outline, cx, |this, window, cx| {
                     let outcome = this.model.move_profile(true);
                     this.outcome(outcome, window, cx);
                 }))
-                .child(self.button(
-                    "profile-down",
-                    "↓",
-                    false,
-                    editable && state.selected + 1 < state.entries.len(),
-                    cx,
-                    |this, window, cx| {
-                        let outcome = this.model.move_profile(false);
-                        this.outcome(outcome, window, cx);
-                    },
-                ))
+                .child(self.button(Btn::Down, "↓", outline, cx, |this, window, cx| {
+                    let outcome = this.model.move_profile(false);
+                    this.outcome(outcome, window, cx);
+                }))
                 .child(div().flex_1())
-                .child(self.button("profile-close", "Close", false, true, cx, |_, _, cx| cx.emit(super::SettingsEvent::Close)))
+                .child(self.button(Btn::Close, "Close", ButtonVariant::Default, cx, |_, _, cx| {
+                    cx.emit(gpui::DismissEvent)
+                }))
         };
 
         div()
@@ -1132,9 +1151,9 @@ impl SettingsDialog {
                 "ctrl-alt-N opens profile N; alt-up/alt-down reorder. Changes are saved as you make them.",
             ))
             .when_some(state.read_only.clone(), |d, e| {
-                d.child(div().text_xs().text_color(t.ansi[1].hsla()).child(SharedString::from(format!("Read-only: {e}"))))
+                d.child(div().text_xs().text_color(t.destructive).child(SharedString::from(format!("Read-only: {e}"))))
             })
-            .child(
+            .child(self.list_frame(
                 div()
                     .id("profile-list")
                     .flex()
@@ -1144,15 +1163,17 @@ impl SettingsDialog {
                     .overflow_y_scroll()
                     .track_scroll(&self.profile_list_scroll)
                     .children(rows),
-            )
+                window,
+                cx,
+            ))
             .child(footer)
             .into_any_element()
     }
 
     fn render_profile_editor(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let muted = t.muted_foreground().hsla();
-        let red: Hsla = t.ansi[1].hsla();
+        let t = *cx.ui_theme();
+        let muted = t.muted_foreground;
+        let red = t.destructive;
         let errors = match self.model.profiles.editor_result() {
             Some(Err(errors)) => errors,
             _ => Vec::new(),
@@ -1161,27 +1182,17 @@ impl SettingsDialog {
         let label = |text: &'static str| div().w(px(120.0)).flex_none().text_color(muted).child(text);
 
         let row = |this: &Self, field: Field, cx: &mut Context<Self>| -> AnyElement {
-            let focused = editor.focused == field;
             let error = error_for(field);
             let control: AnyElement = match field {
-                Field::Theme => this.render_theme_choice(editor, focused, cx),
-                Field::Tmux => this.render_tmux_choice(editor, focused, cx),
-                Field::Remote => this.render_remote_choice(editor, focused, cx),
-                Field::Engine => this.render_engine_choice(editor, focused, cx),
-                Field::Default => this.render_default_toggle(editor, focused, cx),
-                _ => {
-                    let input = this.profile_inputs.iter().find(|(f, _)| *f == field).map(|(_, i)| i.clone());
-                    this.field_box(focused, error.is_some())
-                        .id(field.label())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(e) = this.model.profiles.editor_mut() {
-                                e.focused = field;
-                            }
-                            this.changed(window, cx);
-                        }))
-                        .when_some(input, |d, input| d.child(input))
-                        .into_any_element()
+                f if SELECT_FIELDS.contains(&f) => {
+                    this.choice_slot(Choice::Profile(f)).flex_1().min_w_0().into_any_element()
                 }
+                Field::Default => this.render_default_toggle(editor, cx),
+                _ => div()
+                    .flex_1()
+                    .min_w_0()
+                    .children(this.profile_input(field).map(|input| Input::new(input).invalid(error.is_some())))
+                    .into_any_element(),
             };
             div()
                 .flex()
@@ -1202,14 +1213,13 @@ impl SettingsDialog {
             Some(name) => format!("Edit {name:?}"),
             None => "New profile".to_string(),
         };
-        let can_save = errors.is_empty();
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .gap_2()
-            .child(div().text_color(t.foreground.hsla()).child(SharedString::from(title)))
+            .child(div().text_color(t.foreground).child(SharedString::from(title)))
             .child(name_row)
             .child(
                 div()
@@ -1231,202 +1241,50 @@ impl SettingsDialog {
                     .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
                         "Theme and font size show on this profile's tabs now; the rest applies to new tabs.",
                     ))
-                    .child(self.button("profile-discard", "Discard", false, true, cx, |this, window, cx| {
-                        this.model.cancel();
-                        this.changed(window, cx);
-                    }))
-                    .child(self.button("profile-save", "Save", true, can_save, cx, |this, window, cx| {
-                        let outcome = this.model.confirm();
-                        this.outcome(outcome, window, cx);
-                    })),
+                    .child(self.editor_buttons(cx)),
             )
             .into_any_element()
     }
 
-    fn choice_handle(&self, field: Field) -> Option<gpui::FocusHandle> {
-        self.choice_handles.iter().find(|(f, _)| *f == field).map(|(_, h)| h.clone())
-    }
-
-    /// The focusable box around a choice or checkbox, with its keys.
-    fn choice_box(&self, field: Field, focused: bool, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        self.choice_frame(field.label(), focused, self.choice_handle(field).as_ref())
-            .on_action(cx.listener(Self::choice_next))
-            .on_action(cx.listener(Self::choice_prev))
-            .on_action(cx.listener(Self::toggle))
-    }
-
-    fn render_theme_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let muted = t.muted_foreground().hsla();
-        let panel = t.chrome_background();
-        let known = |theme: &Option<String>| {
-            self.model.entries.iter().any(|e| e.theme.is_ok() && Some(&e.name) == theme.as_ref())
-        };
-        let choice_label = |theme: &Option<String>| -> SharedString {
-            match theme {
-                None => "follow global".into(),
-                Some(name) if known(theme) => name.clone().into(),
-                Some(name) => format!("{name} (missing)").into(),
-            }
-        };
-        let current = editor.theme().map(str::to_string);
-        let open = editor.open_choice == Some(Field::Theme);
-        let boxed = self
-            .choice_box(Field::Theme, focused, cx)
-            .justify_between()
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.edit_profile(window, cx, |e| {
-                    e.focused = Field::Theme;
-                    e.open_choice = if e.open_choice == Some(Field::Theme) { None } else { Some(Field::Theme) };
-                });
-            }))
-            .child(choice_label(&current))
-            .child(div().text_xs().text_color(muted).child("‹ › ▾"));
-        let options = editor.theme_choices.iter().enumerate().map(|(ix, theme)| {
-            let selected = *theme == current;
-            let choice = theme.clone();
-            div()
-                .id(("theme-choice", ix))
-                .px_2()
-                .py_0p5()
-                .rounded_sm()
-                .when(selected, |d| d.bg(panel.mix(t.accent(), 0.22).hsla()))
-                .hover(|d| d.bg(panel.mix(t.foreground, 0.08).hsla()))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let choice = choice.clone();
-                    this.edit_profile(window, cx, |e| {
-                        e.choose_theme(choice);
-                        e.open_choice = None;
-                    });
-                }))
-                .child(choice_label(theme))
-        });
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .gap_1()
-            .child(boxed)
-            .when(open, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(t.chrome_border().hsla())
-                        .text_color(t.foreground.hsla())
-                        .children(options),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_tmux_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let panel = t.chrome_background();
-        let segments = TMUX_MODES.iter().map(|&mode| {
-            let selected = editor.tmux() == mode;
-            div()
-                .id(tmux_label(mode))
-                .px_3()
-                .rounded_sm()
-                .when(selected, |d| d.bg(panel.mix(t.accent(), 0.3).hsla()))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.edit_profile(window, cx, |e| {
-                        e.focused = Field::Tmux;
-                        e.choose_tmux(mode);
-                    });
-                }))
-                .child(tmux_label(mode))
-        })
-        .collect::<Vec<_>>();
-        self.choice_box(Field::Tmux, focused, cx).gap_1().children(segments).into_any_element()
-    }
-
-    fn render_remote_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let labels: Vec<&'static str> = REMOTE_KINDS.iter().map(|&k| remote_label(k)).collect();
-        let selected = REMOTE_KINDS.iter().position(|&k| k == editor.remote_kind()).unwrap_or(0);
-        self.segment_choice(Field::Remote, &labels, selected, focused, cx, |e, ix| e.choose_remote(REMOTE_KINDS[ix]))
-    }
-
-    fn render_engine_choice(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let selected = ENGINES.iter().position(|e| *e == editor.engine()).unwrap_or(0);
-        self.segment_choice(Field::Engine, &ENGINES, selected, focused, cx, |e, ix| e.choose_engine(ENGINES[ix]))
-    }
-
-    /// A row of labelled segments, one selected.
-    fn segment_choice(
-        &self,
-        field: Field,
-        labels: &[&'static str],
-        selected: usize,
-        focused: bool,
-        cx: &mut Context<Self>,
-        choose: fn(&mut ProfileEditor, usize),
-    ) -> AnyElement {
-        let t = &self.theme;
-        let panel = t.chrome_background();
-        let segments = labels
-            .iter()
-            .enumerate()
-            .map(|(ix, &label)| {
-                div()
-                    .id((field.label(), ix))
-                    .px_3()
-                    .rounded_sm()
-                    .when(ix == selected, |d| d.bg(panel.mix(t.accent(), 0.3).hsla()))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_profile(window, cx, |e| {
-                            e.focused = field;
-                            choose(e, ix);
-                        });
-                    }))
-                    .child(label)
-            })
-            .collect::<Vec<_>>();
-        self.choice_box(field, focused, cx).gap_1().children(segments).into_any_element()
-    }
-
-    /// A checkbox: a bordered square, filled with the accent and ticked when
-    /// checked, faded when it can't be changed.
-    fn checkbox(&self, checked: bool, enabled: bool) -> impl IntoElement {
-        let t = &self.theme;
-        let accent = t.accent();
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size(px(14.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(if checked { accent.hsla() } else { t.chrome_border().mix(t.foreground, 0.35).hsla() })
-            .when(checked, |d| d.bg(accent.hsla()))
-            .when(!enabled, |d| d.opacity(0.6))
-            .when(checked, |d| d.child(div().text_xs().line_height(px(12.0)).text_color(t.background.hsla()).child("✓")))
-    }
-
-    fn render_default_toggle(&self, editor: &ProfileEditor, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let t = &self.theme;
-        let muted = t.muted_foreground().hsla();
-        let note = if editor.default_locked() {
+    /// The default checkbox and its note. The current default can't be
+    /// unticked, so its checkbox is disabled.
+    fn render_default_toggle(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.ui_theme().muted_foreground;
+        let locked = editor.default_locked();
+        let note = if locked {
             "New tabs use this profile. Make another profile the default to change it."
         } else {
             "Use this profile for new tabs and windows"
         };
-        self.choice_box(Field::Default, focused, cx)
+        let toggle = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.edit_profile(window, cx, |e| e.toggle_default());
+        };
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
             .gap_2()
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.edit_profile(window, cx, |e| {
-                    e.focused = Field::Default;
-                    e.toggle_default();
-                });
-            }))
-            .child(self.checkbox(editor.is_default(), !editor.default_locked()))
-            .child(div().text_xs().text_color(muted).child(note))
+            .child(
+                Checkbox::new("profile-default", editor.is_default())
+                    .disabled(locked)
+                    .focus(&self.default_handle)
+                    .on_click(cx.listener(move |this, _: &bool, window, cx| toggle(this, window, cx))),
+            )
+            .child(
+                div()
+                    .id("profile-default-note")
+                    .text_xs()
+                    .text_color(muted)
+                    // The note is the checkbox's label: a click on it toggles too.
+                    .when(!locked, |d| {
+                        d.cursor_pointer().on_click(cx.listener(move |this, _, window, cx| {
+                            window.focus(&this.default_handle);
+                            toggle(this, window, cx)
+                        }))
+                    })
+                    .child(note),
+            )
             .into_any_element()
     }
 }
@@ -1521,7 +1379,7 @@ theme = "gone"
         assert_eq!(names(&state), ["Shell", "tmux", "Work"]);
         assert_eq!(state.default_index(), 2);
         assert_eq!(state.selected, 2);
-        assert!(state.describe(&None).contains("default=\"Work\""));
+        assert!(state.describe(&None, "").contains("default=\"Work\""));
     }
 
     #[test]
@@ -1613,22 +1471,24 @@ theme = "gone"
         let mut state = f.state();
         let editor = edit(&mut state, "Shell");
         assert!(!editor.visible_fields().contains(&Field::Session));
-        editor.cycle(Field::Tmux, true);
+        editor.choose(Field::Tmux, 1);
         assert_eq!(editor.tmux(), TmuxMode::Plain);
         assert!(editor.visible_fields().contains(&Field::Session));
         editor.set_text(Field::Session, "dev");
         // Hidden again, the values are kept but not saved.
-        editor.cycle(Field::Tmux, false);
+        editor.choose(Field::Tmux, 0);
         assert_eq!(editor.text(Field::Session), "dev");
-        editor.cycle(Field::Tmux, false);
+        editor.choose(Field::Tmux, 2);
         assert_eq!(editor.tmux(), TmuxMode::Control);
-        editor.focused = Field::TmuxArgs;
-        editor.move_focus(true);
-        assert_eq!(editor.focused, Field::Default);
-        editor.cycle(Field::Tmux, true);
-        editor.focused = Field::Tmux;
-        editor.move_focus(true);
-        assert_eq!(editor.focused, Field::Default);
+        // After the tmux arguments comes the default checkbox.
+        let visible = editor.visible_fields();
+        let at = visible.iter().position(|f| *f == Field::TmuxArgs).unwrap();
+        assert_eq!(visible[at + 1], Field::Default);
+        editor.choose(Field::Tmux, 0);
+        assert_eq!(editor.tmux(), TmuxMode::None);
+        let visible = editor.visible_fields();
+        let at = visible.iter().position(|f| *f == Field::Tmux).unwrap();
+        assert_eq!(visible[at + 1], Field::Default);
         state.save(&f.path, &[]).unwrap();
         let shell = f.config().profiles[0].clone();
         assert_eq!((shell.tmux, shell.tmux_session), (TmuxMode::None, None));
@@ -1641,7 +1501,7 @@ theme = "gone"
         let editor = edit(&mut state, "Work");
         assert_eq!(editor.remote_kind(), RemoteKind::Local);
         assert!(!editor.visible_fields().contains(&Field::SshHost));
-        editor.cycle(Field::Remote, true);
+        editor.choose(Field::Remote, 1);
         assert_eq!(editor.remote_kind(), RemoteKind::Ssh);
         assert!(editor.visible_fields().contains(&Field::SshHost));
         assert!(!editor.visible_fields().contains(&Field::Container));
@@ -1670,10 +1530,10 @@ theme = "gone"
         let f = Fixture::new("remote-container", CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
-        editor.cycle(Field::Remote, false);
+        editor.choose(Field::Remote, 2);
         assert_eq!(editor.remote_kind(), RemoteKind::Container);
         editor.set_text(Field::Container, "my-box");
-        editor.cycle(Field::Engine, true);
+        editor.choose(Field::Engine, 1);
         state.save(&f.path, &[]).unwrap();
         assert_eq!(
             f.config().profiles[2].remote,
@@ -1709,15 +1569,39 @@ theme = "gone"
         assert_eq!(invalid(&state), [Field::Container]);
     }
 
+    /// A select's index is the option the editor shows, and choosing an
+    /// index sets it.
     #[test]
-    fn hiding_the_target_fields_moves_focus_off_them() {
-        let f = Fixture::new("remote-focus", CONFIG);
+    fn choice_indexes() {
+        let f = Fixture::new("choices", CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
-        editor.choose_remote(RemoteKind::Ssh);
-        editor.focused = Field::SshHost;
-        editor.choose_remote(RemoteKind::Local);
-        assert_eq!(editor.focused, Field::Remote);
+        // Follow global, the three themes, then the missing `gone`.
+        assert_eq!(editor.choice_count(Field::Theme), 5);
+        assert_eq!(editor.choice_index(Field::Theme), Some(4));
+        editor.choose(Field::Theme, 0);
+        assert_eq!((editor.theme(), editor.choice_index(Field::Theme)), (None, Some(0)));
+        editor.choose(Field::Theme, 4);
+        assert_eq!(editor.theme(), Some("gone"));
+        editor.choose(Field::Theme, 2);
+        assert_eq!(editor.theme(), Some("tokyo-night"));
+        // Out of range changes nothing.
+        editor.choose(Field::Theme, 9);
+        assert_eq!(editor.theme(), Some("tokyo-night"));
+        for field in [Field::Tmux, Field::Remote, Field::Engine] {
+            assert_eq!(editor.choice_index(field), Some(0), "{field:?}");
+            for ix in 0..editor.choice_count(field) {
+                editor.choose(field, ix);
+                assert_eq!(editor.choice_index(field), Some(ix), "{field:?}");
+            }
+            editor.choose(field, 0);
+        }
+        // Choosing a remote kind shows its fields.
+        editor.choose(Field::Remote, 1);
+        assert_eq!(editor.remote_kind(), RemoteKind::Ssh);
+        assert!(editor.visible_fields().contains(&Field::SshHost));
+        // Text fields aren't choices.
+        assert_eq!((editor.choice_count(Field::Cwd), editor.choice_index(Field::Cwd)), (0, None));
     }
 
     #[test]
@@ -1726,7 +1610,8 @@ theme = "gone"
         let mut state = f.state();
         assert!(state.preview().is_none());
         let editor = edit(&mut state, "Shell");
-        editor.cycle(Field::Theme, true);
+        // Shell follows the global theme (option 0); option 1 is brindle-dark.
+        editor.choose(Field::Theme, 1);
         editor.set_text(Field::FontSize, "18");
         let (name, profile) = state.preview().unwrap();
         assert_eq!((name.as_str(), profile.theme.as_deref(), profile.font_size), ("Shell", Some("brindle-dark"), Some(18.0)));

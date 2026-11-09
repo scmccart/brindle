@@ -87,21 +87,19 @@ actions!(
         // Settings dialog.
         SettingsUp,
         SettingsDown,
+        SettingsFirst,
+        SettingsLast,
         SettingsConfirm,
-        SettingsCancel,
-        SettingsNextField,
-        SettingsPrevField,
         SettingsNew,
         SettingsEdit,
         SettingsDelete,
         SettingsSectionNext,
         SettingsSectionPrev,
+        SettingsSectionFirst,
+        SettingsSectionLast,
         SettingsDuplicate,
         SettingsMoveUp,
         SettingsMoveDown,
-        SettingsChoiceNext,
-        SettingsChoicePrev,
-        SettingsToggle,
     ]
 );
 
@@ -194,21 +192,31 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     // command palette, but `--action` and user bindings can reach them.
     ("settings_up", None, || Box::new(SettingsUp)),
     ("settings_down", None, || Box::new(SettingsDown)),
+    ("settings_first", None, || Box::new(SettingsFirst)),
+    ("settings_last", None, || Box::new(SettingsLast)),
     ("settings_confirm", None, || Box::new(SettingsConfirm)),
-    ("settings_cancel", None, || Box::new(SettingsCancel)),
-    ("settings_next_field", None, || Box::new(SettingsNextField)),
-    ("settings_prev_field", None, || Box::new(SettingsPrevField)),
+    // Escape and Tab in the dialog are the overlay's: a dismiss request
+    // (the dialog answers it as cancel) and its focus scope's stops.
+    ("settings_cancel", None, || Box::new(brindle_ui::Dismiss)),
+    ("settings_next_field", None, || Box::new(brindle_ui::FocusNext)),
+    ("settings_prev_field", None, || Box::new(brindle_ui::FocusPrev)),
     ("settings_new", None, || Box::new(SettingsNew)),
     ("settings_edit", None, || Box::new(SettingsEdit)),
     ("settings_delete", None, || Box::new(SettingsDelete)),
     ("settings_section_next", None, || Box::new(SettingsSectionNext)),
     ("settings_section_prev", None, || Box::new(SettingsSectionPrev)),
+    ("settings_section_first", None, || Box::new(SettingsSectionFirst)),
+    ("settings_section_last", None, || Box::new(SettingsSectionLast)),
     ("settings_duplicate", None, || Box::new(SettingsDuplicate)),
     ("settings_move_up", None, || Box::new(SettingsMoveUp)),
     ("settings_move_down", None, || Box::new(SettingsMoveDown)),
-    ("settings_choice_next", None, || Box::new(SettingsChoiceNext)),
-    ("settings_choice_prev", None, || Box::new(SettingsChoicePrev)),
-    ("settings_toggle", None, || Box::new(SettingsToggle)),
+    // A list's keys (a select's trigger and menu, the command list), for
+    // `--action`: a choice field changes only through its menu.
+    ("list_up", None, || Box::new(brindle_ui::ListUp)),
+    ("list_down", None, || Box::new(brindle_ui::ListDown)),
+    ("list_first", None, || Box::new(brindle_ui::ListFirst)),
+    ("list_last", None, || Box::new(brindle_ui::ListLast)),
+    ("list_confirm", None, || Box::new(brindle_ui::ListConfirm)),
     // Palette navigation and text editing, for `--action` and user bindings.
     ("picker_up", None, || Box::new(PickerUp)),
     ("picker_down", None, || Box::new(PickerDown)),
@@ -279,7 +287,8 @@ fn default_bindings() -> Vec<KeyBinding> {
     let x = Some("TmuxWindow");
     let z = Some("ZoneTree");
     let s = Some("SettingsDialog");
-    let c = Some("SettingsChoice");
+    let l = Some("SettingsList");
+    let sl = Some("SettingsSections");
     let f = Some("FindBar");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
@@ -352,24 +361,32 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", PickerConfirm, p),
         KeyBinding::new("escape", PickerCancel, p),
         KeyBinding::new("ctrl-shift-delete", PickerKill, p),
-        KeyBinding::new("up", SettingsUp, s),
-        KeyBinding::new("down", SettingsDown, s),
-        KeyBinding::new("ctrl-p", SettingsUp, s),
-        KeyBinding::new("ctrl-n", SettingsDown, s),
+        // The section list: the dialog's first Tab stop, a vertical tab
+        // list whose keys switch sections at once (Radix's vertical Tabs).
+        KeyBinding::new("up", SettingsSectionPrev, sl),
+        KeyBinding::new("down", SettingsSectionNext, sl),
+        KeyBinding::new("home", SettingsSectionFirst, sl),
+        KeyBinding::new("end", SettingsSectionLast, sl),
+        // The theme and profile lists: one Tab stop each, whose keys move
+        // the selection.
+        KeyBinding::new("up", SettingsUp, l),
+        KeyBinding::new("down", SettingsDown, l),
+        KeyBinding::new("ctrl-p", SettingsUp, l),
+        KeyBinding::new("ctrl-n", SettingsDown, l),
+        KeyBinding::new("home", SettingsFirst, l),
+        KeyBinding::new("end", SettingsLast, l),
+        // Escape and tab come from the overlay around the dialog (`UiLayer`,
+        // `UiFocusScope`). Enter on a focused button reaches the button.
         KeyBinding::new("enter", SettingsConfirm, s),
-        KeyBinding::new("escape", SettingsCancel, s),
-        KeyBinding::new("tab", SettingsNextField, s),
-        KeyBinding::new("shift-tab", SettingsPrevField, s),
         KeyBinding::new("ctrl-pagedown", SettingsSectionNext, s),
         KeyBinding::new("ctrl-pageup", SettingsSectionPrev, s),
         KeyBinding::new("ctrl-tab", SettingsSectionNext, s),
         KeyBinding::new("ctrl-shift-tab", SettingsSectionPrev, s),
         KeyBinding::new("alt-up", SettingsMoveUp, s),
         KeyBinding::new("alt-down", SettingsMoveDown, s),
-        // The profile editor's theme and tmux choices and default checkbox.
-        KeyBinding::new("left", SettingsChoicePrev, c),
-        KeyBinding::new("right", SettingsChoiceNext, c),
-        KeyBinding::new("space", SettingsToggle, c),
+        // The dialog's selects and checkbox keep their own keys (enter,
+        // space, up and down open a select's menu; space ticks a checkbox),
+        // and left and right do nothing on them.
     ];
     // The text inputs' keys, in the `TextInput` context.
     bindings.extend(brindle_ui::default_bindings());
@@ -548,5 +565,97 @@ mod tests {
             palette_commands(|a| available.contains(&a.as_any().type_id())).into_iter().map(|(l, _)| l).collect();
         assert_eq!(labels, ["Go to Last Tab", "Clear Scrollback", "Reload Config"]);
         assert!(palette_commands(|_| true).iter().any(|(l, _)| *l == "tmux: Split Right"));
+    }
+
+    /// On a select in the settings dialog the select's own keys win over
+    /// the dialog's (up and down open it rather than move the dialog), and
+    /// left and right reach nothing: a choice changes only through its menu.
+    #[test]
+    fn settings_select_keys_are_the_selects() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(default_bindings());
+        let contexts: Vec<KeyContext> = ["Workspace", "UiLayer", "UiFocusScope", "SettingsDialog", "UiList"]
+            .iter()
+            .map(|c| KeyContext::parse(c).unwrap())
+            .collect();
+        let first = |key: &str| {
+            let (bindings, pending) = keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], &contexts);
+            assert!(!pending, "{key}");
+            bindings.first().map(|b| b.action().name())
+        };
+        assert_eq!(first("up"), Some("brindle_ui::ListUp"));
+        assert_eq!(first("down"), Some("brindle_ui::ListDown"));
+        assert_eq!(first("enter"), Some("brindle_ui::ListConfirm"));
+        assert_eq!(first("home"), Some("brindle_ui::ListFirst"));
+        assert_eq!(first("end"), Some("brindle_ui::ListLast"));
+        assert_eq!(first("left"), None);
+        assert_eq!(first("right"), None);
+        assert_eq!(first("space"), None);
+    }
+
+    /// A focused theme or profile list takes the list keys; elsewhere in
+    /// the dialog (a footer button, say) up, down, home and end are unbound.
+    #[test]
+    fn settings_list_keys_are_the_lists() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(default_bindings());
+        let stack = |extra: &[&str]| -> Vec<KeyContext> {
+            ["Workspace", "UiLayer", "UiFocusScope", "SettingsDialog"]
+                .iter()
+                .chain(extra)
+                .map(|c| KeyContext::parse(c).unwrap())
+                .collect()
+        };
+        let first = |key: &str, contexts: &[KeyContext]| {
+            let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], contexts);
+            bindings.first().map(|b| b.action().name())
+        };
+        let list = stack(&["SettingsList"]);
+        assert_eq!(first("up", &list), Some("brindle::SettingsUp"));
+        assert_eq!(first("down", &list), Some("brindle::SettingsDown"));
+        assert_eq!(first("ctrl-p", &list), Some("brindle::SettingsUp"));
+        assert_eq!(first("ctrl-n", &list), Some("brindle::SettingsDown"));
+        assert_eq!(first("home", &list), Some("brindle::SettingsFirst"));
+        assert_eq!(first("end", &list), Some("brindle::SettingsLast"));
+        assert_eq!(first("enter", &list), Some("brindle::SettingsConfirm"));
+        let button = stack(&[]);
+        for key in ["up", "down", "home", "end"] {
+            assert_eq!(first(key, &button), None, "{key}");
+        }
+        // The section list switches sections; the dialog's shortcuts stay.
+        let sections = stack(&["SettingsSections"]);
+        assert_eq!(first("up", &sections), Some("brindle::SettingsSectionPrev"));
+        assert_eq!(first("down", &sections), Some("brindle::SettingsSectionNext"));
+        assert_eq!(first("home", &sections), Some("brindle::SettingsSectionFirst"));
+        assert_eq!(first("end", &sections), Some("brindle::SettingsSectionLast"));
+        for contexts in [&sections, &list, &button] {
+            assert_eq!(first("ctrl-tab", contexts), Some("brindle::SettingsSectionNext"));
+            assert_eq!(first("ctrl-shift-tab", contexts), Some("brindle::SettingsSectionPrev"));
+            assert_eq!(first("ctrl-pagedown", contexts), Some("brindle::SettingsSectionNext"));
+            assert_eq!(first("ctrl-pageup", contexts), Some("brindle::SettingsSectionPrev"));
+        }
+    }
+
+    /// Enter on a focused button in the dialog: its only binding is
+    /// `SettingsConfirm`, whose handler propagates when a button has focus
+    /// (`settings_dialog::enter_confirms`), so gpui goes on to the button's
+    /// own key-down, which takes a bare enter. Nothing else in the stack
+    /// binds enter, so nothing else runs.
+    #[test]
+    fn enter_on_a_dialog_button_reaches_the_button() {
+        use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
+        let keymap = Keymap::new(default_bindings());
+        let contexts: Vec<KeyContext> = ["Workspace", "UiLayer", "UiFocusScope", "SettingsDialog"]
+            .iter()
+            .map(|c| KeyContext::parse(c).unwrap())
+            .collect();
+        let (bindings, pending) = keymap.bindings_for_input(&[Keystroke::parse("enter").unwrap()], &contexts);
+        assert!(!pending);
+        let names: Vec<_> = bindings.iter().map(|b| b.action().name()).collect();
+        assert_eq!(names, ["brindle::SettingsConfirm"]);
+        assert_eq!(
+            brindle_ui::key_activation("enter", Modifiers::default(), false, &brindle_ui::ACTIVATION_KEYS),
+            Some(gpui::KeyboardButton::Enter)
+        );
     }
 }

@@ -1,13 +1,14 @@
 //! `Switch`: shadcn's switch, a toggle drawn as a thumb sliding along a
 //! track, controlled by its owner like a [`Checkbox`].
 //!
-//! The owner passes the state as `checked`; a primary click, or the space
-//! key-down while the switch has focus ([`activates`] with [`TOGGLE_KEYS`]),
-//! asks the owner to flip it through `on_click(&new, …)`
-//! ([`toggle_request`]), and the thumb moves once the owner re-renders
-//! with the new state ([`switch_style`] gives its position). A disabled
-//! switch is drawn at half opacity, asks nothing and tracks no focus. The
-//! ring shows when it is focused from the keyboard.
+//! The owner passes the state as `checked`; a primary click, or the enter
+//! or space key-down while the switch has focus ([`activates`] with
+//! [`SWITCH_KEYS`]: Radix's switch is a plain button, so enter toggles it
+//! too, unlike a checkbox), asks the owner to flip it through
+//! `on_click(&new, …)` ([`toggle_request`]), and the thumb moves once the
+//! owner re-renders with the new state ([`switch_style`] gives its
+//! position). A disabled switch is drawn at half opacity, asks nothing and
+//! tracks no focus. The ring shows when it is focused from the keyboard.
 //!
 //! [`Checkbox`]: crate::components::Checkbox
 
@@ -17,7 +18,7 @@ use gpui::{
 };
 
 use crate::components::checkbox::{ToggleHandler, click_key, toggle_request, toggles};
-use crate::components::{DISABLED_OPACITY, FocusRing, TOGGLE_KEYS, activates, inert_press, interaction};
+use crate::components::{DISABLED_OPACITY, FocusRing, SWITCH_KEYS, activates, inert_press, interaction};
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
 use crate::style::{
     SWITCH_THUMB_SIZE, SWITCH_TRACK_BORDER, SWITCH_TRACK_HEIGHT, SWITCH_TRACK_WIDTH, focus_ring, switch_style,
@@ -63,7 +64,7 @@ impl Switch {
     }
 
     /// The handle the switch is focused through. Without one it can't take
-    /// focus, so space can't reach it.
+    /// focus, so enter and space can't reach it.
     pub fn focus(mut self, handle: &FocusHandle) -> Self {
         self.focus = Some(handle.clone());
         self
@@ -115,9 +116,9 @@ impl RenderOnce for Switch {
             .when_some(on_click, |d, on_click| {
                 activates(
                     d,
-                    &TOGGLE_KEYS,
+                    &SWITCH_KEYS,
                     Box::new(move |event, window, cx| {
-                        if toggles(click_key(event))
+                        if toggles(&SWITCH_KEYS, click_key(event))
                             && let Some(value) = toggle_request(checked, disabled)
                         {
                             on_click(&value, window, cx);
