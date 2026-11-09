@@ -9,7 +9,8 @@
 //! disabled button is drawn at half opacity, has no click handler and
 //! tracks no focus, so a press on it runs nothing and moves focus nowhere
 //! ([`interaction`]). The ring shows when the button is focused from the
-//! keyboard ([`shows_ring`]).
+//! keyboard ([`shows_ring`]). A tooltip (`.tooltip_for(..)`, [`TooltipFor`])
+//! shows only while the button is enabled.
 
 use gpui::{
     App, ClickEvent, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -17,6 +18,7 @@ use gpui::{
     prelude::FluentBuilder,
 };
 
+use crate::components::tooltip::{Tooltip, TooltipFor, TooltipHandler, attach};
 use crate::components::{ACTIVATION_KEYS, ClickHandler, DISABLED_OPACITY, FocusRing, activates, inert_press, interaction};
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
@@ -35,6 +37,7 @@ pub struct Button {
     disabled: bool,
     focus: Option<FocusHandle>,
     on_click: Option<ClickHandler>,
+    tooltip: Option<TooltipHandler>,
     style: StyleRefinement,
 }
 
@@ -51,6 +54,7 @@ impl Button {
             disabled: false,
             focus: None,
             on_click: None,
+            tooltip: None,
             style: StyleRefinement::default(),
         }
     }
@@ -94,6 +98,14 @@ impl Button {
     /// focused (as a `ClickEvent::Keyboard`).
     pub fn on_click(mut self, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
         self.on_click = Some(Box::new(on_click));
+        self
+    }
+}
+
+/// The tooltip shows only while the button is enabled.
+impl TooltipFor for Button {
+    fn tooltip_with(mut self, build: impl Fn(&mut Window, &mut App) -> Tooltip + 'static) -> Self {
+        self.tooltip = Some(Box::new(build));
         self
     }
 }
@@ -154,6 +166,7 @@ impl RenderOnce for Button {
             .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
             .children(self.icon.map(|icon| icon.size(style.icon_size)))
             .children(self.label);
+        button = attach(button, self.tooltip.filter(|_| !self.disabled));
         // The owner's layout refinements win over the component's. The ring
         // follows the corners they leave.
         button.style().refine(&self.style);

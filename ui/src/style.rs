@@ -549,6 +549,152 @@ pub fn command_style(t: &Tokens) -> CommandStyle {
     }
 }
 
+/// shadcn's toggle variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToggleVariant {
+    #[default]
+    Default,
+    Outline,
+}
+
+impl ToggleVariant {
+    pub const ALL: [ToggleVariant; 2] = [ToggleVariant::Default, ToggleVariant::Outline];
+}
+
+/// shadcn's toggle sizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToggleSize {
+    #[default]
+    Default,
+    Sm,
+    Lg,
+}
+
+impl ToggleSize {
+    pub const ALL: [ToggleSize; 3] = [ToggleSize::Default, ToggleSize::Sm, ToggleSize::Lg];
+}
+
+/// A toggle's resolved look. `None` colours draw nothing (a transparent
+/// background, no border).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToggleStyle {
+    pub background: Option<Hsla>,
+    pub foreground: Hsla,
+    pub border: Option<Hsla>,
+    pub hover_background: Hsla,
+    pub hover_foreground: Hsla,
+    /// The focus ring's colour while it shows.
+    pub ring: Hsla,
+    /// The border's colour while the ring shows, for the outline variant
+    /// (shadcn's `focus-visible:border-ring`).
+    pub focus_border: Option<Hsla>,
+    pub height: Rems,
+    /// `min-w-*`: an icon or a one-letter label makes a square.
+    pub min_width: Rems,
+    pub padding_x: Rems,
+    /// Space between an icon and the label, shadcn's `gap-2`.
+    pub gap: Rems,
+    /// The icon's side, shadcn's `size-4`.
+    pub icon_size: Rems,
+    pub text_size: Rems,
+    pub radius: Rems,
+}
+
+/// shadcn's `toggleVariants` (the new-york-v4 style) for `variant`, `size`
+/// and the `pressed` state, in the colours of `t`.
+///
+/// The base is `hover:bg-muted hover:text-muted-foreground
+/// data-[state=on]:bg-accent data-[state=on]:text-accent-foreground`; the
+/// outline variant adds `border border-input bg-transparent
+/// hover:bg-accent hover:text-accent-foreground`. A pressed toggle keeps the
+/// accent pair under the pointer: the `data-[state=on]:` rule has the same
+/// specificity as the `hover:` one and comes later in Tailwind's output, so
+/// it wins. The toggle has no `dark:` refinements besides the invalid ring,
+/// which is left out (a toggle has no invalid state here).
+pub fn toggle_style(variant: ToggleVariant, size: ToggleSize, pressed: bool, t: &Tokens) -> ToggleStyle {
+    let (border, mut hover_background, mut hover_foreground) = match variant {
+        ToggleVariant::Default => (None, t.muted, t.muted_foreground),
+        ToggleVariant::Outline => (Some(t.input), t.accent, t.accent_foreground),
+    };
+    let (background, foreground) = if pressed {
+        hover_background = t.accent;
+        hover_foreground = t.accent_foreground;
+        (Some(t.accent), t.accent_foreground)
+    } else {
+        (None, t.foreground)
+    };
+    // (height and min width, px): h-9 px-2 min-w-9, h-8 px-1.5 min-w-8,
+    // h-10 px-2.5 min-w-10.
+    let (height, padding_x) = match size {
+        ToggleSize::Default => (rems(2.25), rems(0.5)),
+        ToggleSize::Sm => (rems(2.), rems(0.375)),
+        ToggleSize::Lg => (rems(2.5), rems(0.625)),
+    };
+    ToggleStyle {
+        background,
+        foreground,
+        border,
+        hover_background,
+        hover_foreground,
+        ring: focus_ring(t),
+        focus_border: border.map(|_| t.ring),
+        height,
+        min_width: height,
+        padding_x,
+        gap: rems(0.5),
+        icon_size: rems(1.),
+        // text-sm rounded-md
+        text_size: rems(0.875),
+        radius: t.radius_md(),
+    }
+}
+
+/// A tooltip's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipStyle {
+    /// `bg-foreground`: the tooltip is drawn inverted.
+    pub background: Hsla,
+    /// `text-background`.
+    pub foreground: Hsla,
+    /// The shortcut's keycaps inside it: `bg-background/20`
+    /// (`dark:bg-background/10`).
+    pub kbd_background: Hsla,
+    /// `text-background`.
+    pub kbd_foreground: Hsla,
+    /// `px-3`.
+    pub padding_x: Rems,
+    /// `py-1.5`.
+    pub padding_y: Rems,
+    /// The right padding beside a shortcut, `pr-1.5`.
+    pub padding_right_with_shortcut: Rems,
+    /// Between the label and the shortcut, `gap-2`.
+    pub gap: Rems,
+    /// `text-xs`.
+    pub text_size: Rems,
+    /// `rounded-md`.
+    pub radius: Rems,
+}
+
+/// shadcn's TooltipContent (`bg-foreground text-background rounded-md px-3
+/// py-1.5 text-xs`), and its Kbd example (`pr-1.5`, the label and the keys
+/// `gap-2`), with the keycaps in the Kbd's tooltip colours
+/// (`[[data-slot=tooltip-content]_&]:bg-background/20 text-background
+/// dark:…bg-background/10`).
+pub fn tooltip_style(t: &Tokens) -> TooltipStyle {
+    TooltipStyle {
+        background: t.foreground,
+        foreground: t.background,
+        kbd_background: t.background.opacity(if t.dark { 0.1 } else { 0.2 }),
+        kbd_foreground: t.background,
+        padding_x: rems(0.75),
+        padding_y: rems(0.375),
+        padding_right_with_shortcut: rems(0.375),
+        gap: rems(0.5),
+        text_size: rems(0.75),
+        radius: t.radius_md(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::hsla;
@@ -1042,5 +1188,75 @@ mod tests {
         }
         let sizes: Vec<_> = SIZE_ROWS.iter().map(|r| r.0).collect();
         assert_eq!(sizes, ButtonSize::ALL);
+    }
+
+    /// (size, height = min width, px), in rems: shadcn's toggle sizes.
+    const TOGGLE_SIZE_ROWS: [(ToggleSize, f32, f32); 3] =
+        [(ToggleSize::Default, 2.25, 0.5), (ToggleSize::Sm, 2.0, 0.375), (ToggleSize::Lg, 2.5, 0.625)];
+
+    #[test]
+    fn toggle_sizes_are_shadcns_and_cover_every_size() {
+        let t = Tokens::neutral_light();
+        let sizes: Vec<_> = TOGGLE_SIZE_ROWS.iter().map(|r| r.0).collect();
+        assert_eq!(sizes, ToggleSize::ALL);
+        for (size, height, px) in TOGGLE_SIZE_ROWS {
+            for variant in ToggleVariant::ALL {
+                for pressed in [false, true] {
+                    let s = toggle_style(variant, size, pressed, &t);
+                    assert_eq!((s.height, s.min_width, s.padding_x), (rems(height), rems(height), rems(px)), "{size:?}");
+                    assert_eq!((s.gap, s.icon_size, s.text_size, s.radius), (rems(0.5), rems(1.), rems(0.875), t.radius_md()));
+                }
+            }
+        }
+    }
+
+    /// Unpressed, the default toggle is a transparent control in the
+    /// foreground that hovers muted; the outline one has an input border and
+    /// hovers in accent. Pressed, both are the accent pair, under the
+    /// pointer too.
+    #[test]
+    fn toggle_colours_for_each_variant_and_state() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = |variant, pressed| toggle_style(variant, ToggleSize::Default, pressed, &t);
+
+            let off = s(ToggleVariant::Default, false);
+            assert_eq!((off.background, off.foreground, off.border), (None, t.foreground, None));
+            assert_eq!((off.hover_background, off.hover_foreground), (t.muted, t.muted_foreground));
+            assert_eq!(off.focus_border, None);
+
+            let off = s(ToggleVariant::Outline, false);
+            assert_eq!((off.background, off.foreground, off.border), (None, t.foreground, Some(t.input)));
+            assert_eq!((off.hover_background, off.hover_foreground), (t.accent, t.accent_foreground));
+            assert_eq!(off.focus_border, Some(t.ring));
+
+            for variant in ToggleVariant::ALL {
+                let on = s(variant, true);
+                assert_eq!((on.background, on.foreground), (Some(t.accent), t.accent_foreground), "{variant:?}");
+                assert_eq!((on.hover_background, on.hover_foreground), (t.accent, t.accent_foreground), "{variant:?}");
+                assert_eq!(on.ring, focus_ring(&t));
+                // Pressing doesn't change the frame.
+                assert_eq!(on.border, s(variant, false).border);
+            }
+        }
+    }
+
+    /// The tooltip is drawn inverted: the foreground token behind the
+    /// background token, its keycaps in a faint wash of the background.
+    #[test]
+    fn tooltip_colours_come_from_the_tokens_inverted() {
+        for (t, kbd_opacity) in [(Tokens::neutral_light(), 0.2), (Tokens::neutral_dark(), 0.1)] {
+            let s = tooltip_style(&t);
+            assert_eq!((s.background, s.foreground), (t.foreground, t.background));
+            assert_eq!((s.kbd_background, s.kbd_foreground), (t.background.opacity(kbd_opacity), t.background));
+            assert_eq!((s.padding_x, s.padding_y, s.padding_right_with_shortcut), (rems(0.75), rems(0.375), rems(0.375)));
+            assert_eq!((s.gap, s.text_size, s.radius), (rems(0.5), rems(0.75), t.radius_md()));
+        }
+        // A theme of its own: the style follows the tokens, not shadcn's
+        // neutral values.
+        let mut t = Tokens::neutral_light();
+        t.foreground = hsla(0.6, 0.5, 0.2, 1.);
+        t.background = hsla(0.1, 0.3, 0.95, 1.);
+        let s = tooltip_style(&t);
+        assert_eq!((s.background, s.foreground), (t.foreground, t.background));
     }
 }

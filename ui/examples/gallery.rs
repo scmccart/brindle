@@ -28,7 +28,7 @@ use std::rc::Rc;
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem, Dialog,
     Dismiss, FocusScope, FocusStops, Icon, Input, Kbd, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
-    Separator, Switch, TextInput, Tokens, UiTheme,
+    Separator, Switch, TextInput, Toggle, ToggleSize, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
@@ -154,6 +154,8 @@ pub struct Gallery {
     records: Records,
     checked: bool,
     switched: bool,
+    /// Each toggle's pressed state, by name (unpressed when missing).
+    pressed: HashMap<String, bool>,
     name: Entity<TextInput>,
     email: Entity<TextInput>,
     shell: Entity<Select>,
@@ -186,7 +188,7 @@ impl Gallery {
             [
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
-                "switch-off", "theme",
+                "switch-off", "theme", "toggle", "toggle-off",
             ]
             .map(String::from),
         );
@@ -236,6 +238,7 @@ impl Gallery {
             records: Records::default(),
             checked: false,
             switched: true,
+            pressed: HashMap::new(),
             name,
             email,
             shell,
@@ -618,6 +621,130 @@ impl Gallery {
             )
     }
 
+    /// Whether the toggle called `name` is pressed.
+    pub fn is_pressed(&self, name: &str) -> bool {
+        self.pressed.get(name).copied().unwrap_or(false)
+    }
+
+    /// A toggle handler that stores the state asked for under `name` and
+    /// counts the request.
+    fn press_toggle(&self, name: &str, cx: &mut Context<Self>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let (name, clicks) = (name.to_string(), self.clicks.clone());
+        cx.listener(move |this, pressed: &bool, _, cx| {
+            *clicks.borrow_mut().entry(name.clone()).or_default() += 1;
+            this.pressed.insert(name.clone(), *pressed);
+            cx.notify();
+        })
+    }
+
+    /// Every toggle variant and size, the states, and buttons and a plain
+    /// element with tooltips (shown after a 500 ms hover), plus the
+    /// tooltip's look drawn in place.
+    fn toggle_tooltip_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div().flex().flex_col().gap_3().child(heading("Toggle and Tooltip", cx));
+        for variant in ToggleVariant::ALL {
+            let mut row = div().flex().items_center().gap_3().child(label(format!("{variant:?}"), cx));
+            for size in ToggleSize::ALL {
+                // No focus handles here: a press flips them and moves focus
+                // nowhere.
+                let name = format!("toggle:{variant:?}:{size:?}");
+                row = row
+                    .child(recorded(
+                        Toggle::new(SharedString::from(name.clone()), format!("{size:?}"))
+                            .variant(variant)
+                            .size(size)
+                            .pressed(self.is_pressed(&name))
+                            .on_click(self.press_toggle(&name, cx)),
+                        &name,
+                        &self.records,
+                    ))
+                    .child({
+                        let name = format!("toggle-icon:{variant:?}:{size:?}");
+                        Toggle::icon_only(SharedString::from(name.clone()), Icon::Check)
+                            .variant(variant)
+                            .size(size)
+                            .pressed(self.is_pressed(&name))
+                            .on_click(self.press_toggle(&name, cx))
+                    });
+            }
+            section = section.child(row);
+        }
+        let states = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("States", cx))
+            .child(recorded(
+                Toggle::new("toggle", "Aa")
+                    .size(ToggleSize::Sm)
+                    .pressed(self.is_pressed("toggle"))
+                    .focus(&self.handle("toggle"))
+                    .on_click(self.press_toggle("toggle", cx))
+                    .tooltip_for("Match case", Some("alt-c".into())),
+                "toggle",
+                &self.records,
+            ))
+            .child(recorded(
+                Toggle::new("toggle-off", "Off")
+                    .disabled(true)
+                    .focus(&self.handle("toggle-off"))
+                    .on_click(self.count_toggle("toggle-off"))
+                    .tooltip_for("Never shown", None),
+                "toggle-off",
+                &self.records,
+            ))
+            .child(Toggle::new("toggle-off-pressed", "On").pressed(true).disabled(true))
+            .child(Toggle::new("toggle-icon-label", "Bold").icon(Icon::Check).variant(ToggleVariant::Outline));
+        let tooltips = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("Tooltips", cx))
+            .child(recorded(
+                Button::icon_only("tip-new", Icon::Plus)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::IconSm)
+                    .on_click(self.count("tip-new"))
+                    .tooltip_for("New tab", Some("ctrl-shift-t".into())),
+                "tip-new",
+                &self.records,
+            ))
+            .child(recorded(
+                // The text is worked out when the tooltip shows.
+                Button::icon_only("tip-find", Icon::Search)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::IconSm)
+                    .tooltip_with(|_, _| Tooltip::new("Find").shortcut("ctrl-shift-f")),
+                "tip-find",
+                &self.records,
+            ))
+            .child(Button::new("tip-save", "Save").variant(ButtonVariant::Outline).tooltip_for("Save the profile", None))
+            .child(recorded(
+                Button::new("tip-disabled", "Disabled")
+                    .variant(ButtonVariant::Outline)
+                    .disabled(true)
+                    .tooltip_for("Never shown", None),
+                "tip-disabled",
+                &self.records,
+            ))
+            .child(
+                div()
+                    .id("tip-text")
+                    .text_color(cx.ui_theme().muted_foreground)
+                    .child("Hover me (a plain element)")
+                    .tooltip_for("Any stateful element", None),
+            );
+        let look = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("Tooltip look", cx))
+            .child(Tooltip::new("New tab").shortcut("ctrl-shift-t"))
+            .child(Tooltip::new("Close tab"))
+            .child(Tooltip::new("Split").shortcut("ctrl-k ctrl-v"));
+        section.child(states).child(tooltips).child(look)
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -696,7 +823,7 @@ impl FocusStops for Gallery {
         stops.extend(named(&["icon-label"]));
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
-        stops.extend(named(&["checkbox", "switch", "corner-0", "corner-1", "corner-2", "corner-3"]));
+        stops.extend(named(&["checkbox", "switch", "toggle", "corner-0", "corner-1", "corner-2", "corner-3"]));
         stops
     }
 }
@@ -722,6 +849,7 @@ impl Render for Gallery {
             .child(self.chrome_section(cx))
             .child(self.inputs_section(cx))
             .child(self.toggles_section(cx))
+            .child(self.toggle_tooltip_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -1246,6 +1374,7 @@ mod check {
         window: WindowHandle<Gallery>,
         cx: AsyncApp,
         /// The platform window the messages go to (Windows), else 0.
+        #[cfg_attr(not(windows), allow(dead_code))]
         hwnd: isize,
         /// Physical pixels per logical pixel, for the messages' coordinates.
         scale: f32,
@@ -1622,6 +1751,25 @@ mod check {
         c.run_check("switch-space-and-enter-toggle", check).await;
         let check = checkbox_disabled(&mut c).await;
         c.run_check("checkbox-disabled-asks-nothing", check).await;
+        let check = toggle_space_and_enter(&mut c).await;
+        c.run_check("toggle-space-and-enter-flip-it", check).await;
+        let check = toggle_click(&mut c).await;
+        c.run_check("toggle-click-flips-it-and-a-handleless-press-keeps-focus", check).await;
+        let check = toggle_disabled_keys(&mut c).await;
+        c.run_check("toggle-disabled-space-asks-nothing", check).await;
+        let check = toggle_disabled_press(&mut c).await;
+        c.run_check("toggle-disabled-press-asks-nothing-keeps-focus", check).await;
+        // Each moves the pointer away after, passed or not, so no tooltip
+        // stays up for the later checks' pixel samples.
+        let check = tooltip_hover_and_press(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-hover-shows-it-press-hides-it-and-clicks", check).await;
+        let check = tooltip_escape(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-escape-hides-it", check).await;
+        let check = tooltip_disabled(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-not-shown-on-a-disabled-control", check).await;
         let check = dialog_opens_focusing_input(&mut c).await;
         c.run_check("dialog-opens-with-input-focused-and-typing-goes-there", check).await;
         let check = dialog_tab_cycles(&mut c).await;
@@ -1983,6 +2131,155 @@ mod check {
         ensure!(c.focused_name("behind")?, "pressing a disabled checkbox moved focus");
         Ok(())
     }
+
+    // ---- toggle and tooltip ----
+
+    fn pressed(c: &mut Checker, name: &str) -> Result<bool, Failure> {
+        let name = name.to_string();
+        c.with(move |gallery, _, _| gallery.is_pressed(&name))
+    }
+
+    /// Space and enter on a focused toggle each ask the owner to flip it
+    /// (Radix's toggle is a button), once per key, as keyboard input.
+    async fn toggle_space_and_enter(c: &mut Checker) -> Check {
+        c.focus("toggle").await?;
+        let before = pressed(c, "toggle")?;
+        let asked = c.clicks("toggle")?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        ensure!(pressed(c, "toggle")? == !before, "space didn't ask the owner to flip the toggle");
+        ensure!(c.modality()? == Modality::Keyboard, "space on a toggle didn't count as keyboard input");
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(pressed(c, "toggle")? == before, "enter didn't flip it back (or flipped it twice)");
+        let asked = c.clicks("toggle")? - asked;
+        ensure!(asked == 2, "two keys asked {asked} times");
+        Ok(())
+    }
+
+    /// A click flips the toggle and focuses it as a pointer does. A click on
+    /// a toggle without a focus handle flips it and leaves focus where it
+    /// was, not on the gallery around it.
+    async fn toggle_click(c: &mut Checker) -> Check {
+        let at = center(c.reveal("toggle").await?);
+        let before = pressed(c, "toggle")?;
+        c.press(at).await?;
+        ensure!(pressed(c, "toggle")? == !before, "a click didn't flip the toggle");
+        ensure!(c.focused_name("toggle")?, "the clicked toggle isn't focused");
+        ensure!(c.modality()? == Modality::Pointer, "a click left the keyboard modality (a ring would show)");
+        let name = format!("toggle:{:?}:{:?}", ToggleVariant::Outline, ToggleSize::Sm);
+        let at = center(c.reveal(&name).await?);
+        let before = pressed(c, &name)?;
+        c.press(at).await?;
+        ensure!(pressed(c, &name)? == !before, "a click didn't flip the toggle without a focus handle");
+        ensure!(c.focused_name("toggle")?, "a press on a toggle without a focus handle moved focus");
+        Ok(())
+    }
+
+    /// A disabled toggle tracks no focus and has no key handler: space with
+    /// its handle focused asks nothing.
+    async fn toggle_disabled_keys(c: &mut Checker) -> Check {
+        c.focus("toggle-off").await?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(c.clicks("toggle-off")? == 0, "a disabled toggle asked for a change from a key");
+        Ok(())
+    }
+
+    async fn toggle_disabled_press(c: &mut Checker) -> Check {
+        c.focus("behind").await?;
+        let at = center(c.reveal("toggle-off").await?);
+        c.press(at).await?;
+        ensure!(c.clicks("toggle-off")? == 0, "a disabled toggle asked for a change");
+        ensure!(c.focused_name("behind")?, "pressing a disabled toggle moved focus");
+        Ok(())
+    }
+
+    /// Longer than gpui's 500 ms hover delay.
+    const TOOLTIP_WAIT: Duration = Duration::from_millis(800);
+
+    /// Where a tooltip shown for a pointer at `at` is sure to paint its
+    /// background: gpui places it 1px below and right of the pointer, and
+    /// this is inside its padding.
+    fn tooltip_point(at: Point<Pixels>) -> Point<Pixels> {
+        point(at.x + px(6.), at.y + px(4.))
+    }
+
+    /// The tooltip's background as the window shows it.
+    fn tooltip_colour(c: &mut Checker) -> Result<[u8; 3], Failure> {
+        c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            over(brindle_ui::tooltip_style(t).background, t.background)
+        })
+    }
+
+    /// Rests the pointer at `at` past the hover delay.
+    async fn rest(c: &mut Checker, at: Point<Pixels>) -> Result<(), Failure> {
+        c.hover(at).await?;
+        c.cx.background_executor().timer(TOOLTIP_WAIT).await;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// Moves the pointer to blank space, so no tooltip stays up for the
+    /// next check's samples.
+    async fn pointer_away(c: &mut Checker) -> Result<(), Failure> {
+        let viewport = c.viewport()?;
+        c.hover(point(viewport.width - px(40.), viewport.height / 2.)).await?;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// [`pointer_away`] after a tooltip check, whatever its result; the
+    /// check's own failure or skip wins over the move's.
+    async fn pointer_away_after(c: &mut Checker, check: Check) -> Check {
+        let away = pointer_away(c).await;
+        check.and(away)
+    }
+
+    async fn tooltip_hover_and_press(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-new").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        let before = c.pixel(sample).await?;
+        ensure!(!near(before, tooltip), "the tooltip's colour {tooltip:?} shows at {sample:?} before any hover");
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on the button showed {shown:?} at {sample:?}, not the tooltip {tooltip:?}");
+        let clicks = c.clicks("tip-new")?;
+        c.press(at).await?;
+        ensure!(c.clicks("tip-new")? == clicks + 1, "the press under the tooltip didn't click the button");
+        let after = c.pixel(sample).await?;
+        ensure!(!near(after, tooltip), "the tooltip stayed up after a press ({after:?})");
+        Ok(())
+    }
+
+    async fn tooltip_escape(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-find").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on the button showed {shown:?}, not the tooltip {tooltip:?}");
+        c.key("escape").await?;
+        let after = c.pixel(sample).await?;
+        ensure!(!near(after, tooltip), "the tooltip stayed up after Escape ({after:?})");
+        Ok(())
+    }
+
+    async fn tooltip_disabled(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-disabled").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(!near(shown, tooltip), "a disabled button showed a tooltip ({shown:?})");
+        Ok(())
+    }
+
+    use brindle_ui::{ToggleSize, ToggleVariant};
 
     // ---- dialog ----
 

@@ -32,7 +32,7 @@ A separator SHALL be a one-pixel rule in the border colour, horizontal or vertic
 - **THEN** the item below the separator is highlighted
 
 ### Requirement: Toggles
-A toggle SHALL show a pressed or unpressed state set by its owner, and SHALL ask the owner to flip it on a primary click, and on enter or space while it has focus. A pressed toggle SHALL be drawn with the accent background and foreground, an unpressed one like a ghost button. A disabled toggle SHALL be drawn muted and SHALL NOT ask. Without a focus handle a toggle SHALL NOT take focus on a press.
+A toggle SHALL show a pressed or unpressed state set by its owner, and SHALL ask the owner to flip it on a primary click, and on enter or space while it has focus. A pressed toggle SHALL be drawn with the accent background and foreground, an unpressed one transparent, with the muted background on hover, as shadcn's toggle. A disabled toggle SHALL be drawn muted and SHALL NOT ask. Without a focus handle a toggle SHALL NOT take focus on a press.
 
 #### Scenario: Click flips it
 - **WHEN** the user clicks an unpressed toggle

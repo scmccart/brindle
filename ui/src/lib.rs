@@ -21,8 +21,9 @@ pub use icon::{Icon, IconElement};
 pub use primitives::*;
 pub use style::{
     ButtonSize, ButtonStyle, ButtonVariant, CheckboxStyle, CommandStyle, DialogStyle, InputStyle, PopoverStyle,
-    SelectStyle, SwitchStyle, button_style, checkbox_style, command_style, dialog_style, focus_ring, input_style,
-    popover_style, select_style, switch_style, switch_thumb_offset,
+    SelectStyle, SwitchStyle, ToggleSize, ToggleStyle, ToggleVariant, TooltipStyle, button_style, checkbox_style,
+    command_style, dialog_style, focus_ring, input_style, popover_style, select_style, switch_style,
+    switch_thumb_offset, toggle_style, tooltip_style,
 };
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Tokens, UiTheme};

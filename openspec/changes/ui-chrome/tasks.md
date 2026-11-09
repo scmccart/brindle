@@ -10,10 +10,10 @@
 
 ## 2. brindle-ui: Tooltip and Toggle
 
-- [ ] 2.1 Add `Tooltip` (label, optional shortcut `Kbd`, shadcn's inverted look) and a `.tooltip_for(label, shortcut)` extension over GPUI's `tooltip`, building text only when shown; verify a unit test of the style (colours from tokens) and that the extension compiles on a `Button` in the gallery
-- [ ] 2.2 Add `Toggle` (pressed state, default/outline variants, default/sm/lg sizes, activation as `Button`, no focus without a handle) reusing `interaction`/`activates`; verify unit tests of `toggle_style` (pressed uses accent) and the disabled and no-focus cases
-- [ ] 2.3 Show them in the gallery and add `-- --check` cases for Toggle (click and space flip it, disabled does not) and Tooltip (hover cases run on Windows only and are `SKIP` elsewhere, as for pointer checks); verify `scripts/with-xvfb cargo run -p brindle-ui --example gallery -- --check` has no `FAIL`
-- [ ] 2.4 Document both in `ui/README.md`, listing the differences from shadcn (no delay group, 500 ms hover delay from GPUI, no arrow); verify the Differences list names them
+- [x] 2.1 Add `Tooltip` (label, optional shortcut `Kbd`, shadcn's inverted look) and a `.tooltip_for(label, shortcut)` extension over GPUI's `tooltip`, building text only when shown; verify a unit test of the style (colours from tokens) and that the extension compiles on a `Button` in the gallery
+- [x] 2.2 Add `Toggle` (pressed state, default/outline variants, default/sm/lg sizes, activation as `Button`, no focus without a handle) reusing `interaction`/`activates`; verify unit tests of `toggle_style` (pressed uses accent) and the disabled and no-focus cases
+- [x] 2.3 Show them in the gallery and add `-- --check` cases for Toggle (click and space flip it, disabled does not) and Tooltip (hover cases run on Windows only and are `SKIP` elsewhere, as for pointer checks); verify `scripts/with-xvfb cargo run -p brindle-ui --example gallery -- --check` has no `FAIL`
+- [x] 2.4 Document both in `ui/README.md`, listing the differences from shadcn (no delay group, 500 ms hover delay from GPUI, no arrow); verify the Differences list names them
 
 ## 3. brindle-ui: menus (Menu, ContextMenu, DropdownMenu)
 
@@ -38,7 +38,7 @@
 
 - [ ] 6.1 Rebuild the strip on `TabList`/`TabTrigger` (`Attached` variant, the active trigger given the active terminal's background and foreground): titles, tmux marker, bell and status dots as adornments, close slot with a tooltip, drag reorder through `drop_tab`, middle-click close through `close_tab_at`, `DraggedTab` and the window border from `cx.ui_theme()`, status dots in the global theme's ANSI colours; verify an e2e capture case with a profile theme differing from the global one samples the strip in token colours and the active tab in the tab's terminal background
 - [ ] 6.2 Make a press activate the tab and leave focus in its terminal (the host's activation focuses the terminal, never the list); add the hidden `FocusTabStrip` action (focus the list, Enter/Escape return focus to the terminal); verify e2e cases that run `--action focus_tab_strip` then `--key right`/`--key home`/`--key escape` and check the active tab and `--- focus` in each step
-- [ ] 6.3 Replace the new-tab and chevron buttons with ghost `IconXs` `Button`s in press-stopping wrappers, with tooltips ("New tab", "New tab from profile…" plus shortcuts); keep the caption buttons hand-built with no handlers on Windows, coloured from `button_style` and drawing the `Minus`, `Square`/`Copy` and `X` icons instead of text glyphs, and replace the tmux tab marker `⧉` with `AppWindow`; verify `cargo test --workspace` passes and the `win` caption hit-test case still passes on Windows
+- [ ] 6.3 Replace the new-tab and chevron buttons with ghost `IconXs` `Button`s in press-stopping wrappers (a `Button` without a focus handle still lets a press bubble to a focus-tracking ancestor, so the wrapper stops propagation and uses `inert_press`, as `Toggle` does), with tooltips ("New tab", "New tab from profile…" plus shortcuts); keep the caption buttons hand-built with no handlers on Windows, coloured from `button_style` and drawing the `Minus`, `Square`/`Copy` and `X` icons instead of text glyphs, and replace the tmux tab marker `⧉` with `AppWindow`; verify `cargo test --workspace` passes and the `win` caption hit-test case still passes on Windows
 - [ ] 6.4 Remove the strip's uses of the four chrome helpers; verify `grep` finds none in the strip code in `src/workspace.rs`
 
 ## 7. Profile menu
@@ -57,7 +57,7 @@
 
 ## 9. Zone headers and dividers
 
-- [ ] 9.1 Rebuild the zone header on token colours, ghost `IconXs` `Button`s (`Columns2`, `Rows2`, `X`) with tooltips, keeping the 28px height, the 2px active line in `primary`, status dot and the focus-on-press handler; recolour the dividers from the `border` token; verify the `zones` e2e cases pass and a capture case samples header, active line and divider colours
+- [ ] 9.1 Rebuild the zone header on token colours, ghost `IconXs` `Button`s (`Columns2`, `Rows2`, `X`) with tooltips (presses stop at the button as in 6.3, since the header's own press focuses the zone), keeping the 28px height, the 2px active line in `primary`, status dot and the focus-on-press handler; recolour the dividers from the `border` token; verify the `zones` e2e cases pass and a capture case samples header, active line and divider colours
 - [ ] 9.2 Remove the headers' uses of the four chrome helpers; verify `grep` finds none in `src/zone_view.rs`
 
 ## 10. tmux chrome and theme.rs

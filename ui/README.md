@@ -53,10 +53,35 @@ rule, not a convenience.
     (variants default, destructive, outline, secondary, ghost, link; sizes
     default, sm, lg, icon, icon-sm, icon-xs; the icon sizes are squares of
     2.25, 2 and 1.5rem, and the icon inside is 1rem, 0.75rem in icon-xs),
-    `Input` (a frame around a `TextInput`), `Checkbox`, `Switch`, the
-    `Dialog` chrome and `PopoverContent`. A focusable control takes its
+    `Input` (a frame around a `TextInput`), `Checkbox`, `Switch`, `Toggle`,
+    the `Dialog` chrome and `PopoverContent`. A focusable control takes its
     `FocusHandle` from the owner (`.focus(&handle)`); without one it can't
-    take keyboard focus. Two of them are not controls:
+    take keyboard focus.
+    - `Toggle` (`Toggle::new(id, "Aa")` or `Toggle::icon_only(id, icon)`):
+      shadcn's toggle, a button with a `pressed` state the owner holds.
+      Variants default and outline, sizes default, sm and lg (`h-9`, `h-8`,
+      `h-10`, each also the min width, so an icon or one letter makes a
+      square). A primary click, or enter or space while focused, calls
+      `on_click(&new_state, …)`; pressed, it is the accent pair, unpressed a
+      transparent control that hovers muted (`toggle_style`). Disabled, it
+      is drawn at half opacity, asks nothing and takes no focus. Without a
+      focus handle a press on it moves focus nowhere, not even to an
+      ancestor that tracks focus (a find bar's query keeps it).
+    - `Tooltip` (`Tooltip::new("New tab").shortcut("ctrl-shift-t")`): a
+      label and an optional shortcut as `Kbd` keycaps, drawn inverted
+      (`foreground` behind `background` text, `text-xs`, `tooltip_style`).
+      `TooltipFor` puts one on an element: `.tooltip_for(label, shortcut)`
+      with fixed strings, or `.tooltip_with(|window, cx| Tooltip::new(..))`
+      to work the text out (a shortcut from the keymap) when it is shown.
+      Either way the view is built only when it shows. It works on any
+      stateful element (`div().id(..)`) and on `Button` and `Toggle`, which
+      drop it while disabled. gpui's `tooltip` shows it after a 500 ms rest
+      and hides it when the pointer leaves, on a press and on a scroll; the
+      shown view hides itself on Escape (`intercept_keystrokes`, which sees
+      the key before any binding and lets it go on). A `Tooltip` also
+      renders in place, as the gallery shows its look.
+
+    Two of the builders are not controls:
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
       rule in the border colour that takes no focus and no pointer events.
     - `Kbd` (`Kbd::new("ctrl-shift-t")`): keycaps from a keymap string, one
@@ -65,18 +90,18 @@ rule, not a convenience.
       does the splitting, `.colors(background, foreground)` replaces the
       muted tokens (an inverted tooltip). It prints what the keymap prints;
       mapping `cmd` or `super` per platform is the keymap's job.
-- **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
-  rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
-  `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
-  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2` and
-  `Rows2`. Strokes have butt caps and miter joins, since gpui doesn't expose
-  lucide's round caps.
   - entities the owner creates, keeps and subscribes to: `Select`
     (`SelectEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`
     (`TextInputEvent::Changed`). `Popover` is a `RenderOnce` whose open state
     lives in keyed state; its trigger closure wires `PopoverTrigger::on_click`
     into the trigger's own click.
+- **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
+  rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
+  `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
+  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2` and
+  `Rows2`. Strokes have butt caps and miter joins, since gpui doesn't expose
+  lucide's round caps.
 - **`TextInput`** (`text_input.rs`) and **`filter`** (`fuzzy_match`, the
   case-insensitive subsequence match palettes use).
 - **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `Dismiss`,
@@ -121,10 +146,51 @@ Everywhere:
   example a dialog's footer is always a row. Reason: these are desktop
   windows.
 
-Button, Checkbox, Switch:
+Button, Checkbox, Switch, Toggle:
 
 - **A checkbox has no indeterminate state** (`checked` is a `bool`). It is a
   missing feature, not a different behaviour.
+- **A toggle without a focus handle is not a Tab stop, and a press on it
+  moves focus nowhere.** Radix's toggle is a `<button>`, always in the tab
+  order, and a press focuses it. Reason: a `RenderOnce` builder keeps no
+  handle of its own (as for Dialog's close `X`), and a find bar's option
+  toggles must leave focus in its query. With a handle it behaves as
+  Radix's. A button without a handle doesn't take focus either, but its
+  press still bubbles to an ancestor that tracks focus.
+- **A toggle has no `aria-invalid` state**, so shadcn's invalid ring and
+  border aren't drawn. A missing feature.
+
+Tooltip (shadcn's is Radix's Tooltip; ours is gpui's `tooltip` with the
+crate's look):
+
+- **No delay group, and a fixed 500 ms delay.** The delay is gpui's
+  (`TOOLTIP_SHOW_DELAY`), with no skip-delay when the pointer moves from
+  one trigger to the next. shadcn's `TooltipProvider` sets
+  `delayDuration={0}` (Radix's default is 700 ms) and Radix skips the delay
+  for 300 ms after a tooltip closed. Reason: gpui 0.2.2 doesn't expose the
+  delay or the shown tooltip's state.
+- **Placed at the pointer, not beside the trigger.** gpui puts the tooltip
+  1px below and right of the pointer where it rested, flipped to the other
+  side of the pointer at the window's edges. Radix centres it on a side of
+  the trigger (`top`, `sideOffset` 0 in shadcn), with collision handling.
+  Reason: gpui places tooltips itself and gives the view no anchor.
+- **No arrow.** shadcn draws `TooltipPrimitive.Arrow`. Reason: the
+  placement is the pointer's, not a side of the trigger, so an arrow would
+  point at nothing in particular, and gpui 0.2.2 can't rotate a `div`.
+- **Hover only: focusing the trigger from the keyboard shows nothing.**
+  Radix opens a tooltip on keyboard focus too. Reason: gpui's tooltip
+  follows the pointer alone.
+- **The pointer can't move onto the tooltip to keep it open.** Radix keeps
+  hoverable content open (`disableHoverableContent` false). Reason: the
+  spec says a tooltip takes no pointer events (gpui's `hoverable_tooltip`
+  would make it hoverable).
+- **Any wheel event over the window hides it** (gpui's rule). Radix closes
+  a tooltip only when an element containing its trigger scrolls.
+- **One line, no wrapping.** shadcn's content is `text-balance` and wraps
+  at the page's width. Reason: gpui lays a tooltip out at its smallest
+  size, so wrapping text would break at every word.
+- **No open fade or zoom.** shadcn animates `fade-in-0 zoom-in-95`. Reason:
+  gpui shows the tooltip view as is (see "Only opening animates").
 
 Input (shadcn's is a native `<input>`, so the reference is a browser's text
 field; the editing is `TextInput`'s):
@@ -311,7 +377,9 @@ cargo run -p brindle-ui --example gallery -- --check   # the spec's scenarios, f
 
 The gallery shows every component in every variant and size, with a dark
 toggle, dialogs (one that refuses to be dismissed), popovers in each window
-corner, selects and command lists inline, in a dialog and in a popover.
+corner, selects and command lists inline, in a dialog and in a popover,
+toggles in each variant and size, and buttons and a plain element with
+tooltips (beside the tooltip's look drawn in place).
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,

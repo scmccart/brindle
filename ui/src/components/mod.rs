@@ -40,6 +40,8 @@ pub mod popover;
 pub mod select;
 pub mod separator;
 pub mod switch;
+pub mod toggle;
+pub mod tooltip;
 
 use std::rc::Rc;
 
@@ -64,6 +66,8 @@ pub use select::{
 };
 pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
+pub use toggle::Toggle;
+pub use tooltip::{Tooltip, TooltipFor, TooltipView};
 
 /// shadcn's `disabled:opacity-50`.
 pub const DISABLED_OPACITY: f32 = 0.5;
