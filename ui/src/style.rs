@@ -5,7 +5,7 @@
 //! applies the result. Sizes are in rems (GPUI's `h_9` is `rems(2.25)`, as
 //! Tailwind's `h-9` is 2.25rem), so they scale with the window's text size.
 
-use gpui::{Corners, Edges, Hsla, Pixels, Rems, px, rems};
+use gpui::{Corners, Edges, FontWeight, Hsla, Pixels, Rems, px, rems, transparent_black};
 
 use crate::theme::Tokens;
 
@@ -747,6 +747,276 @@ pub fn menu_style(t: &Tokens) -> MenuStyle {
     }
 }
 
+/// shadcn's tab list variants, and `Attached`, the crate's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TabVariant {
+    /// shadcn's default: a muted pill, the active trigger raised on the
+    /// background.
+    #[default]
+    Default,
+    /// shadcn's `line`: no surfaces; the active trigger in the foreground
+    /// with a primary line along its top.
+    Line,
+    /// The crate's own: triggers on the background, the active one on a
+    /// surface with rounded top corners and a primary line along its top,
+    /// so it joins the content below the list (a window's tab strip).
+    Attached,
+}
+
+impl TabVariant {
+    pub const ALL: [TabVariant; 3] = [TabVariant::Default, TabVariant::Line, TabVariant::Attached];
+}
+
+/// The line along an active trigger's top edge (`Line` and `Attached`), and
+/// the bar that marks where a dragged trigger will land: two pixels, as
+/// shadcn's `h-0.5` underline.
+pub const TAB_LINE_WIDTH: Pixels = px(2.);
+
+/// A pill or line list's height, shadcn's `h-9`.
+pub const TAB_LIST_HEIGHT: Rems = Rems(2.25);
+
+/// The room around a list's triggers, shadcn's `p-[3px]`, in pixels as
+/// shadcn's is. It is also the focus ring's width, so the active trigger's
+/// ring stays inside the list.
+pub const TAB_LIST_PADDING: Pixels = px(3.);
+
+/// An attached trigger's height: 1.875rem, 30px at the default root size,
+/// the height of Brindle's tab faces.
+pub const TAB_ATTACHED_HEIGHT: Rems = Rems(1.875);
+
+/// The widest a dragged trigger's preview is drawn.
+pub const TAB_DRAG_MAX_WIDTH: Rems = Rems(15.);
+
+/// A tab list's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabListStyle {
+    /// `bg-muted` for the pill, nothing for `line`, the background for
+    /// `attached` (its inactive triggers sit on it).
+    pub background: Option<Hsla>,
+    /// `h-9`; an attached list is as tall as its triggers and its padding.
+    pub height: Option<Rems>,
+    /// `p-[3px]`; an attached list has none below, where its triggers meet
+    /// the content.
+    pub padding: Edges<Pixels>,
+    /// Between triggers: none in the pill, `gap-1` in `line`, 2px attached.
+    pub gap: Rems,
+    /// Whether the triggers sit at the bottom (`attached`) rather than in
+    /// the middle.
+    pub align_bottom: bool,
+    /// `rounded-lg`; `line` and `attached` are square.
+    pub radius: Rems,
+}
+
+/// shadcn's TabsList (`bg-muted rounded-lg p-[3px] h-9`, and the line
+/// variant's `gap-1 bg-transparent rounded-none`), and the attached list,
+/// in the colours of `t`.
+pub fn tab_list_style(variant: TabVariant, t: &Tokens) -> TabListStyle {
+    let all = Edges::all(TAB_LIST_PADDING);
+    match variant {
+        TabVariant::Default => TabListStyle {
+            background: Some(t.muted),
+            height: Some(TAB_LIST_HEIGHT),
+            padding: all,
+            gap: rems(0.),
+            align_bottom: false,
+            radius: t.radius_lg(),
+        },
+        TabVariant::Line => TabListStyle {
+            background: None,
+            height: Some(TAB_LIST_HEIGHT),
+            padding: all,
+            gap: rems(0.25),
+            align_bottom: false,
+            radius: rems(0.),
+        },
+        TabVariant::Attached => TabListStyle {
+            background: Some(t.background),
+            height: None,
+            padding: Edges { bottom: px(0.), ..all },
+            gap: rems(0.125),
+            align_bottom: true,
+            radius: rems(0.),
+        },
+    }
+}
+
+/// A trigger's own colours, which its owner may give it: used exactly when
+/// it is the active trigger of an attached list (a terminal tab drawn in
+/// its terminal's colours), and nowhere else.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TabColors {
+    /// The active surface, the `background` token when not given.
+    pub surface: Option<Hsla>,
+    /// The active text, the `foreground` token when not given.
+    pub text: Option<Hsla>,
+}
+
+/// A tab trigger's resolved look. `None` colours draw nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabStyle {
+    pub background: Option<Hsla>,
+    pub foreground: Hsla,
+    /// A 1px border in this colour (often transparent, shadcn's
+    /// `border-transparent`); `None` for no border at all.
+    pub border: Option<Hsla>,
+    pub hover_background: Option<Hsla>,
+    pub hover_foreground: Hsla,
+    /// The [`TAB_LINE_WIDTH`] line along the top edge.
+    pub top_line: Option<Hsla>,
+    /// shadcn's `shadow-sm` under the active pill.
+    pub shadow: bool,
+    /// The focus ring's colour while it shows.
+    pub ring: Hsla,
+    /// The border's colour while the ring shows (`focus-visible:border-ring`).
+    pub focus_border: Option<Hsla>,
+    pub radius: Rems,
+    /// Only the top corners are rounded (`attached`).
+    pub rounded_top_only: bool,
+    /// A fixed height (`attached`); otherwise the trigger fills the list.
+    pub height: Option<Rems>,
+    pub padding_left: Rems,
+    pub padding_right: Rems,
+    /// The right padding beside a close button.
+    pub padding_right_with_close: Rems,
+    /// Between the leading slot, the label and the adornments, `gap-1.5`.
+    pub gap: Rems,
+    /// A leading icon's side, `size-4`.
+    pub icon_size: Rems,
+    pub text_size: Rems,
+    pub font_weight: FontWeight,
+}
+
+/// shadcn's TabsTrigger (new-york-v4) for `variant` and the `active` state,
+/// in the colours of `t`; `colors` are the trigger's own, used when it is
+/// the active trigger of an attached list.
+///
+/// The pill and line triggers are `border border-transparent rounded-md
+/// px-2 py-1 text-sm font-medium gap-1.5`, inactive in
+/// `text-foreground/60 hover:text-foreground` (`dark:text-muted-foreground
+/// dark:hover:text-foreground`), active in `text-foreground`; the active
+/// pill is `bg-background shadow-sm` (`dark:bg-input/30
+/// dark:border-input`), and the active line trigger has no surface and,
+/// per the spec, a primary line along its top where shadcn draws a
+/// foreground underline below. Focused from the keyboard, both take
+/// `focus-visible:border-ring` and the ring.
+///
+/// Attached triggers sit on the background in the muted foreground, an
+/// inactive one hovered on the accent pair; the active one is on its
+/// surface (the `background` token unless the owner gave one) in its text
+/// colour (the `foreground` token unless given), with rounded top corners
+/// and a primary line along its top.
+pub fn tab_style(variant: TabVariant, active: bool, colors: TabColors, t: &Tokens) -> TabStyle {
+    let dark = t.dark;
+    let inactive_text = if dark { t.muted_foreground } else { t.foreground.opacity(0.6) };
+    let shadcn = |background, foreground, border, top_line, shadow| TabStyle {
+        background,
+        foreground,
+        border: Some(border),
+        hover_background: None,
+        hover_foreground: t.foreground,
+        top_line,
+        shadow,
+        ring: focus_ring(t),
+        focus_border: Some(t.ring),
+        radius: t.radius_md(),
+        rounded_top_only: false,
+        height: None,
+        // px-2
+        padding_left: rems(0.5),
+        padding_right: rems(0.5),
+        padding_right_with_close: rems(0.25),
+        gap: rems(0.375),
+        icon_size: rems(1.),
+        text_size: rems(0.875),
+        font_weight: FontWeight::MEDIUM,
+    };
+    let clear = transparent_black();
+    match (variant, active) {
+        (TabVariant::Default | TabVariant::Line, false) => shadcn(None, inactive_text, clear, None, false),
+        (TabVariant::Default, true) => {
+            let (background, border) = if dark { (t.input.opacity(0.3), t.input) } else { (t.background, clear) };
+            shadcn(Some(background), t.foreground, border, None, true)
+        }
+        (TabVariant::Line, true) => shadcn(None, t.foreground, clear, Some(t.primary), false),
+        (TabVariant::Attached, _) => {
+            let (background, foreground, hover_background, hover_foreground, top_line) = if active {
+                let surface = colors.surface.unwrap_or(t.background);
+                let text = colors.text.unwrap_or(t.foreground);
+                (Some(surface), text, None, text, Some(t.primary))
+            } else {
+                (None, t.muted_foreground, Some(t.accent), t.accent_foreground, None)
+            };
+            TabStyle {
+                background,
+                foreground,
+                border: None,
+                hover_background,
+                hover_foreground,
+                top_line,
+                shadow: false,
+                ring: focus_ring(t),
+                focus_border: None,
+                radius: t.radius_md(),
+                rounded_top_only: true,
+                height: Some(TAB_ATTACHED_HEIGHT),
+                padding_left: rems(0.75),
+                padding_right: rems(0.75),
+                padding_right_with_close: rems(0.25),
+                gap: rems(0.375),
+                icon_size: rems(0.875),
+                text_size: rems(0.875),
+                font_weight: FontWeight::NORMAL,
+            }
+        }
+    }
+}
+
+/// How narrow and how wide a trigger may get: it shrinks towards `min`
+/// when the list is crowded, grows with its label up to `max`, and past
+/// that the label is cut with an ellipsis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabWidth {
+    min: Rems,
+    max: Rems,
+}
+
+impl TabWidth {
+    /// Limits of `min` and `max`. A `max` below `min` is raised to it: as in
+    /// CSS, the minimum wins.
+    pub fn new(min: Rems, max: Rems) -> Self {
+        Self { min, max: Rems(max.0.max(min.0)) }
+    }
+
+    pub fn min(&self) -> Rems {
+        self.min
+    }
+
+    pub fn max(&self) -> Rems {
+        self.max
+    }
+
+    /// The width a trigger is drawn at when its content would take
+    /// `natural`, room allowing: its natural width, held between the two.
+    /// A crowded list shrinks it further, but never below `min`.
+    pub fn clamp(&self, natural: Rems) -> Rems {
+        Rems(natural.0.min(self.max.0).max(self.min.0))
+    }
+}
+
+/// A dragged trigger's preview: the background token with a primary
+/// border, as the tab being moved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabDragStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub radius: Rems,
+}
+
+pub fn tab_drag_style(t: &Tokens) -> TabDragStyle {
+    TabDragStyle { background: t.background, foreground: t.foreground, border: t.primary, radius: t.radius_md() }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::hsla;
@@ -1330,5 +1600,138 @@ mod tests {
         let s = menu_style(&t);
         assert_eq!((s.background, s.highlight), (t.popover, t.accent));
         assert_eq!(MENU_MIN_WIDTH, Rems(8.));
+    }
+
+    /// The spec's owner colours (`#1a1b26` on `#c0caf5`).
+    fn owner_colors() -> TabColors {
+        TabColors { surface: Some(gpui::rgb(0x1a1b26).into()), text: Some(gpui::rgb(0xc0caf5).into()) }
+    }
+
+    /// An active attached trigger is on its surface (the owner's, else the
+    /// background token) in its text colour (the owner's, else the
+    /// foreground token), with rounded top corners and a primary line on
+    /// top. The owner's colours are used exactly then: an inactive trigger
+    /// and the other variants ignore them.
+    #[test]
+    fn attached_active_uses_the_surface_override_else_the_background() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let own = owner_colors();
+            let s = tab_style(TabVariant::Attached, true, own, &t);
+            assert_eq!((s.background, s.foreground), (own.surface, own.text.unwrap()));
+            assert_eq!(s.top_line, Some(t.primary));
+            assert!(s.rounded_top_only);
+            // Hovering the active trigger changes nothing.
+            assert_eq!((s.hover_background, s.hover_foreground), (None, own.text.unwrap()));
+
+            let s = tab_style(TabVariant::Attached, true, TabColors::default(), &t);
+            assert_eq!((s.background, s.foreground), (Some(t.background), t.foreground));
+            // One override alone: the other colour is the token's.
+            let surface_only = TabColors { surface: own.surface, text: None };
+            let s = tab_style(TabVariant::Attached, true, surface_only, &t);
+            assert_eq!((s.background, s.foreground), (own.surface, t.foreground));
+
+            // Inactive: on the list's background (no surface of its own) in
+            // the muted foreground, whatever the owner gave it.
+            for colors in [own, TabColors::default()] {
+                let s = tab_style(TabVariant::Attached, false, colors, &t);
+                assert_eq!((s.background, s.foreground, s.top_line), (None, t.muted_foreground, None));
+            }
+            // The other variants never use them.
+            for variant in [TabVariant::Default, TabVariant::Line] {
+                for active in [false, true] {
+                    let plain = tab_style(variant, active, TabColors::default(), &t);
+                    assert_eq!(tab_style(variant, active, own, &t), plain, "{variant:?} active={active}");
+                }
+            }
+        }
+    }
+
+    /// The line variant marks the active trigger with a primary line on top
+    /// and the foreground text, and draws no surface; the attached one marks
+    /// it in primary too, and the pill doesn't.
+    #[test]
+    fn line_uses_the_primary_colour() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = tab_style(TabVariant::Line, true, TabColors::default(), &t);
+            assert_eq!((s.top_line, s.background, s.foreground), (Some(t.primary), None, t.foreground));
+            assert!(!s.shadow);
+            assert_eq!(s.border, Some(transparent_black()));
+            assert_eq!(tab_style(TabVariant::Line, false, TabColors::default(), &t).top_line, None);
+            assert_eq!(tab_style(TabVariant::Default, true, TabColors::default(), &t).top_line, None);
+            assert_eq!(tab_style(TabVariant::Attached, true, TabColors::default(), &t).top_line, Some(t.primary));
+        }
+    }
+
+    /// A hovered inactive attached trigger is on the accent pair; shadcn's
+    /// variants only bring the text up to the foreground.
+    #[test]
+    fn hover_uses_accent() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = tab_style(TabVariant::Attached, false, TabColors::default(), &t);
+            assert_eq!((s.hover_background, s.hover_foreground), (Some(t.accent), t.accent_foreground));
+            for variant in [TabVariant::Default, TabVariant::Line] {
+                let s = tab_style(variant, false, TabColors::default(), &t);
+                assert_eq!((s.hover_background, s.hover_foreground), (None, t.foreground), "{variant:?}");
+            }
+        }
+    }
+
+    /// The pill: inactive text at 60% (muted in a dark set), the active
+    /// trigger raised on the background with a shadow (`dark:bg-input/30
+    /// dark:border-input`), and the ring's border colour when focused.
+    #[test]
+    fn default_pill_follows_shadcn_in_both_sets() {
+        let t = Tokens::neutral_light();
+        let off = tab_style(TabVariant::Default, false, TabColors::default(), &t);
+        assert_eq!((off.background, off.foreground), (None, t.foreground.opacity(0.6)));
+        let on = tab_style(TabVariant::Default, true, TabColors::default(), &t);
+        assert_eq!((on.background, on.foreground, on.border), (Some(t.background), t.foreground, Some(transparent_black())));
+        assert!(on.shadow && !off.shadow);
+        let t = Tokens::neutral_dark();
+        let off = tab_style(TabVariant::Default, false, TabColors::default(), &t);
+        assert_eq!(off.foreground, t.muted_foreground);
+        let on = tab_style(TabVariant::Default, true, TabColors::default(), &t);
+        assert_eq!((on.background, on.border), (Some(t.input.opacity(0.3)), Some(t.input)));
+        for variant in TabVariant::ALL {
+            let s = tab_style(variant, true, TabColors::default(), &t);
+            assert_eq!(s.ring, focus_ring(&t));
+            let expected = if variant == TabVariant::Attached { None } else { Some(t.ring) };
+            assert_eq!(s.focus_border, expected, "{variant:?}");
+            assert_eq!((s.text_size, s.gap), (rems(0.875), rems(0.375)));
+        }
+    }
+
+    #[test]
+    fn tab_lists_are_shadcns_pill_and_line_and_the_attached_strip() {
+        let t = Tokens::neutral_light();
+        let pill = tab_list_style(TabVariant::Default, &t);
+        assert_eq!((pill.background, pill.height, pill.radius), (Some(t.muted), Some(rems(2.25)), t.radius_lg()));
+        assert_eq!(pill.padding, Edges::all(px(3.)));
+        let line = tab_list_style(TabVariant::Line, &t);
+        assert_eq!((line.background, line.gap, line.radius), (None, rems(0.25), rems(0.)));
+        let attached = tab_list_style(TabVariant::Attached, &t);
+        assert_eq!((attached.background, attached.height), (Some(t.background), None));
+        // Nothing below: the triggers meet the content there.
+        assert_eq!(attached.padding.bottom, px(0.));
+        assert!(attached.align_bottom && !pill.align_bottom);
+        // The padding is room for the focus ring.
+        assert_eq!(TAB_LIST_PADDING, crate::components::RING_WIDTH);
+    }
+
+    /// A trigger keeps its natural width between the limits, grows to the
+    /// minimum and stops at the maximum; limits that cross keep the minimum,
+    /// as CSS does, and never panic.
+    #[test]
+    fn tab_width_clamps_between_min_and_max() {
+        let width = TabWidth::new(rems(5.), rems(15.));
+        assert_eq!(width.clamp(rems(8.)), rems(8.));
+        assert_eq!(width.clamp(rems(2.)), rems(5.));
+        assert_eq!(width.clamp(rems(40.)), rems(15.));
+        assert_eq!((width.clamp(rems(5.)), width.clamp(rems(15.))), (rems(5.), rems(15.)));
+        let crossed = TabWidth::new(rems(10.), rems(4.));
+        assert_eq!((crossed.min(), crossed.max()), (rems(10.), rems(10.)));
+        for natural in [0., 4., 10., 30.] {
+            assert_eq!(crossed.clamp(rems(natural)), rems(10.), "natural {natural}");
+        }
     }
 }

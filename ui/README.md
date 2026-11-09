@@ -84,6 +84,33 @@ rule, not a convenience.
       shown view hides itself on Escape (`intercept_keystrokes`, which sees
       the key before any binding and lets it go on). A `Tooltip` also
       renders in place, as the gallery shows its look.
+    - `TabList` (`TabList::new(id).variant(..).active(ix).children(triggers)`)
+      and `TabTrigger` (`TabTrigger::new(id, label)`): shadcn's tab list and
+      triggers, with what a window's tab strip adds. The owner keeps the
+      triggers and which one is active and is asked to change them:
+      `on_activate(&TabActivate { index, by })` (`by` is the pointer or the
+      keyboard, so the owner decides where focus goes), `on_close(&index)`
+      and `on_move(&TabMove { from, to })`; `on_trigger_bounds` reports where
+      the triggers were laid out. Variants `Default` (shadcn's pill),
+      `Line` and `Attached` (a tab strip: the active trigger is drawn on a
+      surface with rounded top corners and a 2px primary line on top, in
+      the trigger's own `surface` and `text_color` when it has them, else
+      the background and foreground tokens; `tab_style`). The list is one
+      keyboard stop through the handle `.focus(&handle)` gives it, with
+      focus resting on the active trigger: left and right activate the
+      previous and next enabled trigger, wrapping, home/PageUp and
+      end/PageDown the first and last (`tab_key`, `tab_target`). A primary
+      press asks to activate and moves no focus. A trigger takes a leading
+      element (an icon), trailing adornments (status dots), a tooltip,
+      `disabled` (half opacity, skipped, asks nothing) and `closable`: a
+      ghost `IconXs` close button shown on the active trigger and on a
+      hovered one, whose press asks to close and doesn't activate; a middle
+      press on a closable trigger asks to close it too. `trigger_width`
+      (`TabWidth::new(min, max)`) lets triggers shrink to the minimum and
+      grow with their label to the maximum, cutting it with an ellipsis.
+      With `on_move`, a trigger dragged onto another of the same list
+      (`DraggedTab`, previewed as a pill with its label) asks to move there,
+      and a 2px primary bar marks the side it will land on (`drop_side`).
 
     Two of the builders are not controls:
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
@@ -157,7 +184,9 @@ is pinned by `closed_trigger_keys_match_radix` (`components/select.rs`) and
 the gallery's `select-closed-trigger-keys-match-radix` check; the dropdown
 trigger's by `trigger_keys_match_radix` (`components/dropdown_menu.rs`) and
 the gallery's `dropdown-enter-space-down-open-below-the-trigger-other-keys-do-not`
-check.
+check; the tab list's by `keys_map_as_radixs_roving_focus`
+(`components/tabs.rs`) and the gallery's
+`tabs-home-end-pageup-pagedown-go-to-the-ends-other-keys-do-nothing` check.
 
 Everywhere:
 
@@ -413,6 +442,80 @@ Command (shadcn's command is cmdk):
   Reason: cmdk's rule drops lines between two groups that are both still
   listed (add-brindle-ui design, "Command separators").
 
+Tabs (`TabList` and `TabTrigger`; shadcn's are Radix's Tabs over its
+RovingFocusGroup). Compared against Radix's `packages/react/tabs` source and
+shadcn's new-york-v4 `tabs`, read while implementing the ui-chrome change.
+What matches: the list is one Tab stop, entered on the active trigger; left
+and right move to the previous and next enabled trigger and activate it
+(automatic activation, Radix's default), wrapping at the ends (`loop`
+defaults to true on Radix's `TabsList`); home and PageUp go to the first,
+end and PageDown to the last; up and down do nothing in the horizontal list;
+a key with ctrl, alt, shift or super held is left alone; a disabled trigger
+is skipped and a press on it does nothing; a non-primary press activates
+nothing; the pill and line looks, sizes, colours (dark ones included) and the
+focus ring are shadcn's. The differences, mostly what a window's tab strip
+needs:
+
+- **A primary press activates but moves no focus**, and no press anywhere on
+  the list does. Radix's trigger focuses itself on the press, then
+  activates. Reason: the owner decides where focus goes (`TabActivate::by`):
+  Brindle's strip keeps it in the tab's terminal, and its list takes focus
+  only from the keyboard.
+- **Focus follows activation.** The list has one focus handle and focus
+  rests on whichever trigger the owner made active, so an owner that ignores
+  an arrow's request leaves focus where it was. Radix moves focus to the
+  next trigger whatever the owner does with the value. Reason: a
+  `RenderOnce` builder keeps no handle per trigger.
+- **Enter, space and Escape are left to the owner.** Radix's trigger
+  activates on enter and space, which in automatic mode changes nothing,
+  since the focused trigger is already the active one. Reason: the owner can
+  use them (Brindle's strip sends focus back to the terminal on them).
+- **A ctrl-press activates.** Radix's trigger ignores a press with ctrl.
+  Reason: as for `Select` (ctrl-click is a macOS context-menu click).
+- **Closable triggers** (an addition): a ghost `IconXs` close button at the
+  trigger's end, shown on the active trigger and on a hovered one, and
+  keeping its room when hidden so a trigger's width doesn't change under the
+  pointer. Its press asks the owner to close the trigger and doesn't
+  activate it, start a drag or move focus. Reason: a tab strip closes tabs.
+- **A middle press closes a closable trigger, on the press.** Radix's
+  trigger does nothing on a middle press; a browser's tab strip closes on
+  the middle release (`auxclick`). Reason: tab strips close on a middle
+  click, and Brindle's strip has always done it on the press.
+- **Adornments and a tooltip** (additions): a leading element (an icon),
+  trailing adornments (status and bell dots) and a tooltip on the trigger and
+  on its close button. Radix's trigger takes any children, so the slots are
+  an API shape rather than a behaviour; the tooltip is gpui's (see Tooltip).
+  Reason: a tab shows its program's state and its whole title.
+- **Widths** (an addition): with `trigger_width`, a trigger is as wide as its
+  label between a minimum and a maximum, shrinks towards the minimum when
+  the list runs out of room, and cuts its label with an ellipsis. shadcn's
+  triggers are `flex-1`, so in a list stretched wider than its content they
+  share its width evenly; ours keep their own width (without
+  `trigger_width`, their content's), and the rest of the list stays empty.
+  Reason: a tab strip's tabs are as wide as their titles up to a limit,
+  never spread across the window.
+- **Drag to reorder** (an addition): with `on_move`, a trigger dragged onto
+  another trigger of the same list asks the owner to move it there, and a
+  2px primary bar marks the side it will land on. Reason: tab strips
+  reorder tabs.
+- **The `Attached` variant** (an addition): triggers on the background in
+  the muted foreground, a hovered inactive one on the accent background, and
+  the active one on a surface with rounded top corners and a 2px primary line
+  along its top, so it joins the content below. Each trigger may carry its
+  own `surface` and `text_color`, used only while it is active. Reason: a
+  window's tab strip, whose active tab takes its terminal's colours (a
+  profile can theme a tab differently from the window).
+- **`Line` marks the active trigger with a 2px primary line along its
+  top.** shadcn's line variant underlines it, `bottom-[-5px]`, in the
+  foreground colour. Reason: the spec ("Tab list look"), so the line matches
+  the attached strip's and a zone header's active line.
+- **Triggers fill the list's height.** shadcn's are `h-[calc(100%-1px)]`.
+  Reason: gpui has no `calc()`; the difference is a pixel.
+- **Horizontal and left-to-right only, automatic activation only, and no
+  `TabsContent`.** Radix has `orientation`, `dir` and
+  `activationMode="manual"`, and its content panels. Missing features; the
+  owner shows what the active trigger stands for.
+
 Not verified against the upstream source here, so worth a check before
 relying on them:
 
@@ -428,8 +531,12 @@ relying on them:
 - Whether the current shadcn `SelectContent` defaults to `popper` or
   `item-aligned`.
 - From recollection, not from a source: browsers firing `contextmenu` on the
-  secondary press on Linux and macOS and on its release on Windows, and
-  floating-ui's `size` middleware leaving out collision padding by default.
+  secondary press on Linux and macOS and on its release on Windows,
+  floating-ui's `size` middleware leaving out collision padding by default,
+  and browsers' tab strips closing a tab on the middle release (`auxclick`).
+- The tabs' dark look (shadcn's active pill on `input` at 30% with an
+  `input` border) has unit tests of its colours but hasn't been looked at in
+  a capture; only the light tokens have.
 
 ## Wiring an app
 
@@ -502,8 +609,12 @@ toggle, dialogs (one that refuses to be dismissed), popovers in each window
 corner, selects and command lists inline, in a dialog and in a popover,
 a context menu target and two dropdown menus (one with descriptions and
 shortcuts, one of forty items that scrolls), toggles in each variant and
-size, and buttons and a plain element with tooltips (beside the tooltip's
-look drawn in place).
+size, buttons and a plain element with tooltips (beside the tooltip's
+look drawn in place), and tab lists in each variant: a pill list with a
+disabled trigger, a line list, an attached strip above a panel in the active
+tab's colours (closable, reorderable triggers with an icon, status and bell
+dots, tooltips and a long title cut at the maximum width) and a crowded
+strip whose triggers shrink to their minimum.
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,
@@ -518,7 +629,7 @@ machine someone is using.
 ## Testing
 
 ```sh
-cargo test -p brindle-ui                           # the pure parts: layers, focus cycle, placement, lists, menus, styles, tokens, EditState
+cargo test -p brindle-ui                           # the pure parts: layers, focus cycle, placement, lists, menus, tab keys, styles, tokens, EditState
 cargo clippy -p brindle-ui --all-targets           # the gallery included
 ```
 

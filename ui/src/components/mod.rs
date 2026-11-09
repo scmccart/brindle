@@ -43,6 +43,7 @@ pub mod popover;
 pub mod select;
 pub mod separator;
 pub mod switch;
+pub mod tabs;
 pub mod toggle;
 pub mod tooltip;
 
@@ -74,6 +75,7 @@ pub use select::{
 };
 pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
+pub use tabs::{DraggedTab, DropSide, TabActivate, TabKey, TabList, TabMove, TabTrigger, drop_side, tab_key, tab_target};
 pub use toggle::Toggle;
 pub use tooltip::{Tooltip, TooltipFor, TooltipView};
 

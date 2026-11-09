@@ -28,13 +28,14 @@ use std::rc::Rc;
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
     ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
-    MenuEvent, MenuItem, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator, Switch,
-    TextInput, Toggle, ToggleSize, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
+    MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
+    Switch, TabActivate, TabList, TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Toggle, ToggleSize,
+    ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    WindowOptions, div, prelude::*, px, rems, rgb, size,
 };
 
 /// Bounds the gallery records as components paint, by name, for the checks
@@ -156,6 +157,77 @@ fn long_entries() -> Vec<MenuEntry> {
         .collect()
 }
 
+/// A tab in one of the gallery's tab lists.
+#[derive(Clone, Debug)]
+pub struct DemoTab {
+    /// Its trigger's element id, kept when it moves.
+    pub id: usize,
+    pub label: SharedString,
+    disabled: bool,
+    /// The surface and text it is drawn in while active in an attached
+    /// list, as a terminal's background and foreground.
+    colors: Option<(u32, u32)>,
+    /// A leading icon, as a tmux window's marker.
+    icon: bool,
+    /// A status dot in this colour, and a bell dot.
+    status: Option<u32>,
+    bell: bool,
+}
+
+impl DemoTab {
+    fn new(id: usize, label: impl Into<SharedString>) -> Self {
+        Self { id, label: label.into(), disabled: false, colors: None, icon: false, status: None, bell: false }
+    }
+}
+
+/// One of the gallery's tab lists: its tabs and the active one.
+#[derive(Clone, Debug)]
+pub struct TabsDemo {
+    pub tabs: Vec<DemoTab>,
+    pub active: usize,
+}
+
+/// The tab lists as they start, by name:
+/// - `default` (pill): Account, Password (active), Billing (disabled),
+///   Settings;
+/// - `line`: Overview, Analytics (active), Reports, Notifications;
+/// - `attached`: a tab strip whose tabs close, move and show a tooltip:
+///   bash (active, the spec's `#1a1b26` on `#c0caf5`), a long nvim title
+///   (Solarized light colours), tmux (a leading icon, the tokens' colours)
+///   and a build with a status dot and a bell;
+/// - `crowded`: six sessions in a list too narrow for them.
+fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
+    let plain = |labels: &[&'static str]| -> Vec<DemoTab> {
+        labels.iter().enumerate().map(|(id, label)| DemoTab::new(id, *label)).collect()
+    };
+    let mut pill = plain(&["Account", "Password", "Billing", "Settings"]);
+    pill[2].disabled = true;
+    let line = plain(&["Overview", "Analytics", "Reports", "Notifications"]);
+    let attached = vec![
+        DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
+        DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
+        DemoTab { icon: true, ..DemoTab::new(2, "tmux: main") },
+        DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
+    ];
+    let crowded = (0..6).map(|n| DemoTab::new(n, format!("Session {}", n + 1))).collect();
+    HashMap::from([
+        ("default", TabsDemo { tabs: pill, active: 1 }),
+        ("line", TabsDemo { tabs: line, active: 1 }),
+        ("attached", TabsDemo { tabs: attached, active: 0 }),
+        ("crowded", TabsDemo { tabs: crowded, active: 0 }),
+    ])
+}
+
+/// The attached lists' trigger limits: 5rem to 15rem.
+fn demo_tab_width() -> TabWidth {
+    TabWidth::new(rems(5.), rems(15.))
+}
+
+/// A 6px dot, as a tab's status and bell adornments.
+fn dot(color: Hsla) -> Div {
+    div().flex_none().size(px(6.)).rounded_full().bg(color)
+}
+
 /// The label of entry `ix` of `entries`, for the menu log.
 fn entry_label(entries: &[MenuEntry], ix: usize) -> String {
     entries.get(ix).map_or_else(|| format!("#{ix}"), |entry| entry.label().to_string())
@@ -217,6 +289,11 @@ pub struct Gallery {
     long_dropdown: Entity<DropdownMenu>,
     /// What the menus chose, in order, as `menu:label`.
     menu_log: Vec<String>,
+    /// The tab lists' tabs and active indices, by list name.
+    tabs: HashMap<&'static str, TabsDemo>,
+    /// What the tab lists asked for, in order: `list:activate:N:pointer`,
+    /// `list:close:N`, `list:move:A->B`.
+    tab_log: Vec<String>,
     /// Each corner popover's panel bounds while it is open.
     corners: [Rc<Cell<Option<Bounds<Pixels>>>>; 4],
     scroll: ScrollHandle,
@@ -234,7 +311,8 @@ impl Gallery {
             [
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
-                "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger",
+                "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger", "tabs-default",
+                "tabs-line", "tabs-attached",
             ]
             .map(String::from),
         );
@@ -336,6 +414,8 @@ impl Gallery {
             dropdown,
             long_dropdown,
             menu_log: Vec::new(),
+            tabs: initial_tabs(),
+            tab_log: Vec::new(),
             corners: Default::default(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -874,6 +954,170 @@ impl Gallery {
         section.child(states).child(tooltips).child(look)
     }
 
+    /// The tab list called `name`, as it is now.
+    pub fn tabs_demo(&self, name: &str) -> &TabsDemo {
+        self.tabs.get(name).unwrap_or_else(|| panic!("no tab list named {name:?}"))
+    }
+
+    /// Makes the trigger at `ix` of `name` the active one, as the checks'
+    /// preconditions do.
+    pub fn set_tab_active(&mut self, name: &str, ix: usize, cx: &mut Context<Self>) {
+        if let Some(demo) = self.tabs.get_mut(name) {
+            demo.active = ix;
+        }
+        cx.notify();
+    }
+
+    /// Puts every tab list back as it started (the checks' reset).
+    pub fn reset_tabs(&mut self, cx: &mut Context<Self>) {
+        self.tabs = initial_tabs();
+        cx.notify();
+    }
+
+    fn activate_tab(&mut self, name: &str, request: &TabActivate, cx: &mut Context<Self>) {
+        let by = match request.by {
+            Modality::Pointer => "pointer",
+            Modality::Keyboard => "keyboard",
+        };
+        self.tab_log.push(format!("{name}:activate:{}:{by}", request.index));
+        self.set_tab_active(name, request.index, cx);
+    }
+
+    /// Closes the tab at `ix`; the active tab stays, or its right-hand
+    /// neighbour takes over (the left one at the end).
+    fn close_tab(&mut self, name: &str, ix: usize, cx: &mut Context<Self>) {
+        self.tab_log.push(format!("{name}:close:{ix}"));
+        if let Some(demo) = self.tabs.get_mut(name)
+            && ix < demo.tabs.len()
+        {
+            demo.tabs.remove(ix);
+            if ix < demo.active || demo.active >= demo.tabs.len() {
+                demo.active = demo.active.saturating_sub(1);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Moves the tab at `from` to `to`'s place; the active tab stays active.
+    fn move_tab(&mut self, name: &str, request: &TabMove, cx: &mut Context<Self>) {
+        let TabMove { from, to } = *request;
+        self.tab_log.push(format!("{name}:move:{from}->{to}"));
+        if let Some(demo) = self.tabs.get_mut(name)
+            && from < demo.tabs.len()
+        {
+            let active = demo.tabs.get(demo.active).map(|tab| tab.id);
+            let tab = demo.tabs.remove(from);
+            demo.tabs.insert(to.min(demo.tabs.len()), tab);
+            demo.active = demo.tabs.iter().position(|tab| Some(tab.id) == active).unwrap_or(0);
+        }
+        cx.notify();
+    }
+
+    /// The tab list called `name` in `variant`. Attached lists' tabs close
+    /// (with a tooltip on the button), move, show their title as a tooltip
+    /// and keep between 5 and 15rem. Each trigger's bounds are recorded as
+    /// `tab:NAME:IX`.
+    fn tab_list(&self, name: &'static str, variant: TabVariant, cx: &mut Context<Self>) -> TabList {
+        let demo = self.tabs_demo(name);
+        let attached = variant == TabVariant::Attached;
+        let primary = cx.ui_theme().primary;
+        let triggers: Vec<TabTrigger> = demo
+            .tabs
+            .iter()
+            .map(|tab| {
+                let mut trigger = TabTrigger::new(("tab", tab.id), tab.label.clone()).disabled(tab.disabled);
+                if attached {
+                    trigger = trigger
+                        .closable(true)
+                        .tooltip_for(tab.label.clone(), None)
+                        .close_tooltip(|_, _| Tooltip::new("Close tab").shortcut("ctrl-shift-w"));
+                }
+                if let Some((surface, text)) = tab.colors {
+                    trigger = trigger.surface(rgb(surface)).text_color(rgb(text));
+                }
+                if tab.icon {
+                    trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
+                }
+                if let Some(status) = tab.status {
+                    trigger = trigger.adornment(dot(rgb(status).into()));
+                }
+                if tab.bell {
+                    trigger = trigger.adornment(dot(primary));
+                }
+                trigger
+            })
+            .collect();
+        let (records, prefix) = (self.records.clone(), format!("tab:{name}:"));
+        let list = TabList::new(SharedString::from(format!("tabs-{name}")))
+            .variant(variant)
+            .active(demo.active)
+            .children(triggers)
+            .on_activate(cx.listener(move |this, request: &TabActivate, _, cx| this.activate_tab(name, request, cx)))
+            .on_trigger_bounds(move |bounds, _, _| {
+                let mut records = records.borrow_mut();
+                records.retain(|key, _| !key.starts_with(&prefix));
+                for (ix, bounds) in bounds.iter().enumerate() {
+                    records.insert(format!("{prefix}{ix}"), *bounds);
+                }
+            });
+        if !attached {
+            return list;
+        }
+        list.trigger_width(demo_tab_width())
+            .on_close(cx.listener(move |this, ix: &usize, _, cx| this.close_tab(name, *ix, cx)))
+            .on_move(cx.listener(move |this, request: &TabMove, _, cx| this.move_tab(name, request, cx)))
+    }
+
+    /// The tab lists in each variant: the pill and line ones as shadcn's,
+    /// the attached one as a tab strip above content in the active tab's
+    /// colours, and a crowded one whose triggers shrink to their minimum.
+    fn tabs_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let attached = self.tabs_demo("attached");
+        let current = attached.tabs.get(attached.active);
+        let (surface, text): (Hsla, Hsla) = current
+            .and_then(|tab| tab.colors)
+            .map_or((t.background, t.foreground), |(surface, text)| (rgb(surface).into(), rgb(text).into()));
+        let content = current.map_or_else(|| "No tabs left".to_string(), |tab| format!("The content of {}", tab.label));
+        let pill = self.tab_list("default", TabVariant::Default, cx).focus(&self.handle("tabs-default"));
+        let line = self.tab_list("line", TabVariant::Line, cx).focus(&self.handle("tabs-line"));
+        let strip = self.tab_list("attached", TabVariant::Attached, cx).focus(&self.handle("tabs-attached"));
+        let crowded = self.tab_list("crowded", TabVariant::Attached, cx);
+        let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Tabs", cx))
+            .child(row("Default").child(recorded(pill, "tabs:default", &self.records)))
+            .child(row("Line").child(recorded(line, "tabs:line", &self.records)))
+            .child(
+                div().flex().items_start().gap_3().child(label("Attached", cx)).child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .rounded(t.radius_md())
+                        .border_1()
+                        .border_color(t.border)
+                        .overflow_hidden()
+                        .child(strip)
+                        .child(div().h(px(56.)).px_3().py_2().bg(surface).text_color(text).child(content)),
+                ),
+            )
+            .child(
+                row("Crowded").child(
+                    div()
+                        .w(px(320.))
+                        .rounded(t.radius_md())
+                        .border_1()
+                        .border_color(t.border)
+                        .overflow_hidden()
+                        .child(crowded),
+                ),
+            )
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -897,6 +1141,7 @@ impl Gallery {
             ))
             .child(format!("Command: {}", self.command_log.last().map_or("—", String::as_str)))
             .child(format!("Menu: {}", self.menu_log.last().map_or("—", String::as_str)))
+            .child(format!("Tabs: {}", self.tab_log.last().map_or("—", String::as_str)))
             .child(format!("Hosts confirmed: {}", self.confirmed.borrow().join(", ")))
             .child(format!("Clicks: {}", if clicks.is_empty() { "—".to_string() } else { clicks.join(", ") }))
     }
@@ -954,7 +1199,10 @@ impl FocusStops for Gallery {
         stops.extend(named(&["icon-label"]));
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
-        stops.extend(named(&["checkbox", "switch", "toggle", "corner-0", "corner-1", "corner-2", "corner-3"]));
+        stops.extend(named(&[
+            "checkbox", "switch", "toggle", "tabs-default", "tabs-line", "tabs-attached", "corner-0", "corner-1", "corner-2",
+            "corner-3",
+        ]));
         stops
     }
 }
@@ -982,6 +1230,7 @@ impl Render for Gallery {
             .child(self.inputs_section(cx))
             .child(self.toggles_section(cx))
             .child(self.toggle_tooltip_section(cx))
+            .child(self.tabs_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -1300,9 +1549,12 @@ mod check {
         pub const WM_LBUTTONUP: u32 = 0x0202;
         pub const WM_RBUTTONDOWN: u32 = 0x0204;
         pub const WM_RBUTTONUP: u32 = 0x0205;
+        pub const WM_MBUTTONDOWN: u32 = 0x0207;
+        pub const WM_MBUTTONUP: u32 = 0x0208;
         pub const WM_KEYUP: u32 = 0x0101;
         pub const MK_LBUTTON: usize = 0x0001;
         pub const MK_RBUTTON: usize = 0x0002;
+        pub const MK_MBUTTON: usize = 0x0010;
         /// A key-up's lparam: repeat count 1, previous state down, transition up.
         pub const KEYUP_LPARAM: isize = 0xC000_0001u32 as isize;
 
@@ -1455,6 +1707,7 @@ mod check {
     fn button_messages(button: MouseButton) -> (u32, u32, usize) {
         match button {
             MouseButton::Right => (win::WM_RBUTTONDOWN, win::WM_RBUTTONUP, win::MK_RBUTTON),
+            MouseButton::Middle => (win::WM_MBUTTONDOWN, win::WM_MBUTTONUP, win::MK_MBUTTON),
             _ => (win::WM_LBUTTONDOWN, win::WM_LBUTTONUP, win::MK_LBUTTON),
         }
     }
@@ -1866,6 +2119,7 @@ mod check {
             }
             self.with(|gallery, window, cx| {
                 gallery.close_all(window, cx);
+                gallery.reset_tabs(cx);
                 gallery.scroll.set_offset(point(px(0.), px(0.)));
                 // Back to the gallery itself, as a page's body.
                 window.focus(&gallery.focus);
@@ -2083,6 +2337,40 @@ mod check {
         c.run_check("dropdown-press-drag-release-selects-the-third-item", check).await;
         let check = dropdown_enter_keyup(&mut c).await;
         c.run_check("dropdown-enter-key-up-does-not-reopen", check).await;
+        // Tabs: the keys, everywhere.
+        let check = tabs_arrow_activates(&mut c).await;
+        c.run_check("tabs-right-on-the-second-of-four-activates-the-third-and-focus-follows", check).await;
+        let check = tabs_wrap(&mut c).await;
+        c.run_check("tabs-right-on-the-last-wraps-to-the-first-and-left-back", check).await;
+        let check = tabs_disabled_skipped(&mut c).await;
+        c.run_check("tabs-right-skips-a-disabled-trigger", check).await;
+        let check = tabs_home_end(&mut c).await;
+        c.run_check("tabs-home-end-pageup-pagedown-go-to-the-ends-other-keys-do-nothing", check).await;
+        let check = tabs_one_stop(&mut c).await;
+        c.run_check("tabs-each-list-is-one-tab-stop", check).await;
+        let check = tabs_widths(&mut c).await;
+        c.run_check("tabs-triggers-keep-between-their-min-and-max-width", check).await;
+        // Tabs: what is drawn and the pointer (Windows only).
+        let check = tabs_ring(&mut c).await;
+        c.run_check("tabs-ring-paints-around-the-active-trigger-only", check).await;
+        let check = tabs_attached_colours(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-attached-active-trigger-in-the-owners-colours-others-on-the-background", check).await;
+        let check = tabs_press_activates(&mut c).await;
+        c.run_check("tabs-press-activates-and-moves-no-focus", check).await;
+        let check = tabs_disabled_press(&mut c).await;
+        c.run_check("tabs-press-on-a-disabled-trigger-does-nothing", check).await;
+        let check = tabs_close_button(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-close-button-closes-without-activating", check).await;
+        let check = tabs_middle_click(&mut c).await;
+        c.run_check("tabs-middle-press-asks-to-close-a-closable-trigger", check).await;
+        let check = tabs_drag(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-drag-first-onto-third-moves-it-with-a-drop-bar", check).await;
+        let check = tabs_tooltip(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-trigger-tooltip-shows-on-hover", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -3775,6 +4063,341 @@ mod check {
             return Err(Failure::Skip(NO_KEY_UP.to_string()));
         }
         ensure!(c.layers()? == 0, "the enter key-up reopened the menu");
+        Ok(())
+    }
+
+    // ---- tabs ----
+
+    use brindle_ui::set_modality;
+
+    fn tabs_of(c: &mut Checker, name: &'static str) -> Result<super::TabsDemo, Failure> {
+        c.with(move |gallery, _, _| gallery.tabs_demo(name).clone())
+    }
+
+    fn tab_active(c: &mut Checker, name: &'static str) -> Result<usize, Failure> {
+        Ok(tabs_of(c, name)?.active)
+    }
+
+    fn tab_labels(c: &mut Checker, name: &'static str) -> Result<Vec<String>, Failure> {
+        Ok(tabs_of(c, name)?.tabs.iter().map(|tab| tab.label.to_string()).collect())
+    }
+
+    fn tab_log(c: &mut Checker) -> Result<Vec<String>, Failure> {
+        c.with(|gallery, _, _| gallery.tab_log.clone())
+    }
+
+    /// The check's precondition: trigger `ix` of `name` is the active one.
+    async fn set_tab_active(c: &mut Checker, name: &'static str, ix: usize) -> Check {
+        c.with(move |gallery, _, cx| gallery.set_tab_active(name, ix, cx))?;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// Where trigger `ix` of `name` is laid out, scrolled into view.
+    async fn trigger(c: &mut Checker, name: &str, ix: usize) -> Result<Bounds<Pixels>, Failure> {
+        c.reveal(&format!("tab:{name}:{ix}")).await
+    }
+
+    /// The spec's scenario: focus on the second of four triggers, right
+    /// makes the third active, and focus stays on the list, which is focus
+    /// on the active trigger. The key counts as keyboard input, so the ring
+    /// shows.
+    async fn tabs_arrow_activates(c: &mut Checker) -> Check {
+        set_tab_active(c, "line", 1).await?;
+        c.focus("tabs-line").await?;
+        c.with(|_, window, cx| set_modality(window, Modality::Pointer, cx))?;
+        let before = tab_log(c)?.len();
+        c.key("right").await?;
+        let active = tab_active(c, "line")?;
+        ensure!(active == 2, "right on the second of four made trigger {active} active, not the third");
+        ensure!(c.focused_name("tabs-line")?, "focus left the list");
+        ensure!(c.modality()? == Modality::Keyboard, "right didn't count as keyboard input (no ring would show)");
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["line:activate:2:keyboard"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: right on the last trigger comes round to the
+    /// first, and left goes back round to the last.
+    async fn tabs_wrap(c: &mut Checker) -> Check {
+        set_tab_active(c, "line", 3).await?;
+        c.focus("tabs-line").await?;
+        c.key("right").await?;
+        let active = tab_active(c, "line")?;
+        ensure!(active == 0, "right on the last trigger made {active} active, not the first");
+        ensure!(c.focused_name("tabs-line")?, "focus left the list");
+        c.key("left").await?;
+        let active = tab_active(c, "line")?;
+        ensure!(active == 3, "left on the first trigger made {active} active, not the last");
+        Ok(())
+    }
+
+    /// The spec's scenario: the next trigger (Billing) is disabled, so
+    /// right makes the one after it active; left skips it on the way back.
+    async fn tabs_disabled_skipped(c: &mut Checker) -> Check {
+        set_tab_active(c, "default", 1).await?;
+        c.focus("tabs-default").await?;
+        let before = tab_log(c)?.len();
+        c.key("right").await?;
+        let active = tab_active(c, "default")?;
+        ensure!(active == 3, "right past the disabled Billing made {active} active, not Settings");
+        c.key("left").await?;
+        let active = tab_active(c, "default")?;
+        ensure!(active == 1, "left past the disabled Billing made {active} active, not Password");
+        let log = tab_log(c)?;
+        ensure!(
+            log[before..] == ["default:activate:3:keyboard", "default:activate:1:keyboard"],
+            "the owner heard {:?}",
+            &log[before..]
+        );
+        Ok(())
+    }
+
+    /// Home and PageUp go to the first trigger, end and PageDown to the
+    /// last (Radix's roving focus); up, down, modified arrows, enter, space
+    /// and escape change nothing and leave focus on the list.
+    async fn tabs_home_end(c: &mut Checker) -> Check {
+        set_tab_active(c, "line", 1).await?;
+        c.focus("tabs-line").await?;
+        for (key, expected) in [("end", 3), ("home", 0), ("pagedown", 3), ("pageup", 0)] {
+            c.key(key).await?;
+            let active = tab_active(c, "line")?;
+            ensure!(active == expected, "{key} made {active} active, not {expected}");
+        }
+        let before = tab_log(c)?.len();
+        for key in ["up", "down", "shift-right", "ctrl-right", "alt-left", "shift-end", "enter", "space", "escape"] {
+            c.key(key).await?;
+            let active = tab_active(c, "line")?;
+            ensure!(active == 0, "{key} made {active} active");
+            ensure!(c.focused_name("tabs-line")?, "{key} moved focus off the list");
+        }
+        let log = tab_log(c)?;
+        ensure!(log.len() == before, "the other keys asked for {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// Each list is one keyboard stop: Tab goes from list to list (not from
+    /// trigger to trigger) and on past the last; shift-Tab comes back.
+    async fn tabs_one_stop(c: &mut Checker) -> Check {
+        c.focus("toggle").await?;
+        for name in ["tabs-default", "tabs-line", "tabs-attached", "corner-0"] {
+            c.key("tab").await?;
+            ensure!(c.focused_name(name)?, "Tab didn't move on to {name}");
+        }
+        c.key("shift-tab").await?;
+        ensure!(c.focused_name("tabs-attached")?, "shift-Tab didn't come back to the attached list");
+        Ok(())
+    }
+
+    /// The long nvim title is cut at the 15rem maximum, the tmux tab keeps
+    /// its own width between the limits, and the crowded list's triggers
+    /// shrink to the 5rem minimum.
+    async fn tabs_widths(c: &mut Checker) -> Check {
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let limits = super::demo_tab_width();
+        let (min, max) = (limits.min().0 * rem, limits.max().0 * rem);
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let long = f32::from(trigger(c, "attached", 1).await?.size.width);
+        ensure!(close(long, max), "the long title's trigger is {long}px wide, not the {max}px maximum");
+        let tmux = f32::from(trigger(c, "attached", 2).await?.size.width);
+        ensure!(tmux > min + 0.5 && tmux < max - 0.5, "the tmux trigger is {tmux}px wide, not its own width within {min}..{max}");
+        for ix in 0..6 {
+            let width = f32::from(trigger(c, "crowded", ix).await?.size.width);
+            ensure!(close(width, min), "crowded trigger {ix} is {width}px wide, not the {min}px minimum");
+        }
+        Ok(())
+    }
+
+    /// Tabbed to, the list rings its active trigger, and nothing else; the
+    /// ring goes when Tab moves on.
+    async fn tabs_ring(c: &mut Checker) -> Check {
+        set_tab_active(c, "line", 1).await?;
+        c.focus("tabs-default").await?;
+        c.key("tab").await?;
+        ensure!(c.focused_name("tabs-line")?, "Tab didn't reach the line list");
+        let (background, ring) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (over(t.background, t.background), over(brindle_ui::focus_ring(t), t.background))
+        })?;
+        let (active, other) = (trigger(c, "line", 1).await?, trigger(c, "line", 0).await?);
+        let above = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() - px(1.5));
+        let shown = c.pixels(&[above(active), above(other)]).await?;
+        ensure!(near(shown[0], ring), "above the active trigger shows {:?}, not the ring {ring:?}", shown[0]);
+        ensure!(near(shown[1], background), "an inactive trigger shows a ring ({:?})", shown[1]);
+        c.key("tab").await?;
+        let after = c.pixel(above(active)).await?;
+        ensure!(near(after, background), "the ring stayed after Tab moved on ({after:?})");
+        Ok(())
+    }
+
+    /// The spec's scenarios: the active attached trigger is drawn on its
+    /// owner's `#1a1b26` with a primary line on top, the others on the
+    /// list's background; a trigger without colours of its own is active
+    /// on the background token, and the first, no longer active, drops its
+    /// own.
+    async fn tabs_attached_colours(c: &mut Checker) -> Check {
+        pointer_away(c).await?;
+        set_tab_active(c, "attached", 0).await?;
+        let (primary, background) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (over(t.primary, t.background), over(t.background, t.background))
+        })?;
+        let inside = |bounds: Bounds<Pixels>| point(bounds.left() + px(6.), bounds.bottom() - px(4.));
+        let top = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() + px(1.));
+        let (bash, nvim) = (trigger(c, "attached", 0).await?, trigger(c, "attached", 1).await?);
+        let shown = c.pixels(&[inside(bash), top(bash), inside(nvim), top(nvim)]).await?;
+        ensure!(near(shown[0], [0x1a, 0x1b, 0x26]), "the active trigger's surface is {:?}, not #1a1b26", shown[0]);
+        ensure!(near(shown[1], primary), "the active trigger's top line is {:?}, not primary {primary:?}", shown[1]);
+        ensure!(near(shown[2], background), "an inactive trigger is drawn on {:?}, not the background", shown[2]);
+        ensure!(!near(shown[3], primary), "an inactive trigger has a primary line");
+        set_tab_active(c, "attached", 2).await?;
+        let (bash, tmux) = (trigger(c, "attached", 0).await?, trigger(c, "attached", 2).await?);
+        let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash)]).await?;
+        ensure!(near(shown[0], background), "a trigger without colours is active on {:?}, not the background", shown[0]);
+        ensure!(near(shown[1], primary), "its top line is {:?}, not primary", shown[1]);
+        ensure!(near(shown[2], background), "the inactive bash trigger kept its own surface ({:?})", shown[2]);
+        Ok(())
+    }
+
+    /// A primary press activates the trigger (and tells the owner it was the
+    /// pointer) without moving focus: not to the list, not to the gallery
+    /// around it. A press in the list's padding does nothing.
+    async fn tabs_press_activates(c: &mut Checker) -> Check {
+        set_tab_active(c, "line", 1).await?;
+        let at = center(trigger(c, "line", 3).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        let active = tab_active(c, "line")?;
+        ensure!(active == 3, "a press on Notifications made {active} active");
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["line:activate:3:pointer"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("toggle")?, "the press moved focus off the toggle");
+        ensure!(!c.focused_name("tabs-line")?, "the press focused the list");
+        ensure!(c.modality()? == Modality::Pointer, "the press didn't set the pointer modality");
+        let list = c.recorded("tabs:line")?;
+        c.press(point(list.left() + px(1.5), list.center().y)).await?;
+        ensure!(tab_active(c, "line")? == 3, "a press in the list's padding changed the active trigger");
+        ensure!(tab_log(c)?.len() == before + 1, "a press in the list's padding asked for something");
+        ensure!(c.focused_name("toggle")?, "a press in the list's padding moved focus");
+        Ok(())
+    }
+
+    async fn tabs_disabled_press(c: &mut Checker) -> Check {
+        set_tab_active(c, "default", 1).await?;
+        let at = center(trigger(c, "default", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        ensure!(tab_active(c, "default")? == 1, "a press on the disabled Billing activated it");
+        ensure!(tab_log(c)?.len() == before, "a press on a disabled trigger asked for something");
+        ensure!(c.focused_name("toggle")?, "a press on a disabled trigger moved focus");
+        Ok(())
+    }
+
+    /// The centre of the close button of trigger `bounds`: an `IconXs`
+    /// button (1.5rem) against the trigger's 0.25rem right padding.
+    fn close_button(bounds: Bounds<Pixels>, rem: f32) -> Point<Pixels> {
+        point(bounds.right() - px(rem), bounds.center().y)
+    }
+
+    /// The spec's scenario: a press on an inactive trigger's close button
+    /// (shown under the pointer) asks to close it and doesn't activate it;
+    /// the active trigger's button closes it too.
+    async fn tabs_close_button(c: &mut Checker) -> Check {
+        set_tab_active(c, "attached", 0).await?;
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let labels = tab_labels(c, "attached")?;
+        let at = close_button(trigger(c, "attached", 1).await?, rem);
+        c.hover(at).await?;
+        c.tick().await;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["attached:close:1"], "the close button's press made the owner hear {:?}", &log[before..]);
+        let mut expected = labels.clone();
+        expected.remove(1);
+        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after closing the second", tab_labels(c, "attached")?);
+        ensure!(tab_active(c, "attached")? == 0, "closing the second tab changed the active one");
+        let at = close_button(trigger(c, "attached", 0).await?, rem);
+        c.press(at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before + 1..] == ["attached:close:0"], "the active trigger's close button made the owner hear {:?}", &log[before + 1..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: a middle press on a closable trigger asks to
+    /// close it; on a trigger that doesn't close it does nothing, and
+    /// neither moves focus.
+    async fn tabs_middle_click(c: &mut Checker) -> Check {
+        set_tab_active(c, "attached", 0).await?;
+        let labels = tab_labels(c, "attached")?;
+        let at = center(trigger(c, "attached", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Middle, at).await?;
+        c.button_up(MouseButton::Middle, at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["attached:close:2"], "the middle press made the owner hear {:?}", &log[before..]);
+        let mut expected = labels.clone();
+        expected.remove(2);
+        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after the middle press", tab_labels(c, "attached")?);
+        ensure!(c.focused_name("toggle")?, "the middle press moved focus");
+        let at = center(trigger(c, "line", 0).await?);
+        c.button_down(MouseButton::Middle, at).await?;
+        c.button_up(MouseButton::Middle, at).await?;
+        ensure!(tab_log(c)?.len() == before + 1, "a middle press on a trigger that doesn't close asked for something");
+        ensure!(tabs_of(c, "line")?.tabs.len() == 4, "a middle press closed a trigger that doesn't close");
+        ensure!(c.focused_name("toggle")?, "the middle press on the line list moved focus");
+        Ok(())
+    }
+
+    /// The spec's scenario: the first trigger dragged onto the third asks
+    /// to move it to the third place, and while it is over the third a
+    /// primary bar on that trigger's right marks where it will land.
+    async fn tabs_drag(c: &mut Checker) -> Check {
+        set_tab_active(c, "attached", 0).await?;
+        let labels = tab_labels(c, "attached")?;
+        let from = center(trigger(c, "attached", 0).await?);
+        // Near the third trigger's left edge, so the preview, which keeps the
+        // pointer where it pressed the first trigger, is clear of the bar on
+        // its right.
+        let target = trigger(c, "attached", 2).await?;
+        let to = point(target.left() + px(12.), target.center().y);
+        let primary = c.with(|_, _, cx| over(cx.ui_theme().primary, cx.ui_theme().primary))?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Left, from).await?;
+        c.button_move(MouseButton::Left, point(from.x + px(8.), from.y)).await?;
+        c.button_move(MouseButton::Left, to).await?;
+        let dragging = c.with(|_, _, cx| cx.has_active_drag())?;
+        // As the target is drawn now, with the bar.
+        let target = c.recorded("tab:attached:2")?;
+        let bar = c.pixel(point(target.right() - px(1.), target.center().y)).await;
+        c.button_up(MouseButton::Left, to).await?;
+        ensure!(dragging, "pressing the first trigger and moving onto the third started no drag");
+        let bar = bar?;
+        ensure!(near(bar, primary), "the third trigger's right edge shows {bar:?} while dragged over, not the primary bar");
+        let log = tab_log(c)?;
+        ensure!(
+            log[before..] == ["attached:activate:0:pointer", "attached:move:0->2"],
+            "the owner heard {:?}",
+            &log[before..]
+        );
+        let expected = vec![labels[1].clone(), labels[2].clone(), labels[0].clone(), labels[3].clone()];
+        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after the drop", tab_labels(c, "attached")?);
+        ensure!(tab_active(c, "attached")? == 2, "the moved tab didn't stay active");
+        Ok(())
+    }
+
+    /// A trigger's tooltip shows after the pointer rests on it.
+    async fn tabs_tooltip(c: &mut Checker) -> Check {
+        set_tab_active(c, "attached", 0).await?;
+        let at = center(trigger(c, "attached", 1).await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on a trigger showed {shown:?} at {sample:?}, not the tooltip {tooltip:?}");
         Ok(())
     }
 }
