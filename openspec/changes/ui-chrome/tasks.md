@@ -43,9 +43,9 @@
 
 ## 7. Profile menu
 
-- [ ] 7.1 Make `⌄` a `DropdownMenu` trigger listing the profiles in configuration order with the picker's description line and ctrl-alt-N shortcuts for the first nine, choosing an item through the picker's `open_profile` path (session shown here or by another Brindle included); add the hidden `OpenProfileMenu` action; verify unit tests of the item builder (names, shortcuts, more than nine profiles) and an e2e case that opens the menu with `--action open_profile_menu`, picks with `--key down`/`--key enter` and checks the new tab's profile
-- [ ] 7.2 Keep ctrl-shift-space, `open_profile_picker` and the palette unchanged; verify the existing `profiles`/picker e2e cases pass and a case checks the menu and the palette are never open together
-- [ ] 7.3 Update README.md (`⌄` row of the keybinding table, the removed-key note near the palette text, `focus_tab_strip`, the profile menu) and CLAUDE.md's manual-check list (the `⌄` check becomes "profile menu opens and toggles; ctrl-shift-space still toggles the palette"); verify the lines are present
+- [x] 7.1 Make `⌄` a `DropdownMenu` trigger listing the profiles in configuration order with the picker's description line and ctrl-alt-N shortcuts for the first nine, choosing an item through the picker's `open_profile` path (session shown here or by another Brindle included); add the hidden `OpenProfileMenu` action; verify unit tests of the item builder (names, shortcuts, more than nine profiles) and an e2e case that opens the menu with `--action open_profile_menu`, picks with `--key down`/`--key enter` and checks the new tab's profile
+- [x] 7.2 Keep ctrl-shift-space, `open_profile_picker` and the palette unchanged; verify the existing `profiles`/picker e2e cases pass and a case checks the menu and the palette are never open together
+- [x] 7.3 Update README.md (`⌄` row of the keybinding table, the removed-key note near the palette text, `focus_tab_strip`, the profile menu) and CLAUDE.md's manual-check list (the `⌄` check becomes "profile menu opens and toggles; ctrl-shift-space still toggles the palette"); verify the lines are present
 
 ## 8. Context menus on tabs and zone headers
 

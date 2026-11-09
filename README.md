@@ -437,7 +437,8 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-x | close zone (in a local tab) |
 | alt-arrows | move between zones (in a local tab) |
 | ctrl-shift-p | command palette (every command, with its shortcut) |
-| ctrl-shift-space, or the strip's `⌄` | new tab with a profile |
+| ctrl-shift-space | new tab with a profile (a list you can filter by typing) |
+| the strip's `⌄` | profile menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
 | ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
 | shift-pageup/down, shift-home/end | scrollback |
@@ -446,6 +447,19 @@ On first launch Brindle writes a commented config to
 | ctrl-= / ctrl-- / ctrl-0 | font size |
 | ctrl-shift-, | settings (general options, profiles, theme picker with live preview, custom theme editor) |
 | ctrl-, | edit config |
+
+The `⌄` button at the end of the tab strip opens the profile menu: every profile
+in config order, each with what it runs and its ctrl-alt-N key. Up/down move,
+enter opens the profile in a new tab, typing jumps to a profile whose name
+starts with the text, and escape, a click outside or `⌄` again closes the menu.
+Choosing a control-mode profile whose session the window already shows switches
+to that tab instead (the menu says "open in this window"), just as the
+ctrl-shift-space list does; that list is the one to use to filter by name.
+
+Two actions have no default key, for working without a mouse: bind
+`open_profile_menu` to open the profile menu below `⌄`, and `focus_tab_strip`
+to put keyboard focus on the tab strip, where left/right (wrapping), home and
+end switch tabs and enter or escape go back to the terminal.
 
 The settings dialog has three sections: General, Profiles and Theme. The section
 list is the dialog's first Tab stop (shift-tab from where the dialog opens):
@@ -528,8 +542,9 @@ colors with `search_match_background`, `search_match_foreground`,
 otherwise they come from the theme's yellow.
 
 **Breaking change:** ctrl-shift-p used to open the profile list and now opens the
-command palette. The profile list is on ctrl-shift-space and the `⌄` button; to
-get the old key back, bind `"ctrl-shift-p" = "open_profile_picker"`.
+command palette. The profile list is on ctrl-shift-space (the strip's `⌄` button
+opens the profile menu instead); to get the old key back, bind
+`"ctrl-shift-p" = "open_profile_picker"`.
 
 ### Session restore
 

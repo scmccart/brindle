@@ -614,6 +614,10 @@ pub struct Dump {
     pub settings: Option<String>,
     /// The palette's lines (its header first), when it is open.
     pub palette: Vec<String>,
+    /// An open menu's lines, when one is open: its header without the
+    /// prefix (`items=A|[B]|-|C highlighted=N|none`), then one line per item
+    /// (`label  description  [keys]`).
+    pub menu: Vec<String>,
     /// The focused text input, in a palette, the settings dialog or the
     /// find bar.
     pub input: Option<Input>,
@@ -629,7 +633,7 @@ pub struct Dump {
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
     /// Where keyboard focus is (`--- focus`): `terminal`, `palette`,
-    /// `settings`, `tabs` (the tab strip), `none` or `other`.
+    /// `settings`, `tabs` (the tab strip), `menu`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
     /// `list`, `session_end`, `close`, a field's or a button's label.
@@ -690,6 +694,9 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- palette ") {
                 dump.palette.push(rest.to_string());
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- menu ") {
+                dump.menu.push(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- input ") {
                 dump.input = parse_input(rest);
                 in_screen = false;
@@ -705,6 +712,8 @@ impl Dump {
                 in_screen = false;
             } else if !dump.palette.is_empty() && dump.input.is_none() && !in_screen {
                 dump.palette.push(line.to_string());
+            } else if !dump.menu.is_empty() && dump.input.is_none() && dump.focus.is_none() && !in_screen {
+                dump.menu.push(line.to_string());
             } else if in_screen {
                 screen.push(line);
             }
@@ -865,5 +874,23 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
     ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|tmux highlighted=0\n\
+         Shell  bash  [ctrl-alt-1]\nOff\ntmux  tmux control mode · e2e  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",
+    );
+    ensure!(dump.screen == ["hi"], "screen before the menu {:?}", dump.screen);
+    ensure!(
+        dump.menu
+            == [
+                "items=Shell|[Off]|tmux highlighted=0",
+                "Shell  bash  [ctrl-alt-1]",
+                "Off",
+                "tmux  tmux control mode · e2e  [ctrl-alt-3]"
+            ],
+        "menu {:?}",
+        dump.menu
+    );
+    ensure!(dump.palette.is_empty(), "palette {:?}", dump.palette);
+    ensure!(dump.focus.as_deref() == Some("menu"), "focus after the menu {:?}", dump.focus);
     Ok(())
 }

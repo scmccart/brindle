@@ -82,6 +82,10 @@ actions!(
         /// end then switch tabs, and enter or escape return focus to the
         /// terminal. Hidden (no label, no default key).
         FocusTabStrip,
+        /// Opens the profile menu below the strip's `⌄` button (closes it
+        /// when it reaches an open one, as from `--action`). Hidden (no
+        /// label, no default key).
+        OpenProfileMenu,
         // The sessions palette: end the highlighted session. (The palettes'
         // other keys are the command list's and the overlay's.)
         PickerKill,
@@ -192,6 +196,9 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
     // bindings (its keys are the tab list's own).
     ("focus_tab_strip", None, || Box::new(FocusTabStrip)),
+    // The `⌄` button's profile menu: unlabelled (the palette has "New Tab
+    // from Profile"), for `--action` and user bindings.
+    ("open_profile_menu", None, || Box::new(OpenProfileMenu)),
     // The settings dialog's own actions: unlabelled, so they stay out of the
     // command palette, but `--action` and user bindings can reach them.
     ("settings_up", None, || Box::new(SettingsUp)),
@@ -287,7 +294,7 @@ pub fn palette_commands(mut available: impl FnMut(&dyn Action) -> bool) -> Vec<(
 
 /// Default bindings follow GNOME Terminal / kitty conventions so plain
 /// ctrl-<letter> always reaches the shell (and tmux's prefix).
-fn default_bindings() -> Vec<KeyBinding> {
+pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let w = Some("Workspace");
     let t = Some("Terminal");
     let p = Some("Palette");

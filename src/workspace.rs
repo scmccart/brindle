@@ -22,8 +22,9 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Icon, Modality, Overlay as UiOverlay, TabActivate, TabList,
-    TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem, Modality,
+    Overlay as UiOverlay, TabActivate, TabList, TabMove, TabTrigger, TabVariant, TabWidth, TextInput, Tooltip,
+    TooltipFor as _, button_style,
 };
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
@@ -344,8 +345,8 @@ fn ignores_outside_press(tag: PaletteTag) -> bool {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    /// The palettes' modal slot. At most one overlay, a palette or the
-    /// settings dialog, is open at a time.
+    /// The palettes' modal slot. At most one overlay, a palette, the
+    /// settings dialog or the profile menu, is open at a time.
     palette: UiOverlay<Palette>,
     /// What the open palette is for, and the subscription to its events.
     palette_kind: Option<PaletteKind>,
@@ -354,6 +355,12 @@ pub struct Workspace {
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
     _settings_subscriptions: Vec<Subscription>,
+    /// The strip's `⌄` button and its profile menu, the third overlay: at
+    /// most one of the palette, the settings dialog and this menu is open.
+    /// Its items are rebuilt each time it opens (`refresh_profile_menu`),
+    /// since they say which sessions the window shows.
+    profile_menu: Entity<DropdownMenu>,
+    _profile_menu_subscription: Subscription,
     /// A theme being previewed by the settings dialog, shown on the tabs
     /// that follow the global theme.
     theme_preview: Option<Theme>,
@@ -393,6 +400,13 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
         static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let focus_handle = cx.focus_handle();
+        let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
+        // The menu has closed and given focus back to the tab by now.
+        let profile_menu_subscription = cx.subscribe_in(&profile_menu, window, |this, _, event: &MenuEvent, window, cx| {
+            let MenuEvent::Selected(ix) = *event;
+            this.open_profile(ix, window, cx);
+        });
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
@@ -401,9 +415,11 @@ impl Workspace {
             _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
+            profile_menu,
+            _profile_menu_subscription: profile_menu_subscription,
             theme_preview: None,
             profile_preview: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             strip_focus: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
@@ -1299,7 +1315,7 @@ impl Workspace {
         if !self.select(index, cx) {
             return;
         }
-        if !self.has_overlay() {
+        if !self.has_overlay(cx) {
             self.focus_active_tab(window, cx);
         }
     }
@@ -1344,7 +1360,7 @@ impl Workspace {
     /// `FocusTabStrip`: focus moves to the strip, on the active tab. Nothing
     /// happens while an overlay holds focus, or with no tabs.
     fn focus_tab_strip(&mut self, _: &FocusTabStrip, window: &mut Window, cx: &mut Context<Self>) {
-        if self.has_overlay() || self.tabs.is_empty() {
+        if self.has_overlay(cx) || self.tabs.is_empty() {
             return;
         }
         window.focus(&self.strip_focus);
@@ -1511,24 +1527,40 @@ impl Workspace {
         if self.close_palette_toggling(|k| matches!(k, PaletteKind::NewTab), window, cx) {
             return;
         }
-        let tab_focus = self.tabs.get(self.active).map(|t| t.focus_handle(cx));
-        let rows = Self::settings(cx)
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(ix, profile)| {
-                // Picking a session the window shows activates its tab; say so.
-                let shown = SessionKey::for_profile(profile).and_then(|key| self.find_session(&key, cx));
-                let state = if shown.is_some() { " · open in this window" } else { "" };
-                PaletteRow {
-                    label: profile.name.clone().into(),
-                    detail: Some(format!("{}{state}", profile.description()).into()),
-                    shortcut: tab_focus.as_ref().and_then(|f| shortcut(&NewTabWithProfile(ix), f, window)),
-                }
-            })
-            .collect();
+        let rows = self.profile_rows(window, cx);
         let palette = cx.new(|cx| Palette::list(rows, "Open profile…", cx));
         self.show_palette(palette, PaletteKind::NewTab, window, cx);
+    }
+
+    /// The profiles as the picker and the profile menu list them
+    /// ([`profile_rows`]), with the keys that open each in the active tab.
+    fn profile_rows(&self, window: &Window, cx: &App) -> Vec<PaletteRow> {
+        let focus = self.tabs.get(self.active).map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
+        let open = self.open_sessions(cx);
+        profile_rows(&Self::settings(cx).profiles, &open, |ix| shortcut(&NewTabWithProfile(ix), &focus, window))
+    }
+
+    /// Gives the profile menu the picker's rows as they are now, for its
+    /// next opening.
+    fn refresh_profile_menu(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let entries = profile_menu_entries(self.profile_rows(window, cx));
+        self.profile_menu.update(cx, |menu, _| menu.set_entries(entries));
+    }
+
+    /// `OpenProfileMenu`: opens the `⌄` button's menu below it, as a press
+    /// on the button does, or closes it when it is open. Another overlay
+    /// closes first, so the menu gives focus back to the tab.
+    fn open_profile_menu(&mut self, _: &OpenProfileMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.profile_menu.read(cx).is_open();
+        if self.has_overlay(cx) {
+            self.dismiss_overlay(window, cx);
+        }
+        if was_open {
+            return;
+        }
+        self.refresh_profile_menu(window, cx);
+        self.profile_menu.update(cx, |menu, cx| menu.open(window, cx));
+        cx.notify();
     }
 
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -1579,7 +1611,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.has_overlay() {
+        if !self.has_overlay(cx) {
             return false;
         }
         let same = self.palette_kind.as_ref().is_some_and(is);
@@ -1801,10 +1833,10 @@ impl Workspace {
         // The slot closes itself on the dialog's `DismissEvent`; this ends
         // the previews, as closing it any other way does.
         let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| this.end_previews(cx));
-        // A palette goes first, with focus back on the tab, so that is the
-        // focus the dialog records and puts back when it closes (the
-        // palette's input is gone by then).
-        if self.palette.is_open() {
+        // A palette or the profile menu goes first, with focus back on the
+        // tab, so that is the focus the dialog records and puts back when it
+        // closes (the palette's input is gone by then).
+        if self.has_overlay(cx) {
             self.dismiss_overlay(window, cx);
         }
         self._settings_subscriptions = vec![subscription, dismissed];
@@ -1812,8 +1844,9 @@ impl Workspace {
         cx.notify();
     }
 
-    fn has_overlay(&self) -> bool {
-        self.palette.is_open() || self.settings.is_open()
+    /// Whether a palette, the settings dialog or the profile menu is open.
+    fn has_overlay(&self, cx: &App) -> bool {
+        self.palette.is_open() || self.settings.is_open() || self.profile_menu.read(cx).is_open()
     }
 
     /// Closes whatever overlay is open and gives focus back to the tab.
@@ -1833,6 +1866,7 @@ impl Workspace {
         self._palette_subscription = None;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
+        self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.end_previews(cx);
     }
 
@@ -2049,6 +2083,10 @@ impl Workspace {
         if let Some(dialog) = self.settings.view() {
             out.push_str(&dialog.read(cx).describe(window, cx));
         }
+        if let Some(menu) = self.profile_menu.read(cx).menu() {
+            let menu = menu.read(cx);
+            out.push_str(&describe_menu(menu.entries(), menu.highlighted()));
+        }
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
         }
@@ -2059,7 +2097,8 @@ impl Workspace {
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
     /// active tab's active terminal), `palette` (inside an open palette),
     /// `settings stop=NAME` (inside the settings dialog, on the control
-    /// `NAME`), `tabs` (the tab strip, on the active tab), `none`, or
+    /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
+    /// menu, such as the profile menu), `none`, or
     /// `other`; then the window's `modality=keyboard|pointer`, which
     /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
@@ -2074,6 +2113,13 @@ impl Workspace {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
         } else if self.strip_focus.is_focused(window) {
             "tabs".to_string()
+        } else if self
+            .profile_menu
+            .read(cx)
+            .menu()
+            .is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx))
+        {
+            "menu".to_string()
         } else if window.focused(cx).is_none() {
             "none".to_string()
         } else {
@@ -2190,9 +2236,17 @@ impl Workspace {
         let new_tab = button("new-tab", Icon::Plus)
             .tooltip_with(tip("New tab", Box::new(NewTab)))
             .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)));
-        let profiles = button("profiles", Icon::ChevronDown)
-            .tooltip_with(tip("New tab from profile…", Box::new(OpenProfilePicker)))
-            .on_click(cx.listener(|this, _, window, cx| this.open_profile_picker(&OpenProfilePicker, window, cx)));
+        // `⌄` is the profile menu's trigger: the dropdown opens on the
+        // press. The capture phase runs before the dropdown's own handler,
+        // so the items it opens with are the picker's rows as they are now.
+        // While the menu is open its cover takes the press, which closes it.
+        let profiles = inert("profiles-press", self.profile_menu.clone().into_any_element()).capture_any_mouse_down(
+            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Left {
+                    this.refresh_profile_menu(window, cx);
+                }
+            }),
+        );
 
         // The caption buttons stay hand-built faces, in the ghost icon
         // button's size and hover colours, drawing icons rather than text
@@ -2303,7 +2357,7 @@ impl Workspace {
                     .gap_0p5()
                     .pl_1()
                     .child(inert("new-tab-press", new_tab.into_any_element()))
-                    .child(inert("profiles-press", profiles.into_any_element())),
+                    .child(profiles),
             )
             // Windows hit-tests this as the caption: drag, double-click,
             // the system menu and Snap. Only empty space is marked, since a
@@ -2414,7 +2468,86 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
     if near(outer) && near(inner) { known } else { inner }
 }
 
-/// The keys that run `action` in the element `focus`, as the palettes show them.
+/// The profiles as the profile picker and the profile menu list them, in
+/// configuration order: each one's name, what it runs and the keys bound to
+/// opening it (`shortcut(ix)`, the keymap's ctrl-alt-N for the first nine).
+/// A control-mode profile whose session the window shows (`open`) adds
+/// " · open in this window", since choosing it activates that tab.
+fn profile_rows(
+    profiles: &[Profile],
+    open: &[SessionKey],
+    shortcut: impl Fn(usize) -> Option<SharedString>,
+) -> Vec<PaletteRow> {
+    profiles
+        .iter()
+        .enumerate()
+        .map(|(ix, profile)| {
+            let shown = SessionKey::for_profile(profile).is_some_and(|key| open.contains(&key));
+            let state = if shown { " · open in this window" } else { "" };
+            PaletteRow {
+                label: profile.name.clone().into(),
+                detail: Some(format!("{}{state}", profile.description()).into()),
+                shortcut: shortcut(ix),
+            }
+        })
+        .collect()
+}
+
+/// The profile menu's items: the picker's rows, the description under the
+/// name and the keys at the right. There are no separators, so an item's
+/// index is its profile's.
+fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
+    rows.into_iter()
+        .map(|row| MenuItem { label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into())
+        .collect()
+}
+
+/// The strip's `⌄` button, as the profile menu's trigger builds it each
+/// frame: a ghost icon button with no `on_click` (the dropdown takes the
+/// press) and no focus handle (a press moves focus nowhere), whose tooltip
+/// names the picker's key, looked up in `focus` when it is shown.
+fn profile_menu_trigger(focus: FocusHandle) -> impl Fn(bool, &mut Window, &mut App) -> Button + 'static {
+    move |_open, _, cx| {
+        let focus = focus.clone();
+        Button::icon_only("profiles", Icon::ChevronDown)
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::IconXs)
+            .text_color(cx.ui_theme().muted_foreground)
+            .tooltip_with(move |window, _| {
+                Tooltip::new("New tab from profile…").shortcut_opt(shortcut(&OpenProfilePicker, &focus, window))
+            })
+    }
+}
+
+/// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
+/// highlighted=N`, with disabled items in brackets and separators as `-`;
+/// `N` is the highlighted entry's index from 0, separators counted (as
+/// `MenuEvent::Selected` counts), or `none`. Then each item on a line of
+/// its own as the palette prints its rows: `label  description  [keys]`.
+fn describe_menu(entries: &[MenuEntry], highlighted: Option<usize>) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry.item() {
+            None => "-".to_string(),
+            Some(item) if item.disabled => format!("[{}]", item.label),
+            Some(item) => item.label.to_string(),
+        })
+        .collect();
+    let highlighted = highlighted.map_or_else(|| "none".to_string(), |ix| ix.to_string());
+    let mut out = format!("--- menu items={} highlighted={highlighted}\n", items.join("|"));
+    for item in entries.iter().filter_map(MenuEntry::item) {
+        out.push_str(&item.label);
+        if let Some(description) = &item.description {
+            out.push_str(&format!("  {description}"));
+        }
+        if let Some(keys) = &item.shortcut {
+            out.push_str(&format!("  [{keys}]"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The rows of the palette shown after a session that was all the window
 /// showed ended: "Close window", then a new tab with each profile.
 /// Rows for a window whose only session ended. A control-mode profile
@@ -2448,9 +2581,16 @@ fn session_open_rows(profiles: &[Profile], picked: usize, open: &[SessionKey]) -
     rows
 }
 
+/// The keys that run `action` in the element `focus`, as the palettes show them.
 pub(crate) fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
-    Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
+    Some(keys_text(&binding))
+}
+
+/// A binding's keystrokes as the keymap prints them (`ctrl-alt-1`), with a
+/// space between strokes.
+fn keys_text(binding: &gpui::KeyBinding) -> SharedString {
+    binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into()
 }
 
 /// The command that opens `path` in `$VISUAL`, else `$EDITOR`, else nano,
@@ -2520,6 +2660,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_profile_picker))
+            .on_action(cx.listener(Self::open_profile_menu))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::open_settings))
             .when(Settings::get(cx).config.profiles.iter().any(|p| p.tmux == TmuxMode::Control), |d| {
@@ -2591,7 +2732,8 @@ impl Render for Workspace {
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
             // Last in the tree, so a modal backdrop paints above the rest
-            // (one of the two is open at most).
+            // (one of the two is open at most; the profile menu is drawn
+            // deferred from the strip, and only while neither is open).
             .children(self.palette.render(window, cx))
             .children(self.settings.render(window, cx));
 
@@ -2752,6 +2894,101 @@ mod tests {
         let rows = session_open_rows(&config.profiles, 0, &open);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
         assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: classic"]);
+    }
+
+    /// The keys `shortcut` shows for `action` in a local tab's terminal with
+    /// the default keymap: the last binding that matches there and isn't
+    /// shadowed, as gpui's `highest_precedence_binding_for_action_in` finds it.
+    fn default_keys(keymap: &gpui::Keymap, action: &dyn Action) -> Option<SharedString> {
+        let contexts: Vec<gpui::KeyContext> =
+            ["Workspace", "ZoneTree", "Terminal"].iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+        keymap
+            .bindings_for_action(action)
+            .rev()
+            .find(|binding| {
+                let (found, _) = keymap.bindings_for_input(binding.keystrokes(), &contexts);
+                found.first().is_some_and(|f| f.action().partial_eq(binding.action()))
+            })
+            .map(keys_text)
+    }
+
+    fn text(s: &Option<SharedString>) -> Option<&str> {
+        s.as_ref().map(|s| s.as_ref())
+    }
+
+    /// The picker's rows and the menu's items: names in configuration
+    /// order, what each runs (a control-mode profile names its session, and
+    /// says so when the window shows it) and ctrl-alt-N from the keymap.
+    #[test]
+    fn profile_rows_and_menu_items_match_the_picker() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\ncommand = \"bash\"\n\
+             [[profiles]]\nname = \"tmux\"\ntmux = \"control\"\ntmux_session = \"main\"\n\
+             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n",
+        )
+        .unwrap();
+        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
+        let open = [SessionKey::for_profile(&config.profiles[1]).unwrap()];
+        let build = || profile_rows(&config.profiles, &open, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));
+        let rows = build();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
+        assert_eq!(labels, ["Shell", "tmux", "work"]);
+        assert_eq!(text(&rows[0].detail), Some(config.profiles[0].description().as_str()));
+        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main · open in this window"));
+        assert_eq!(text(&rows[2].detail), Some("tmux control mode · work"));
+        let keys: Vec<Option<&str>> = rows.iter().map(|r| text(&r.shortcut)).collect();
+        assert_eq!(keys, [Some("ctrl-alt-1"), Some("ctrl-alt-2"), Some("ctrl-alt-3")]);
+
+        // One item per row, in the same order, with nothing between them, so
+        // `MenuEvent::Selected(ix)` is profile `ix`.
+        let entries = profile_menu_entries(build());
+        assert_eq!(entries.len(), rows.len());
+        for (entry, row) in entries.iter().zip(&rows) {
+            let item = entry.item().expect("a separator in the profile menu");
+            assert_eq!(item.label, row.label);
+            assert_eq!(item.description, row.detail);
+            assert_eq!(item.shortcut, row.shortcut);
+            assert!(!item.disabled);
+        }
+
+        // Nothing open: no profile says "open in this window".
+        let rows = profile_rows(&config.profiles, &[], |_| None);
+        assert!(rows.iter().all(|r| !r.detail.as_ref().is_some_and(|d| d.contains("open in"))));
+        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main"));
+    }
+
+    /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth
+    /// and eleventh are listed with no keys.
+    #[test]
+    fn only_the_first_nine_profiles_have_keys() {
+        let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
+        let config = Config::parse(&toml).unwrap();
+        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
+        let entries = profile_menu_entries(profile_rows(&config.profiles, &[], |ix| {
+            default_keys(&keymap, &NewTabWithProfile(ix))
+        }));
+        assert_eq!(entries.len(), 11);
+        for (ix, entry) in entries.iter().enumerate() {
+            let item = entry.item().unwrap();
+            assert_eq!(item.label.as_ref(), format!("p{}", ix + 1));
+            let want = (ix < 9).then(|| format!("ctrl-alt-{}", ix + 1));
+            assert_eq!(text(&item.shortcut), want.as_deref(), "profile {}", ix + 1);
+        }
+    }
+
+    #[test]
+    fn menus_dump_their_items_and_highlight() {
+        let entries = vec![
+            MenuItem::new("Shell").description("bash").shortcut("ctrl-alt-1").into(),
+            MenuItem::new("Off").disabled(true).into(),
+            MenuEntry::Separator,
+            MenuItem::new("tmux").into(),
+        ];
+        assert_eq!(
+            describe_menu(&entries, None),
+            "--- menu items=Shell|[Off]|-|tmux highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\ntmux\n"
+        );
+        assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|tmux highlighted=3\n"));
     }
 
     #[test]
