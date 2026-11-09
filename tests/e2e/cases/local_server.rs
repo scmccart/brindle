@@ -644,14 +644,14 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
         .profile("Shell")
         .default_profile("Shell")
         .action("attach_session")
-        .action("picker_kill")
-        .action("picker_confirm")
+        .key("ctrl-shift-delete")
+        .key("enter")
         .action("attach_session")
         .dump_at(14.0)
         .run()?;
     ensure!(out.dump.tabs.len() == 2, "tabs: {:?}", out.dump.tabs);
     screen_has(&out, "older-2")?;
-    // Open, with no rows (its placeholder says "No detached sessions").
+    // Open, with no rows (its empty message says "No detached sessions").
     ensure!(
         out.dump.palette.len() == 1 && out.dump.palette[0].starts_with("list "),
         "palette: {:?}",

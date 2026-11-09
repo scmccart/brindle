@@ -78,11 +78,8 @@ actions!(
         AttachSession,
         /// Consumes a key without doing anything (see the ctrl-shift-d guard).
         Swallow,
-        // Palette navigation.
-        PickerUp,
-        PickerDown,
-        PickerConfirm,
-        PickerCancel,
+        // The sessions palette: end the highlighted session. (The palettes'
+        // other keys are the command list's and the overlay's.)
         PickerKill,
         // Settings dialog.
         SettingsUp,
@@ -218,10 +215,13 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("list_last", None, || Box::new(brindle_ui::ListLast)),
     ("list_confirm", None, || Box::new(brindle_ui::ListConfirm)),
     // Palette navigation and text editing, for `--action` and user bindings.
-    ("picker_up", None, || Box::new(PickerUp)),
-    ("picker_down", None, || Box::new(PickerDown)),
-    ("picker_confirm", None, || Box::new(PickerConfirm)),
-    ("picker_cancel", None, || Box::new(PickerCancel)),
+    // A palette's keys are its command list's and its overlay's, so these
+    // names stand for the shared actions (enter in a prompt is
+    // `ListConfirm` too); `picker_kill` is the sessions palette's own.
+    ("picker_up", None, || Box::new(brindle_ui::ListUp)),
+    ("picker_down", None, || Box::new(brindle_ui::ListDown)),
+    ("picker_confirm", None, || Box::new(brindle_ui::ListConfirm)),
+    ("picker_cancel", None, || Box::new(brindle_ui::Dismiss)),
     ("picker_kill", None, || Box::new(PickerKill)),
     ("text_input_left", None, || Box::new(brindle_ui::TextInputLeft)),
     ("text_input_right", None, || Box::new(brindle_ui::TextInputRight)),
@@ -354,13 +354,12 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-right", TmuxFocusRight, x),
         KeyBinding::new("alt-up", TmuxFocusUp, x),
         KeyBinding::new("alt-down", TmuxFocusDown, x),
-        KeyBinding::new("up", PickerUp, p),
-        KeyBinding::new("down", PickerDown, p),
-        KeyBinding::new("ctrl-p", PickerUp, p),
-        KeyBinding::new("ctrl-n", PickerDown, p),
-        KeyBinding::new("enter", PickerConfirm, p),
-        KeyBinding::new("escape", PickerCancel, p),
+        // A palette's list keys and escape come from its command list
+        // (`UiList`, `UiCommand`) and overlay (`UiLayer`). The host adds
+        // the sessions palette's kill, and enter for a prompt, which submits
+        // as a one-field form does (a list's `UiList` enter is nearer).
         KeyBinding::new("ctrl-shift-delete", PickerKill, p),
+        KeyBinding::new("enter", brindle_ui::ListConfirm, p),
         // The section list: the dialog's first Tab stop, a vertical tab
         // list whose keys switch sections at once (Radix's vertical Tabs).
         KeyBinding::new("up", SettingsSectionPrev, sl),
@@ -634,6 +633,57 @@ mod tests {
             assert_eq!(first("ctrl-pagedown", contexts), Some("brindle::SettingsSectionNext"));
             assert_eq!(first("ctrl-pageup", contexts), Some("brindle::SettingsSectionPrev"));
         }
+    }
+
+    /// A palette's keys, as gpui resolves them with focus in a list's
+    /// filter and in a prompt's input: each `picker_*` name stands for the
+    /// action its key resolves to, so `--action picker_*` and a user's
+    /// binding of one do what the key does.
+    #[test]
+    fn palette_keys_and_picker_aliases() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(default_bindings());
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            ["Workspace", "UiLayer", "UiFocusScope", "Palette"]
+                .iter()
+                .chain(names)
+                .map(|c| KeyContext::parse(c).unwrap())
+                .collect()
+        };
+        let list = stack(&["UiCommand", "UiList", "TextInput"]);
+        let prompt = stack(&["TextInput"]);
+        let first = |key: &str, contexts: &[KeyContext]| -> Box<dyn Action> {
+            let (bindings, pending) = keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], contexts);
+            assert!(!pending, "{key}");
+            bindings.first().unwrap_or_else(|| panic!("{key} is unbound")).action().boxed_clone()
+        };
+        let alias = |name: &str| action_by_name(name).unwrap_or_else(|| panic!("{name} does not resolve"));
+        for (key, name) in [
+            ("up", "picker_up"),
+            ("down", "picker_down"),
+            ("ctrl-p", "picker_up"),
+            ("ctrl-n", "picker_down"),
+            ("enter", "picker_confirm"),
+            ("escape", "picker_cancel"),
+            ("ctrl-shift-delete", "picker_kill"),
+        ] {
+            let action = first(key, &list);
+            assert!(action.partial_eq(&*alias(name)), "list: {key} -> {}, {name} -> {}", action.name(), alias(name).name());
+        }
+        assert!(alias("picker_up").partial_eq(&brindle_ui::ListUp));
+        assert!(alias("picker_down").partial_eq(&brindle_ui::ListDown));
+        assert!(alias("picker_confirm").partial_eq(&brindle_ui::ListConfirm));
+        assert!(alias("picker_cancel").partial_eq(&brindle_ui::Dismiss));
+        assert!(alias("picker_kill").partial_eq(&PickerKill));
+        // Home and end edit the filter; tab stays in the palette.
+        assert!(first("home", &list).partial_eq(&brindle_ui::TextInputHome));
+        assert!(first("end", &list).partial_eq(&brindle_ui::TextInputEnd));
+        assert!(first("tab", &list).partial_eq(&brindle_ui::FocusNext));
+        assert!(first("shift-tab", &list).partial_eq(&brindle_ui::FocusPrev));
+        // A prompt: enter submits and escape dismisses, by the same names.
+        assert!(first("enter", &prompt).partial_eq(&*alias("picker_confirm")));
+        assert!(first("escape", &prompt).partial_eq(&*alias("picker_cancel")));
+        assert!(first("tab", &prompt).partial_eq(&brindle_ui::FocusNext));
     }
 
     /// Enter on a focused button in the dialog: its only binding is

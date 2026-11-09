@@ -700,7 +700,7 @@ decides what happens next:
 - `"new_tab"`: a tab with your default profile opens in their place, or with the
   first non-tmux profile if the default is a control-mode one.
 - `"ask"`: a palette offers "Close window", or a new tab with any profile.
-  Escape closes the window.
+  Escape closes the window; a click outside leaves the question open.
 
 It can also be changed in the settings dialog's General section.
 
@@ -731,7 +731,7 @@ instead, with these rows:
 - "New tmux session…": create a new session instead (see below);
 - "New tab: <profile>" for your other profiles.
 
-Escape or a click outside does nothing. Profiles with the same `command`,
+Escape opens nothing, and a click outside leaves the question open. Profiles with the same `command`,
 `tmux_args` and `tmux_session` count as the same session.
 
 **tmux: New Session** (command palette, from any tab while you have a

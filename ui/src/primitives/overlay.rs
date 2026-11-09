@@ -107,8 +107,22 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     /// view's own controls close the view as before. Overlays opened above
     /// it keep their own outside presses.
     pub fn ignore_outside_press(mut self) -> Self {
-        self.outside_press_dismisses = false;
+        self.set_ignore_outside_press(true);
         self
+    }
+
+    /// [`Overlay::ignore_outside_press`] on a slot the owner already
+    /// keeps, for a slot whose views differ (a palette that asks a
+    /// question ignores outside presses, a plain one doesn't). It takes
+    /// effect from the next frame, so it can be set before `open` or while
+    /// a view is shown.
+    pub fn set_ignore_outside_press(&mut self, ignore: bool) {
+        self.outside_press_dismisses = !ignore;
+    }
+
+    /// Whether a press outside the view requests its dismissal.
+    pub fn outside_press_dismisses(&self) -> bool {
+        self.outside_press_dismisses
     }
 
     /// A slot for a non-modal view (a popover): it blocks the pointer only
@@ -356,6 +370,37 @@ mod tests {
         assert!(!outside_press_requests_dismissal(true, false));
         // An ignoring slot asks for nothing, even on top.
         assert!(!outside_press_requests_dismissal(false, true));
+    }
+
+    /// The setter has the constructor flag's effect, and can be turned
+    /// back off on the same slot.
+    #[test]
+    fn the_outside_press_flag_can_be_set_on_a_kept_slot() {
+        struct Never;
+        impl gpui::EventEmitter<DismissEvent> for Never {}
+        impl Focusable for Never {
+            fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+                unreachable!()
+            }
+        }
+        impl gpui::Render for Never {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        impl FocusStops for Never {
+            fn stops(&self, _: &App) -> Vec<gpui::FocusHandle> {
+                Vec::new()
+            }
+        }
+        let mut slot = Overlay::<Never>::modal();
+        assert!(slot.outside_press_dismisses());
+        slot.set_ignore_outside_press(true);
+        assert!(!slot.outside_press_dismisses());
+        assert_eq!(slot.outside_press_dismisses(), Overlay::<Never>::modal().ignore_outside_press().outside_press_dismisses());
+        slot.set_ignore_outside_press(false);
+        assert!(slot.outside_press_dismisses());
+        assert!(outside_press_requests_dismissal(slot.outside_press_dismisses(), true));
     }
 
     #[test]
