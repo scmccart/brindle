@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, DismissEvent, ElementId, Entity, EventEmitter, Focusable, Hsla,
-    InteractiveElement, IntoElement, ManagedView, MouseButton, ParentElement, Point, Styled, Subscription,
+    InteractiveElement, IntoElement, ManagedView, ParentElement, Point, Styled, Subscription,
     WeakFocusHandle, Window, anchored, deferred, div, ease_in_out, hsla,
 };
 
@@ -293,12 +293,13 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
             let placed = place(panel.with_animation(enter_id, enter, |panel, delta| panel.opacity(delta)).into_any_element());
             if self.blocks_outside {
                 // The cover first, so the panel paints (and hit-tests) above
-                // it. A press on it is pointer input; its default (moving
-                // focus) is prevented, so focus stays in the view until the
-                // dismissal gives it back. Both are out of flow.
+                // it. A press on it, with any button, is pointer input; its
+                // default (moving focus) is prevented, so focus stays in the
+                // view until the dismissal gives it back. Both are out of
+                // flow.
                 let size = window.viewport_size();
                 let cover = anchored().position(Point::default()).child(
-                    div().w(size.width).h(size.height).occlude().on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    div().w(size.width).h(size.height).occlude().on_any_mouse_down(|_, window, cx| {
                         set_modality(window, Modality::Pointer, cx);
                         window.prevent_default();
                     }),

@@ -695,6 +695,58 @@ pub fn tooltip_style(t: &Tokens) -> TooltipStyle {
     }
 }
 
+/// A menu's least width, shadcn's `min-w-[8rem]`.
+pub const MENU_MIN_WIDTH: Rems = Rems(8.);
+
+/// A menu's resolved look: the panel, its items and separators.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MenuStyle {
+    /// The panel: `bg-popover text-popover-foreground border`.
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    /// The highlighted item: `focus:bg-accent focus:text-accent-foreground`.
+    pub highlight: Hsla,
+    pub highlight_foreground: Hsla,
+    /// An item's description line and its shortcut's keycaps:
+    /// `text-muted-foreground`, on the `muted` keycaps of `Kbd`.
+    pub muted: Hsla,
+    /// A separator: `bg-border`.
+    pub separator: Hsla,
+    /// The panel's corners, `rounded-md`.
+    pub radius: Rems,
+    /// An item's corners, `rounded-sm`.
+    pub item_radius: Rems,
+    /// An item's label, `text-sm`.
+    pub text_size: Rems,
+    /// A description line, `text-xs`.
+    pub description_size: Rems,
+}
+
+/// shadcn's DropdownMenu and ContextMenu (new-york-v4): the content
+/// `bg-popover text-popover-foreground rounded-md border p-1 shadow-md
+/// min-w-[8rem]`, the item `rounded-sm px-2 py-1.5 text-sm gap-2
+/// focus:bg-accent focus:text-accent-foreground data-[disabled]:opacity-50`,
+/// the separator `-mx-1 my-1 h-px bg-border` and the shortcut
+/// `text-muted-foreground ml-auto`, in the colours of `t`. The description
+/// line is the crate's addition, in the shortcut's muted colour at
+/// `text-xs`.
+pub fn menu_style(t: &Tokens) -> MenuStyle {
+    MenuStyle {
+        background: t.popover,
+        foreground: t.popover_foreground,
+        border: t.border,
+        highlight: t.accent,
+        highlight_foreground: t.accent_foreground,
+        muted: t.muted_foreground,
+        separator: t.border,
+        radius: t.radius_md(),
+        item_radius: t.radius_sm(),
+        text_size: rems(0.875),
+        description_size: rems(0.75),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::hsla;
@@ -1258,5 +1310,25 @@ mod tests {
         t.background = hsla(0.1, 0.3, 0.95, 1.);
         let s = tooltip_style(&t);
         assert_eq!((s.background, s.foreground), (t.foreground, t.background));
+    }
+
+    /// A menu is a popover-coloured panel with an accent highlight, muted
+    /// shortcuts and descriptions, and border-coloured separators.
+    #[test]
+    fn menu_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = menu_style(&t);
+            assert_eq!((s.background, s.foreground, s.border), (t.popover, t.popover_foreground, t.border));
+            assert_eq!((s.highlight, s.highlight_foreground), (t.accent, t.accent_foreground));
+            assert_eq!((s.muted, s.separator), (t.muted_foreground, t.border));
+            assert_eq!((s.radius, s.item_radius), (t.radius_md(), t.radius_sm()));
+            assert_eq!((s.text_size, s.description_size), (rems(0.875), rems(0.75)));
+        }
+        let mut t = Tokens::neutral_light();
+        t.popover = hsla(0.6, 0.5, 0.2, 1.);
+        t.accent = hsla(0.1, 0.3, 0.95, 1.);
+        let s = menu_style(&t);
+        assert_eq!((s.background, s.highlight), (t.popover, t.accent));
+        assert_eq!(MENU_MIN_WIDTH, Rems(8.));
     }
 }

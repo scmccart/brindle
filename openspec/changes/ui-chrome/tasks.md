@@ -17,10 +17,10 @@
 
 ## 3. brindle-ui: menus (Menu, ContextMenu, DropdownMenu)
 
-- [ ] 3.1 Add the `Menu` view (`MenuEntry::{Item, Separator}`, items with label, optional description line, shortcut, disabled), its style, and `MenuEvent::Selected(index)`; verify unit tests of navigation (no wrap, skips disabled and separators, home/end, typeahead) built on `primitives::nav`
-- [ ] 3.2 Host it as an `Overlay` placed with `Anchored` against a zero-size rectangle at a point (context menu) or the trigger's bounds (dropdown), blocking the outside pointer, with a maximum height that scrolls; verify `placement` unit tests that a zero-size trigger near the right and bottom edges flips and clamps, and that a menu taller than the window is limited to it
-- [ ] 3.3 Implement `ContextMenu` (secondary press opens), `DropdownMenu` (primary press opens, a second press closes, enter/space/down open it from a focused trigger), selection (enter, space, click), the `Select` pointer gesture (opening release ignored within 10px, drag-release selects), Escape and outside-press dismissal, and focus return; verify `-- --check` cases for each scenario of the "Context menus", "Context menu keys and selection", "Context menu dismissal" and "Dropdown menus" requirements (pointer-only ones `SKIP` off Windows)
-- [ ] 3.4 Show both menus in the gallery, compare the pointer gesture and keys against Radix's menu source and document every difference in `ui/README.md`; verify the gallery builds and the README lists them
+- [x] 3.1 Add the `Menu` view (`MenuEntry::{Item, Separator}`, items with label, optional description line, shortcut, disabled), its style, and `MenuEvent::Selected(index)`; verify unit tests of navigation (no wrap, skips disabled and separators, home/end, typeahead) built on `primitives::nav`
+- [x] 3.2 Host it as an `Overlay` placed with `Anchored` against a zero-size rectangle at a point (context menu) or the trigger's bounds (dropdown), blocking the outside pointer, with a maximum height that scrolls; verify `placement` unit tests that a zero-size trigger near the right and bottom edges flips and clamps, and that a menu taller than the window is limited to it
+- [x] 3.3 Implement `ContextMenu` (secondary press opens), `DropdownMenu` (primary press opens, a second press closes, enter/space/down open it from a focused trigger), selection (enter, space, click), the `Select` pointer gesture (opening release ignored within 10px, drag-release selects), Escape and outside-press dismissal, and focus return; verify `-- --check` cases for each scenario of the "Context menus", "Context menu keys and selection", "Context menu dismissal" and "Dropdown menus" requirements (pointer-only ones `SKIP` off Windows)
+- [x] 3.4 Show both menus in the gallery, compare the pointer gesture and keys against Radix's menu source and document every difference in `ui/README.md`; verify the gallery builds and the README lists them
 
 ## 4. brindle-ui: Tabs
 

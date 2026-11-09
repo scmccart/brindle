@@ -33,9 +33,12 @@
 pub mod button;
 pub mod checkbox;
 pub mod command;
+pub mod context_menu;
 pub mod dialog;
+pub mod dropdown_menu;
 pub mod input;
 pub mod kbd;
+pub mod menu;
 pub mod popover;
 pub mod select;
 pub mod separator;
@@ -56,9 +59,14 @@ use crate::style::ring_geometry;
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
+pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};
+pub use dropdown_menu::{DropdownMenu, trigger_key_opens};
 pub use input::Input;
 pub use kbd::{Kbd, KbdStyle, kbd_style, keycaps};
+pub use menu::{
+    Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuNav, MenuPress, menu_item_release, menu_overlay, render_menu,
+};
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
     Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,

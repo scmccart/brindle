@@ -16,4 +16,6 @@ pub use nav::{ListNav, TYPEAHEAD_TIMEOUT, Typeahead, typeahead_find};
 pub use overlay::{
     ENTER_DURATION, Overlay, dismiss_on_request, enter_animation_id, initial_focus, restore_focus, wrap_in_deferred,
 };
-pub use placement::{Align, Anchored, Placement, Side, anchor_trigger, place};
+pub use placement::{
+    Align, Anchored, EDGE_MARGIN, Placement, SIDE_OFFSET, Side, anchor_trigger, available_height, place,
+};

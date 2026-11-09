@@ -40,6 +40,10 @@ rule, not a convenience.
     view lists, and never leave it.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
     its start, centre or end, flipping and clamping to stay in the window.
+    The trigger may be a zero-size rectangle (a point, for a context menu).
+    `available_height` is the tallest a box may be beside its trigger (the
+    larger room above or below it, or the window's height for a side
+    placement, less the 8px `EDGE_MARGIN`), which caps a menu's height.
   - `ListNav` and `Typeahead`: roving highlight over enabled options, with or
     without wrapping, and type-to-select.
   - `focus_visible`: the per-window `Modality` (keyboard or pointer) that
@@ -96,6 +100,38 @@ rule, not a convenience.
     (`TextInputEvent::Changed`). `Popover` is a `RenderOnce` whose open state
     lives in keyed state; its trigger closure wires `PopoverTrigger::on_click`
     into the trigger's own click.
+    - Menus: `Menu` is the content both openers show, a list of `MenuEntry`
+      (`Item(MenuItem)` with a label, an optional `description` line under
+      it in the muted colour, an optional `shortcut` drawn as `Kbd` keycaps
+      and `disabled`; or `Separator`). It emits `MenuEvent::Selected(index)`
+      (separators counted); Escape and an outside press only close it. It
+      blocks the pointer outside it, has its height capped at the room
+      beside its anchor and scrolls, keeping the highlight in view. The
+      highlight starts on nothing; up/down (and ctrl-p/ctrl-n) move over the
+      enabled items without wrapping, home/PageUp and end/PageDown go to the
+      ends, typing matches labels (`MenuNav`), and enter or space selects. A
+      primary release on an enabled item selects it; the release ending the
+      press that opened the menu selects only after a move of more than
+      10px (`menu_item_release`), so press, drag and release is one gesture.
+      Focus goes back to what had it when the menu opened.
+    - `ContextMenu`: the owner renders it anywhere (it takes no room) and
+      opens it from a target's secondary press with
+      `.on_context_menu(|event, window, cx| …)` (`ContextMenuTarget`) and
+      `ContextMenu::open_on_press(event, entries, …)`, or at a point from a
+      key or code with `open(at, entries, …)`. The menu's corner goes at the
+      pointer, flipping to its left near the window's right edge and shifted
+      up near the bottom.
+    - `DropdownMenu::new(trigger, entries)`: renders its trigger from the
+      closure (a `Button` with no `on_click`, and a focus handle for the
+      keys) and opens the menu below it, start-aligned and 4px away, on a
+      primary press or enter, space or down from the focused trigger
+      (`trigger_key_opens`). A second press on the trigger closes it.
+      `set_disabled(true)` makes it open nothing (draw the trigger disabled
+      too).
+    - An app that keeps its own overlay slot for menus (Brindle's workspace)
+      creates a `Menu` with `Menu::new(entries, MenuAnchor::at(point) or
+      MenuAnchor::below(bounds), press, cx)`, opens it in a `menu_overlay()`
+      slot and draws it with `render_menu`.
 - **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
   rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
@@ -118,7 +154,10 @@ listed here with its reason; a difference that isn't listed is a bug. Apps
 add no keys around a component: a need shadcn doesn't meet goes into the
 component and onto this list, or is dropped. The select trigger's key table
 is pinned by `closed_trigger_keys_match_radix` (`components/select.rs`) and
-the gallery's `select-closed-trigger-keys-match-radix` check.
+the gallery's `select-closed-trigger-keys-match-radix` check; the dropdown
+trigger's by `trigger_keys_match_radix` (`components/dropdown_menu.rs`) and
+the gallery's `dropdown-enter-space-down-open-below-the-trigger-other-keys-do-not`
+check.
 
 Everywhere:
 
@@ -273,6 +312,86 @@ Select:
   change (the settings dialog's General section writes `config.toml`) writes
   once per matching character.
 
+Menus (`ContextMenu` and `DropdownMenu`; shadcn's are Radix's ContextMenu and
+DropdownMenu, both over Radix's Menu, modal by default). The pointer
+gesture and keys were compared against Radix's source (`packages/react/menu`,
+`dropdown-menu` and `context-menu` in radix-ui/primitives) and shadcn's
+new-york-v4 `dropdown-menu` and `context-menu`, read while implementing the
+ui-chrome change. What matches: down, PageUp and Home highlight the first
+enabled item from none, up, PageDown and End the last; up and down don't
+wrap (`loop` is off by default); enter and space select; a space during a
+typeahead search is part of the search; Tab does nothing; the pointer
+highlights an enabled item it moves over and clears the highlight over a
+disabled one or on leaving; a primary release on an enabled item selects
+it wherever the press came; a release elsewhere does nothing (so a dragged
+release outside keeps the menu open, unlike `Select`, whose Radix
+counterpart closes there); outside pointer events are blocked; the
+dropdown's trigger opens on a primary press, on enter or space (which
+toggle in Radix, and the trigger only has focus while closed) and on down;
+it sits 4px below the trigger (shadcn's `sideOffset`); the height is capped
+at the available height and scrolls. The differences:
+
+- **The release that ends the opening press selects only after a move of
+  more than 10px.** Radix's item selects on any pointer-up that didn't
+  follow a press on that item (`isPointerDownRef`), with no threshold.
+  Reason: the spec takes `Select`'s gesture rule; and with our context
+  menu's corner under the pointer, a release after a slight move would
+  otherwise land on the first item and select it.
+- **The dropdown is aligned to the trigger's start.** Radix's popper
+  content defaults to `align="center"`, and shadcn's `DropdownMenuContent`
+  passes only `sideOffset={4}`, so its default menu is centred under the
+  trigger (a call site opts into `align="start"`). Reason: the spec
+  (anchored below the trigger, aligned to its start).
+- **The context menu's corner is at the pointer** (`sideOffset` 0). Radix's
+  `ContextMenuContent` uses `side="right" sideOffset={2} align="start"`, so
+  its corner is 2px right of the pointer. Reason: the spec's "corner at
+  (200, 40)"; the threshold above covers what the 2px did.
+- **Opening by key highlights nothing.** Radix's menu focuses the first
+  enabled item when the trigger was opened from the keyboard
+  (`isUsingKeyboardRef`), and nothing when opened by the pointer. Reason:
+  the spec ("opening it moves the highlight to nothing; the first down key
+  highlights the first enabled item"), the same for both ways in.
+- **Focus always goes back to what had it when the menu opened.** Radix's
+  dropdown focuses its trigger on close, except after a right-click outside
+  (or when non-modal); its context menu returns focus as ours does. Reason:
+  the spec's "Focus returns when an overlay closes" is unconditional; a
+  trigger with a focus handle gets focus back either way, and one without
+  (Brindle's `⌄`) leaves it with the terminal.
+- **A ctrl-press opens the dropdown, on the press for every pointer.**
+  Radix's trigger ignores a press with ctrl and opens on pointer-down only
+  for a mouse. Reason: as for `Select` (no pointer type in gpui's events;
+  ctrl-click is a macOS context-menu click).
+- **The context menu opens on the secondary press on every platform.**
+  Radix opens on the browser's `contextmenu` event, which comes on the
+  press on Linux and macOS and on the release on Windows, and also from the
+  keyboard (the Menu key, shift-F10). Reason: gpui has no context-menu
+  event; the spec says press. No key opens it: `ContextMenu::open(at, …)`
+  is there for an app's own binding.
+- **No long press.** Radix opens a context menu after a 700 ms touch or pen
+  press. Reason: gpui's events carry no pointer type.
+- **ctrl-p and ctrl-n move the highlight**, as in every `UiList`. Radix
+  binds neither.
+- **Shortcuts are `Kbd` keycaps**, not shadcn's `DropdownMenuShortcut` text
+  (`ml-auto text-xs tracking-widest text-muted-foreground`). Reason: the
+  ui-chrome design draws every shortcut with `Kbd`. In the neutral tokens
+  `muted` and `accent` are the same colour, so on the highlighted row the
+  keycaps' boxes don't show (their text does).
+- **Items may carry a description line** under the label. An addition: a
+  Radix item is whatever its children are. Typeahead matches labels only;
+  Radix matches an item's `textValue`, which defaults to its text content
+  (description and shortcut included), by prefix, so the two differ only
+  for a query longer than the label.
+- **The height cap is the larger room above or below the trigger** (for the
+  context menu, the window's height), less the 8px edge margin. Radix's
+  `--radix-*-content-available-height` comes from floating-ui's `size`
+  middleware with no collision padding.
+- **The dropdown trigger's press stops there**, so an ancestor's handlers
+  (one that tracks focus, a window menu) don't run; the context target's
+  secondary press too.
+- **No submenus, checkbox or radio items, labels, groups, `inset` or
+  `destructive` items, and no open or close animation beyond the fade** (see
+  "Only opening animates"). Missing features.
+
 Command (shadcn's command is cmdk):
 
 - **Filtering keeps declaration order.** Items are kept or hidden by a
@@ -308,6 +427,9 @@ relying on them:
   the crate doesn't.
 - Whether the current shadcn `SelectContent` defaults to `popper` or
   `item-aligned`.
+- From recollection, not from a source: browsers firing `contextmenu` on the
+  secondary press on Linux and macOS and on its release on Windows, and
+  floating-ui's `size` middleware leaving out collision padding by default.
 
 ## Wiring an app
 
@@ -378,8 +500,10 @@ cargo run -p brindle-ui --example gallery -- --check   # the spec's scenarios, f
 The gallery shows every component in every variant and size, with a dark
 toggle, dialogs (one that refuses to be dismissed), popovers in each window
 corner, selects and command lists inline, in a dialog and in a popover,
-toggles in each variant and size, and buttons and a plain element with
-tooltips (beside the tooltip's look drawn in place).
+a context menu target and two dropdown menus (one with descriptions and
+shortcuts, one of forty items that scrolls), toggles in each variant and
+size, and buttons and a plain element with tooltips (beside the tooltip's
+look drawn in place).
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,
@@ -394,7 +518,7 @@ machine someone is using.
 ## Testing
 
 ```sh
-cargo test -p brindle-ui                           # the pure parts: layers, focus cycle, placement, lists, styles, tokens, EditState
+cargo test -p brindle-ui                           # the pure parts: layers, focus cycle, placement, lists, menus, styles, tokens, EditState
 cargo clippy -p brindle-ui --all-targets           # the gallery included
 ```
 

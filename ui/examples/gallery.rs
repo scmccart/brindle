@@ -26,14 +26,15 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem, Dialog,
-    Dismiss, FocusScope, FocusStops, Icon, Input, Kbd, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
-    Separator, Switch, TextInput, Toggle, ToggleSize, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
+    ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
+    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
+    MenuEvent, MenuItem, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator, Switch,
+    TextInput, Toggle, ToggleSize, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
 };
 
 /// Bounds the gallery records as components paint, by name, for the checks
@@ -120,6 +121,46 @@ fn shells() -> Vec<SelectOption> {
     vec!["bash".into(), "fish".into(), "foot".into(), SelectOption::new("zsh").disabled(true), "nu".into()]
 }
 
+/// The context menu's entries: a tab's menu, as Brindle's (Move Tab Left
+/// disabled, for the first tab). Enabled items are 0, 2 and 4.
+fn context_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuItem::new("Rename Tab").shortcut("ctrl-shift-r").into(),
+        MenuItem::new("Move Tab Left").disabled(true).into(),
+        MenuItem::new("Move Tab Right").into(),
+        MenuEntry::Separator,
+        MenuItem::new("Close Tab").shortcut("ctrl-shift-w").into(),
+    ]
+}
+
+/// The dropdown's entries: a profile menu, with descriptions under some
+/// labels and `zsh` disabled.
+fn dropdown_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuItem::new("bash").description("the default shell").shortcut("ctrl-alt-1").into(),
+        MenuItem::new("fish").shortcut("ctrl-alt-2").into(),
+        MenuItem::new("tmux").description("tmux control mode · main").shortcut("ctrl-alt-3").into(),
+        MenuItem::new("zsh").description("not installed").disabled(true).into(),
+        MenuEntry::Separator,
+        MenuItem::new("Settings…").into(),
+    ]
+}
+
+/// A menu taller than the window: forty profiles, the first nine with keys.
+fn long_entries() -> Vec<MenuEntry> {
+    (1..=40)
+        .map(|n| {
+            let item = MenuItem::new(format!("Profile {n}"));
+            if n <= 9 { item.shortcut(format!("ctrl-alt-{n}")) } else { item }.into()
+        })
+        .collect()
+}
+
+/// The label of entry `ix` of `entries`, for the menu log.
+fn entry_label(entries: &[MenuEntry], ix: usize) -> String {
+    entries.get(ix).map_or_else(|| format!("#{ix}"), |entry| entry.label().to_string())
+}
+
 /// A `div` around `element` that records the element's painted bounds under
 /// `name`, in window coordinates.
 fn recorded(element: impl IntoElement, name: &str, records: &Records) -> Div {
@@ -171,6 +212,11 @@ pub struct Gallery {
     sticky_dialog: Overlay<DemoDialog>,
     command_dialog: Overlay<CommandHost>,
     confirmed: Confirmed,
+    context_menu: Entity<ContextMenu>,
+    dropdown: Entity<DropdownMenu>,
+    long_dropdown: Entity<DropdownMenu>,
+    /// What the menus chose, in order, as `menu:label`.
+    menu_log: Vec<String>,
     /// Each corner popover's panel bounds while it is open.
     corners: [Rc<Cell<Option<Bounds<Pixels>>>>; 4],
     scroll: ScrollHandle,
@@ -188,7 +234,7 @@ impl Gallery {
             [
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
-                "switch-off", "theme", "toggle", "toggle-off",
+                "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger",
             ]
             .map(String::from),
         );
@@ -200,7 +246,25 @@ impl Gallery {
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let handles = Self::handle_names().into_iter().map(|name| (name, cx.focus_handle())).collect();
+        let handles: HashMap<String, FocusHandle> =
+            Self::handle_names().into_iter().map(|name| (name, cx.focus_handle())).collect();
+        let context_menu = cx.new(|_| ContextMenu::new());
+        // Triggers with a focus handle, for the keys, and no `on_click`:
+        // the dropdown takes the press and the keys itself.
+        let trigger = |id: &'static str, text: &'static str, handle: FocusHandle| {
+            move |_open: bool, _: &mut Window, _: &mut App| {
+                Button::new(id, text).variant(ButtonVariant::Outline).icon(Icon::ChevronDown).focus(&handle)
+            }
+        };
+        let dropdown = cx.new(|_| {
+            DropdownMenu::new(trigger("dropdown-trigger", "Profiles", handles["dropdown-trigger"].clone()), dropdown_entries())
+        });
+        let long_dropdown = cx.new(|_| {
+            DropdownMenu::new(
+                trigger("long-dropdown-trigger", "Forty profiles", handles["long-dropdown-trigger"].clone()),
+                long_entries(),
+            )
+        });
         let name = cx.new(|cx| TextInput::new("", cx).with_placeholder("Name"));
         let email = cx.new(|cx| TextInput::new("not an address", cx).with_placeholder("Email"));
         let shell = cx.new(|cx| Select::new(shells(), Some(0), cx));
@@ -229,6 +293,23 @@ impl Gallery {
                 this.command_log.push(entry);
                 cx.notify();
             }),
+            cx.subscribe(&context_menu, |this, _, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                this.menu_log.push(format!("context:{}", entry_label(&context_entries(), ix)));
+                cx.notify();
+            }),
+            cx.subscribe(&dropdown, |this, dropdown, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                let label = entry_label(dropdown.read(cx).entries(), ix);
+                this.menu_log.push(format!("dropdown:{label}"));
+                cx.notify();
+            }),
+            cx.subscribe(&long_dropdown, |this, dropdown, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                let label = entry_label(dropdown.read(cx).entries(), ix);
+                this.menu_log.push(format!("long:{label}"));
+                cx.notify();
+            }),
         ];
         Self {
             focus,
@@ -251,6 +332,10 @@ impl Gallery {
             sticky_dialog: Overlay::modal().ignore_outside_press(),
             command_dialog: Overlay::modal(),
             confirmed: Confirmed::default(),
+            context_menu,
+            dropdown,
+            long_dropdown,
+            menu_log: Vec::new(),
             corners: Default::default(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -314,7 +399,51 @@ impl Gallery {
         self.command_dialog.close(window, cx);
         self.shell.update(cx, |select, cx| select.close(window, cx));
         self.editor.update(cx, |select, cx| select.close(window, cx));
+        self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
+        self.dropdown.update(cx, |menu, cx| menu.close(window, cx));
+        self.long_dropdown.update(cx, |menu, cx| menu.close(window, cx));
         cx.notify();
+    }
+
+    /// Opens the context menu with its corner at `at`, as a key or code
+    /// would (no pointer gesture).
+    pub fn open_context_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu.update(cx, |menu, cx| menu.open(at, context_entries(), window, cx));
+    }
+
+    /// The context menu, both dropdowns and what they chose.
+    fn menus_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let target = div()
+            .id("context-target")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(240.))
+            .h(px(64.))
+            .rounded(t.radius_md())
+            .border_1()
+            .border_dashed()
+            .border_color(t.border)
+            .text_color(t.muted_foreground)
+            .child("Right-click here")
+            .on_context_menu(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.context_menu.update(cx, |menu, cx| menu.open_on_press(event, context_entries(), window, cx));
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("ContextMenu and DropdownMenu", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(recorded(target, "context-target", &self.records))
+                    .child(recorded(self.dropdown.clone(), "dropdown", &self.records))
+                    .child(recorded(self.long_dropdown.clone(), "long-dropdown", &self.records)),
+            )
     }
 
     fn header(&self, cx: &mut Context<Self>) -> Div {
@@ -767,6 +896,7 @@ impl Gallery {
                 if self.shell_changes.len() == 1 { "" } else { "s" }
             ))
             .child(format!("Command: {}", self.command_log.last().map_or("—", String::as_str)))
+            .child(format!("Menu: {}", self.menu_log.last().map_or("—", String::as_str)))
             .child(format!("Hosts confirmed: {}", self.confirmed.borrow().join(", ")))
             .child(format!("Clicks: {}", if clicks.is_empty() { "—".to_string() } else { clicks.join(", ") }))
     }
@@ -816,6 +946,7 @@ impl FocusStops for Gallery {
         let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog", "command-popover", "behind"]);
         stops.push(self.shell.focus_handle(cx));
         stops.push(self.editor.focus_handle(cx));
+        stops.extend(named(&["dropdown-trigger", "long-dropdown-trigger"]));
         stops.push(self.command.focus_handle(cx));
         for variant in ButtonVariant::ALL {
             stops.extend(ButtonSize::ALL.iter().map(|size| self.handle(&Self::button_name(variant, *size))));
@@ -844,6 +975,7 @@ impl Render for Gallery {
             .child(self.header(cx))
             .child(self.overlays_section(cx))
             .child(self.selects_section(cx))
+            .child(self.menus_section(cx))
             .child(self.command_section(cx))
             .child(self.buttons_section(cx))
             .child(self.chrome_section(cx))
@@ -864,6 +996,8 @@ impl Render for Gallery {
                 .text_size(px(14.))
                 .child(content)
                 .children(self.corner_triggers())
+                // Takes no room; its menu is drawn above the window.
+                .child(self.context_menu.clone())
                 // Modal layers render last in the root: tree order is their
                 // z-order, and nothing lifts them.
                 .children(self.dialog.render(window, cx))
@@ -1149,10 +1283,10 @@ impl Render for NotePopover {
 mod check {
     use std::time::Duration;
 
-    use brindle_ui::{ActiveTheme, Modality, modality, primitives::layer};
+    use brindle_ui::{ActiveTheme, Menu, MenuAnchor, Modality, modality, primitives::layer};
     use gpui::{
-        App, AppContext, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, Keystroke, Pixels, Point,
-        SharedString, Window, WindowHandle, point, px,
+        App, AppContext, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, Keystroke, MouseButton, Pixels,
+        Point, SharedString, Window, WindowHandle, point, px,
     };
 
     use super::Gallery;
@@ -1164,8 +1298,11 @@ mod check {
         pub const WM_MOUSEMOVE: u32 = 0x0200;
         pub const WM_LBUTTONDOWN: u32 = 0x0201;
         pub const WM_LBUTTONUP: u32 = 0x0202;
+        pub const WM_RBUTTONDOWN: u32 = 0x0204;
+        pub const WM_RBUTTONUP: u32 = 0x0205;
         pub const WM_KEYUP: u32 = 0x0101;
         pub const MK_LBUTTON: usize = 0x0001;
+        pub const MK_RBUTTON: usize = 0x0002;
         /// A key-up's lparam: repeat count 1, previous state down, transition up.
         pub const KEYUP_LPARAM: isize = 0xC000_0001u32 as isize;
 
@@ -1309,6 +1446,16 @@ mod check {
                 "tab" => 0x09,
                 _ => return None,
             })
+        }
+    }
+
+    /// A mouse button's down and up messages, and its flag in a message's
+    /// wparam while it is held.
+    #[cfg(windows)]
+    fn button_messages(button: MouseButton) -> (u32, u32, usize) {
+        match button {
+            MouseButton::Right => (win::WM_RBUTTONDOWN, win::WM_RBUTTONUP, win::MK_RBUTTON),
+            _ => (win::WM_LBUTTONDOWN, win::WM_LBUTTONUP, win::MK_LBUTTON),
         }
     }
 
@@ -1510,6 +1657,58 @@ mod check {
             #[cfg(not(windows))]
             self.post(0, 0, lparam)?;
             self.cx.background_executor().timer(HOVER_TICK).await;
+            Ok(())
+        }
+
+        /// `button` goes down at `at` (and stays down), then a frame.
+        async fn button_down(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (down, _, held) = button_messages(button);
+                self.post(down, held, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.tick().await;
+            Ok(())
+        }
+
+        /// The pointer moves to `at` with `button` held, then a frame.
+        async fn button_move(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (_, _, held) = button_messages(button);
+                self.post(win::WM_MOUSEMOVE, held, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.cx.background_executor().timer(HOVER_TICK).await;
+            self.tick().await;
+            Ok(())
+        }
+
+        /// `button` comes up at `at`, then a frame.
+        async fn button_up(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (_, up, _) = button_messages(button);
+                self.post(up, 0, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.tick().await;
             Ok(())
         }
 
@@ -1848,6 +2047,42 @@ mod check {
         c.run_check("command-in-dialog-escape-and-enter", check).await;
         let check = command_popover_hazard(&mut c).await;
         c.run_check("command-in-popover-enter-key-up-does-not-reopen", check).await;
+        // Menus: everywhere, opened by key or from code.
+        let check = context_menu_corner(&mut c).await;
+        c.run_check("context-menu-opens-with-its-corner-at-200-40-highlighting-nothing", check).await;
+        let check = context_menu_edges(&mut c).await;
+        c.run_check("context-menu-near-the-edges-opens-left-of-the-pointer-and-stays-inside", check).await;
+        let check = context_menu_keys(&mut c).await;
+        c.run_check("context-menu-keys-skip-disabled-and-separators-without-wrapping", check).await;
+        let check = context_menu_enter_selects(&mut c).await;
+        c.run_check("context-menu-down-down-enter-selects-the-second-enabled-item", check).await;
+        let check = context_menu_space_selects(&mut c).await;
+        c.run_check("context-menu-space-selects-and-continues-a-typeahead-search", check).await;
+        let check = context_menu_escape(&mut c).await;
+        c.run_check("context-menu-escape-closes-and-focus-returns", check).await;
+        let check = dropdown_keys(&mut c).await;
+        c.run_check("dropdown-enter-space-down-open-below-the-trigger-other-keys-do-not", check).await;
+        let check = dropdown_description(&mut c).await;
+        c.run_check("dropdown-description-under-the-label-and-t-highlights-tmux", check).await;
+        let check = dropdown_long_menu(&mut c).await;
+        c.run_check("dropdown-long-menu-fits-the-window-scrolls-and-keeps-the-highlight-in-view", check).await;
+        // Menus: the pointer (Windows only).
+        let check = context_menu_press_and_near_release(&mut c).await;
+        c.run_check("context-menu-secondary-press-opens-at-the-pointer-release-within-10px-stays", check).await;
+        let check = context_menu_one_gesture(&mut c).await;
+        c.run_check("context-menu-press-drag-release-selects-the-item", check).await;
+        let check = context_menu_hover_and_click(&mut c).await;
+        c.run_check("context-menu-hover-highlights-click-selects", check).await;
+        let check = context_menu_disabled_click(&mut c).await;
+        c.run_check("context-menu-disabled-item-click-selects-nothing-stays-open", check).await;
+        let check = context_menu_outside_press(&mut c).await;
+        c.run_check("context-menu-outside-press-closes-reaches-nothing-focus-returns", check).await;
+        let check = dropdown_trigger_toggles(&mut c).await;
+        c.run_check("dropdown-trigger-press-opens-second-press-closes", check).await;
+        let check = dropdown_drag_selects(&mut c).await;
+        c.run_check("dropdown-press-drag-release-selects-the-third-item", check).await;
+        let check = dropdown_enter_keyup(&mut c).await;
+        c.run_check("dropdown-enter-key-up-does-not-reopen", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -3058,6 +3293,488 @@ mod check {
         }
         c.tick().await;
         ensure!(c.layers()? == 0, "the enter key-up clicked the trigger and reopened the popover");
+        Ok(())
+    }
+
+    // ---- menus ----
+
+    /// The gallery's menus.
+    #[derive(Clone, Copy, Debug)]
+    enum Which {
+        Context,
+        Dropdown,
+        Long,
+    }
+
+    /// The open menu of `which`, if one is open.
+    fn open_menu(c: &mut Checker, which: Which) -> Result<Option<Entity<Menu>>, Failure> {
+        c.with(move |gallery, _, cx| match which {
+            Which::Context => gallery.context_menu.read(cx).menu().cloned(),
+            Which::Dropdown => gallery.dropdown.read(cx).menu().cloned(),
+            Which::Long => gallery.long_dropdown.read(cx).menu().cloned(),
+        })
+    }
+
+    fn the_menu(c: &mut Checker, which: Which) -> Result<Entity<Menu>, Failure> {
+        open_menu(c, which)?.ok_or_else(|| Failure::Fail(format!("the {which:?} menu isn't open")))
+    }
+
+    fn menu_highlight(c: &mut Checker, which: Which) -> Result<Option<usize>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, |menu, _| menu.highlighted())
+    }
+
+    /// The open menu's panel, as last painted.
+    fn menu_bounds(c: &mut Checker, which: Which) -> Result<Bounds<Pixels>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, |menu, _| menu.bounds())?
+            .ok_or_else(|| Failure::Fail(format!("the {which:?} menu painted no bounds")))
+    }
+
+    /// Where entry `ix` of the open menu was painted, scrolled as shown.
+    fn entry_bounds(c: &mut Checker, which: Which, ix: usize) -> Result<Bounds<Pixels>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, move |menu, _| menu.entry_bounds(ix))?
+            .ok_or_else(|| Failure::Fail(format!("entry {ix} of the {which:?} menu painted no bounds")))
+    }
+
+    fn menu_log(c: &mut Checker) -> Result<Vec<String>, Failure> {
+        c.with(|gallery, _, _| gallery.menu_log.clone())
+    }
+
+    /// The trigger bounds a dropdown places its menu against.
+    fn dropdown_trigger(c: &mut Checker, which: Which) -> Result<Bounds<Pixels>, Failure> {
+        c.with(move |gallery, _, cx| match which {
+            Which::Long => gallery.long_dropdown.read(cx).trigger_bounds(),
+            _ => gallery.dropdown.read(cx).trigger_bounds(),
+        })?
+        .ok_or_else(|| Failure::Fail(format!("the {which:?} dropdown's trigger painted no bounds")))
+    }
+
+    /// Within a pixel, for positions that went through a message's whole
+    /// physical pixels.
+    fn close_to(a: Pixels, b: Pixels) -> bool {
+        (a - b).abs() <= px(1.)
+    }
+
+    fn inside(bounds: Bounds<Pixels>, viewport: gpui::Size<Pixels>, margin: Pixels) -> bool {
+        bounds.left() >= margin - px(0.5)
+            && bounds.top() >= margin - px(0.5)
+            && bounds.right() <= viewport.width - margin + px(0.5)
+            && bounds.bottom() <= viewport.height - margin + px(0.5)
+    }
+
+    /// Whether `inner` lies within `outer` vertically: a row in a menu's view.
+    fn in_view(inner: Bounds<Pixels>, outer: Bounds<Pixels>) -> bool {
+        inner.top() >= outer.top() - px(0.5) && inner.bottom() <= outer.bottom() + px(0.5)
+    }
+
+    /// Opens the context menu at `at` from code, and lets it paint.
+    async fn open_context_at(c: &mut Checker, at: Point<Pixels>) -> Check {
+        c.with(move |gallery, window, cx| gallery.open_context_menu(at, window, cx))?;
+        c.tick().await;
+        c.tick().await;
+        ensure!(c.layers()? == 1, "the context menu isn't the one layer ({} open)", c.layers()?);
+        Ok(())
+    }
+
+    /// The spec's scenario, with the press stood in for by code: the corner
+    /// lands on (200, 40), the menu has focus and highlights nothing, and
+    /// the first down highlights the first enabled item.
+    async fn context_menu_corner(c: &mut Checker) -> Check {
+        let at = point(px(200.), px(40.));
+        open_context_at(c, at).await?;
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not {at:?}",
+            bounds.origin
+        );
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight.is_none(), "the menu opened highlighting {highlight:?}");
+        let menu = the_menu(c, Which::Context)?;
+        let own = c.read(&menu, |menu, cx| menu.focus_handle(cx))?;
+        ensure!(c.focused(&own)?, "the open menu doesn't have focus");
+        c.key("down").await?;
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight == Some(0), "the first down highlighted {highlight:?}, not Rename Tab");
+        Ok(())
+    }
+
+    /// Near the right edge the menu opens to the left of the pointer; near
+    /// the bottom it is shifted up; it stays inside the window less its
+    /// margin either way.
+    async fn context_menu_edges(c: &mut Checker) -> Check {
+        let viewport = c.viewport()?;
+        let margin = px(8.);
+        let right = point(viewport.width - px(20.), px(100.));
+        let bottom = point(px(100.), viewport.height - px(20.));
+        let corner = point(viewport.width - px(20.), viewport.height - px(20.));
+        for at in [right, bottom, corner] {
+            open_context_at(c, at).await?;
+            let bounds = menu_bounds(c, Which::Context)?;
+            ensure!(inside(bounds, viewport, margin), "the menu opened at {at:?} leaves the window: {bounds:?} in {viewport:?}");
+            if at.x == right.x {
+                ensure!(
+                    close_to(bounds.right(), at.x),
+                    "near the right edge the menu {bounds:?} isn't just to the left of the pointer at {at:?}"
+                );
+            } else {
+                ensure!(close_to(bounds.left(), at.x), "the menu {bounds:?} isn't at the pointer's x ({at:?})");
+            }
+            if at.y == right.y {
+                ensure!(close_to(bounds.top(), at.y), "the menu {bounds:?} isn't at the pointer's y ({at:?})");
+            } else {
+                ensure!(bounds.top() < at.y, "near the bottom the menu {bounds:?} wasn't shifted up from {at:?}");
+            }
+            c.key("escape").await?;
+            ensure!(c.layers()? == 0, "escape didn't close the menu opened at {at:?}");
+        }
+        Ok(())
+    }
+
+    /// Up and down skip the disabled item and the separator and stop at
+    /// the ends; home, end, PageUp and PageDown go to the first and last;
+    /// typing goes by the labels and passes the disabled item. Nothing is
+    /// selected and the menu stays open.
+    async fn context_menu_keys(c: &mut Checker) -> Check {
+        let before = menu_log(c)?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        // Rename Tab 0, Move Tab Left 1 (disabled), Move Tab Right 2,
+        // separator 3, Close Tab 4.
+        let keys = [
+            ("down", 0),
+            ("down", 2),
+            ("down", 4),
+            ("down", 4),
+            ("up", 2),
+            ("up", 0),
+            ("up", 0),
+            ("end", 4),
+            ("home", 0),
+            ("pagedown", 4),
+            ("pageup", 0),
+            ("ctrl-n", 2),
+            ("ctrl-p", 0),
+        ];
+        for (key, expected) in keys {
+            c.key(key).await?;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == Some(expected), "{key} highlighted {highlight:?}, expected {expected}");
+        }
+        for (key, expected) in [("m", 2), ("c", 4), ("r", 0)] {
+            c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+            c.key(key).await?;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == Some(expected), "typing {key} highlighted {highlight:?}, expected {expected}");
+        }
+        ensure!(c.layers()? == 1, "a key closed the menu");
+        ensure!(menu_log(c)? == before, "a key selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: down twice and enter select the second enabled
+    /// item, tell the owner and close the menu; focus goes back to the
+    /// button that had it, which the enter doesn't reach.
+    async fn context_menu_enter_selects(c: &mut Checker) -> Check {
+        c.focus("open-dialog").await?;
+        let before = menu_log(c)?.len();
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("down").await?;
+        c.key("down").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 0 && open_menu(c, Which::Context)?.is_none(), "enter didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return to the button that had it");
+        ensure!(!c.with(|gallery, _, _| gallery.dialog.is_open())?, "the enter reached the button and opened the dialog");
+        Ok(())
+    }
+
+    /// Space selects the highlighted item, except while a typeahead search
+    /// is under way, when it is part of the search (Radix's rule).
+    async fn context_menu_space_selects(c: &mut Checker) -> Check {
+        let before = menu_log(c)?.len();
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("m").await?;
+        ensure!(menu_highlight(c, Which::Context)? == Some(2), "m didn't highlight Move Tab Right");
+        c.key("space").await?;
+        ensure!(c.layers()? == 1, "a space during the search closed the menu");
+        ensure!(menu_log(c)?.len() == before, "a space during the search selected");
+        ensure!(menu_highlight(c, Which::Context)? == Some(2), "a space during the search moved the highlight");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        c.key("space").await?;
+        ensure!(c.layers()? == 0, "space didn't select and close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: Escape closes the menu and focus is where it
+    /// was before; nothing is selected.
+    async fn context_menu_escape(c: &mut Checker) -> Check {
+        c.focus("open-dialog").await?;
+        let before = menu_log(c)?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("down").await?;
+        c.key("escape").await?;
+        ensure!(c.layers()? == 0 && open_menu(c, Which::Context)?.is_none(), "escape didn't close the menu");
+        ensure!(c.focused_name("open-dialog")?, "focus isn't back on the button that had it");
+        ensure!(menu_log(c)? == before, "escape selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// Radix's trigger keys: enter, space and down open the menu below the
+    /// trigger, start-aligned and 4px away, highlighting nothing; Escape
+    /// gives focus back to the trigger. Up, left, right, home, end and
+    /// ctrl-n don't open it.
+    async fn dropdown_keys(c: &mut Checker) -> Check {
+        let trigger = dropdown_trigger(c, Which::Dropdown)?;
+        let handle = c.handle("dropdown-trigger")?;
+        for key in ["enter", "space", "down"] {
+            c.focus("dropdown-trigger").await?;
+            c.key(key).await?;
+            ensure!(c.layers()? == 1 && open_menu(c, Which::Dropdown)?.is_some(), "{key} on the trigger didn't open the menu");
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Dropdown)?;
+            ensure!(highlight.is_none(), "{key}: the menu opened highlighting {highlight:?}");
+            let bounds = menu_bounds(c, Which::Dropdown)?;
+            ensure!(
+                close_to(bounds.left(), trigger.left()) && close_to(bounds.top(), trigger.bottom() + px(4.)),
+                "{key}: the menu {bounds:?} isn't 4px below the trigger {trigger:?}, aligned to its start"
+            );
+            ensure!(c.modality()? == Modality::Keyboard, "{key} didn't count as keyboard input");
+            c.key("escape").await?;
+            ensure!(c.layers()? == 0, "escape after {key} didn't close the menu");
+            ensure!(c.focused(&handle)?, "escape after {key} didn't give focus back to the trigger");
+        }
+        for key in ["up", "left", "right", "home", "end", "ctrl-n"] {
+            c.focus("dropdown-trigger").await?;
+            c.key(key).await?;
+            ensure!(c.layers()? == 0, "{key} on the trigger opened the menu");
+            ensure!(c.focused(&handle)?, "{key} moved focus off the trigger");
+        }
+        Ok(())
+    }
+
+    /// The spec's scenario: the tmux item shows its description on a second
+    /// line, and `t` highlights it (bash's description starts with `t`, its
+    /// label doesn't). Typing passes the disabled zsh, and a letter only a
+    /// description starts with matches nothing.
+    async fn dropdown_description(c: &mut Checker) -> Check {
+        c.focus("dropdown-trigger").await?;
+        c.key("down").await?;
+        c.key("t").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(2), "t highlighted {highlight:?}, not tmux");
+        let (bash, fish, tmux) =
+            (entry_bounds(c, Which::Dropdown, 0)?, entry_bounds(c, Which::Dropdown, 1)?, entry_bounds(c, Which::Dropdown, 2)?);
+        ensure!(
+            tmux.size.height > fish.size.height + px(8.),
+            "the tmux row ({:?} tall) holds no second line beside fish's ({:?})",
+            tmux.size.height,
+            fish.size.height
+        );
+        ensure!(close_to(bash.size.height, tmux.size.height), "the described rows differ in height");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        c.key("s").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(5), "s highlighted {highlight:?}, not Settings… past the disabled zsh");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        // "not installed", zsh's description: no label starts with n.
+        c.key("n").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(5), "n, which only a description starts with, moved the highlight to {highlight:?}");
+        Ok(())
+    }
+
+    /// The spec's scenario: a menu with more items than fit is as tall as
+    /// the window allows below its trigger, and scrolls so the highlight
+    /// stays in view.
+    async fn dropdown_long_menu(c: &mut Checker) -> Check {
+        c.reveal("long-dropdown").await?;
+        let trigger = dropdown_trigger(c, Which::Long)?;
+        let viewport = c.viewport()?;
+        c.focus("long-dropdown-trigger").await?;
+        c.key("down").await?;
+        c.tick().await;
+        let bounds = menu_bounds(c, Which::Long)?;
+        let limit = MenuAnchor::below(trigger).max_height(viewport);
+        ensure!(
+            (bounds.size.height - limit).abs() <= px(1.),
+            "the menu is {:?} tall, not the {limit:?} the window allows",
+            bounds.size.height
+        );
+        ensure!(inside(bounds, viewport, px(8.)), "the menu {bounds:?} leaves the window {viewport:?}");
+        c.key("down").await?;
+        ensure!(menu_highlight(c, Which::Long)? == Some(0), "down didn't highlight the first profile");
+        let last = entry_bounds(c, Which::Long, 39)?;
+        ensure!(!in_view(last, bounds), "the last profile {last:?} is in view at the start: nothing to scroll");
+        for (key, ix) in [("end", 39), ("home", 0), ("pagedown", 39), ("up", 38)] {
+            c.key(key).await?;
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Long)?;
+            ensure!(highlight == Some(ix), "{key} highlighted {highlight:?}, not {ix}");
+            let row = entry_bounds(c, Which::Long, ix)?;
+            ensure!(in_view(row, bounds), "after {key} the highlighted row {row:?} is outside the menu's view {bounds:?}");
+        }
+        Ok(())
+    }
+
+    /// The spec's scenarios: a secondary press on the target opens the menu
+    /// with its corner at the pointer, and its release 8px away, over the
+    /// first item, selects nothing and leaves the menu open.
+    async fn context_menu_press_and_near_release(c: &mut Checker) -> Check {
+        let at = center(c.reveal("context-target").await?);
+        let before = menu_log(c)?;
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not the pointer's {at:?}",
+            bounds.origin
+        );
+        let release = point(at.x + px(8.), at.y + px(8.));
+        c.button_up(MouseButton::Right, release).await?;
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the release within 10px closed the menu");
+        ensure!(menu_log(c)? == before, "the release within 10px selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: secondary press, a move of more than 10px onto
+    /// an enabled item, and the release there select it.
+    async fn context_menu_one_gesture(c: &mut Checker) -> Check {
+        let at = center(c.reveal("context-target").await?);
+        let before = menu_log(c)?.len();
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let row = center(entry_bounds(c, Which::Context, 2)?);
+        ensure!(row.y - at.y > px(10.), "Move Tab Right at {row:?} is within 10px of the press at {at:?}");
+        c.button_move(MouseButton::Right, row).await?;
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight == Some(2), "moving onto Move Tab Right with the button held highlighted {highlight:?}");
+        c.button_up(MouseButton::Right, row).await?;
+        ensure!(c.layers()? == 0, "the release on Move Tab Right didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// Moving over an enabled item highlights it, over the disabled one
+    /// clears the highlight, and a primary click selects.
+    async fn context_menu_hover_and_click(c: &mut Checker) -> Check {
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let before = menu_log(c)?.len();
+        let rows = [
+            center(entry_bounds(c, Which::Context, 0)?),
+            center(entry_bounds(c, Which::Context, 1)?),
+            center(entry_bounds(c, Which::Context, 2)?),
+        ];
+        for (row, expected) in [(rows[0], Some(0)), (rows[1], None), (rows[2], Some(2))] {
+            c.hover(row).await?;
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == expected, "the pointer at {row:?} highlighted {highlight:?}, expected {expected:?}");
+        }
+        c.press(rows[2]).await?;
+        ensure!(c.layers()? == 0, "the click on Move Tab Right didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: a click on the disabled item (or the
+    /// separator) selects nothing and the menu stays open.
+    async fn context_menu_disabled_click(c: &mut Checker) -> Check {
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let before = menu_log(c)?;
+        for (ix, what) in [(1, "the disabled Move Tab Left"), (3, "the separator")] {
+            let at = center(entry_bounds(c, Which::Context, ix)?);
+            c.press(at).await?;
+            ensure!(open_menu(c, Which::Context)?.is_some(), "a click on {what} closed the menu");
+            ensure!(menu_log(c)? == before, "a click on {what} selected {:?}", &menu_log(c)?[before.len()..]);
+        }
+        Ok(())
+    }
+
+    /// The spec's scenario: a press outside closes the menu and the button
+    /// pressed isn't activated; focus goes back. A secondary press outside,
+    /// on the menu's own target, closes it and opens nothing.
+    async fn context_menu_outside_press(c: &mut Checker) -> Check {
+        let target = center(c.reveal("context-target").await?);
+        let behind = center(c.recorded("behind")?);
+        c.focus("open-dialog").await?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let clicks = c.clicks("behind")?;
+        c.press(behind).await?;
+        ensure!(c.layers()? == 0, "the outside press didn't close the menu");
+        ensure!(c.clicks("behind")? == clicks, "the outside press clicked the button beneath");
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return to the button that had it");
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.button_down(MouseButton::Right, target).await?;
+        c.button_up(MouseButton::Right, target).await?;
+        ensure!(c.layers()? == 0, "the secondary press outside left {} layers open (it reached the target)", c.layers()?);
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return after the secondary press");
+        Ok(())
+    }
+
+    /// The spec's scenario: a press on the trigger opens the menu (its
+    /// release, where it began, leaves it open), and a second press closes
+    /// it without reopening it on the release.
+    async fn dropdown_trigger_toggles(c: &mut Checker) -> Check {
+        c.reveal("dropdown").await?;
+        let at = center(dropdown_trigger(c, Which::Dropdown)?);
+        let before = menu_log(c)?;
+        c.press(at).await?;
+        ensure!(c.layers()? == 1 && open_menu(c, Which::Dropdown)?.is_some(), "the first press didn't leave the menu open");
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight.is_none(), "the press opened the menu highlighting {highlight:?}");
+        c.press(at).await?;
+        ensure!(c.layers()? == 0, "the second press didn't close the menu");
+        c.tick().await;
+        ensure!(c.layers()? == 0, "the menu reopened after the second press");
+        ensure!(c.focused_name("dropdown-trigger")?, "focus isn't on the trigger after the menu closed");
+        ensure!(menu_log(c)? == before, "the presses selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: press the trigger, move onto the third item and
+    /// release. The row is found first with the menu opened by key.
+    async fn dropdown_drag_selects(c: &mut Checker) -> Check {
+        c.reveal("dropdown").await?;
+        let trigger = dropdown_trigger(c, Which::Dropdown)?;
+        c.focus("dropdown-trigger").await?;
+        c.key("down").await?;
+        let row = center(entry_bounds(c, Which::Dropdown, 2)?);
+        c.key("escape").await?;
+        ensure!(c.layers()? == 0, "escape didn't close the menu opened to find the row");
+        let before = menu_log(c)?.len();
+        c.drag(center(trigger), row).await?;
+        ensure!(c.layers()? == 0, "the release on tmux didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["dropdown:tmux"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("dropdown-trigger")?, "focus didn't return to the trigger");
+        Ok(())
+    }
+
+    /// Enter opens the menu and enter selects; the key-up that follows,
+    /// with focus back on the trigger, doesn't open it again.
+    async fn dropdown_enter_keyup(c: &mut Checker) -> Check {
+        let before = menu_log(c)?.len();
+        c.focus("dropdown-trigger").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 1, "enter didn't open the menu");
+        c.key("down").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 0, "enter didn't select and close");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["dropdown:bash"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("dropdown-trigger")?, "focus didn't return to the trigger");
+        if !c.key_up("enter").await? {
+            return Err(Failure::Skip(NO_KEY_UP.to_string()));
+        }
+        ensure!(c.layers()? == 0, "the enter key-up reopened the menu");
         Ok(())
     }
 }
