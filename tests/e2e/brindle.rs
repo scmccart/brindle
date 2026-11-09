@@ -623,8 +623,8 @@ pub struct Dump {
     pub zone_list: Vec<String>,
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
-    /// Where keyboard focus is (`--- focus`): `terminal`, `settings`, `none`
-    /// or `other`.
+    /// Where keyboard focus is (`--- focus`): `terminal`, `palette`,
+    /// `settings`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
     /// `list`, `session_end`, `close`, a field's or a button's label.
@@ -851,10 +851,11 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.focus_stop.is_none(), "stop {:?}", dump.focus_stop);
     ensure!(dump.modality.as_deref() == Some("keyboard"), "modality {:?}", dump.modality);
     let dump = Dump::parse(
-        "--- palette list query=\"\"\nrow\n--- input text=\"\" cursor=0 selection=0..0\n--- focus other modality=pointer\n",
+        "--- palette list query=\"\"\nrow\n--- input text=\"\" cursor=0 selection=0..0\n--- focus palette modality=pointer\n",
     );
     ensure!(dump.palette == ["list query=\"\"", "row"], "palette before focus {:?}", dump.palette);
-    ensure!(dump.focus.as_deref() == Some("other"), "focus after the palette {:?}", dump.focus);
+    ensure!(dump.focus.as_deref() == Some("palette"), "focus after the palette {:?}", dump.focus);
+    ensure!(dump.focus_stop.is_none(), "stop {:?}", dump.focus_stop);
     ensure!(dump.modality.as_deref() == Some("pointer"), "modality {:?}", dump.modality);
     let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);

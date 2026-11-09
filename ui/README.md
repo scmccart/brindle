@@ -132,7 +132,9 @@ Dialog:
   (`close_focus`) and lists that handle among its stops. In shadcn it is
   always a button in the tab order. Reason: a `RenderOnce` builder keeps no
   focus handle of its own.
-- **`Overlay::ignore_outside_press`** (a "sticky" dialog) makes a press on
+- **`Overlay::ignore_outside_press`** (a "sticky" dialog), or
+  `set_ignore_outside_press(true)` on a slot whose views differ (Brindle's
+  palettes: only the ones that ask a question are sticky), makes a press on
   the backdrop request nothing. This matches Radix's
   `onPointerDownOutside={(e) => e.preventDefault()}`, so it is a different
   API rather than a different behaviour. The backdrop still blocks the
@@ -278,7 +280,11 @@ paints above its backdrop.
 
 A view hosting a `Command` lists `command.focus_handle(cx)` in its stops,
 turns `CommandEvent::Cancelled` into `DismissEvent`, and on `Confirmed`
-closes (emits `DismissEvent`) before acting on the item.
+closes (emits `DismissEvent`) before acting on the item. A host whose
+closing has side effects in its owner reports it in an event of its own
+instead and never emits `DismissEvent`, and the owner closes the slot:
+Brindle's palette sends `PaletteEvent::Dismissed`, so the workspace's rules
+for ended sessions and orphaned tabs always run.
 
 ## Gallery
 

@@ -272,16 +272,60 @@ fn session_rows(sessions: &mut [SessionInfo], now: u64) -> Vec<PaletteRow> {
         .collect()
 }
 
-/// What is shown over the tabs besides the settings dialog (which has its
-/// own modal slot); at most one overlay, this or the dialog, at a time.
-enum Overlay {
-    Palette(OpenPalette),
+/// The sessions palette's empty message for `count` detached sessions: it
+/// says there are none only when there are none; a filter matching none of
+/// them gets the command list's own "No results found.".
+fn sessions_empty_message(count: usize) -> Option<SharedString> {
+    (count == 0).then(|| "No detached sessions".into())
 }
 
-struct OpenPalette {
-    palette: Entity<Palette>,
-    kind: PaletteKind,
-    _subscription: Subscription,
+/// What a [`PaletteKind`] is, without its payload (entities and focus
+/// handles), so the rules that depend only on that are testable for every
+/// kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteTag {
+    NewTab,
+    Commands,
+    Prompt,
+    SessionEnded,
+    SessionOpenElsewhere,
+    Sessions,
+}
+
+impl PaletteTag {
+    #[cfg(test)]
+    const ALL: [PaletteTag; 6] = [
+        PaletteTag::NewTab,
+        PaletteTag::Commands,
+        PaletteTag::Prompt,
+        PaletteTag::SessionEnded,
+        PaletteTag::SessionOpenElsewhere,
+        PaletteTag::Sessions,
+    ];
+
+    fn of(kind: &PaletteKind) -> Self {
+        match kind {
+            PaletteKind::NewTab => PaletteTag::NewTab,
+            PaletteKind::Commands { .. } => PaletteTag::Commands,
+            PaletteKind::Prompt => PaletteTag::Prompt,
+            PaletteKind::SessionEnded { .. } => PaletteTag::SessionEnded,
+            PaletteKind::SessionOpenElsewhere { .. } => PaletteTag::SessionOpenElsewhere,
+            PaletteKind::Sessions { .. } => PaletteTag::Sessions,
+        }
+    }
+}
+
+/// Whether a palette of this kind, opened on its own, ignores a press
+/// outside it: those that ask a question the user must answer (after a
+/// session ended or opened elsewhere) close only on escape, their close
+/// button or a choice. A prompt opened on its own is a plain palette; one
+/// that follows a question takes its place in the same slot and keeps its
+/// flag (`open_prompt`).
+fn ignores_outside_press(tag: PaletteTag) -> bool {
+    match tag {
+        PaletteTag::SessionEnded | PaletteTag::SessionOpenElsewhere => true,
+        PaletteTag::NewTab | PaletteTag::Commands | PaletteTag::Prompt | PaletteTag::Sessions => false,
+    }
 }
 
 #[derive(Clone)]
@@ -310,7 +354,12 @@ impl Render for DraggedTab {
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    overlay: Option<Overlay>,
+    /// The palettes' modal slot. At most one overlay, a palette or the
+    /// settings dialog, is open at a time.
+    palette: UiOverlay<Palette>,
+    /// What the open palette is for, and the subscription to its events.
+    palette_kind: Option<PaletteKind>,
+    _palette_subscription: Option<Subscription>,
     /// The settings dialog's modal slot. A press on its backdrop does
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
@@ -352,7 +401,9 @@ impl Workspace {
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
-            overlay: None,
+            palette: UiOverlay::modal(),
+            palette_kind: None,
+            _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
             theme_preview: None,
@@ -869,8 +920,7 @@ impl Workspace {
         let open = self.open_sessions(cx);
         let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &open).into_iter().unzip();
         let placeholder = format!("tmux session \"{name}\" is open in another Brindle");
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx));
+        let palette = cx.new(|cx| Palette::list(rows, placeholder, cx));
         self.show_palette(palette, PaletteKind::SessionOpenElsewhere { choices, profile }, window, cx);
     }
 
@@ -1088,8 +1138,7 @@ impl Workspace {
     fn ask_session_ended(&mut self, session: Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
         let rows = session_ended_rows(&Self::settings(cx).profiles);
         let placeholder = format!("tmux session \"{}\" ended", session.read(cx).session_name.as_deref().unwrap_or("?"));
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx).modal());
+        let palette = cx.new(|cx| Palette::list(rows, placeholder, cx));
         self.show_palette(palette, PaletteKind::SessionEnded { session }, window, cx);
     }
 
@@ -1428,8 +1477,7 @@ impl Workspace {
                 }
             })
             .collect();
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::list(rows, "Open profile…", theme, cx));
+        let palette = cx.new(|cx| Palette::list(rows, "Open profile…", cx));
         self.show_palette(palette, PaletteKind::NewTab, window, cx);
     }
 
@@ -1453,15 +1501,23 @@ impl Workspace {
             })
             .collect();
         let actions = commands.into_iter().map(|(_, a)| a).collect();
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::list(rows, "Run a command…", theme, cx));
+        let palette = cx.new(|cx| Palette::list(rows, "Run a command…", cx));
         self.show_palette(palette, PaletteKind::Commands { actions, tab_focus }, window, cx);
     }
 
-    /// Asks for a line of text, replacing any open palette.
+    /// Asks for a line of text. An open palette becomes the prompt in
+    /// place (a list followed by a prompt keeps one overlay layer and the
+    /// focus it gives back, and the slot's outside-press rule: the prompt
+    /// that follows a question ignores outside presses as the question
+    /// did); otherwise one opens, replacing any overlay.
     fn open_prompt(&mut self, request: PromptRequest, window: &mut Window, cx: &mut Context<Self>) {
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::prompt(request, theme, cx));
+        if let Some(palette) = self.palette.view().cloned() {
+            palette.update(cx, |palette, cx| palette.show_prompt(request, window, cx));
+            self.palette_kind = Some(PaletteKind::Prompt);
+            cx.notify();
+            return;
+        }
+        let palette = cx.new(|cx| Palette::prompt(request, cx));
         self.show_palette(palette, PaletteKind::Prompt, window, cx);
     }
 
@@ -1476,11 +1532,14 @@ impl Workspace {
         if !self.has_overlay() {
             return false;
         }
-        let same = matches!(&self.overlay, Some(Overlay::Palette(open)) if is(&open.kind));
+        let same = self.palette_kind.as_ref().is_some_and(is);
         self.dismiss_overlay(window, cx);
         same
     }
 
+    /// Opens `palette` in the palette slot, replacing any overlay. The one
+    /// open goes first and gives focus back (to the tab), so that is the
+    /// focus the palette records and gives back when it closes.
     fn show_palette(
         &mut self,
         palette: Entity<Palette>,
@@ -1488,14 +1547,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_overlay(window, cx);
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
             PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
             PaletteEvent::Kill(ix) => this.palette_kill(*ix, window, cx),
             PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
-        self.close_overlay(window, cx);
-        window.focus(&palette.focus_handle(cx));
-        self.overlay = Some(Overlay::Palette(OpenPalette { palette, kind, _subscription: subscription }));
+        self.palette.set_ignore_outside_press(ignores_outside_press(PaletteTag::of(&kind)));
+        self.palette_kind = Some(kind);
+        self._palette_subscription = Some(subscription);
+        self.palette.open(palette, |this| &mut this.palette, window, cx);
         cx.notify();
     }
 
@@ -1504,14 +1565,9 @@ impl Workspace {
     /// (or a prompt that followed), tabs nothing replaces close, and so does
     /// a window left without tabs.
     fn palette_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (ended, orphans) = match &self.overlay {
-            Some(Overlay::Palette(OpenPalette { kind: PaletteKind::SessionEnded { session }, .. })) => {
-                (Some(session.clone()), false)
-            }
-            Some(Overlay::Palette(OpenPalette {
-                kind: PaletteKind::SessionOpenElsewhere { .. } | PaletteKind::Prompt,
-                ..
-            })) => (None, true),
+        let (ended, orphans) = match &self.palette_kind {
+            Some(PaletteKind::SessionEnded { session }) => (Some(session.clone()), false),
+            Some(PaletteKind::SessionOpenElsewhere { .. } | PaletteKind::Prompt) => (None, true),
             _ => (None, false),
         };
         self.dismiss_overlay(window, cx);
@@ -1524,26 +1580,31 @@ impl Workspace {
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Overlay::Palette(open)) = self.overlay.take() else { return };
-        match open.kind {
+        let Some(kind) = self.palette_kind.take() else { return };
+        match kind {
             PaletteKind::NewTab => {
                 self.dismiss_overlay(window, cx);
                 self.open_profile(ix, window, cx);
             }
-            PaletteKind::SessionOpenElsewhere { choices, profile } => {
-                self.dismiss_overlay(window, cx);
-                match choices.get(ix) {
-                    Some(OpenChoice::NewSession) => {
-                        if let Some(profile) = Self::settings(cx).profiles.get(profile).cloned() {
-                            self.ask_new_session(profile, window, cx);
-                        }
-                    }
-                    Some(&OpenChoice::Profile(other)) => self.launch_replacing_orphans(other, window, cx),
-                    None => {}
+            PaletteKind::SessionOpenElsewhere { choices, profile } => match choices.get(ix) {
+                // The question turns into the prompt for the session's
+                // name, in place.
+                Some(OpenChoice::NewSession) => match Self::settings(cx).profiles.get(profile).cloned() {
+                    Some(profile) => self.ask_new_session(profile, window, cx),
+                    None => self.dismiss_overlay(window, cx),
+                },
+                Some(&OpenChoice::Profile(other)) => {
+                    self.dismiss_overlay(window, cx);
+                    self.launch_replacing_orphans(other, window, cx);
                 }
-            }
+                None => self.dismiss_overlay(window, cx),
+            },
             PaletteKind::Commands { actions, tab_focus } => {
-                // Run it from the tab, exactly as its keybinding would.
+                // Run it from the tab, exactly as its keybinding would: the
+                // palette closes first (giving focus back to the tab), since
+                // the dispatch is deferred and follows focus. A prompt the
+                // command asks for opens a palette of its own.
+                self.close_overlay(window, cx);
                 window.focus(&tab_focus);
                 cx.notify();
                 if let Some(action) = actions.into_iter().nth(ix) {
@@ -1551,7 +1612,7 @@ impl Workspace {
                 }
             }
             // A prompt has no rows to confirm.
-            PaletteKind::Prompt => {}
+            PaletteKind::Prompt => self.palette_kind = Some(PaletteKind::Prompt),
             PaletteKind::Sessions { sessions } => {
                 self.dismiss_overlay(window, cx);
                 if let Some(info) = sessions.into_iter().nth(ix) {
@@ -1595,10 +1656,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let listed = listing.await;
             this.update_in(cx, |this, window, cx| {
-                let open = matches!(
-                    &this.overlay,
-                    Some(Overlay::Palette(OpenPalette { kind: PaletteKind::Sessions { .. }, .. }))
-                );
+                let open = matches!(&this.palette_kind, Some(PaletteKind::Sessions { .. }));
                 if kill.is_some() && !open {
                     return;
                 }
@@ -1618,16 +1676,25 @@ impl Workspace {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let rows = session_rows(&mut sessions, now);
-        let placeholder = if sessions.is_empty() { "No detached sessions" } else { "Attach a detached session" };
-        let theme = self.active_theme(cx);
-        let palette = cx.new(|cx| Palette::list(rows, placeholder, theme, cx));
+        let empty = sessions_empty_message(sessions.len());
+        // An open sessions palette takes the new list in place, keeping its
+        // filter text.
+        if let Some(PaletteKind::Sessions { sessions: listed }) = &mut self.palette_kind
+            && let Some(palette) = self.palette.view().cloned()
+        {
+            *listed = sessions;
+            palette.update(cx, |palette, cx| palette.set_rows(rows, empty, cx));
+            cx.notify();
+            return;
+        }
+        let palette = cx.new(|cx| Palette::list_with_empty(rows, "Attach a detached session", empty, cx));
         self.show_palette(palette, PaletteKind::Sessions { sessions }, window, cx);
     }
 
     /// `picker_kill` in the sessions palette: ends that session, and shows
     /// the list again.
     fn palette_kill(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Overlay::Palette(OpenPalette { kind: PaletteKind::Sessions { sessions }, .. })) = &self.overlay else {
+        let Some(PaletteKind::Sessions { sessions }) = &self.palette_kind else {
             return;
         };
         let Some(id) = sessions.get(ix).map(|s| s.session) else { return };
@@ -1687,7 +1754,7 @@ impl Workspace {
         // A palette goes first, with focus back on the tab, so that is the
         // focus the dialog records and puts back when it closes (the
         // palette's input is gone by then).
-        if self.overlay.is_some() {
+        if self.palette.is_open() {
             self.dismiss_overlay(window, cx);
         }
         self._settings_subscriptions = vec![subscription, dismissed];
@@ -1696,7 +1763,7 @@ impl Workspace {
     }
 
     fn has_overlay(&self) -> bool {
-        self.overlay.is_some() || self.settings.is_open()
+        self.palette.is_open() || self.settings.is_open()
     }
 
     /// Closes whatever overlay is open and gives focus back to the tab.
@@ -1711,7 +1778,9 @@ impl Workspace {
     /// Drops the open overlay. Closing the settings dialog this way cancels
     /// it, ending any preview.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overlay = None;
+        self.palette.close(window, cx);
+        self.palette_kind = None;
+        self._palette_subscription = None;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
         self.end_previews(cx);
@@ -1843,17 +1912,15 @@ impl Workspace {
     /// The text input that has keyboard focus, if any: the overlay's, or
     /// the find bar's in the active terminal.
     fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
-        match &self.overlay {
-            Some(Overlay::Palette(open)) => {
-                let input = open.palette.read(cx).input();
-                input.read(cx).is_focused(window).then(|| input.clone())
-            }
-            None if self.settings.is_open() => self.settings.view()?.read(cx).focused_input(window, cx),
-            None => {
-                let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
-                input.read(cx).is_focused(window).then_some(input)
-            }
+        if let Some(palette) = self.palette.view() {
+            let input = palette.read(cx).input(cx);
+            return input.read(cx).is_focused(window).then_some(input);
         }
+        if self.settings.is_open() {
+            return self.settings.view()?.read(cx).focused_input(window, cx);
+        }
+        let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
+        input.read(cx).is_focused(window).then_some(input)
     }
 
     /// Debug hook for `--send`: types into the focused text input, or else
@@ -1926,9 +1993,8 @@ impl Workspace {
         if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
             out.push_str(&find);
         }
-        match &self.overlay {
-            Some(Overlay::Palette(open)) => out.push_str(&open.palette.read(cx).describe(cx)),
-            None => {}
+        if let Some(palette) = self.palette.view() {
+            out.push_str(&palette.read(cx).describe(cx));
         }
         if let Some(dialog) = self.settings.view() {
             out.push_str(&dialog.read(cx).describe(window, cx));
@@ -1941,14 +2007,17 @@ impl Workspace {
     }
 
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
-    /// active tab's active terminal), `settings stop=NAME` (inside the
-    /// settings dialog, on the control `NAME`), `none`, or `other`; then
+    /// active tab's active terminal), `palette` (inside an open palette),
+    /// `settings stop=NAME` (inside the settings dialog, on the control
+    /// `NAME`), `none`, or `other`; then
     /// the window's `modality=keyboard|pointer`, which decides whether the
     /// focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
         let terminal = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
             "terminal".to_string()
+        } else if self.palette.view().is_some_and(|p| p.read(cx).focus_handle(cx).contains_focused(window, cx)) {
+            "palette".to_string()
         } else if let Some(dialog) =
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
@@ -2150,23 +2219,6 @@ impl Workspace {
             // marked area wins over everything inside it.
             .child(div().id("caption").flex_1().h_full().when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag)))
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
-    }
-
-    fn render_overlay(&self) -> Option<AnyElement> {
-        let overlay = match self.overlay.as_ref()? {
-            Overlay::Palette(open) => open.palette.clone().into_any_element(),
-        };
-        Some(
-            div()
-                .absolute()
-                .top(px(TAB_BAR_HEIGHT + 8.0))
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
-                .child(overlay)
-                .into_any_element(),
-        )
     }
 
     fn render_content(&self) -> AnyElement {
@@ -2426,8 +2478,9 @@ impl Render for Workspace {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
-            .when_some(self.render_overlay(), |d, overlay| d.child(overlay))
-            // Last in the tree, so the modal backdrop paints above the rest.
+            // Last in the tree, so a modal backdrop paints above the rest
+            // (one of the two is open at most).
+            .children(self.palette.render(window, cx))
             .children(self.settings.render(window, cx));
 
         // With client-side decorations we draw a transparent margin around the
@@ -2487,6 +2540,35 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::size;
+
+    /// The click-outside rule per palette (pointer presses can't be posted
+    /// on Linux, so this stands in for an e2e case): questions ignore a
+    /// press outside, plain lists and a prompt opened on its own close on
+    /// it. The prompt that follows a question replaces it in place and
+    /// keeps the slot's flag (`open_prompt` doesn't set it). Every kind is
+    /// covered through its tag; `PaletteTag::of` is an exhaustive match, so
+    /// a new kind needs a decision.
+    #[test]
+    fn questions_ignore_outside_presses() {
+        let sticky: Vec<PaletteTag> = PaletteTag::ALL.into_iter().filter(|&tag| ignores_outside_press(tag)).collect();
+        assert_eq!(sticky, [PaletteTag::SessionEnded, PaletteTag::SessionOpenElsewhere]);
+        // The kinds that build without an app map to their tags.
+        let elsewhere = PaletteKind::SessionOpenElsewhere { choices: Vec::new(), profile: 0 };
+        assert_eq!(PaletteTag::of(&elsewhere), PaletteTag::SessionOpenElsewhere);
+        assert_eq!(PaletteTag::of(&PaletteKind::Prompt), PaletteTag::Prompt);
+        assert_eq!(PaletteTag::of(&PaletteKind::NewTab), PaletteTag::NewTab);
+        assert_eq!(PaletteTag::of(&PaletteKind::Sessions { sessions: Vec::new() }), PaletteTag::Sessions);
+    }
+
+    /// The sessions palette says "No detached sessions" only when there
+    /// are none; a filter that matches none of several gets the command
+    /// list's own empty message.
+    #[test]
+    fn sessions_palette_says_none_only_when_there_are_none() {
+        assert_eq!(sessions_empty_message(0).as_ref().map(|m| m.as_ref()), Some("No detached sessions"));
+        assert_eq!(sessions_empty_message(1), None);
+        assert_eq!(sessions_empty_message(3), None);
+    }
 
     #[test]
     fn session_ended_rows_offer_closing_first_then_each_profile() {

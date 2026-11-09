@@ -362,6 +362,13 @@ impl Command {
         self
     }
 
+    /// Changes the message shown when nothing matches, as an app swaps
+    /// cmdk's `<Command.Empty>` children; `None` goes back to shadcn's.
+    pub fn set_empty_message(&mut self, message: Option<SharedString>, cx: &mut Context<Self>) {
+        self.empty_message = message.unwrap_or_else(|| EMPTY_MESSAGE.into());
+        cx.notify();
+    }
+
     pub fn groups(&self) -> &[CommandGroup] {
         &self.groups
     }
