@@ -2,11 +2,11 @@
 
 ## 1. brindle-ui: icons, sizes, Separator, Kbd
 
-- [ ] 1.1 Add `ButtonSize::IconSm` (2rem) and `IconXs` (1.5rem) to `ui/src/style.rs` with the icon scaled to fit; verify `button_style` unit tests pin both sizes and the existing sizes are unchanged (`cargo test -p brindle-ui`)
-- [ ] 1.2 Add `Icon::{Plus, Minus, Square, Copy, AppWindow, ArrowUp, ArrowDown, Columns2, Rows2}` from lucide's paths (with a `Stroke::Rect` for the rectangles) in `ui/src/icon.rs`; verify each icon's strokes stay inside the unit square in a unit test
-- [ ] 1.3 Add `Separator` (horizontal and vertical) and `Kbd` (keycaps from a keymap string, a gap between strokes) in `ui/src/components`; verify a unit test of the key splitting (`ctrl-shift-t`, a two-stroke `ctrl-k ctrl-c`, a lone `enter`) passes
-- [ ] 1.4 Show the new sizes, icons, `Separator` and `Kbd` in the gallery, light and dark, and extend `-- --check` for the sizes; verify `scripts/with-xvfb cargo run -p brindle-ui --example gallery -- --check` prints `ok` for them
-- [ ] 1.5 Document the components in `ui/README.md`; verify the component list there names each new one
+- [x] 1.1 Add `ButtonSize::IconSm` (2rem) and `IconXs` (1.5rem) to `ui/src/style.rs` with the icon scaled to fit; verify `button_style` unit tests pin both sizes and the existing sizes are unchanged (`cargo test -p brindle-ui`)
+- [x] 1.2 Add `Icon::{Plus, Minus, Square, Copy, AppWindow, ArrowUp, ArrowDown, Columns2, Rows2}` from lucide's paths (with a `Stroke::Rect` for the rectangles) in `ui/src/icon.rs`; verify each icon's strokes stay inside the unit square in a unit test
+- [x] 1.3 Add `Separator` (horizontal and vertical) and `Kbd` (keycaps from a keymap string, a gap between strokes) in `ui/src/components`; verify a unit test of the key splitting (`ctrl-shift-t`, a two-stroke `ctrl-k ctrl-c`, a lone `enter`) passes
+- [x] 1.4 Show the new sizes, icons, `Separator` and `Kbd` in the gallery, light and dark, and extend `-- --check` for the sizes; verify `scripts/with-xvfb cargo run -p brindle-ui --example gallery -- --check` prints `ok` for them
+- [x] 1.5 Document the components in `ui/README.md`; verify the component list there names each new one
 
 ## 2. brindle-ui: Tooltip and Toggle
 

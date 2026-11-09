@@ -51,10 +51,26 @@ rule, not a convenience.
 - **Components** (`components/`), in two kinds:
   - stateless `RenderOnce` builders, controlled by their owner: `Button`
     (variants default, destructive, outline, secondary, ghost, link; sizes
-    default, sm, lg, icon), `Input` (a frame around a `TextInput`),
-    `Checkbox`, `Switch`, the `Dialog` chrome and `PopoverContent`. A
-    focusable control takes its `FocusHandle` from the owner
-    (`.focus(&handle)`); without one it can't take keyboard focus.
+    default, sm, lg, icon, icon-sm, icon-xs; the icon sizes are squares of
+    2.25, 2 and 1.5rem, and the icon inside is 1rem, 0.75rem in icon-xs),
+    `Input` (a frame around a `TextInput`), `Checkbox`, `Switch`, the
+    `Dialog` chrome and `PopoverContent`. A focusable control takes its
+    `FocusHandle` from the owner (`.focus(&handle)`); without one it can't
+    take keyboard focus. Two of them are not controls:
+    - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
+      rule in the border colour that takes no focus and no pointer events.
+    - `Kbd` (`Kbd::new("ctrl-shift-t")`): keycaps from a keymap string, one
+      per key with the names unchanged. Strokes separated by a space
+      (`ctrl-k ctrl-c`) are groups with a wider gap between them. `keycaps`
+      does the splitting, `.colors(background, foreground)` replaces the
+      muted tokens (an inverted tooltip). It prints what the keymap prints;
+      mapping `cmd` or `super` per platform is the keymap's job.
+- **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
+  rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
+  `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
+  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2` and
+  `Rows2`. Strokes have butt caps and miter joins, since gpui doesn't expose
+  lucide's round caps.
   - entities the owner creates, keeps and subscribes to: `Select`
     (`SelectEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`

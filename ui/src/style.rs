@@ -80,7 +80,8 @@ impl ButtonVariant {
     ];
 }
 
-/// shadcn's button sizes. `Icon` is a square for an icon-only button.
+/// shadcn's button sizes. `Icon`, `IconSm` (`icon-sm`) and `IconXs`
+/// (`icon-xs`) are squares for an icon-only button.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ButtonSize {
     #[default]
@@ -88,14 +89,18 @@ pub enum ButtonSize {
     Sm,
     Lg,
     Icon,
+    IconSm,
+    IconXs,
 }
 
 impl ButtonSize {
-    pub const ALL: [ButtonSize; 4] = [
+    pub const ALL: [ButtonSize; 6] = [
         ButtonSize::Default,
         ButtonSize::Sm,
         ButtonSize::Lg,
         ButtonSize::Icon,
+        ButtonSize::IconSm,
+        ButtonSize::IconXs,
     ];
 }
 
@@ -124,6 +129,9 @@ pub struct ButtonStyle {
     pub padding_x_with_icon: Rems,
     /// Space between a leading icon and the label.
     pub gap: Rems,
+    /// The icon's side: 1rem (`size-4`), 0.75rem in `IconXs`
+    /// (`[&_svg:not([class*='size-'])]:size-3`).
+    pub icon_size: Rems,
     pub text_size: Rems,
     pub radius: Rems,
 }
@@ -221,7 +229,12 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
         ButtonSize::Lg => (rems(2.5), None, rems(1.5), rems(1.), rems(0.5)),
         // size-9
         ButtonSize::Icon => (rems(2.25), Some(rems(2.25)), rems(0.), rems(0.), rems(0.5)),
+        // size-8
+        ButtonSize::IconSm => (rems(2.), Some(rems(2.)), rems(0.), rems(0.), rems(0.5)),
+        // size-6
+        ButtonSize::IconXs => (rems(1.5), Some(rems(1.5)), rems(0.), rems(0.), rems(0.5)),
     };
+    let icon_size = if size == ButtonSize::IconXs { rems(0.75) } else { rems(1.) };
 
     ButtonStyle {
         background,
@@ -237,6 +250,7 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
         padding_x,
         padding_x_with_icon,
         gap,
+        icon_size,
         // text-sm rounded-md
         text_size: rems(0.875),
         radius: t.radius_md(),
@@ -656,7 +670,7 @@ mod tests {
 
     /// The style `row` and the size row describe, in the colours of `t`.
     fn expected_style(row: &VariantRow, size_row: SizeRow, t: &Tokens) -> ButtonStyle {
-        let (_, height, width, px, px_icon, gap) = size_row;
+        let (_, height, width, px, px_icon, gap, icon) = size_row;
         let faded = |(pick, opacity): Faded| pick(t).opacity(opacity);
         ButtonStyle {
             background: row.background.map(faded),
@@ -672,19 +686,22 @@ mod tests {
             padding_x: rems(px),
             padding_x_with_icon: rems(px_icon),
             gap: rems(gap),
+            icon_size: rems(icon),
             text_size: rems(0.875),
             radius: t.radius_md(),
         }
     }
 
-    /// (size, height, width, px, px with an icon, gap), in rems.
-    type SizeRow = (ButtonSize, f32, Option<f32>, f32, f32, f32);
+    /// (size, height, width, px, px with an icon, gap, icon side), in rems.
+    type SizeRow = (ButtonSize, f32, Option<f32>, f32, f32, f32, f32);
 
-    const SIZE_ROWS: [SizeRow; 4] = [
-        (ButtonSize::Default, 2.25, None, 1.0, 0.75, 0.5),
-        (ButtonSize::Sm, 2.0, None, 0.75, 0.625, 0.375),
-        (ButtonSize::Lg, 2.5, None, 1.5, 1.0, 0.5),
-        (ButtonSize::Icon, 2.25, Some(2.25), 0.0, 0.0, 0.5),
+    const SIZE_ROWS: [SizeRow; 6] = [
+        (ButtonSize::Default, 2.25, None, 1.0, 0.75, 0.5, 1.0),
+        (ButtonSize::Sm, 2.0, None, 0.75, 0.625, 0.375, 1.0),
+        (ButtonSize::Lg, 2.5, None, 1.5, 1.0, 0.5, 1.0),
+        (ButtonSize::Icon, 2.25, Some(2.25), 0.0, 0.0, 0.5, 1.0),
+        (ButtonSize::IconSm, 2.0, Some(2.0), 0.0, 0.0, 0.5, 1.0),
+        (ButtonSize::IconXs, 1.5, Some(1.5), 0.0, 0.0, 0.5, 0.75),
     ];
 
     #[test]
@@ -705,9 +722,34 @@ mod tests {
                 }
             }
         }
-        // 6 variants x 4 sizes, in each of the two sets.
-        assert_eq!(combinations, 2 * 24);
-        assert_eq!(ButtonVariant::ALL.len() * ButtonSize::ALL.len(), 24);
+        // 6 variants x 6 sizes, in each of the two sets.
+        assert_eq!(combinations, 2 * 36);
+        assert_eq!(ButtonVariant::ALL.len() * ButtonSize::ALL.len(), 36);
+    }
+
+    /// The two new icon sizes are shadcn's `size-8` and `size-6` squares,
+    /// the existing sizes are untouched, and only `IconXs` shrinks its icon.
+    #[test]
+    fn icon_sizes_are_squares_of_two_and_one_and_a_half_rems() {
+        let t = Tokens::neutral_light();
+        let style = |size| button_style(ButtonVariant::Ghost, size, &t);
+        for (size, side, icon) in [
+            (ButtonSize::Icon, 2.25, 1.),
+            (ButtonSize::IconSm, 2., 1.),
+            (ButtonSize::IconXs, 1.5, 0.75),
+        ] {
+            let s = style(size);
+            assert_eq!((s.height, s.width, s.icon_size), (rems(side), Some(rems(side)), rems(icon)), "{size:?}");
+            assert_eq!((s.padding_x, s.padding_x_with_icon), (rems(0.), rems(0.)), "{size:?}");
+        }
+        for size in [ButtonSize::Default, ButtonSize::Sm, ButtonSize::Lg] {
+            assert_eq!(style(size).width, None, "{size:?}");
+            assert_eq!(style(size).icon_size, rems(1.), "{size:?}");
+        }
+        // Heights of the existing sizes: 2.25, 2, 2.5 rem.
+        assert_eq!(style(ButtonSize::Default).height, rems(2.25));
+        assert_eq!(style(ButtonSize::Sm).height, rems(2.));
+        assert_eq!(style(ButtonSize::Lg).height, rems(2.5));
     }
 
     /// The hint alone picks the `dark:` refinements: the dark colours with

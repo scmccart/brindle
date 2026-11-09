@@ -35,8 +35,10 @@ pub mod checkbox;
 pub mod command;
 pub mod dialog;
 pub mod input;
+pub mod kbd;
 pub mod popover;
 pub mod select;
+pub mod separator;
 pub mod switch;
 
 use std::rc::Rc;
@@ -54,11 +56,13 @@ pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
 pub use dialog::{Dialog, dialog_width};
 pub use input::Input;
+pub use kbd::{Kbd, KbdStyle, kbd_style, keycaps};
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
     Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,
     TypedKey, closed_trigger_key, initial_highlight, menu_release, moved_off, trigger_activation, typed_key,
 };
+pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
 
 /// shadcn's `disabled:opacity-50`.

@@ -152,7 +152,7 @@ impl RenderOnce for Button {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             })
             .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
-            .children(self.icon)
+            .children(self.icon.map(|icon| icon.size(style.icon_size)))
             .children(self.label);
         // The owner's layout refinements win over the component's. The ring
         // follows the corners they leave.

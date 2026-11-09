@@ -27,8 +27,8 @@ use std::rc::Rc;
 
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem, Dialog,
-    Dismiss, FocusScope, FocusStops, Icon, Input, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Switch,
-    TextInput, Tokens, UiTheme,
+    Dismiss, FocusScope, FocusStops, Icon, Input, Kbd, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
+    Separator, Switch, TextInput, Tokens, UiTheme,
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
@@ -45,6 +45,9 @@ type Counts = Rc<RefCell<HashMap<String, usize>>>;
 
 /// What the command hosts (dialog and popover) confirmed, in order.
 type Confirmed = Rc<RefCell<Vec<String>>>;
+
+/// The icon-only button sizes, with their side in rems.
+const ICON_SIZES: [ButtonSize; 3] = [ButtonSize::Icon, ButtonSize::IconSm, ButtonSize::IconXs];
 
 /// The window's size: fixed, so the edge cases know where the edges are.
 const WINDOW_SIZE: gpui::Size<Pixels> = size(px(1000.), px(700.));
@@ -434,7 +437,7 @@ impl Gallery {
                 let name = Self::button_name(variant, size);
                 let id: SharedString = name.clone().into();
                 let button = match size {
-                    ButtonSize::Icon => Button::icon_only(id, Icon::Check),
+                    ButtonSize::Icon | ButtonSize::IconSm | ButtonSize::IconXs => Button::icon_only(id, Icon::Check),
                     _ => Button::new(id, format!("{size:?}")),
                 };
                 row = row.child(button.variant(variant).size(size).focus(&self.handle(&name)).on_click(self.count(&name)));
@@ -465,6 +468,79 @@ impl Gallery {
                 .child(Button::icon_only("icon-x", Icon::X).variant(ButtonVariant::Ghost))
                 .child(Button::new("link", "Learn more").variant(ButtonVariant::Link)),
         )
+    }
+
+    /// The icon sizes, every icon, `Separator` and `Kbd`.
+    fn chrome_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
+        let mut sizes = row("Icon sizes");
+        for size in ICON_SIZES {
+            let name = format!("size:{size:?}");
+            sizes = sizes
+                .child(recorded(
+                    Button::icon_only(SharedString::from(name.clone()), Icon::Plus)
+                        .variant(ButtonVariant::Outline)
+                        .size(size),
+                    &name,
+                    &self.records,
+                ))
+                .child(
+                    Button::icon_only(SharedString::from(format!("size-ghost:{size:?}")), Icon::ArrowDown)
+                        .variant(ButtonVariant::Ghost)
+                        .size(size),
+                );
+        }
+        let mut icons = row("Icons");
+        for icon in Icon::ALL {
+            icons = icons.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(icon.size(gpui::rems(1.5)))
+                    .child(div().text_size(px(10.)).text_color(t.muted_foreground).child(format!("{icon:?}"))),
+            );
+        }
+        let separators = row("Separator")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(160.))
+                    .child("Above")
+                    .child(Separator::horizontal())
+                    .child("Below"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .h(px(20.))
+                    .child("Docs")
+                    .child(Separator::vertical())
+                    .child("Source")
+                    .child(Separator::vertical())
+                    .child("Releases"),
+            );
+        let keys = row("Kbd")
+            .child(Kbd::new("enter"))
+            .child(Kbd::new("ctrl-shift-t"))
+            .child(Kbd::new("ctrl-k ctrl-c"))
+            .child(Kbd::new("alt-1"))
+            .child(Kbd::new("ctrl--"));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Icon buttons, icons, Separator and Kbd", cx))
+            .child(sizes)
+            .child(icons)
+            .child(separators)
+            .child(keys)
     }
 
     fn inputs_section(&self, cx: &mut Context<Self>) -> Div {
@@ -643,6 +719,7 @@ impl Render for Gallery {
             .child(self.selects_section(cx))
             .child(self.command_section(cx))
             .child(self.buttons_section(cx))
+            .child(self.chrome_section(cx))
             .child(self.inputs_section(cx))
             .child(self.toggles_section(cx))
             .child(self.status(cx));
@@ -1531,6 +1608,8 @@ mod check {
         c.run_check("button-space-and-enter-activate-once", check).await;
         let check = button_disabled_inert(&mut c).await;
         c.run_check("button-disabled-runs-nothing-keeps-focus", check).await;
+        let check = icon_button_sizes(&mut c).await;
+        c.run_check("icon-button-sizes-are-two-and-a-quarter-two-and-one-and-a-half-rem", check).await;
         let check = focus_visible(&mut c).await;
         c.run_check("focus-visible-pointer-then-keyboard", check).await;
         let check = ring_paints(&mut c).await;
@@ -1723,6 +1802,22 @@ mod check {
         c.press(at).await?;
         ensure!(c.clicks("disabled")? == 0, "a disabled button ran its action");
         ensure!(c.focused_name("behind")?, "pressing a disabled button moved focus");
+        Ok(())
+    }
+
+    /// The icon-only sizes paint as shadcn's `size-9`, `size-8` and `size-6`
+    /// squares: 2.25, 2 and 1.5 rem.
+    async fn icon_button_sizes(c: &mut Checker) -> Check {
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        for (size, rems) in [(ButtonSize::Icon, 2.25), (ButtonSize::IconSm, 2.), (ButtonSize::IconXs, 1.5)] {
+            let bounds = c.reveal(&format!("size:{size:?}")).await?;
+            let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let side = rems * rem;
+            ensure!(
+                (width - side).abs() < 0.5 && (height - side).abs() < 0.5,
+                "{size:?} paints {width}x{height}, not {side}x{side} ({rems}rem)"
+            );
+        }
         Ok(())
     }
 
