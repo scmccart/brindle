@@ -83,6 +83,8 @@ Added after 11.1 passed; 11.2 to 11.4 run on the result, so redo 11.1 once this 
 - [ ] 12.4 Update everything that assumed the 30px strip (`TAB_ATTACHED_HEIGHT` users, the caption hit-test region, e2e capture offsets, `--dump-screen-after` grid origin expectations, the zone and tmux layout offsets); verify `cargo test --workspace` and the full e2e under `scripts/with-xvfb` pass, and the `win` cases on Windows
 - [ ] 12.5 Update CLAUDE.md's `workspace.rs` bullet (the strip is a `brindle_ui::TabList` in the `Line` variant, with each tab's face in its terminal's colours) and the `brindle-ui` bullet (no `Attached` variant); verify `grep -n Attached CLAUDE.md` finds nothing about tabs
 
+- [ ] 12.6 Add the Split Right, Split Down and Find buttons to the strip between its empty space and the window controls (`Columns2`, `Rows2`, `Search`; press-stopping wrappers as in 6.3; tooltips with the bound key; tmux tabs dispatch the `tmux_split_*` actions; split buttons disabled through `can_split_zone`); verify e2e cases that use the tab's actions to check a split from the strip's action path and the disabled state, `--dump-screen-after` zone output after a split, and that the `win` caption hit-test still passes on Windows
+
 ## Workflow follow-up
 
 - Open a PR from a branch (the usual): implementation commits, then an archive commit `docs(openspec): archive ui-chrome`; the user merges.

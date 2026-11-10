@@ -89,3 +89,22 @@ Each tab's face in the strip SHALL be drawn on its terminal's background in its 
 #### Scenario: Active tab marker
 - **WHEN** a tab is active
 - **THEN** its text is at full opacity and a 2px line in its theme's accent runs along its top edge; inactive tabs have no line
+
+### Requirement: Active-tab action buttons
+The strip SHALL show Split Right, Split Down and Find buttons, between its empty space and the window controls, acting on the active tab through the same actions as the keymap (the tmux split actions on a tmux tab). A split button SHALL be disabled when the active zone cannot be split along its axis, and a press on any of them SHALL NOT move the window or take focus from the terminal.
+
+#### Scenario: Split from the strip
+- **WHEN** the user presses Split Right in a local tab with one zone
+- **THEN** the tab has two zones side by side and keyboard focus is in the new zone's terminal
+
+#### Scenario: Tmux tab
+- **WHEN** the active tab is a tmux window and the user presses Split Down
+- **THEN** tmux receives a down split, as for the `tmux_split_down` action
+
+#### Scenario: Find from the strip
+- **WHEN** the user presses Find
+- **THEN** the active terminal's find bar opens with its query focused
+
+#### Scenario: Button tooltip
+- **WHEN** the pointer rests on Split Right
+- **THEN** a tooltip reads "Split right" with the key bound to the action
