@@ -104,7 +104,7 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/4   # every 4th selected case, 
 
 ### Manual checks
 
-The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway` to try them on a build without touching their config, saved session or terminal server (it runs Brindle against a private config, state and server directory under `/tmp`, stops that server on exit, and takes `--config FILE`, `--keep` and `-- <brindle args>`; it opens a window, so it is theirs to run, not ours):
+The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway.sh` (on Windows `scripts/run-throwaway.ps1`, which sets only the config and state directories, as Windows has no terminal server, and takes `-Config FILE`, `-Keep` and `-BrindleArgs '-d','C:/Temp'`) to try them on a build without touching their config, saved session or terminal server (the shell script runs Brindle against a private config, state and server directory under `/tmp`, stops that server on exit, and takes `--config FILE`, `--keep` and `-- <brindle args>`; it opens a window, so it is theirs to run, not ours):
 - ctrl-shift-d in a local tab does nothing and sends no `^D` (the `Swallow` binding; `commands-detach-beside-local` only checks the action);
 - IME composition: with IBus, ctrl-shift-u `e9` space gives `é`, in a terminal and in a palette;
 - wheel scrolling in local tabs and tmux panes;
