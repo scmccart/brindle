@@ -91,14 +91,12 @@ rule, not a convenience.
       `on_activate(&TabActivate { index, by })` (`by` is the pointer or the
       keyboard, so the owner decides where focus goes), `on_close(&index)`
       and `on_move(&TabMove { from, to })`; `on_trigger_bounds` reports where
-      the triggers were laid out. Variants `Default` (shadcn's pill),
-      `Line` and `Attached` (a tab strip: the active trigger is drawn on a
-      surface with rounded top corners and a 2px primary line on top, in
-      the trigger's own `surface` and `text_color` when it has them, else
-      the background and foreground tokens; `tab_style`). The list is one
-      keyboard stop through the handle `.focus(&handle)` gives it, with
-      focus resting on the active trigger: left and right activate the
-      previous and next enabled trigger, wrapping, home/PageUp and
+      the triggers were laid out. Variants `Default` (shadcn's pill) and
+      `Line`. A trigger may carry its own `surface`, `text_color` and
+      `line_color`, drawn whether it is active or not (`tab_style`). The
+      list is one keyboard stop through the handle `.focus(&handle)` gives
+      it, with focus resting on the active trigger: left and right activate
+      the previous and next enabled trigger, wrapping, home/PageUp and
       end/PageDown the first and last (`tab_key`, `tab_target`). A primary
       press asks to activate and moves no focus. A trigger takes a leading
       element (an icon), trailing adornments (status dots), a tooltip,
@@ -513,17 +511,19 @@ needs:
   another trigger of the same list asks the owner to move it there, and a
   2px primary bar marks the side it will land on. Reason: tab strips
   reorder tabs.
-- **The `Attached` variant** (an addition): triggers on the background in
-  the muted foreground, a hovered inactive one on the accent background, and
-  the active one on a surface with rounded top corners and a 2px primary line
-  along its top, so it joins the content below. Each trigger may carry its
-  own `surface` and `text_color`, used only while it is active. Reason: a
-  window's tab strip, whose active tab takes its terminal's colours (a
-  profile can theme a tab differently from the window).
+- **Per-trigger colours** (an addition): a trigger may carry its own
+  `surface`, `text_color` and `line_color`. It is drawn on its surface in
+  its text colour whether active or not: the active one's text at full
+  opacity, an inactive one's at 60% until hovered, then full; the active
+  `Line` trigger's top line takes `line_color`, else the `primary` token.
+  Colours not given come from the variant, so a list without them looks as
+  shadcn's does. Reason: a window's tab strip draws each tab in its own
+  terminal's background, foreground and accent (a profile can theme a tab
+  differently from the window), background tabs included.
 - **`Line` marks the active trigger with a 2px primary line along its
   top.** shadcn's line variant underlines it, `bottom-[-5px]`, in the
   foreground colour. Reason: the spec ("Tab list look"), so the line matches
-  the attached strip's and a zone header's active line.
+  a zone header's active line.
 - **Triggers fill the list's height.** shadcn's are `h-[calc(100%-1px)]`.
   Reason: gpui has no `calc()`; the difference is a pixel.
 - **Horizontal and left-to-right only, automatic activation only, and no
@@ -626,7 +626,7 @@ a context menu target and two dropdown menus (one with descriptions and
 shortcuts, one of forty items that scrolls), toggles in each variant and
 size, buttons and a plain element with tooltips (beside the tooltip's
 look drawn in place), and tab lists in each variant: a pill list with a
-disabled trigger, a line list, an attached strip above a panel in the active
+disabled trigger, a line list, a line strip above a panel in the active
 tab's colours (closable, reorderable triggers with an icon, status and bell
 dots, tooltips and a long title cut at the maximum width) and a crowded
 strip whose triggers shrink to their minimum.

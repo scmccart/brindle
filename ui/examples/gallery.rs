@@ -164,9 +164,9 @@ pub struct DemoTab {
     pub id: usize,
     pub label: SharedString,
     disabled: bool,
-    /// The surface and text it is drawn in while active in an attached
-    /// list, as a terminal's background and foreground.
-    colors: Option<(u32, u32)>,
+    /// The surface, text and top-line colours it is drawn in, active or
+    /// not, as a terminal's background, foreground and accent.
+    colors: Option<(u32, u32, u32)>,
     /// A leading icon, as a tmux window's marker.
     icon: bool,
     /// A status dot in this colour, and a bell dot.
@@ -191,10 +191,11 @@ pub struct TabsDemo {
 /// - `default` (pill): Account, Password (active), Billing (disabled),
 ///   Settings;
 /// - `line`: Overview, Analytics (active), Reports, Notifications;
-/// - `attached`: a tab strip whose tabs close, move and show a tooltip:
-///   bash (active, the spec's `#1a1b26` on `#c0caf5`), a long nvim title
-///   (Solarized light colours), tmux (a leading icon, the tokens' colours)
-///   and a build with a status dot and a bell;
+/// - `strip`: a `Line` tab strip whose tabs close, move and show a tooltip:
+///   bash (active, the spec's `#1a1b26` on `#c0caf5` with a `#7aa2f7`
+///   line), a long nvim title (Solarized light colours, inactive but on its
+///   own surface), tmux (a leading icon, the tokens' colours) and a build
+///   with a status dot and a bell;
 /// - `crowded`: six sessions in a list too narrow for them.
 fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let plain = |labels: &[&'static str]| -> Vec<DemoTab> {
@@ -203,9 +204,9 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let mut pill = plain(&["Account", "Password", "Billing", "Settings"]);
     pill[2].disabled = true;
     let line = plain(&["Overview", "Analytics", "Reports", "Notifications"]);
-    let attached = vec![
-        DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
-        DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
+    let strip = vec![
+        DemoTab { colors: Some((0x1a1b26, 0xc0caf5, 0x7aa2f7)), ..DemoTab::new(0, "bash") },
+        DemoTab { colors: Some((0xfdf6e3, 0x657b83, 0xb58900)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
         DemoTab { icon: true, ..DemoTab::new(2, "tmux: main") },
         DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
     ];
@@ -213,12 +214,12 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     HashMap::from([
         ("default", TabsDemo { tabs: pill, active: 1 }),
         ("line", TabsDemo { tabs: line, active: 1 }),
-        ("attached", TabsDemo { tabs: attached, active: 0 }),
+        ("strip", TabsDemo { tabs: strip, active: 0 }),
         ("crowded", TabsDemo { tabs: crowded, active: 0 }),
     ])
 }
 
-/// The attached lists' trigger limits: 5rem to 15rem.
+/// The strip and crowded lists' trigger limits: 5rem to 15rem.
 fn demo_tab_width() -> TabWidth {
     TabWidth::new(rems(5.), rems(15.))
 }
@@ -312,7 +313,7 @@ impl Gallery {
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
                 "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger", "tabs-default",
-                "tabs-line", "tabs-attached",
+                "tabs-line", "tabs-strip",
             ]
             .map(String::from),
         );
@@ -1013,27 +1014,27 @@ impl Gallery {
         cx.notify();
     }
 
-    /// The tab list called `name` in `variant`. Attached lists' tabs close
-    /// (with a tooltip on the button), move, show their title as a tooltip
-    /// and keep between 5 and 15rem. Each trigger's bounds are recorded as
-    /// `tab:NAME:IX`.
+    /// The tab list called `name` in `variant`. The strip and crowded
+    /// lists' tabs close (with a tooltip on the button), move, show their
+    /// title as a tooltip and keep between 5 and 15rem. Each trigger's
+    /// bounds are recorded as `tab:NAME:IX`.
     fn tab_list(&self, name: &'static str, variant: TabVariant, cx: &mut Context<Self>) -> TabList {
         let demo = self.tabs_demo(name);
-        let attached = variant == TabVariant::Attached;
+        let closable = matches!(name, "strip" | "crowded");
         let primary = cx.ui_theme().primary;
         let triggers: Vec<TabTrigger> = demo
             .tabs
             .iter()
             .map(|tab| {
                 let mut trigger = TabTrigger::new(("tab", tab.id), tab.label.clone()).disabled(tab.disabled);
-                if attached {
+                if closable {
                     trigger = trigger
                         .closable(true)
                         .tooltip_for(tab.label.clone(), None)
                         .close_tooltip(|_, _| Tooltip::new("Close tab").shortcut("ctrl-shift-w"));
                 }
-                if let Some((surface, text)) = tab.colors {
-                    trigger = trigger.surface(rgb(surface)).text_color(rgb(text));
+                if let Some((surface, text, line)) = tab.colors {
+                    trigger = trigger.surface(rgb(surface)).text_color(rgb(text)).line_color(rgb(line));
                 }
                 if tab.icon {
                     trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
@@ -1060,7 +1061,7 @@ impl Gallery {
                     records.insert(format!("{prefix}{ix}"), *bounds);
                 }
             });
-        if !attached {
+        if !closable {
             return list;
         }
         list.trigger_width(demo_tab_width())
@@ -1081,20 +1082,20 @@ impl Gallery {
     }
 
     /// The tab lists in each variant: the pill and line ones as shadcn's,
-    /// the attached one as a tab strip above content in the active tab's
+    /// the strip as a `Line` tab strip above content in the active tab's
     /// colours, and a crowded one whose triggers shrink to their minimum.
     fn tabs_section(&self, cx: &mut Context<Self>) -> Div {
         let t = *cx.ui_theme();
-        let attached = self.tabs_demo("attached");
-        let current = attached.tabs.get(attached.active);
+        let demo = self.tabs_demo("strip");
+        let current = demo.tabs.get(demo.active);
         let (surface, text): (Hsla, Hsla) = current
             .and_then(|tab| tab.colors)
-            .map_or((t.background, t.foreground), |(surface, text)| (rgb(surface).into(), rgb(text).into()));
+            .map_or((t.background, t.foreground), |(surface, text, _)| (rgb(surface).into(), rgb(text).into()));
         let content = current.map_or_else(|| "No tabs left".to_string(), |tab| format!("The content of {}", tab.label));
         let pill = self.tab_list("default", TabVariant::Default, cx).focus(&self.handle("tabs-default"));
         let line = self.tab_list("line", TabVariant::Line, cx).focus(&self.handle("tabs-line"));
-        let strip = self.tab_list("attached", TabVariant::Attached, cx).focus(&self.handle("tabs-attached"));
-        let crowded = self.tab_list("crowded", TabVariant::Attached, cx);
+        let strip = self.tab_list("strip", TabVariant::Line, cx).focus(&self.handle("tabs-strip"));
+        let crowded = self.tab_list("crowded", TabVariant::Line, cx);
         let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
         div()
             .flex()
@@ -1104,7 +1105,7 @@ impl Gallery {
             .child(row("Default").child(recorded(pill, "tabs:default", &self.records)))
             .child(row("Line").child(recorded(line, "tabs:line", &self.records)))
             .child(
-                div().flex().items_start().gap_3().child(label("Attached", cx)).child(
+                div().flex().items_start().gap_3().child(label("Strip", cx)).child(
                     div()
                         .flex_1()
                         .flex()
@@ -1212,7 +1213,7 @@ impl FocusStops for Gallery {
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
         stops.extend(named(&[
-            "checkbox", "switch", "toggle", "tabs-default", "tabs-line", "tabs-attached", "corner-0", "corner-1", "corner-2",
+            "checkbox", "switch", "toggle", "tabs-default", "tabs-line", "tabs-strip", "corner-0", "corner-1", "corner-2",
             "corner-3",
         ]));
         stops
@@ -2365,9 +2366,9 @@ mod check {
         // Tabs: what is drawn and the pointer (Windows only).
         let check = tabs_ring(&mut c).await;
         c.run_check("tabs-ring-paints-around-the-active-trigger-only", check).await;
-        let check = tabs_attached_colours(&mut c).await;
+        let check = tabs_owner_colours(&mut c).await;
         let check = pointer_away_after(&mut c, check).await;
-        c.run_check("tabs-attached-active-trigger-in-the-owners-colours-others-on-the-background", check).await;
+        c.run_check("tabs-owner-colours-apply-to-active-and-inactive-triggers", check).await;
         let check = tabs_press_activates(&mut c).await;
         c.run_check("tabs-press-activates-and-moves-no-focus", check).await;
         let check = tabs_disabled_press(&mut c).await;
@@ -4194,12 +4195,12 @@ mod check {
     /// trigger to trigger) and on past the last; shift-Tab comes back.
     async fn tabs_one_stop(c: &mut Checker) -> Check {
         c.focus("toggle").await?;
-        for name in ["tabs-default", "tabs-line", "tabs-attached", "corner-0"] {
+        for name in ["tabs-default", "tabs-line", "tabs-strip", "corner-0"] {
             c.key("tab").await?;
             ensure!(c.focused_name(name)?, "Tab didn't move on to {name}");
         }
         c.key("shift-tab").await?;
-        ensure!(c.focused_name("tabs-attached")?, "shift-Tab didn't come back to the attached list");
+        ensure!(c.focused_name("tabs-strip")?, "shift-Tab didn't come back to the strip list");
         Ok(())
     }
 
@@ -4211,9 +4212,9 @@ mod check {
         let limits = super::demo_tab_width();
         let (min, max) = (limits.min().0 * rem, limits.max().0 * rem);
         let close = |a: f32, b: f32| (a - b).abs() < 0.5;
-        let long = f32::from(trigger(c, "attached", 1).await?.size.width);
+        let long = f32::from(trigger(c, "strip", 1).await?.size.width);
         ensure!(close(long, max), "the long title's trigger is {long}px wide, not the {max}px maximum");
-        let tmux = f32::from(trigger(c, "attached", 2).await?.size.width);
+        let tmux = f32::from(trigger(c, "strip", 2).await?.size.width);
         ensure!(tmux > min + 0.5 && tmux < max - 0.5, "the tmux trigger is {tmux}px wide, not its own width within {min}..{max}");
         for ix in 0..6 {
             let width = f32::from(trigger(c, "crowded", ix).await?.size.width);
@@ -4244,32 +4245,35 @@ mod check {
         Ok(())
     }
 
-    /// The spec's scenarios: the active attached trigger is drawn on its
-    /// owner's `#1a1b26` with a primary line on top, the others on the
-    /// list's background; a trigger without colours of its own is active
-    /// on the background token, and the first, no longer active, drops its
-    /// own.
-    async fn tabs_attached_colours(c: &mut Checker) -> Check {
+    /// The spec's scenarios: a trigger given owner colours is drawn on its
+    /// surface whether active or not; the active one has a top line in its
+    /// own `line` colour (bash `#7aa2f7`); a trigger without colours of its
+    /// own is on the list's background, with the `primary` line when
+    /// active, and the first, no longer active, keeps its surface but
+    /// drops its line.
+    async fn tabs_owner_colours(c: &mut Checker) -> Check {
         pointer_away(c).await?;
-        set_tab_active(c, "attached", 0).await?;
+        set_tab_active(c, "strip", 0).await?;
         let (primary, background) = c.with(|_, _, cx| {
             let t = cx.ui_theme();
             (over(t.primary, t.background), over(t.background, t.background))
         })?;
+        let (line, bash_surface, nvim_surface) = ([0x7a, 0xa2, 0xf7], [0x1a, 0x1b, 0x26], [0xfd, 0xf6, 0xe3]);
         let inside = |bounds: Bounds<Pixels>| point(bounds.left() + px(6.), bounds.bottom() - px(4.));
         let top = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() + px(1.));
-        let (bash, nvim) = (trigger(c, "attached", 0).await?, trigger(c, "attached", 1).await?);
+        let (bash, nvim) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 1).await?);
         let shown = c.pixels(&[inside(bash), top(bash), inside(nvim), top(nvim)]).await?;
-        ensure!(near(shown[0], [0x1a, 0x1b, 0x26]), "the active trigger's surface is {:?}, not #1a1b26", shown[0]);
-        ensure!(near(shown[1], primary), "the active trigger's top line is {:?}, not primary {primary:?}", shown[1]);
-        ensure!(near(shown[2], background), "an inactive trigger is drawn on {:?}, not the background", shown[2]);
-        ensure!(!near(shown[3], primary), "an inactive trigger has a primary line");
-        set_tab_active(c, "attached", 2).await?;
-        let (bash, tmux) = (trigger(c, "attached", 0).await?, trigger(c, "attached", 2).await?);
-        let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash)]).await?;
+        ensure!(near(shown[0], bash_surface), "the active trigger's surface is {:?}, not #1a1b26", shown[0]);
+        ensure!(near(shown[1], line), "the active trigger's top line is {:?}, not its line colour #7aa2f7", shown[1]);
+        ensure!(near(shown[2], nvim_surface), "an inactive trigger with a surface is drawn on {:?}, not #fdf6e3", shown[2]);
+        ensure!(!near(shown[3], primary) && !near(shown[3], [0xb5, 0x89, 0x00]), "an inactive trigger has a line");
+        set_tab_active(c, "strip", 2).await?;
+        let (bash, tmux) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 2).await?);
+        let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash), top(bash)]).await?;
         ensure!(near(shown[0], background), "a trigger without colours is active on {:?}, not the background", shown[0]);
         ensure!(near(shown[1], primary), "its top line is {:?}, not primary", shown[1]);
-        ensure!(near(shown[2], background), "the inactive bash trigger kept its own surface ({:?})", shown[2]);
+        ensure!(near(shown[2], bash_surface), "the inactive bash trigger lost its surface ({:?})", shown[2]);
+        ensure!(!near(shown[3], line), "the inactive bash trigger kept its line");
         Ok(())
     }
 
@@ -4319,24 +4323,24 @@ mod check {
     /// (shown under the pointer) asks to close it and doesn't activate it;
     /// the active trigger's button closes it too.
     async fn tabs_close_button(c: &mut Checker) -> Check {
-        set_tab_active(c, "attached", 0).await?;
+        set_tab_active(c, "strip", 0).await?;
         let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
-        let labels = tab_labels(c, "attached")?;
-        let at = close_button(trigger(c, "attached", 1).await?, rem);
+        let labels = tab_labels(c, "strip")?;
+        let at = close_button(trigger(c, "strip", 1).await?, rem);
         c.hover(at).await?;
         c.tick().await;
         let before = tab_log(c)?.len();
         c.press(at).await?;
         let log = tab_log(c)?;
-        ensure!(log[before..] == ["attached:close:1"], "the close button's press made the owner hear {:?}", &log[before..]);
+        ensure!(log[before..] == ["strip:close:1"], "the close button's press made the owner hear {:?}", &log[before..]);
         let mut expected = labels.clone();
         expected.remove(1);
-        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after closing the second", tab_labels(c, "attached")?);
-        ensure!(tab_active(c, "attached")? == 0, "closing the second tab changed the active one");
-        let at = close_button(trigger(c, "attached", 0).await?, rem);
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after closing the second", tab_labels(c, "strip")?);
+        ensure!(tab_active(c, "strip")? == 0, "closing the second tab changed the active one");
+        let at = close_button(trigger(c, "strip", 0).await?, rem);
         c.press(at).await?;
         let log = tab_log(c)?;
-        ensure!(log[before + 1..] == ["attached:close:0"], "the active trigger's close button made the owner hear {:?}", &log[before + 1..]);
+        ensure!(log[before + 1..] == ["strip:close:0"], "the active trigger's close button made the owner hear {:?}", &log[before + 1..]);
         Ok(())
     }
 
@@ -4344,18 +4348,18 @@ mod check {
     /// close it; on a trigger that doesn't close it does nothing, and
     /// neither moves focus.
     async fn tabs_middle_click(c: &mut Checker) -> Check {
-        set_tab_active(c, "attached", 0).await?;
-        let labels = tab_labels(c, "attached")?;
-        let at = center(trigger(c, "attached", 2).await?);
+        set_tab_active(c, "strip", 0).await?;
+        let labels = tab_labels(c, "strip")?;
+        let at = center(trigger(c, "strip", 2).await?);
         c.focus("toggle").await?;
         let before = tab_log(c)?.len();
         c.button_down(MouseButton::Middle, at).await?;
         c.button_up(MouseButton::Middle, at).await?;
         let log = tab_log(c)?;
-        ensure!(log[before..] == ["attached:close:2"], "the middle press made the owner hear {:?}", &log[before..]);
+        ensure!(log[before..] == ["strip:close:2"], "the middle press made the owner hear {:?}", &log[before..]);
         let mut expected = labels.clone();
         expected.remove(2);
-        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after the middle press", tab_labels(c, "attached")?);
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after the middle press", tab_labels(c, "strip")?);
         ensure!(c.focused_name("toggle")?, "the middle press moved focus");
         let at = center(trigger(c, "line", 0).await?);
         c.button_down(MouseButton::Middle, at).await?;
@@ -4372,14 +4376,14 @@ mod check {
     /// leaves the menu open, and escape gives focus back. On a list without
     /// the handler the press asks for nothing.
     async fn tabs_context_menu(c: &mut Checker) -> Check {
-        set_tab_active(c, "attached", 0).await?;
-        let at = center(trigger(c, "attached", 2).await?);
+        set_tab_active(c, "strip", 0).await?;
+        let at = center(trigger(c, "strip", 2).await?);
         c.focus("toggle").await?;
         let before = tab_log(c)?.len();
         c.button_down(MouseButton::Right, at).await?;
         c.tick().await;
         let log = tab_log(c)?;
-        ensure!(log[before..] == ["attached:menu:2"], "the secondary press made the owner hear {:?}", &log[before..]);
+        ensure!(log[before..] == ["strip:menu:2"], "the secondary press made the owner hear {:?}", &log[before..]);
         ensure!(open_menu(c, Which::Context)?.is_some(), "the secondary press opened no menu");
         let bounds = menu_bounds(c, Which::Context)?;
         ensure!(
@@ -4389,7 +4393,7 @@ mod check {
         );
         c.button_up(MouseButton::Right, at).await?;
         ensure!(open_menu(c, Which::Context)?.is_some(), "the release of the opening press closed the menu");
-        ensure!(tab_active(c, "attached")? == 0, "the secondary press activated a trigger");
+        ensure!(tab_active(c, "strip")? == 0, "the secondary press activated a trigger");
         c.key("escape").await?;
         ensure!(open_menu(c, Which::Context)?.is_none(), "escape left the menu open");
         ensure!(c.focused_name("toggle")?, "escape didn't give focus back to the toggle");
@@ -4405,13 +4409,13 @@ mod check {
     /// to move it to the third place, and while it is over the third a
     /// primary bar on that trigger's right marks where it will land.
     async fn tabs_drag(c: &mut Checker) -> Check {
-        set_tab_active(c, "attached", 0).await?;
-        let labels = tab_labels(c, "attached")?;
-        let from = center(trigger(c, "attached", 0).await?);
+        set_tab_active(c, "strip", 0).await?;
+        let labels = tab_labels(c, "strip")?;
+        let from = center(trigger(c, "strip", 0).await?);
         // Near the third trigger's left edge, so the preview, which keeps the
         // pointer where it pressed the first trigger, is clear of the bar on
         // its right.
-        let target = trigger(c, "attached", 2).await?;
+        let target = trigger(c, "strip", 2).await?;
         let to = point(target.left() + px(12.), target.center().y);
         let primary = c.with(|_, _, cx| over(cx.ui_theme().primary, cx.ui_theme().primary))?;
         let before = tab_log(c)?.len();
@@ -4420,7 +4424,7 @@ mod check {
         c.button_move(MouseButton::Left, to).await?;
         let dragging = c.with(|_, _, cx| cx.has_active_drag())?;
         // As the target is drawn now, with the bar.
-        let target = c.recorded("tab:attached:2")?;
+        let target = c.recorded("tab:strip:2")?;
         let bar = c.pixel(point(target.right() - px(1.), target.center().y)).await;
         c.button_up(MouseButton::Left, to).await?;
         ensure!(dragging, "pressing the first trigger and moving onto the third started no drag");
@@ -4428,20 +4432,20 @@ mod check {
         ensure!(near(bar, primary), "the third trigger's right edge shows {bar:?} while dragged over, not the primary bar");
         let log = tab_log(c)?;
         ensure!(
-            log[before..] == ["attached:activate:0:pointer", "attached:move:0->2"],
+            log[before..] == ["strip:activate:0:pointer", "strip:move:0->2"],
             "the owner heard {:?}",
             &log[before..]
         );
         let expected = vec![labels[1].clone(), labels[2].clone(), labels[0].clone(), labels[3].clone()];
-        ensure!(tab_labels(c, "attached")? == expected, "the tabs are {:?} after the drop", tab_labels(c, "attached")?);
-        ensure!(tab_active(c, "attached")? == 2, "the moved tab didn't stay active");
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after the drop", tab_labels(c, "strip")?);
+        ensure!(tab_active(c, "strip")? == 2, "the moved tab didn't stay active");
         Ok(())
     }
 
     /// A trigger's tooltip shows after the pointer rests on it.
     async fn tabs_tooltip(c: &mut Checker) -> Check {
-        set_tab_active(c, "attached", 0).await?;
-        let at = center(trigger(c, "attached", 1).await?);
+        set_tab_active(c, "strip", 0).await?;
+        let at = center(trigger(c, "strip", 1).await?);
         let tooltip = tooltip_colour(c)?;
         let sample = tooltip_point(at);
         rest(c, at).await?;

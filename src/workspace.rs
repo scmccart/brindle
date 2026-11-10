@@ -2304,7 +2304,7 @@ impl Workspace {
             })
             .collect();
         let list = TabList::new("tabs")
-            .variant(TabVariant::Attached)
+            .variant(TabVariant::Line)
             .active(self.active)
             .children(triggers)
             .focus(&self.strip_focus)

@@ -36,8 +36,9 @@
 //! - with `on_move`, a trigger can be dragged onto another, which asks the
 //!   owner to move it there; a bar on the side where it will land marks the
 //!   target while dragging ([`drop_side`]);
-//! - the `Attached` variant, whose active trigger takes its owner's
-//!   surface and text colours ([`TabTrigger::surface`]).
+//! - per-trigger colours from the owner ([`TabTrigger::surface`],
+//!   [`TabTrigger::text_color`], [`TabTrigger::line_color`]), drawn whether
+//!   the trigger is active or not.
 //!
 //! A disabled trigger is drawn at half opacity and takes no part: no
 //! activation, close, drag or drop, and no tooltip.
@@ -268,18 +269,24 @@ impl TabTrigger {
         self
     }
 
-    /// The surface the trigger is drawn on while it is the active trigger
-    /// of an attached list (a terminal's background), instead of the
-    /// `background` token. Other variants and an inactive trigger ignore it.
+    /// The surface the trigger is drawn on, active or not (a terminal's
+    /// background), instead of the variant's own.
     pub fn surface(mut self, color: impl Into<Hsla>) -> Self {
         self.colors.surface = Some(color.into());
         self
     }
 
-    /// The text colour while it is the active trigger of an attached list,
-    /// instead of the `foreground` token.
+    /// The text colour, instead of the variant's: at full opacity when the
+    /// trigger is active or hovered, at 60% otherwise.
     pub fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.colors.text = Some(color.into());
+        self
+    }
+
+    /// The line along the top of the trigger while it is the active trigger
+    /// of a `Line` list, instead of the `primary` token.
+    pub fn line_color(mut self, color: impl Into<Hsla>) -> Self {
+        self.colors.line = Some(color.into());
         self
     }
 
@@ -486,9 +493,8 @@ impl RenderOnce for TabList {
             .pb(list_style.padding.bottom)
             .pl(list_style.padding.left)
             .rounded(list_style.radius)
-            .when(list_style.align_bottom, |d| d.items_end())
-            .when(!list_style.align_bottom, |d| d.items_center())
-            .when_some(list_style.height, |d, height| d.h(height))
+            .items_center()
+            .h(list_style.height)
             .when_some(list_style.background, |d, background| d.bg(background))
             .when_some(self.on_bounds, |d, on_bounds| {
                 d.on_children_prepainted(move |bounds, window, cx| on_bounds(&bounds, window, cx))
@@ -575,8 +581,7 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         .font_weight(style.font_weight)
         .whitespace_nowrap()
         .text_color(style.foreground)
-        .when_some(style.height, |d, height| d.h(height))
-        .when(style.height.is_none(), |d| d.h_full())
+        .h_full()
         .when_some(list.width, |d, width| d.flex_shrink().min_w(width.min()).max_w(width.max()))
         .when(list.width.is_none(), |d| d.flex_none())
         .when_some(style.background, |d, background| d.bg(background))
@@ -627,23 +632,15 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         })
         .when_some(style.top_line, |d, line| {
             // Over the border, where there is one, as the edge of the trigger.
-            let mut top = div()
-                .absolute()
-                .top(-border_width)
-                .left(-border_width)
-                .right(-border_width)
-                .h(TAB_LINE_WIDTH)
-                .bg(line);
-            if style.rounded_top_only {
-                top = top.rounded_t(style.radius);
-            }
-            d.child(top)
+            d.child(
+                div().absolute().top(-border_width).left(-border_width).right(-border_width).h(TAB_LINE_WIDTH).bg(line),
+            )
         })
         .children(trigger.leading)
         .child(label)
         .children(trigger.adornments)
         .children(close);
-    element = if style.rounded_top_only { element.rounded_t(style.radius) } else { element.rounded(style.radius) };
+    element = element.rounded(style.radius);
     if let Some(on_move) = on_move {
         let value = DraggedTab { list: list.id.clone(), index: ix, label: trigger.label };
         let (over_list, drop_list, primary) = (list.id.clone(), list.id.clone(), list.primary);
