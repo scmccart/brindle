@@ -120,11 +120,15 @@ impl Strip {
         self.rect(left + 6.0, FACE_TOP + 5.0, 60.0, FACE_HEIGHT - 10.0)
     }
 
-    /// The top 2px of tab `ix`'s face, where a line marking the active tab
-    /// would be.
+    /// Two rows just inside the top of tab `ix`'s face, where a line
+    /// marking the active tab would run into it. They start 1px below the
+    /// face's top edge: which device row the edge falls on varied by one
+    /// between runs (the strip's origin is derived from the dump's logical
+    /// pixels; the exact cause was not chased), and a band that began on
+    /// the edge read the pill's muted background in two of seven runs.
     fn face_top(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
-        self.rect(left + 8.0, FACE_TOP, 56.0, 2.0)
+        self.rect(left + 8.0, FACE_TOP + 1.0, 56.0, 2.0)
     }
 
     /// The pill's bottom padding under tab `ix`'s face.
