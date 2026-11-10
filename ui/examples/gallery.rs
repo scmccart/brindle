@@ -4287,10 +4287,20 @@ mod check {
         ensure!(!near(shown[3], primary) && near(shown[3], nvim_surface), "an inactive trigger's top edge is {:?}", shown[3]);
         let text = lightest(&c.pixels(&label_row(bash)).await?);
         ensure!(text > dim + 24, "the active bash label is at most {text} light, not #c0caf5 at full opacity (60% is {dim})");
-        // The close button's X crosses at its centre, in the text colour.
+        // The close button's X crosses at its centre, in the text colour:
+        // judged by the lightest pixel of the 3x3 round the centre, since
+        // where the centre falls on the pixel grid depends on the display
+        // scale and the strokes' edges blend towards the surface (Windows
+        // measured a 75% blend on the one pixel this used to read).
         let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
-        let x = c.pixel(close_button(bash, rem)).await?;
-        ensure!(near(x, bash_text), "the active bash close button's X is {x:?}, not its text colour #c0caf5");
+        let centre = close_button(bash, rem);
+        let around: Vec<Point<Pixels>> =
+            (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| point(centre.x + px(dx as f32), centre.y + px(dy as f32)))).collect();
+        let x = lightest(&c.pixels(&around).await?);
+        ensure!(
+            x > dim + 24,
+            "the active bash close button's X is at most {x} light, not #c0caf5 at full opacity (60% is {dim})"
+        );
         set_tab_active(c, "strip", 2).await?;
         let (bash, tmux) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 2).await?);
         let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash), top(bash)]).await?;
