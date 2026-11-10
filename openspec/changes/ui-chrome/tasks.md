@@ -73,6 +73,16 @@
 - [ ] 11.3 On Windows, run the `win` e2e cases and check by hand that a tab and the new-tab button respond, empty strip space drags, the caption buttons and Snap Layouts work, and right-click on a tab opens the tab menu and not the system menu; verify each by observation
 - [ ] 11.4 Hand the user the manual checks via `scripts/run-throwaway`: tab drag-reorder, the `⌄` profile menu and ctrl-shift-space palette, right-click menus on a tab and a zone header (a right-click on a background tab activates it, and on an unfocused zone's header focuses that zone first, before the menu acts on it; a right-click on a tab doesn't also open the window menu), tooltips on strip, header and find bar buttons, keyboard walk of the strip, a profile theme differing from the global one; verify with their report
 
+## 12. Strip look: `line` variant, each tab in its own theme
+
+Added after 11.1 passed; 11.2 to 11.4 run on the result, so redo 11.1 once this section is done.
+
+- [ ] 12.1 In `brindle-ui`, remove `TabVariant::Attached` (and `TAB_ATTACHED_HEIGHT`, `align_bottom`, `rounded_top_only` if nothing else uses them); give `TabColors` a `line` colour and apply a trigger's `surface`, `text` and `line` in the `Default` and `Line` variants whether it is active or not (inactive text at 60% opacity until hovered, then full; the active top line in `line` else `primary`); add `TabTrigger::line_color`; verify unit tests of `tab_style` (owner colours on an active and an inactive trigger, hover full opacity, no owner colours unchanged)
+- [ ] 12.2 Update the `ui-components` check cases and the gallery (`-- --check`) for the removed variant and the new colour rules, and `ui/README.md` (the `Attached` difference goes, the owner-colours addition is listed with its reason); verify `cargo run -p brindle-ui --example gallery -- --check` has no `FAIL` and the README no longer mentions `Attached`
+- [ ] 12.3 Move `render_tab_bar` to `TabVariant::Line` and give every trigger its own terminal's background, foreground and `accent()` (background tabs included, tmux tabs from their active pane's theme); the list stays on the global background token; verify an e2e capture case with a profile theme differing from the global one samples an inactive tab in its own theme's background and the strip in the token background, and that the active tab's top line is the tab's accent
+- [ ] 12.4 Update everything that assumed the 30px strip (`TAB_ATTACHED_HEIGHT` users, the caption hit-test region, e2e capture offsets, `--dump-screen-after` grid origin expectations, the zone and tmux layout offsets); verify `cargo test --workspace` and the full e2e under `scripts/with-xvfb` pass, and the `win` cases on Windows
+- [ ] 12.5 Update CLAUDE.md's `workspace.rs` bullet (the strip is a `brindle_ui::TabList` in the `Line` variant, with each tab's face in its terminal's colours) and the `brindle-ui` bullet (no `Attached` variant); verify `grep -n Attached CLAUDE.md` finds nothing about tabs
+
 ## Workflow follow-up
 
 - Open a PR from a branch (the usual): implementation commits, then an archive commit `docs(openspec): archive ui-chrome`; the user merges.

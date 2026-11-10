@@ -78,3 +78,14 @@ The new-tab button, the profile chevron and each tab's close button SHALL show a
 #### Scenario: New-tab tooltip
 - **WHEN** the pointer rests on the new-tab button
 - **THEN** a tooltip reads "New tab" followed by its shortcut
+
+### Requirement: Tab faces
+Each tab's face in the strip SHALL be drawn on its terminal's background in its terminal's foreground, in shadcn's `line` geometry (a 36px list, square list corners, 4px between faces). An inactive tab's text SHALL be the foreground at 60% opacity until hovered. The active tab SHALL be marked by full-opacity text and a 2px line along its top edge in that tab's theme accent. The strip's own background and its buttons SHALL use the global tokens.
+
+#### Scenario: Mixed themes
+- **WHEN** one tab's profile sets a theme other than the global one
+- **THEN** that tab's face is drawn on its own theme's background and foreground, whether active or not, and the other faces are drawn in the global theme's
+
+#### Scenario: Active tab marker
+- **WHEN** a tab is active
+- **THEN** its text is at full opacity and a 2px line in its theme's accent runs along its top edge; inactive tabs have no line

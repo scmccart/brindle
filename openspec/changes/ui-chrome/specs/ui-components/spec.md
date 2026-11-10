@@ -136,22 +136,22 @@ A tab trigger SHALL be able to carry a close button, adornments (status dots) an
 - **THEN** the owner is asked to close it
 
 ### Requirement: Tab list look
-A tab list SHALL offer three variants: shadcn's default (pill) and `line`, and `attached`. In `attached` the triggers sit on the background in the muted foreground, with a hovered inactive trigger on the accent background, and the active trigger is drawn on a surface with rounded top corners and a two-pixel primary line along its top edge, so it joins the content below the list.
-
-#### Scenario: Attached active trigger
-- **WHEN** a trigger is active in an `attached` list
-- **THEN** it is drawn on the surface colour with a primary line along its top, and inactive triggers are drawn on the list's background
+A tab list SHALL offer shadcn's two variants, default (pill) and `line`. It SHALL NOT offer a variant of its own; the window's tab strip uses `line`, with trigger colours given by its owner.
 
 #### Scenario: Line variant
 - **WHEN** a trigger is active in a `line` list
 - **THEN** it is drawn in the foreground colour with a primary line along its top, with no surface
 
 ### Requirement: Tab trigger colours
-In an `attached` list the active trigger's surface and text colours SHALL default to the background and foreground tokens, and an owner MAY give any trigger its own, which SHALL be used exactly when that trigger is active.
+An owner MAY give any trigger of a `line` or default list its own surface, text and line colours. A trigger with its own colours SHALL be drawn on its surface in its text colour whether it is active or not, except that while inactive and not hovered the text SHALL be drawn at 60% opacity; the active trigger's top line SHALL use its own line colour. A colour the owner did not give SHALL come from the variant's tokens as usual.
 
 #### Scenario: Owner colours
-- **WHEN** the owner gives the active trigger a surface colour of `#1a1b26` and a text colour of `#c0caf5`
-- **THEN** that trigger is drawn with exactly those colours, and other triggers are unaffected
+- **WHEN** the owner gives a trigger a surface colour of `#1a1b26`, a text colour of `#c0caf5` and a line colour of `#7aa2f7`
+- **THEN** that trigger, while active, is drawn on `#1a1b26` with `#c0caf5` text and a `#7aa2f7` top line, and other triggers are unaffected
+
+#### Scenario: Inactive trigger with owner colours
+- **WHEN** an inactive, unhovered trigger has the owner colours above
+- **THEN** it is drawn on `#1a1b26` with `#c0caf5` text at 60% opacity, and full `#c0caf5` while hovered
 
 ### Requirement: Menu item descriptions
 A menu item MAY carry a description, drawn in the muted foreground on a second line under its label. Typeahead and the item's accessible name SHALL use the label only.
