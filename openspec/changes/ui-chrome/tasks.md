@@ -68,7 +68,7 @@
 
 ## 11. Integration checks
 
-- [ ] 11.1 Run `cargo test --workspace`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (both tmux versions via the CI matrix if available); verify all pass
+- [x] 11.1 Run `cargo test --workspace`, `cargo build --release --locked` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (both tmux versions via the CI matrix if available); verify all pass
 - [ ] 11.2 Compare `latency-shell` and `latency-tmux` before and after (`BRINDLE_PERF_BASELINE`, asking before opening windows on `:0`); verify no regression beyond noise
 - [ ] 11.3 On Windows, run the `win` e2e cases and check by hand that a tab and the new-tab button respond, empty strip space drags, the caption buttons and Snap Layouts work, and right-click on a tab opens the tab menu and not the system menu; verify each by observation
 - [ ] 11.4 Hand the user the manual checks via `scripts/run-throwaway`: tab drag-reorder, the `⌄` profile menu and ctrl-shift-space palette, right-click menus on a tab and a zone header (a right-click on a background tab activates it, and on an unfocused zone's header focuses that zone first, before the menu acts on it; a right-click on a tab doesn't also open the window menu), tooltips on strip, header and find bar buttons, keyboard walk of the strip, a profile theme differing from the global one; verify with their report
