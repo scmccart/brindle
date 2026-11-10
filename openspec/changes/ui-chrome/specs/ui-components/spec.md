@@ -136,18 +136,22 @@ A tab trigger SHALL be able to carry a close button, adornments (status dots) an
 - **THEN** the owner is asked to close it
 
 ### Requirement: Tab list look
-A tab list SHALL offer shadcn's two variants, default (pill) and `line`. It SHALL NOT offer a variant of its own; the window's tab strip uses `line`, with trigger colours given by its owner.
+A tab list SHALL offer shadcn's two variants, default (pill) and `line`. It SHALL NOT offer a variant of its own; the window's tab strip uses the default (pill), with trigger colours given by its owner.
+
+#### Scenario: Pill variant
+- **WHEN** a tab list is drawn in the default variant
+- **THEN** its triggers sit inside one rounded rectangle on the muted background, and the active trigger is raised with a shadow
 
 #### Scenario: Line variant
 - **WHEN** a trigger is active in a `line` list
 - **THEN** it is drawn in the foreground colour with a primary line along its top, with no surface
 
 ### Requirement: Tab trigger colours
-An owner MAY give any trigger of a `line` or default list its own surface, text and line colours. A trigger with its own colours SHALL be drawn on its surface in its text colour whether it is active or not, except that while inactive and not hovered the text SHALL be drawn at 60% opacity; the active trigger's top line SHALL use its own line colour. A colour the owner did not give SHALL come from the variant's tokens as usual.
+An owner MAY give any trigger of a `line` or default list its own surface and text colours (its icons take the text colour). A trigger with its own colours SHALL be drawn on its surface in its text colour whether it is active or not, except that while inactive and not hovered the text SHALL be drawn at 60% opacity. A colour the owner did not give SHALL come from the variant's tokens as usual.
 
 #### Scenario: Owner colours
-- **WHEN** the owner gives a trigger a surface colour of `#1a1b26`, a text colour of `#c0caf5` and a line colour of `#7aa2f7`
-- **THEN** that trigger, while active, is drawn on `#1a1b26` with `#c0caf5` text and a `#7aa2f7` top line, and other triggers are unaffected
+- **WHEN** the owner gives a trigger a surface colour of `#1a1b26` and a text colour of `#c0caf5`
+- **THEN** that trigger, while active, is drawn on `#1a1b26` with `#c0caf5` text, and other triggers are unaffected
 
 #### Scenario: Inactive trigger with owner colours
 - **WHEN** an inactive, unhovered trigger has the owner colours above

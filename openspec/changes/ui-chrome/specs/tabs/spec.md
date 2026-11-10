@@ -80,7 +80,7 @@ The new-tab button, the profile chevron and each tab's close button SHALL show a
 - **THEN** a tooltip reads "New tab" followed by its shortcut
 
 ### Requirement: Tab faces
-Each tab's face in the strip SHALL be drawn on its terminal's background in its terminal's foreground, in shadcn's `line` geometry (a 36px list, square list corners, 4px between faces). An inactive tab's text SHALL be the foreground at 60% opacity until hovered. The active tab SHALL be marked by full-opacity text and a 2px line along its top edge in that tab's theme accent. The strip's own background and its buttons SHALL use the global tokens.
+The strip's tab faces SHALL sit inside one rounded rectangle on the muted token background (shadcn's default tab list), and each face SHALL be drawn on its terminal's background in its terminal's foreground, with its icons and close button in that foreground. The strip's own background and its buttons SHALL use the global tokens.
 
 #### Scenario: Mixed themes
 - **WHEN** one tab's profile sets a theme other than the global one
@@ -88,23 +88,15 @@ Each tab's face in the strip SHALL be drawn on its terminal's background in its 
 
 #### Scenario: Active tab marker
 - **WHEN** a tab is active
-- **THEN** its text is at full opacity and a 2px line in its theme's accent runs along its top edge; inactive tabs have no line
+- **THEN** its face is raised with a shadow and its text is at full opacity, and no line runs along its top edge
 
-### Requirement: Active-tab action buttons
-The strip SHALL show Split Right, Split Down and Find buttons, between its empty space and the window controls, acting on the active tab through the same actions as the keymap (the tmux split actions on a tmux tab). A split button SHALL be disabled when the active zone cannot be split along its axis, and a press on any of them SHALL NOT move the window or take focus from the terminal.
+#### Scenario: Inactive tab
+- **WHEN** a tab is inactive and not hovered
+- **THEN** its text is its foreground at 60% opacity, and at full opacity while hovered
 
-#### Scenario: Split from the strip
-- **WHEN** the user presses Split Right in a local tab with one zone
-- **THEN** the tab has two zones side by side and keyboard focus is in the new zone's terminal
+### Requirement: Strip icons are legible
+The icons of the strip's buttons (new tab, the profile chevron, the window controls) and of a tab's close button SHALL be drawn at least 16px high with a stroke of at least two pixels at the default scale.
 
-#### Scenario: Tmux tab
-- **WHEN** the active tab is a tmux window and the user presses Split Down
-- **THEN** tmux receives a down split, as for the `tmux_split_down` action
-
-#### Scenario: Find from the strip
-- **WHEN** the user presses Find
-- **THEN** the active terminal's find bar opens with its query focused
-
-#### Scenario: Button tooltip
-- **WHEN** the pointer rests on Split Right
-- **THEN** a tooltip reads "Split right" with the key bound to the action
+#### Scenario: New-tab icon
+- **WHEN** the strip is drawn at the default scale
+- **THEN** the `+` is at least 16px across with strokes at least two pixels wide

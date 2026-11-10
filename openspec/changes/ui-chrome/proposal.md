@@ -24,8 +24,8 @@ Each draws its colours from `theme.rs`'s chrome derivations (`chrome_background`
 - Add two `ButtonSize`s, shadcn's `icon-sm` and `icon-xs`, because the strip and the headers are shorter than a 36px icon button.
 - Add icons the surfaces need (plus, minus, arrows, split columns and rows) to `Icon`.
 - Move the find bar to `Input` + `Toggle` + ghost icon `Button` + `Separator`, in a popover-styled panel.
-- Move the tab strip to `Tabs` in shadcn's `line` variant, with every tab face drawn in its own terminal theme's background and foreground (an owner-supplied colour set on each trigger, active or not), with ghost icon `Button`s, `Tooltip` and token colours, and the zone headers to ghost icon `Button`, `Tooltip` and token colours. The rest of the strip (the list's own background, the buttons, the border) follows the global theme tokens. The crate-specific `attached` variant is removed.
-- Put Split Right, Split Down and Find buttons in the strip, outside the tab list, acting on the active tab.
+- Move the tab strip to `Tabs` in shadcn's default (pill) variant, the faces inside one rounded rectangle, with every tab face drawn in its own terminal theme's background and foreground (an owner-supplied colour set on each trigger, active or not) and no line on the active tab, with ghost icon `Button`s, `Tooltip` and token colours, and the zone headers to ghost icon `Button`, `Tooltip` and token colours. The rest of the strip (the list's own background, the buttons, the border) follows the global theme tokens. The crate-specific `attached` variant is removed.
+- Draw the strip's icons larger and with a heavier stroke so they are legible.
 - Menu items may carry a description line, so the profile menu keeps what the palette shows.
 - The strip's `⌄` button opens a **profile dropdown menu** (one item per profile, with its description and ctrl-alt-N shortcut) instead of the new-tab palette. ctrl-shift-space and `open_profile_picker` still open the palette.
 - Make the strip a keyboard-reachable tab list: a hidden `focus_tab_strip` action puts focus on the active tab, where arrows, home and end move and activate tabs; a pointer press still activates a tab and leaves focus in its terminal.
@@ -47,7 +47,7 @@ Out of scope, with reasons:
 ### Modified Capabilities
 - `ui-components`: adds Tabs, DropdownMenu, ContextMenu, Tooltip, Toggle, Kbd and Separator behaviour, and the two icon sizes.
 - `ui-theme-tokens`: the window chrome (strip, headers, dividers, border, find bar) takes its colours from the tokens; the one exception is each tab's face, drawn in that tab's terminal colours.
-- `tabs`: the strip is a tab list with keyboard navigation; "Title bar behaviour" gains right-click on a tab; a tab menu; tooltips on the strip's buttons; tab faces in each tab's theme; split and find buttons for the active tab.
+- `tabs`: the strip is a tab list with keyboard navigation; "Title bar behaviour" gains right-click on a tab; a tab menu; tooltips on the strip's buttons; tab faces in each tab's theme inside a rounded rectangle; legible strip icons.
 - `profiles`: the strip's `⌄` opens a profile dropdown menu; the palette stays on its shortcut.
 - `zones`: a zone header menu; tooltips on the header buttons.
 - `scrollback-search`: the find bar's controls show tooltips with their shortcuts, and its option toggles show their state.

@@ -85,6 +85,15 @@ Added after 11.1 passed; 11.2 to 11.4 run on the result, so redo 11.1 once this 
 
 - [x] 12.6 Add the Split Right, Split Down and Find buttons to the strip between its empty space and the window controls (`Columns2`, `Rows2`, `Search`; press-stopping wrappers as in 6.3; tooltips with the bound key; tmux tabs dispatch the `tmux_split_*` actions; split buttons disabled through `can_split_zone`); verify e2e cases that use the tab's actions to check a split from the strip's action path and the disabled state, `--dump-screen-after` zone output after a split, and that the `win` caption hit-test still passes on Windows
 
+## 13. After hand checking: pill tabs, no strip actions, legible icons
+
+The line on the active tab ran past its rounded corners and the line variant did not look like shadcn's tabs; the strip's icons were too small to see; the split and find buttons are dropped from the strip (split moves to the zones, see the `zones-shadcn` change). This supersedes the top line of 12.1 to 12.3 and the buttons of 12.6. The perf comparison of 11.2 is not rerun.
+
+- [ ] 13.1 In `brindle-ui`, drop `TabColors.line` and `TabTrigger::line_color`; make the default (pill) variant honour a trigger's owner `surface` and `text` colours whether active or not (inactive text at 60% opacity until hovered, the active trigger raised with `shadow-sm`, icons and the close button in the text colour); update the `tab_style` unit tests, the gallery strip demo and its check, and `ui/README.md`; verify `cargo test -p brindle-ui` passes and `grep -rn line_color ui/ src/` finds nothing
+- [ ] 13.2 Make the strip's icons legible: `IconSm` buttons for the new-tab, profile and window-control buttons, the icon at least 16px, and `Icon`'s stroke at least 2px at that size (set in pixels, not scaled down with the icon), also for the tab close button; keep the caption buttons handler-free on Windows; verify a unit test of the stroke width at 16px and `--dump-screen-after` or a capture case that samples the `+` glyph's stroke width
+- [ ] 13.3 Move `render_tab_bar` to the default (pill) variant with each face in its terminal's background and foreground, no line; remove the Split Right, Split Down and Find buttons (`StripButton`, `press_strip_button`, `--strip-button`, the `--- strip` dump lines, `can_split_active` if nothing else uses it, the `tabs-strip-buttons` case) and update `tabs-strip-colors` and the `win` caption points for the pill's geometry and the missing buttons; verify `cargo test --workspace` and the full e2e under `scripts/with-xvfb` pass, and the `win` cases on Windows
+- [ ] 13.4 Update CLAUDE.md (the strip bullet: pill variant, no actions, no `--strip-button` or `--- strip` lines); verify `grep -n "strip-button\|StripButton\|line_color" CLAUDE.md` finds nothing
+
 ## Workflow follow-up
 
 - Open a PR from a branch (the usual): implementation commits, then an archive commit `docs(openspec): archive ui-chrome`; the user merges.
