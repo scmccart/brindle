@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Zones are cards
-Every zone of a local tab SHALL be drawn as a card: a 1-pixel border and rounded corners round the zone, in a border colour derived from the zone terminal's theme (a mix of its background and foreground). A 6-pixel gap SHALL separate adjacent cards and surround the cards of a tab on every side, in the tab theme's background. The gaps replace the dividers between zones. Dividers SHALL NOT be draggable.
+Every zone of a local tab SHALL be drawn as a card: a 1-pixel border and rounded corners round the zone, in a border colour derived from the zone terminal's theme (a mix of its background and foreground). A 6-pixel gap SHALL separate adjacent cards and surround the cards of a tab on every side, in the window chrome's background colour (the same as behind the tab strip). The gaps replace the dividers between zones. Dividers SHALL NOT be draggable.
 
 #### Scenario: Unsplit tab is a card
 - **WHEN** a local tab has one zone
@@ -17,7 +17,7 @@ Every zone of a local tab SHALL be drawn as a card: a 1-pixel border and rounded
 
 #### Scenario: Corners are rounded over the terminal
 - **WHEN** a zone's terminal paints its background to the corners of the card
-- **THEN** the card's corners are still drawn rounded, with the gap colour outside the rounded edge
+- **THEN** the card's corners are still drawn rounded, with the chrome background colour outside the rounded edge
 
 ### Requirement: Active zone ring
 While a local tab has two or more zones, the active zone's card SHALL show the focus ring in the ring colour when keyboard focus is in it and focus got there from the keyboard. A zone focused with the pointer SHALL NOT show the ring. A tab with one zone SHALL NOT show the ring.

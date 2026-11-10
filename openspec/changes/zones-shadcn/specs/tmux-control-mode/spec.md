@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: A tmux window is one card
-A tmux tab SHALL draw its window as one card without a header row: a 1-pixel border and rounded corners, in a border colour derived from the window's default terminal theme, inside a 6-pixel margin. The panes, tmux's dividers and the pane title lines SHALL stay as tmux's layout places them, inside the card. The grid size reported to tmux SHALL be the card's inner area.
+A tmux tab SHALL draw its window as one card without a header row: a 1-pixel border and rounded corners, in a border colour derived from the window's default terminal theme, inside a 6-pixel margin in the window chrome's background colour. The panes, tmux's dividers and the pane title lines SHALL stay as tmux's layout places them, inside the card. The grid size reported to tmux SHALL be the card's inner area.
 
 #### Scenario: Window card
 - **WHEN** a tmux window with two panes is shown

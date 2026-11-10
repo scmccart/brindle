@@ -4,11 +4,9 @@
 //! The test config's custom themes list as `e2e` (active) then `e2e-alt`,
 //! after the built-ins, so one `settings_down` selects `e2e-alt`.
 
-use std::sync::{Arc, Mutex};
-
-use super::{cells, server};
+use super::{Shots, cells, server, step_time};
 use crate::brindle::{self, Output, Run, theme};
-use crate::capture::{self, Image, PxRect, Rgb};
+use crate::capture::{PxRect, Rgb};
 use crate::tmux::TmuxServer;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -325,72 +323,8 @@ fn expect_choice_outline(out: &Output) -> Result {
 }
 
 // ---- focus stops and rings, with real key dispatch (`--key`) ----
-
-/// When step `step` (counted from 1) runs: Brindle runs its steps one
-/// second apart, the first 1.5 s in.
-fn step_time(step: usize) -> f64 {
-    0.5 + step as f64
-}
-
-/// Window captures taken during a run, by name.
-#[derive(Clone, Default)]
-struct Shots(Arc<Mutex<Vec<(&'static str, Image)>>>);
-
-impl Shots {
-    /// Captures the window as `name` a little after step `step` ran, before
-    /// the next one.
-    fn after<'a>(&self, run: Run<'a>, ctx: &Ctx, step: usize, name: &'static str) -> Run<'a> {
-        let (display, shots) = (ctx.display.clone(), self.0.clone());
-        run.call_at(step_time(step) + 0.55, move |pid| {
-            let image = capture::grab(&display, pid)?;
-            shots.lock().unwrap().push((name, image));
-            Ok(())
-        })
-    }
-
-    /// Captures `a` and `b` show the same view except for one focus ring:
-    /// the pixels that differ form a band about 3 px wide around a box
-    /// `width` by `height` logical pixels (ring included) within the given
-    /// ranges. Both captures are saved to the case directory if not.
-    fn expect_ring(&self, ctx: &Ctx, what: &str, (a, b): (&str, &str), scale: f32, width: (f32, f32), height: (f32, f32)) -> Result {
-        let shots = self.0.lock().unwrap();
-        let find = |name: &str| shots.iter().find(|(n, _)| *n == name).map(|(_, i)| i).ok_or(format!("no capture {name:?}"));
-        let (first, second) = (find(a)?, find(b)?);
-        let result = ring_between(first, second, scale, width, height);
-        if result.is_err() {
-            first.save_ppm(&ctx.dir.join(format!("{a}.ppm")));
-            second.save_ppm(&ctx.dir.join(format!("{b}.ppm")));
-        }
-        result.map_err(|e| format!("{what} ({a} against {b}): {e}"))
-    }
-}
-
-fn ring_between(a: &Image, b: &Image, scale: f32, width: (f32, f32), height: (f32, f32)) -> Result {
-    ensure!((a.width, a.height) == (b.width, b.height), "the window changed size");
-    let (mut count, mut bbox) = (0usize, PxRect { x0: u32::MAX, y0: u32::MAX, x1: 0, y1: 0 });
-    for y in 0..a.height {
-        for x in 0..a.width {
-            if !a.pixel(x, y).near(b.pixel(x, y), 16) {
-                count += 1;
-                bbox = PxRect { x0: bbox.x0.min(x), y0: bbox.y0.min(y), x1: bbox.x1.max(x + 1), y1: bbox.y1.max(y + 1) };
-            }
-        }
-    }
-    ensure!(count > 0, "no pixel differs: no ring");
-    let (w, h) = ((bbox.x1 - bbox.x0) as f32 / scale, (bbox.y1 - bbox.y0) as f32 / scale);
-    ensure!(
-        (width.0..=width.1).contains(&w) && (height.0..=height.1).contains(&h),
-        "the change spans {w}x{h} at {bbox:?}, want {width:?} x {height:?}"
-    );
-    // A 3 px ring (and a 1 px border inside it) along the box's edges, not
-    // a filled box.
-    let band = 2.0 * (w + h) * scale * 3.0 * scale;
-    ensure!(
-        (count as f32) >= band * 0.5 && (count as f32) <= band * 2.0,
-        "{count} pixels differ in {w}x{h}, want a ring of about {band}"
-    );
-    Ok(())
-}
+// (`Shots` and its ring check are in `cases/mod.rs`, shared with the zone
+// cards' ring.)
 
 /// General's select width (280) and trigger height (h-9), ring included.
 const GENERAL_SELECT: ((f32, f32), (f32, f32)) = ((280.0, 300.0), (36.0, 48.0));

@@ -173,21 +173,23 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// (maximizing) and a press on maximize (restoring), which it does only when
 /// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels: the strip is 37 high (the 36px pill tab list and a
-    // 1px border); the caption buttons are 32 wide (the `IconSm` button
-    // size), 4 apart, 8 from the right edge, and centered in the list's
-    // 36px, so empty space ends 112 from the right. Tabs are 3 below the
-    // top, 30 high, 11 in (the strip's and the pill's padding), at least 80
-    // wide (a `cmd` tab is exactly that), with the pill's 3px after the
-    // last; the new-tab button is 4 past the pill, 32 wide.
+    // Logical pixels: the strip is 42 high (6px of padding above the 36px
+    // tab list, no border under it); the caption buttons are 32 wide
+    // (the `IconSm` button size), 4 apart, 8 from the right edge, and
+    // centered in the list's 36px (24 down), so empty space ends 112 from
+    // the right. Tabs are 9 below the top, 30 high, 6 in (the strip's
+    // padding; the list has none at its left and no pill), at least 80 wide
+    // (a `cmd` tab is exactly that), with the list's 3px after the last; the
+    // new-tab button is 4 past the list, 32 wide.
+    let middle = 6.0 + 18.0;
     let points = [
-        ("close", -(8.0 + 16.0), 18.0),
-        ("max", -(8.0 + 32.0 + 4.0 + 16.0), 18.0),
-        ("min", -(8.0 + 2.0 * (32.0 + 4.0) + 16.0), 18.0),
-        ("strip", -(8.0 + 3.0 * 32.0 + 2.0 * 4.0 + 60.0), 18.0),
-        ("tab", 48.0, 18.0),
+        ("close", -(8.0 + 16.0), middle),
+        ("max", -(8.0 + 32.0 + 4.0 + 16.0), middle),
+        ("min", -(8.0 + 2.0 * (32.0 + 4.0) + 16.0), middle),
+        ("strip", -(8.0 + 3.0 * 32.0 + 2.0 * 4.0 + 60.0), middle),
+        ("tab", 48.0, middle),
         // The new-tab button: client area, a press on it is Brindle's.
-        ("new-tab", 8.0 + 3.0 + 80.0 + 3.0 + 4.0 + 16.0, 18.0),
+        ("new-tab", 6.0 + 80.0 + 3.0 + 4.0 + 16.0, middle),
     ];
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;

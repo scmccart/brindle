@@ -28,7 +28,7 @@ The card paints, after its content, four corner pieces (the square minus a quart
 
 ### 3. Surround and border colours
 
-The gap and the outer margin are the *tab's* terminal background (the zone tree already paints `self.theme.background`), so cards sit on the colour they are drawn in. The border is a mix of the zone terminal's background and foreground, using the same mix `Theme::ui_tokens` uses for `border` (`chrome_border`, made `pub(crate)` as `Theme::card_border`) so a card's line reads like a chrome border in that theme. The header sits on the terminal background; its title uses the foreground (active) or muted foreground (`Theme::muted_foreground`, already the tab face's rule), the buttons the muted foreground.
+The gap, the outer margin and the corner surround are the window chrome's `background` token, the strip's colour (changed after first sight: the strip, the margin and the gaps read as one surface, and the strip has no border under it). The zone tree and the tmux view paint it as their root background and pass it as `CardColors::surround`. The border is a mix of the zone terminal's background and foreground, using the same mix `Theme::ui_tokens` uses for `border` (`chrome_border`, made `pub(crate)` as `Theme::card_border`) so a card's line reads like a chrome border in that theme. The header sits on the terminal background; its title uses the foreground (active) or muted foreground (`Theme::muted_foreground`, already the tab face's rule), the buttons the muted foreground.
 
 ### 4. Layout: gaps replace dividers
 
@@ -56,4 +56,4 @@ The card wraps `TmuxWindowView` in `Workspace::render_content` (or inside the vi
 - **Ghost button hover on terminal colours**: `Button` hover surfaces come from the `accent` token, which may clash with a terminal background → check by eye on every built-in theme; if it is illegible, add a hover-colour override to `Button` (listed in `ui/README.md` as a difference).
 - **Lost space**: about 14px per dimension per tab, and 6px more per split. Accepted in the proposal; the e2e `zones` case geometry expectations shift.
 - **Hit testing at corners**: the cutouts are paint only, so a click in a cutout still reaches the terminal. Harmless (a 10px corner inside the padding).
-- **Gap colour with differently themed zones**: all zones of a tab share the tab's theme today, so one surround colour is enough. If zones gain their own themes later, the gap stays the tab's.
+- **Gap colour with differently themed zones**: the gap is the chrome background whatever a zone's theme, so zones with their own themes need no change.

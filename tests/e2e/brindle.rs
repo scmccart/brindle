@@ -43,13 +43,12 @@ pub mod theme {
 
     /// The window chrome's `background` token for the `e2e` theme: its
     /// background mixed 35% towards black (`Theme::ui_tokens`), which the
-    /// tab strip is drawn in.
+    /// tab strip is drawn in, and the gaps round the cards below it.
     pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
-    /// The `muted` token for the `e2e` theme, the tab list's pill: the same
-    /// surface as `secondary` (`Theme::ui_tokens`).
-    pub const CHROME_MUTED: Rgb = CHROME_SECONDARY;
     /// The `border` token for the `e2e` theme: its background mixed 12%
-    /// towards its foreground, which zone headers and dividers are drawn in.
+    /// towards its foreground. A card's border is the same mix of its own
+    /// terminal theme's colours (`Theme::card_border`), so an `e2e` tab's
+    /// cards are drawn in it too.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
     /// The `secondary` token for the `e2e` theme: `CHROME_BACKGROUND` mixed
     /// 8% towards the foreground, which tmux's zoomed badge is drawn on.
@@ -69,6 +68,15 @@ pub mod theme {
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
     /// The second theme's blue; its other ANSI colors are the first's.
     pub const ALT_BLUE: Rgb = Rgb(0x30, 0x60, 0xc0);
+    /// The border of a card (a zone, a tmux window) in a theme of
+    /// `ALT_FOREGROUND` on `ALT_BACKGROUND` (`e2e-alt`, and the cases' own
+    /// themes with those colours): the background mixed 12% towards the
+    /// foreground (`Theme::card_border`).
+    pub const ALT_CARD_BORDER: Rgb = Rgb(0x36, 0x2f, 0x2f);
+    /// An inactive zone header's title in such a theme: the foreground
+    /// mixed 45% towards the background (#6a6666, 2.8:1 on it), pushed 5%
+    /// towards white to reach 3:1 (`Theme::card_muted_foreground`).
+    pub const ALT_CARD_MUTED: Rgb = Rgb(0x71, 0x6e, 0x6e);
 }
 
 /// The test config, with `theme_name` as the global theme.
@@ -175,6 +183,8 @@ pub struct Run<'a> {
     /// Leave the sessions this run left detached for the next run to
     /// attach, instead of hanging them up when it exits.
     keep_detached: bool,
+    /// The terminal padding, in place of the test config's 6.
+    padding: Option<u32>,
 }
 
 /// Hangs up the case server's detached sessions and waits for them to go,
@@ -253,6 +263,7 @@ impl<'a> Run<'a> {
             args: Vec::new(),
             command: Vec::new(),
             keep_detached: false,
+            padding: None,
         }
     }
 
@@ -331,6 +342,13 @@ impl<'a> Run<'a> {
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
+        self
+    }
+
+    /// Sets the config's terminal `padding` (logical pixels) instead of the
+    /// test config's 6.
+    pub fn padding(mut self, padding: u32) -> Self {
+        self.padding = Some(padding);
         self
     }
 
@@ -452,7 +470,11 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        let text = config_with(&self.server.socket, "e2e", self.default_profile, &self.top) + &self.extra_config;
+        let mut text = config_with(&self.server.socket, "e2e", self.default_profile, &self.top);
+        if let Some(padding) = self.padding {
+            text = text.replacen("\npadding = 6\n", &format!("\npadding = {padding}\n"), 1);
+        }
+        text += &self.extra_config;
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 

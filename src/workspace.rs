@@ -40,12 +40,17 @@ use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
-use crate::zone_view::{ZoneMenuRequest, ZoneTreeView};
+use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
 
 /// The tab strip's height in logical pixels: the pill tab list's
-/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default 16px rem) and the
-/// 1px border under it. The strip's `IconSm` (2rem) buttons fit inside it.
-pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16.0 + 1.0;
+/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default 16px rem) plus the
+/// `ZONE_GAP` margin above it, which matches the one between it and the
+/// cards (and the one at its left). The strip's `IconSm` (2rem) buttons fit
+/// inside the list's height. It has no border under it: the strip's
+/// background runs on into the margin round the cards below.
+pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16.0 + ZONE_GAP;
+/// The room between two tab faces, in logical pixels.
+const TAB_FACE_GAP: f32 = 4.0;
 const RESIZE_BORDER: f32 = 6.0;
 
 pub enum TabContent {
@@ -2337,7 +2342,13 @@ impl Workspace {
             })
             .flex_shrink()
             .min_w_0()
-            .overflow_hidden();
+            .overflow_hidden()
+            // No pill behind the faces, and a little room between them; the
+            // list's left padding goes too, so the first face lines up with
+            // the card below. (Documented in `ui/README.md`.)
+            .bg(gpui::transparent_black())
+            .gap(px(TAB_FACE_GAP))
+            .pl_0();
 
         // A press on a strip button stops here: it doesn't start a window
         // move (the strip's own press handler, below) and moves focus
@@ -2435,11 +2446,10 @@ impl Workspace {
             .flex_none()
             .items_end()
             .h(px(TAB_BAR_HEIGHT))
-            .pl_2()
+            .pt(px(ZONE_GAP))
+            .pl(px(ZONE_GAP))
             .gap_0p5()
             .bg(tokens.background)
-            .border_b_1()
-            .border_color(tokens.border)
             // On Windows, Windows acts on caption presses only when Brindle
             // leaves them unhandled, and GPUI counts a press as handled when
             // it moves focus, which it does for any focusable element under

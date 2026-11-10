@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use brindle_ui::{ActiveTheme as _, Tokens};
+use brindle_ui::{ActiveTheme as _, Card, Tokens};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, FontWeight, Hsla,
@@ -25,6 +25,7 @@ use crate::tmux::layout::Rect;
 use crate::tmux::protocol::{PaneId, WindowId};
 use crate::tmux::style::{StyledRun, TmuxColor};
 use crate::tmux::{BorderStatus, Direction, TmuxSession, resolve_color};
+use crate::zone_view::ZONE_GAP;
 
 pub struct TmuxWindowView {
     session: Entity<TmuxSession>,
@@ -415,10 +416,11 @@ impl Render for TmuxWindowView {
         let (cw, lh) = (metrics.cell_width, metrics.line_height);
         let padding = px(Settings::get(cx).config.padding);
         let active_rect = self.panes.iter().find(|(id, _)| Some(*id) == self.active).map(|(_, r)| *r);
-        let theme = self.theme.clone();
         let session = self.session.clone();
         let dividers = self.dividers.clone();
         let tokens = *cx.ui_theme();
+        let mut card_colors = self.theme.card_colors();
+        card_colors.surround = Some(tokens.background);
         let colors = border_colors(&self.theme, self.border_colors, divider_fallback(&tokens));
         let multiple = self.panes.len() > 1;
         let titles = self.title_lines(&metrics, colors, window, cx);
@@ -474,38 +476,57 @@ impl Render for TmuxWindowView {
             .on_action(cx.listener(Self::run_command))
             .relative()
             .size_full()
-            .bg(theme.background.hsla())
+            .p(px(ZONE_GAP))
+            .bg(tokens.background)
             .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        // The client size tells tmux how much room its windows get.
-                        let (cols, rows) = fit_grid(bounds.size, padding, cw, lh);
-                        session.update(cx, |s, _| s.set_client_size(cols as u16, rows as u16));
-                    },
-                    move |bounds, _, window, cx| {
-                        let origin = bounds.origin + point(padding, padding);
-                        paint_dividers(&dividers, active_rect.filter(|_| multiple), origin, cw, lh, colors, window);
-                        paint_titles(&titles, origin, cw, lh, window, cx);
-                    },
-                )
-                .absolute()
-                .size_full(),
-            )
-            .children(pane_elements)
-            .when(self.zoomed, |d| {
-                d.child(
+                // One headerless card round the whole window, as round a
+                // local tab's zone. Everything placed on the grid is inside
+                // it, so the size reported to tmux is the card's inner area.
+                Card::new("tmux-window").colors(card_colors).size_full().child(
                     div()
-                        .absolute()
-                        .top(px(4.0))
-                        .right(px(8.0))
-                        .px_2()
-                        .rounded_md()
-                        .text_xs()
-                        .bg(tokens.secondary)
-                        .text_color(tokens.secondary_foreground)
-                        .child("zoomed"),
-                )
-            })
+                        .relative()
+                        .size_full()
+                        .child(
+                            canvas(
+                                move |bounds, _, cx| {
+                                    // The client size tells tmux how much room its windows get.
+                                    let (cols, rows) = fit_grid(bounds.size, padding, cw, lh);
+                                    session.update(cx, |s, _| s.set_client_size(cols as u16, rows as u16));
+                                },
+                                move |bounds, _, window, cx| {
+                                    let origin = bounds.origin + point(padding, padding);
+                                    paint_dividers(
+                                        &dividers,
+                                        active_rect.filter(|_| multiple),
+                                        origin,
+                                        cw,
+                                        lh,
+                                        colors,
+                                        window,
+                                    );
+                                    paint_titles(&titles, origin, cw, lh, window, cx);
+                                },
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .children(pane_elements)
+                        .when(self.zoomed, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(4.0))
+                                    .right(px(8.0))
+                                    .px_2()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .bg(tokens.secondary)
+                                    .text_color(tokens.secondary_foreground)
+                                    .child("zoomed"),
+                            )
+                        }),
+                ),
+            )
     }
 }
 

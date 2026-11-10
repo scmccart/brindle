@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::server;
+use super::{CARD_BORDER, ZONE_GAP, server};
 use crate::brindle::{Run, state_dir, theme};
 use crate::capture::{Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -130,14 +130,17 @@ pub fn close(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// A bash profile with its own theme, `e2e-zone`, while the global theme
-/// stays `e2e`: its chrome tokens would be a background of #1a1515, a
-/// border of #362f2f and a primary of #00a0ff, none of which the headers
-/// and dividers may show.
-const ZONE_PROFILE: &str = "\n[[profiles]]\nname = \"Alt\"\ncommand = \"bash\"\nargs = [\"--norc\", \"--noprofile\"]\ntheme = \"e2e-zone\"\n\n[themes.e2e-zone]\nforeground = \"#a0a0a0\"\nbackground = \"#282020\"\naccent = \"#00a0ff\"\n";
+/// A bash profile with its own theme, `e2e-zone` (`ALT_FOREGROUND` on
+/// `ALT_BACKGROUND`, with its own accent), while the global theme stays
+/// `e2e`. Its zones' cards and headers are drawn in its colours, the card
+/// border in `ALT_CARD_BORDER`; the gaps round them, the focus ring and the
+/// status dots stay on the global theme's tokens.
+pub(super) const ZONE_PROFILE: &str = "\n[[profiles]]\nname = \"Alt\"\ncommand = \"bash\"\nargs = [\"--norc\", \"--noprofile\"]\ntheme = \"e2e-zone\"\n\n[themes.e2e-zone]\nforeground = \"#a0a0a0\"\nbackground = \"#282020\"\naccent = \"#00a0ff\"\n";
+/// `e2e-zone`'s accent, which nothing of a zone's chrome may show.
+pub(super) const ZONE_ACCENT: Rgb = Rgb(0x00, 0xa0, 0xff);
 
-/// The header's height (`ZONE_HEADER_HEIGHT`) and the test config's
-/// terminal padding, in logical pixels.
+/// The header's height (`ZONE_HEADER_HEIGHT`, its bottom line included)
+/// and the test config's terminal padding, in logical pixels.
 const HEADER_HEIGHT: f32 = 28.0;
 const PADDING: f32 = 6.0;
 
@@ -155,10 +158,13 @@ fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
     Ok(())
 }
 
-/// With the tab's profile theme (`e2e-zone`) differing from the global one
-/// (`e2e`), a split tab's zone headers and divider are drawn in the global
-/// theme's tokens: the headers in `background`, the active one's top line
-/// in `primary` (the theme's accent) and the divider in `border`.
+/// The spec's "Header uses the terminal's theme" (`zones` and
+/// `ui-theme-tokens`): with the tab's profile theme (`e2e-zone`) differing
+/// from the global one (`e2e`), a split tab's zone headers are drawn on the
+/// zone terminal's background, not the chrome's; the active zone's title
+/// is in the terminal's foreground and the other's in its muted
+/// foreground, neither in the global theme's foreground; and no line marks
+/// the active header, in the global accent (`primary`) or the zone's.
 pub fn header_colors(ctx: &Ctx) -> Result<Outcome> {
     let server = server()?;
     let out = Run::new(ctx, &server, "run")
@@ -171,39 +177,37 @@ pub fn header_colors(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
     let image = out.image.as_ref().ok_or("no capture")?;
     // The dump's grid is the active zone's (the right one): its terminal's
-    // top-left plus the padding, right under its header.
+    // top-left plus the padding, right under its header, inside its card's
+    // border. The left card is as wide, a gap to its left.
     let grid = out.dump.grid()?;
     let scale = grid.scale;
-    let (left, top) = (grid.x - PADDING, grid.y - PADDING - HEADER_HEIGHT);
-    let width = image.width as f32 / scale - left;
+    let (left, top) = (grid.x - PADDING - CARD_BORDER, grid.y - PADDING - HEADER_HEIGHT);
+    let width = image.width as f32 / scale - ZONE_GAP - left;
+    let other_left = left - ZONE_GAP - width;
     let rect = |x: f32, y: f32, w: f32, h: f32| {
         let px = |v: f32| (v * scale).round().max(0.0) as u32;
         PxRect { x0: px(x), y0: px(y), x1: px(x + w), y1: px(y + h) }
     };
     ensure!(left > 260.0 && width > 260.0, "zone 2 at x={left}, {width} wide: too narrow to sample");
 
-    // The active header, between its title and its buttons, and its line.
-    let header = rect(left + 60.0, top + 4.0, width - 160.0, 20.0);
-    expect_dominant(image, "active header", header, theme::CHROME_BACKGROUND)?;
-    expect_dominant(image, "active line", rect(left + 10.0, top, width - 20.0, 2.0), theme::ACCENT)?;
-    // The inactive header, left of the divider, has no line.
-    let inactive = rect(60.0, top + 4.0, left - 220.0, 20.0);
-    expect_dominant(image, "inactive header", inactive, theme::CHROME_BACKGROUND)?;
-    image.expect_none("inactive header's top", rect(10.0, top, left - 20.0, 2.0), theme::ACCENT)?;
+    for (what, x) in [("active header", left), ("inactive header", other_left)] {
+        // Between the title and the buttons: the zone terminal's background.
+        let header = rect(x + 60.0, top + 4.0, width - 160.0, 20.0);
+        expect_dominant(image, what, header, theme::ALT_BACKGROUND)?;
+        image.expect_none(&format!("{what} on the chrome's background"), header, theme::CHROME_BACKGROUND)?;
+        // Along its top, under the card's border: no line.
+        let line = rect(x + 12.0, top, width - 24.0, 2.0);
+        image.expect_none(&format!("a primary line on the {what}"), line, theme::ACCENT)?;
+        image.expect_none(&format!("an accent line on the {what}"), line, ZONE_ACCENT)?;
+        expect_dominant(image, &format!("top of the {what}"), line, theme::ALT_BACKGROUND)?;
+    }
 
-    // The divider is the column just left of the active zone. One pixel is
-    // easily missed, so the columns around it are looked at and one of them
-    // must be the border colour all the way down (the terminal backgrounds
-    // beside it are close to it, so `near` is kept tight).
-    let (rows_top, rows) = (grid.y + 10.0, 100.0);
-    let columns: Vec<Option<Rgb>> =
-        (-3..=1).map(|dx| image.dominant(rect(left + dx as f32, rows_top, 1.0 / scale, rows))).collect();
-    ensure!(
-        columns.iter().any(|c| c.is_some_and(|c| c.near(theme::CHROME_BORDER, 2))),
-        "divider: columns {:?} near x={left}, want one of {}",
-        columns.iter().map(|c| c.map(Rgb::hex)).collect::<Vec<_>>(),
-        theme::CHROME_BORDER.hex()
-    );
+    // The titles, past the header's 10px of padding.
+    let title = |x: f32| rect(x + CARD_BORDER + 8.0, top + 6.0, 100.0, 16.0);
+    image.expect("active title", title(left), theme::ALT_FOREGROUND, 5)?;
+    image.expect_none("active title in the global foreground", title(left), theme::FOREGROUND)?;
+    image.expect("inactive title", title(other_left), theme::ALT_CARD_MUTED, 5)?;
+    image.expect_none("inactive title in the foreground", title(other_left), theme::ALT_FOREGROUND)?;
     Ok(Outcome::Pass)
 }
 

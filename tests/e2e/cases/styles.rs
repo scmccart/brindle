@@ -1,7 +1,7 @@
 //! tmux pane styles: `window-style`, `window-active-style` and the border
 //! styles.
 
-use super::{cells, server};
+use super::{CARD_INSET, cells, server};
 use crate::brindle::{Run, theme};
 use crate::capture::{PxRect, Rgb};
 use crate::tmux::TmuxServer;
@@ -86,7 +86,7 @@ pub fn borders(ctx: &Ctx) -> Result<Outcome> {
 
 /// A tmux profile whose theme (`e2e-alt`) differs from the global `e2e`
 /// one, which the window chrome's tokens come from.
-fn alt_profile(server: &TmuxServer) -> String {
+pub(super) fn alt_profile(server: &TmuxServer) -> String {
     format!(
         "\n[[profiles]]\nname = \"tmux-alt\"\ntmux = \"control\"\ntmux_session = \"e2e\"\n\
          tmux_args = [\"-L\", \"{}\", \"-f\", \"/dev/null\"]\ntheme = \"e2e-alt\"\n",
@@ -134,11 +134,12 @@ pub fn chrome_fallback(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     let image = out.image.as_ref().ok_or("no capture")?;
     let grid = out.dump.grid()?;
-    // The badge is 4 px below the tab's top (the grid's, less the 6 px
-    // padding) and 8 px in from its right; sample inside it, clear of its
-    // rounded corners.
+    // The badge is 4 px below the top of the window's card (the grid's,
+    // less the 6 px padding) and 8 px in from its right, which is the
+    // card's margin and border in from the window's; sample inside it,
+    // clear of its rounded corners.
     let scale = grid.scale;
-    let (right, top) = (image.width as f32 / scale - 8.0, grid.y - 6.0 + 4.0);
+    let (right, top) = (image.width as f32 / scale - CARD_INSET - 8.0, grid.y - 6.0 + 4.0);
     let px = |v: f32| (v * scale).round().max(0.0) as u32;
     let badge = PxRect { x0: px(right - 40.0), y0: px(top + 3.0), x1: px(right - 6.0), y1: px(top + 10.0) };
     let got = image.dominant(badge);

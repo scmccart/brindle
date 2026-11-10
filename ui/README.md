@@ -117,7 +117,7 @@ rule, not a convenience.
       (`DraggedTab`, previewed as a pill with its label) asks to move there,
       and a 2px primary bar marks the side it will land on (`drop_side`).
 
-    Two of the builders are not controls:
+    Three of the builders are not controls:
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
       rule in the border colour that takes no focus and no pointer events.
     - `Kbd` (`Kbd::new("ctrl-shift-t")`): keycaps from a keymap string, one
@@ -126,6 +126,27 @@ rule, not a convenience.
       does the splitting, `.colors(background, foreground)` replaces the
       muted tokens (an inverted tooltip). It prints what the keymap prints;
       mapping `cmd` or `super` per platform is the keymap's job.
+    - `Card` (`Card::new(id).header(CardHeader::new(id).title(..)).child(content)`):
+      shadcn's card, compact, for a titled pane: a bordered, `rounded-lg`
+      surface (`card_style`; a 1px `CARD_BORDER`) with an optional header
+      row over its content, which fills the rest of the card with no
+      padding. `CardHeader` is a `CARD_HEADER_HEIGHT` (28px) row with a
+      `leading` adornment (a status dot), the `title` on one line cut with
+      an ellipsis (`trigger_label`), drawn muted with `title_muted(true)`,
+      and `action`s at its end (icon buttons) over a border line. The slot's
+      text colour is the muted one, which a `Button` takes only when given
+      it (`text_color`), since a button sets its own. It is a stateful element, so the owner gives it handlers
+      (a press, `on_context_menu`); `Card::on_header_bounds` reports where it
+      was laid out. `.colors(CardColors { surface, text, muted, border,
+      surround })` takes the owner's colours (a terminal's), each defaulting
+      to the card, foreground, muted foreground, border and background
+      tokens. `.ring(true)` draws the focus ring outside the border; the
+      owner decides when (`shows_ring`). The card paints the four pieces
+      outside its rounded edge in `surround` above its content and below
+      its border (`corner_cutouts`), so a content that paints a square
+      background to its corners (a terminal) stays inside the rounded
+      border with no clipping. Refine its layout (`size_full`, `flex_1`)
+      through `Styled`.
   - entities the owner creates, keeps and subscribes to: `Select`
     (`SelectEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`
@@ -528,6 +549,7 @@ needs:
   window's tab strip draws each tab in its own terminal's background and
   foreground (a profile can theme a tab differently from the window),
   background tabs included.
+- **A window's strip drops the pill's surface (owner styling, not the component).** Brindle's strip gives its `TabList` a transparent background, no left padding and a gap between faces, through `Styled`, since each face has its own surface. The component still draws shadcn's pill unless told otherwise.
 - **One look, the pill.** shadcn also has a `line` variant (no surfaces, an
   underline under the active trigger); it isn't offered. Reason: the spec
   ("Tab list look"): hand checking found it far from shadcn's base look,
@@ -538,6 +560,43 @@ needs:
   `TabsContent`.** Radix has `orientation`, `dir` and
   `activationMode="manual"`, and its content panels. Missing features; the
   owner shows what the active trigger stands for.
+
+Card (`Card` and `CardHeader`; shadcn's new-york-v4 `card`, which is plain
+markup with no Radix primitive under it). Compared against shadcn's `card`
+source from recollection while implementing the zones-shadcn change. What
+matches: a `bg-card text-card-foreground` surface with a 1px `border`, a
+header with a title and an action slot at its end (`CardAction`), and the
+content below it. The differences, mostly what a terminal pane needs:
+
+- **Rounded corners are painted over the content**, not clipped. shadcn's
+  card relies on CSS rounding and `overflow` (or on its padding keeping the
+  content off the corners). Reason: gpui 0.2.2 clips to rectangles only,
+  and a terminal paints a square background to its box with less padding
+  than the radius, so the card paints the area outside its rounded edge in
+  the owner's `surround` colour above the content and below the border.
+  The pieces are paint only: a press on one reaches the content beneath.
+- **`rounded-lg`, not `rounded-xl`, and no `shadow-sm`.** Reason: cards sit
+  edge to edge in a window, 6px apart, where a larger radius eats terminal
+  cells and a shadow would fall on the neighbour.
+- **Compact and flush.** shadcn's card is `py-6 gap-6` with `px-6`
+  sections; here the content has no padding at all and the header is one
+  28px `text-xs` row (`pl-2.5 pr-0.5 gap-1.5`). Reason: the content is a
+  terminal, whose own padding is the inset.
+- **The header always has a border line under it.** shadcn draws one only
+  with `.border-b` on the header. Reason: the header and a terminal's
+  first row would otherwise run together.
+- **No `CardDescription`, `CardFooter` or separate `CardTitle`/
+  `CardContent`.** The title is a `CardHeader` property, laid out with
+  `trigger_label` (one line, ellipsis), and the content is the card's
+  children. Missing features nothing needs yet.
+- **A leading adornment** (an addition): before the title, a status dot.
+- **Owner colours** (an addition): `CardColors` replaces the surface, text,
+  muted, border and surround colours one by one; the ring stays the
+  tokens'. Reason: a pane is drawn in its terminal's colours, as a tab
+  face is.
+- **The ring is a prop** (`ring(bool)`), not `focus-visible` on the card.
+  Reason: the card isn't focusable itself; its owner knows whether the
+  pane inside has keyboard focus.
 
 Not verified against the upstream source here, so worth a check before
 relying on them:
@@ -637,7 +696,10 @@ look drawn in place), and pill tab lists: one with a disabled trigger, a
 plain one, a strip above a panel in the active tab's colours (closable,
 reorderable triggers in their own colours with an icon, status and bell
 dots, tooltips and a long title cut at the maximum width) and a crowded
-strip whose triggers shrink to their minimum.
+strip whose triggers shrink to their minimum, and cards: the default look
+with a header, two in a terminal's colours on a surround of their own (one
+with its title muted), a headerless one whose content paints a square
+background to its corners, and a pair without and with the ring.
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,

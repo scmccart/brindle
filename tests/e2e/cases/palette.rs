@@ -223,7 +223,8 @@ const PANEL_MAX_HEIGHT: f32 = 345.0;
 /// The rows of `image` that hold a horizontal run of the `border` token at
 /// least `min_run` pixels long: the panel's top and bottom edges and the
 /// line under its filter. Nothing else in the window is drawn in that
-/// colour at that length; the tab strip's border is dimmed by the backdrop.
+/// colour at that length: the top and bottom edges of an `e2e` tab's card
+/// lie under the backdrop, which dims them.
 fn border_rows(image: &Image, min_run: u32) -> Vec<u32> {
     (0..image.height)
         .filter(|&y| {
