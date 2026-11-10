@@ -15,6 +15,12 @@ Split buttons were dropped from the tab strip because they belong on the zones. 
 3. **A zone is a card:** a bordered, rounded surface with a header row and the terminal as its content.
 4. **The header uses the terminal's theme**, as tab faces do (background, foreground, icon colours from the zone's terminal). This reverses `ui-chrome`'s rule that zone headers stay on the global tokens, and the `ui-theme-tokens` requirement "Window chrome uses the tokens" has to widen its exception from tab faces to zone headers (and the card around them, see below).
 
+5. **A gap between cards**, so each zone's rounded corners show (no edge-to-edge cards).
+6. **The card's border is derived from the terminal's theme**, not the `border` token.
+7. **The active zone is marked by a ring** (shadcn's focus ring on the card), to be judged by eye and changed if it does not work.
+8. **tmux windows get one card around the whole window**: the panes inside keep tmux's layout, title lines and canvas-painted dividers, so a tmux tab is a single card, not one per pane.
+9. **Narrow-zone overflow is tabled.** It is an edge case, so the action slot stays three buttons for now and the overflow menu waits for a later change.
+
 ## Ideas (which shadcn pieces fit)
 
 No existing `brindle-ui` component fits as is:
@@ -26,16 +32,15 @@ No existing `brindle-ui` component fits as is:
 
 ## Open questions
 
-1. **Card geometry:** radius, border and the gap between cards cost pixels, and a card fights a terminal that fills edge to edge. Does the card keep a gap (so rounded corners show), or do cards sit edge to edge with only their outer corners rounded? What does the terminal's own padding do inside the card?
-2. **Card border colour:** the `border` token (consistent with the rest of the chrome), or derived from the terminal's theme (consistent with its colours)?
-3. **Marking the active zone:** the header today has a `primary` line along its top for the active zone, which crossed rounded corners on tab faces and was dropped there. On a card the marker could be a ring (shadcn's focus-visible ring on the card), a stronger border, or text weight and opacity as for tabs.
-4. **Narrow zones:** at what width the action slot collapses to the overflow menu.
-5. **tmux panes:** they are tmux's layout and draw their own title lines; they are out of scope and keep their dividers, unless a card around the whole tmux window is wanted.
+1. **Card sizes:** the gap between cards, the corner radius and the border width cost pixels (a card fights a terminal that fills edge to edge). Pick them in the design from what looks right; what does the terminal's own padding do inside the card?
+2. **Cards on unsplit tabs:** a local tab with one zone has no header. Does its terminal still sit in a card (border and rounded corners, no header row), so a tab looks the same before and after a split, and the same as a tmux window's card? Or is the card only drawn for two or more zones, which leaves the unsplit terminal edge to edge?
+3. **tmux window card:** one card around the whole window (decision 8). Does it have a header row (the window's name and actions), or only the border and rounding?
+4. **The ring's colour and width**, and whether the ring shows on a mouse focus or only on keyboard focus (shadcn's focus-visible), since a zone is focused by clicking it.
 
 ## What Changes
 
 - a `brindle-ui` `Card` component (surface and text colours from its owner, a header with a title, an action slot, and content);
-- `ZoneTreeView` rebuilt on it for local tabs with two or more zones: each zone a card, headers on the terminal's theme, static dividers or gaps between cards;
+- `ZoneTreeView` rebuilt on it for local tabs with two or more zones: each zone a card with a gap between cards, the header on the terminal's theme, the border derived from it, a ring on the active zone, and the dividers replaced by the gaps; `TmuxWindowView` wrapped in one card;
 - the zones spec's "Multi-zone chrome and header controls" requirement revised for the card and the header theme (the unsplit-tab rule stays);
 - `ui-theme-tokens`: the zone header and card take the terminal's colours.
 
