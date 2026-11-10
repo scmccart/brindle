@@ -45,6 +45,9 @@ pub mod theme {
     /// background mixed 35% towards black (`Theme::ui_tokens`), which the
     /// tab strip is drawn in.
     pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    /// The `muted` token for the `e2e` theme, the tab list's pill: the same
+    /// surface as `secondary` (`Theme::ui_tokens`).
+    pub const CHROME_MUTED: Rgb = CHROME_SECONDARY;
     /// The `border` token for the `e2e` theme: its background mixed 12%
     /// towards its foreground, which zone headers and dividers are drawn in.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
@@ -403,14 +406,6 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Presses the strip's `split-right`, `split-down` or `find` button
-    /// through the handler its click runs (in-process: a pointer press
-    /// can't be posted on Linux). A disabled button does nothing.
-    pub fn strip_button(mut self, name: &str) -> Self {
-        self.steps.extend(["--strip-button".to_string(), name.to_string()]);
-        self
-    }
-
     /// Counts focus as moved by `pointer` or `keyboard` from this step on,
     /// as a pointer press on a control or a key press would.
     pub fn modality(mut self, modality: &str) -> Self {
@@ -620,10 +615,6 @@ pub struct Grid {
 pub struct Dump {
     /// Tab titles, and which tab is active.
     pub tabs: Vec<(String, bool)>,
-    /// The strip's tab action buttons (`--- strip …`), one line each without
-    /// the prefix: `buttons=A|[B]|C` (disabled in brackets), then a
-    /// `tip=label  [keys]` line per button.
-    pub strip: Vec<String>,
     pub size: Option<(u16, u16)>,
     /// The active terminal's `TermMode(...)` flags, as printed.
     pub mode: String,
@@ -692,8 +683,6 @@ impl Dump {
                 let active = title.ends_with(" (active)");
                 let title = title.trim_end_matches(" (active)").trim_matches('"').to_string();
                 dump.tabs.push((title, active));
-            } else if let Some(rest) = line.strip_prefix("--- strip ") {
-                dump.strip.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- screen ") {
                 let size = rest.split(' ').next().unwrap_or("");
                 dump.mode = rest.split_once(" mode ").map(|(_, m)| m.to_string()).unwrap_or_default();
@@ -818,16 +807,10 @@ pub fn matches_tmux(server: &TmuxServer, dump: &Dump, pane: &str) -> Result {
 
 pub fn self_test_dump() -> Result {
     let dump = Dump::parse(
-        "--- tab 1 \"bash\" (active)\n--- tab 2 \"vi\"\n--- strip buttons=split-right|[split-down]|find\n\
-         --- strip tip=Split right  [ctrl-shift-e]\n--- screen 56x32 mode TermMode(SHOW_CURSOR)\n\
+        "--- tab 1 \"bash\" (active)\n--- tab 2 \"vi\"\n--- screen 56x32 mode TermMode(SHOW_CURSOR)\n\
          --- grid origin=6,51.5 cell=8.4x18 scale=2\nhello   \n\nworld\n\n\n",
     );
     ensure!(dump.tabs == [("bash".into(), true), ("vi".into(), false)], "tabs {:?}", dump.tabs);
-    ensure!(
-        dump.strip == ["buttons=split-right|[split-down]|find", "tip=Split right  [ctrl-shift-e]"],
-        "strip {:?}",
-        dump.strip
-    );
     ensure!(dump.size == Some((56, 32)), "size {:?}", dump.size);
     ensure!(dump.mode == "TermMode(SHOW_CURSOR)", "mode {:?}", dump.mode);
     let grid = Grid { x: 6.0, y: 51.5, cell_width: 8.4, line_height: 18.0, scale: 2.0 };

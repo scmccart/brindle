@@ -14,7 +14,7 @@
 
 use gpui::{
     App, ClickEvent, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Refineable, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
+    Pixels, Refineable, Rems, RenderOnce, SharedString, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder,
 };
 
@@ -32,6 +32,9 @@ pub struct Button {
     id: ElementId,
     label: Option<SharedString>,
     icon: Option<Icon>,
+    /// The icon's side and minimum stroke instead of the size's.
+    icon_size: Option<Rems>,
+    icon_min_stroke: Option<Pixels>,
     variant: ButtonVariant,
     size: ButtonSize,
     disabled: bool,
@@ -49,6 +52,8 @@ impl Button {
             id: id.into(),
             label: Some(label.into()),
             icon: None,
+            icon_size: None,
+            icon_min_stroke: None,
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             disabled: false,
@@ -67,6 +72,20 @@ impl Button {
     /// A leading icon before the label.
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// The icon drawn `size` square instead of the button size's (a 16px
+    /// icon in an `IconXs` button, say).
+    pub fn icon_size(mut self, size: Rems) -> Self {
+        self.icon_size = Some(size);
+        self
+    }
+
+    /// The icon's strokes at least `width` pixels wide
+    /// ([`IconElement::min_stroke`](crate::icon::IconElement::min_stroke)).
+    pub fn icon_min_stroke(mut self, width: Pixels) -> Self {
+        self.icon_min_stroke = Some(width);
         self
     }
 
@@ -164,7 +183,13 @@ impl RenderOnce for Button {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| focus_from_pointer(&handle, window, cx))
             })
             .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
-            .children(self.icon.map(|icon| icon.size(style.icon_size)))
+            .children(self.icon.map(|icon| {
+                let icon = icon.size(self.icon_size.unwrap_or(style.icon_size));
+                match self.icon_min_stroke {
+                    Some(width) => icon.min_stroke(width),
+                    None => icon,
+                }
+            }))
             .children(self.label);
         button = attach(button, self.tooltip.filter(|_| !self.disabled));
         // The owner's layout refinements win over the component's. The ring
@@ -197,6 +222,9 @@ mod tests {
         assert_eq!(button.size, ButtonSize::Icon);
         assert_eq!(button.icon, Some(Icon::X));
         assert_eq!(button.label, None);
+        assert_eq!((button.icon_size, button.icon_min_stroke), (None, None));
+        let button = button.icon_size(gpui::rems(1.)).icon_min_stroke(gpui::px(2.));
+        assert_eq!((button.icon_size, button.icon_min_stroke), (Some(gpui::rems(1.)), Some(gpui::px(2.))));
         // A labelled button keeps the default size with an icon added.
         let button = Button::new("save", "Save").icon(Icon::Check);
         assert_eq!(button.size, ButtonSize::Default);

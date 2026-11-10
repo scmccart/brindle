@@ -671,12 +671,6 @@ impl ZoneTreeView {
         })
     }
 
-    /// [`ZoneTreeView::can_split`] for the active zone (the strip's split
-    /// buttons).
-    pub fn can_split_active(&self, axis: SplitAxis, window: &Window, cx: &App) -> bool {
-        self.can_split(self.active, axis, window, cx)
-    }
-
     /// Focuses zone `id`, then asks the window for its header menu at `at`
     /// (from the secondary `press`, if one asked), its split items enabled
     /// as [`ZoneTreeView::can_split`] says. Focus comes first, so the items

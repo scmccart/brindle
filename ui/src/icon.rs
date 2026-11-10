@@ -49,6 +49,19 @@ const GRID: f32 = 24.;
 /// Lucide's stroke width, in unit coordinates.
 const STROKE_WIDTH: f32 = 2. / GRID;
 
+/// The thinnest stroke a window-chrome icon (a tab strip's buttons, a tab's
+/// close button, the caption buttons) reads at: two pixels. Lucide's stroke
+/// scales with the icon, so at 16px it is 1.33px, too thin to see there;
+/// [`IconElement::min_stroke`] sets this instead.
+pub const LEGIBLE_ICON_STROKE: Pixels = px(2.);
+
+/// The stroke width of an icon drawn `side` pixels square: lucide's 2 on
+/// its 24 grid, scaled with the icon, and at least `min` pixels when given.
+pub fn stroke_width(side: Pixels, min: Option<Pixels>) -> Pixels {
+    let lucide = side * STROKE_WIDTH;
+    min.map_or(lucide, |min| lucide.max(min))
+}
+
 /// A point on lucide's grid, in unit coordinates.
 const fn p(x: f32, y: f32) -> (f32, f32) {
     (x / GRID, y / GRID)
@@ -174,8 +187,9 @@ impl Icon {
         IconElement::new(self).color(color)
     }
 
-    /// Strokes the icon into the largest square centred in `bounds`.
-    fn paint(self, bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    /// Strokes the icon into the largest square centred in `bounds`, at
+    /// least `min_stroke` wide when given ([`stroke_width`]).
+    fn paint(self, bounds: Bounds<Pixels>, color: Hsla, min_stroke: Option<Pixels>, window: &mut Window) {
         let side = bounds.size.width.min(bounds.size.height);
         let origin = bounds.origin
             + point(
@@ -186,7 +200,7 @@ impl Icon {
 
         // Butt caps and miter joins: gpui doesn't re-export lyon's `LineCap`,
         // so lucide's round caps aren't available.
-        let mut path = PathBuilder::stroke(side * STROKE_WIDTH);
+        let mut path = PathBuilder::stroke(stroke_width(side, min_stroke));
         for stroke in self.strokes() {
             match *stroke {
                 Stroke::Polyline(points) => {
@@ -237,12 +251,14 @@ impl RenderOnce for Icon {
     }
 }
 
-/// An [`Icon`] with a size and, optionally, its own colour.
+/// An [`Icon`] with a size and, optionally, its own colour and a minimum
+/// stroke width.
 #[derive(IntoElement)]
 pub struct IconElement {
     icon: Icon,
     size: Rems,
     color: Option<Hsla>,
+    min_stroke: Option<Pixels>,
 }
 
 impl IconElement {
@@ -251,6 +267,7 @@ impl IconElement {
             icon,
             size: rems(1.),
             color: None,
+            min_stroke: None,
         }
     }
 
@@ -263,17 +280,25 @@ impl IconElement {
         self.color = Some(color);
         self
     }
+
+    /// Strokes at least `width` pixels wide, whatever the icon's size
+    /// (lucide's own stroke scales down with it): [`LEGIBLE_ICON_STROKE`]
+    /// for window chrome.
+    pub fn min_stroke(mut self, width: Pixels) -> Self {
+        self.min_stroke = Some(width);
+        self
+    }
 }
 
 impl RenderOnce for IconElement {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let Self { icon, size, color } = self;
+        let Self { icon, size, color, min_stroke } = self;
         canvas(
             |_, _, _| {},
             move |bounds, (), window, _| {
                 // Read at paint time, inside the parents' text styles.
                 let color = color.unwrap_or_else(|| window.text_style().color);
-                icon.paint(bounds, color, window);
+                icon.paint(bounds, color, min_stroke, window);
             },
         )
         .size(size)
@@ -285,10 +310,10 @@ impl RenderOnce for IconElement {
 mod tests {
     use super::*;
 
-    /// The extent of a stroke, widened by half the stroke width:
-    /// (min x, min y, max x, max y).
-    fn extent(stroke: &Stroke) -> (f32, f32, f32, f32) {
-        let half = STROKE_WIDTH / 2.;
+    /// The extent of a stroke `width` wide (in unit coordinates), widened
+    /// by half of it: (min x, min y, max x, max y).
+    fn extent(stroke: &Stroke, width: f32) -> (f32, f32, f32, f32) {
+        let half = width / 2.;
         match *stroke {
             Stroke::Polyline(points) => points.iter().fold(
                 (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
@@ -307,8 +332,26 @@ mod tests {
         }
     }
 
+    /// The spec's "Strip icons are legible": at 16px lucide's stroke is
+    /// 1.33px, and a chrome icon's minimum makes it two; a bigger icon whose
+    /// own stroke is wider keeps it, and other icons keep lucide's.
+    #[test]
+    fn chrome_icons_stroke_two_pixels_at_16px() {
+        let near = |width: Pixels, want: f32| (f32::from(width) - want).abs() < 1e-4;
+        assert!(near(stroke_width(px(16.), None), 16. / 12.));
+        assert!(near(stroke_width(px(16.), Some(LEGIBLE_ICON_STROKE)), 2.));
+        assert!(f32::from(LEGIBLE_ICON_STROKE) >= 2.);
+        assert!(near(stroke_width(px(48.), Some(LEGIBLE_ICON_STROKE)), 4.));
+        assert!(near(stroke_width(px(12.), None), 1.));
+        let icon = Icon::Plus.size(rems(1.)).min_stroke(LEGIBLE_ICON_STROKE);
+        assert_eq!((icon.size, icon.min_stroke), (rems(1.), Some(px(2.))));
+        assert_eq!(IconElement::new(Icon::Plus).min_stroke, None);
+    }
+
     #[test]
     fn every_icon_stays_inside_its_unit_box() {
+        // Lucide's stroke, and a chrome icon's two pixels at 16px.
+        let widths = [STROKE_WIDTH, f32::from(LEGIBLE_ICON_STROKE) / 16.];
         for icon in Icon::ALL {
             let strokes = icon.strokes();
             assert!(!strokes.is_empty(), "{icon:?} has no strokes");
@@ -323,11 +366,13 @@ mod tests {
                     assert!(*width > 0. && *height > 0., "{icon:?}: empty rectangle");
                     assert!(*radius >= 0. && *radius * 2. <= width.min(*height), "{icon:?}: corners overlap");
                 }
-                let (x0, y0, x1, y1) = extent(stroke);
-                assert!(
-                    x0 >= 0. && y0 >= 0. && x1 <= 1. && y1 <= 1.,
-                    "{icon:?}: {stroke:?} reaches ({x0}, {y0})..({x1}, {y1})"
-                );
+                for width in widths {
+                    let (x0, y0, x1, y1) = extent(stroke, width);
+                    assert!(
+                        x0 >= 0. && y0 >= 0. && x1 <= 1. && y1 <= 1.,
+                        "{icon:?}: {stroke:?} {width} wide reaches ({x0}, {y0})..({x1}, {y1})"
+                    );
+                }
             }
         }
     }

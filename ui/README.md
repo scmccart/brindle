@@ -84,16 +84,17 @@ rule, not a convenience.
       shown view hides itself on Escape (`intercept_keystrokes`, which sees
       the key before any binding and lets it go on). A `Tooltip` also
       renders in place, as the gallery shows its look.
-    - `TabList` (`TabList::new(id).variant(..).active(ix).children(triggers)`)
-      and `TabTrigger` (`TabTrigger::new(id, label)`): shadcn's tab list and
+    - `TabList` (`TabList::new(id).active(ix).children(triggers)`) and
+      `TabTrigger` (`TabTrigger::new(id, label)`): shadcn's tab list and
       triggers, with what a window's tab strip adds. The owner keeps the
       triggers and which one is active and is asked to change them:
       `on_activate(&TabActivate { index, by })` (`by` is the pointer or the
       keyboard, so the owner decides where focus goes), `on_close(&index)`
       and `on_move(&TabMove { from, to })`; `on_trigger_bounds` reports where
-      the triggers were laid out. Variants `Default` (shadcn's pill) and
-      `Line`. A trigger may carry its own `surface`, `text_color` and
-      `line_color`, drawn whether it is active or not (`tab_style`). The
+      the triggers were laid out. One look, shadcn's default (pill) list
+      (`tab_list_style`); shadcn's `line` variant is deliberately not
+      offered. A trigger may carry its own `surface` and `text_color`, drawn
+      whether it is active or not (`tab_style`). The
       list is one keyboard stop through the handle `.focus(&handle)` gives
       it, with focus resting on the active trigger: left and right activate
       the previous and next enabled trigger, wrapping, home/PageUp and
@@ -101,8 +102,9 @@ rule, not a convenience.
       press asks to activate and moves no focus. A trigger takes a leading
       element (an icon), trailing adornments (status dots), a tooltip,
       `disabled` (half opacity, skipped, asks nothing) and `closable`: a
-      ghost `IconXs` close button shown on the active trigger and on a
-      hovered one, whose press asks to close and doesn't activate; a middle
+      ghost `IconXs` close button (its X 16px at a 2px stroke, in the
+      trigger's text colour) shown on the active trigger and on a hovered
+      one, whose press asks to close and doesn't activate; a middle
       press on a closable trigger asks to close it too. With
       `on_context_menu`, a secondary press on an enabled trigger asks for
       its menu (`TabContextMenu`: the index and the press, for
@@ -167,7 +169,13 @@ rule, not a convenience.
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
   `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2` and
   `Rows2`. Strokes have butt caps and miter joins, since gpui doesn't expose
-  lucide's round caps.
+  lucide's round caps. Lucide's stroke (2 on its 24 grid) scales with the
+  icon, which leaves a 16px icon 1.33px thin; `IconElement::min_stroke`
+  (and `Button::icon_min_stroke`, with `Button::icon_size` for a bigger
+  icon than the button size's) sets a minimum in pixels, and
+  `LEGIBLE_ICON_STROKE` (2px) is the one window chrome uses: a tab strip's
+  buttons, the caption buttons and a trigger's close button. Other icons
+  keep lucide's weight.
 - **`TextInput`** (`text_input.rs`) and **`filter`** (`fuzzy_match`, the
   case-insensitive subsequence match palettes use).
 - **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `Dismiss`,
@@ -512,18 +520,18 @@ needs:
   2px primary bar marks the side it will land on. Reason: tab strips
   reorder tabs.
 - **Per-trigger colours** (an addition): a trigger may carry its own
-  `surface`, `text_color` and `line_color`. It is drawn on its surface in
-  its text colour whether active or not: the active one's text at full
-  opacity, an inactive one's at 60% until hovered, then full; the active
-  `Line` trigger's top line takes `line_color`, else the `primary` token.
-  Colours not given come from the variant, so a list without them looks as
-  shadcn's does. Reason: a window's tab strip draws each tab in its own
-  terminal's background, foreground and accent (a profile can theme a tab
-  differently from the window), background tabs included.
-- **`Line` marks the active trigger with a 2px primary line along its
-  top.** shadcn's line variant underlines it, `bottom-[-5px]`, in the
-  foreground colour. Reason: the spec ("Tab list look"), so the line matches
-  a zone header's active line.
+  `surface` and `text_color`. It is drawn on its surface in its text colour
+  (its icons and close button too) whether active or not: the active one's
+  text at full opacity and the trigger still raised with `shadow-sm`, an
+  inactive one's at 60% until hovered, then full. Colours not given come
+  from the tokens, so a list without them looks as shadcn's does. Reason: a
+  window's tab strip draws each tab in its own terminal's background and
+  foreground (a profile can theme a tab differently from the window),
+  background tabs included.
+- **One look, the pill.** shadcn also has a `line` variant (no surfaces, an
+  underline under the active trigger); it isn't offered. Reason: the spec
+  ("Tab list look"): hand checking found it far from shadcn's base look,
+  and nothing here needs it.
 - **Triggers fill the list's height.** shadcn's are `h-[calc(100%-1px)]`.
   Reason: gpui has no `calc()`; the difference is a pixel.
 - **Horizontal and left-to-right only, automatic activation only, and no
@@ -625,9 +633,9 @@ corner, selects and command lists inline, in a dialog and in a popover,
 a context menu target and two dropdown menus (one with descriptions and
 shortcuts, one of forty items that scrolls), toggles in each variant and
 size, buttons and a plain element with tooltips (beside the tooltip's
-look drawn in place), and tab lists in each variant: a pill list with a
-disabled trigger, a line list, a line strip above a panel in the active
-tab's colours (closable, reorderable triggers with an icon, status and bell
+look drawn in place), and pill tab lists: one with a disabled trigger, a
+plain one, a strip above a panel in the active tab's colours (closable,
+reorderable triggers in their own colours with an icon, status and bell
 dots, tooltips and a long title cut at the maximum width) and a crowded
 strip whose triggers shrink to their minimum.
 

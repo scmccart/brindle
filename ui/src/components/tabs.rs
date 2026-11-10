@@ -37,8 +37,11 @@
 //!   owner to move it there; a bar on the side where it will land marks the
 //!   target while dragging ([`drop_side`]);
 //! - per-trigger colours from the owner ([`TabTrigger::surface`],
-//!   [`TabTrigger::text_color`], [`TabTrigger::line_color`]), drawn whether
-//!   the trigger is active or not.
+//!   [`TabTrigger::text_color`]), drawn whether the trigger is active or
+//!   not, its icons and close button in the text colour.
+//!
+//! The list is always shadcn's default (pill) list: the triggers in one
+//! rounded muted rectangle, the active one raised with a shadow.
 //!
 //! A disabled trigger is drawn at half opacity and takes no part: no
 //! activation, close, drag or drop, and no tooltip.
@@ -54,12 +57,12 @@ use gpui::{
 use crate::components::button::Button;
 use crate::components::tooltip::{Tooltip, TooltipFor, TooltipHandler, attach};
 use crate::components::{DISABLED_OPACITY, FocusRing};
-use crate::icon::Icon;
+use crate::icon::{Icon, LEGIBLE_ICON_STROKE};
 use crate::primitives::focus_visible::{Modality, modality, set_modality, shows_ring};
 use crate::primitives::nav::ListNav;
 use crate::style::{
-    ButtonSize, ButtonVariant, TAB_DRAG_MAX_WIDTH, TAB_LINE_WIDTH, TabColors, TabVariant, TabWidth, tab_drag_style,
-    tab_list_style, tab_style,
+    ButtonSize, ButtonVariant, TAB_DRAG_MAX_WIDTH, TAB_LINE_WIDTH, TabColors, TabWidth, tab_drag_style, tab_list_style,
+    tab_style,
 };
 use crate::theme::ActiveTheme;
 
@@ -270,23 +273,17 @@ impl TabTrigger {
     }
 
     /// The surface the trigger is drawn on, active or not (a terminal's
-    /// background), instead of the variant's own.
+    /// background), instead of the pill's own.
     pub fn surface(mut self, color: impl Into<Hsla>) -> Self {
         self.colors.surface = Some(color.into());
         self
     }
 
-    /// The text colour, instead of the variant's: at full opacity when the
-    /// trigger is active or hovered, at 60% otherwise.
+    /// The text colour, instead of the pill's, which the trigger's icons
+    /// and close button take too: at full opacity when the trigger is
+    /// active or hovered, at 60% otherwise.
     pub fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.colors.text = Some(color.into());
-        self
-    }
-
-    /// The line along the top of the trigger while it is the active trigger
-    /// of a `Line` list, instead of the `primary` token.
-    pub fn line_color(mut self, color: impl Into<Hsla>) -> Self {
-        self.colors.line = Some(color.into());
         self
     }
 
@@ -322,7 +319,6 @@ type BoundsHandler = Box<dyn Fn(&[Bounds<Pixels>], &mut Window, &mut App) + 'sta
 #[derive(IntoElement)]
 pub struct TabList {
     id: ElementId,
-    variant: TabVariant,
     active: Option<usize>,
     triggers: Vec<TabTrigger>,
     focus: Option<FocusHandle>,
@@ -341,7 +337,6 @@ impl TabList {
     pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
-            variant: TabVariant::default(),
             active: None,
             triggers: Vec::new(),
             focus: None,
@@ -353,11 +348,6 @@ impl TabList {
             on_bounds: None,
             style: StyleRefinement::default(),
         }
-    }
-
-    pub fn variant(mut self, variant: TabVariant) -> Self {
-        self.variant = variant;
-        self
     }
 
     /// The index of the active trigger.
@@ -443,7 +433,6 @@ impl Styled for TabList {
 /// What every trigger of one list shares while it renders.
 struct ListContext {
     id: ElementId,
-    variant: TabVariant,
     active: Option<usize>,
     ring_shown: bool,
     width: Option<TabWidth>,
@@ -460,13 +449,12 @@ const TRIGGER_GROUP: &str = "brindle-ui-tab-trigger";
 impl RenderOnce for TabList {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens = *cx.ui_theme();
-        let list_style = tab_list_style(self.variant, &tokens);
+        let list_style = tab_list_style(&tokens);
         let count = self.triggers.len();
         let active = self.active.filter(|ix| *ix < count);
         let focused = self.focus.as_ref().is_some_and(|handle| handle.is_focused(window));
         let context = ListContext {
             id: self.id.clone(),
-            variant: self.variant,
             active,
             ring_shown: shows_ring(focused, modality(window, cx), false),
             width: self.width,
@@ -487,7 +475,6 @@ impl RenderOnce for TabList {
         let mut list = div()
             .flex()
             .flex_none()
-            .gap(list_style.gap)
             .pt(list_style.padding.top)
             .pr(list_style.padding.right)
             .pb(list_style.padding.bottom)
@@ -495,7 +482,7 @@ impl RenderOnce for TabList {
             .rounded(list_style.radius)
             .items_center()
             .h(list_style.height)
-            .when_some(list_style.background, |d, background| d.bg(background))
+            .bg(list_style.background)
             .when_some(self.on_bounds, |d, on_bounds| {
                 d.on_children_prepainted(move |bounds, window, cx| on_bounds(&bounds, window, cx))
             })
@@ -531,7 +518,7 @@ impl RenderOnce for TabList {
 fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &mut Window, cx: &mut App) -> AnyElement {
     let tokens = *cx.ui_theme();
     let is_active = list.active == Some(ix);
-    let style = tab_style(list.variant, is_active, trigger.colors, &tokens);
+    let style = tab_style(is_active, trigger.colors, &tokens);
     let disabled = trigger.disabled;
     let ring_shown = list.ring_shown && is_active;
     let on_activate = list.on_activate.clone().filter(|_| !disabled);
@@ -539,14 +526,19 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
     let on_move = list.on_move.clone().filter(|_| !disabled);
     let on_context_menu = list.on_context_menu.clone().filter(|_| !disabled);
     let closes = on_close.is_some();
-    let border_width = if style.border.is_some() { px(1.) } else { px(0.) };
 
     let label = trigger_label(trigger.label.clone());
     let close = on_close.clone().map(|on_close| {
+        // An `IconXs` button (it fits the 30px face) with a 16px icon at a
+        // legible stroke. It shows only while the trigger is active or
+        // hovered, when the trigger's text is at full opacity, so it is in
+        // that colour: the hover foreground (the active one's foreground).
         let button = Button::icon_only("close", Icon::X)
             .variant(ButtonVariant::Ghost)
             .size(ButtonSize::IconXs)
-            .text_color(style.foreground)
+            .icon_size(gpui::rems(1.))
+            .icon_min_stroke(LEGIBLE_ICON_STROKE)
+            .text_color(style.hover_foreground)
             .on_click(move |_, window, cx| on_close(&ix, window, cx));
         let button = match trigger.close_tooltip {
             Some(build) => button.tooltip_with(build),
@@ -629,12 +621,6 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
                 }
                 None => {}
             }
-        })
-        .when_some(style.top_line, |d, line| {
-            // Over the border, where there is one, as the edge of the trigger.
-            d.child(
-                div().absolute().top(-border_width).left(-border_width).right(-border_width).h(TAB_LINE_WIDTH).bg(line),
-            )
         })
         .children(trigger.leading)
         .child(label)
@@ -858,6 +844,6 @@ mod tests {
         assert_eq!(trigger.colors.surface, Some(gpui::rgb(0x1a1b26).into()));
         assert!(trigger.closable && trigger.tooltip.is_some() && trigger.close_tooltip.is_some());
         let list = TabList::new("tabs").child(trigger).active(0);
-        assert_eq!((list.active, list.triggers.len(), list.variant), (Some(0), 1, TabVariant::Default));
+        assert_eq!((list.active, list.triggers.len()), (Some(0), 1));
     }
 }
