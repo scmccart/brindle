@@ -1,6 +1,6 @@
 # Proposal
 
-Status: skeleton. The main decisions are made (below); specs, design and tasks come after the remaining open questions are settled.
+Status: skeleton. The decisions are made (below, no open questions left); specs, design and tasks are written when the change is picked up, after `ui-chrome` lands.
 
 ## Why
 
@@ -30,18 +30,20 @@ No existing `brindle-ui` component fits as is:
 - **Dropdown Menu** (exists as `DropdownMenu`): an overflow `…` in the action slot for rename, move and close, instead of three always-visible buttons when the zone is narrow.
 - **Badge**: the status dot with a label for blocked, done and error states, if the dot alone proves too small (see the icon legibility work in `ui-chrome`).
 
+10. **Unsplit local tabs are a card too**, with no header row, so a tab looks the same before and after a split and the same as a tmux window. The zones spec's "no header bar" rule for one zone is unchanged; only the card frame is new.
+11. **The tmux window card has no header row** either: a border and rounded corners round the whole window.
+12. **The ring shows on keyboard focus only** (shadcn's focus-visible), through the same focus-visible modality `brindle-ui` already tracks. A zone focused with the mouse shows no ring, so the header's title in the foreground (muted when inactive, as today) stays as the cue that works for both.
+13. **Sizes (chosen here, adjusted by eye in the design):** a 6px gap between cards and as an outer margin round the card (twice the tab pill's 3px padding), the `rounded-lg` radius of the tokens (`radius_lg`), a 1px border, and the terminal's current padding unchanged inside the card. The card costs about 14px in each dimension against an edge-to-edge terminal (6px margin and 1px border on each side); the design verifies that `fit_grid` and the tmux `refresh-client -C` size account for it.
+
 ## Open questions
 
-1. **Card sizes:** the gap between cards, the corner radius and the border width cost pixels (a card fights a terminal that fills edge to edge). Pick them in the design from what looks right; what does the terminal's own padding do inside the card?
-2. **Cards on unsplit tabs:** a local tab with one zone has no header. Does its terminal still sit in a card (border and rounded corners, no header row), so a tab looks the same before and after a split, and the same as a tmux window's card? Or is the card only drawn for two or more zones, which leaves the unsplit terminal edge to edge?
-3. **tmux window card:** one card around the whole window (decision 8). Does it have a header row (the window's name and actions), or only the border and rounding?
-4. **The ring's colour and width**, and whether the ring shows on a mouse focus or only on keyboard focus (shadcn's focus-visible), since a zone is focused by clicking it.
+None. Narrow-zone overflow is tabled (decision 9).
 
 ## What Changes
 
 - a `brindle-ui` `Card` component (surface and text colours from its owner, a header with a title, an action slot, and content);
-- `ZoneTreeView` rebuilt on it for local tabs with two or more zones: each zone a card with a gap between cards, the header on the terminal's theme, the border derived from it, a ring on the active zone, and the dividers replaced by the gaps; `TmuxWindowView` wrapped in one card;
-- the zones spec's "Multi-zone chrome and header controls" requirement revised for the card and the header theme (the unsplit-tab rule stays);
+- `ZoneTreeView` rebuilt on it: every local tab's zone a card (headerless when the tab has one zone, with a header on two or more), a gap between cards, the header on the terminal's theme, the border derived from it, a keyboard-focus ring on the active zone, and the dividers replaced by the gaps; `TmuxWindowView` wrapped in one headerless card;
+- the zones spec's "Multi-zone chrome and header controls" requirement revised for the card and the header theme, and the unsplit-tab rule amended only to add the card frame;
 - `ui-theme-tokens`: the zone header and card take the terminal's colours.
 
 ## Capabilities
