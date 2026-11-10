@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use brindle_ui::{ActiveTheme as _, Tokens};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, FontWeight, Hsla,
@@ -260,15 +261,21 @@ struct TitleLine {
 
 impl TmuxWindowView {
     /// Title lines for the visible panes, as tmux draws them for terminal
-    /// clients when `pane-border-status` is on.
-    fn title_lines(&mut self, metrics: &CellMetrics, window: &Window, cx: &App) -> Vec<TitleLine> {
+    /// clients when `pane-border-status` is on. Their border lines take the
+    /// dividers' `(normal, active)` colors.
+    fn title_lines(
+        &mut self,
+        metrics: &CellMetrics,
+        (normal, accent): (Hsla, Hsla),
+        window: &Window,
+        cx: &App,
+    ) -> Vec<TitleLine> {
         if self.border_status == BorderStatus::Off {
             self.titles.clear();
             return Vec::new();
         }
         let session = self.session.read(cx);
         let theme = &self.theme;
-        let (normal, accent) = border_colors(theme, self.border_colors);
         // Title text uses the border style's color, or the theme's text
         // colors where the muted divider color would be hard to read.
         let (base_normal, base_active) = (
@@ -388,11 +395,18 @@ fn paint_titles(titles: &[TitleLine], origin: gpui::Point<Pixels>, cw: Pixels, l
 }
 
 /// Divider colors: the window's border styles' colors where they set
-/// them, else a muted line and the accent next to the active pane.
-fn border_colors(theme: &Theme, styles: (Option<TmuxColor>, Option<TmuxColor>)) -> (Hsla, Hsla) {
-    let normal = resolve_color(styles.0, theme).unwrap_or(theme.chrome_border().mix(theme.foreground, 0.15));
+/// them (resolved against the pane theme), else `fallback` and the pane
+/// theme's accent next to the active pane.
+fn border_colors(theme: &Theme, styles: (Option<TmuxColor>, Option<TmuxColor>), fallback: Hsla) -> (Hsla, Hsla) {
+    let normal = resolve_color(styles.0, theme).map_or(fallback, Color::hsla);
     let active = resolve_color(styles.1, theme).unwrap_or(theme.accent());
-    (normal.hsla(), active.hsla())
+    (normal, active.hsla())
+}
+
+/// The plain divider color from the window chrome's tokens: the border
+/// token 15% towards the foreground, so it shows against pane backgrounds.
+fn divider_fallback(tokens: &Tokens) -> Hsla {
+    tokens.border.blend(tokens.foreground.opacity(0.15))
 }
 
 impl Render for TmuxWindowView {
@@ -404,9 +418,10 @@ impl Render for TmuxWindowView {
         let theme = self.theme.clone();
         let session = self.session.clone();
         let dividers = self.dividers.clone();
-        let colors = border_colors(&self.theme, self.border_colors);
+        let tokens = *cx.ui_theme();
+        let colors = border_colors(&self.theme, self.border_colors, divider_fallback(&tokens));
         let multiple = self.panes.len() > 1;
-        let titles = self.title_lines(&metrics, window, cx);
+        let titles = self.title_lines(&metrics, colors, window, cx);
 
         let pane_elements = self.panes.iter().filter_map(|(id, _)| {
             let (view, _) = self.views.get(id)?;
@@ -486,8 +501,8 @@ impl Render for TmuxWindowView {
                         .px_2()
                         .rounded_md()
                         .text_xs()
-                        .bg(self.theme.accent().mix(self.theme.background, 0.5).hsla())
-                        .text_color(self.theme.foreground.hsla())
+                        .bg(tokens.secondary)
+                        .text_color(tokens.secondary_foreground)
                         .child("zoomed"),
                 )
             })
@@ -609,6 +624,23 @@ mod tests {
 
     fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
         Rect { x, y, width, height }
+    }
+
+    /// Unstyled dividers take the chrome's tokens (the border token 15%
+    /// towards the foreground), not the pane theme; the active one and any
+    /// tmux style colour still come from the pane theme.
+    #[test]
+    fn divider_colors_fall_back_to_the_chrome_tokens() {
+        let chrome = crate::theme::builtin_theme("brindle-light").unwrap().ui_tokens();
+        let pane = crate::theme::builtin_theme("tokyo-night").unwrap();
+        let fallback = divider_fallback(&chrome);
+        let (b, f, got) = (chrome.border.to_rgb(), chrome.foreground.to_rgb(), fallback.to_rgb());
+        for (b, f, got) in [(b.r, f.r, got.r), (b.g, f.g, got.g), (b.b, f.b, got.b)] {
+            assert!((got - (b + (f - b) * 0.15)).abs() < 0.005, "{got} from {b} towards {f}");
+        }
+        assert_eq!(border_colors(&pane, (None, None), fallback), (fallback, pane.accent().hsla()));
+        let styled = (Some(TmuxColor::Indexed(5)), Some(TmuxColor::Indexed(3)));
+        assert_eq!(border_colors(&pane, styled, fallback), (pane.ansi[5].hsla(), pane.ansi[3].hsla()));
     }
 
     #[test]

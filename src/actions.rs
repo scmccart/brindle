@@ -78,6 +78,20 @@ actions!(
         AttachSession,
         /// Consumes a key without doing anything (see the ctrl-shift-d guard).
         Swallow,
+        /// Puts keyboard focus on the tab strip, a tab list: arrows, home and
+        /// end then switch tabs, and enter or escape return focus to the
+        /// terminal. Hidden (no label, no default key).
+        FocusTabStrip,
+        /// Opens the profile menu below the strip's `⌄` button (closes it
+        /// when it reaches an open one, as from `--action`). Hidden (no
+        /// label, no default key).
+        OpenProfileMenu,
+        /// Opens the active tab's menu (what a right-click on its face opens)
+        /// below the tab. Hidden (no label, no default key).
+        OpenTabMenu,
+        /// Opens the active zone's menu (what a right-click on its header
+        /// opens) below the header. Hidden (no label, no default key).
+        OpenZoneMenu,
         // The sessions palette: end the highlighted session. (The palettes'
         // other keys are the command list's and the overlay's.)
         PickerKill,
@@ -185,6 +199,16 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("tmux_new_session", Some("tmux: New Session"), || Box::new(TmuxNewSession)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
+    // The tab strip as a keyboard stop: unlabelled, for `--action` and user
+    // bindings (its keys are the tab list's own).
+    ("focus_tab_strip", None, || Box::new(FocusTabStrip)),
+    // The `⌄` button's profile menu: unlabelled (the palette has "New Tab
+    // from Profile"), for `--action` and user bindings.
+    ("open_profile_menu", None, || Box::new(OpenProfileMenu)),
+    // The tab and zone header menus (a right-click opens them): unlabelled,
+    // for `--action` and user bindings (GPUI has no menu key).
+    ("open_tab_menu", None, || Box::new(OpenTabMenu)),
+    ("open_zone_menu", None, || Box::new(OpenZoneMenu)),
     // The settings dialog's own actions: unlabelled, so they stay out of the
     // command palette, but `--action` and user bindings can reach them.
     ("settings_up", None, || Box::new(SettingsUp)),
@@ -278,9 +302,77 @@ pub fn palette_commands(mut available: impl FnMut(&dyn Action) -> bool) -> Vec<(
         .collect()
 }
 
+/// An action's label as a menu item shows it: its command palette label,
+/// without the `tmux: ` prefix (a tmux tab's menu already says where it
+/// acts). `None` for an action without a label.
+pub fn menu_label(action: &dyn Action) -> Option<&'static str> {
+    let label = ACTIONS.iter().find(|(_, _, build)| build().partial_eq(action)).and_then(|(_, label, _)| *label)?;
+    Some(label.strip_prefix("tmux: ").unwrap_or(label))
+}
+
+/// A row of a menu whose items run actions, such as a tab's or a zone
+/// header's menu.
+pub enum ActionRow {
+    Item { action: Box<dyn Action>, enabled: bool },
+    Separator,
+}
+
+impl ActionRow {
+    pub fn item(action: impl Action, enabled: bool) -> Self {
+        Self::Item { action: Box::new(action), enabled }
+    }
+}
+
+impl Clone for ActionRow {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Item { action, enabled } => Self::Item { action: action.boxed_clone(), enabled: *enabled },
+            Self::Separator => Self::Separator,
+        }
+    }
+}
+
+/// A menu of actions: its entries, each item labelled from the `ACTIONS`
+/// table ([`menu_label`]) with the keys bound to its action, and, by entry
+/// index (separators counted, as `MenuEvent::Selected` counts), the action
+/// each item runs.
+pub struct ActionMenu {
+    pub entries: Vec<brindle_ui::MenuEntry>,
+    pub actions: Vec<Option<Box<dyn Action>>>,
+}
+
+impl ActionMenu {
+    /// The menu of `rows`, each item showing `shortcut(action)`.
+    pub fn new(rows: Vec<ActionRow>, shortcut: impl Fn(&dyn Action) -> Option<gpui::SharedString>) -> Self {
+        let mut menu = Self { entries: Vec::with_capacity(rows.len()), actions: Vec::with_capacity(rows.len()) };
+        for row in rows {
+            match row {
+                ActionRow::Item { action, enabled } => {
+                    let label = menu_label(&*action).unwrap_or_else(|| action.name());
+                    let mut item = brindle_ui::MenuItem::new(label).disabled(!enabled);
+                    item.shortcut = shortcut(&*action);
+                    menu.entries.push(item.into());
+                    menu.actions.push(Some(action));
+                }
+                ActionRow::Separator => {
+                    menu.entries.push(brindle_ui::MenuEntry::Separator);
+                    menu.actions.push(None);
+                }
+            }
+        }
+        menu
+    }
+
+    /// The action of entry `ix`, when it is an enabled item.
+    pub fn action(&self, ix: usize) -> Option<&dyn Action> {
+        self.entries.get(ix).filter(|entry| entry.is_enabled())?;
+        self.actions.get(ix)?.as_deref()
+    }
+}
+
 /// Default bindings follow GNOME Terminal / kitty conventions so plain
 /// ctrl-<letter> always reaches the shell (and tmux's prefix).
-fn default_bindings() -> Vec<KeyBinding> {
+pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let w = Some("Workspace");
     let t = Some("Terminal");
     let p = Some("Palette");
@@ -456,6 +548,33 @@ mod tests {
             assert!(action.partial_eq(&*build()), "{name}");
         }
         assert!(palette_commands(|_| true).iter().all(|(_, a)| !a.partial_eq(&OpenCommandPalette) && !a.partial_eq(&NoAction)));
+    }
+
+    /// The tab and zone menus' hidden openers resolve by name and stay out
+    /// of the palette; the menus' items take their labels from the table.
+    #[test]
+    fn menu_openers_are_hidden_and_menu_labels_come_from_the_table() {
+        for (name, action) in [("open_tab_menu", &OpenTabMenu as &dyn Action), ("open_zone_menu", &OpenZoneMenu)] {
+            assert!(action_by_name(name).is_some_and(|a| a.partial_eq(action)), "{name}");
+            assert!(action_names().any(|n| n == name), "{name} isn't listed");
+            assert!(palette_commands(|_| true).iter().all(|(_, a)| !a.partial_eq(action)), "{name} is in the palette");
+            assert_eq!(menu_label(action), None, "{name}");
+        }
+        assert_eq!(menu_label(&RenameTab), Some("Rename Tab"));
+        assert_eq!(menu_label(&TmuxRenameWindow), Some("Rename Window"));
+        assert_eq!(menu_label(&SplitZoneDown), Some("Split Zone Down"));
+
+        let menu = ActionMenu::new(
+            vec![ActionRow::item(RenameTab, true), ActionRow::Separator, ActionRow::item(CloseTab, false)],
+            |action| action.partial_eq(&RenameTab).then(|| "ctrl-shift-r".into()),
+        );
+        let labels: Vec<&str> = menu.entries.iter().map(|e| e.label()).collect();
+        assert_eq!(labels, ["Rename Tab", "", "Close Tab"]);
+        assert_eq!(menu.entries[0].item().and_then(|i| i.shortcut.clone()), Some("ctrl-shift-r".into()));
+        assert!(menu.entries[2].item().is_some_and(|i| i.disabled && i.shortcut.is_none()));
+        assert!(menu.action(0).is_some_and(|a| a.partial_eq(&RenameTab)));
+        // A separator and a disabled item run nothing.
+        assert!(menu.action(1).is_none() && menu.action(2).is_none() && menu.action(3).is_none());
     }
 
     #[test]

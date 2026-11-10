@@ -5,7 +5,7 @@
 //! applies the result. Sizes are in rems (GPUI's `h_9` is `rems(2.25)`, as
 //! Tailwind's `h-9` is 2.25rem), so they scale with the window's text size.
 
-use gpui::{Corners, Edges, Hsla, Pixels, Rems, px, rems};
+use gpui::{Corners, Edges, FontWeight, Hsla, Pixels, Rems, px, rems, transparent_black};
 
 use crate::theme::Tokens;
 
@@ -80,7 +80,8 @@ impl ButtonVariant {
     ];
 }
 
-/// shadcn's button sizes. `Icon` is a square for an icon-only button.
+/// shadcn's button sizes. `Icon`, `IconSm` (`icon-sm`) and `IconXs`
+/// (`icon-xs`) are squares for an icon-only button.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ButtonSize {
     #[default]
@@ -88,14 +89,18 @@ pub enum ButtonSize {
     Sm,
     Lg,
     Icon,
+    IconSm,
+    IconXs,
 }
 
 impl ButtonSize {
-    pub const ALL: [ButtonSize; 4] = [
+    pub const ALL: [ButtonSize; 6] = [
         ButtonSize::Default,
         ButtonSize::Sm,
         ButtonSize::Lg,
         ButtonSize::Icon,
+        ButtonSize::IconSm,
+        ButtonSize::IconXs,
     ];
 }
 
@@ -124,6 +129,9 @@ pub struct ButtonStyle {
     pub padding_x_with_icon: Rems,
     /// Space between a leading icon and the label.
     pub gap: Rems,
+    /// The icon's side: 1rem (`size-4`), 0.75rem in `IconXs`
+    /// (`[&_svg:not([class*='size-'])]:size-3`).
+    pub icon_size: Rems,
     pub text_size: Rems,
     pub radius: Rems,
 }
@@ -221,7 +229,12 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
         ButtonSize::Lg => (rems(2.5), None, rems(1.5), rems(1.), rems(0.5)),
         // size-9
         ButtonSize::Icon => (rems(2.25), Some(rems(2.25)), rems(0.), rems(0.), rems(0.5)),
+        // size-8
+        ButtonSize::IconSm => (rems(2.), Some(rems(2.)), rems(0.), rems(0.), rems(0.5)),
+        // size-6
+        ButtonSize::IconXs => (rems(1.5), Some(rems(1.5)), rems(0.), rems(0.), rems(0.5)),
     };
+    let icon_size = if size == ButtonSize::IconXs { rems(0.75) } else { rems(1.) };
 
     ButtonStyle {
         background,
@@ -237,6 +250,7 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
         padding_x,
         padding_x_with_icon,
         gap,
+        icon_size,
         // text-sm rounded-md
         text_size: rems(0.875),
         radius: t.radius_md(),
@@ -535,6 +549,386 @@ pub fn command_style(t: &Tokens) -> CommandStyle {
     }
 }
 
+/// shadcn's toggle variants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToggleVariant {
+    #[default]
+    Default,
+    Outline,
+}
+
+impl ToggleVariant {
+    pub const ALL: [ToggleVariant; 2] = [ToggleVariant::Default, ToggleVariant::Outline];
+}
+
+/// shadcn's toggle sizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToggleSize {
+    #[default]
+    Default,
+    Sm,
+    Lg,
+}
+
+impl ToggleSize {
+    pub const ALL: [ToggleSize; 3] = [ToggleSize::Default, ToggleSize::Sm, ToggleSize::Lg];
+}
+
+/// A toggle's resolved look. `None` colours draw nothing (a transparent
+/// background, no border).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToggleStyle {
+    pub background: Option<Hsla>,
+    pub foreground: Hsla,
+    pub border: Option<Hsla>,
+    pub hover_background: Hsla,
+    pub hover_foreground: Hsla,
+    /// The focus ring's colour while it shows.
+    pub ring: Hsla,
+    /// The border's colour while the ring shows, for the outline variant
+    /// (shadcn's `focus-visible:border-ring`).
+    pub focus_border: Option<Hsla>,
+    pub height: Rems,
+    /// `min-w-*`: an icon or a one-letter label makes a square.
+    pub min_width: Rems,
+    pub padding_x: Rems,
+    /// Space between an icon and the label, shadcn's `gap-2`.
+    pub gap: Rems,
+    /// The icon's side, shadcn's `size-4`.
+    pub icon_size: Rems,
+    pub text_size: Rems,
+    pub radius: Rems,
+}
+
+/// shadcn's `toggleVariants` (the new-york-v4 style) for `variant`, `size`
+/// and the `pressed` state, in the colours of `t`.
+///
+/// The base is `hover:bg-muted hover:text-muted-foreground
+/// data-[state=on]:bg-accent data-[state=on]:text-accent-foreground`; the
+/// outline variant adds `border border-input bg-transparent
+/// hover:bg-accent hover:text-accent-foreground`. A pressed toggle keeps the
+/// accent pair under the pointer: the `data-[state=on]:` rule has the same
+/// specificity as the `hover:` one and comes later in Tailwind's output, so
+/// it wins. The toggle has no `dark:` refinements besides the invalid ring,
+/// which is left out (a toggle has no invalid state here).
+pub fn toggle_style(variant: ToggleVariant, size: ToggleSize, pressed: bool, t: &Tokens) -> ToggleStyle {
+    let (border, mut hover_background, mut hover_foreground) = match variant {
+        ToggleVariant::Default => (None, t.muted, t.muted_foreground),
+        ToggleVariant::Outline => (Some(t.input), t.accent, t.accent_foreground),
+    };
+    let (background, foreground) = if pressed {
+        hover_background = t.accent;
+        hover_foreground = t.accent_foreground;
+        (Some(t.accent), t.accent_foreground)
+    } else {
+        (None, t.foreground)
+    };
+    // (height and min width, px): h-9 px-2 min-w-9, h-8 px-1.5 min-w-8,
+    // h-10 px-2.5 min-w-10.
+    let (height, padding_x) = match size {
+        ToggleSize::Default => (rems(2.25), rems(0.5)),
+        ToggleSize::Sm => (rems(2.), rems(0.375)),
+        ToggleSize::Lg => (rems(2.5), rems(0.625)),
+    };
+    ToggleStyle {
+        background,
+        foreground,
+        border,
+        hover_background,
+        hover_foreground,
+        ring: focus_ring(t),
+        focus_border: border.map(|_| t.ring),
+        height,
+        min_width: height,
+        padding_x,
+        gap: rems(0.5),
+        icon_size: rems(1.),
+        // text-sm rounded-md
+        text_size: rems(0.875),
+        radius: t.radius_md(),
+    }
+}
+
+/// A tooltip's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipStyle {
+    /// `bg-foreground`: the tooltip is drawn inverted.
+    pub background: Hsla,
+    /// `text-background`.
+    pub foreground: Hsla,
+    /// The shortcut's keycaps inside it: `bg-background/20`
+    /// (`dark:bg-background/10`).
+    pub kbd_background: Hsla,
+    /// `text-background`.
+    pub kbd_foreground: Hsla,
+    /// `px-3`.
+    pub padding_x: Rems,
+    /// `py-1.5`.
+    pub padding_y: Rems,
+    /// The right padding beside a shortcut, `pr-1.5`.
+    pub padding_right_with_shortcut: Rems,
+    /// Between the label and the shortcut, `gap-2`.
+    pub gap: Rems,
+    /// `text-xs`.
+    pub text_size: Rems,
+    /// `rounded-md`.
+    pub radius: Rems,
+}
+
+/// shadcn's TooltipContent (`bg-foreground text-background rounded-md px-3
+/// py-1.5 text-xs`), and its Kbd example (`pr-1.5`, the label and the keys
+/// `gap-2`), with the keycaps in the Kbd's tooltip colours
+/// (`[[data-slot=tooltip-content]_&]:bg-background/20 text-background
+/// dark:…bg-background/10`).
+pub fn tooltip_style(t: &Tokens) -> TooltipStyle {
+    TooltipStyle {
+        background: t.foreground,
+        foreground: t.background,
+        kbd_background: t.background.opacity(if t.dark { 0.1 } else { 0.2 }),
+        kbd_foreground: t.background,
+        padding_x: rems(0.75),
+        padding_y: rems(0.375),
+        padding_right_with_shortcut: rems(0.375),
+        gap: rems(0.5),
+        text_size: rems(0.75),
+        radius: t.radius_md(),
+    }
+}
+
+/// A menu's least width, shadcn's `min-w-[8rem]`.
+pub const MENU_MIN_WIDTH: Rems = Rems(8.);
+
+/// A menu's resolved look: the panel, its items and separators.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MenuStyle {
+    /// The panel: `bg-popover text-popover-foreground border`.
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    /// The highlighted item: `focus:bg-accent focus:text-accent-foreground`.
+    pub highlight: Hsla,
+    pub highlight_foreground: Hsla,
+    /// An item's description line and its shortcut's keycaps:
+    /// `text-muted-foreground`, on the `muted` keycaps of `Kbd`.
+    pub muted: Hsla,
+    /// A separator: `bg-border`.
+    pub separator: Hsla,
+    /// The panel's corners, `rounded-md`.
+    pub radius: Rems,
+    /// An item's corners, `rounded-sm`.
+    pub item_radius: Rems,
+    /// An item's label, `text-sm`.
+    pub text_size: Rems,
+    /// A description line, `text-xs`.
+    pub description_size: Rems,
+}
+
+/// shadcn's DropdownMenu and ContextMenu (new-york-v4): the content
+/// `bg-popover text-popover-foreground rounded-md border p-1 shadow-md
+/// min-w-[8rem]`, the item `rounded-sm px-2 py-1.5 text-sm gap-2
+/// focus:bg-accent focus:text-accent-foreground data-[disabled]:opacity-50`,
+/// the separator `-mx-1 my-1 h-px bg-border` and the shortcut
+/// `text-muted-foreground ml-auto`, in the colours of `t`. The description
+/// line is the crate's addition, in the shortcut's muted colour at
+/// `text-xs`.
+pub fn menu_style(t: &Tokens) -> MenuStyle {
+    MenuStyle {
+        background: t.popover,
+        foreground: t.popover_foreground,
+        border: t.border,
+        highlight: t.accent,
+        highlight_foreground: t.accent_foreground,
+        muted: t.muted_foreground,
+        separator: t.border,
+        radius: t.radius_md(),
+        item_radius: t.radius_sm(),
+        text_size: rems(0.875),
+        description_size: rems(0.75),
+    }
+}
+
+/// The bar that marks where a dragged trigger will land: two pixels, as
+/// shadcn's `h-0.5` line.
+pub const TAB_LINE_WIDTH: Pixels = px(2.);
+
+/// A list's height, shadcn's `h-9`.
+pub const TAB_LIST_HEIGHT: Rems = Rems(2.25);
+
+/// The room around a list's triggers, shadcn's `p-[3px]`, in pixels as
+/// shadcn's is. It is also the focus ring's width, so the active trigger's
+/// ring stays inside the list.
+pub const TAB_LIST_PADDING: Pixels = px(3.);
+
+/// The widest a dragged trigger's preview is drawn.
+pub const TAB_DRAG_MAX_WIDTH: Rems = Rems(15.);
+
+/// A tab list's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabListStyle {
+    /// `bg-muted`.
+    pub background: Hsla,
+    /// `h-9`.
+    pub height: Rems,
+    /// `p-[3px]`.
+    pub padding: Edges<Pixels>,
+    /// `rounded-lg`.
+    pub radius: Rems,
+}
+
+/// shadcn's TabsList, the default (pill) one: `bg-muted rounded-lg p-[3px]
+/// h-9`, in the colours of `t`. shadcn's `line` variant isn't offered.
+pub fn tab_list_style(t: &Tokens) -> TabListStyle {
+    TabListStyle {
+        background: t.muted,
+        height: TAB_LIST_HEIGHT,
+        padding: Edges::all(TAB_LIST_PADDING),
+        radius: t.radius_lg(),
+    }
+}
+
+/// A trigger's own colours, which its owner may give it (a terminal tab
+/// drawn in its terminal's colours). A colour left `None` comes from the
+/// tokens, so a trigger given none looks as shadcn's does.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TabColors {
+    /// The surface the trigger is drawn on, active or not.
+    pub surface: Option<Hsla>,
+    /// The text colour, which its icons and close button take too: full
+    /// when active or hovered, at 60% opacity otherwise.
+    pub text: Option<Hsla>,
+}
+
+/// A tab trigger's resolved look. `None` colours draw nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabStyle {
+    pub background: Option<Hsla>,
+    pub foreground: Hsla,
+    /// A 1px border in this colour (often transparent, shadcn's
+    /// `border-transparent`); `None` for no border at all.
+    pub border: Option<Hsla>,
+    pub hover_background: Option<Hsla>,
+    pub hover_foreground: Hsla,
+    /// shadcn's `shadow-sm` under the active pill.
+    pub shadow: bool,
+    /// The focus ring's colour while it shows.
+    pub ring: Hsla,
+    /// The border's colour while the ring shows (`focus-visible:border-ring`).
+    pub focus_border: Option<Hsla>,
+    pub radius: Rems,
+    pub padding_left: Rems,
+    pub padding_right: Rems,
+    /// The right padding beside a close button.
+    pub padding_right_with_close: Rems,
+    /// Between the leading slot, the label and the adornments, `gap-1.5`.
+    pub gap: Rems,
+    /// A leading icon's side, `size-4`.
+    pub icon_size: Rems,
+    pub text_size: Rems,
+    pub font_weight: FontWeight,
+}
+
+/// shadcn's TabsTrigger (new-york-v4) in the pill list, for the `active`
+/// state, in the colours of `t`; `colors` are the trigger's own, if its
+/// owner gave any.
+///
+/// A trigger is `border border-transparent rounded-md px-2 py-1 text-sm
+/// font-medium gap-1.5`, inactive in `text-foreground/60
+/// hover:text-foreground` (`dark:text-muted-foreground
+/// dark:hover:text-foreground`), active in `text-foreground` on
+/// `bg-background shadow-sm` (`dark:bg-input/30 dark:border-input`).
+/// Focused from the keyboard, it takes `focus-visible:border-ring` and the
+/// ring.
+///
+/// The owner's colours (an addition to shadcn) apply in both states: a
+/// `surface` replaces the trigger's background, an inactive one included;
+/// `text` replaces the foreground, at 60% opacity while inactive and not
+/// hovered and at full opacity when active or hovered. The active trigger
+/// stays raised with its shadow.
+pub fn tab_style(active: bool, colors: TabColors, t: &Tokens) -> TabStyle {
+    let dark = t.dark;
+    let inactive_text = if dark { t.muted_foreground } else { t.foreground.opacity(0.6) };
+    let shadcn = |background, foreground, border, shadow| TabStyle {
+        background,
+        foreground,
+        border: Some(border),
+        hover_background: None,
+        hover_foreground: t.foreground,
+        shadow,
+        ring: focus_ring(t),
+        focus_border: Some(t.ring),
+        radius: t.radius_md(),
+        // px-2
+        padding_left: rems(0.5),
+        padding_right: rems(0.5),
+        padding_right_with_close: rems(0.25),
+        gap: rems(0.375),
+        icon_size: rems(1.),
+        text_size: rems(0.875),
+        font_weight: FontWeight::MEDIUM,
+    };
+    let clear = transparent_black();
+    let mut style = if active {
+        let (background, border) = if dark { (t.input.opacity(0.3), t.input) } else { (t.background, clear) };
+        shadcn(Some(background), t.foreground, border, true)
+    } else {
+        shadcn(None, inactive_text, clear, false)
+    };
+    if let Some(surface) = colors.surface {
+        style.background = Some(surface);
+    }
+    if let Some(text) = colors.text {
+        style.foreground = if active { text } else { text.opacity(0.6) };
+        style.hover_foreground = text;
+    }
+    style
+}
+
+/// How narrow and how wide a trigger may get: it shrinks towards `min`
+/// when the list is crowded, grows with its label up to `max`, and past
+/// that the label is cut with an ellipsis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabWidth {
+    min: Rems,
+    max: Rems,
+}
+
+impl TabWidth {
+    /// Limits of `min` and `max`. A `max` below `min` is raised to it: as in
+    /// CSS, the minimum wins.
+    pub fn new(min: Rems, max: Rems) -> Self {
+        Self { min, max: Rems(max.0.max(min.0)) }
+    }
+
+    pub fn min(&self) -> Rems {
+        self.min
+    }
+
+    pub fn max(&self) -> Rems {
+        self.max
+    }
+
+    /// The width a trigger is drawn at when its content would take
+    /// `natural`, room allowing: its natural width, held between the two.
+    /// A crowded list shrinks it further, but never below `min`.
+    pub fn clamp(&self, natural: Rems) -> Rems {
+        Rems(natural.0.min(self.max.0).max(self.min.0))
+    }
+}
+
+/// A dragged trigger's preview: the background token with a primary
+/// border, as the tab being moved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabDragStyle {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub border: Hsla,
+    pub radius: Rems,
+}
+
+pub fn tab_drag_style(t: &Tokens) -> TabDragStyle {
+    TabDragStyle { background: t.background, foreground: t.foreground, border: t.primary, radius: t.radius_md() }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::hsla;
@@ -656,7 +1050,7 @@ mod tests {
 
     /// The style `row` and the size row describe, in the colours of `t`.
     fn expected_style(row: &VariantRow, size_row: SizeRow, t: &Tokens) -> ButtonStyle {
-        let (_, height, width, px, px_icon, gap) = size_row;
+        let (_, height, width, px, px_icon, gap, icon) = size_row;
         let faded = |(pick, opacity): Faded| pick(t).opacity(opacity);
         ButtonStyle {
             background: row.background.map(faded),
@@ -672,19 +1066,22 @@ mod tests {
             padding_x: rems(px),
             padding_x_with_icon: rems(px_icon),
             gap: rems(gap),
+            icon_size: rems(icon),
             text_size: rems(0.875),
             radius: t.radius_md(),
         }
     }
 
-    /// (size, height, width, px, px with an icon, gap), in rems.
-    type SizeRow = (ButtonSize, f32, Option<f32>, f32, f32, f32);
+    /// (size, height, width, px, px with an icon, gap, icon side), in rems.
+    type SizeRow = (ButtonSize, f32, Option<f32>, f32, f32, f32, f32);
 
-    const SIZE_ROWS: [SizeRow; 4] = [
-        (ButtonSize::Default, 2.25, None, 1.0, 0.75, 0.5),
-        (ButtonSize::Sm, 2.0, None, 0.75, 0.625, 0.375),
-        (ButtonSize::Lg, 2.5, None, 1.5, 1.0, 0.5),
-        (ButtonSize::Icon, 2.25, Some(2.25), 0.0, 0.0, 0.5),
+    const SIZE_ROWS: [SizeRow; 6] = [
+        (ButtonSize::Default, 2.25, None, 1.0, 0.75, 0.5, 1.0),
+        (ButtonSize::Sm, 2.0, None, 0.75, 0.625, 0.375, 1.0),
+        (ButtonSize::Lg, 2.5, None, 1.5, 1.0, 0.5, 1.0),
+        (ButtonSize::Icon, 2.25, Some(2.25), 0.0, 0.0, 0.5, 1.0),
+        (ButtonSize::IconSm, 2.0, Some(2.0), 0.0, 0.0, 0.5, 1.0),
+        (ButtonSize::IconXs, 1.5, Some(1.5), 0.0, 0.0, 0.5, 0.75),
     ];
 
     #[test]
@@ -705,9 +1102,34 @@ mod tests {
                 }
             }
         }
-        // 6 variants x 4 sizes, in each of the two sets.
-        assert_eq!(combinations, 2 * 24);
-        assert_eq!(ButtonVariant::ALL.len() * ButtonSize::ALL.len(), 24);
+        // 6 variants x 6 sizes, in each of the two sets.
+        assert_eq!(combinations, 2 * 36);
+        assert_eq!(ButtonVariant::ALL.len() * ButtonSize::ALL.len(), 36);
+    }
+
+    /// The two new icon sizes are shadcn's `size-8` and `size-6` squares,
+    /// the existing sizes are untouched, and only `IconXs` shrinks its icon.
+    #[test]
+    fn icon_sizes_are_squares_of_two_and_one_and_a_half_rems() {
+        let t = Tokens::neutral_light();
+        let style = |size| button_style(ButtonVariant::Ghost, size, &t);
+        for (size, side, icon) in [
+            (ButtonSize::Icon, 2.25, 1.),
+            (ButtonSize::IconSm, 2., 1.),
+            (ButtonSize::IconXs, 1.5, 0.75),
+        ] {
+            let s = style(size);
+            assert_eq!((s.height, s.width, s.icon_size), (rems(side), Some(rems(side)), rems(icon)), "{size:?}");
+            assert_eq!((s.padding_x, s.padding_x_with_icon), (rems(0.), rems(0.)), "{size:?}");
+        }
+        for size in [ButtonSize::Default, ButtonSize::Sm, ButtonSize::Lg] {
+            assert_eq!(style(size).width, None, "{size:?}");
+            assert_eq!(style(size).icon_size, rems(1.), "{size:?}");
+        }
+        // Heights of the existing sizes: 2.25, 2, 2.5 rem.
+        assert_eq!(style(ButtonSize::Default).height, rems(2.25));
+        assert_eq!(style(ButtonSize::Sm).height, rems(2.));
+        assert_eq!(style(ButtonSize::Lg).height, rems(2.5));
     }
 
     /// The hint alone picks the `dark:` refinements: the dark colours with
@@ -1000,5 +1422,183 @@ mod tests {
         }
         let sizes: Vec<_> = SIZE_ROWS.iter().map(|r| r.0).collect();
         assert_eq!(sizes, ButtonSize::ALL);
+    }
+
+    /// (size, height = min width, px), in rems: shadcn's toggle sizes.
+    const TOGGLE_SIZE_ROWS: [(ToggleSize, f32, f32); 3] =
+        [(ToggleSize::Default, 2.25, 0.5), (ToggleSize::Sm, 2.0, 0.375), (ToggleSize::Lg, 2.5, 0.625)];
+
+    #[test]
+    fn toggle_sizes_are_shadcns_and_cover_every_size() {
+        let t = Tokens::neutral_light();
+        let sizes: Vec<_> = TOGGLE_SIZE_ROWS.iter().map(|r| r.0).collect();
+        assert_eq!(sizes, ToggleSize::ALL);
+        for (size, height, px) in TOGGLE_SIZE_ROWS {
+            for variant in ToggleVariant::ALL {
+                for pressed in [false, true] {
+                    let s = toggle_style(variant, size, pressed, &t);
+                    assert_eq!((s.height, s.min_width, s.padding_x), (rems(height), rems(height), rems(px)), "{size:?}");
+                    assert_eq!((s.gap, s.icon_size, s.text_size, s.radius), (rems(0.5), rems(1.), rems(0.875), t.radius_md()));
+                }
+            }
+        }
+    }
+
+    /// Unpressed, the default toggle is a transparent control in the
+    /// foreground that hovers muted; the outline one has an input border and
+    /// hovers in accent. Pressed, both are the accent pair, under the
+    /// pointer too.
+    #[test]
+    fn toggle_colours_for_each_variant_and_state() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = |variant, pressed| toggle_style(variant, ToggleSize::Default, pressed, &t);
+
+            let off = s(ToggleVariant::Default, false);
+            assert_eq!((off.background, off.foreground, off.border), (None, t.foreground, None));
+            assert_eq!((off.hover_background, off.hover_foreground), (t.muted, t.muted_foreground));
+            assert_eq!(off.focus_border, None);
+
+            let off = s(ToggleVariant::Outline, false);
+            assert_eq!((off.background, off.foreground, off.border), (None, t.foreground, Some(t.input)));
+            assert_eq!((off.hover_background, off.hover_foreground), (t.accent, t.accent_foreground));
+            assert_eq!(off.focus_border, Some(t.ring));
+
+            for variant in ToggleVariant::ALL {
+                let on = s(variant, true);
+                assert_eq!((on.background, on.foreground), (Some(t.accent), t.accent_foreground), "{variant:?}");
+                assert_eq!((on.hover_background, on.hover_foreground), (t.accent, t.accent_foreground), "{variant:?}");
+                assert_eq!(on.ring, focus_ring(&t));
+                // Pressing doesn't change the frame.
+                assert_eq!(on.border, s(variant, false).border);
+            }
+        }
+    }
+
+    /// The tooltip is drawn inverted: the foreground token behind the
+    /// background token, its keycaps in a faint wash of the background.
+    #[test]
+    fn tooltip_colours_come_from_the_tokens_inverted() {
+        for (t, kbd_opacity) in [(Tokens::neutral_light(), 0.2), (Tokens::neutral_dark(), 0.1)] {
+            let s = tooltip_style(&t);
+            assert_eq!((s.background, s.foreground), (t.foreground, t.background));
+            assert_eq!((s.kbd_background, s.kbd_foreground), (t.background.opacity(kbd_opacity), t.background));
+            assert_eq!((s.padding_x, s.padding_y, s.padding_right_with_shortcut), (rems(0.75), rems(0.375), rems(0.375)));
+            assert_eq!((s.gap, s.text_size, s.radius), (rems(0.5), rems(0.75), t.radius_md()));
+        }
+        // A theme of its own: the style follows the tokens, not shadcn's
+        // neutral values.
+        let mut t = Tokens::neutral_light();
+        t.foreground = hsla(0.6, 0.5, 0.2, 1.);
+        t.background = hsla(0.1, 0.3, 0.95, 1.);
+        let s = tooltip_style(&t);
+        assert_eq!((s.background, s.foreground), (t.foreground, t.background));
+    }
+
+    /// A menu is a popover-coloured panel with an accent highlight, muted
+    /// shortcuts and descriptions, and border-coloured separators.
+    #[test]
+    fn menu_colours_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = menu_style(&t);
+            assert_eq!((s.background, s.foreground, s.border), (t.popover, t.popover_foreground, t.border));
+            assert_eq!((s.highlight, s.highlight_foreground), (t.accent, t.accent_foreground));
+            assert_eq!((s.muted, s.separator), (t.muted_foreground, t.border));
+            assert_eq!((s.radius, s.item_radius), (t.radius_md(), t.radius_sm()));
+            assert_eq!((s.text_size, s.description_size), (rems(0.875), rems(0.75)));
+        }
+        let mut t = Tokens::neutral_light();
+        t.popover = hsla(0.6, 0.5, 0.2, 1.);
+        t.accent = hsla(0.1, 0.3, 0.95, 1.);
+        let s = menu_style(&t);
+        assert_eq!((s.background, s.highlight), (t.popover, t.accent));
+        assert_eq!(MENU_MIN_WIDTH, Rems(8.));
+    }
+
+    /// The spec's owner colours (`#c0caf5` text on `#1a1b26`).
+    fn owner_colors() -> TabColors {
+        TabColors { surface: Some(gpui::rgb(0x1a1b26).into()), text: Some(gpui::rgb(0xc0caf5).into()) }
+    }
+
+    /// A trigger given owner colours is on its surface in its text colour
+    /// whether active or not: active at full opacity and raised, inactive
+    /// at 60% until hovered, then full.
+    #[test]
+    fn owner_colours_apply_to_active_and_inactive_triggers() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let own = owner_colors();
+            let (surface, text) = (own.surface.unwrap(), own.text.unwrap());
+            let on = tab_style(true, own, &t);
+            assert_eq!((on.background, on.foreground, on.hover_foreground), (Some(surface), text, text));
+            assert!(on.shadow, "the active trigger isn't raised");
+            let off = tab_style(false, own, &t);
+            assert_eq!(off.background, Some(surface));
+            assert_eq!(off.foreground, text.opacity(0.6));
+            assert_eq!(off.hover_foreground, text);
+            assert_eq!(off.hover_background, None);
+            assert!(!off.shadow);
+            // One colour alone: the other comes from the tokens.
+            let surface_only = TabColors { surface: own.surface, ..TabColors::default() };
+            let s = tab_style(false, surface_only, &t);
+            let plain = tab_style(false, TabColors::default(), &t);
+            assert_eq!((s.background, s.foreground, s.hover_foreground), (Some(surface), plain.foreground, t.foreground));
+            let text_only = TabColors { text: own.text, ..TabColors::default() };
+            let s = tab_style(true, text_only, &t);
+            let plain = tab_style(true, TabColors::default(), &t);
+            assert_eq!((s.background, s.foreground), (plain.background, text));
+        }
+    }
+
+    /// The pill: inactive text at 60% (muted in a dark set) on no surface
+    /// of its own, full on hover; the active trigger raised on the
+    /// background with a shadow (`dark:bg-input/30 dark:border-input`), and
+    /// the ring's border colour when focused. Nothing depends on
+    /// `TabColors::default()`.
+    #[test]
+    fn default_pill_follows_shadcn_in_both_sets() {
+        let t = Tokens::neutral_light();
+        let off = tab_style(false, TabColors::default(), &t);
+        assert_eq!((off.background, off.foreground), (None, t.foreground.opacity(0.6)));
+        assert_eq!((off.hover_background, off.hover_foreground), (None, t.foreground));
+        let on = tab_style(true, TabColors::default(), &t);
+        assert_eq!((on.background, on.foreground, on.border), (Some(t.background), t.foreground, Some(transparent_black())));
+        assert!(on.shadow && !off.shadow);
+        let t = Tokens::neutral_dark();
+        let off = tab_style(false, TabColors::default(), &t);
+        assert_eq!((off.foreground, off.hover_foreground), (t.muted_foreground, t.foreground));
+        let on = tab_style(true, TabColors::default(), &t);
+        assert_eq!((on.background, on.border), (Some(t.input.opacity(0.3)), Some(t.input)));
+        for active in [true, false] {
+            let s = tab_style(active, TabColors::default(), &t);
+            assert_eq!(s.ring, focus_ring(&t));
+            assert_eq!(s.focus_border, Some(t.ring));
+            assert_eq!((s.text_size, s.gap), (rems(0.875), rems(0.375)));
+        }
+    }
+
+    #[test]
+    fn tab_lists_are_shadcns_pill() {
+        let t = Tokens::neutral_light();
+        let pill = tab_list_style(&t);
+        assert_eq!((pill.background, pill.height, pill.radius), (t.muted, rems(2.25), t.radius_lg()));
+        assert_eq!(pill.padding, Edges::all(px(3.)));
+        // The padding is room for the focus ring.
+        assert_eq!(TAB_LIST_PADDING, crate::components::RING_WIDTH);
+    }
+
+    /// A trigger keeps its natural width between the limits, grows to the
+    /// minimum and stops at the maximum; limits that cross keep the minimum,
+    /// as CSS does, and never panic.
+    #[test]
+    fn tab_width_clamps_between_min_and_max() {
+        let width = TabWidth::new(rems(5.), rems(15.));
+        assert_eq!(width.clamp(rems(8.)), rems(8.));
+        assert_eq!(width.clamp(rems(2.)), rems(5.));
+        assert_eq!(width.clamp(rems(40.)), rems(15.));
+        assert_eq!((width.clamp(rems(5.)), width.clamp(rems(15.))), (rems(5.), rems(15.)));
+        let crossed = TabWidth::new(rems(10.), rems(4.));
+        assert_eq!((crossed.min(), crossed.max()), (rems(10.), rems(10.)));
+        for natural in [0., 4., 10., 30.] {
+            assert_eq!(crossed.clamp(rems(natural)), rems(10.), "natural {natural}");
+        }
     }
 }

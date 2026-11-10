@@ -9,17 +9,19 @@ use std::time::Duration;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::search::{Match, RegexSearch};
-use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px, relative,
+    Action, AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, SharedString, Styled, Subscription, Task, Window, div, px, relative,
 };
 
 use crate::actions::*;
 use crate::terminal::search::{self, COUNT_CAP, Count, SearchOptions, Step};
 use crate::terminal_view::TerminalView;
-use brindle_ui::{TextInput, TextInputEvent};
-use crate::theme::Theme;
+use crate::workspace::shortcut;
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Icon, Input, Separator, TextInput, TextInputEvent, Toggle,
+    ToggleSize, Tooltip, TooltipFor as _,
+};
 
 /// Delay before counting after the query changes, so fast typing scans once.
 const COUNT_AFTER_EDIT: Duration = Duration::from_millis(100);
@@ -286,20 +288,26 @@ impl TerminalView {
         ))
     }
 
-    /// The bar, drawn over the terminal's top-right corner.
-    pub fn render_find_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The bar, drawn over the terminal's top-right corner in the window's
+    /// chrome tokens (`cx.ui_theme()`), not the terminal's theme: a
+    /// popover-styled panel holding the query's `Input`, the count, the
+    /// option `Toggle`s and ghost buttons for the matches and closing.
+    ///
+    /// The controls take no focus (the query keeps it): they have no focus
+    /// handle, and each sits in a wrapper that keeps a press from moving
+    /// focus anywhere. The panel's own press handler then stops the press
+    /// before it reaches the terminal. Each control's tooltip names it and
+    /// the key the keymap binds to its action from the query, looked up
+    /// when the tooltip is shown.
+    pub fn render_find_bar(&self, _window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let bar = self.find.as_ref()?;
-        let theme: Theme = self.terminal.read(cx).theme.clone();
-        let t = &theme;
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let accent = t.accent();
-        let panel = t.chrome_background();
-        let bar_focused = bar.query.read(cx).is_focused(window);
+        let t = *cx.ui_theme();
+        let query_focus = bar.query.focus_handle(cx);
 
         let status: (SharedString, Hsla) = if bar.invalid {
-            ("Invalid regex".into(), t.ansi[1].hsla())
+            ("Invalid regex".into(), t.destructive)
         } else {
+            let muted = t.muted_foreground;
             match (&bar.regex, bar.count) {
                 (None, _) => ("".into(), muted),
                 (Some(_), None) => ("…".into(), muted),
@@ -311,32 +319,47 @@ impl TerminalView {
             }
         };
 
-        // The input draws in the inherited text color, which it also uses
-        // for its caret and selection.
-        let query_text = div().flex().flex_1().min_w_0().overflow_hidden().text_color(fg).child(bar.query.clone());
-
+        // A tooltip naming the control and the key bound to `action` where
+        // the query has focus (the `FindBar` context's keys).
+        let tip = |label: &'static str, action: Box<dyn Action>| {
+            let focus = query_focus.clone();
+            move |window: &mut Window, _: &mut gpui::App| {
+                Tooltip::new(label).shortcut_opt(shortcut(action.as_ref(), &focus, window))
+            }
+        };
+        // A press on a control moves focus nowhere (as a `Toggle` without a
+        // handle does), so the query keeps it.
+        let inert = |id: &'static str, control: AnyElement| {
+            div()
+                .id(id)
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .child(control)
+        };
         let toggle = |id: &'static str, label: &'static str, on: bool| {
-            div()
-                .id(id)
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .text_xs()
-                .text_color(if on { fg } else { muted })
-                .when(on, |d| d.bg(panel.mix(accent, 0.35).hsla()).border_1().border_color(accent.hsla()))
-                .hover(|d| d.bg(panel.mix(t.foreground, 0.12).hsla()))
-                .child(label)
+            Toggle::new(id, label).size(ToggleSize::Sm).pressed(on)
         };
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .text_color(muted)
-                .hover(|d| d.bg(panel.mix(t.foreground, 0.12).hsla()).text_color(fg))
-                .child(label)
+        let button = |id: &'static str, icon: Icon| {
+            Button::icon_only(id, icon).variant(ButtonVariant::Ghost).size(ButtonSize::IconXs)
         };
+
+        let case = toggle("find-case", "Aa", bar.options.case_sensitive)
+            .tooltip_with(tip("Match case", Box::new(FindToggleCase)))
+            .on_click(cx.listener(|this, _, w, cx| this.find_toggle_case(&FindToggleCase, w, cx)));
+        let regex = toggle("find-regex", ".*", bar.options.regex)
+            .tooltip_with(tip("Regular expression", Box::new(FindToggleRegex)))
+            .on_click(cx.listener(|this, _, w, cx| this.find_toggle_regex(&FindToggleRegex, w, cx)));
+        // Next is up, towards older output (`find_next`), so it is the up
+        // arrow; previous is down.
+        let next = button("find-up", Icon::ArrowUp)
+            .tooltip_with(tip("Next match", Box::new(FindNext)))
+            .on_click(cx.listener(|this, _, _, cx| this.step_match(Step::Up, cx)));
+        let previous = button("find-down", Icon::ArrowDown)
+            .tooltip_with(tip("Previous match", Box::new(FindPrevious)))
+            .on_click(cx.listener(|this, _, _, cx| this.step_match(Step::Down, cx)));
+        let close = button("find-close", Icon::X)
+            .tooltip_with(tip("Close", Box::new(FindClose)))
+            .on_click(cx.listener(|this, _, w, cx| this.close_find_bar(w, cx)));
 
         Some(
             div()
@@ -364,26 +387,25 @@ impl TerminalView {
                 .flex()
                 .items_center()
                 .gap_1()
-                .px_2()
-                .py_1()
-                .bg(panel.hsla())
+                .p_1()
+                .bg(t.popover)
+                .text_color(t.popover_foreground)
                 .border_1()
-                .border_color(if bar_focused { accent.hsla() } else { t.chrome_border().hsla() })
-                .rounded_md()
+                .border_color(t.border)
+                .rounded(t.radius_md())
                 .shadow_md()
                 .text_sm()
                 .cursor(gpui::CursorStyle::Arrow)
-                .child(query_text)
+                // The field's ring marks focus; the input clips a long query
+                // and scrolls it to keep the caret in view.
+                .child(Input::new(&bar.query).invalid(bar.invalid).flex_1().min_w_0().h_8().overflow_hidden())
                 .child(div().flex_none().text_xs().text_color(status.1).child(status.0))
-                .child(toggle("find-case", "Aa", bar.options.case_sensitive).on_click(
-                    cx.listener(|this, _, w, cx| this.find_toggle_case(&FindToggleCase, w, cx)),
-                ))
-                .child(toggle("find-regex", ".*", bar.options.regex).on_click(
-                    cx.listener(|this, _, w, cx| this.find_toggle_regex(&FindToggleRegex, w, cx)),
-                ))
-                .child(button("find-up", "↑").on_click(cx.listener(|this, _, _, cx| this.step_match(Step::Up, cx))))
-                .child(button("find-down", "↓").on_click(cx.listener(|this, _, _, cx| this.step_match(Step::Down, cx))))
-                .child(button("find-close", "×").on_click(cx.listener(|this, _, w, cx| this.close_find_bar(w, cx))))
+                .child(Separator::vertical().h_4().mx_0p5())
+                .child(inert("find-case-press", case.into_any_element()))
+                .child(inert("find-regex-press", regex.into_any_element()))
+                .child(inert("find-up-press", next.into_any_element()))
+                .child(inert("find-down-press", previous.into_any_element()))
+                .child(inert("find-close-press", close.into_any_element()))
                 .into_any_element(),
         )
     }

@@ -1,6 +1,7 @@
 //! A Brindle window: the tab strip (which doubles as the title bar), the
 //! active tab's content, and the palettes.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,10 +10,11 @@ use futures::channel::oneshot;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, CursorStyle, Decorations, Entity, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
+    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Bounds, Context, CursorStyle, Decorations, Entity,
+    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px,
+    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
 use gpui::EntityId;
 
@@ -21,7 +23,11 @@ use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
-use brindle_ui::{Overlay as UiOverlay, TextInput};
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
+    LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
+    TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
+};
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
@@ -34,9 +40,12 @@ use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
-use crate::zone_view::ZoneTreeView;
+use crate::zone_view::{ZoneMenuRequest, ZoneTreeView};
 
-const TAB_BAR_HEIGHT: f32 = 38.0;
+/// The tab strip's height in logical pixels: the pill tab list's
+/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default 16px rem) and the
+/// 1px border under it. The strip's `IconSm` (2rem) buttons fit inside it.
+pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16.0 + 1.0;
 const RESIZE_BORDER: f32 = 6.0;
 
 pub enum TabContent {
@@ -146,6 +155,18 @@ impl Tab {
             TabContent::Zones(view) => view.read(cx).theme.clone(),
             TabContent::Tmux { view, .. } => view.read(cx).theme.clone(),
         }
+    }
+
+    /// The colours of the tab's face in the strip, active or not: its
+    /// terminal's background (the face's surface) and foreground (its
+    /// text, icons and close button). A tmux tab's panes share the window
+    /// view's theme.
+    fn face_colors(&self, cx: &App) -> (Hsla, Hsla) {
+        let theme = match &self.content {
+            TabContent::Zones(view) => &view.read(cx).theme,
+            TabContent::Tmux { view, .. } => &view.read(cx).theme,
+        };
+        (theme.background.hsla(), theme.foreground.hsla())
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
@@ -328,34 +349,11 @@ fn ignores_outside_press(tag: PaletteTag) -> bool {
     }
 }
 
-#[derive(Clone)]
-struct DraggedTab {
-    id: u64,
-    title: SharedString,
-    theme: Theme,
-}
-
-impl Render for DraggedTab {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let t = &self.theme;
-        div()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(t.background.hsla())
-            .border_1()
-            .border_color(t.accent().hsla())
-            .text_sm()
-            .text_color(t.foreground.hsla())
-            .child(self.title.clone())
-    }
-}
-
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
-    /// The palettes' modal slot. At most one overlay, a palette or the
-    /// settings dialog, is open at a time.
+    /// The palettes' modal slot. At most one overlay, a palette, the
+    /// settings dialog or the profile menu, is open at a time.
     palette: UiOverlay<Palette>,
     /// What the open palette is for, and the subscription to its events.
     palette_kind: Option<PaletteKind>,
@@ -364,6 +362,22 @@ pub struct Workspace {
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
     _settings_subscriptions: Vec<Subscription>,
+    /// The strip's `⌄` button and its profile menu, the third overlay: at
+    /// most one of the palette, the settings dialog and this menu is open.
+    /// Its items are rebuilt each time it opens (`refresh_profile_menu`),
+    /// since they say which sessions the window shows.
+    profile_menu: Entity<DropdownMenu>,
+    _profile_menu_subscription: Subscription,
+    /// The tab and zone header menus' slot, the fourth overlay (one of the
+    /// four is open at most). It opens on the tab or zone it is for, which
+    /// is active and focused by then, so its items run their actions there.
+    context_menu: Entity<ContextMenu>,
+    /// The open context menu's entries and what its items run.
+    context_menu_items: Option<ActionMenu>,
+    _context_menu_subscription: Subscription,
+    /// Where the strip's tabs were laid out in the last frame, in window
+    /// coordinates, for placing a tab menu opened from a key.
+    tab_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// A theme being previewed by the settings dialog, shown on the tabs
     /// that follow the global theme.
     theme_preview: Option<Theme>,
@@ -371,6 +385,11 @@ pub struct Workspace {
     /// the settings its tabs preview: theme and font size.
     profile_preview: Option<(String, Profile)>,
     focus_handle: FocusHandle,
+    /// The tab strip's focus, as a tab list: one keyboard stop, reached
+    /// only through `FocusTabStrip` (a press on a tab leaves focus in its
+    /// terminal). Focus rests on the active tab; arrows, home and end
+    /// switch tabs, and enter or escape give focus back to the terminal.
+    strip_focus: FocusHandle,
     /// tmux control-mode sessions attached in this window.
     tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
     last_title: SharedString,
@@ -398,6 +417,19 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
         static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let focus_handle = cx.focus_handle();
+        let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
+        // The menu has closed and given focus back to the tab by now.
+        let profile_menu_subscription = cx.subscribe_in(&profile_menu, window, |this, _, event: &MenuEvent, window, cx| {
+            let MenuEvent::Selected(ix) = *event;
+            this.open_profile(ix, window, cx);
+        });
+        let context_menu = cx.new(|_| ContextMenu::new());
+        let context_menu_subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, event: &MenuEvent, window, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                this.context_menu_selected(ix, window, cx);
+            });
         let mut this = Self {
             tabs: Vec::new(),
             active: 0,
@@ -406,9 +438,16 @@ impl Workspace {
             _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
+            profile_menu,
+            _profile_menu_subscription: profile_menu_subscription,
+            context_menu,
+            context_menu_items: None,
+            _context_menu_subscription: context_menu_subscription,
+            tab_bounds: Rc::default(),
             theme_preview: None,
             profile_preview: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            strip_focus: cx.focus_handle(),
             tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
             _title_refresh: Task::ready(()),
@@ -1213,9 +1252,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Subscription> {
-        vec![cx.subscribe_in(view, window, |this, view, event, window, cx| {
-            this.on_zone_tree_event(view, event, window, cx)
-        })]
+        vec![
+            cx.subscribe_in(view, window, |this, view, event, window, cx| this.on_zone_tree_event(view, event, window, cx)),
+            cx.subscribe_in(view, window, |this, view, request: &ZoneMenuRequest, window, cx| {
+                this.open_zone_menu(view, request, window, cx)
+            }),
+        ]
+    }
+
+    /// A zone asked for its header menu (it has focus by now). The menu
+    /// opens only in the active tab, whose zones are the ones shown.
+    fn open_zone_menu(
+        &mut self,
+        view: &Entity<ZoneTreeView>,
+        request: &ZoneMenuRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shown = matches!(self.tabs.get(self.active).map(|t| &t.content), Some(TabContent::Zones(v)) if v == view);
+        if !shown {
+            return;
+        }
+        let menu = ActionMenu::new(request.rows.clone(), |action| tab_shortcut(action, false, cx));
+        self.open_context_menu(menu, request.at, request.press.as_ref(), window, cx);
     }
 
     fn on_zone_tree_event(
@@ -1297,9 +1356,22 @@ impl Workspace {
         }
     }
 
+    /// Makes tab `index` the active one and, unless an overlay is open,
+    /// gives its terminal focus.
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+        if !self.select(index, cx) {
             return;
+        }
+        if !self.has_overlay(cx) {
+            self.focus_active_tab(window, cx);
+        }
+    }
+
+    /// Shows tab `index` (clamped) without moving focus: its bell clears and
+    /// a tmux window becomes its session's current one. False with no tabs.
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if self.tabs.is_empty() {
+            return false;
         }
         self.active = index.min(self.tabs.len() - 1);
         let tab = &mut self.tabs[self.active];
@@ -1308,10 +1380,49 @@ impl Workspace {
             let window_id = view.read(cx).window_id;
             session.update(cx, |s, _| s.select_window(window_id));
         }
-        let focus = tab.focus_handle(cx);
-        if !self.has_overlay() {
-            window.focus(&focus);
+        cx.notify();
+        true
+    }
+
+    /// Focuses the active tab's terminal (the tab's own focus handle).
+    fn focus_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            window.focus(&tab.focus_handle(cx));
         }
+    }
+
+    /// The strip asked to activate a tab. A pointer press activates it and
+    /// puts focus in its terminal, as a key or a click elsewhere would; an
+    /// arrow, home or end while the strip has focus only shows the tab, so
+    /// focus stays on the strip, resting on the new active tab.
+    fn activate_from_strip(&mut self, request: &TabActivate, window: &mut Window, cx: &mut Context<Self>) {
+        match request.by {
+            Modality::Pointer => self.activate(request.index, window, cx),
+            Modality::Keyboard => {
+                self.select(request.index, cx);
+            }
+        }
+    }
+
+    /// `FocusTabStrip`: focus moves to the strip, on the active tab. Nothing
+    /// happens while an overlay holds focus, or with no tabs.
+    fn focus_tab_strip(&mut self, _: &FocusTabStrip, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_overlay(cx) || self.tabs.is_empty() {
+            return;
+        }
+        window.focus(&self.strip_focus);
+        cx.notify();
+    }
+
+    /// A key while the strip has focus, after the tab list took its own
+    /// (arrows, home, end): enter and escape return focus to the active
+    /// tab's terminal. Anything else goes on to the window's bindings.
+    fn strip_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.strip_focus.is_focused(window) || !returns_from_strip(&event.keystroke.key, event.keystroke.modifiers) {
+            return;
+        }
+        cx.stop_propagation();
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -1442,12 +1553,14 @@ impl Workspace {
         self.open_prompt(PromptRequest { label, initial, submit }, window, cx);
     }
 
-    fn drop_tab(&mut self, dragged: &DraggedTab, target: usize, cx: &mut Context<Self>) {
-        let Some(from) = self.tabs.iter().position(|t| t.id == dragged.id) else { return };
-        let active_id = self.tabs[self.active].id;
-        let tab = self.tabs.remove(from);
-        let to = target.min(self.tabs.len());
-        self.tabs.insert(to, tab);
+    /// A tab dragged onto another: the tab at `from` takes `to`'s place
+    /// (after it when it came from the left, before it from the right), and
+    /// the active tab stays active wherever it ends up.
+    fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let Some(active_id) = self.tabs.get(self.active).map(|t| t.id) else { return };
+        if !reorder(&mut self.tabs, from, to) {
+            return;
+        }
         self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
         cx.notify();
     }
@@ -1461,24 +1574,104 @@ impl Workspace {
         if self.close_palette_toggling(|k| matches!(k, PaletteKind::NewTab), window, cx) {
             return;
         }
-        let tab_focus = self.tabs.get(self.active).map(|t| t.focus_handle(cx));
-        let rows = Self::settings(cx)
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(ix, profile)| {
-                // Picking a session the window shows activates its tab; say so.
-                let shown = SessionKey::for_profile(profile).and_then(|key| self.find_session(&key, cx));
-                let state = if shown.is_some() { " · open in this window" } else { "" };
-                PaletteRow {
-                    label: profile.name.clone().into(),
-                    detail: Some(format!("{}{state}", profile.description()).into()),
-                    shortcut: tab_focus.as_ref().and_then(|f| shortcut(&NewTabWithProfile(ix), f, window)),
-                }
-            })
-            .collect();
+        let rows = self.profile_rows(window, cx);
         let palette = cx.new(|cx| Palette::list(rows, "Open profile…", cx));
         self.show_palette(palette, PaletteKind::NewTab, window, cx);
+    }
+
+    /// The profiles as the picker and the profile menu list them
+    /// ([`profile_rows`]), with the keys that open each in the active tab.
+    fn profile_rows(&self, window: &Window, cx: &App) -> Vec<PaletteRow> {
+        let focus = self.tabs.get(self.active).map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
+        let open = self.open_sessions(cx);
+        profile_rows(&Self::settings(cx).profiles, &open, |ix| shortcut(&NewTabWithProfile(ix), &focus, window))
+    }
+
+    /// Gives the profile menu the picker's rows as they are now, for its
+    /// next opening.
+    fn refresh_profile_menu(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let entries = profile_menu_entries(self.profile_rows(window, cx));
+        self.profile_menu.update(cx, |menu, _| menu.set_entries(entries));
+    }
+
+    /// `OpenProfileMenu`: opens the `⌄` button's menu below it, as a press
+    /// on the button does, or closes it when it is open. Another overlay
+    /// closes first, so the menu gives focus back to the tab.
+    fn open_profile_menu(&mut self, _: &OpenProfileMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.profile_menu.read(cx).is_open();
+        if self.has_overlay(cx) {
+            self.dismiss_overlay(window, cx);
+        }
+        if was_open {
+            return;
+        }
+        self.refresh_profile_menu(window, cx);
+        self.profile_menu.update(cx, |menu, cx| menu.open(window, cx));
+        cx.notify();
+    }
+
+    /// `OpenTabMenu`: the active tab's menu, below its face in the strip
+    /// (below the strip's start before the strip was first drawn).
+    fn open_tab_menu(&mut self, _: &OpenTabMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let face = self.tab_bounds.borrow().get(self.active).copied();
+        let at = face.map_or_else(|| point(px(0.), px(TAB_BAR_HEIGHT)), |face| face.bottom_left());
+        self.open_tab_menu_at(self.active, at, None, window, cx);
+    }
+
+    /// Tab `ix`'s menu, at `at` (window coordinates), from the secondary
+    /// `press` on its face when one asked. The tab becomes the active one
+    /// and its terminal takes focus first, so the items, which run the tab
+    /// actions, act on it.
+    fn open_tab_menu_at(
+        &mut self,
+        ix: usize,
+        at: Point<Pixels>,
+        press: Option<&MouseDownEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.select(ix, cx);
+        let is_tmux = self.tabs[ix].is_tmux();
+        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, self.tabs.len()), |action| tab_shortcut(action, is_tmux, cx));
+        self.open_context_menu(menu, at, press, window, cx);
+    }
+
+    /// Opens `menu` in the context menu slot at `at`, or at the pointer of
+    /// `press`, replacing any overlay. Focus goes to the active tab first:
+    /// the menu gives it back there on closing, and a chosen item's action
+    /// runs from there.
+    fn open_context_menu(
+        &mut self,
+        menu: ActionMenu,
+        at: Point<Pixels>,
+        press: Option<&MouseDownEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_overlay(window, cx);
+        self.focus_active_tab(window, cx);
+        let entries = menu.entries.clone();
+        self.context_menu_items = Some(menu);
+        self.context_menu.update(cx, |context_menu, cx| match press {
+            Some(event) => context_menu.open_on_press(event, entries, window, cx),
+            None => context_menu.open(at, entries, window, cx),
+        });
+        cx.notify();
+    }
+
+    /// An item of the tab or zone menu was chosen. The menu has closed and
+    /// given focus back to the tab; its action runs from there, exactly as
+    /// its keybinding would (as the command palette runs one).
+    fn context_menu_selected(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.context_menu_items.take().and_then(|menu| menu.action(ix).map(|a| a.boxed_clone())) else {
+            return;
+        };
+        self.focus_active_tab(window, cx);
+        cx.notify();
+        window.dispatch_action(action, cx);
     }
 
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -1529,7 +1722,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.has_overlay() {
+        if !self.has_overlay(cx) {
             return false;
         }
         let same = self.palette_kind.as_ref().is_some_and(is);
@@ -1751,10 +1944,10 @@ impl Workspace {
         // The slot closes itself on the dialog's `DismissEvent`; this ends
         // the previews, as closing it any other way does.
         let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| this.end_previews(cx));
-        // A palette goes first, with focus back on the tab, so that is the
-        // focus the dialog records and puts back when it closes (the
-        // palette's input is gone by then).
-        if self.palette.is_open() {
+        // A palette or the profile menu goes first, with focus back on the
+        // tab, so that is the focus the dialog records and puts back when it
+        // closes (the palette's input is gone by then).
+        if self.has_overlay(cx) {
             self.dismiss_overlay(window, cx);
         }
         self._settings_subscriptions = vec![subscription, dismissed];
@@ -1762,8 +1955,18 @@ impl Workspace {
         cx.notify();
     }
 
-    fn has_overlay(&self) -> bool {
-        self.palette.is_open() || self.settings.is_open()
+    /// Whether a palette, the settings dialog, the profile menu or a tab or
+    /// zone menu is open.
+    fn has_overlay(&self, cx: &App) -> bool {
+        self.palette.is_open()
+            || self.settings.is_open()
+            || self.profile_menu.read(cx).is_open()
+            || self.context_menu.read(cx).is_open()
+    }
+
+    /// The open menu: the profile menu, or a tab or zone menu.
+    fn open_menu(&self, cx: &App) -> Option<Entity<brindle_ui::Menu>> {
+        self.profile_menu.read(cx).menu().or_else(|| self.context_menu.read(cx).menu()).cloned()
     }
 
     /// Closes whatever overlay is open and gives focus back to the tab.
@@ -1783,6 +1986,8 @@ impl Workspace {
         self._palette_subscription = None;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
+        self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
+        self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.end_previews(cx);
     }
 
@@ -1999,6 +2204,10 @@ impl Workspace {
         if let Some(dialog) = self.settings.view() {
             out.push_str(&dialog.read(cx).describe(window, cx));
         }
+        if let Some(menu) = self.open_menu(cx) {
+            let menu = menu.read(cx);
+            out.push_str(&describe_menu(menu.entries(), menu.highlighted()));
+        }
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
         }
@@ -2009,9 +2218,10 @@ impl Workspace {
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
     /// active tab's active terminal), `palette` (inside an open palette),
     /// `settings stop=NAME` (inside the settings dialog, on the control
-    /// `NAME`), `none`, or `other`; then
-    /// the window's `modality=keyboard|pointer`, which decides whether the
-    /// focused control shows its ring.
+    /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
+    /// menu: the profile menu, or a tab or zone menu), `none`, or
+    /// `other`; then the window's `modality=keyboard|pointer`, which
+    /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
         let terminal = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
@@ -2022,6 +2232,10 @@ impl Workspace {
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
+        } else if self.strip_focus.is_focused(window) {
+            "tabs".to_string()
+        } else if self.open_menu(cx).is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx)) {
+            "menu".to_string()
         } else if window.focused(cx).is_none() {
             "none".to_string()
         } else {
@@ -2036,124 +2250,168 @@ impl Workspace {
 
     // ---- rendering --------------------------------------------------------------
 
+    /// The tab strip, which is also the window's title bar: a `TabList`
+    /// (shadcn's pill), the new-tab and profile buttons, the caption (empty
+    /// space) and, with client decorations, the window controls. Nothing in
+    /// it acts on the active tab: split and find are on their keys, the tab
+    /// menu and the palette.
+    ///
+    /// It is drawn in the window's chrome tokens (`cx.ui_theme()`, from the
+    /// global theme), whatever the tabs' profile themes; only each tab's
+    /// face, active or not, takes its terminal's background and foreground
+    /// (its icons and close button too), the active one raised. Its buttons
+    /// are `IconSm` with 16px icons at a legible stroke. The strip is one
+    /// keyboard stop (`strip_focus`), reached through `FocusTabStrip`: the
+    /// list takes the arrows, home and end, and the wrapper around it enter
+    /// and escape. A press on a tab activates it and leaves focus in its
+    /// terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.active_theme(cx);
-        let t = &theme;
-        let chrome = t.chrome_background();
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let accent = t.accent().hsla();
-        let border = t.chrome_border().hsla();
+        let tokens = *cx.ui_theme();
         let decorations = window.window_decorations();
         // Windows always shows Brindle's own caption (see `window_control_area`
         // below); GPUI reports server decorations there.
         let csd = matches!(decorations, Decorations::Client { .. }) || cfg!(windows);
 
-        let status_color = |state: State| match state {
-            State::Blocked => t.ansi[3].hsla(),
-            State::Error => t.ansi[1].hsla(),
-            State::Done => t.ansi[2].hsla(),
-            State::Working | State::Idle => muted,
-        };
-        let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
-            let active = ix == self.active;
-            let title = tab.title.clone();
-            let bell = tab.bell;
-            let status = tab.status.map(status_color);
-            let tmux = tab.is_tmux();
-            let dragged = DraggedTab { id: tab.id, title: title.clone(), theme: theme.clone() };
-            div()
-                .id(("tab", tab.id as usize))
-                .group("tab")
-                .relative()
-                .flex()
-                .flex_shrink()
-                .min_w(px(80.0))
-                .max_w(px(240.0))
-                .h(px(TAB_BAR_HEIGHT - 8.0))
-                .items_center()
-                .gap_1p5()
-                .pl_3()
-                .pr_1()
-                .rounded_t_md()
-                .text_sm()
-                .cursor(CursorStyle::Arrow)
-                .when(active, |d| d.bg(t.background.hsla()).text_color(fg))
-                .when(!active, |d| d.text_color(muted).hover(|d| d.bg(t.hover_background().hsla())))
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                    this.activate(ix, window, cx);
-                    cx.stop_propagation();
-                }))
-                .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
-                    this.close_tab_at(ix, window, cx);
-                    cx.stop_propagation();
-                }))
-                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(accent))
-                .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| this.drop_tab(dragged, ix, cx)))
-                .when(active, |d| {
-                    d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).rounded_t_md().bg(accent))
-                })
-                .when(tmux, |d| {
-                    d.child(div().text_xs().text_color(accent).child("⧉"))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(title),
-                )
-                .when_some(status, |d, color| d.child(div().size(px(6.0)).rounded_full().bg(color)))
-                .when(bell, |d| d.child(div().size(px(6.0)).rounded_full().bg(accent)))
-                .child(
-                    div()
-                        .id(("close", ix))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.0))
-                        .rounded_sm()
-                        .text_color(muted)
-                        .when(!active, |d| d.invisible().group_hover("tab", |d| d.visible()))
-                        .hover(|d| d.bg(t.hover_background().mix(t.foreground, 0.1).hsla()).text_color(fg))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, window, cx| this.close_tab_at(ix, window, cx)))
-                        .child("×"),
-                )
-        });
+        // Status dots take the global theme's ANSI colours (the previewed
+        // theme's while the settings dialog shows one), not the tab's;
+        // working is the muted foreground.
+        let global = Settings::chrome_theme(cx).clone();
+        let status_color = |state: State| global.status_color(state, tokens.muted_foreground);
+        let dot = |color: Hsla| div().flex_none().size(px(6.0)).rounded_full().bg(color);
 
-        let face = |id: &'static str, label: &'static str| {
+        // A tooltip naming a control and the key bound to its action in this
+        // window, looked up when the tooltip is shown (a rebound key shows
+        // correctly, and a render pays only for the closure).
+        let focus = self.focus_handle.clone();
+        let tip = move |label: &'static str, action: Box<dyn Action>| {
+            let (focus, action): (FocusHandle, Rc<dyn Action>) = (focus.clone(), Rc::from(action));
+            move |window: &mut Window, _: &mut App| Tooltip::new(label).shortcut_opt(shortcut(&*action, &focus, window))
+        };
+        let close_tip = tip("Close tab", Box::new(CloseTab));
+
+        let triggers: Vec<TabTrigger> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let (surface, text) = tab.face_colors(cx);
+                let mut trigger = TabTrigger::new(("tab", tab.id as usize), tab.title.clone())
+                    .closable(true)
+                    .close_tooltip(close_tip.clone())
+                    .surface(surface)
+                    .text_color(text);
+                if tab.is_tmux() {
+                    // In the face's text colour, as its label.
+                    trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
+                }
+                if let Some(state) = tab.status {
+                    trigger = trigger.adornment(dot(status_color(state)));
+                }
+                if tab.bell {
+                    trigger = trigger.adornment(dot(tokens.primary));
+                }
+                trigger
+            })
+            .collect();
+        let list = TabList::new("tabs")
+            .active(self.active)
+            .children(triggers)
+            .focus(&self.strip_focus)
+            .trigger_width(TabWidth::new(rems(5.), rems(15.)))
+            .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
+            .on_close(cx.listener(|this, ix: &usize, window, cx| this.close_tab_at(*ix, window, cx)))
+            .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_tab_to(request.from, request.to, cx)))
+            // A right-click on a tab opens its menu at the pointer; the press
+            // goes no further, so the strip's window menu doesn't open too.
+            // (On Windows a tab isn't a caption area: only the empty
+            // `caption` element is, so the system menu doesn't open either.)
+            .on_context_menu(cx.listener(|this, request: &TabContextMenu, window, cx| {
+                this.open_tab_menu_at(request.index, request.event.position, Some(&request.event), window, cx)
+            }))
+            .on_trigger_bounds({
+                let tab_bounds = self.tab_bounds.clone();
+                move |bounds, _, _| {
+                    let mut recorded = tab_bounds.borrow_mut();
+                    recorded.clear();
+                    recorded.extend_from_slice(bounds);
+                }
+            })
+            .flex_shrink()
+            .min_w_0()
+            .overflow_hidden();
+
+        // A press on a strip button stops here: it doesn't start a window
+        // move (the strip's own press handler, below) and moves focus
+        // nowhere (a `Button` without a handle lets a press bubble to the
+        // workspace, which tracks focus).
+        let inert = |id: &'static str, control: AnyElement| {
+            div()
+                .id(id)
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(control)
+        };
+        let new_tab = strip_button("new-tab", Icon::Plus, tokens.muted_foreground)
+            .tooltip_with(tip("New tab", Box::new(NewTab)))
+            .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)));
+        // `⌄` is the profile menu's trigger: the dropdown opens on the
+        // press. The capture phase runs before the dropdown's own handler,
+        // so the items it opens with are the picker's rows as they are now.
+        // While the menu is open its cover takes the press, which closes it.
+        let profiles = inert("profiles-press", self.profile_menu.clone().into_any_element()).capture_any_mouse_down(
+            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Left {
+                    this.refresh_profile_menu(window, cx);
+                }
+            }),
+        );
+
+        // The caption buttons stay hand-built faces, in the strip buttons'
+        // ghost `IconSm` size and hover colours, drawing icons at the same
+        // legible stroke rather than text glyphs (which fall back to
+        // whatever font the platform picks). On Windows the marked areas are
+        // native caption buttons: Windows acts on them (and shows Snap
+        // Layouts on maximize), but only on a press Brindle leaves
+        // unhandled, so they get no handlers there.
+        let caption = button_style(ButtonVariant::Ghost, ButtonSize::IconSm, &tokens);
+        let face = move |id: &'static str, icon: Icon| {
             div()
                 .id(id)
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(px(26.0))
-                .rounded_md()
-                .text_color(muted)
+                .h(caption.height)
+                .w(caption.width.unwrap_or(caption.height))
+                .rounded(caption.radius)
+                .text_color(tokens.muted_foreground)
                 .cursor(CursorStyle::Arrow)
-                .hover(|d| d.bg(t.hover_background().hsla()).text_color(fg))
-                .child(label)
+                .hover(move |mut s| {
+                    s = s.text_color(caption.hover_foreground);
+                    if let Some(background) = caption.hover_background {
+                        s = s.bg(background);
+                    }
+                    s
+                })
+                .child(icon.size(caption.icon_size).min_stroke(LEGIBLE_ICON_STROKE))
         };
-        let button = |id, label| face(id, label).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-
-        // On Windows the marked areas are native caption buttons: Windows
-        // acts on them (and shows Snap Layouts on maximize), but only on a
-        // press Brindle leaves unhandled, so they get no handlers there.
-        let control = |id, label, area, action: fn(&mut Window, &mut App)| {
+        let control = |id, icon, area, action: fn(&mut Window, &mut App)| {
             if cfg!(windows) {
-                face(id, label).window_control_area(area)
+                face(id, icon).window_control_area(area)
             } else {
-                button(id, label).on_click(move |_, window, cx| action(window, cx))
+                face(id, icon)
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_click(move |_, window, cx| action(window, cx))
             }
         };
         let window_controls = csd.then(|| {
             let controls = window.window_controls();
-            let maximize = if window.is_maximized() { "❐" } else { "□" };
+            let maximize = if window.is_maximized() { Icon::Copy } else { Icon::Square };
             div()
                 .flex()
                 .flex_none()
@@ -2161,12 +2419,14 @@ impl Workspace {
                 .gap_1()
                 .pr_2()
                 .when(controls.minimize, |d| {
-                    d.child(control("minimize", "–", WindowControlArea::Min, |window, _| window.minimize_window()))
+                    d.child(control("minimize", Icon::Minus, WindowControlArea::Min, |window, _| window.minimize_window()))
                 })
                 .when(controls.maximize, |d| {
                     d.child(control("maximize", maximize, WindowControlArea::Max, |window, _| window.zoom_window()))
                 })
-                .child(control("close-window", "×", WindowControlArea::Close, |window, cx| window.dispatch_action(Box::new(CloseWindow), cx)))
+                .child(control("close-window", Icon::X, WindowControlArea::Close, |window, cx| {
+                    window.dispatch_action(Box::new(CloseWindow), cx)
+                }))
         });
 
         div()
@@ -2177,9 +2437,9 @@ impl Workspace {
             .h(px(TAB_BAR_HEIGHT))
             .pl_2()
             .gap_0p5()
-            .bg(chrome.hsla())
+            .bg(tokens.background)
             .border_b_1()
-            .border_color(border)
+            .border_color(tokens.border)
             // On Windows, Windows acts on caption presses only when Brindle
             // leaves them unhandled, and GPUI counts a press as handled when
             // it moves focus, which it does for any focusable element under
@@ -2198,21 +2458,27 @@ impl Workspace {
                 })
                 .on_mouse_down(MouseButton::Right, |e, window, _| window.show_window_menu(e.position))
             })
-            .child(div().flex().flex_shrink().min_w_0().items_end().gap_0p5().overflow_hidden().children(tabs))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink()
+                    .min_w_0()
+                    .items_end()
+                    // Enter and escape while the strip has focus go back to
+                    // the terminal; the list has already taken its own keys.
+                    .on_key_down(cx.listener(Self::strip_key_down))
+                    .child(list),
+            )
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
-                    .h(px(TAB_BAR_HEIGHT - 4.0))
+                    .h_full()
                     .gap_0p5()
                     .pl_1()
-                    .child(button("new-tab", "+").on_click(cx.listener(|this, _, window, cx| {
-                        this.new_tab(&NewTab, window, cx)
-                    })))
-                    .child(button("profiles", "⌄").on_click(cx.listener(|this, _, window, cx| {
-                        this.open_profile_picker(&OpenProfilePicker, window, cx)
-                    }))),
+                    .child(inert("new-tab-press", new_tab.into_any_element()))
+                    .child(profiles),
             )
             // Windows hit-tests this as the caption: drag, double-click,
             // the system menu and Snap. Only empty space is marked, since a
@@ -2230,6 +2496,26 @@ impl Workspace {
     }
 }
 
+
+/// Moves `items[from]` to `to`'s place: after it when it came from the
+/// left (the items between move left), before it when it came from the
+/// right, which is where a tab dropped on another lands. False, moving
+/// nothing, for a drop on itself or an index out of range.
+fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
+/// Whether a key pressed while the tab strip has focus sends focus back to
+/// the active tab's terminal: enter or escape with no modifier held. The
+/// tab list itself takes the arrows, home and end.
+fn returns_from_strip(key: &str, modifiers: Modifiers) -> bool {
+    !modifiers.modified() && matches!(key, "enter" | "escape")
+}
 
 /// Trims a submitted `Rename Tab` value: a non-empty string sets a manual
 /// title, and an empty one clears it.
@@ -2303,7 +2589,138 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
     if near(outer) && near(inner) { known } else { inner }
 }
 
-/// The keys that run `action` in the element `focus`, as the palettes show them.
+/// The profiles as the profile picker and the profile menu list them, in
+/// configuration order: each one's name, what it runs and the keys bound to
+/// opening it (`shortcut(ix)`, the keymap's ctrl-alt-N for the first nine).
+/// A control-mode profile whose session the window shows (`open`) adds
+/// " · open in this window", since choosing it activates that tab.
+fn profile_rows(
+    profiles: &[Profile],
+    open: &[SessionKey],
+    shortcut: impl Fn(usize) -> Option<SharedString>,
+) -> Vec<PaletteRow> {
+    profiles
+        .iter()
+        .enumerate()
+        .map(|(ix, profile)| {
+            let shown = SessionKey::for_profile(profile).is_some_and(|key| open.contains(&key));
+            let state = if shown { " · open in this window" } else { "" };
+            PaletteRow {
+                label: profile.name.clone().into(),
+                detail: Some(format!("{}{state}", profile.description()).into()),
+                shortcut: shortcut(ix),
+            }
+        })
+        .collect()
+}
+
+/// The profile menu's items: the picker's rows, the description under the
+/// name and the keys at the right. There are no separators, so an item's
+/// index is its profile's.
+fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
+    rows.into_iter()
+        .map(|row| MenuItem { label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into())
+        .collect()
+}
+
+/// The menu of tab `ix` of `count`: Rename Tab (a tmux tab's is tmux's
+/// Rename Window, shown as "Rename Window"), Move Tab Left (disabled on the
+/// first tab), Move Tab Right (disabled on the last), a separator and Close
+/// Tab, which on a tmux tab closes that tmux window.
+fn tab_menu_rows(is_tmux: bool, ix: usize, count: usize) -> Vec<ActionRow> {
+    let rename = if is_tmux { ActionRow::item(TmuxRenameWindow, true) } else { ActionRow::item(RenameTab, true) };
+    vec![
+        rename,
+        ActionRow::item(MoveTabLeft, ix > 0),
+        ActionRow::item(MoveTabRight, ix + 1 < count),
+        ActionRow::Separator,
+        ActionRow::item(CloseTab, true),
+    ]
+}
+
+/// One of the strip's buttons (new tab, the profile chevron): a ghost
+/// `IconSm` button in `color` whose 16px icon is stroked at least
+/// [`LEGIBLE_ICON_STROKE`] wide (the spec's "Strip icons are legible").
+fn strip_button(id: &'static str, icon: Icon, color: Hsla) -> Button {
+    Button::icon_only(id, icon)
+        .variant(ButtonVariant::Ghost)
+        .size(ButtonSize::IconSm)
+        .icon_min_stroke(LEGIBLE_ICON_STROKE)
+        .text_color(color)
+}
+
+/// The keys that run `action` in a terminal of a local or tmux tab, as the
+/// keymap resolves them in that terminal's contexts (`Workspace`, then
+/// `ZoneTree` or `TmuxWindow`, then `Terminal`, where user bindings go).
+/// Unlike [`shortcut`] it needs no drawn frame, so a background tab that a
+/// right-click just activated shows its keys.
+fn tab_shortcut(action: &dyn Action, is_tmux: bool, cx: &App) -> Option<SharedString> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    tab_keys(&keymap, action, is_tmux)
+}
+
+/// [`tab_shortcut`] in `keymap`.
+fn tab_keys(keymap: &gpui::Keymap, action: &dyn Action, is_tmux: bool) -> Option<SharedString> {
+    let contexts: Vec<gpui::KeyContext> = ["Workspace", if is_tmux { "TmuxWindow" } else { "ZoneTree" }, "Terminal"]
+        .into_iter()
+        .filter_map(|name| gpui::KeyContext::parse(name).ok())
+        .collect();
+    keymap
+        .bindings_for_action(action)
+        .rev()
+        .find(|binding| {
+            // The binding counts only when its keys reach it there, rather
+            // than another binding of the same keys.
+            let (found, _) = keymap.bindings_for_input(binding.keystrokes(), &contexts);
+            found.first().is_some_and(|first| first.action().partial_eq(binding.action()))
+        })
+        .map(keys_text)
+}
+
+/// The strip's `⌄` button, as the profile menu's trigger builds it each
+/// frame: a strip button with no `on_click` (the dropdown takes the press)
+/// and no focus handle (a press moves focus nowhere), whose tooltip names
+/// the picker's key, looked up in `focus` when it is shown.
+fn profile_menu_trigger(focus: FocusHandle) -> impl Fn(bool, &mut Window, &mut App) -> Button + 'static {
+    move |_open, _, cx| {
+        let focus = focus.clone();
+        strip_button("profiles", Icon::ChevronDown, cx.ui_theme().muted_foreground)
+            .tooltip_with(move |window, _| {
+                Tooltip::new("New tab from profile…").shortcut_opt(shortcut(&OpenProfilePicker, &focus, window))
+            })
+    }
+}
+
+/// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
+/// highlighted=N`, with disabled items in brackets and separators as `-`;
+/// `N` is the highlighted entry's index from 0, separators counted (as
+/// `MenuEvent::Selected` counts), or `none`. Then each item on a line of
+/// its own as the palette prints its rows: `label  description  [keys]`.
+fn describe_menu(entries: &[MenuEntry], highlighted: Option<usize>) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry.item() {
+            None => "-".to_string(),
+            Some(item) if item.disabled => format!("[{}]", item.label),
+            Some(item) => item.label.to_string(),
+        })
+        .collect();
+    let highlighted = highlighted.map_or_else(|| "none".to_string(), |ix| ix.to_string());
+    let mut out = format!("--- menu items={} highlighted={highlighted}\n", items.join("|"));
+    for item in entries.iter().filter_map(MenuEntry::item) {
+        out.push_str(&item.label);
+        if let Some(description) = &item.description {
+            out.push_str(&format!("  {description}"));
+        }
+        if let Some(keys) = &item.shortcut {
+            out.push_str(&format!("  [{keys}]"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The rows of the palette shown after a session that was all the window
 /// showed ended: "Close window", then a new tab with each profile.
 /// Rows for a window whose only session ended. A control-mode profile
@@ -2337,9 +2754,16 @@ fn session_open_rows(profiles: &[Profile], picked: usize, open: &[SessionKey]) -
     rows
 }
 
-fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
+/// The keys that run `action` in the element `focus`, as the palettes show them.
+pub(crate) fn shortcut(action: &dyn Action, focus: &FocusHandle, window: &Window) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in(action, focus)?;
-    Some(binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into())
+    Some(keys_text(&binding))
+}
+
+/// A binding's keystrokes as the keymap prints them (`ctrl-alt-1`), with a
+/// space between strokes.
+fn keys_text(binding: &gpui::KeyBinding) -> SharedString {
+    binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ").into()
 }
 
 /// The command that opens `path` in `$VISUAL`, else `$EDITOR`, else nano,
@@ -2409,6 +2833,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_profile_picker))
+            .on_action(cx.listener(Self::open_profile_menu))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::open_settings))
             .when(Settings::get(cx).config.profiles.iter().any(|p| p.tmux == TmuxMode::Control), |d| {
@@ -2426,6 +2851,8 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::move_tab_left))
                     .on_action(cx.listener(Self::move_tab_right))
                     .on_action(cx.listener(Self::rename_tab))
+                    .on_action(cx.listener(Self::open_tab_menu))
+                    .on_action(cx.listener(Self::focus_tab_strip))
                     .on_action(cx.listener(Self::close_window))
                     .on_action(cx.listener(Self::attach_session))
                     .on_action(cx.listener(Self::increase_font_size))
@@ -2445,7 +2872,7 @@ impl Render for Workspace {
                 Decorations::Client { tiling } => Some(tiling),
                 Decorations::Server => None,
             }, |d, tiling| {
-                d.border_color(theme.chrome_border().hsla())
+                d.border_color(cx.ui_theme().border)
                     .when(!(tiling.top || tiling.left), |d| d.rounded_tl(rounding))
                     .when(!(tiling.top || tiling.right), |d| d.rounded_tr(rounding))
                     .when(!(tiling.bottom || tiling.left), |d| d.rounded_bl(rounding))
@@ -2479,9 +2906,12 @@ impl Render for Workspace {
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
             // Last in the tree, so a modal backdrop paints above the rest
-            // (one of the two is open at most).
+            // (one of the two is open at most; the profile menu is drawn
+            // deferred from the strip, and only while neither is open).
             .children(self.palette.render(window, cx))
-            .children(self.settings.render(window, cx));
+            .children(self.settings.render(window, cx))
+            // The tab and zone menus: drawn deferred, taking no room here.
+            .child(self.context_menu.clone());
 
         // With client-side decorations we draw a transparent margin around the
         // window for the shadow and the resize handles.
@@ -2560,6 +2990,36 @@ mod tests {
         assert_eq!(PaletteTag::of(&PaletteKind::Sessions { sessions: Vec::new() }), PaletteTag::Sessions);
     }
 
+    /// The spec's drag scenario: the first tab dropped on the third lands in
+    /// the third place; one dropped from the right lands before its target;
+    /// a drop on itself or out of range moves nothing.
+    #[test]
+    fn reorder_puts_the_moved_item_in_the_targets_place() {
+        let mut items = vec!['a', 'b', 'c', 'd'];
+        assert!(reorder(&mut items, 0, 2));
+        assert_eq!(items, ['b', 'c', 'a', 'd']);
+        assert!(reorder(&mut items, 3, 1));
+        assert_eq!(items, ['b', 'd', 'c', 'a']);
+        assert!(!reorder(&mut items, 2, 2));
+        assert!(!reorder(&mut items, 4, 0));
+        assert!(!reorder(&mut items, 0, 4));
+        assert_eq!(items, ['b', 'd', 'c', 'a']);
+    }
+
+    /// Enter and escape alone leave the strip; the list's own keys, tab
+    /// (the focus scope's) and modified keys don't.
+    #[test]
+    fn enter_and_escape_leave_the_strip() {
+        let none = Modifiers::default();
+        assert!(returns_from_strip("enter", none));
+        assert!(returns_from_strip("escape", none));
+        for key in ["left", "right", "home", "end", "pageup", "pagedown", "tab", "space", "a"] {
+            assert!(!returns_from_strip(key, none), "{key}");
+        }
+        assert!(!returns_from_strip("enter", Modifiers::shift()));
+        assert!(!returns_from_strip("escape", Modifiers::control()));
+    }
+
     /// The sessions palette says "No detached sessions" only when there
     /// are none; a filter that matches none of several gets the command
     /// list's own empty message.
@@ -2610,6 +3070,151 @@ mod tests {
         let rows = session_open_rows(&config.profiles, 0, &open);
         let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
         assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: classic"]);
+    }
+
+    /// The keys `shortcut` shows for `action` in a local tab's terminal with
+    /// the default keymap: the last binding that matches there and isn't
+    /// shadowed, as gpui's `highest_precedence_binding_for_action_in` finds it.
+    fn default_keys(keymap: &gpui::Keymap, action: &dyn Action) -> Option<SharedString> {
+        let contexts: Vec<gpui::KeyContext> =
+            ["Workspace", "ZoneTree", "Terminal"].iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+        keymap
+            .bindings_for_action(action)
+            .rev()
+            .find(|binding| {
+                let (found, _) = keymap.bindings_for_input(binding.keystrokes(), &contexts);
+                found.first().is_some_and(|f| f.action().partial_eq(binding.action()))
+            })
+            .map(keys_text)
+    }
+
+    fn text(s: &Option<SharedString>) -> Option<&str> {
+        s.as_ref().map(|s| s.as_ref())
+    }
+
+    /// The picker's rows and the menu's items: names in configuration
+    /// order, what each runs (a control-mode profile names its session, and
+    /// says so when the window shows it) and ctrl-alt-N from the keymap.
+    #[test]
+    fn profile_rows_and_menu_items_match_the_picker() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\ncommand = \"bash\"\n\
+             [[profiles]]\nname = \"tmux\"\ntmux = \"control\"\ntmux_session = \"main\"\n\
+             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n",
+        )
+        .unwrap();
+        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
+        let open = [SessionKey::for_profile(&config.profiles[1]).unwrap()];
+        let build = || profile_rows(&config.profiles, &open, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));
+        let rows = build();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
+        assert_eq!(labels, ["Shell", "tmux", "work"]);
+        assert_eq!(text(&rows[0].detail), Some(config.profiles[0].description().as_str()));
+        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main · open in this window"));
+        assert_eq!(text(&rows[2].detail), Some("tmux control mode · work"));
+        let keys: Vec<Option<&str>> = rows.iter().map(|r| text(&r.shortcut)).collect();
+        assert_eq!(keys, [Some("ctrl-alt-1"), Some("ctrl-alt-2"), Some("ctrl-alt-3")]);
+
+        // One item per row, in the same order, with nothing between them, so
+        // `MenuEvent::Selected(ix)` is profile `ix`.
+        let entries = profile_menu_entries(build());
+        assert_eq!(entries.len(), rows.len());
+        for (entry, row) in entries.iter().zip(&rows) {
+            let item = entry.item().expect("a separator in the profile menu");
+            assert_eq!(item.label, row.label);
+            assert_eq!(item.description, row.detail);
+            assert_eq!(item.shortcut, row.shortcut);
+            assert!(!item.disabled);
+        }
+
+        // Nothing open: no profile says "open in this window".
+        let rows = profile_rows(&config.profiles, &[], |_| None);
+        assert!(rows.iter().all(|r| !r.detail.as_ref().is_some_and(|d| d.contains("open in"))));
+        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main"));
+    }
+
+    /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth
+    /// and eleventh are listed with no keys.
+    #[test]
+    fn only_the_first_nine_profiles_have_keys() {
+        let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
+        let config = Config::parse(&toml).unwrap();
+        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
+        let entries = profile_menu_entries(profile_rows(&config.profiles, &[], |ix| {
+            default_keys(&keymap, &NewTabWithProfile(ix))
+        }));
+        assert_eq!(entries.len(), 11);
+        for (ix, entry) in entries.iter().enumerate() {
+            let item = entry.item().unwrap();
+            assert_eq!(item.label.as_ref(), format!("p{}", ix + 1));
+            let want = (ix < 9).then(|| format!("ctrl-alt-{}", ix + 1));
+            assert_eq!(text(&item.shortcut), want.as_deref(), "profile {}", ix + 1);
+        }
+    }
+
+    #[test]
+    fn menus_dump_their_items_and_highlight() {
+        let entries = vec![
+            MenuItem::new("Shell").description("bash").shortcut("ctrl-alt-1").into(),
+            MenuItem::new("Off").disabled(true).into(),
+            MenuEntry::Separator,
+            MenuItem::new("tmux").into(),
+        ];
+        assert_eq!(
+            describe_menu(&entries, None),
+            "--- menu items=Shell|[Off]|-|tmux highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\ntmux\n"
+        );
+        assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|tmux highlighted=3\n"));
+    }
+
+    /// The first line `--- menu` prints for the menu of tab `ix` of `count`,
+    /// with the default keys.
+    fn tab_menu_line(is_tmux: bool, ix: usize, count: usize) -> String {
+        let keymap = gpui::Keymap::new(default_bindings());
+        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, count), |action| tab_keys(&keymap, action, is_tmux));
+        describe_menu(&menu.entries, None)
+    }
+
+    /// The spec's tab menu: Move Tab Left disabled on the first tab, Move
+    /// Tab Right on the last (both on a lone tab), a tmux tab's Rename
+    /// Window in place of Rename Tab, and each item's default key. The menu
+    /// of the third of four tabs has both moves enabled.
+    #[test]
+    fn tab_menu_items() {
+        assert_eq!(
+            tab_menu_line(false, 0, 3),
+            "--- menu items=Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab highlighted=none\n\
+             Rename Tab\nMove Tab Left  [ctrl-shift-pageup]\nMove Tab Right  [ctrl-shift-pagedown]\n\
+             Close Tab  [ctrl-shift-w]\n"
+        );
+        assert!(tab_menu_line(false, 2, 4).starts_with("--- menu items=Rename Tab|Move Tab Left|Move Tab Right|-|Close Tab "));
+        assert!(tab_menu_line(false, 2, 3).starts_with("--- menu items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "));
+        assert!(
+            tab_menu_line(false, 0, 1).starts_with("--- menu items=Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab ")
+        );
+        assert!(tab_menu_line(true, 1, 3).starts_with("--- menu items=Rename Window|Move Tab Left|Move Tab Right|-|Close Tab "));
+        let tmux = ActionMenu::new(tab_menu_rows(true, 0, 2), |_| None);
+        assert!(tmux.action(0).is_some_and(|a| a.partial_eq(&TmuxRenameWindow)));
+        assert!(tmux.action(1).is_none(), "Move Tab Left on the first tab runs nothing");
+        assert!(tmux.action(4).is_some_and(|a| a.partial_eq(&CloseTab)));
+    }
+
+    /// A tab menu's keys come from the keymap for the tab's own contexts,
+    /// so a binding in the `Terminal` context (where user bindings go) shows,
+    /// a binding only another context has doesn't, and a key that a later
+    /// binding takes for something else isn't shown for the earlier one.
+    #[test]
+    fn tab_menu_keys_follow_the_tab_contexts() {
+        let mut bindings = default_bindings();
+        bindings.push(gpui::KeyBinding::new("f2", RenameTab, Some("Terminal")));
+        bindings.push(gpui::KeyBinding::new("f3", TmuxRenameWindow, Some("TmuxWindow")));
+        bindings.push(gpui::KeyBinding::new("ctrl-shift-w", Swallow, Some("Terminal")));
+        let keymap = gpui::Keymap::new(bindings);
+        assert_eq!(tab_keys(&keymap, &RenameTab, false), Some("f2".into()));
+        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, true), Some("f3".into()));
+        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, false), None);
+        assert_eq!(tab_keys(&keymap, &CloseTab, false), None);
+        assert_eq!(tab_keys(&keymap, &MoveTabLeft, true), Some("ctrl-shift-pageup".into()));
     }
 
     #[test]

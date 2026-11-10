@@ -33,11 +33,19 @@
 pub mod button;
 pub mod checkbox;
 pub mod command;
+pub mod context_menu;
 pub mod dialog;
+pub mod dropdown_menu;
 pub mod input;
+pub mod kbd;
+pub mod menu;
 pub mod popover;
 pub mod select;
+pub mod separator;
 pub mod switch;
+pub mod tabs;
+pub mod toggle;
+pub mod tooltip;
 
 use std::rc::Rc;
 
@@ -52,14 +60,27 @@ use crate::style::ring_geometry;
 pub use button::Button;
 pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
+pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};
+pub use dropdown_menu::{DropdownMenu, trigger_key_opens};
 pub use input::Input;
+pub use kbd::{Kbd, KbdStyle, kbd_style, keycaps};
+pub use menu::{
+    Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuNav, MenuPress, menu_item_release, menu_overlay, render_menu,
+};
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
     Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,
     TypedKey, closed_trigger_key, initial_highlight, menu_release, moved_off, trigger_activation, typed_key,
 };
+pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
+pub use tabs::{
+    DraggedTab, DropSide, TabActivate, TabContextMenu, TabKey, TabList, TabMove, TabTrigger, TriggerPress, drop_side,
+    tab_key, tab_target, trigger_label, trigger_press,
+};
+pub use toggle::Toggle;
+pub use tooltip::{Tooltip, TooltipFor, TooltipView};
 
 /// shadcn's `disabled:opacity-50`.
 pub const DISABLED_OPACITY: f32 = 0.5;

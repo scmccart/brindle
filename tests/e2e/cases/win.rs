@@ -173,22 +173,29 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// (maximizing) and a press on maximize (restoring), which it does only when
 /// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels: the strip is 38 high; the buttons are 26 wide, 4 apart,
-    // 8 from the right edge, and centered in it; tabs sit at the bottom.
+    // Logical pixels: the strip is 37 high (the 36px pill tab list and a
+    // 1px border); the caption buttons are 32 wide (the `IconSm` button
+    // size), 4 apart, 8 from the right edge, and centered in the list's
+    // 36px, so empty space ends 112 from the right. Tabs are 3 below the
+    // top, 30 high, 11 in (the strip's and the pill's padding), at least 80
+    // wide (a `cmd` tab is exactly that), with the pill's 3px after the
+    // last; the new-tab button is 4 past the pill, 32 wide.
     let points = [
-        ("close", -(8.0 + 13.0), 19.0),
-        ("max", -(8.0 + 26.0 + 4.0 + 13.0), 19.0),
-        ("min", -(8.0 + 2.0 * (26.0 + 4.0) + 13.0), 19.0),
-        ("strip", -(8.0 + 3.0 * 26.0 + 2.0 * 4.0 + 60.0), 19.0),
-        ("tab", 48.0, 23.0),
+        ("close", -(8.0 + 16.0), 18.0),
+        ("max", -(8.0 + 32.0 + 4.0 + 16.0), 18.0),
+        ("min", -(8.0 + 2.0 * (32.0 + 4.0) + 16.0), 18.0),
+        ("strip", -(8.0 + 3.0 * 32.0 + 2.0 * 4.0 + 60.0), 18.0),
+        ("tab", 48.0, 18.0),
+        // The new-tab button: client area, a press on it is Brindle's.
+        ("new-tab", 8.0 + 3.0 + 80.0 + 3.0 + 4.0 + 16.0, 18.0),
     ];
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
     let probe = move |pid| caption_probe(pid, scale, &points);
     let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some((2.5, &probe)))?;
-    // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT.
-    let expected = "close=20 max=9 min=8 strip=2 tab=1 double-click=maximized maximize=windowed";
+    // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT, HTCLIENT.
+    let expected = "close=20 max=9 min=8 strip=2 tab=1 new-tab=1 double-click=maximized maximize=windowed";
     ensure!(ran.during == expected, "caption at scale {scale}: {} (want {expected})", ran.during);
     Ok(Outcome::Pass)
 }

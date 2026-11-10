@@ -868,7 +868,13 @@ mod tests {
     #[test]
     fn debug_options_make_a_debug_run() {
         assert!(!parse(&["-p", "tmux", "-e", "htop"]).is_debug_run());
-        for args in [&["--send", "x"][..], &["--action", "new_tab"], &["--dump-screen-after", "2"], &["--latency-bench", "5"]] {
+        for args in [
+            &["--send", "x"][..],
+            &["--action", "new_tab"],
+            &["--dump-screen-after", "2"],
+            &["--latency-bench", "5"],
+            &["--modality", "pointer"],
+        ] {
             assert!(parse(args).is_debug_run(), "{args:?}");
         }
     }

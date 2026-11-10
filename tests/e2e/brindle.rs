@@ -41,6 +41,23 @@ pub mod theme {
     pub const BLUE: Rgb = ANSI[4];
     pub const MAGENTA: Rgb = ANSI[5];
 
+    /// The window chrome's `background` token for the `e2e` theme: its
+    /// background mixed 35% towards black (`Theme::ui_tokens`), which the
+    /// tab strip is drawn in.
+    pub const CHROME_BACKGROUND: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    /// The `muted` token for the `e2e` theme, the tab list's pill: the same
+    /// surface as `secondary` (`Theme::ui_tokens`).
+    pub const CHROME_MUTED: Rgb = CHROME_SECONDARY;
+    /// The `border` token for the `e2e` theme: its background mixed 12%
+    /// towards its foreground, which zone headers and dividers are drawn in.
+    pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
+    /// The `secondary` token for the `e2e` theme: `CHROME_BACKGROUND` mixed
+    /// 8% towards the foreground, which tmux's zoomed badge is drawn on.
+    pub const CHROME_SECONDARY: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    /// A tmux divider with no border style: `CHROME_BORDER` mixed 15%
+    /// towards the foreground token.
+    pub const TMUX_DIVIDER: Rgb = Rgb(0x3c, 0x40, 0x42);
+
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
     pub const SEARCH_MATCH_FG: Rgb = Rgb(0xf0, 0xf0, 0xf0);
@@ -609,6 +626,10 @@ pub struct Dump {
     pub settings: Option<String>,
     /// The palette's lines (its header first), when it is open.
     pub palette: Vec<String>,
+    /// An open menu's lines, when one is open: its header without the
+    /// prefix (`items=A|[B]|-|C highlighted=N|none`), then one line per item
+    /// (`label  description  [keys]`).
+    pub menu: Vec<String>,
     /// The focused text input, in a palette, the settings dialog or the
     /// find bar.
     pub input: Option<Input>,
@@ -624,7 +645,7 @@ pub struct Dump {
     /// The active terminal's find bar line, when it is open.
     pub find: Option<String>,
     /// Where keyboard focus is (`--- focus`): `terminal`, `palette`,
-    /// `settings`, `none` or `other`.
+    /// `settings`, `tabs` (the tab strip), `menu`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
     /// `list`, `session_end`, `close`, a field's or a button's label.
@@ -685,6 +706,9 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- palette ") {
                 dump.palette.push(rest.to_string());
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- menu ") {
+                dump.menu.push(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- input ") {
                 dump.input = parse_input(rest);
                 in_screen = false;
@@ -700,6 +724,8 @@ impl Dump {
                 in_screen = false;
             } else if !dump.palette.is_empty() && dump.input.is_none() && !in_screen {
                 dump.palette.push(line.to_string());
+            } else if !dump.menu.is_empty() && dump.input.is_none() && dump.focus.is_none() && !in_screen {
+                dump.menu.push(line.to_string());
             } else if in_screen {
                 screen.push(line);
             }
@@ -860,5 +886,23 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
     ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|tmux highlighted=0\n\
+         Shell  bash  [ctrl-alt-1]\nOff\ntmux  tmux control mode · e2e  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",
+    );
+    ensure!(dump.screen == ["hi"], "screen before the menu {:?}", dump.screen);
+    ensure!(
+        dump.menu
+            == [
+                "items=Shell|[Off]|tmux highlighted=0",
+                "Shell  bash  [ctrl-alt-1]",
+                "Off",
+                "tmux  tmux control mode · e2e  [ctrl-alt-3]"
+            ],
+        "menu {:?}",
+        dump.menu
+    );
+    ensure!(dump.palette.is_empty(), "palette {:?}", dump.palette);
+    ensure!(dump.focus.as_deref() == Some("menu"), "focus after the menu {:?}", dump.focus);
     Ok(())
 }

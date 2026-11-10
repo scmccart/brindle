@@ -3,6 +3,7 @@
 use gpui::{App, Font, FontFallbacks, FontFeatures, Global, Pixels, px};
 
 use crate::config::Config;
+use crate::theme::Theme;
 
 pub struct Settings {
     pub config: Config,
@@ -16,6 +17,11 @@ pub struct Settings {
 }
 
 impl Global for Settings {}
+
+/// See [`Settings::chrome_theme`]; set with the tokens.
+struct ChromeTheme(Theme);
+
+impl Global for ChromeTheme {}
 
 /// Glyph sources tried when the primary font lacks a character.
 const FALLBACK_FAMILIES: &[&str] = &[
@@ -57,9 +63,20 @@ impl Settings {
         Self::set_ui_theme(&theme, cx);
     }
 
-    /// Makes `theme` the active token set (a preview, or the config's theme).
-    pub fn set_ui_theme(theme: &crate::theme::Theme, cx: &mut App) {
+    /// Makes `theme` the active token set (a preview, or the config's theme),
+    /// and the theme chrome takes its status colours from
+    /// ([`Settings::chrome_theme`]).
+    pub fn set_ui_theme(theme: &Theme, cx: &mut App) {
         brindle_ui::UiTheme::set(theme.ui_tokens(), cx);
+        cx.set_global(ChromeTheme(theme.clone()));
+    }
+
+    /// The theme the window chrome's tokens come from: the config's global
+    /// theme, or the one the settings dialog previews. The strip and the
+    /// zone headers draw program status dots in its colours
+    /// ([`Theme::status_color`]), so a tab's own theme never tints them.
+    pub fn chrome_theme(cx: &App) -> &Theme {
+        &cx.global::<ChromeTheme>().0
     }
 
     pub fn get(cx: &App) -> &Self {
@@ -160,12 +177,16 @@ mod tests {
 
             let preview = builtin_theme("brindle-light").unwrap();
             assert_ne!(preview, config_theme);
+            assert_eq!(*Settings::chrome_theme(cx), config_theme);
             Settings::set_ui_theme(&preview, cx);
             assert_eq!(*cx.ui_theme(), preview.ui_tokens());
             assert_ne!(*cx.ui_theme(), before);
+            // Chrome's status colours follow the preview too.
+            assert_eq!(*Settings::chrome_theme(cx), preview);
 
             Settings::apply_ui_theme(cx);
             assert_eq!(*cx.ui_theme(), before);
+            assert_eq!(*Settings::chrome_theme(cx), config_theme);
         });
     }
 }

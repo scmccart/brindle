@@ -10,11 +10,21 @@
 //!
 //! gpui's own `anchored` knows only corners: it can't centre a box on its
 //! trigger or shift it along one axis, which is why the crate has its own.
+//!
+//! [`available_height`] is how tall a box may be and still fit on one side
+//! of its trigger: a menu longer than that is capped there and scrolls.
 
 use gpui::{
     AnyElement, App, Bounds, Display, Div, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, ParentElement, Pixels, Point, Position, Size, Style, Window, div, point, px,
 };
+
+/// The gap [`Anchored`] leaves between a trigger and its box by default,
+/// shadcn's `sideOffset={4}`.
+pub const SIDE_OFFSET: Pixels = px(4.);
+
+/// The least distance [`Anchored`] keeps from the window's edges by default.
+pub const EDGE_MARGIN: Pixels = px(8.);
 
 /// The side of the trigger a box is placed on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -80,6 +90,26 @@ pub fn place(
     let fits = |side| fits(at(side), size, viewport, margin, side);
     let side = if fits(side) || !fits(side.opposite()) { side } else { side.opposite() };
     Placement { origin: clamp(at(side), size, viewport, margin), side }
+}
+
+/// The greatest height a box placed against `trigger` on `side`, `offset`
+/// away, can have and still fit in a viewport `viewport` large less
+/// `margin` at each edge, which is Radix's available height. Above or
+/// below the trigger it is the larger room of the two, so a box capped at
+/// it fits on one of them ([`place`] flips it there) and never covers its
+/// trigger. Beside the trigger it is the viewport's height less the
+/// margins, since [`place`] only shifts a box along that axis. Never
+/// negative.
+pub fn available_height(trigger: Bounds<Pixels>, viewport: Size<Pixels>, side: Side, offset: Pixels, margin: Pixels) -> Pixels {
+    let room = match side {
+        Side::Top | Side::Bottom => {
+            let below = viewport.height - margin - (trigger.bottom() + offset);
+            let above = trigger.top() - offset - margin;
+            below.max(above)
+        }
+        Side::Left | Side::Right => viewport.height - margin * 2.,
+    };
+    room.max(px(0.))
 }
 
 /// The box's corner against the trigger on `side`, before fitting.
@@ -149,8 +179,9 @@ fn union(bounds: impl IntoIterator<Item = Bounds<Pixels>>) -> Option<Bounds<Pixe
 /// there. Its children should carry no margin, which would count towards
 /// the measured size without moving.
 ///
-/// By default the box goes below the trigger, centred, 4px away (shadcn's
-/// `sideOffset`), and stays 8px from the window's edges.
+/// By default the box goes below the trigger, centred, [`SIDE_OFFSET`] (4px,
+/// shadcn's `sideOffset`) away, and stays [`EDGE_MARGIN`] (8px) from the
+/// window's edges.
 pub struct Anchored {
     trigger: Bounds<Pixels>,
     side: Side,
@@ -168,8 +199,8 @@ impl Anchored {
             trigger,
             side: Side::default(),
             align: Align::default(),
-            offset: px(4.),
-            margin: px(8.),
+            offset: SIDE_OFFSET,
+            margin: EDGE_MARGIN,
             children: Vec::new(),
         }
     }
@@ -409,6 +440,80 @@ mod tests {
         let placement =
             place(b(100., 0., 30., 20.), size(px(10.), px(80.)), viewport, Side::Right, Align::End, OFFSET, MARGIN);
         assert_eq!(placement, at(134., 8., Side::Right));
+    }
+
+    /// A context menu's anchor: a zero-size trigger at the pointer, the box
+    /// beside it on the right with no offset, aligned to its start (Radix's
+    /// `side="right" align="start"`).
+    fn at_pointer(x: f32, y: f32, box_size: Size<Pixels>, viewport: Size<Pixels>) -> Placement {
+        place(b(x, y, 0., 0.), box_size, viewport, Side::Right, Align::Start, px(0.), MARGIN)
+    }
+
+    #[test]
+    fn a_zero_size_trigger_puts_the_corner_at_the_point() {
+        let viewport = size(px(500.), px(500.));
+        let menu = size(px(100.), px(80.));
+        assert_eq!(at_pointer(200., 40., menu, viewport), at(200., 40., Side::Right));
+        // Below it, as a dropdown from a point would go.
+        let below = place(b(200., 40., 0., 0.), menu, viewport, Side::Bottom, Align::Start, px(0.), MARGIN);
+        assert_eq!(below, at(200., 40., Side::Bottom));
+    }
+
+    /// Near the right edge the box flips to the left of the point; near
+    /// the bottom it is shifted up to end on the margin and stays right of
+    /// the point; in the corner both.
+    #[test]
+    fn a_zero_size_trigger_flips_and_clamps_at_the_edges() {
+        let viewport = size(px(300.), px(300.));
+        let menu = size(px(100.), px(80.));
+        // Right: 270 + 100 would end past 292, so it ends at the point.
+        assert_eq!(at_pointer(270., 100., menu, viewport), at(170., 100., Side::Left));
+        // Bottom: 260 + 80 would end past 292; clamped to 292 - 80.
+        assert_eq!(at_pointer(50., 260., menu, viewport), at(50., 212., Side::Right));
+        // The corner: flipped left and clamped up.
+        assert_eq!(at_pointer(270., 260., menu, viewport), at(170., 212., Side::Left));
+        // On the bottom side instead, the bottom edge flips and the right
+        // edge clamps.
+        let go = |x, y| place(b(x, y, 0., 0.), menu, viewport, Side::Bottom, Align::Start, px(0.), MARGIN);
+        assert_eq!(go(50., 260.), at(50., 180., Side::Top));
+        assert_eq!(go(270., 100.), at(192., 100., Side::Bottom));
+        // Every placement is inside the viewport less the margin.
+        for (x, y) in [(270., 100.), (50., 260.), (270., 260.), (0., 0.), (300., 300.)] {
+            let placed = at_pointer(x, y, menu, viewport).origin;
+            assert!(placed.x >= MARGIN && placed.x + menu.width <= viewport.width - MARGIN, "{placed:?}");
+            assert!(placed.y >= MARGIN && placed.y + menu.height <= viewport.height - MARGIN, "{placed:?}");
+        }
+    }
+
+    /// A menu taller than the window is capped at the available height and
+    /// then fits: beside a point, the window less its margins; above or
+    /// below a trigger, the larger room of the two, on that side, so it
+    /// never covers the trigger.
+    #[test]
+    fn a_menu_taller_than_the_window_is_limited_to_it() {
+        let viewport = size(px(300.), px(300.));
+        let tall = |height: Pixels| size(px(100.), height);
+        // Beside a point near the bottom: the whole height less the margins.
+        let height = available_height(b(50., 260., 0., 0.), viewport, Side::Right, px(0.), MARGIN);
+        assert_eq!(height, px(284.));
+        assert_eq!(at_pointer(50., 260., tall(height), viewport), at(50., 8., Side::Right));
+        // Below a trigger near the top: the room below (300 - 8 - 64).
+        let trigger = b(20., 40., 50., 20.);
+        let height = available_height(trigger, viewport, Side::Bottom, OFFSET, MARGIN);
+        assert_eq!(height, px(228.));
+        let placed = place(trigger, tall(height), viewport, Side::Bottom, Align::Start, OFFSET, MARGIN);
+        assert_eq!(placed, at(20., 64., Side::Bottom));
+        assert!(placed.origin.y >= trigger.bottom());
+        // Below a trigger near the bottom: the room above, where it flips.
+        let trigger = b(20., 250., 50., 20.);
+        let height = available_height(trigger, viewport, Side::Bottom, OFFSET, MARGIN);
+        assert_eq!(height, px(238.));
+        let placed = place(trigger, tall(height), viewport, Side::Bottom, Align::Start, OFFSET, MARGIN);
+        assert_eq!(placed, at(20., 8., Side::Top));
+        assert!(placed.origin.y + height <= trigger.top());
+        // No room at all is no height, never a negative one.
+        assert_eq!(available_height(b(0., 0., 10., 10.), size(px(10.), px(10.)), Side::Left, OFFSET, MARGIN), px(0.));
+        assert_eq!(available_height(b(0., 0., 10., 10.), size(px(10.), px(10.)), Side::Bottom, OFFSET, MARGIN), px(0.));
     }
 
     #[test]

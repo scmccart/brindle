@@ -6,6 +6,8 @@ use std::fmt;
 use gpui::{Hsla, Rgba};
 use serde::{Deserialize, Deserializer};
 
+use crate::terminal::status::State;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color {
     pub r: u8,
@@ -200,31 +202,45 @@ impl Theme {
         }
     }
 
+    /// A program status dot's colour in window chrome (the strip and zone
+    /// headers draw them from the chrome's theme, not a tab's): yellow for
+    /// blocked, red for error, green for done, and `muted` (the
+    /// muted-foreground token) for working.
+    pub fn status_color(&self, state: State, muted: Hsla) -> Hsla {
+        match state {
+            State::Blocked => self.ansi[3].hsla(),
+            State::Error => self.ansi[1].hsla(),
+            State::Done => self.ansi[2].hsla(),
+            State::Working | State::Idle => muted,
+        }
+    }
+
     pub fn is_dark(&self) -> bool {
         self.background.luminance() < 0.5
     }
 
-    /// Background of the tab strip, slightly offset from the terminal background.
-    pub fn chrome_background(&self) -> Color {
+    /// The chrome's background (the `background` token): the terminal
+    /// background mixed 35% towards black, or white for a light theme.
+    fn chrome_background(&self) -> Color {
         let target = if self.is_dark() { Color::hex(0x000000) } else { Color::hex(0xffffff) };
         self.background.mix(target, 0.35)
     }
 
-    pub fn chrome_border(&self) -> Color {
+    /// The `border` (and `input`) token.
+    fn chrome_border(&self) -> Color {
         self.background.mix(self.foreground, 0.12)
     }
 
-    pub fn muted_foreground(&self) -> Color {
+    /// The `muted_foreground` token, before its legibility adjustment.
+    fn muted_foreground(&self) -> Color {
         self.foreground.mix(self.background, 0.45)
-    }
-
-    pub fn hover_background(&self) -> Color {
-        self.chrome_background().mix(self.foreground, 0.08)
     }
 
     /// The `brindle-ui` token set for this theme: chrome background and
     /// border, the theme's foreground and accent, and its red as destructive.
-    /// Every text/background pair is kept legible (4.5:1, muted 3:1).
+    /// Every text/background pair is kept legible (4.5:1, muted 3:1). The
+    /// tokens are the window chrome's only colour source; the helpers above
+    /// are private inputs to them.
     pub fn ui_tokens(&self) -> brindle_ui::Tokens {
         let bg = self.chrome_background();
         let fg = self.foreground.legible_on(bg, 4.5);
@@ -370,6 +386,19 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Status dots: the theme's yellow, red and green, and the muted colour
+    /// given for working (and idle, which shows no dot).
+    #[test]
+    fn status_colors_come_from_the_ansi_palette() {
+        let theme = builtin_theme("tokyo-night").unwrap();
+        let muted = Color::hex(0x123456).hsla();
+        assert_eq!(theme.status_color(State::Blocked, muted), theme.ansi[3].hsla());
+        assert_eq!(theme.status_color(State::Error, muted), theme.ansi[1].hsla());
+        assert_eq!(theme.status_color(State::Done, muted), theme.ansi[2].hsla());
+        assert_eq!(theme.status_color(State::Working, muted), muted);
+        assert_eq!(theme.status_color(State::Idle, muted), muted);
+    }
 
     #[test]
     fn parse_colors() {

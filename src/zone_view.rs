@@ -1,14 +1,20 @@
 //! A local tab's binary split tree of zones, normalized geometry, and
 //! native GPUI zone chrome.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
+use brindle_ui::{
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenuTarget as _, Icon, Tokens, Tooltip, TooltipFor as _,
+    trigger_label,
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    Size, StatefulInteractiveElement, Styled, Subscription, Window, div, px, size,
+    Action, AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
+    SharedString, Size, Styled, Subscription, Window, div, px, size,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +28,7 @@ use crate::terminal_element::cell_metrics;
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
 use crate::tmux::Direction;
-use crate::workspace::terminal_automatic_title;
+use crate::workspace::{shortcut, terminal_automatic_title};
 
 /// Height of the native zone header bar shown when a tab has 2+ zones.
 pub const ZONE_HEADER_HEIGHT: f32 = 28.0;
@@ -266,6 +272,32 @@ pub fn can_split_zone(
     }
 }
 
+/// A zone header's menu: Split Zone Right, Split Zone Down, a separator and
+/// Close Zone. Each split item is enabled only when the zone can be split
+/// along its axis (`split_right`, `split_down`: [`can_split_zone`] for the
+/// zone's current size); Close Zone always is.
+pub fn zone_menu_rows(split_right: bool, split_down: bool) -> Vec<ActionRow> {
+    vec![
+        ActionRow::item(SplitZoneRight, split_right),
+        ActionRow::item(SplitZoneDown, split_down),
+        ActionRow::Separator,
+        ActionRow::item(CloseZone, true),
+    ]
+}
+
+/// A zone asks its tab's window for its menu: on a secondary press on its
+/// header, or `OpenZoneMenu`. The zone has focus by then, so the items,
+/// which run the zone actions, act on it.
+#[derive(Clone)]
+pub struct ZoneMenuRequest {
+    pub rows: Vec<ActionRow>,
+    /// Where the menu's corner goes, in window coordinates: the pointer, or
+    /// below the header's start.
+    pub at: Point<Pixels>,
+    /// The secondary press that asked, whose release ends the gesture.
+    pub press: Option<MouseDownEvent>,
+}
+
 /// Formats `--dump-screen-after` zone lines when a tab has 2 or more zones,
 /// or returns an empty string for a single-zone tab.
 pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
@@ -317,6 +349,8 @@ pub struct Zone {
 
 pub struct ZoneTreeView {
     pub profile: Profile,
+    /// The tab's theme, for its terminals. The headers and dividers are
+    /// chrome, drawn in the window's tokens (`cx.ui_theme()`) instead.
     pub theme: Theme,
     pub font_size_override: Option<f32>,
     tree: ZoneTree,
@@ -326,9 +360,21 @@ pub struct ZoneTreeView {
     focus_serial: u64,
     shutting_down: bool,
     focus_handle: FocusHandle,
+    /// Where the tree and each zone's header were laid out in the last
+    /// frame, in window coordinates, for placing a menu opened from a key.
+    /// Recorded while the frame is drawn, so without a notify.
+    laid_out: Rc<RefCell<LaidOut>>,
+}
+
+/// See [`ZoneTreeView::laid_out`].
+#[derive(Default)]
+struct LaidOut {
+    tree: Option<Bounds<Pixels>>,
+    headers: HashMap<ZoneId, Bounds<Pixels>>,
 }
 
 impl EventEmitter<TerminalEvent> for ZoneTreeView {}
+impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
 
 impl ZoneTreeView {
     /// Creates a `ZoneTreeView` with a single initial terminal zone.
@@ -352,6 +398,7 @@ impl ZoneTreeView {
             focus_serial: 0,
             shutting_down: false,
             focus_handle: cx.focus_handle(),
+            laid_out: Rc::default(),
         };
         this.insert_terminal_zone(id, terminal, window, cx);
         this
@@ -381,6 +428,7 @@ impl ZoneTreeView {
             focus_serial: 0,
             shutting_down: false,
             focus_handle: cx.focus_handle(),
+            laid_out: Rc::default(),
         };
         for (id, terminal) in terminals {
             this.insert_terminal_zone(id, terminal, window, cx);
@@ -608,20 +656,57 @@ impl ZoneTreeView {
         // and the zone's normalized rectangle.
         let (_, rect) = self.tree.rects().into_iter().find(|(zid, _)| *zid == id)?;
         let win_size = window.inner_window_bounds().get_bounds().size;
-        let content_h = (f32::from(win_size.height) - 38.0).max(0.0);
+        let content_h = (f32::from(win_size.height) - crate::workspace::TAB_BAR_HEIGHT).max(0.0);
         Some(size(px(f32::from(win_size.width) * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
-    pub fn split_zone(&mut self, target: ZoneId, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.zones.contains_key(&target) {
-            return;
-        }
+    /// Whether zone `id` is big enough, at its current size, to split along
+    /// `axis` ([`can_split_zone`]). A zone whose size isn't known yet can.
+    pub fn can_split(&self, id: ZoneId, axis: SplitAxis, window: &Window, cx: &App) -> bool {
         let metrics = cell_metrics(self.font_size_override, window, cx);
         let padding = px(Settings::get(cx).config.padding);
         let has_header = self.zones.len() >= 2;
-        if let Some(zone_size) = self.zone_outer_size(target, window, cx)
-            && !can_split_zone(zone_size, has_header, axis, padding, metrics.cell_width, metrics.line_height)
-        {
+        self.zone_outer_size(id, window, cx).is_none_or(|zone_size| {
+            can_split_zone(zone_size, has_header, axis, padding, metrics.cell_width, metrics.line_height)
+        })
+    }
+
+    /// Focuses zone `id`, then asks the window for its header menu at `at`
+    /// (from the secondary `press`, if one asked), its split items enabled
+    /// as [`ZoneTreeView::can_split`] says. Focus comes first, so the items
+    /// act on this zone.
+    pub fn open_menu(
+        &mut self,
+        id: ZoneId,
+        at: Point<Pixels>,
+        press: Option<MouseDownEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.zones.contains_key(&id) {
+            return;
+        }
+        self.focus_zone(id, window, cx);
+        let rows = zone_menu_rows(
+            self.can_split(id, SplitAxis::Horizontal, window, cx),
+            self.can_split(id, SplitAxis::Vertical, window, cx),
+        );
+        cx.emit(ZoneMenuRequest { rows, at, press });
+    }
+
+    /// Where `OpenZoneMenu` puts the active zone's menu: below the start of
+    /// its header, or, in a tab of one zone (which has no header), at the
+    /// top-left corner of the tab's content. `None` before the first frame.
+    fn menu_anchor(&self) -> Option<Point<Pixels>> {
+        let laid_out = self.laid_out.borrow();
+        match laid_out.headers.get(&self.active) {
+            Some(header) if self.zones.len() >= 2 => Some(header.bottom_left()),
+            _ => laid_out.tree.map(|tree| tree.origin),
+        }
+    }
+
+    pub fn split_zone(&mut self, target: ZoneId, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.zones.contains_key(&target) || !self.can_split(target, axis, window, cx) {
             return;
         }
 
@@ -737,6 +822,14 @@ impl ZoneTreeView {
         self.close_zone_by_id(self.active, window, cx);
     }
 
+    /// `OpenZoneMenu`: the active zone's header menu, below its header (see
+    /// [`ZoneTreeView::menu_anchor`]; before the first frame, at the
+    /// window's top-left).
+    fn open_zone_menu(&mut self, _: &OpenZoneMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.menu_anchor().unwrap_or_default();
+        self.open_menu(self.active, at, None, window, cx);
+    }
+
     fn focus_left(&mut self, _: &FocusZoneLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_direction(Direction::Left, window, cx);
     }
@@ -755,13 +848,16 @@ impl ZoneTreeView {
 
     // ---- rendering --------------------------------------------------------------
 
-    fn render_tree(&self, node: &ZoneTree, cx: &mut Context<Self>) -> AnyElement {
+    /// The split tree under `node`, its chrome (dividers and headers) in the
+    /// window's tokens, which come from the global theme: a tab's own theme
+    /// colours only its terminals.
+    fn render_tree(&self, node: &ZoneTree, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         match node {
-            ZoneTree::Leaf(id) => self.render_leaf(*id, cx),
+            ZoneTree::Leaf(id) => self.render_leaf(*id, tokens, cx),
             ZoneTree::Split { axis, first, second } => {
-                let border = self.theme.chrome_border().hsla();
-                let first_el = self.render_tree(first, cx);
-                let second_el = self.render_tree(second, cx);
+                let border = tokens.border;
+                let first_el = self.render_tree(first, tokens, cx);
+                let second_el = self.render_tree(second, tokens, cx);
                 let divider = match axis {
                     SplitAxis::Horizontal => div().flex_none().w(px(ZONE_DIVIDER_SIZE)).h_full().bg(border),
                     SplitAxis::Vertical => div().flex_none().h(px(ZONE_DIVIDER_SIZE)).w_full().bg(border),
@@ -781,7 +877,9 @@ impl ZoneTreeView {
         }
     }
 
-    fn render_leaf(&self, id: ZoneId, cx: &mut Context<Self>) -> AnyElement {
+    /// Zone `id`: its terminal, under a header when the tab has 2+ zones.
+    /// The header is the zone's first child (see `menu_anchor`).
+    fn render_leaf(&self, id: ZoneId, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let Some(zone) = self.zones.get(&id) else {
             return div().size_full().into_any_element();
         };
@@ -791,38 +889,48 @@ impl ZoneTreeView {
         }
 
         let active = id == self.active;
-        let t = &self.theme;
-        let chrome = t.chrome_background().hsla();
-        let border = t.chrome_border().hsla();
-        let fg = t.foreground.hsla();
-        let muted = t.muted_foreground().hsla();
-        let accent = t.accent().hsla();
-        let hover_bg = t.hover_background().mix(t.foreground, 0.1).hsla();
-
-        let status_color = zone.status.map(|state| match state {
-            State::Blocked => t.ansi[3].hsla(),
-            State::Error => t.ansi[1].hsla(),
-            State::Done => t.ansi[2].hsla(),
-            State::Working | State::Idle => muted,
-        });
+        // Status dots in the chrome theme's colours, like the strip's.
+        let status_color =
+            zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
         let title = zone.title.clone();
 
-        let header_btn = |btn_id: (&'static str, usize), label: &'static str| {
-            div()
-                .id(btn_id)
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(20.0))
-                .rounded_sm()
-                .text_xs()
-                .text_color(muted)
-                .cursor(CursorStyle::Arrow)
-                .hover(move |d| d.bg(hover_bg).text_color(fg))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(label)
+        // A tooltip naming a button and the key bound to its action, looked
+        // up when it is shown. The zone actions are bound in `ZoneTree`, so
+        // the lookup starts at this zone's terminal, which is inside it.
+        let focus = view.read(cx).focus_handle.clone();
+        let tip = |label: &'static str, action: Box<dyn Action>| {
+            let (focus, action): (FocusHandle, Rc<dyn Action>) = (focus.clone(), Rc::from(action));
+            move |window: &mut Window, _: &mut App| Tooltip::new(label).shortcut_opt(shortcut(&*action, &focus, window))
         };
+        let button = |name: &'static str, icon: Icon| {
+            Button::icon_only((name, id.0 as usize), icon)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::IconXs)
+                .text_color(tokens.muted_foreground)
+        };
+        // A press on a header button stops at its wrapper: the header's own
+        // press focuses the zone, and a `Button` without a focus handle
+        // would let the press bubble to the zone tree, which tracks focus
+        // and would take it from the terminal.
+        let inert = |name: &'static str, control: Button| {
+            div()
+                .id((name, id.0 as usize))
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(control)
+        };
+        let split_right = button("zone-split-right", Icon::Columns2)
+            .tooltip_with(tip("Split right", Box::new(SplitZoneRight)))
+            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Horizontal, window, cx)));
+        let split_down = button("zone-split-down", Icon::Rows2)
+            .tooltip_with(tip("Split down", Box::new(SplitZoneDown)))
+            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Vertical, window, cx)));
+        let close = button("zone-close", Icon::X)
+            .tooltip_with(tip("Close zone", Box::new(CloseZone)))
+            .on_click(cx.listener(move |this, _, window, cx| this.close_zone_by_id(id, window, cx)));
 
         let header = div()
             .id(("zone-header", id.0 as usize))
@@ -832,64 +940,50 @@ impl ZoneTreeView {
             .items_center()
             .h(px(ZONE_HEADER_HEIGHT))
             .pl_2p5()
-            .pr_1()
+            .pr_0p5()
             .gap_1p5()
-            .bg(chrome)
+            .bg(tokens.background)
             .border_b_1()
-            .border_color(border)
+            .border_color(tokens.border)
             .text_xs()
+            .text_color(if active { tokens.foreground } else { tokens.muted_foreground })
             .cursor(CursorStyle::Arrow)
-            .when(active, |d| d.text_color(fg))
-            .when(!active, |d| d.text_color(muted))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                 this.focus_zone(id, window, cx);
                 cx.stop_propagation();
             }))
+            // A secondary press focuses the zone and opens its menu at the
+            // pointer; it goes no further and moves focus nowhere else.
+            .on_context_menu(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                this.open_menu(id, event.position, Some(event.clone()), window, cx);
+            }))
             .when(active, |d| {
-                d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(accent))
+                d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(tokens.primary))
             })
             .when_some(status_color, |d, color| {
                 d.child(div().flex_none().size(px(6.0)).rounded_full().bg(color))
             })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(title),
-            )
+            // gpui 0.2.2's `text_ellipsis` on a flex item cuts nothing; the
+            // tab strip's label helper does.
+            .child(trigger_label(title))
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .items_center()
                     .gap_0p5()
-                    .child(
-                        header_btn(("zone-split-right", id.0 as usize), "◫").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.split_zone(id, SplitAxis::Horizontal, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        header_btn(("zone-split-down", id.0 as usize), "⬒").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.split_zone(id, SplitAxis::Vertical, window, cx);
-                            },
-                        )),
-                    )
-                    .child(
-                        header_btn(("zone-close", id.0 as usize), "×").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.close_zone_by_id(id, window, cx);
-                            },
-                        )),
-                    ),
+                    .child(inert("zone-split-right-press", split_right))
+                    .child(inert("zone-split-down-press", split_down))
+                    .child(inert("zone-close-press", close)),
             );
 
+        let laid_out = self.laid_out.clone();
         div()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(header) = bounds.first() {
+                    laid_out.borrow_mut().headers.insert(id, *header);
+                }
+            })
             .id(("zone", id.0 as usize))
             .flex()
             .flex_col()
@@ -906,8 +1000,13 @@ impl ZoneTreeView {
 impl Render for ZoneTreeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tree = self.tree.clone();
-        let content = self.render_tree(&tree, cx);
+        // Headers are recorded again as this frame lays them out.
+        self.laid_out.borrow_mut().headers.clear();
+        let tokens = *cx.ui_theme();
+        let content = self.render_tree(&tree, &tokens, cx);
+        let laid_out = self.laid_out.clone();
         div()
+            .on_children_prepainted(move |bounds, _, _| laid_out.borrow_mut().tree = bounds.first().copied())
             .id("zone-tree")
             .key_context("ZoneTree")
             .track_focus(&self.focus_handle)
@@ -922,6 +1021,7 @@ impl Render for ZoneTreeView {
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::close_active_zone))
+            .on_action(cx.listener(Self::open_zone_menu))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::focus_up))
@@ -1021,6 +1121,35 @@ mod tests {
         assert_eq!(tree.focus_target(z5, Direction::Right), Some(z3));
         // From z1 (center_y = 0.25), moving right goes to z2 (center_y = 0.25).
         assert_eq!(tree.focus_target(z1, Direction::Right), Some(z2));
+    }
+
+    /// The header menu's items, labelled from the actions table, with the
+    /// split items disabled where the zone is too small for them (the
+    /// spec's "Too small to split": both disabled, Close Zone enabled).
+    #[test]
+    fn zone_menu_items() {
+        let shortcut = |action: &dyn gpui::Action| action.partial_eq(&CloseZone).then(|| "ctrl-shift-x".into());
+        let describe = |right, down| {
+            let menu = ActionMenu::new(zone_menu_rows(right, down), shortcut);
+            menu.entries
+                .iter()
+                .map(|e| match e.item() {
+                    None => "-".to_string(),
+                    Some(item) if item.disabled => format!("[{}]", item.label),
+                    Some(item) => item.label.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        assert_eq!(describe(true, true), "Split Zone Right|Split Zone Down|-|Close Zone");
+        assert_eq!(describe(false, true), "[Split Zone Right]|Split Zone Down|-|Close Zone");
+        assert_eq!(describe(true, false), "Split Zone Right|[Split Zone Down]|-|Close Zone");
+        assert_eq!(describe(false, false), "[Split Zone Right]|[Split Zone Down]|-|Close Zone");
+        let menu = ActionMenu::new(zone_menu_rows(true, false), shortcut);
+        assert!(menu.action(0).is_some_and(|a| a.partial_eq(&SplitZoneRight)));
+        assert!(menu.action(1).is_none(), "a disabled split runs nothing");
+        assert!(menu.action(3).is_some_and(|a| a.partial_eq(&CloseZone)));
+        assert_eq!(menu.entries[3].item().and_then(|i| i.shortcut.clone()), Some("ctrl-shift-x".into()));
     }
 
     #[test]

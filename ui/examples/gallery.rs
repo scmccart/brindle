@@ -26,14 +26,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem, Dialog,
-    Dismiss, FocusScope, FocusStops, Icon, Input, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Switch,
-    TextInput, Tokens, UiTheme,
+    ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
+    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
+    MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
+    Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
+    ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, rems, rgb, size,
 };
 
 /// Bounds the gallery records as components paint, by name, for the checks
@@ -45,6 +47,9 @@ type Counts = Rc<RefCell<HashMap<String, usize>>>;
 
 /// What the command hosts (dialog and popover) confirmed, in order.
 type Confirmed = Rc<RefCell<Vec<String>>>;
+
+/// The icon-only button sizes, with their side in rems.
+const ICON_SIZES: [ButtonSize; 3] = [ButtonSize::Icon, ButtonSize::IconSm, ButtonSize::IconXs];
 
 /// The window's size: fixed, so the edge cases know where the edges are.
 const WINDOW_SIZE: gpui::Size<Pixels> = size(px(1000.), px(700.));
@@ -117,6 +122,118 @@ fn shells() -> Vec<SelectOption> {
     vec!["bash".into(), "fish".into(), "foot".into(), SelectOption::new("zsh").disabled(true), "nu".into()]
 }
 
+/// The context menu's entries: a tab's menu, as Brindle's (Move Tab Left
+/// disabled, for the first tab). Enabled items are 0, 2 and 4.
+fn context_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuItem::new("Rename Tab").shortcut("ctrl-shift-r").into(),
+        MenuItem::new("Move Tab Left").disabled(true).into(),
+        MenuItem::new("Move Tab Right").into(),
+        MenuEntry::Separator,
+        MenuItem::new("Close Tab").shortcut("ctrl-shift-w").into(),
+    ]
+}
+
+/// The dropdown's entries: a profile menu, with descriptions under some
+/// labels and `zsh` disabled.
+fn dropdown_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuItem::new("bash").description("the default shell").shortcut("ctrl-alt-1").into(),
+        MenuItem::new("fish").shortcut("ctrl-alt-2").into(),
+        MenuItem::new("tmux").description("tmux control mode · main").shortcut("ctrl-alt-3").into(),
+        MenuItem::new("zsh").description("not installed").disabled(true).into(),
+        MenuEntry::Separator,
+        MenuItem::new("Settings…").into(),
+    ]
+}
+
+/// A menu taller than the window: forty profiles, the first nine with keys.
+fn long_entries() -> Vec<MenuEntry> {
+    (1..=40)
+        .map(|n| {
+            let item = MenuItem::new(format!("Profile {n}"));
+            if n <= 9 { item.shortcut(format!("ctrl-alt-{n}")) } else { item }.into()
+        })
+        .collect()
+}
+
+/// A tab in one of the gallery's tab lists.
+#[derive(Clone, Debug)]
+pub struct DemoTab {
+    /// Its trigger's element id, kept when it moves.
+    pub id: usize,
+    pub label: SharedString,
+    disabled: bool,
+    /// The surface and text colours it is drawn in, active or not, as a
+    /// terminal's background and foreground.
+    colors: Option<(u32, u32)>,
+    /// A leading icon, as a tmux window's marker.
+    icon: bool,
+    /// A status dot in this colour, and a bell dot.
+    status: Option<u32>,
+    bell: bool,
+}
+
+impl DemoTab {
+    fn new(id: usize, label: impl Into<SharedString>) -> Self {
+        Self { id, label: label.into(), disabled: false, colors: None, icon: false, status: None, bell: false }
+    }
+}
+
+/// One of the gallery's tab lists: its tabs and the active one.
+#[derive(Clone, Debug)]
+pub struct TabsDemo {
+    pub tabs: Vec<DemoTab>,
+    pub active: usize,
+}
+
+/// The tab lists as they start, by name:
+/// - `default` (pill): Account, Password (active), Billing (disabled),
+///   Settings;
+/// - `plain`: Overview, Analytics (active), Reports, Notifications;
+/// - `strip`: a tab strip whose tabs close, move and show a tooltip: bash
+///   (active, the spec's `#c0caf5` on `#1a1b26`), a long nvim title
+///   (Solarized light colours, inactive but on its own surface), tmux (a
+///   leading icon, the tokens' colours) and a build with a status dot and
+///   a bell;
+/// - `crowded`: six sessions in a list too narrow for them.
+fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
+    let labelled = |labels: &[&'static str]| -> Vec<DemoTab> {
+        labels.iter().enumerate().map(|(id, label)| DemoTab::new(id, *label)).collect()
+    };
+    let mut pill = labelled(&["Account", "Password", "Billing", "Settings"]);
+    pill[2].disabled = true;
+    let plain = labelled(&["Overview", "Analytics", "Reports", "Notifications"]);
+    let strip = vec![
+        DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
+        DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
+        DemoTab { icon: true, ..DemoTab::new(2, "tmux: main") },
+        DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
+    ];
+    let crowded = (0..6).map(|n| DemoTab::new(n, format!("Session {}", n + 1))).collect();
+    HashMap::from([
+        ("default", TabsDemo { tabs: pill, active: 1 }),
+        ("plain", TabsDemo { tabs: plain, active: 1 }),
+        ("strip", TabsDemo { tabs: strip, active: 0 }),
+        ("crowded", TabsDemo { tabs: crowded, active: 0 }),
+    ])
+}
+
+/// The strip and crowded lists' trigger limits: 5rem to 15rem.
+fn demo_tab_width() -> TabWidth {
+    TabWidth::new(rems(5.), rems(15.))
+}
+
+/// A 6px dot, as a tab's status and bell adornments.
+fn dot(color: Hsla) -> Div {
+    div().flex_none().size(px(6.)).rounded_full().bg(color)
+}
+
+/// The label of entry `ix` of `entries`, for the menu log.
+fn entry_label(entries: &[MenuEntry], ix: usize) -> String {
+    entries.get(ix).map_or_else(|| format!("#{ix}"), |entry| entry.label().to_string())
+}
+
 /// A `div` around `element` that records the element's painted bounds under
 /// `name`, in window coordinates.
 fn recorded(element: impl IntoElement, name: &str, records: &Records) -> Div {
@@ -151,6 +268,8 @@ pub struct Gallery {
     records: Records,
     checked: bool,
     switched: bool,
+    /// Each toggle's pressed state, by name (unpressed when missing).
+    pressed: HashMap<String, bool>,
     name: Entity<TextInput>,
     email: Entity<TextInput>,
     shell: Entity<Select>,
@@ -166,6 +285,16 @@ pub struct Gallery {
     sticky_dialog: Overlay<DemoDialog>,
     command_dialog: Overlay<CommandHost>,
     confirmed: Confirmed,
+    context_menu: Entity<ContextMenu>,
+    dropdown: Entity<DropdownMenu>,
+    long_dropdown: Entity<DropdownMenu>,
+    /// What the menus chose, in order, as `menu:label`.
+    menu_log: Vec<String>,
+    /// The tab lists' tabs and active indices, by list name.
+    tabs: HashMap<&'static str, TabsDemo>,
+    /// What the tab lists asked for, in order: `list:activate:N:pointer`,
+    /// `list:close:N`, `list:move:A->B`, `list:menu:N`.
+    tab_log: Vec<String>,
     /// Each corner popover's panel bounds while it is open.
     corners: [Rc<Cell<Option<Bounds<Pixels>>>>; 4],
     scroll: ScrollHandle,
@@ -183,7 +312,8 @@ impl Gallery {
             [
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
-                "switch-off", "theme",
+                "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger", "tabs-default",
+                "tabs-plain", "tabs-strip",
             ]
             .map(String::from),
         );
@@ -195,7 +325,25 @@ impl Gallery {
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let handles = Self::handle_names().into_iter().map(|name| (name, cx.focus_handle())).collect();
+        let handles: HashMap<String, FocusHandle> =
+            Self::handle_names().into_iter().map(|name| (name, cx.focus_handle())).collect();
+        let context_menu = cx.new(|_| ContextMenu::new());
+        // Triggers with a focus handle, for the keys, and no `on_click`:
+        // the dropdown takes the press and the keys itself.
+        let trigger = |id: &'static str, text: &'static str, handle: FocusHandle| {
+            move |_open: bool, _: &mut Window, _: &mut App| {
+                Button::new(id, text).variant(ButtonVariant::Outline).icon(Icon::ChevronDown).focus(&handle)
+            }
+        };
+        let dropdown = cx.new(|_| {
+            DropdownMenu::new(trigger("dropdown-trigger", "Profiles", handles["dropdown-trigger"].clone()), dropdown_entries())
+        });
+        let long_dropdown = cx.new(|_| {
+            DropdownMenu::new(
+                trigger("long-dropdown-trigger", "Forty profiles", handles["long-dropdown-trigger"].clone()),
+                long_entries(),
+            )
+        });
         let name = cx.new(|cx| TextInput::new("", cx).with_placeholder("Name"));
         let email = cx.new(|cx| TextInput::new("not an address", cx).with_placeholder("Email"));
         let shell = cx.new(|cx| Select::new(shells(), Some(0), cx));
@@ -224,6 +372,23 @@ impl Gallery {
                 this.command_log.push(entry);
                 cx.notify();
             }),
+            cx.subscribe(&context_menu, |this, _, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                this.menu_log.push(format!("context:{}", entry_label(&context_entries(), ix)));
+                cx.notify();
+            }),
+            cx.subscribe(&dropdown, |this, dropdown, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                let label = entry_label(dropdown.read(cx).entries(), ix);
+                this.menu_log.push(format!("dropdown:{label}"));
+                cx.notify();
+            }),
+            cx.subscribe(&long_dropdown, |this, dropdown, event: &MenuEvent, cx| {
+                let MenuEvent::Selected(ix) = *event;
+                let label = entry_label(dropdown.read(cx).entries(), ix);
+                this.menu_log.push(format!("long:{label}"));
+                cx.notify();
+            }),
         ];
         Self {
             focus,
@@ -233,6 +398,7 @@ impl Gallery {
             records: Records::default(),
             checked: false,
             switched: true,
+            pressed: HashMap::new(),
             name,
             email,
             shell,
@@ -245,6 +411,12 @@ impl Gallery {
             sticky_dialog: Overlay::modal().ignore_outside_press(),
             command_dialog: Overlay::modal(),
             confirmed: Confirmed::default(),
+            context_menu,
+            dropdown,
+            long_dropdown,
+            menu_log: Vec::new(),
+            tabs: initial_tabs(),
+            tab_log: Vec::new(),
             corners: Default::default(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -308,7 +480,51 @@ impl Gallery {
         self.command_dialog.close(window, cx);
         self.shell.update(cx, |select, cx| select.close(window, cx));
         self.editor.update(cx, |select, cx| select.close(window, cx));
+        self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
+        self.dropdown.update(cx, |menu, cx| menu.close(window, cx));
+        self.long_dropdown.update(cx, |menu, cx| menu.close(window, cx));
         cx.notify();
+    }
+
+    /// Opens the context menu with its corner at `at`, as a key or code
+    /// would (no pointer gesture).
+    pub fn open_context_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu.update(cx, |menu, cx| menu.open(at, context_entries(), window, cx));
+    }
+
+    /// The context menu, both dropdowns and what they chose.
+    fn menus_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let target = div()
+            .id("context-target")
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(240.))
+            .h(px(64.))
+            .rounded(t.radius_md())
+            .border_1()
+            .border_dashed()
+            .border_color(t.border)
+            .text_color(t.muted_foreground)
+            .child("Right-click here")
+            .on_context_menu(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.context_menu.update(cx, |menu, cx| menu.open_on_press(event, context_entries(), window, cx));
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("ContextMenu and DropdownMenu", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(recorded(target, "context-target", &self.records))
+                    .child(recorded(self.dropdown.clone(), "dropdown", &self.records))
+                    .child(recorded(self.long_dropdown.clone(), "long-dropdown", &self.records)),
+            )
     }
 
     fn header(&self, cx: &mut Context<Self>) -> Div {
@@ -434,7 +650,7 @@ impl Gallery {
                 let name = Self::button_name(variant, size);
                 let id: SharedString = name.clone().into();
                 let button = match size {
-                    ButtonSize::Icon => Button::icon_only(id, Icon::Check),
+                    ButtonSize::Icon | ButtonSize::IconSm | ButtonSize::IconXs => Button::icon_only(id, Icon::Check),
                     _ => Button::new(id, format!("{size:?}")),
                 };
                 row = row.child(button.variant(variant).size(size).focus(&self.handle(&name)).on_click(self.count(&name)));
@@ -465,6 +681,79 @@ impl Gallery {
                 .child(Button::icon_only("icon-x", Icon::X).variant(ButtonVariant::Ghost))
                 .child(Button::new("link", "Learn more").variant(ButtonVariant::Link)),
         )
+    }
+
+    /// The icon sizes, every icon, `Separator` and `Kbd`.
+    fn chrome_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
+        let mut sizes = row("Icon sizes");
+        for size in ICON_SIZES {
+            let name = format!("size:{size:?}");
+            sizes = sizes
+                .child(recorded(
+                    Button::icon_only(SharedString::from(name.clone()), Icon::Plus)
+                        .variant(ButtonVariant::Outline)
+                        .size(size),
+                    &name,
+                    &self.records,
+                ))
+                .child(
+                    Button::icon_only(SharedString::from(format!("size-ghost:{size:?}")), Icon::ArrowDown)
+                        .variant(ButtonVariant::Ghost)
+                        .size(size),
+                );
+        }
+        let mut icons = row("Icons");
+        for icon in Icon::ALL {
+            icons = icons.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(icon.size(gpui::rems(1.5)))
+                    .child(div().text_size(px(10.)).text_color(t.muted_foreground).child(format!("{icon:?}"))),
+            );
+        }
+        let separators = row("Separator")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w(px(160.))
+                    .child("Above")
+                    .child(Separator::horizontal())
+                    .child("Below"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .h(px(20.))
+                    .child("Docs")
+                    .child(Separator::vertical())
+                    .child("Source")
+                    .child(Separator::vertical())
+                    .child("Releases"),
+            );
+        let keys = row("Kbd")
+            .child(Kbd::new("enter"))
+            .child(Kbd::new("ctrl-shift-t"))
+            .child(Kbd::new("ctrl-k ctrl-c"))
+            .child(Kbd::new("alt-1"))
+            .child(Kbd::new("ctrl--"));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Icon buttons, icons, Separator and Kbd", cx))
+            .child(sizes)
+            .child(icons)
+            .child(separators)
+            .child(keys)
     }
 
     fn inputs_section(&self, cx: &mut Context<Self>) -> Div {
@@ -542,6 +831,307 @@ impl Gallery {
             )
     }
 
+    /// Whether the toggle called `name` is pressed.
+    pub fn is_pressed(&self, name: &str) -> bool {
+        self.pressed.get(name).copied().unwrap_or(false)
+    }
+
+    /// A toggle handler that stores the state asked for under `name` and
+    /// counts the request.
+    fn press_toggle(&self, name: &str, cx: &mut Context<Self>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        let (name, clicks) = (name.to_string(), self.clicks.clone());
+        cx.listener(move |this, pressed: &bool, _, cx| {
+            *clicks.borrow_mut().entry(name.clone()).or_default() += 1;
+            this.pressed.insert(name.clone(), *pressed);
+            cx.notify();
+        })
+    }
+
+    /// Every toggle variant and size, the states, and buttons and a plain
+    /// element with tooltips (shown after a 500 ms hover), plus the
+    /// tooltip's look drawn in place.
+    fn toggle_tooltip_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div().flex().flex_col().gap_3().child(heading("Toggle and Tooltip", cx));
+        for variant in ToggleVariant::ALL {
+            let mut row = div().flex().items_center().gap_3().child(label(format!("{variant:?}"), cx));
+            for size in ToggleSize::ALL {
+                // No focus handles here: a press flips them and moves focus
+                // nowhere.
+                let name = format!("toggle:{variant:?}:{size:?}");
+                row = row
+                    .child(recorded(
+                        Toggle::new(SharedString::from(name.clone()), format!("{size:?}"))
+                            .variant(variant)
+                            .size(size)
+                            .pressed(self.is_pressed(&name))
+                            .on_click(self.press_toggle(&name, cx)),
+                        &name,
+                        &self.records,
+                    ))
+                    .child({
+                        let name = format!("toggle-icon:{variant:?}:{size:?}");
+                        Toggle::icon_only(SharedString::from(name.clone()), Icon::Check)
+                            .variant(variant)
+                            .size(size)
+                            .pressed(self.is_pressed(&name))
+                            .on_click(self.press_toggle(&name, cx))
+                    });
+            }
+            section = section.child(row);
+        }
+        let states = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("States", cx))
+            .child(recorded(
+                Toggle::new("toggle", "Aa")
+                    .size(ToggleSize::Sm)
+                    .pressed(self.is_pressed("toggle"))
+                    .focus(&self.handle("toggle"))
+                    .on_click(self.press_toggle("toggle", cx))
+                    .tooltip_for("Match case", Some("alt-c".into())),
+                "toggle",
+                &self.records,
+            ))
+            .child(recorded(
+                Toggle::new("toggle-off", "Off")
+                    .disabled(true)
+                    .focus(&self.handle("toggle-off"))
+                    .on_click(self.count_toggle("toggle-off"))
+                    .tooltip_for("Never shown", None),
+                "toggle-off",
+                &self.records,
+            ))
+            .child(Toggle::new("toggle-off-pressed", "On").pressed(true).disabled(true))
+            .child(Toggle::new("toggle-icon-label", "Bold").icon(Icon::Check).variant(ToggleVariant::Outline));
+        let tooltips = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("Tooltips", cx))
+            .child(recorded(
+                // As a tab strip's new-tab button: a legible stroke.
+                Button::icon_only("tip-new", Icon::Plus)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::IconSm)
+                    .icon_min_stroke(brindle_ui::LEGIBLE_ICON_STROKE)
+                    .on_click(self.count("tip-new"))
+                    .tooltip_for("New tab", Some("ctrl-shift-t".into())),
+                "tip-new",
+                &self.records,
+            ))
+            .child(recorded(
+                // The text is worked out when the tooltip shows.
+                Button::icon_only("tip-find", Icon::Search)
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::IconSm)
+                    .tooltip_with(|_, _| Tooltip::new("Find").shortcut("ctrl-shift-f")),
+                "tip-find",
+                &self.records,
+            ))
+            .child(Button::new("tip-save", "Save").variant(ButtonVariant::Outline).tooltip_for("Save the profile", None))
+            .child(recorded(
+                Button::new("tip-disabled", "Disabled")
+                    .variant(ButtonVariant::Outline)
+                    .disabled(true)
+                    .tooltip_for("Never shown", None),
+                "tip-disabled",
+                &self.records,
+            ))
+            .child(
+                div()
+                    .id("tip-text")
+                    .text_color(cx.ui_theme().muted_foreground)
+                    .child("Hover me (a plain element)")
+                    .tooltip_for("Any stateful element", None),
+            );
+        let look = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(label("Tooltip look", cx))
+            .child(Tooltip::new("New tab").shortcut("ctrl-shift-t"))
+            .child(Tooltip::new("Close tab"))
+            .child(Tooltip::new("Split").shortcut("ctrl-k ctrl-v"));
+        section.child(states).child(tooltips).child(look)
+    }
+
+    /// The tab list called `name`, as it is now.
+    pub fn tabs_demo(&self, name: &str) -> &TabsDemo {
+        self.tabs.get(name).unwrap_or_else(|| panic!("no tab list named {name:?}"))
+    }
+
+    /// Makes the trigger at `ix` of `name` the active one, as the checks'
+    /// preconditions do.
+    pub fn set_tab_active(&mut self, name: &str, ix: usize, cx: &mut Context<Self>) {
+        if let Some(demo) = self.tabs.get_mut(name) {
+            demo.active = ix;
+        }
+        cx.notify();
+    }
+
+    /// Puts every tab list back as it started (the checks' reset).
+    pub fn reset_tabs(&mut self, cx: &mut Context<Self>) {
+        self.tabs = initial_tabs();
+        cx.notify();
+    }
+
+    fn activate_tab(&mut self, name: &str, request: &TabActivate, cx: &mut Context<Self>) {
+        let by = match request.by {
+            Modality::Pointer => "pointer",
+            Modality::Keyboard => "keyboard",
+        };
+        self.tab_log.push(format!("{name}:activate:{}:{by}", request.index));
+        self.set_tab_active(name, request.index, cx);
+    }
+
+    /// Closes the tab at `ix`; the active tab stays, or its right-hand
+    /// neighbour takes over (the left one at the end).
+    fn close_tab(&mut self, name: &str, ix: usize, cx: &mut Context<Self>) {
+        self.tab_log.push(format!("{name}:close:{ix}"));
+        if let Some(demo) = self.tabs.get_mut(name)
+            && ix < demo.tabs.len()
+        {
+            demo.tabs.remove(ix);
+            if ix < demo.active || demo.active >= demo.tabs.len() {
+                demo.active = demo.active.saturating_sub(1);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Moves the tab at `from` to `to`'s place; the active tab stays active.
+    fn move_tab(&mut self, name: &str, request: &TabMove, cx: &mut Context<Self>) {
+        let TabMove { from, to } = *request;
+        self.tab_log.push(format!("{name}:move:{from}->{to}"));
+        if let Some(demo) = self.tabs.get_mut(name)
+            && from < demo.tabs.len()
+        {
+            let active = demo.tabs.get(demo.active).map(|tab| tab.id);
+            let tab = demo.tabs.remove(from);
+            demo.tabs.insert(to.min(demo.tabs.len()), tab);
+            demo.active = demo.tabs.iter().position(|tab| Some(tab.id) == active).unwrap_or(0);
+        }
+        cx.notify();
+    }
+
+    /// The tab list called `name`. The strip and crowded lists' tabs close
+    /// (with a tooltip on the button), move, show their title as a tooltip
+    /// and keep between 5 and 15rem. Each trigger's bounds are recorded as
+    /// `tab:NAME:IX`.
+    fn tab_list(&self, name: &'static str, cx: &mut Context<Self>) -> TabList {
+        let demo = self.tabs_demo(name);
+        let closable = matches!(name, "strip" | "crowded");
+        let primary = cx.ui_theme().primary;
+        let triggers: Vec<TabTrigger> = demo
+            .tabs
+            .iter()
+            .map(|tab| {
+                let mut trigger = TabTrigger::new(("tab", tab.id), tab.label.clone()).disabled(tab.disabled);
+                if closable {
+                    trigger = trigger
+                        .closable(true)
+                        .tooltip_for(tab.label.clone(), None)
+                        .close_tooltip(|_, _| Tooltip::new("Close tab").shortcut("ctrl-shift-w"));
+                }
+                if let Some((surface, text)) = tab.colors {
+                    trigger = trigger.surface(rgb(surface)).text_color(rgb(text));
+                }
+                if tab.icon {
+                    trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
+                }
+                if let Some(status) = tab.status {
+                    trigger = trigger.adornment(dot(rgb(status).into()));
+                }
+                if tab.bell {
+                    trigger = trigger.adornment(dot(primary));
+                }
+                trigger
+            })
+            .collect();
+        let (records, prefix) = (self.records.clone(), format!("tab:{name}:"));
+        let list = TabList::new(SharedString::from(format!("tabs-{name}")))
+            .active(demo.active)
+            .children(triggers)
+            .on_activate(cx.listener(move |this, request: &TabActivate, _, cx| this.activate_tab(name, request, cx)))
+            .on_trigger_bounds(move |bounds, _, _| {
+                let mut records = records.borrow_mut();
+                records.retain(|key, _| !key.starts_with(&prefix));
+                for (ix, bounds) in bounds.iter().enumerate() {
+                    records.insert(format!("{prefix}{ix}"), *bounds);
+                }
+            });
+        if !closable {
+            return list;
+        }
+        list.trigger_width(demo_tab_width())
+            .on_close(cx.listener(move |this, ix: &usize, _, cx| this.close_tab(name, *ix, cx)))
+            .on_move(cx.listener(move |this, request: &TabMove, _, cx| this.move_tab(name, request, cx)))
+            .on_context_menu(cx.listener(move |this, request: &TabContextMenu, window, cx| {
+                this.tab_menu(name, request, window, cx)
+            }))
+    }
+
+    /// A secondary press on a tab of `name`: the tab menu opens at the
+    /// pointer, in the shared context menu (the gallery's demo menu is a tab
+    /// menu already). The tab isn't activated, as a strip may choose to.
+    fn tab_menu(&mut self, name: &str, request: &TabContextMenu, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_log.push(format!("{name}:menu:{}", request.index));
+        self.context_menu.update(cx, |menu, cx| menu.open_on_press(&request.event, context_entries(), window, cx));
+        cx.notify();
+    }
+
+    /// The tab lists, all shadcn's pill: one with a disabled trigger, a
+    /// plain one, the strip above content in the active tab's colours, and
+    /// a crowded one whose triggers shrink to their minimum.
+    fn tabs_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let demo = self.tabs_demo("strip");
+        let current = demo.tabs.get(demo.active);
+        let (surface, text): (Hsla, Hsla) = current
+            .and_then(|tab| tab.colors)
+            .map_or((t.background, t.foreground), |(surface, text)| (rgb(surface).into(), rgb(text).into()));
+        let content = current.map_or_else(|| "No tabs left".to_string(), |tab| format!("The content of {}", tab.label));
+        let pill = self.tab_list("default", cx).focus(&self.handle("tabs-default"));
+        let plain = self.tab_list("plain", cx).focus(&self.handle("tabs-plain"));
+        let strip = self.tab_list("strip", cx).focus(&self.handle("tabs-strip"));
+        let crowded = self.tab_list("crowded", cx);
+        let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Tabs", cx))
+            .child(row("Default").child(recorded(pill, "tabs:default", &self.records)))
+            .child(row("Plain").child(recorded(plain, "tabs:plain", &self.records)))
+            .child(
+                div().flex().items_start().gap_3().child(label("Strip", cx)).child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .rounded(t.radius_md())
+                        .border_1()
+                        .border_color(t.border)
+                        .overflow_hidden()
+                        .child(strip)
+                        .child(div().h(px(56.)).px_3().py_2().bg(surface).text_color(text).child(content)),
+                ),
+            )
+            .child(
+                row("Crowded").child(
+                    div()
+                        .w(px(320.))
+                        .rounded(t.radius_md())
+                        .border_1()
+                        .border_color(t.border)
+                        .overflow_hidden()
+                        .child(crowded),
+                ),
+            )
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -564,6 +1154,8 @@ impl Gallery {
                 if self.shell_changes.len() == 1 { "" } else { "s" }
             ))
             .child(format!("Command: {}", self.command_log.last().map_or("—", String::as_str)))
+            .child(format!("Menu: {}", self.menu_log.last().map_or("—", String::as_str)))
+            .child(format!("Tabs: {}", self.tab_log.last().map_or("—", String::as_str)))
             .child(format!("Hosts confirmed: {}", self.confirmed.borrow().join(", ")))
             .child(format!("Clicks: {}", if clicks.is_empty() { "—".to_string() } else { clicks.join(", ") }))
     }
@@ -613,6 +1205,7 @@ impl FocusStops for Gallery {
         let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog", "command-popover", "behind"]);
         stops.push(self.shell.focus_handle(cx));
         stops.push(self.editor.focus_handle(cx));
+        stops.extend(named(&["dropdown-trigger", "long-dropdown-trigger"]));
         stops.push(self.command.focus_handle(cx));
         for variant in ButtonVariant::ALL {
             stops.extend(ButtonSize::ALL.iter().map(|size| self.handle(&Self::button_name(variant, *size))));
@@ -620,7 +1213,10 @@ impl FocusStops for Gallery {
         stops.extend(named(&["icon-label"]));
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
-        stops.extend(named(&["checkbox", "switch", "corner-0", "corner-1", "corner-2", "corner-3"]));
+        stops.extend(named(&[
+            "checkbox", "switch", "toggle", "tabs-default", "tabs-plain", "tabs-strip", "corner-0", "corner-1", "corner-2",
+            "corner-3",
+        ]));
         stops
     }
 }
@@ -641,10 +1237,14 @@ impl Render for Gallery {
             .child(self.header(cx))
             .child(self.overlays_section(cx))
             .child(self.selects_section(cx))
+            .child(self.menus_section(cx))
             .child(self.command_section(cx))
             .child(self.buttons_section(cx))
+            .child(self.chrome_section(cx))
             .child(self.inputs_section(cx))
             .child(self.toggles_section(cx))
+            .child(self.toggle_tooltip_section(cx))
+            .child(self.tabs_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -659,6 +1259,8 @@ impl Render for Gallery {
                 .text_size(px(14.))
                 .child(content)
                 .children(self.corner_triggers())
+                // Takes no room; its menu is drawn above the window.
+                .child(self.context_menu.clone())
                 // Modal layers render last in the root: tree order is their
                 // z-order, and nothing lifts them.
                 .children(self.dialog.render(window, cx))
@@ -944,10 +1546,10 @@ impl Render for NotePopover {
 mod check {
     use std::time::Duration;
 
-    use brindle_ui::{ActiveTheme, Modality, modality, primitives::layer};
+    use brindle_ui::{ActiveTheme, Menu, MenuAnchor, Modality, modality, primitives::layer};
     use gpui::{
-        App, AppContext, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, Keystroke, Pixels, Point,
-        SharedString, Window, WindowHandle, point, px,
+        App, AppContext, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable, Keystroke, MouseButton, Pixels,
+        Point, SharedString, Window, WindowHandle, point, px,
     };
 
     use super::Gallery;
@@ -959,8 +1561,14 @@ mod check {
         pub const WM_MOUSEMOVE: u32 = 0x0200;
         pub const WM_LBUTTONDOWN: u32 = 0x0201;
         pub const WM_LBUTTONUP: u32 = 0x0202;
+        pub const WM_RBUTTONDOWN: u32 = 0x0204;
+        pub const WM_RBUTTONUP: u32 = 0x0205;
+        pub const WM_MBUTTONDOWN: u32 = 0x0207;
+        pub const WM_MBUTTONUP: u32 = 0x0208;
         pub const WM_KEYUP: u32 = 0x0101;
         pub const MK_LBUTTON: usize = 0x0001;
+        pub const MK_RBUTTON: usize = 0x0002;
+        pub const MK_MBUTTON: usize = 0x0010;
         /// A key-up's lparam: repeat count 1, previous state down, transition up.
         pub const KEYUP_LPARAM: isize = 0xC000_0001u32 as isize;
 
@@ -1107,6 +1715,17 @@ mod check {
         }
     }
 
+    /// A mouse button's down and up messages, and its flag in a message's
+    /// wparam while it is held.
+    #[cfg(windows)]
+    fn button_messages(button: MouseButton) -> (u32, u32, usize) {
+        match button {
+            MouseButton::Right => (win::WM_RBUTTONDOWN, win::WM_RBUTTONUP, win::MK_RBUTTON),
+            MouseButton::Middle => (win::WM_MBUTTONDOWN, win::WM_MBUTTONUP, win::MK_MBUTTON),
+            _ => (win::WM_LBUTTONDOWN, win::WM_LBUTTONUP, win::MK_LBUTTON),
+        }
+    }
+
     /// Why the pointer checks can't run on this platform.
     #[cfg(not(windows))]
     const NO_MESSAGES: &str = "needs a real pointer: the gallery posts presses as window messages on Windows only";
@@ -1169,6 +1788,7 @@ mod check {
         window: WindowHandle<Gallery>,
         cx: AsyncApp,
         /// The platform window the messages go to (Windows), else 0.
+        #[cfg_attr(not(windows), allow(dead_code))]
         hwnd: isize,
         /// Physical pixels per logical pixel, for the messages' coordinates.
         scale: f32,
@@ -1304,6 +1924,58 @@ mod check {
             #[cfg(not(windows))]
             self.post(0, 0, lparam)?;
             self.cx.background_executor().timer(HOVER_TICK).await;
+            Ok(())
+        }
+
+        /// `button` goes down at `at` (and stays down), then a frame.
+        async fn button_down(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (down, _, held) = button_messages(button);
+                self.post(down, held, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.tick().await;
+            Ok(())
+        }
+
+        /// The pointer moves to `at` with `button` held, then a frame.
+        async fn button_move(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (_, _, held) = button_messages(button);
+                self.post(win::WM_MOUSEMOVE, held, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.cx.background_executor().timer(HOVER_TICK).await;
+            self.tick().await;
+            Ok(())
+        }
+
+        /// `button` comes up at `at`, then a frame.
+        async fn button_up(&mut self, button: MouseButton, at: Point<Pixels>) -> Result<(), Failure> {
+            let lparam = self.mouse_lparam(at);
+            #[cfg(windows)]
+            {
+                let (_, up, _) = button_messages(button);
+                self.post(up, 0, lparam)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = button;
+                self.post(0, 0, lparam)?;
+            }
+            self.tick().await;
             Ok(())
         }
 
@@ -1461,6 +2133,7 @@ mod check {
             }
             self.with(|gallery, window, cx| {
                 gallery.close_all(window, cx);
+                gallery.reset_tabs(cx);
                 gallery.scroll.set_offset(point(px(0.), px(0.)));
                 // Back to the gallery itself, as a page's body.
                 window.focus(&gallery.focus);
@@ -1531,6 +2204,8 @@ mod check {
         c.run_check("button-space-and-enter-activate-once", check).await;
         let check = button_disabled_inert(&mut c).await;
         c.run_check("button-disabled-runs-nothing-keeps-focus", check).await;
+        let check = icon_button_sizes(&mut c).await;
+        c.run_check("icon-button-sizes-are-two-and-a-quarter-two-and-one-and-a-half-rem", check).await;
         let check = focus_visible(&mut c).await;
         c.run_check("focus-visible-pointer-then-keyboard", check).await;
         let check = ring_paints(&mut c).await;
@@ -1543,6 +2218,25 @@ mod check {
         c.run_check("switch-space-and-enter-toggle", check).await;
         let check = checkbox_disabled(&mut c).await;
         c.run_check("checkbox-disabled-asks-nothing", check).await;
+        let check = toggle_space_and_enter(&mut c).await;
+        c.run_check("toggle-space-and-enter-flip-it", check).await;
+        let check = toggle_click(&mut c).await;
+        c.run_check("toggle-click-flips-it-and-a-handleless-press-keeps-focus", check).await;
+        let check = toggle_disabled_keys(&mut c).await;
+        c.run_check("toggle-disabled-space-asks-nothing", check).await;
+        let check = toggle_disabled_press(&mut c).await;
+        c.run_check("toggle-disabled-press-asks-nothing-keeps-focus", check).await;
+        // Each moves the pointer away after, passed or not, so no tooltip
+        // stays up for the later checks' pixel samples.
+        let check = tooltip_hover_and_press(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-hover-shows-it-press-hides-it-and-clicks", check).await;
+        let check = tooltip_escape(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-escape-hides-it", check).await;
+        let check = tooltip_disabled(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tooltip-not-shown-on-a-disabled-control", check).await;
         let check = dialog_opens_focusing_input(&mut c).await;
         c.run_check("dialog-opens-with-input-focused-and-typing-goes-there", check).await;
         let check = dialog_tab_cycles(&mut c).await;
@@ -1621,6 +2315,78 @@ mod check {
         c.run_check("command-in-dialog-escape-and-enter", check).await;
         let check = command_popover_hazard(&mut c).await;
         c.run_check("command-in-popover-enter-key-up-does-not-reopen", check).await;
+        // Menus: everywhere, opened by key or from code.
+        let check = context_menu_corner(&mut c).await;
+        c.run_check("context-menu-opens-with-its-corner-at-200-40-highlighting-nothing", check).await;
+        let check = context_menu_edges(&mut c).await;
+        c.run_check("context-menu-near-the-edges-opens-left-of-the-pointer-and-stays-inside", check).await;
+        let check = context_menu_keys(&mut c).await;
+        c.run_check("context-menu-keys-skip-disabled-and-separators-without-wrapping", check).await;
+        let check = context_menu_enter_selects(&mut c).await;
+        c.run_check("context-menu-down-down-enter-selects-the-second-enabled-item", check).await;
+        let check = context_menu_space_selects(&mut c).await;
+        c.run_check("context-menu-space-selects-and-continues-a-typeahead-search", check).await;
+        let check = context_menu_escape(&mut c).await;
+        c.run_check("context-menu-escape-closes-and-focus-returns", check).await;
+        let check = dropdown_keys(&mut c).await;
+        c.run_check("dropdown-enter-space-down-open-below-the-trigger-other-keys-do-not", check).await;
+        let check = dropdown_description(&mut c).await;
+        c.run_check("dropdown-description-under-the-label-and-t-highlights-tmux", check).await;
+        let check = dropdown_long_menu(&mut c).await;
+        c.run_check("dropdown-long-menu-fits-the-window-scrolls-and-keeps-the-highlight-in-view", check).await;
+        // Menus: the pointer (Windows only).
+        let check = context_menu_press_and_near_release(&mut c).await;
+        c.run_check("context-menu-secondary-press-opens-at-the-pointer-release-within-10px-stays", check).await;
+        let check = context_menu_one_gesture(&mut c).await;
+        c.run_check("context-menu-press-drag-release-selects-the-item", check).await;
+        let check = context_menu_hover_and_click(&mut c).await;
+        c.run_check("context-menu-hover-highlights-click-selects", check).await;
+        let check = context_menu_disabled_click(&mut c).await;
+        c.run_check("context-menu-disabled-item-click-selects-nothing-stays-open", check).await;
+        let check = context_menu_outside_press(&mut c).await;
+        c.run_check("context-menu-outside-press-closes-reaches-nothing-focus-returns", check).await;
+        let check = dropdown_trigger_toggles(&mut c).await;
+        c.run_check("dropdown-trigger-press-opens-second-press-closes", check).await;
+        let check = dropdown_drag_selects(&mut c).await;
+        c.run_check("dropdown-press-drag-release-selects-the-third-item", check).await;
+        let check = dropdown_enter_keyup(&mut c).await;
+        c.run_check("dropdown-enter-key-up-does-not-reopen", check).await;
+        // Tabs: the keys, everywhere.
+        let check = tabs_arrow_activates(&mut c).await;
+        c.run_check("tabs-right-on-the-second-of-four-activates-the-third-and-focus-follows", check).await;
+        let check = tabs_wrap(&mut c).await;
+        c.run_check("tabs-right-on-the-last-wraps-to-the-first-and-left-back", check).await;
+        let check = tabs_disabled_skipped(&mut c).await;
+        c.run_check("tabs-right-skips-a-disabled-trigger", check).await;
+        let check = tabs_home_end(&mut c).await;
+        c.run_check("tabs-home-end-pageup-pagedown-go-to-the-ends-other-keys-do-nothing", check).await;
+        let check = tabs_one_stop(&mut c).await;
+        c.run_check("tabs-each-list-is-one-tab-stop", check).await;
+        let check = tabs_widths(&mut c).await;
+        c.run_check("tabs-triggers-keep-between-their-min-and-max-width", check).await;
+        // Tabs: what is drawn and the pointer (Windows only).
+        let check = tabs_ring(&mut c).await;
+        c.run_check("tabs-ring-paints-around-the-active-trigger-only", check).await;
+        let check = tabs_owner_colours(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-owner-colours-apply-to-active-and-inactive-triggers", check).await;
+        let check = tabs_press_activates(&mut c).await;
+        c.run_check("tabs-press-activates-and-moves-no-focus", check).await;
+        let check = tabs_disabled_press(&mut c).await;
+        c.run_check("tabs-press-on-a-disabled-trigger-does-nothing", check).await;
+        let check = tabs_close_button(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-close-button-closes-without-activating", check).await;
+        let check = tabs_middle_click(&mut c).await;
+        c.run_check("tabs-middle-press-asks-to-close-a-closable-trigger", check).await;
+        let check = tabs_context_menu(&mut c).await;
+        c.run_check("tabs-secondary-press-asks-for-the-trigger-menu", check).await;
+        let check = tabs_drag(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-drag-first-onto-third-moves-it-with-a-drop-bar", check).await;
+        let check = tabs_tooltip(&mut c).await;
+        let check = pointer_away_after(&mut c, check).await;
+        c.run_check("tabs-trigger-tooltip-shows-on-hover", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -1723,6 +2489,22 @@ mod check {
         c.press(at).await?;
         ensure!(c.clicks("disabled")? == 0, "a disabled button ran its action");
         ensure!(c.focused_name("behind")?, "pressing a disabled button moved focus");
+        Ok(())
+    }
+
+    /// The icon-only sizes paint as shadcn's `size-9`, `size-8` and `size-6`
+    /// squares: 2.25, 2 and 1.5 rem.
+    async fn icon_button_sizes(c: &mut Checker) -> Check {
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        for (size, rems) in [(ButtonSize::Icon, 2.25), (ButtonSize::IconSm, 2.), (ButtonSize::IconXs, 1.5)] {
+            let bounds = c.reveal(&format!("size:{size:?}")).await?;
+            let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let side = rems * rem;
+            ensure!(
+                (width - side).abs() < 0.5 && (height - side).abs() < 0.5,
+                "{size:?} paints {width}x{height}, not {side}x{side} ({rems}rem)"
+            );
+        }
         Ok(())
     }
 
@@ -1888,6 +2670,155 @@ mod check {
         ensure!(c.focused_name("behind")?, "pressing a disabled checkbox moved focus");
         Ok(())
     }
+
+    // ---- toggle and tooltip ----
+
+    fn pressed(c: &mut Checker, name: &str) -> Result<bool, Failure> {
+        let name = name.to_string();
+        c.with(move |gallery, _, _| gallery.is_pressed(&name))
+    }
+
+    /// Space and enter on a focused toggle each ask the owner to flip it
+    /// (Radix's toggle is a button), once per key, as keyboard input.
+    async fn toggle_space_and_enter(c: &mut Checker) -> Check {
+        c.focus("toggle").await?;
+        let before = pressed(c, "toggle")?;
+        let asked = c.clicks("toggle")?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        ensure!(pressed(c, "toggle")? == !before, "space didn't ask the owner to flip the toggle");
+        ensure!(c.modality()? == Modality::Keyboard, "space on a toggle didn't count as keyboard input");
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(pressed(c, "toggle")? == before, "enter didn't flip it back (or flipped it twice)");
+        let asked = c.clicks("toggle")? - asked;
+        ensure!(asked == 2, "two keys asked {asked} times");
+        Ok(())
+    }
+
+    /// A click flips the toggle and focuses it as a pointer does. A click on
+    /// a toggle without a focus handle flips it and leaves focus where it
+    /// was, not on the gallery around it.
+    async fn toggle_click(c: &mut Checker) -> Check {
+        let at = center(c.reveal("toggle").await?);
+        let before = pressed(c, "toggle")?;
+        c.press(at).await?;
+        ensure!(pressed(c, "toggle")? == !before, "a click didn't flip the toggle");
+        ensure!(c.focused_name("toggle")?, "the clicked toggle isn't focused");
+        ensure!(c.modality()? == Modality::Pointer, "a click left the keyboard modality (a ring would show)");
+        let name = format!("toggle:{:?}:{:?}", ToggleVariant::Outline, ToggleSize::Sm);
+        let at = center(c.reveal(&name).await?);
+        let before = pressed(c, &name)?;
+        c.press(at).await?;
+        ensure!(pressed(c, &name)? == !before, "a click didn't flip the toggle without a focus handle");
+        ensure!(c.focused_name("toggle")?, "a press on a toggle without a focus handle moved focus");
+        Ok(())
+    }
+
+    /// A disabled toggle tracks no focus and has no key handler: space with
+    /// its handle focused asks nothing.
+    async fn toggle_disabled_keys(c: &mut Checker) -> Check {
+        c.focus("toggle-off").await?;
+        c.key("space").await?;
+        c.key_up("space").await?;
+        c.key("enter").await?;
+        c.key_up("enter").await?;
+        ensure!(c.clicks("toggle-off")? == 0, "a disabled toggle asked for a change from a key");
+        Ok(())
+    }
+
+    async fn toggle_disabled_press(c: &mut Checker) -> Check {
+        c.focus("behind").await?;
+        let at = center(c.reveal("toggle-off").await?);
+        c.press(at).await?;
+        ensure!(c.clicks("toggle-off")? == 0, "a disabled toggle asked for a change");
+        ensure!(c.focused_name("behind")?, "pressing a disabled toggle moved focus");
+        Ok(())
+    }
+
+    /// Longer than gpui's 500 ms hover delay.
+    const TOOLTIP_WAIT: Duration = Duration::from_millis(800);
+
+    /// Where a tooltip shown for a pointer at `at` is sure to paint its
+    /// background: gpui places it 1px below and right of the pointer, and
+    /// this is inside its padding.
+    fn tooltip_point(at: Point<Pixels>) -> Point<Pixels> {
+        point(at.x + px(6.), at.y + px(4.))
+    }
+
+    /// The tooltip's background as the window shows it.
+    fn tooltip_colour(c: &mut Checker) -> Result<[u8; 3], Failure> {
+        c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            over(brindle_ui::tooltip_style(t).background, t.background)
+        })
+    }
+
+    /// Rests the pointer at `at` past the hover delay.
+    async fn rest(c: &mut Checker, at: Point<Pixels>) -> Result<(), Failure> {
+        c.hover(at).await?;
+        c.cx.background_executor().timer(TOOLTIP_WAIT).await;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// Moves the pointer to blank space, so no tooltip stays up for the
+    /// next check's samples.
+    async fn pointer_away(c: &mut Checker) -> Result<(), Failure> {
+        let viewport = c.viewport()?;
+        c.hover(point(viewport.width - px(40.), viewport.height / 2.)).await?;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// [`pointer_away`] after a tooltip check, whatever its result; the
+    /// check's own failure or skip wins over the move's.
+    async fn pointer_away_after(c: &mut Checker, check: Check) -> Check {
+        let away = pointer_away(c).await;
+        check.and(away)
+    }
+
+    async fn tooltip_hover_and_press(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-new").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        let before = c.pixel(sample).await?;
+        ensure!(!near(before, tooltip), "the tooltip's colour {tooltip:?} shows at {sample:?} before any hover");
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on the button showed {shown:?} at {sample:?}, not the tooltip {tooltip:?}");
+        let clicks = c.clicks("tip-new")?;
+        c.press(at).await?;
+        ensure!(c.clicks("tip-new")? == clicks + 1, "the press under the tooltip didn't click the button");
+        let after = c.pixel(sample).await?;
+        ensure!(!near(after, tooltip), "the tooltip stayed up after a press ({after:?})");
+        Ok(())
+    }
+
+    async fn tooltip_escape(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-find").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on the button showed {shown:?}, not the tooltip {tooltip:?}");
+        c.key("escape").await?;
+        let after = c.pixel(sample).await?;
+        ensure!(!near(after, tooltip), "the tooltip stayed up after Escape ({after:?})");
+        Ok(())
+    }
+
+    async fn tooltip_disabled(c: &mut Checker) -> Check {
+        let at = center(c.reveal("tip-disabled").await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(!near(shown, tooltip), "a disabled button showed a tooltip ({shown:?})");
+        Ok(())
+    }
+
+    use brindle_ui::{ToggleSize, ToggleVariant};
 
     // ---- dialog ----
 
@@ -2666,6 +3597,901 @@ mod check {
         }
         c.tick().await;
         ensure!(c.layers()? == 0, "the enter key-up clicked the trigger and reopened the popover");
+        Ok(())
+    }
+
+    // ---- menus ----
+
+    /// The gallery's menus.
+    #[derive(Clone, Copy, Debug)]
+    enum Which {
+        Context,
+        Dropdown,
+        Long,
+    }
+
+    /// The open menu of `which`, if one is open.
+    fn open_menu(c: &mut Checker, which: Which) -> Result<Option<Entity<Menu>>, Failure> {
+        c.with(move |gallery, _, cx| match which {
+            Which::Context => gallery.context_menu.read(cx).menu().cloned(),
+            Which::Dropdown => gallery.dropdown.read(cx).menu().cloned(),
+            Which::Long => gallery.long_dropdown.read(cx).menu().cloned(),
+        })
+    }
+
+    fn the_menu(c: &mut Checker, which: Which) -> Result<Entity<Menu>, Failure> {
+        open_menu(c, which)?.ok_or_else(|| Failure::Fail(format!("the {which:?} menu isn't open")))
+    }
+
+    fn menu_highlight(c: &mut Checker, which: Which) -> Result<Option<usize>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, |menu, _| menu.highlighted())
+    }
+
+    /// The open menu's panel, as last painted.
+    fn menu_bounds(c: &mut Checker, which: Which) -> Result<Bounds<Pixels>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, |menu, _| menu.bounds())?
+            .ok_or_else(|| Failure::Fail(format!("the {which:?} menu painted no bounds")))
+    }
+
+    /// Where entry `ix` of the open menu was painted, scrolled as shown.
+    fn entry_bounds(c: &mut Checker, which: Which, ix: usize) -> Result<Bounds<Pixels>, Failure> {
+        let menu = the_menu(c, which)?;
+        c.read(&menu, move |menu, _| menu.entry_bounds(ix))?
+            .ok_or_else(|| Failure::Fail(format!("entry {ix} of the {which:?} menu painted no bounds")))
+    }
+
+    fn menu_log(c: &mut Checker) -> Result<Vec<String>, Failure> {
+        c.with(|gallery, _, _| gallery.menu_log.clone())
+    }
+
+    /// The trigger bounds a dropdown places its menu against.
+    fn dropdown_trigger(c: &mut Checker, which: Which) -> Result<Bounds<Pixels>, Failure> {
+        c.with(move |gallery, _, cx| match which {
+            Which::Long => gallery.long_dropdown.read(cx).trigger_bounds(),
+            _ => gallery.dropdown.read(cx).trigger_bounds(),
+        })?
+        .ok_or_else(|| Failure::Fail(format!("the {which:?} dropdown's trigger painted no bounds")))
+    }
+
+    /// Within a pixel, for positions that went through a message's whole
+    /// physical pixels.
+    fn close_to(a: Pixels, b: Pixels) -> bool {
+        (a - b).abs() <= px(1.)
+    }
+
+    fn inside(bounds: Bounds<Pixels>, viewport: gpui::Size<Pixels>, margin: Pixels) -> bool {
+        bounds.left() >= margin - px(0.5)
+            && bounds.top() >= margin - px(0.5)
+            && bounds.right() <= viewport.width - margin + px(0.5)
+            && bounds.bottom() <= viewport.height - margin + px(0.5)
+    }
+
+    /// Whether `inner` lies within `outer` vertically: a row in a menu's view.
+    fn in_view(inner: Bounds<Pixels>, outer: Bounds<Pixels>) -> bool {
+        inner.top() >= outer.top() - px(0.5) && inner.bottom() <= outer.bottom() + px(0.5)
+    }
+
+    /// Opens the context menu at `at` from code, and lets it paint.
+    async fn open_context_at(c: &mut Checker, at: Point<Pixels>) -> Check {
+        c.with(move |gallery, window, cx| gallery.open_context_menu(at, window, cx))?;
+        c.tick().await;
+        c.tick().await;
+        ensure!(c.layers()? == 1, "the context menu isn't the one layer ({} open)", c.layers()?);
+        Ok(())
+    }
+
+    /// The spec's scenario, with the press stood in for by code: the corner
+    /// lands on (200, 40), the menu has focus and highlights nothing, and
+    /// the first down highlights the first enabled item.
+    async fn context_menu_corner(c: &mut Checker) -> Check {
+        let at = point(px(200.), px(40.));
+        open_context_at(c, at).await?;
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not {at:?}",
+            bounds.origin
+        );
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight.is_none(), "the menu opened highlighting {highlight:?}");
+        let menu = the_menu(c, Which::Context)?;
+        let own = c.read(&menu, |menu, cx| menu.focus_handle(cx))?;
+        ensure!(c.focused(&own)?, "the open menu doesn't have focus");
+        c.key("down").await?;
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight == Some(0), "the first down highlighted {highlight:?}, not Rename Tab");
+        Ok(())
+    }
+
+    /// Near the right edge the menu opens to the left of the pointer; near
+    /// the bottom it is shifted up; it stays inside the window less its
+    /// margin either way.
+    async fn context_menu_edges(c: &mut Checker) -> Check {
+        let viewport = c.viewport()?;
+        let margin = px(8.);
+        let right = point(viewport.width - px(20.), px(100.));
+        let bottom = point(px(100.), viewport.height - px(20.));
+        let corner = point(viewport.width - px(20.), viewport.height - px(20.));
+        for at in [right, bottom, corner] {
+            open_context_at(c, at).await?;
+            let bounds = menu_bounds(c, Which::Context)?;
+            ensure!(inside(bounds, viewport, margin), "the menu opened at {at:?} leaves the window: {bounds:?} in {viewport:?}");
+            if at.x == right.x {
+                ensure!(
+                    close_to(bounds.right(), at.x),
+                    "near the right edge the menu {bounds:?} isn't just to the left of the pointer at {at:?}"
+                );
+            } else {
+                ensure!(close_to(bounds.left(), at.x), "the menu {bounds:?} isn't at the pointer's x ({at:?})");
+            }
+            if at.y == right.y {
+                ensure!(close_to(bounds.top(), at.y), "the menu {bounds:?} isn't at the pointer's y ({at:?})");
+            } else {
+                ensure!(bounds.top() < at.y, "near the bottom the menu {bounds:?} wasn't shifted up from {at:?}");
+            }
+            c.key("escape").await?;
+            ensure!(c.layers()? == 0, "escape didn't close the menu opened at {at:?}");
+        }
+        Ok(())
+    }
+
+    /// Up and down skip the disabled item and the separator and stop at
+    /// the ends; home, end, PageUp and PageDown go to the first and last;
+    /// typing goes by the labels and passes the disabled item. Nothing is
+    /// selected and the menu stays open.
+    async fn context_menu_keys(c: &mut Checker) -> Check {
+        let before = menu_log(c)?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        // Rename Tab 0, Move Tab Left 1 (disabled), Move Tab Right 2,
+        // separator 3, Close Tab 4.
+        let keys = [
+            ("down", 0),
+            ("down", 2),
+            ("down", 4),
+            ("down", 4),
+            ("up", 2),
+            ("up", 0),
+            ("up", 0),
+            ("end", 4),
+            ("home", 0),
+            ("pagedown", 4),
+            ("pageup", 0),
+            ("ctrl-n", 2),
+            ("ctrl-p", 0),
+        ];
+        for (key, expected) in keys {
+            c.key(key).await?;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == Some(expected), "{key} highlighted {highlight:?}, expected {expected}");
+        }
+        for (key, expected) in [("m", 2), ("c", 4), ("r", 0)] {
+            c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+            c.key(key).await?;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == Some(expected), "typing {key} highlighted {highlight:?}, expected {expected}");
+        }
+        ensure!(c.layers()? == 1, "a key closed the menu");
+        ensure!(menu_log(c)? == before, "a key selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: down twice and enter select the second enabled
+    /// item, tell the owner and close the menu; focus goes back to the
+    /// button that had it, which the enter doesn't reach.
+    async fn context_menu_enter_selects(c: &mut Checker) -> Check {
+        c.focus("open-dialog").await?;
+        let before = menu_log(c)?.len();
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("down").await?;
+        c.key("down").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 0 && open_menu(c, Which::Context)?.is_none(), "enter didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return to the button that had it");
+        ensure!(!c.with(|gallery, _, _| gallery.dialog.is_open())?, "the enter reached the button and opened the dialog");
+        Ok(())
+    }
+
+    /// Space selects the highlighted item, except while a typeahead search
+    /// is under way, when it is part of the search (Radix's rule).
+    async fn context_menu_space_selects(c: &mut Checker) -> Check {
+        let before = menu_log(c)?.len();
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("m").await?;
+        ensure!(menu_highlight(c, Which::Context)? == Some(2), "m didn't highlight Move Tab Right");
+        c.key("space").await?;
+        ensure!(c.layers()? == 1, "a space during the search closed the menu");
+        ensure!(menu_log(c)?.len() == before, "a space during the search selected");
+        ensure!(menu_highlight(c, Which::Context)? == Some(2), "a space during the search moved the highlight");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        c.key("space").await?;
+        ensure!(c.layers()? == 0, "space didn't select and close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: Escape closes the menu and focus is where it
+    /// was before; nothing is selected.
+    async fn context_menu_escape(c: &mut Checker) -> Check {
+        c.focus("open-dialog").await?;
+        let before = menu_log(c)?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.key("down").await?;
+        c.key("escape").await?;
+        ensure!(c.layers()? == 0 && open_menu(c, Which::Context)?.is_none(), "escape didn't close the menu");
+        ensure!(c.focused_name("open-dialog")?, "focus isn't back on the button that had it");
+        ensure!(menu_log(c)? == before, "escape selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// Radix's trigger keys: enter, space and down open the menu below the
+    /// trigger, start-aligned and 4px away, highlighting nothing; Escape
+    /// gives focus back to the trigger. Up, left, right, home, end and
+    /// ctrl-n don't open it.
+    async fn dropdown_keys(c: &mut Checker) -> Check {
+        let trigger = dropdown_trigger(c, Which::Dropdown)?;
+        let handle = c.handle("dropdown-trigger")?;
+        for key in ["enter", "space", "down"] {
+            c.focus("dropdown-trigger").await?;
+            c.key(key).await?;
+            ensure!(c.layers()? == 1 && open_menu(c, Which::Dropdown)?.is_some(), "{key} on the trigger didn't open the menu");
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Dropdown)?;
+            ensure!(highlight.is_none(), "{key}: the menu opened highlighting {highlight:?}");
+            let bounds = menu_bounds(c, Which::Dropdown)?;
+            ensure!(
+                close_to(bounds.left(), trigger.left()) && close_to(bounds.top(), trigger.bottom() + px(4.)),
+                "{key}: the menu {bounds:?} isn't 4px below the trigger {trigger:?}, aligned to its start"
+            );
+            ensure!(c.modality()? == Modality::Keyboard, "{key} didn't count as keyboard input");
+            c.key("escape").await?;
+            ensure!(c.layers()? == 0, "escape after {key} didn't close the menu");
+            ensure!(c.focused(&handle)?, "escape after {key} didn't give focus back to the trigger");
+        }
+        for key in ["up", "left", "right", "home", "end", "ctrl-n"] {
+            c.focus("dropdown-trigger").await?;
+            c.key(key).await?;
+            ensure!(c.layers()? == 0, "{key} on the trigger opened the menu");
+            ensure!(c.focused(&handle)?, "{key} moved focus off the trigger");
+        }
+        Ok(())
+    }
+
+    /// The spec's scenario: the tmux item shows its description on a second
+    /// line, and `t` highlights it (bash's description starts with `t`, its
+    /// label doesn't). Typing passes the disabled zsh, and a letter only a
+    /// description starts with matches nothing.
+    async fn dropdown_description(c: &mut Checker) -> Check {
+        c.focus("dropdown-trigger").await?;
+        c.key("down").await?;
+        c.key("t").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(2), "t highlighted {highlight:?}, not tmux");
+        let (bash, fish, tmux) =
+            (entry_bounds(c, Which::Dropdown, 0)?, entry_bounds(c, Which::Dropdown, 1)?, entry_bounds(c, Which::Dropdown, 2)?);
+        ensure!(
+            tmux.size.height > fish.size.height + px(8.),
+            "the tmux row ({:?} tall) holds no second line beside fish's ({:?})",
+            tmux.size.height,
+            fish.size.height
+        );
+        ensure!(close_to(bash.size.height, tmux.size.height), "the described rows differ in height");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        c.key("s").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(5), "s highlighted {highlight:?}, not Settings… past the disabled zsh");
+        c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
+        // "not installed", zsh's description: no label starts with n.
+        c.key("n").await?;
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight == Some(5), "n, which only a description starts with, moved the highlight to {highlight:?}");
+        Ok(())
+    }
+
+    /// The spec's scenario: a menu with more items than fit is as tall as
+    /// the window allows below its trigger, and scrolls so the highlight
+    /// stays in view.
+    async fn dropdown_long_menu(c: &mut Checker) -> Check {
+        c.reveal("long-dropdown").await?;
+        let trigger = dropdown_trigger(c, Which::Long)?;
+        let viewport = c.viewport()?;
+        c.focus("long-dropdown-trigger").await?;
+        c.key("down").await?;
+        c.tick().await;
+        let bounds = menu_bounds(c, Which::Long)?;
+        let limit = MenuAnchor::below(trigger).max_height(viewport);
+        ensure!(
+            (bounds.size.height - limit).abs() <= px(1.),
+            "the menu is {:?} tall, not the {limit:?} the window allows",
+            bounds.size.height
+        );
+        ensure!(inside(bounds, viewport, px(8.)), "the menu {bounds:?} leaves the window {viewport:?}");
+        c.key("down").await?;
+        ensure!(menu_highlight(c, Which::Long)? == Some(0), "down didn't highlight the first profile");
+        let last = entry_bounds(c, Which::Long, 39)?;
+        ensure!(!in_view(last, bounds), "the last profile {last:?} is in view at the start: nothing to scroll");
+        for (key, ix) in [("end", 39), ("home", 0), ("pagedown", 39), ("up", 38)] {
+            c.key(key).await?;
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Long)?;
+            ensure!(highlight == Some(ix), "{key} highlighted {highlight:?}, not {ix}");
+            let row = entry_bounds(c, Which::Long, ix)?;
+            ensure!(in_view(row, bounds), "after {key} the highlighted row {row:?} is outside the menu's view {bounds:?}");
+        }
+        Ok(())
+    }
+
+    /// The spec's scenarios: a secondary press on the target opens the menu
+    /// with its corner at the pointer, and its release 8px away, over the
+    /// first item, selects nothing and leaves the menu open.
+    async fn context_menu_press_and_near_release(c: &mut Checker) -> Check {
+        let at = center(c.reveal("context-target").await?);
+        let before = menu_log(c)?;
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not the pointer's {at:?}",
+            bounds.origin
+        );
+        let release = point(at.x + px(8.), at.y + px(8.));
+        c.button_up(MouseButton::Right, release).await?;
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the release within 10px closed the menu");
+        ensure!(menu_log(c)? == before, "the release within 10px selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: secondary press, a move of more than 10px onto
+    /// an enabled item, and the release there select it.
+    async fn context_menu_one_gesture(c: &mut Checker) -> Check {
+        let at = center(c.reveal("context-target").await?);
+        let before = menu_log(c)?.len();
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let row = center(entry_bounds(c, Which::Context, 2)?);
+        ensure!(row.y - at.y > px(10.), "Move Tab Right at {row:?} is within 10px of the press at {at:?}");
+        c.button_move(MouseButton::Right, row).await?;
+        let highlight = menu_highlight(c, Which::Context)?;
+        ensure!(highlight == Some(2), "moving onto Move Tab Right with the button held highlighted {highlight:?}");
+        c.button_up(MouseButton::Right, row).await?;
+        ensure!(c.layers()? == 0, "the release on Move Tab Right didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// Moving over an enabled item highlights it, over the disabled one
+    /// clears the highlight, and a primary click selects.
+    async fn context_menu_hover_and_click(c: &mut Checker) -> Check {
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let before = menu_log(c)?.len();
+        let rows = [
+            center(entry_bounds(c, Which::Context, 0)?),
+            center(entry_bounds(c, Which::Context, 1)?),
+            center(entry_bounds(c, Which::Context, 2)?),
+        ];
+        for (row, expected) in [(rows[0], Some(0)), (rows[1], None), (rows[2], Some(2))] {
+            c.hover(row).await?;
+            c.tick().await;
+            let highlight = menu_highlight(c, Which::Context)?;
+            ensure!(highlight == expected, "the pointer at {row:?} highlighted {highlight:?}, expected {expected:?}");
+        }
+        c.press(rows[2]).await?;
+        ensure!(c.layers()? == 0, "the click on Move Tab Right didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["context:Move Tab Right"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: a click on the disabled item (or the
+    /// separator) selects nothing and the menu stays open.
+    async fn context_menu_disabled_click(c: &mut Checker) -> Check {
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let before = menu_log(c)?;
+        for (ix, what) in [(1, "the disabled Move Tab Left"), (3, "the separator")] {
+            let at = center(entry_bounds(c, Which::Context, ix)?);
+            c.press(at).await?;
+            ensure!(open_menu(c, Which::Context)?.is_some(), "a click on {what} closed the menu");
+            ensure!(menu_log(c)? == before, "a click on {what} selected {:?}", &menu_log(c)?[before.len()..]);
+        }
+        Ok(())
+    }
+
+    /// The spec's scenario: a press outside closes the menu and the button
+    /// pressed isn't activated; focus goes back. A secondary press outside,
+    /// on the menu's own target, closes it and opens nothing.
+    async fn context_menu_outside_press(c: &mut Checker) -> Check {
+        let target = center(c.reveal("context-target").await?);
+        let behind = center(c.recorded("behind")?);
+        c.focus("open-dialog").await?;
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        let clicks = c.clicks("behind")?;
+        c.press(behind).await?;
+        ensure!(c.layers()? == 0, "the outside press didn't close the menu");
+        ensure!(c.clicks("behind")? == clicks, "the outside press clicked the button beneath");
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return to the button that had it");
+        open_context_at(c, point(px(200.), px(40.))).await?;
+        c.button_down(MouseButton::Right, target).await?;
+        c.button_up(MouseButton::Right, target).await?;
+        ensure!(c.layers()? == 0, "the secondary press outside left {} layers open (it reached the target)", c.layers()?);
+        ensure!(c.focused_name("open-dialog")?, "focus didn't return after the secondary press");
+        Ok(())
+    }
+
+    /// The spec's scenario: a press on the trigger opens the menu (its
+    /// release, where it began, leaves it open), and a second press closes
+    /// it without reopening it on the release.
+    async fn dropdown_trigger_toggles(c: &mut Checker) -> Check {
+        c.reveal("dropdown").await?;
+        let at = center(dropdown_trigger(c, Which::Dropdown)?);
+        let before = menu_log(c)?;
+        c.press(at).await?;
+        ensure!(c.layers()? == 1 && open_menu(c, Which::Dropdown)?.is_some(), "the first press didn't leave the menu open");
+        let highlight = menu_highlight(c, Which::Dropdown)?;
+        ensure!(highlight.is_none(), "the press opened the menu highlighting {highlight:?}");
+        c.press(at).await?;
+        ensure!(c.layers()? == 0, "the second press didn't close the menu");
+        c.tick().await;
+        ensure!(c.layers()? == 0, "the menu reopened after the second press");
+        ensure!(c.focused_name("dropdown-trigger")?, "focus isn't on the trigger after the menu closed");
+        ensure!(menu_log(c)? == before, "the presses selected {:?}", &menu_log(c)?[before.len()..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: press the trigger, move onto the third item and
+    /// release. The row is found first with the menu opened by key.
+    async fn dropdown_drag_selects(c: &mut Checker) -> Check {
+        c.reveal("dropdown").await?;
+        let trigger = dropdown_trigger(c, Which::Dropdown)?;
+        c.focus("dropdown-trigger").await?;
+        c.key("down").await?;
+        let row = center(entry_bounds(c, Which::Dropdown, 2)?);
+        c.key("escape").await?;
+        ensure!(c.layers()? == 0, "escape didn't close the menu opened to find the row");
+        let before = menu_log(c)?.len();
+        c.drag(center(trigger), row).await?;
+        ensure!(c.layers()? == 0, "the release on tmux didn't close the menu");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["dropdown:tmux"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("dropdown-trigger")?, "focus didn't return to the trigger");
+        Ok(())
+    }
+
+    /// Enter opens the menu and enter selects; the key-up that follows,
+    /// with focus back on the trigger, doesn't open it again.
+    async fn dropdown_enter_keyup(c: &mut Checker) -> Check {
+        let before = menu_log(c)?.len();
+        c.focus("dropdown-trigger").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 1, "enter didn't open the menu");
+        c.key("down").await?;
+        c.key("enter").await?;
+        ensure!(c.layers()? == 0, "enter didn't select and close");
+        let log = menu_log(c)?;
+        ensure!(log[before..] == ["dropdown:bash"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("dropdown-trigger")?, "focus didn't return to the trigger");
+        if !c.key_up("enter").await? {
+            return Err(Failure::Skip(NO_KEY_UP.to_string()));
+        }
+        ensure!(c.layers()? == 0, "the enter key-up reopened the menu");
+        Ok(())
+    }
+
+    // ---- tabs ----
+
+    use brindle_ui::set_modality;
+
+    fn tabs_of(c: &mut Checker, name: &'static str) -> Result<super::TabsDemo, Failure> {
+        c.with(move |gallery, _, _| gallery.tabs_demo(name).clone())
+    }
+
+    fn tab_active(c: &mut Checker, name: &'static str) -> Result<usize, Failure> {
+        Ok(tabs_of(c, name)?.active)
+    }
+
+    fn tab_labels(c: &mut Checker, name: &'static str) -> Result<Vec<String>, Failure> {
+        Ok(tabs_of(c, name)?.tabs.iter().map(|tab| tab.label.to_string()).collect())
+    }
+
+    fn tab_log(c: &mut Checker) -> Result<Vec<String>, Failure> {
+        c.with(|gallery, _, _| gallery.tab_log.clone())
+    }
+
+    /// The check's precondition: trigger `ix` of `name` is the active one.
+    async fn set_tab_active(c: &mut Checker, name: &'static str, ix: usize) -> Check {
+        c.with(move |gallery, _, cx| gallery.set_tab_active(name, ix, cx))?;
+        c.tick().await;
+        Ok(())
+    }
+
+    /// Where trigger `ix` of `name` is laid out, scrolled into view.
+    async fn trigger(c: &mut Checker, name: &str, ix: usize) -> Result<Bounds<Pixels>, Failure> {
+        c.reveal(&format!("tab:{name}:{ix}")).await
+    }
+
+    /// The spec's scenario: focus on the second of four triggers, right
+    /// makes the third active, and focus stays on the list, which is focus
+    /// on the active trigger. The key counts as keyboard input, so the ring
+    /// shows.
+    async fn tabs_arrow_activates(c: &mut Checker) -> Check {
+        set_tab_active(c, "plain", 1).await?;
+        c.focus("tabs-plain").await?;
+        c.with(|_, window, cx| set_modality(window, Modality::Pointer, cx))?;
+        let before = tab_log(c)?.len();
+        c.key("right").await?;
+        let active = tab_active(c, "plain")?;
+        ensure!(active == 2, "right on the second of four made trigger {active} active, not the third");
+        ensure!(c.focused_name("tabs-plain")?, "focus left the list");
+        ensure!(c.modality()? == Modality::Keyboard, "right didn't count as keyboard input (no ring would show)");
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["plain:activate:2:keyboard"], "the owner heard {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: right on the last trigger comes round to the
+    /// first, and left goes back round to the last.
+    async fn tabs_wrap(c: &mut Checker) -> Check {
+        set_tab_active(c, "plain", 3).await?;
+        c.focus("tabs-plain").await?;
+        c.key("right").await?;
+        let active = tab_active(c, "plain")?;
+        ensure!(active == 0, "right on the last trigger made {active} active, not the first");
+        ensure!(c.focused_name("tabs-plain")?, "focus left the list");
+        c.key("left").await?;
+        let active = tab_active(c, "plain")?;
+        ensure!(active == 3, "left on the first trigger made {active} active, not the last");
+        Ok(())
+    }
+
+    /// The spec's scenario: the next trigger (Billing) is disabled, so
+    /// right makes the one after it active; left skips it on the way back.
+    async fn tabs_disabled_skipped(c: &mut Checker) -> Check {
+        set_tab_active(c, "default", 1).await?;
+        c.focus("tabs-default").await?;
+        let before = tab_log(c)?.len();
+        c.key("right").await?;
+        let active = tab_active(c, "default")?;
+        ensure!(active == 3, "right past the disabled Billing made {active} active, not Settings");
+        c.key("left").await?;
+        let active = tab_active(c, "default")?;
+        ensure!(active == 1, "left past the disabled Billing made {active} active, not Password");
+        let log = tab_log(c)?;
+        ensure!(
+            log[before..] == ["default:activate:3:keyboard", "default:activate:1:keyboard"],
+            "the owner heard {:?}",
+            &log[before..]
+        );
+        Ok(())
+    }
+
+    /// Home and PageUp go to the first trigger, end and PageDown to the
+    /// last (Radix's roving focus); up, down, modified arrows, enter, space
+    /// and escape change nothing and leave focus on the list.
+    async fn tabs_home_end(c: &mut Checker) -> Check {
+        set_tab_active(c, "plain", 1).await?;
+        c.focus("tabs-plain").await?;
+        for (key, expected) in [("end", 3), ("home", 0), ("pagedown", 3), ("pageup", 0)] {
+            c.key(key).await?;
+            let active = tab_active(c, "plain")?;
+            ensure!(active == expected, "{key} made {active} active, not {expected}");
+        }
+        let before = tab_log(c)?.len();
+        for key in ["up", "down", "shift-right", "ctrl-right", "alt-left", "shift-end", "enter", "space", "escape"] {
+            c.key(key).await?;
+            let active = tab_active(c, "plain")?;
+            ensure!(active == 0, "{key} made {active} active");
+            ensure!(c.focused_name("tabs-plain")?, "{key} moved focus off the list");
+        }
+        let log = tab_log(c)?;
+        ensure!(log.len() == before, "the other keys asked for {:?}", &log[before..]);
+        Ok(())
+    }
+
+    /// Each list is one keyboard stop: Tab goes from list to list (not from
+    /// trigger to trigger) and on past the last; shift-Tab comes back.
+    async fn tabs_one_stop(c: &mut Checker) -> Check {
+        c.focus("toggle").await?;
+        for name in ["tabs-default", "tabs-plain", "tabs-strip", "corner-0"] {
+            c.key("tab").await?;
+            ensure!(c.focused_name(name)?, "Tab didn't move on to {name}");
+        }
+        c.key("shift-tab").await?;
+        ensure!(c.focused_name("tabs-strip")?, "shift-Tab didn't come back to the strip list");
+        Ok(())
+    }
+
+    /// The long nvim title is cut at the 15rem maximum, the tmux tab keeps
+    /// its own width between the limits, and the crowded list's triggers
+    /// shrink to the 5rem minimum.
+    async fn tabs_widths(c: &mut Checker) -> Check {
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let limits = super::demo_tab_width();
+        let (min, max) = (limits.min().0 * rem, limits.max().0 * rem);
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let long = f32::from(trigger(c, "strip", 1).await?.size.width);
+        ensure!(close(long, max), "the long title's trigger is {long}px wide, not the {max}px maximum");
+        let tmux = f32::from(trigger(c, "strip", 2).await?.size.width);
+        ensure!(tmux > min + 0.5 && tmux < max - 0.5, "the tmux trigger is {tmux}px wide, not its own width within {min}..{max}");
+        for ix in 0..6 {
+            let width = f32::from(trigger(c, "crowded", ix).await?.size.width);
+            ensure!(close(width, min), "crowded trigger {ix} is {width}px wide, not the {min}px minimum");
+        }
+        Ok(())
+    }
+
+    /// Tabbed to, the list rings its active trigger, and nothing else; the
+    /// ring goes when Tab moves on. Round the triggers is the pill's muted
+    /// padding.
+    async fn tabs_ring(c: &mut Checker) -> Check {
+        set_tab_active(c, "plain", 1).await?;
+        c.focus("tabs-default").await?;
+        c.key("tab").await?;
+        ensure!(c.focused_name("tabs-plain")?, "Tab didn't reach the plain list");
+        let (background, ring) = c.with(|_, _, cx| {
+            // The muted token is opaque.
+            let t = cx.ui_theme();
+            (over(t.muted, t.background), over(brindle_ui::focus_ring(t), t.muted))
+        })?;
+        let (active, other) = (trigger(c, "plain", 1).await?, trigger(c, "plain", 0).await?);
+        let above = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() - px(1.5));
+        let shown = c.pixels(&[above(active), above(other)]).await?;
+        ensure!(near(shown[0], ring), "above the active trigger shows {:?}, not the ring {ring:?}", shown[0]);
+        ensure!(near(shown[1], background), "an inactive trigger shows a ring ({:?})", shown[1]);
+        c.key("tab").await?;
+        let after = c.pixel(above(active)).await?;
+        ensure!(near(after, background), "the ring stayed after Tab moved on ({after:?})");
+        Ok(())
+    }
+
+    /// The spec's scenarios: a trigger given owner colours is drawn on its
+    /// surface in its text colour whether active or not (bash `#c0caf5` on
+    /// `#1a1b26`), with no line along its top; a trigger without colours of
+    /// its own is active on the pill's raised background and inactive on
+    /// the muted list; the first, no longer active, keeps its surface and
+    /// its text colour (at 60%).
+    async fn tabs_owner_colours(c: &mut Checker) -> Check {
+        pointer_away(c).await?;
+        set_tab_active(c, "strip", 0).await?;
+        let (raised, muted, primary) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            let tab = brindle_ui::tab_style(true, Default::default(), t);
+            let raised = tab.background.map_or(over(t.muted, t.background), |b| over(b, t.muted));
+            (raised, over(t.muted, t.background), over(t.primary, t.background))
+        })?;
+        let (bash_surface, bash_text, nvim_surface) = ([0x1a, 0x1b, 0x26], [0xc0, 0xca, 0xf5], [0xfd, 0xf6, 0xe3]);
+        // How light a pixel is, and the lightest a label's glyphs get: the
+        // text colour where they cover a pixel, 60% of it over the surface
+        // while inactive. Edges blend towards the surface, so the label is
+        // judged by its lightest pixel.
+        let light = |p: [u8; 3]| p.iter().map(|&c| c as u32).sum::<u32>();
+        let dim = (light(bash_text) as f32 * 0.6 + light(bash_surface) as f32 * 0.4) as u32;
+        let lightest = |row: &[[u8; 3]]| row.iter().copied().map(light).max().unwrap_or(0);
+        let inside = |bounds: Bounds<Pixels>| point(bounds.left() + px(6.), bounds.bottom() - px(4.));
+        let top = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() + px(1.5));
+        // The label's pixels: a row through the text's middle, from the left
+        // padding to the trigger's middle.
+        let label_row = |bounds: Bounds<Pixels>| -> Vec<Point<Pixels>> {
+            let (left, right) = (f32::from(bounds.left()) + 8., f32::from(bounds.center().x));
+            (0..((right - left) as usize)).map(|dx| point(px(left + dx as f32), bounds.center().y)).collect()
+        };
+        let (bash, nvim) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 1).await?);
+        let shown = c.pixels(&[inside(bash), top(bash), inside(nvim), top(nvim)]).await?;
+        ensure!(near(shown[0], bash_surface), "the active trigger's surface is {:?}, not #1a1b26", shown[0]);
+        ensure!(near(shown[1], bash_surface), "the active trigger's top edge is {:?}, not its surface (a line?)", shown[1]);
+        ensure!(near(shown[2], nvim_surface), "an inactive trigger with a surface is drawn on {:?}, not #fdf6e3", shown[2]);
+        ensure!(!near(shown[3], primary) && near(shown[3], nvim_surface), "an inactive trigger's top edge is {:?}", shown[3]);
+        let text = lightest(&c.pixels(&label_row(bash)).await?);
+        ensure!(text > dim + 24, "the active bash label is at most {text} light, not #c0caf5 at full opacity (60% is {dim})");
+        // The close button's X crosses at its centre, in the text colour:
+        // judged by the lightest pixel of the 3x3 round the centre, since
+        // where the centre falls on the pixel grid depends on the display
+        // scale and the strokes' edges blend towards the surface (Windows
+        // measured a 75% blend on the one pixel this used to read).
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let centre = close_button(bash, rem);
+        let around: Vec<Point<Pixels>> =
+            (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| point(centre.x + px(dx as f32), centre.y + px(dy as f32)))).collect();
+        let x = lightest(&c.pixels(&around).await?);
+        ensure!(
+            x > dim + 24,
+            "the active bash close button's X is at most {x} light, not #c0caf5 at full opacity (60% is {dim})"
+        );
+        set_tab_active(c, "strip", 2).await?;
+        let (bash, tmux) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 2).await?);
+        let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash), top(bash)]).await?;
+        ensure!(near(shown[0], raised), "a trigger without colours is active on {:?}, not the raised pill {raised:?}", shown[0]);
+        ensure!(near(shown[1], raised), "its top edge is {:?}, not the raised pill (a line?)", shown[1]);
+        ensure!(near(shown[2], bash_surface), "the inactive bash trigger lost its surface ({:?})", shown[2]);
+        ensure!(near(shown[3], bash_surface), "the inactive bash trigger's top edge is {:?}", shown[3]);
+        let text = lightest(&c.pixels(&label_row(bash)).await?);
+        ensure!(
+            text <= dim + 12 && text > light(bash_surface) + 120,
+            "the inactive bash label is at most {text} light, not #c0caf5 at 60% ({dim})"
+        );
+        let below = c.pixel(point(bash.center().x, bash.bottom() + px(1.5))).await?;
+        ensure!(near(below, muted), "the list round the triggers is {below:?}, not the muted pill {muted:?}");
+        Ok(())
+    }
+
+    /// A primary press activates the trigger (and tells the owner it was the
+    /// pointer) without moving focus: not to the list, not to the gallery
+    /// around it. A press in the list's padding does nothing.
+    async fn tabs_press_activates(c: &mut Checker) -> Check {
+        set_tab_active(c, "plain", 1).await?;
+        let at = center(trigger(c, "plain", 3).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        let active = tab_active(c, "plain")?;
+        ensure!(active == 3, "a press on Notifications made {active} active");
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["plain:activate:3:pointer"], "the owner heard {:?}", &log[before..]);
+        ensure!(c.focused_name("toggle")?, "the press moved focus off the toggle");
+        ensure!(!c.focused_name("tabs-plain")?, "the press focused the list");
+        ensure!(c.modality()? == Modality::Pointer, "the press didn't set the pointer modality");
+        let list = c.recorded("tabs:plain")?;
+        c.press(point(list.left() + px(1.5), list.center().y)).await?;
+        ensure!(tab_active(c, "plain")? == 3, "a press in the list's padding changed the active trigger");
+        ensure!(tab_log(c)?.len() == before + 1, "a press in the list's padding asked for something");
+        ensure!(c.focused_name("toggle")?, "a press in the list's padding moved focus");
+        Ok(())
+    }
+
+    async fn tabs_disabled_press(c: &mut Checker) -> Check {
+        set_tab_active(c, "default", 1).await?;
+        let at = center(trigger(c, "default", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        ensure!(tab_active(c, "default")? == 1, "a press on the disabled Billing activated it");
+        ensure!(tab_log(c)?.len() == before, "a press on a disabled trigger asked for something");
+        ensure!(c.focused_name("toggle")?, "a press on a disabled trigger moved focus");
+        Ok(())
+    }
+
+    /// The centre of the close button of trigger `bounds`: an `IconXs`
+    /// button (1.5rem) against the trigger's 0.25rem right padding.
+    fn close_button(bounds: Bounds<Pixels>, rem: f32) -> Point<Pixels> {
+        point(bounds.right() - px(rem), bounds.center().y)
+    }
+
+    /// The spec's scenario: a press on an inactive trigger's close button
+    /// (shown under the pointer) asks to close it and doesn't activate it;
+    /// the active trigger's button closes it too.
+    async fn tabs_close_button(c: &mut Checker) -> Check {
+        set_tab_active(c, "strip", 0).await?;
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let labels = tab_labels(c, "strip")?;
+        let at = close_button(trigger(c, "strip", 1).await?, rem);
+        c.hover(at).await?;
+        c.tick().await;
+        let before = tab_log(c)?.len();
+        c.press(at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["strip:close:1"], "the close button's press made the owner hear {:?}", &log[before..]);
+        let mut expected = labels.clone();
+        expected.remove(1);
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after closing the second", tab_labels(c, "strip")?);
+        ensure!(tab_active(c, "strip")? == 0, "closing the second tab changed the active one");
+        let at = close_button(trigger(c, "strip", 0).await?, rem);
+        c.press(at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before + 1..] == ["strip:close:0"], "the active trigger's close button made the owner hear {:?}", &log[before + 1..]);
+        Ok(())
+    }
+
+    /// The spec's scenario: a middle press on a closable trigger asks to
+    /// close it; on a trigger that doesn't close it does nothing, and
+    /// neither moves focus.
+    async fn tabs_middle_click(c: &mut Checker) -> Check {
+        set_tab_active(c, "strip", 0).await?;
+        let labels = tab_labels(c, "strip")?;
+        let at = center(trigger(c, "strip", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Middle, at).await?;
+        c.button_up(MouseButton::Middle, at).await?;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["strip:close:2"], "the middle press made the owner hear {:?}", &log[before..]);
+        let mut expected = labels.clone();
+        expected.remove(2);
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after the middle press", tab_labels(c, "strip")?);
+        ensure!(c.focused_name("toggle")?, "the middle press moved focus");
+        let at = center(trigger(c, "plain", 0).await?);
+        c.button_down(MouseButton::Middle, at).await?;
+        c.button_up(MouseButton::Middle, at).await?;
+        ensure!(tab_log(c)?.len() == before + 1, "a middle press on a trigger that doesn't close asked for something");
+        ensure!(tabs_of(c, "plain")?.tabs.len() == 4, "a middle press closed a trigger that doesn't close");
+        ensure!(c.focused_name("toggle")?, "the middle press on the plain list moved focus");
+        Ok(())
+    }
+
+    /// A secondary press on a trigger of a list with `on_context_menu` asks
+    /// its owner for that trigger's menu, which the gallery opens at the
+    /// pointer: nothing is activated or closed, the release within 10px
+    /// leaves the menu open, and escape gives focus back. On a list without
+    /// the handler the press asks for nothing.
+    async fn tabs_context_menu(c: &mut Checker) -> Check {
+        set_tab_active(c, "strip", 0).await?;
+        let at = center(trigger(c, "strip", 2).await?);
+        c.focus("toggle").await?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Right, at).await?;
+        c.tick().await;
+        let log = tab_log(c)?;
+        ensure!(log[before..] == ["strip:menu:2"], "the secondary press made the owner hear {:?}", &log[before..]);
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the secondary press opened no menu");
+        let bounds = menu_bounds(c, Which::Context)?;
+        ensure!(
+            close_to(bounds.left(), at.x) && close_to(bounds.top(), at.y),
+            "the menu's corner is at {:?}, not the pointer's {at:?}",
+            bounds.origin
+        );
+        c.button_up(MouseButton::Right, at).await?;
+        ensure!(open_menu(c, Which::Context)?.is_some(), "the release of the opening press closed the menu");
+        ensure!(tab_active(c, "strip")? == 0, "the secondary press activated a trigger");
+        c.key("escape").await?;
+        ensure!(open_menu(c, Which::Context)?.is_none(), "escape left the menu open");
+        ensure!(c.focused_name("toggle")?, "escape didn't give focus back to the toggle");
+        let at = center(trigger(c, "plain", 0).await?);
+        c.button_down(MouseButton::Right, at).await?;
+        c.button_up(MouseButton::Right, at).await?;
+        ensure!(tab_log(c)?.len() == before + 1, "a secondary press on a list without a menu asked for something");
+        ensure!(open_menu(c, Which::Context)?.is_none(), "a secondary press on a list without a menu opened one");
+        Ok(())
+    }
+
+    /// The spec's scenario: the first trigger dragged onto the third asks
+    /// to move it to the third place, and while it is over the third a
+    /// primary bar on that trigger's right marks where it will land.
+    async fn tabs_drag(c: &mut Checker) -> Check {
+        set_tab_active(c, "strip", 0).await?;
+        let labels = tab_labels(c, "strip")?;
+        let from = center(trigger(c, "strip", 0).await?);
+        // Near the third trigger's left edge, so the preview, which keeps the
+        // pointer where it pressed the first trigger, is clear of the bar on
+        // its right.
+        let target = trigger(c, "strip", 2).await?;
+        let to = point(target.left() + px(12.), target.center().y);
+        let primary = c.with(|_, _, cx| over(cx.ui_theme().primary, cx.ui_theme().primary))?;
+        let before = tab_log(c)?.len();
+        c.button_down(MouseButton::Left, from).await?;
+        c.button_move(MouseButton::Left, point(from.x + px(8.), from.y)).await?;
+        c.button_move(MouseButton::Left, to).await?;
+        let dragging = c.with(|_, _, cx| cx.has_active_drag())?;
+        // As the target is drawn now, with the bar.
+        let target = c.recorded("tab:strip:2")?;
+        let bar = c.pixel(point(target.right() - px(1.), target.center().y)).await;
+        c.button_up(MouseButton::Left, to).await?;
+        ensure!(dragging, "pressing the first trigger and moving onto the third started no drag");
+        let bar = bar?;
+        ensure!(near(bar, primary), "the third trigger's right edge shows {bar:?} while dragged over, not the primary bar");
+        let log = tab_log(c)?;
+        ensure!(
+            log[before..] == ["strip:activate:0:pointer", "strip:move:0->2"],
+            "the owner heard {:?}",
+            &log[before..]
+        );
+        let expected = vec![labels[1].clone(), labels[2].clone(), labels[0].clone(), labels[3].clone()];
+        ensure!(tab_labels(c, "strip")? == expected, "the tabs are {:?} after the drop", tab_labels(c, "strip")?);
+        ensure!(tab_active(c, "strip")? == 2, "the moved tab didn't stay active");
+        Ok(())
+    }
+
+    /// A trigger's tooltip shows after the pointer rests on it.
+    async fn tabs_tooltip(c: &mut Checker) -> Check {
+        set_tab_active(c, "strip", 0).await?;
+        let at = center(trigger(c, "strip", 1).await?);
+        let tooltip = tooltip_colour(c)?;
+        let sample = tooltip_point(at);
+        rest(c, at).await?;
+        let shown = c.pixel(sample).await?;
+        ensure!(near(shown, tooltip), "resting on a trigger showed {shown:?} at {sample:?}, not the tooltip {tooltip:?}");
         Ok(())
     }
 }

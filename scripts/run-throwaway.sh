@@ -2,10 +2,12 @@
 # Runs Brindle with throwaway state, for trying a build by hand without
 # touching your real config, saved session or terminal server:
 #
-#   scripts/run-throwaway                      # a default config
-#   scripts/run-throwaway --config FILE        # start from a copy of FILE
-#   scripts/run-throwaway --keep               # keep the directory afterwards
-#   scripts/run-throwaway -- -d /tmp           # arguments after -- go to brindle
+#   scripts/run-throwaway.sh                   # a default config
+#   scripts/run-throwaway.sh --config FILE     # start from a copy of FILE
+#   scripts/run-throwaway.sh --keep            # keep the directory afterwards
+#   scripts/run-throwaway.sh -- -d /tmp        # arguments after -- go to brindle
+#
+# On Windows use scripts/run-throwaway.ps1.
 #
 # It makes a private directory (under /tmp, since the terminal server's
 # socket paths have a 108-byte limit) and points BRINDLE_CONFIG,

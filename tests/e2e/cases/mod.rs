@@ -18,6 +18,7 @@ mod multi_window;
 mod restore;
 mod notify;
 mod palette;
+mod profile_menu;
 mod reattach;
 mod remote;
 mod reload;
@@ -28,9 +29,12 @@ mod settings;
 mod shell;
 mod status;
 mod styles;
+mod tab_menu;
+mod tabs;
 mod titles;
 mod tmux;
 mod windows;
+mod zone_menu;
 mod zones;
 
 use crate::capture::Cells;
@@ -88,6 +92,7 @@ fn unix() -> Vec<Case> {
         display("styles-tint", styles::tint),
         display("styles-active-pane", styles::active_pane),
         display("styles-borders", styles::borders),
+        display("styles-chrome-fallback", styles::chrome_fallback),
         display("settings-preview", settings::preview),
         display("settings-cancel", settings::cancel),
         display("settings-apply", settings::apply),
@@ -150,6 +155,7 @@ fn unix() -> Vec<Case> {
         display("search-step", search::step),
         display("search-long-query", search::long_query),
         display("search-input-selection", search::input_selection),
+        display("search-invalid-regex", search::invalid_regex),
         display("search-close-restores", search::close_restores),
         display("search-tmux-pane", search::tmux_pane),
         display("reattach-alt-screen", reattach::alt_screen),
@@ -165,6 +171,7 @@ fn unix() -> Vec<Case> {
         display("palette-wrap", palette::wrap),
         display("palette-home-end", palette::home_end),
         display("palette-prompt-focus", palette::prompt_focus),
+        display("palette-fits-window", palette::fits_window),
         display("commands-break-pane", commands::break_pane),
         display("commands-layouts", commands::layouts),
         display("commands-rotate-swap", commands::rotate_swap),
@@ -176,6 +183,21 @@ fn unix() -> Vec<Case> {
         display("zones-split-and-focus", zones::split_and_focus),
         display("zones-close", zones::close),
         display("zones-restore", zones::restore),
+        display("zones-header-colors", zones::header_colors),
+        display("tabs-strip-colors", tabs::strip_colors),
+        display("tabs-strip-keys", tabs::strip_keys),
+        display("tabs-actions-keep-focus", tabs::actions_keep_focus),
+        display("profile-menu-items", profile_menu::items),
+        display("profile-menu-pick", profile_menu::pick),
+        display("profile-menu-shown", profile_menu::shown),
+        display("profile-menu-palette-exclusive", profile_menu::palette_exclusive),
+        display("tab-menu-items", tab_menu::items),
+        display("tab-menu-choose", tab_menu::choose),
+        display("tab-menu-exclusive", tab_menu::exclusive),
+        display("tab-menu-tmux", tab_menu::tmux),
+        display("zone-menu-items", zone_menu::items),
+        display("zone-menu-choose", zone_menu::choose),
+        display("zone-menu-too-small", zone_menu::too_small),
         display("local-server-session", local_server::session),
         display("local-server-close", local_server::close),
         display("local-server-quit", local_server::quit),
