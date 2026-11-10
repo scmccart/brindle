@@ -173,24 +173,29 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// (maximizing) and a press on maximize (restoring), which it does only when
 /// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels: the strip is 38 high; the buttons are 24 wide (the
-    // `IconXs` button size), 4 apart, 8 from the right edge, and centered
-    // in it; tabs sit at the bottom, 11 in (the strip's and the list's
-    // padding), at least 80 wide.
+    // Logical pixels: the strip is 37 high (the 36px tab list and a 1px
+    // border); the caption buttons are 24 wide (the `IconXs` button size),
+    // 4 apart, 8 from the right edge, and centered in the list's 36px.
+    // Left of them, the split and find buttons take 84 (three 24px buttons
+    // 2 apart, 4 of padding each side), so empty space starts 172 from the
+    // right. Tabs are 3 below the top, 30 high, 11 in (the strip's and the
+    // list's padding), at least 80 wide.
     let points = [
-        ("close", -(8.0 + 12.0), 19.0),
-        ("max", -(8.0 + 24.0 + 4.0 + 12.0), 19.0),
-        ("min", -(8.0 + 2.0 * (24.0 + 4.0) + 12.0), 19.0),
-        ("strip", -(8.0 + 3.0 * 24.0 + 2.0 * 4.0 + 60.0), 19.0),
-        ("tab", 48.0, 23.0),
+        ("close", -(8.0 + 12.0), 18.0),
+        ("max", -(8.0 + 24.0 + 4.0 + 12.0), 18.0),
+        ("min", -(8.0 + 2.0 * (24.0 + 4.0) + 12.0), 18.0),
+        // The find button, the rightmost of the three: client area.
+        ("find", -(8.0 + 3.0 * 24.0 + 2.0 * 4.0 + 4.0 + 12.0), 18.0),
+        ("strip", -(8.0 + 3.0 * 24.0 + 2.0 * 4.0 + 84.0 + 60.0), 18.0),
+        ("tab", 48.0, 18.0),
     ];
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
     let probe = move |pid| caption_probe(pid, scale, &points);
     let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some((2.5, &probe)))?;
-    // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT.
-    let expected = "close=20 max=9 min=8 strip=2 tab=1 double-click=maximized maximize=windowed";
+    // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCLIENT, HTCAPTION, HTCLIENT.
+    let expected = "close=20 max=9 min=8 find=1 strip=2 tab=1 double-click=maximized maximize=windowed";
     ensure!(ran.during == expected, "caption at scale {scale}: {} (want {expected})", ran.during);
     Ok(Outcome::Pass)
 }

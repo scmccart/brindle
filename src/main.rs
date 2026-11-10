@@ -41,7 +41,7 @@ use crate::config::Config;
 use crate::latency::Latency;
 use crate::settings::Settings;
 use crate::session::{SessionStore, WindowState};
-use crate::workspace::{Launch, LaunchRequest, Workspace};
+use crate::workspace::{Launch, LaunchRequest, StripButton, Workspace};
 
 const HELP: &str = "\
 Brindle — a GPU-accelerated terminal
@@ -85,6 +85,8 @@ DEBUGGING:
         --hover [MODS-]COL,ROW   Move the mouse over a cell of the active terminal
                                  (e.g. ctrl-3,0); in-process, not OS input
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
+        --strip-button <NAME>    Press the strip's split-right, split-down or find
+                                 button; in-process, not OS input
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
         --wait-for <TEXT>        Hold the later steps until the active terminal shows
                                  TEXT (\\n = a line break), for at most 30s
@@ -123,6 +125,9 @@ enum Step {
     /// as after a pointer press on a control (`pointer`) or a key press
     /// (`keyboard`); it decides whether focus rings show.
     Modality(brindle_ui::Modality),
+    /// `--strip-button`: a press on one of the strip's tab action buttons,
+    /// through the handler its click runs (nothing when it is disabled).
+    StripButton(StripButton),
 }
 
 /// How long a `--wait-for` step waits before giving up.
@@ -261,6 +266,10 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
                 Some("pointer") => args.steps.push(Step::Modality(brindle_ui::Modality::Pointer)),
                 Some("keyboard") => args.steps.push(Step::Modality(brindle_ui::Modality::Keyboard)),
                 _ => usage_error("--modality needs pointer or keyboard"),
+            },
+            "--strip-button" => match it.next().as_deref().and_then(StripButton::parse) {
+                Some(button) => args.steps.push(Step::StripButton(button)),
+                None => usage_error("--strip-button needs split-right, split-down or find"),
             },
             "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
@@ -747,6 +756,7 @@ fn main() {
                         Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
                         Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
                         Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
+                        Step::StripButton(button) => ws.press_strip_button(*button, window, cx),
                         Step::WaitFor(_) | Step::Key(_) => {}
                     })
                     .ok();
@@ -868,9 +878,22 @@ mod tests {
     #[test]
     fn debug_options_make_a_debug_run() {
         assert!(!parse(&["-p", "tmux", "-e", "htop"]).is_debug_run());
-        for args in [&["--send", "x"][..], &["--action", "new_tab"], &["--dump-screen-after", "2"], &["--latency-bench", "5"]] {
+        for args in [
+            &["--send", "x"][..],
+            &["--action", "new_tab"],
+            &["--dump-screen-after", "2"],
+            &["--latency-bench", "5"],
+            &["--strip-button", "find"],
+        ] {
             assert!(parse(args).is_debug_run(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn strip_button_steps_name_a_button() {
+        let args = parse(&["--strip-button", "split-right", "--strip-button", "split-down", "--strip-button", "find"]);
+        let steps: Vec<String> = args.steps.iter().map(|s| format!("{s:?}")).collect();
+        assert_eq!(steps, ["StripButton(SplitRight)", "StripButton(SplitDown)", "StripButton(Find)"]);
     }
 
     #[test]

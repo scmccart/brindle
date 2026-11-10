@@ -656,7 +656,7 @@ impl ZoneTreeView {
         // and the zone's normalized rectangle.
         let (_, rect) = self.tree.rects().into_iter().find(|(zid, _)| *zid == id)?;
         let win_size = window.inner_window_bounds().get_bounds().size;
-        let content_h = (f32::from(win_size.height) - 38.0).max(0.0);
+        let content_h = (f32::from(win_size.height) - crate::workspace::TAB_BAR_HEIGHT).max(0.0);
         Some(size(px(f32::from(win_size.width) * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
@@ -669,6 +669,12 @@ impl ZoneTreeView {
         self.zone_outer_size(id, window, cx).is_none_or(|zone_size| {
             can_split_zone(zone_size, has_header, axis, padding, metrics.cell_width, metrics.line_height)
         })
+    }
+
+    /// [`ZoneTreeView::can_split`] for the active zone (the strip's split
+    /// buttons).
+    pub fn can_split_active(&self, axis: SplitAxis, window: &Window, cx: &App) -> bool {
+        self.can_split(self.active, axis, window, cx)
     }
 
     /// Focuses zone `id`, then asks the window for its header menu at `at`

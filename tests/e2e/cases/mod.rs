@@ -187,6 +187,7 @@ fn unix() -> Vec<Case> {
         display("tabs-strip-colors", tabs::strip_colors),
         display("tabs-strip-keys", tabs::strip_keys),
         display("tabs-actions-keep-focus", tabs::actions_keep_focus),
+        display("tabs-strip-buttons", tabs::strip_buttons),
         display("profile-menu-items", profile_menu::items),
         display("profile-menu-pick", profile_menu::pick),
         display("profile-menu-shown", profile_menu::shown),

@@ -40,9 +40,12 @@ use crate::theme::Theme;
 use crate::tmux::protocol::WindowId;
 use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
 use crate::tmux_view::TmuxWindowView;
-use crate::zone_view::{ZoneMenuRequest, ZoneTreeView};
+use crate::zone_view::{SplitAxis, ZoneMenuRequest, ZoneTreeView};
 
-const TAB_BAR_HEIGHT: f32 = 38.0;
+/// The tab strip's height in logical pixels: the `Line` tab list's
+/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default 16px rem) and the
+/// 1px border under it.
+pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16.0 + 1.0;
 const RESIZE_BORDER: f32 = 6.0;
 
 pub enum TabContent {
@@ -154,14 +157,16 @@ impl Tab {
         }
     }
 
-    /// The tab's terminal background and foreground, which its face in the
-    /// strip takes while it is active, so it joins the terminal below.
-    fn terminal_colors(&self, cx: &App) -> (Hsla, Hsla) {
+    /// The colours of the tab's face in the strip, active or not: its
+    /// terminal's background (the face's surface) and foreground (its
+    /// text), and its theme's accent (the active face's top line). A tmux
+    /// tab's panes share the window view's theme.
+    fn face_colors(&self, cx: &App) -> (Hsla, Hsla, Hsla) {
         let theme = match &self.content {
             TabContent::Zones(view) => &view.read(cx).theme,
             TabContent::Tmux { view, .. } => &view.read(cx).theme,
         };
-        (theme.background.hsla(), theme.foreground.hsla())
+        (theme.background.hsla(), theme.foreground.hsla(), theme.accent().hsla())
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
@@ -1669,6 +1674,47 @@ impl Workspace {
         window.dispatch_action(action, cx);
     }
 
+    /// Whether a strip button acts on the active tab: a split button of a
+    /// local tab only while its active zone can be split along that axis
+    /// ([`ZoneTreeView::can_split_active`]); tmux splits and find always.
+    fn strip_button_enabled(&self, button: StripButton, window: &Window, cx: &App) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else { return false };
+        let axis = match button {
+            StripButton::SplitRight => SplitAxis::Horizontal,
+            StripButton::SplitDown => SplitAxis::Vertical,
+            StripButton::Find => return true,
+        };
+        match &tab.content {
+            TabContent::Zones(view) => view.read(cx).can_split_active(axis, window, cx),
+            TabContent::Tmux { .. } => true,
+        }
+    }
+
+    /// A press on a strip button (or `--strip-button`): unless it is
+    /// disabled, the active tab's terminal takes focus and the button's
+    /// action runs from there, exactly as its keybinding would (as a tab
+    /// menu item's does).
+    pub fn press_strip_button(&mut self, button: StripButton, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.strip_button_enabled(button, window, cx) {
+            return;
+        }
+        let Some(is_tmux) = self.tabs.get(self.active).map(Tab::is_tmux) else { return };
+        self.focus_active_tab(window, cx);
+        cx.notify();
+        window.dispatch_action(button.action(is_tmux), cx);
+    }
+
+    /// The strip's tab action buttons for `--dump-screen-after`: `--- strip
+    /// buttons=A|[B]|C` (disabled ones in brackets), then a `--- strip
+    /// tip=…` line per button with its tooltip as palette rows print:
+    /// `label  [keys]`.
+    fn describe_strip(&self, window: &Window, cx: &App) -> String {
+        let is_tmux = self.tabs.get(self.active).is_some_and(Tab::is_tmux);
+        let enabled = StripButton::ALL.map(|b| self.strip_button_enabled(b, window, cx));
+        let tips = StripButton::ALL.map(|b| (b.label(), tab_shortcut(&*b.action(is_tmux), is_tmux, cx)));
+        strip_lines(&enabled, &tips)
+    }
+
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_palette_toggling(|k| matches!(k, PaletteKind::Commands { .. }), window, cx) {
             return;
@@ -2170,6 +2216,7 @@ impl Workspace {
                 if ix == self.active { " (active)" } else { "" }
             ));
         }
+        out.push_str(&self.describe_strip(window, cx));
         if let Some(terminal) = self.tabs.get(self.active).and_then(|t| t.active_terminal(cx)) {
             let terminal = terminal.read(cx);
             let size = terminal.size();
@@ -2246,16 +2293,18 @@ impl Workspace {
     // ---- rendering --------------------------------------------------------------
 
     /// The tab strip, which is also the window's title bar: a `TabList` in
-    /// the `Attached` variant, the new-tab and profile buttons, the caption
-    /// (empty space) and, with client decorations, the window controls.
+    /// shadcn's `Line` variant, the new-tab and profile buttons, the caption
+    /// (empty space), the active tab's split and find buttons and, with
+    /// client decorations, the window controls.
     ///
     /// It is drawn in the window's chrome tokens (`cx.ui_theme()`, from the
-    /// global theme), whatever the active tab's profile theme; only the
-    /// active tab's face takes its terminal's background and foreground,
-    /// so it joins the terminal below. The strip is one keyboard stop
-    /// (`strip_focus`), reached through `FocusTabStrip`: the list takes the
-    /// arrows, home and end, and the wrapper around it enter and escape. A
-    /// press on a tab activates it and leaves focus in its terminal.
+    /// global theme), whatever the tabs' profile themes; only each tab's
+    /// face, active or not, takes its terminal's background and foreground,
+    /// and the active face's top line its theme's accent. The strip is one
+    /// keyboard stop (`strip_focus`), reached through `FocusTabStrip`: the
+    /// list takes the arrows, home and end, and the wrapper around it enter
+    /// and escape. A press on a tab activates it and leaves focus in its
+    /// terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = *cx.ui_theme();
         let decorations = window.window_decorations();
@@ -2283,14 +2332,14 @@ impl Workspace {
         let triggers: Vec<TabTrigger> = self
             .tabs
             .iter()
-            .enumerate()
-            .map(|(ix, tab)| {
-                let mut trigger =
-                    TabTrigger::new(("tab", tab.id as usize), tab.title.clone()).closable(true).close_tooltip(close_tip.clone());
-                if ix == self.active {
-                    let (surface, text) = tab.terminal_colors(cx);
-                    trigger = trigger.surface(surface).text_color(text);
-                }
+            .map(|tab| {
+                let (surface, text, line) = tab.face_colors(cx);
+                let mut trigger = TabTrigger::new(("tab", tab.id as usize), tab.title.clone())
+                    .closable(true)
+                    .close_tooltip(close_tip.clone())
+                    .surface(surface)
+                    .text_color(text)
+                    .line_color(line);
                 if tab.is_tmux() {
                     trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)).color(tokens.primary));
                 }
@@ -2363,6 +2412,23 @@ impl Workspace {
                 if event.button == MouseButton::Left {
                     this.refresh_profile_menu(window, cx);
                 }
+            }),
+        );
+
+        // The active tab's actions, between the empty space and the window
+        // controls, each in the same press-stopping wrapper: a press runs
+        // what the keymap would on the active tab (`press_strip_button`),
+        // and its tooltip names the key bound to that action there.
+        let is_tmux = self.tabs.get(self.active).is_some_and(Tab::is_tmux);
+        let enabled = StripButton::ALL.map(|b| self.strip_button_enabled(b, window, cx));
+        let tab_actions = div().flex().flex_none().h_full().items_center().gap_0p5().px_1().children(
+            StripButton::ALL.into_iter().zip(enabled).map(|(b, enabled)| {
+                let action = b.action(is_tmux);
+                let control = button(b.id(), b.icon())
+                    .disabled(!enabled)
+                    .tooltip_with(move |_, cx| Tooltip::new(b.label()).shortcut_opt(tab_shortcut(&*action, is_tmux, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.press_strip_button(b, window, cx)));
+                inert(b.press_id(), control.into_any_element())
             }),
         );
 
@@ -2471,7 +2537,7 @@ impl Workspace {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .h(px(TAB_BAR_HEIGHT - 4.0))
+                    .h_full()
                     .gap_0p5()
                     .pl_1()
                     .child(inert("new-tab-press", new_tab.into_any_element()))
@@ -2481,6 +2547,7 @@ impl Workspace {
             // the system menu and Snap. Only empty space is marked, since a
             // marked area wins over everything inside it.
             .child(div().id("caption").flex_1().h_full().when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag)))
+            .child(tab_actions)
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
     }
 
@@ -2633,6 +2700,87 @@ fn tab_menu_rows(is_tmux: bool, ix: usize, count: usize) -> Vec<ActionRow> {
         ActionRow::Separator,
         ActionRow::item(CloseTab, true),
     ]
+}
+
+/// The strip's buttons that act on the active tab, in their order there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripButton {
+    SplitRight,
+    SplitDown,
+    Find,
+}
+
+impl StripButton {
+    pub const ALL: [StripButton; 3] = [StripButton::SplitRight, StripButton::SplitDown, StripButton::Find];
+
+    /// Its name, as `--strip-button` and `--- strip` print it.
+    pub fn id(self) -> &'static str {
+        match self {
+            StripButton::SplitRight => "split-right",
+            StripButton::SplitDown => "split-down",
+            StripButton::Find => "find",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<StripButton> {
+        StripButton::ALL.into_iter().find(|b| b.id() == name)
+    }
+
+    /// Its wrapper's element id.
+    fn press_id(self) -> &'static str {
+        match self {
+            StripButton::SplitRight => "split-right-press",
+            StripButton::SplitDown => "split-down-press",
+            StripButton::Find => "find-press",
+        }
+    }
+
+    /// Its tooltip's name.
+    fn label(self) -> &'static str {
+        match self {
+            StripButton::SplitRight => "Split right",
+            StripButton::SplitDown => "Split down",
+            StripButton::Find => "Find",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            StripButton::SplitRight => Icon::Columns2,
+            StripButton::SplitDown => Icon::Rows2,
+            StripButton::Find => Icon::Search,
+        }
+    }
+
+    /// The action it runs on a local tab, or a tmux tab (`is_tmux`): the
+    /// zone splits or tmux's, and the find bar on both.
+    fn action(self, is_tmux: bool) -> Box<dyn Action> {
+        match (self, is_tmux) {
+            (StripButton::SplitRight, false) => Box::new(SplitZoneRight),
+            (StripButton::SplitDown, false) => Box::new(SplitZoneDown),
+            (StripButton::SplitRight, true) => Box::new(TmuxSplitRight),
+            (StripButton::SplitDown, true) => Box::new(TmuxSplitDown),
+            (StripButton::Find, _) => Box::new(Find),
+        }
+    }
+}
+
+/// [`Workspace::describe_strip`]'s lines, from each of [`StripButton::ALL`]'s
+/// enabled state and tooltip (its label and keys).
+fn strip_lines(enabled: &[bool; 3], tips: &[(&str, Option<SharedString>); 3]) -> String {
+    let buttons: Vec<String> = StripButton::ALL
+        .iter()
+        .zip(enabled)
+        .map(|(b, &on)| if on { b.id().to_string() } else { format!("[{}]", b.id()) })
+        .collect();
+    let mut out = format!("--- strip buttons={}\n", buttons.join("|"));
+    for (label, keys) in tips {
+        match keys {
+            Some(keys) => out.push_str(&format!("--- strip tip={label}  [{keys}]\n")),
+            None => out.push_str(&format!("--- strip tip={label}\n")),
+        }
+    }
+    out
 }
 
 /// The keys that run `action` in a terminal of a local or tmux tab, as the
@@ -3204,6 +3352,41 @@ mod tests {
         assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, false), None);
         assert_eq!(tab_keys(&keymap, &CloseTab, false), None);
         assert_eq!(tab_keys(&keymap, &MoveTabLeft, true), Some("ctrl-shift-pageup".into()));
+    }
+
+    /// The strip's tab action buttons run the zone splits on a local tab
+    /// and tmux's on a tmux tab, and find on both; their tooltips carry the
+    /// default keys from the tab's contexts (the splits are bound in
+    /// `ZoneTree` and `TmuxWindow`, find in `Terminal`, none of which the
+    /// workspace's own focus would reach).
+    #[test]
+    fn strip_buttons_act_on_the_tab() {
+        let keymap = gpui::Keymap::new(default_bindings());
+        let keys = |is_tmux: bool| StripButton::ALL.map(|b| tab_keys(&keymap, &*b.action(is_tmux), is_tmux));
+        let want = [Some("ctrl-shift-e".into()), Some("ctrl-shift-o".into()), Some("ctrl-shift-f".into())];
+        assert_eq!(keys(false), want);
+        assert_eq!(keys(true), want);
+        assert!(StripButton::SplitRight.action(false).partial_eq(&SplitZoneRight));
+        assert!(StripButton::SplitDown.action(false).partial_eq(&SplitZoneDown));
+        assert!(StripButton::SplitRight.action(true).partial_eq(&TmuxSplitRight));
+        assert!(StripButton::SplitDown.action(true).partial_eq(&TmuxSplitDown));
+        assert!(StripButton::Find.action(true).partial_eq(&Find));
+        for b in StripButton::ALL {
+            assert_eq!(StripButton::parse(b.id()), Some(b));
+        }
+        assert_eq!(StripButton::parse("close"), None);
+    }
+
+    #[test]
+    fn strip_dump_lines() {
+        let tips = [("Split right", Some("ctrl-shift-e".into())), ("Split down", None), ("Find", Some("ctrl-shift-f".into()))];
+        assert_eq!(
+            strip_lines(&[true, false, true], &tips),
+            "--- strip buttons=split-right|[split-down]|find\n\
+             --- strip tip=Split right  [ctrl-shift-e]\n\
+             --- strip tip=Split down\n\
+             --- strip tip=Find  [ctrl-shift-f]\n"
+        );
     }
 
     #[test]
