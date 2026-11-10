@@ -6,7 +6,7 @@ Status: skeleton. This holds the problem and the ideas to choose from; specs, de
 
 `ui-chrome` moved the strip, the find bar, the menus and the zone headers' buttons and colours onto `brindle-ui`, but the **zone** itself is still hand-built: a 28px header bar made of `div`s (status dot, title, three ghost buttons) and 1px dividers. There is no `brindle-ui` component for "a titled pane with actions", and no shadcn look for the whole zone.
 
-It also leaves a gap: split buttons were dropped from the tab strip because they belong on the zones, but a **single-zone tab has no zone header** (zones spec, "Unsplit tab has no header bar"). So today the first split has to come from a key (ctrl-shift-e, ctrl-shift-o), the tab menu or the command palette; the header's split buttons only appear once a tab is already split.
+Split buttons were dropped from the tab strip because they belong on the zones. A **single-zone tab has no zone header** (zones spec, "Unsplit tab has no header bar"), so the first split comes from a key (ctrl-shift-e, ctrl-shift-o), the tab menu or the command palette; the header's split buttons only appear once a tab is already split. That is accepted and stays.
 
 ## Ideas (which shadcn pieces fit)
 
@@ -20,10 +20,7 @@ No existing `brindle-ui` component fits as is. shadcn has several that map onto 
 
 ## Open questions
 
-1. **Header on single-zone tabs?** Three ways to give the first split a home:
-   - always show the header (consistent, costs a 28px row on every tab, and puts the zone title next to the tab's own title);
-   - a compact floating action group in the terminal's top-right corner on hover or focus (no row cost, hides output under it while shown);
-   - no header when unsplit, as today (split from keys, tab menu and palette only, which is the current state and what the removal of the strip buttons leaves).
+1. **Header on single-zone tabs?** Settled: no header when unsplit, as today. The first split comes from a key, the tab menu or the command palette. (Rejected: always showing the header, which costs a 28px row on every tab, and a floating action group in the terminal's corner, which hides output.) The zones spec's "Unsplit tab has no header bar" requirement stays as it is.
 2. **Draggable dividers?** Resizable's handle implies drag-to-resize and keyboard resize. Is that wanted, and does it change how the tree stores sizes and how tmux panes (which are tmux's layout, not ours) are treated? tmux panes stay on the canvas-painted dividers either way.
 3. **Card chrome or flat?** A bordered, rounded card per zone separates zones well but costs pixels (border, radius, gap) and fights terminals that fill edge to edge. A flat header with only a divider is closer to today.
 4. **Theme:** the zone header stays on the global chrome tokens, as in `ui-chrome`; whether a zone's header should wear its terminal theme like tab faces do is not assumed.
@@ -33,7 +30,7 @@ No existing `brindle-ui` component fits as is. shadcn has several that map onto 
 To be decided from the questions above. Likely:
 - a `brindle-ui` panel component (Card-shaped) and, if wanted, a resizable split container;
 - `ZoneTreeView` rebuilt on them (header, dividers, action slot);
-- the zones spec's "Multi-zone chrome and header controls" and "Unsplit tab" requirements revised according to question 1.
+- the zones spec's "Multi-zone chrome and header controls" requirement revised for the new header and dividers (the unsplit-tab rule stays).
 
 ## Capabilities
 
@@ -41,7 +38,7 @@ To be decided from the questions above. Likely:
 - None decided.
 
 ### Modified Capabilities
-- `zones`: header and divider requirements, and the unsplit-tab rule, depending on the open questions.
+- `zones`: header and divider requirements, depending on the open questions.
 - `ui-components`: the panel (and resizable) component requirements, if built.
 
 ## Impact
