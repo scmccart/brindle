@@ -1,6 +1,6 @@
 # Proposal
 
-**Status: outline only.** This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes, and #45 most likely will. It builds on `fix-flaky-tests`, which needs to merge first: `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core come from that change.
+**Status: outline only.** This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests`, which needs to merge first: `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core come from that change.
 
 ## Why
 
@@ -31,17 +31,13 @@ None fails today in normal use. They are cheap to fix while the analysis is fres
 5. **The ready pipe can't be mistaken for an exec error (#46, item 3).**
    - With `--ready-fd 3`, the ready pipe's `dup2` can replace `Command`'s exec-error pipe, and a failed exec's error bytes would read as "ready".
    - Check the ready byte's value, or choose the fd number after the spawn's own pipes.
-6. **GPUI window fixes (#45, dependencies).**
-   - zed-industries/zed#62081: a new window can stay blank until something else wakes the event loop.
-   - zed-industries/zed#63089: a panic on a window-manager close, which `src/main.rs` currently avoids by deferring its quit.
-   - Both arrive only with a gpui upgrade past crates.io 0.2.2. That upgrade is its own change, given the `Cargo.lock` constraints. It is listed here so the upgrade's checklist covers both fixes. It is not work for this change.
+The GPUI window fixes found in the same analysis (#45) need a gpui upgrade. They belong to `update-dependencies`, not this change.
 
 ## Open questions
 
 - Should items 3–5 go in at all, given that no failure is known? Item 1 and item 2 are real bugs.
 - Should "programs start with default signal handling" and "a hang-up ends programs by SIGHUP" become spec requirements, or stay implementation detail?
 - Which signals to reset: SIGHUP, SIGINT, SIGQUIT, SIGPIPE, SIGTERM, SIGCHLD, SIGTSTP, SIGTTIN, SIGTTOU, or every signal, as `posix_spawn` with `POSIX_SPAWN_SETSIGDEF` would?
-- Whether item 6 gets a placeholder change (`upgrade-gpui`) now, or waits for a gpui release worth taking.
 
 ## Capabilities
 
@@ -61,4 +57,4 @@ Items 2, 4 and 5 are test or internal robustness work with no requirement change
 - `remote-agent/src/server/daemon.rs`, `src/remote/local.rs` (`start_core`, `pass_fd_as`), `remote-agent/tests/support/mod.rs`: the ready-fd handling.
 - `src/instance.rs` tests, and the `remote::local` tests.
 - Tests: `remote-agent/tests/holder.rs` gains an ignored-SIGHUP case. Existing tests that accept either ending of a hung-up `cat` (`TestClient::hung_up`) could tighten if item 3 lands.
-- Issues: closes #43 and #44; #46 when its items are decided; #45 stays open for the gpui upgrade.
+- Issues: closes #43 and #44; #46 when its items are decided.
