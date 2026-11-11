@@ -64,7 +64,7 @@ These turned up while verifying groups 1–2: three holder tests failed in 16 of
 
 - [x] 9.1 Run `cargo test --workspace --locked` 20 times in a row on Linux. Verify there are no failures, and list any new flake found, with its test name and failure text, in the PR description.
 - [x] 9.2 Run the full e2e suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2` 3 times. Verify there are no failures.
-- [ ] 9.3 After the PR is pushed, check its CI. Verify that `test`, all e2e shards and `windows-e2e` are green. On a red job, read its log before rerunning anything.
+- [x] 9.3 After the PR is pushed, check its CI. Verify that `test`, all e2e shards and `windows-e2e` are green. On a red job, read its log before rerunning anything.
 - [x] 9.4 Draft follow-up issues for the out-of-scope items in proposal.md (`XDG_RUNTIME_DIR` in `instance.rs` tests, ignored SIGHUP under `nohup`, the GPUI blank-window fix). Show the drafts to the user, and file them only with their approval.
 
 ## Workflow follow-up
