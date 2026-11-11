@@ -167,7 +167,7 @@ Exec={exec}
 Icon={APP_ID}
 Terminal=false
 Categories=System;TerminalEmulator;
-Keywords=shell;prompt;command;commandline;cmd;terminal;tmux;
+Keywords=shell;prompt;command;commandline;cmd;terminal;
 StartupWMClass={APP_ID}
 StartupNotify=false
 "
