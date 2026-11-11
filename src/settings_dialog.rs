@@ -1062,6 +1062,13 @@ impl FocusStops for SettingsDialog {
         stops.push(self.close_handle.clone());
         stops
     }
+
+    /// The dialog opens with its section's first stop focused (the profile
+    /// list), not the section list, as a list or an editor that opens later
+    /// takes focus on its first stop.
+    fn initial_focus(&self, cx: &App) -> Option<FocusHandle> {
+        Some(self.default_focus(cx))
+    }
 }
 
 impl SettingsDialog {
@@ -1200,13 +1207,16 @@ impl SettingsDialog {
     fn place_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = (self.model.section(), self.model.mode_kind());
         let moved = view != self.placed_for;
+        let section_changed = view.0 != self.placed_for.0;
         self.placed_for = view;
         if !moved && self.menu_open(cx) {
             return;
         }
         // On the section list, focus stays while the sections change under
-        // it, by key or click: the user is still choosing a section.
-        if self.sections_handle.is_focused(window) {
+        // it, by key or click: the user is still choosing a section. A view
+        // that opens in the same section (an editor, by a list key) takes
+        // focus as usual.
+        if self.sections_handle.is_focused(window) && (section_changed || !moved) {
             return;
         }
         let stops = self.stops(cx);
@@ -1374,7 +1384,7 @@ impl SettingsDialog {
         self.changed(window, cx);
     }
 
-    /// Enter: the section's confirm (apply, edit, save, delete, close), but
+    /// Enter: the section's confirm (apply, edit, save, delete), but
     /// not on a focused button, which takes the key itself.
     fn confirm(&mut self, _: &SettingsConfirm, window: &mut Window, cx: &mut Context<Self>) {
         // On the section list, the focused section is already the shown
