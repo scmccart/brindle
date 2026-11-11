@@ -499,7 +499,7 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
         target: client::KillTarget::Session(first),
     }));
     assert!(matches!(client.reply(100), ToClient::Ok(_)));
-    assert_eq!(client.exit_code(first), None);
+    client.hung_up(first);
     assert!(!alive(first_pid));
 
     client.send(client::ToCore::Kill(client::Kill {
@@ -516,7 +516,8 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
     let holder = parent(kept_pid).unwrap();
     client.send(client::ToCore::Stop(client::Request { req: 102 }));
     assert!(matches!(client.reply(102), ToClient::Ok(_)));
-    assert_eq!(client.exit_code(kept), None);
+    client.hung_up(kept);
+    // It doesn't read the terminal, so only the signal ends it.
     assert_eq!(client.exit_code(plain), None);
     assert!(client.closes());
     assert!(!alive(kept_pid) && !alive(plain_pid));

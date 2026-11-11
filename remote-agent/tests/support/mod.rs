@@ -854,6 +854,14 @@ impl TestClient {
         self.output_and_exit(session).1
     }
 
+    /// Waits for the `EXIT` of a session that was hung up (`CLOSE`, `KILL`
+    /// or `STOP`), whatever its status. A program blocked reading the
+    /// terminal, such as `cat`, may exit by itself before the signal kills
+    /// it: see [`TestCore::hang_up_and_wait`].
+    pub fn hung_up(&mut self, session: SessionId) {
+        self.exit_code(session);
+    }
+
     /// `session`'s output up to its `EXIT`, and its code. Other messages are
     /// kept for later.
     pub fn output_and_exit(&mut self, session: SessionId) -> (Vec<u8>, Option<i32>) {
