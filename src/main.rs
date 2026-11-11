@@ -85,7 +85,8 @@ DEBUGGING:
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
         --wait-for <TEXT>        Hold the later steps until the active terminal shows
-                                 TEXT (\\n = a line break), for at most 30s
+                                 TEXT (\\n = a line break), for at most 30 step
+                                 intervals (30s by default)
                                  Steps run in order, 1s apart
         --step-interval <S>      Run the steps S seconds apart instead (default 1)
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
@@ -123,8 +124,71 @@ enum Step {
     Modality(brindle_ui::Modality),
 }
 
-/// How long a `--wait-for` step waits before giving up.
-const WAIT_FOR_LIMIT: Duration = Duration::from_secs(30);
+/// How many step intervals a `--wait-for` step waits before giving up (30 s
+/// at the default interval, longer when `--step-interval` is stretched).
+const WAIT_FOR_INTERVALS: u32 = 30;
+
+/// How long a `--wait-for` step waits before giving up, for the run's step
+/// interval.
+fn wait_for_limit(interval: Duration) -> Duration {
+    interval * WAIT_FOR_INTERVALS
+}
+
+/// Where a `--wait-for` step that hasn't found its text stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitState {
+    /// Still waiting.
+    Pending,
+    /// Gave up after its limit.
+    TimedOut,
+}
+
+/// The `--wait-for` steps that haven't found their text, shared by the step
+/// runner (which records them) and the dump (which reports them). A wait
+/// that finds its text, or whose window closed, leaves no entry.
+#[derive(Debug, Default, Clone)]
+struct WaitLog {
+    entries: std::sync::Arc<std::sync::Mutex<Vec<(u64, String, WaitState)>>>,
+}
+
+impl WaitLog {
+    /// Records a wait as pending, and returns its handle for [`Self::set`]
+    /// and [`Self::clear`].
+    fn begin(&self, text: &str) -> u64 {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let id = entries.last().map_or(0, |(id, ..)| id + 1);
+        entries.push((id, text.to_string(), WaitState::Pending));
+        id
+    }
+
+    fn set(&self, id: u64, state: WaitState) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.iter_mut().find(|(i, ..)| *i == id) {
+            entry.2 = state;
+        }
+    }
+
+    fn clear(&self, id: u64) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, ..)| *i != id);
+    }
+
+    /// The dump's lines: `--- wait-for timeout "TEXT"` for each wait that
+    /// timed out and `--- wait-for pending "TEXT"` for one still waiting,
+    /// the text escaped onto one line as the selection line is.
+    fn describe(&self) -> String {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .iter()
+            .map(|(_, text, state)| {
+                let state = match state {
+                    WaitState::Pending => "pending",
+                    WaitState::TimedOut => "timeout",
+                };
+                format!("--- wait-for {state} {text:?}\n")
+            })
+            .collect()
+    }
+}
 
 #[derive(Default, Debug)]
 struct Args {
@@ -713,12 +777,14 @@ fn main() {
         let steps = args.steps.clone();
         let latency_bench = args.latency_bench;
         let interval = Duration::from_secs_f64(args.step_interval.unwrap_or(1.0));
+        let waits = WaitLog::default();
+        let step_waits = waits.clone();
         cx.spawn(async move |cx| {
             cx.background_executor().timer(interval / 2).await;
             for step in steps {
                 cx.background_executor().timer(interval).await;
                 if let Step::WaitFor(text) = &step {
-                    wait_for_text(window, text, cx).await;
+                    wait_for_text(window, text, wait_for_limit(interval), &step_waits, cx).await;
                     continue;
                 }
                 if let Step::Key(key) = &step {
@@ -766,7 +832,10 @@ fn main() {
                 console_output();
                 window
                     .update(cx, |ws, window, cx| {
-                        print!("{}", ws.dump_active_screen(window, cx));
+                        // The wait lines come last, after the focus line, so
+                        // a dump that shows an unexpected screen says which
+                        // wait failed.
+                        print!("{}{}", ws.dump_active_screen(window, cx), waits.describe());
                     })
                     .ok();
                 cx.update(|cx| cx.quit()).ok();
@@ -777,16 +846,28 @@ fn main() {
 }
 
 /// `--wait-for`: polls the active terminal's screen until it shows `text`,
-/// for at most [`WAIT_FOR_LIMIT`].
-async fn wait_for_text(window: gpui::WindowHandle<Workspace>, text: &str, cx: &mut gpui::AsyncApp) {
-    let deadline = std::time::Instant::now() + WAIT_FOR_LIMIT;
+/// for at most `limit` ([`wait_for_limit`]). `waits` shows it as pending
+/// while it waits, and as timed out if it gives up.
+async fn wait_for_text(
+    window: gpui::WindowHandle<Workspace>,
+    text: &str,
+    limit: Duration,
+    waits: &WaitLog,
+    cx: &mut gpui::AsyncApp,
+) {
+    let deadline = std::time::Instant::now() + limit;
+    let id = waits.begin(text);
     loop {
         let shown = window.update(cx, |ws, _, cx| ws.active_screen_text(cx).is_some_and(|screen| screen.contains(text)));
         match shown {
             // A closed window has nothing to wait for.
-            Ok(true) | Err(_) => return,
+            Ok(true) | Err(_) => {
+                waits.clear(id);
+                return;
+            }
             Ok(false) if std::time::Instant::now() >= deadline => {
-                log::warn!("--wait-for: {text:?} didn't appear within {}s", WAIT_FOR_LIMIT.as_secs());
+                log::warn!("--wait-for: {text:?} didn't appear within {limit:?}");
+                waits.set(id, WaitState::TimedOut);
                 return;
             }
             Ok(false) => cx.background_executor().timer(Duration::from_millis(100)).await,
@@ -875,6 +956,33 @@ mod tests {
         ] {
             assert!(parse(args).is_debug_run(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn the_wait_limit_is_thirty_step_intervals() {
+        assert_eq!(wait_for_limit(Duration::from_secs(1)), Duration::from_secs(30), "the default interval");
+        assert_eq!(wait_for_limit(Duration::from_secs(2)), Duration::from_secs(60));
+        assert_eq!(wait_for_limit(Duration::from_secs_f64(0.1)), Duration::from_secs(3));
+        let stretched = parse(&["--step-interval", "2", "--wait-for", "x"]);
+        assert_eq!(wait_for_limit(Duration::from_secs_f64(stretched.step_interval.unwrap_or(1.0))), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_wait_log_describes_pending_and_timed_out_waits() {
+        let waits = WaitLog::default();
+        assert_eq!(waits.describe(), "", "no wait step, no line");
+        let found = waits.begin("found");
+        waits.clear(found);
+        assert_eq!(waits.describe(), "", "a wait that found its text leaves nothing");
+        let first = waits.begin("NEVER");
+        assert_eq!(waits.describe(), "--- wait-for pending \"NEVER\"\n");
+        waits.set(first, WaitState::TimedOut);
+        waits.begin("two\nlines \"q\"");
+        assert_eq!(
+            waits.describe(),
+            "--- wait-for timeout \"NEVER\"\n--- wait-for pending \"two\\nlines \\\"q\\\"\"\n",
+            "text is escaped onto one line"
+        );
     }
 
     #[test]

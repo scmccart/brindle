@@ -47,6 +47,9 @@ fn unix() -> Vec<Case> {
     let display = |name, run| Case { name, display: true, run };
     vec![
         display("dump-grid-geometry", dump::grid_geometry),
+        display("dump-wait-for-timeout", dump::wait_for_timeout),
+        display("dump-wait-for-pending", dump::wait_for_pending),
+        display("dump-wait-for-clean", dump::wait_for_clean),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
         display("colors-local", colors::local),

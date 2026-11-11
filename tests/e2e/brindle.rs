@@ -165,6 +165,8 @@ pub struct Run<'a> {
     keep_detached: bool,
     /// The terminal padding, in place of the test config's 6.
     padding: Option<u32>,
+    /// The steps' spacing in seconds before stretching, in place of 1.
+    interval: Option<f64>,
 }
 
 /// Hangs up the case server's detached sessions and waits for them to go,
@@ -242,7 +244,15 @@ impl<'a> Run<'a> {
             command: Vec::new(),
             keep_detached: false,
             padding: None,
+            interval: None,
         }
+    }
+
+    /// Spaces the steps `secs` apart (stretched like the other delays)
+    /// instead of one second, which also scales a `--wait-for` limit.
+    pub fn step_interval(mut self, secs: f64) -> Self {
+        self.interval = Some(secs);
+        self
     }
 
     /// Launches without `-p`, with session restore on and its state in
@@ -361,7 +371,7 @@ impl<'a> Run<'a> {
     }
 
     /// Waits for `text` on the active terminal's screen before the next
-    /// step (`--wait-for`, at most 30 s). It takes a step's interval even
+    /// step (`--wait-for`, at most 30 step intervals). It takes a step's interval even
     /// when the text is already there, so it also spaces steps out.
     pub fn wait_for(mut self, text: &str) -> Self {
         self.steps.extend(["--wait-for".to_string(), text.to_string()]);
@@ -446,7 +456,10 @@ impl<'a> Run<'a> {
         let mut child = command
             .args(&self.args)
             .args(&self.steps)
-            .args(ctx.step_interval())
+            .args(match self.interval {
+                Some(secs) => vec!["--step-interval".to_string(), ctx.secs(secs).to_string()],
+                None => ctx.step_interval(),
+            })
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .args(if self.command.is_empty() { &[][..] } else { &["-e"][..] })
             .args(&self.command)
@@ -633,6 +646,10 @@ pub struct Dump {
     /// The window's focus-visible modality (`modality=`): `keyboard` or
     /// `pointer`.
     pub modality: Option<String>,
+    /// The `--wait-for` texts that gave up (`--- wait-for timeout "TEXT"`).
+    pub wait_timeouts: Vec<String>,
+    /// The `--wait-for` texts still waiting at the dump (`--- wait-for pending "TEXT"`).
+    pub wait_pending: Vec<String>,
 }
 
 /// `--- input text="split" cursor=4 selection=4..4`
@@ -674,6 +691,12 @@ impl Dump {
                 dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- selection ") {
                 dump.selection = unquote(rest);
+            } else if let Some(rest) = line.strip_prefix("--- wait-for timeout ") {
+                dump.wait_timeouts.extend(unquote(rest));
+                in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- wait-for pending ") {
+                dump.wait_pending.extend(unquote(rest));
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- status ") {
                 dump.status.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
@@ -864,5 +887,16 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.palette.is_empty(), "palette {:?}", dump.palette);
     ensure!(dump.focus.as_deref() == Some("menu"), "focus after the menu {:?}", dump.focus);
+    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- focus terminal modality=keyboard\n");
+    ensure!(dump.wait_timeouts.is_empty() && dump.wait_pending.is_empty(), "waits from a dump without any");
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- focus terminal modality=keyboard\n\
+         --- wait-for timeout \"NEVER\"\n--- wait-for pending \"a\\nb \\\"q\\\"\"\n--- wait-for timeout \"two\"\n",
+    );
+    ensure!(dump.wait_timeouts == ["NEVER", "two"], "timeouts {:?}", dump.wait_timeouts);
+    ensure!(dump.wait_pending == ["a\nb \"q\""], "pending {:?}", dump.wait_pending);
+    ensure!(dump.screen == ["hi"], "screen before the wait lines {:?}", dump.screen);
+    let dump = Dump::parse("--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- wait-for pending \"x\"\nlate\n");
+    ensure!(dump.screen == ["hi"], "a wait line ends the screen {:?}", dump.screen);
     Ok(())
 }
