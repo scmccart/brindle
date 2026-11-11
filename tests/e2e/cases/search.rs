@@ -1,12 +1,11 @@
 //! Scrollback search: the find bar's matches, the current match scrolled
 //! into view and drawn in the theme's focused-match color, escape putting
-//! the view back, and a control-mode pane searching only itself.
+//! the view back, and a zone searching only itself.
 //!
 //! A local tab prints `line-1` … `line-300`. Searching `line-4` matches
 //! `line-4` and `line-40` … `line-49` (11 matches); the newest, `line-49`,
 //! is far up in the history, so the view must scroll to it.
 
-use super::{cells, server};
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Cells, Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -35,8 +34,7 @@ fn local_cells(out: &Output) -> Result<Cells> {
 }
 
 pub fn local(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send(PRINT_LINES)
         .find("line-4")
@@ -80,12 +78,11 @@ fn focused_line(out: &Output) -> Result<String> {
 /// terminal: one step up, back down, then down past the newest match,
 /// which wraps to the oldest (`line-4`, number 11).
 pub fn step(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let up = Run::new(ctx, &server, "up").profile("Shell").send(PRINT_LINES).find("line-4").action("find_next").dump_at(5.0).run()?;
+    let up = Run::new(ctx, "up").profile("Shell").send(PRINT_LINES).find("line-4").action("find_next").dump_at(5.0).run()?;
     ensure!(up.dump.find_field("index") == Some("2"), "after find_next: {:?}", up.dump.find);
     ensure!(focused_line(&up)? == "line-48", "after find_next the current match is on {:?}", focused_line(&up)?);
 
-    let wrap = Run::new(ctx, &server, "wrap")
+    let wrap = Run::new(ctx, "wrap")
         .profile("Shell")
         .send(PRINT_LINES)
         .find("line-4")
@@ -171,9 +168,8 @@ fn panel() -> Rgb {
 /// The query starts with sparse dots and continues with dense `W`s, so the
 /// field's left edge shows `W`s only when the text has scrolled.
 pub fn long_query(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let query = format!(".....{}", "W".repeat(85));
-    let out = Run::new(ctx, &server, "run").profile("Shell").find(&query).capture_at(3.0).dump_at(3.5).run()?;
+    let out = Run::new(ctx, "run").profile("Shell").find(&query).capture_at(3.0).dump_at(3.5).run()?;
     ensure!(out.dump.find_field("count") == Some("0"), "find line: {:?}", out.dump.find);
     let input = out.dump.input.as_ref().ok_or("no focused input in the dump")?;
     ensure!(input.text == query && input.cursor == query.len(), "input {input:?}");
@@ -202,13 +198,12 @@ pub fn long_query(ctx: &Ctx) -> Result<Outcome> {
 /// typing then edit the input, which searches again. A control run without a
 /// selection shows no highlight.
 pub fn input_selection(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     // The selection: the text color at 28% over the bar.
     let selection = mix(panel(), theme::FOREGROUND, 0.28);
     // Inside the selected "foo", clear of the field's left padding.
     let selected_span = |out: &Output, field| field_strip(out, field, 15.0, 29.0);
 
-    let out = Run::new(ctx, &server, "selected")
+    let out = Run::new(ctx, "selected")
         .profile("Shell")
         .find("foo")
         .action("find_close")
@@ -227,7 +222,7 @@ pub fn input_selection(ctx: &Ctx) -> Result<Outcome> {
     ensure!(input.text == "fozo" && input.cursor == 3 && input.selection == (3, 3), "after end, left and typing z: {input:?}");
     ensure!(out.dump.find.as_deref().is_some_and(|f| f.contains("query=\"fozo\"")), "the search didn't follow the edit: {:?}", out.dump.find);
 
-    let control = Run::new(ctx, &server, "unselected").profile("Shell").find("foo").capture_at(2.5).dump_at(3.0).run()?;
+    let control = Run::new(ctx, "unselected").profile("Shell").find("foo").capture_at(2.5).dump_at(3.0).run()?;
     let input = control.dump.input.as_ref().ok_or("no focused input in the control dump")?;
     ensure!(input.selection == (3, 3), "control run has a selection: {input:?}");
     // Anti-aliased glyph edges can come close to the selection color; a
@@ -244,10 +239,9 @@ pub fn input_selection(ctx: &Ctx) -> Result<Outcome> {
 /// ring's accent. A control run with a valid expression shows the accent
 /// frame and no red one.
 pub fn invalid_regex(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     // A field's top and bottom borders are long runs; glyphs are short.
     const FRAME: f32 = 80.0;
-    let out = Run::new(ctx, &server, "invalid")
+    let out = Run::new(ctx, "invalid")
         .profile("Shell")
         .find("(")
         .action("find_toggle_regex")
@@ -261,7 +255,7 @@ pub fn invalid_regex(ctx: &Ctx) -> Result<Outcome> {
     let accent = longest_run(&out, theme::ACCENT)?;
     ensure!(accent < FRAME, "an accent run of {accent}px with an invalid expression");
 
-    let valid = Run::new(ctx, &server, "valid")
+    let valid = Run::new(ctx, "valid")
         .profile("Shell")
         .find("(a)")
         .action("find_toggle_regex")
@@ -278,8 +272,7 @@ pub fn invalid_regex(ctx: &Ctx) -> Result<Outcome> {
 }
 
 pub fn close_restores(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send(PRINT_LINES)
         .find("line-4")
@@ -302,33 +295,33 @@ pub fn close_restores(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Both panes show `needle`; searching in the active one (%1) highlights
-/// only its own.
-pub fn tmux_pane(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    server.run(&["split-window", "-h", "-t", "e2e"])?;
+/// Both zones of a tab split right show `needle`; searching in the left
+/// one highlights only its own: nothing right of its cells is in a match
+/// colour.
+pub fn zones(ctx: &Ctx) -> Result<Outcome> {
     // printf keeps the word itself out of the typed command line.
-    for pane in ["%0", "%1"] {
-        server.type_line(pane, "clear; printf 'nee%s\\n' dle")?;
-    }
-    ctx.sleep(0.5);
-    let out = Run::new(ctx, &server, "run").find("needle").capture_at(3.5).dump_at(4.0).run()?;
-    ensure!(server.active_pane()? == "%1", "the split isn't the active pane");
+    let print = "clear; printf 'nee%s\\012' dle\\r";
+    let out = Run::new(ctx, "run")
+        .send(print)
+        .action("split_zone_right")
+        .send(print)
+        .action("focus_zone_left")
+        .find("needle")
+        .capture_at(6.5)
+        .dump_at(7.0)
+        .run()?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=1"), "the left zone isn't active: {:?}", out.dump.zones);
     ensure!(out.dump.find_field("count") == Some("1"), "find line: {:?}", out.dump.find);
     let (row, col) = focused(&out)?;
-    let window = cells(&server, &out, "%1")?;
-    let [left1, top1, _, _] = server.geometry("%1")?;
+    let (cols, _) = out.dump.size.ok_or("no size")?;
+    let cells = local_cells(&out)?;
     let image = image(&out)?;
-    mostly(image, "active pane's needle", window.rect(left1 + col, top1 + row, 6, 1), theme::SEARCH_FOCUSED_BG)?;
+    mostly(image, "the left zone's needle", cells.rect(col, row, 6, 1), theme::SEARCH_FOCUSED_BG)?;
 
-    let [left0, top0, _, _] = server.geometry("%0")?;
-    let other_row = server
-        .capture("%0")?
-        .iter()
-        .position(|l| l == "needle")
-        .ok_or("no needle line in %0")? as u16;
-    let other = window.rect(left0, top0 + other_row, 6, 1);
-    image.expect_none("other pane's needle", other, theme::SEARCH_FOCUSED_BG)?;
-    image.expect_none("other pane's needle", other, theme::SEARCH_MATCH_BG)?;
+    // The right zone printed the same, so its needle is on the same row.
+    let line = cells.rect(0, row, cols, 1);
+    let right = PxRect { x0: line.x1, x1: image.width, ..line };
+    image.expect_none("the right zone's needle", right, theme::SEARCH_FOCUSED_BG)?;
+    image.expect_none("the right zone's needle", right, theme::SEARCH_MATCH_BG)?;
     Ok(Outcome::Pass)
 }

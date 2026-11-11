@@ -1,6 +1,6 @@
 //! Windows cases: local tabs through Brindle's own pseudoconsole. They run
-//! PowerShell or cmd instead of a tmux server, and check the screen dump,
-//! the log, the notification log and the console host process.
+//! PowerShell or cmd, and check the screen dump, the log, the notification
+//! log and the console host process.
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
@@ -26,50 +26,10 @@ pub fn all() -> Vec<Case> {
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
-        display("windows-wsl-tmux", wsl_tmux),
         display("windows-zones", zones),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
-}
-
-/// A control-mode profile through WSL attaches a throwaway tmux server
-/// inside it, with each tmux window a tab. Skipped without tmux in WSL.
-fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
-    let wsl = |args: &[&str]| Command::new("wsl").args(args).stdin(Stdio::null()).output();
-    match wsl(&["--exec", "tmux", "-V"]) {
-        Ok(out) if out.status.success() => {}
-        _ => return Ok(Outcome::Skip("no tmux in WSL (`wsl --exec tmux -V` failed)".into())),
-    }
-    let socket = format!("brindle-e2e-{}", std::process::id());
-    let tmux = |args: &[&str]| {
-        let mut all = vec!["--exec", "tmux", "-L", socket.as_str(), "-f", "/dev/null"];
-        all.extend_from_slice(args);
-        wsl(&all)
-    };
-    tmux(&["new-session", "-d", "-s", "main", "-n", "first"]).map_err(|e| e.to_string())?;
-    tmux(&["new-window", "-d", "-t", "main", "-n", "second"]).map_err(|e| e.to_string())?;
-    let config = format!(
-        "default_profile = \"wsl\"\n\n[[profiles]]\nname = \"wsl\"\ntmux = \"control\"\ncommand = \"wsl\"\n\
-         tmux_args = [\"tmux\", \"-L\", \"{socket}\", \"-f\", \"/dev/null\"]\n"
-    );
-    let ran = run_with(
-        ctx,
-        &config,
-        "attach",
-        &["-p", "wsl", "--action", "rename_tab", "--send", "  review  ", "--action", "picker_confirm"],
-        &[],
-        8.0,
-        None,
-    );
-    let windows = tmux(&["list-windows", "-t", "main", "-F", "#{window_name}"]);
-    tmux(&["kill-server"]).ok();
-    let ran = ran?;
-    let titles: Vec<&str> = ran.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
-    ensure!(titles == ["review", "second"], "tabs: {titles:?}; see attach.log");
-    let windows = String::from_utf8_lossy(&windows.map_err(|e| e.to_string())?.stdout).into_owned();
-    ensure!(windows.lines().collect::<Vec<_>>() == ["first", "second"], "tmux windows: {windows:?}");
-    Ok(Outcome::Pass)
 }
 
 /// What Windows' hit test (`WM_NCHITTEST`) reports at points of the tab

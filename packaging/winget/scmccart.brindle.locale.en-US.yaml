@@ -8,12 +8,11 @@ PackageName: Brindle
 PackageUrl: https://github.com/scmccart/brindle
 License: MIT OR Apache-2.0
 LicenseUrl: https://github.com/scmccart/brindle#license
-ShortDescription: A GPU-accelerated terminal emulator built on GPUI, with tabs, profiles and first-class tmux support
+ShortDescription: A GPU-accelerated terminal emulator built on GPUI, with tabs and profiles
 Moniker: brindle
 Tags:
   - terminal
   - terminal-emulator
-  - tmux
   - conpty
 ManifestType: defaultLocale
 ManifestVersion: 1.10.0

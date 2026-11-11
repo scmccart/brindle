@@ -134,10 +134,6 @@ Block headers SHALL be drawn on a tint derived from the theme's background, and 
 - **WHEN** a command prints text with its own background color
 - **THEN** that output looks the same as it does with `blocks = false`
 
-#### Scenario: Rail in a tmux pane
-- **WHEN** a block is shown in a control-mode pane, which has no padding
-- **THEN** the rail is drawn over the edge of the first column and the pane's position is unchanged
-
 ### Requirement: Wheel latching
 The wheel SHALL scroll the block under the pointer if its body can scroll that way, and otherwise the terminal's view. A wheel run SHALL stay on the scroller it started on, without passing into or out of a block, until the wheel has been idle for about 300 ms.
 
@@ -210,14 +206,3 @@ Links, double- and triple-click selection, and mouse reports SHALL act on the te
 #### Scenario: Link below a collapsed block
 - **WHEN** the user ctrl-clicks a URL in a row below a collapsed block
 - **THEN** that URL opens
-
-### Requirement: Blocks in tmux panes
-Blocks SHALL work in control-mode panes as they do in local tabs. Each pane SHALL have its own blocks. Text restored on attach SHALL have no blocks until the shell marks new commands, and classic tmux SHALL show none.
-
-#### Scenario: Control-mode pane
-- **WHEN** a shell with integration loaded runs a command in a control-mode pane
-- **THEN** the pane shows a block for it, and scrolling it leaves other panes unchanged
-
-#### Scenario: Reattach
-- **WHEN** Brindle reattaches to a session with earlier output in a pane
-- **THEN** that output is drawn as plain rows

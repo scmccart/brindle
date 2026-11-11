@@ -19,14 +19,14 @@ To be decided. The likely shape:
 - **Brindle updates it as it changes,** the way it writes `session.toml` today, through new protocol-1 messages or an additive version bump.
 - **The layout survives core restarts and upgrades,** carried in the holders' checkpoints or meta, or a core-owned file in the server directory.
 - **Launch-time reattach rebuilds windows and splits** from the layout for every detached session, not just those in `session.toml`.
-- **`session.toml` keeps what the server can't hold:** tmux tabs, remote tabs until phase 4, Windows tabs until phase 3, and respawn records for after a reboot.
+- **`session.toml` keeps what the server can't hold:** remote tabs until phase 4, Windows tabs until phase 3, and respawn records for after a reboot.
 
 ## Open questions
 
 - **Where the layout lives:** in the core's memory and holder meta (it dies when the last session ends), in a file in the server directory (it survives a reboot, but then needs a respawn path), or both?
 - **One layout or one per client:** what happens when two Brindles show sessions from the same server at once, and one quits?
 - **Granularity:** whole windows, or only the tab and split tree around each session, with Brindle choosing windows?
-- **Session-less tabs:** whether tmux and remote tabs move into the server layout too, as placeholders the client re-opens, so `session.toml` can go away entirely once phases 3 and 4 land.
+- **Session-less tabs:** whether remote tabs and Windows tabs move into the server layout too, as placeholders the client re-opens, so `session.toml` can go away entirely once phases 3 and 4 land.
 - **Partial layouts:** what a split tab shows when one of its sessions has ended.
 - **Interaction with phase 4:** one layout per host server, or a client-side merge of several hosts' layouts.
 

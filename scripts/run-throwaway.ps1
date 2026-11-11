@@ -17,9 +17,9 @@
 # The binary is $env:BRINDLE_BIN, else target\release\brindle.exe, else
 # target\debug\brindle.exe.
 #
-# -Config copies a file in, so a copied config's tmux profiles would attach
-# to the tmux server they name (a WSL one is yours unless the profile's
-# `tmux_args` names another socket with `-L`). Check it first.
+# -Config copies a file in, so a copied config's profile that runs tmux would
+# attach to the tmux server it names (a WSL one is yours unless the profile's
+# args name another socket with `-L`). Check it first.
 #
 # This opens a window on your desktop and takes focus: don't start it while
 # typing elsewhere. brindle.exe is a GUI program, which PowerShell does not

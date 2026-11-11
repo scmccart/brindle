@@ -1,10 +1,8 @@
 //! Shell integration (OSC 133): prompt jumps, failed-command marks and
-//! last-output selection, in local tabs and control-mode panes.
+//! last-output selection, in local tabs.
 
-use super::server;
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Cells, PxRect};
-use crate::tmux::ControlClient;
 use crate::{Ctx, Outcome, Result, ensure};
 
 /// Typed first in every case: a plain prompt, Brindle's bash script, then a
@@ -27,8 +25,7 @@ fn expect_jumped(out: &Output) -> Result {
 /// Two long outputs, then ctrl-shift-up twice (as actions): the first
 /// prompt ends up as the top line.
 pub fn prompt_jump(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send(&setup(ctx))
         .send("seq 1 60\\r")
@@ -43,8 +40,7 @@ pub fn prompt_jump(ctx: &Ctx) -> Result<Outcome> {
 
 /// Without shell integration the jump keys scroll one line, as they did.
 pub fn no_marks_scroll_line(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send("PS1='$ '; clear\\r")
         .send("seq 1 60\\r")
@@ -66,8 +62,7 @@ pub fn no_marks_scroll_line(ctx: &Ctx) -> Result<Outcome> {
 /// `false` gets a red bar in the left padding beside its prompt; `true`
 /// doesn't.
 pub fn failed_mark(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send(&setup(ctx))
         .send("false\\r")
@@ -99,8 +94,7 @@ pub fn failed_mark(ctx: &Ctx) -> Result<Outcome> {
 /// Select Last Command Output selects exactly what `printf` printed.
 /// (Octal newlines: `--send` turns a backslash-n into a real newline.)
 pub fn select_output(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .send(&setup(ctx))
         .send("printf 'one\\012two\\012'\\r")
@@ -116,38 +110,15 @@ pub fn select_output(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Prompt jumps in a control-mode pane: tmux forwards the pane's OSC 133
-/// marks in `%output`.
-pub fn tmux_prompt_jump(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
-        .send(&setup(ctx))
-        .send("seq 1 60\\r")
-        .send("seq 61 120\\r")
-        .action("jump_to_previous_prompt")
-        .action("jump_to_previous_prompt")
-        .dump_at(7.5)
-        .run()?;
-    expect_jumped(&out)?;
-    Ok(Outcome::Pass)
-}
-
-/// Up then down after `clear` typed at a marked prompt lower on the screen:
-/// down must reach the `false` prompt (the view's bottom, where it and the
-/// current prompt are), not stop at the erased prompt's leftover mark.
-/// `clear` is `CSI H CSI J CSI 3 J` under tmux's TERM (erase in place); a
-/// local tab gets the same bytes from `printf`.
-fn clear_then_up_down(ctx: &Ctx, local: bool) -> Result<Outcome> {
-    let server = server()?;
-    let clear = if local { r"printf '\033[H\033[J\033[3J'\r" } else { r"clear\r" };
-    let mut run = Run::new(ctx, &server, "run");
-    if local {
-        run = run.profile("Shell");
-    }
-    let out = run
+/// Up then down after a clear at a marked prompt lower on the screen: down
+/// must reach the `false` prompt (the view's bottom, where it and the
+/// current prompt are), not stop at the erased prompt's leftover mark. The
+/// clear is `CSI H CSI J CSI 3 J` (erase in place), from `printf`.
+pub fn clear_up_down(ctx: &Ctx) -> Result<Outcome> {
+    let out = Run::new(ctx, "run")
         .send(&setup(ctx))
         .send(r"seq 1 5\r")
-        .send(clear)
+        .send(r"printf '\033[H\033[J\033[3J'\r")
         .send(r"seq 1 60\r")
         .send(r"false\r")
         .action("jump_to_previous_prompt")
@@ -163,31 +134,4 @@ fn clear_then_up_down(ctx: &Ctx, local: bool) -> Result<Outcome> {
         screen.first()
     );
     Ok(Outcome::Pass)
-}
-
-pub fn clear_up_down(ctx: &Ctx) -> Result<Outcome> {
-    clear_then_up_down(ctx, true)
-}
-
-pub fn tmux_clear_up_down(ctx: &Ctx) -> Result<Outcome> {
-    clear_then_up_down(ctx, false)
-}
-
-/// tmux passes OSC 133 from a pane to control clients unchanged (both
-/// terminators). `Terminal::feed` relies on this for marks in panes.
-pub fn tmux_passthrough(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let client = ControlClient::attach(&server, 100, 30)?;
-    ctx.sleep(0.3);
-    let mark = client.mark();
-    server.type_line("%0", r"printf '\e]133;A\a\e]133;D;3\e\\x\n'")?;
-    let result = client
-        .wait_for(ctx, mark, 3.0, |l| l.starts_with("%output %0") && l.contains(r"\033]133;A\007"))
-        .ok_or("no %output with OSC 133;A within 3 s".to_string())
-        .and_then(|line| {
-            ensure!(line.contains(r"\033]133;D;3\033\134"), "ST-terminated mark changed: {line:?}");
-            Ok(())
-        });
-    ctx.save("transcript.txt", client.transcript());
-    result.map(|()| Outcome::Pass)
 }

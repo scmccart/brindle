@@ -20,9 +20,9 @@
 # target/debug/brindle; `brindle-remote` must be beside it (cargo build
 # builds both).
 #
-# --config copies a file in, so a copied config's tmux profiles would attach
-# to the tmux server it names, which is yours unless it sets `tmux_args`
-# with `-L`. Check it first.
+# --config copies a file in, so a copied config's profile that runs tmux would
+# attach to the tmux server it names, which is yours unless its args pass `-L`
+# or `-S`. Check it first.
 #
 # This opens a window on your desktop and takes focus: don't start it
 # while typing elsewhere.

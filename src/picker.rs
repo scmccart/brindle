@@ -1,13 +1,11 @@
 //! The palette: the view behind every palette Brindle shows (new tab from a
-//! profile, the command palette, the sessions palette, the questions after
-//! a session ended or opened elsewhere) and the one-line prompt.
+//! profile, the command palette, the sessions palette) and the one-line
+//! prompt (`Rename Tab`).
 //!
 //! `Workspace` shows it in a modal `brindle_ui::Overlay`. Its list mode is a
 //! `brindle_ui::Command` in `Dialog` chrome, as shadcn's `CommandDialog`
 //! puts one (no padding, no visible header); its prompt mode is an `Input`
-//! under the prompt's label, which is the dialog's title. Swapping the mode
-//! (a list followed by a prompt) keeps the same view, so the overlay keeps
-//! one layer and one focus to give back.
+//! under the prompt's label, which is the dialog's title.
 //!
 //! Every way of closing reaches the owner as [`PaletteEvent::Dismissed`]:
 //! escape and an outside press arrive as `Dismiss` (the command list's own
@@ -17,17 +15,14 @@
 
 use std::rc::Rc;
 
-use futures::channel::oneshot;
 use gpui::{
     App, AppContext as _, ClickEvent, Context, CursorStyle, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div,
-    prelude::FluentBuilder as _, rems,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
 };
 
 use crate::actions::PickerKill;
 use brindle_ui::{
-    ActiveTheme as _, Command, CommandEvent, CommandGroup, CommandItem, Dialog, Dismiss, FocusStops, Input,
-    ListConfirm, TextInput, TextInputEvent,
+    Command, CommandEvent, CommandGroup, CommandItem, Dialog, Dismiss, FocusStops, Input, ListConfirm, TextInput,
 };
 
 pub enum PaletteEvent {
@@ -55,9 +50,8 @@ fn groups(rows: &[PaletteRow]) -> Vec<CommandGroup> {
     vec![CommandGroup::unnamed(rows.iter().map(PaletteRow::item))]
 }
 
-/// Runs a prompt's text. The palette closes on `Ok` or if the sender is
-/// dropped, and shows the message on `Err`.
-pub type SubmitFn = Rc<dyn Fn(String, &mut App) -> oneshot::Receiver<Result<(), String>>>;
+/// Runs a prompt's text; the palette closes once it has.
+pub type SubmitFn = Rc<dyn Fn(String, &mut App)>;
 
 /// A request to ask the user for one line of text.
 #[derive(Clone)]
@@ -70,10 +64,7 @@ pub struct PromptRequest {
 struct Prompt {
     label: SharedString,
     input: Entity<TextInput>,
-    error: Option<String>,
     submit: SubmitFn,
-    /// Waiting for the submitted command's result.
-    running: Option<Task<()>>,
 }
 
 struct List {
@@ -88,11 +79,10 @@ enum Mode {
 
 pub struct Palette {
     /// The view's own handle, tracked on its root: the overlay keeps it for
-    /// the view's whole life, while the input with focus changes with the
-    /// mode.
+    /// the view's whole life, while the input with focus is the mode's.
     focus: FocusHandle,
     mode: Mode,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 impl EventEmitter<PaletteEvent> for Palette {}
@@ -110,13 +100,6 @@ impl FocusStops for Palette {
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         vec![self.input(cx).focus_handle(cx)]
     }
-}
-
-/// A prompt result that is already known.
-pub fn ready(result: Result<(), String>) -> oneshot::Receiver<Result<(), String>> {
-    let (tx, rx) = oneshot::channel();
-    tx.send(result).ok();
-    rx
 }
 
 impl Palette {
@@ -143,39 +126,18 @@ impl Palette {
             CommandEvent::Confirmed(ix) => cx.emit(PaletteEvent::Confirmed(ix)),
             CommandEvent::Cancelled => cx.emit(PaletteEvent::Dismissed),
         });
-        Self { focus: cx.focus_handle(), mode: Mode::List(List { rows, command }), _subscription: subscription }
+        Self { focus: cx.focus_handle(), mode: Mode::List(List { rows, command }), _subscription: Some(subscription) }
     }
 
     pub fn prompt(request: PromptRequest, cx: &mut Context<Self>) -> Self {
-        let (prompt, subscription) = Self::new_prompt(request, cx);
-        Self { focus: cx.focus_handle(), mode: Mode::Prompt(prompt), _subscription: subscription }
-    }
-
-    fn new_prompt(request: PromptRequest, cx: &mut Context<Self>) -> (Prompt, Subscription) {
         // The pre-filled value is selected, so typing replaces it.
         let input = cx.new(|cx| {
             let mut input = TextInput::new(&request.initial, cx);
             input.select_all(cx);
             input
         });
-        let subscription = cx.subscribe(&input, |this, _, _: &TextInputEvent, cx| {
-            if let Mode::Prompt(prompt) = &mut this.mode {
-                prompt.error = None;
-                cx.notify();
-            }
-        });
-        (Prompt { label: request.label, input, error: None, submit: request.submit, running: None }, subscription)
-    }
-
-    /// Turns the open palette into a prompt, in place, and focuses its
-    /// input: the overlay around it keeps its layer and the focus it gives
-    /// back.
-    pub fn show_prompt(&mut self, request: PromptRequest, window: &mut Window, cx: &mut Context<Self>) {
-        let (prompt, subscription) = Self::new_prompt(request, cx);
-        window.focus(&prompt.input.focus_handle(cx));
-        self.mode = Mode::Prompt(prompt);
-        self._subscription = subscription;
-        cx.notify();
+        let prompt = Prompt { label: request.label, input, submit: request.submit };
+        Self { focus: cx.focus_handle(), mode: Mode::Prompt(prompt), _subscription: None }
     }
 
     /// Replaces a list's rows and its empty message (`None`: the command
@@ -218,13 +180,7 @@ impl Palette {
                 }
                 out
             }
-            Mode::Prompt(p) => format!(
-                "--- palette prompt {:?} text={:?} error={:?} running={}\n",
-                p.label,
-                p.input.read(cx).text(),
-                p.error,
-                p.running.is_some()
-            ),
+            Mode::Prompt(p) => format!("--- palette prompt {:?} text={:?}\n", p.label, p.input.read(cx).text()),
         }
     }
 
@@ -240,30 +196,10 @@ impl Palette {
     /// Enter in a prompt submits it, as enter in a one-field form does. A
     /// list confirms through its command list, which is nearer the focus.
     fn submit(&mut self, _: &ListConfirm, _: &mut Window, cx: &mut Context<Self>) {
-        let Mode::Prompt(prompt) = &mut self.mode else { return };
-        if prompt.running.is_some() {
-            return;
-        }
-        prompt.error = None;
+        let Mode::Prompt(prompt) = &self.mode else { return };
         let text = prompt.input.read(cx).text().to_string();
-        let result = (prompt.submit)(text, cx);
-        prompt.running = Some(cx.spawn(async move |this, cx| {
-            let result = result.await;
-            this.update(cx, |this, cx| {
-                let Mode::Prompt(prompt) = &mut this.mode else { return };
-                prompt.running = None;
-                match result {
-                    Ok(Err(message)) => {
-                        prompt.error = Some(message);
-                        cx.notify();
-                    }
-                    // Success, or the command went away (e.g. tmux exited).
-                    Ok(Ok(())) | Err(_) => cx.emit(PaletteEvent::Dismissed),
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
+        (prompt.submit.clone())(text, cx);
+        cx.emit(PaletteEvent::Dismissed);
     }
 
     /// Escape or an outside press (a list's arrives as the command list's
@@ -273,17 +209,10 @@ impl Palette {
     }
 
     fn render_prompt(prompt: &Prompt, cx: &mut Context<Self>) -> Dialog {
-        let t = *cx.ui_theme();
         Dialog::new()
             .title(prompt.label.clone())
             .on_close(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PaletteEvent::Dismissed)))
-            .child(Input::new(&prompt.input).invalid(prompt.error.is_some()))
-            .when(prompt.running.is_some(), |d| {
-                d.child(div().text_size(rems(0.875)).text_color(t.muted_foreground).child("Running…"))
-            })
-            .when_some(prompt.error.clone(), |d, error| {
-                d.child(div().text_size(rems(0.875)).text_color(t.destructive).child(SharedString::from(error)))
-            })
+            .child(Input::new(&prompt.input))
     }
 }
 

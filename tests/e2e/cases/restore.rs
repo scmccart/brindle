@@ -1,13 +1,10 @@
-//! Session restore: a plain launch reopens the windows and tabs recorded in
-//! the state file, with fallbacks for what changed meanwhile, and tmux
-//! control-mode sessions are attached once without changing tmux's
-//! current window.
+//! Session restore: a plain launch reopens the tabs recorded in the state
+//! file, in one window, with fallbacks for what changed meanwhile, and a
+//! config and state file from a version with tmux support still load.
 
 use std::path::{Path, PathBuf};
 
-use super::server;
 use crate::brindle::{Run, state_dir};
-use crate::tmux::TmuxServer;
 use crate::{Ctx, Outcome, Result, ensure};
 
 fn state_text(ctx: &Ctx) -> Result<String> {
@@ -30,6 +27,12 @@ fn local(profile: &str, cwd: &Path) -> String {
     format!("[[windows.tabs]]\nkind = \"local\"\nprofile = \"{profile}\"\ncwd = \"{}\"\n", cwd.display())
 }
 
+/// A local tab with a manual title.
+fn titled(title: &str, cwd: &Path) -> String {
+    format!("{}title = \"{title}\"\n", local("Shell", cwd))
+}
+
+/// A control-mode session's entry, as versions with tmux support wrote it.
 fn tmux(session: &str) -> String {
     format!("[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"tmux\"\nsession = \"{session}\"\n")
 }
@@ -45,10 +48,9 @@ fn titles(tabs: &[(String, bool)]) -> Vec<String> {
 /// Two local tabs in different directories, the first active: quitting
 /// records them, and the next plain launch brings them back.
 pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let (a, b) = (dir(ctx, "dir a")?, dir(ctx, "dir-b")?);
     let quote = |p: &Path| format!("'{}'", p.display());
-    Run::new(ctx, &server, "record")
+    Run::new(ctx, "record")
         // The next run attaches the same shells, in their directories.
         .keep_detached()
         .restore()
@@ -76,7 +78,7 @@ pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
     }
     ensure!(recorded.find(&a.display().to_string()) < recorded.find(&b.display().to_string()), "tab order:\n{recorded}");
 
-    let out = Run::new(ctx, &server, "restore").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
+    let out = Run::new(ctx, "restore").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
     ensure!(titles(&out.dump.tabs) == ["server*", "bash"], "restored tabs {:?}", out.dump.tabs);
     ensure!(printed_pwd(&out.dump.screen, &a), "pwd in the active tab: {:?}", out.dump.screen);
     // The size comes back as it was: the window doesn't grow per restore.
@@ -89,11 +91,10 @@ pub fn local_tabs(ctx: &Ctx) -> Result<Outcome> {
 /// profile in the home directory; bad state files and `--no-restore` give
 /// a normal launch.
 pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let home = dir(ctx, "home")?;
     let gone = ctx.dir.join("deleted");
     write_state(ctx, &state(0, &[local("Removed", &gone), local("Shell", &ctx.dir)]))?;
-    let out = Run::new(ctx, &server, "fallback")
+    let out = Run::new(ctx, "fallback")
         .restore()
         .default_profile("Shell")
         .env("HOME", &home.display().to_string())
@@ -108,24 +109,23 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
         ("version", "version = 99\n[[windows]]\n", "unknown format version 99"),
     ] {
         write_state(ctx, text)?;
-        let out = Run::new(ctx, &server, label).restore().default_profile("Shell").dump_at(3.0).run()?;
+        let out = Run::new(ctx, label).restore().default_profile("Shell").dump_at(3.0).run()?;
         ensure!(out.dump.tabs.len() == 1, "{label}: tabs {:?}", out.dump.tabs);
         let log_text = std::fs::read_to_string(ctx.dir.join(format!("{label}.log"))).unwrap_or_default();
         ensure!(log_text.contains(log), "{label}: the log doesn't say {log:?}");
     }
 
     write_state(ctx, &state(0, &[local("Shell", &ctx.dir), local("Shell", &ctx.dir)]))?;
-    let out = Run::new(ctx, &server, "no-restore").restore().default_profile("Shell").arg("--no-restore").dump_at(3.0).run()?;
+    let out = Run::new(ctx, "no-restore").restore().default_profile("Shell").arg("--no-restore").dump_at(3.0).run()?;
     ensure!(out.dump.tabs.len() == 1, "--no-restore: tabs {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }
 
 /// Runs a plain restore launch whose steps close its only window, so it
 /// quits without ever dumping, and waits for it to exit.
-fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &[&str]) -> Result {
+fn run_until_window_closes(ctx: &Ctx, label: &str, steps: &[&str]) -> Result {
     let config = ctx.dir.join("config.toml");
-    std::fs::write(&config, crate::brindle::config_with(&server.socket, "e2e", "Shell", ""))
-        .map_err(|e| e.to_string())?;
+    std::fs::write(&config, crate::brindle::config("e2e")).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
     let mut child = std::process::Command::new(&ctx.bin)
         .args(steps)
@@ -155,14 +155,13 @@ fn run_until_window_closes(ctx: &Ctx, server: &TmuxServer, label: &str, steps: &
 /// The only tab exiting closes the window and quits: nothing is left to
 /// restore, and the next launch is a normal one without complaints.
 pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     write_state(ctx, &state(0, &[local("Shell", &ctx.dir)]))?;
-    run_until_window_closes(ctx, &server, "exit", &["--send", "exit\\r"])?;
+    run_until_window_closes(ctx, "exit", &["--send", "exit\\r"])?;
     let text = state_text(ctx)?;
     ctx.save("after-exit.toml", &text);
     ensure!(!text.contains("[[windows"), "a window is still recorded:\n{text}");
 
-    let out = Run::new(ctx, &server, "next").restore().default_profile("Shell").dump_at(3.0).run()?;
+    let out = Run::new(ctx, "next").restore().default_profile("Shell").dump_at(3.0).run()?;
     ensure!(out.dump.tabs.len() == 1, "next launch: tabs {:?}", out.dump.tabs);
     let log = std::fs::read_to_string(ctx.dir.join("next.log")).unwrap_or_default();
     ensure!(!log.contains("ignoring session state"), "an empty state is reported as bad:\n{log}");
@@ -172,17 +171,16 @@ pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
 /// Closing the last window while it still has tabs (the close button, or
 /// close_window) quits and keeps the tabs for the next launch.
 pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let kept = dir(ctx, "kept")?;
     // cd at ~1.5 s, recorded by the 2 s poll, window closed at ~2.5 s.
     let cd = format!("cd '{}'\\r", kept.display());
-    run_until_window_closes(ctx, &server, "close", &["--send", &cd, "--action", "close_window"])?;
+    run_until_window_closes(ctx, "close", &["--send", &cd, "--action", "close_window"])?;
     let text = state_text(ctx)?;
     ctx.save("after-close.toml", &text);
     ensure!(text.matches("kind = \"local\"").count() == 1, "recorded tabs:\n{text}");
     ensure!(text.contains(&format!("cwd = \"{}\"", kept.display())), "recorded directory:\n{text}");
 
-    let out = Run::new(ctx, &server, "reopen").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
+    let out = Run::new(ctx, "reopen").restore().default_profile("Shell").send("pwd\r").dump_at(4.0).run()?;
     ensure!(out.dump.tabs.len() == 1, "reopened tabs {:?}", out.dump.tabs);
     ensure!(printed_pwd(&out.dump.screen, &kept), "pwd: {:?}", out.dump.screen);
     Ok(Outcome::Pass)
@@ -190,14 +188,13 @@ pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
 
 /// A second Brindle started while one runs neither restores nor records.
 pub fn second_instance(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let recorded = state(1, &[local("Shell", &ctx.dir), local("Shell", &ctx.dir)]);
     write_state(ctx, &recorded)?;
     let (first, second) = std::thread::scope(|scope| {
         let first =
-            scope.spawn(|| Run::new(ctx, &server, "first").restore().default_profile("Shell").dump_at(7.0).run());
+            scope.spawn(|| Run::new(ctx, "first").restore().default_profile("Shell").dump_at(7.0).run());
         ctx.sleep(2.0);
-        let second = Run::new(ctx, &server, "second").restore().default_profile("Shell").dump_at(3.0).run();
+        let second = Run::new(ctx, "second").restore().default_profile("Shell").dump_at(3.0).run();
         (first.join().unwrap_or_else(|_| Err("first run panicked".into())), second)
     });
     let (first, second) = (first?, second?);
@@ -211,54 +208,74 @@ pub fn second_instance(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Windows 0, 1 and 2 named w0..w2, window 2 current and window 0 the last
-/// window.
-fn three_windows() -> Result<TmuxServer> {
-    let server = server()?;
-    server.run(&["rename-window", "-t", "e2e:0", "w0"])?;
-    server.run(&["new-window", "-t", "e2e:1", "-n", "w1"])?;
-    server.run(&["new-window", "-t", "e2e:2", "-n", "w2"])?;
-    server.run(&["set", "-g", "automatic-rename", "off"])?;
-    server.run(&["select-window", "-t", "e2e:0"])?;
-    server.run(&["select-window", "-t", "e2e:2"])?;
-    Ok(server)
+/// A state file from before Brindle had one window, recording two windows,
+/// comes back as one window: every window's tabs in order, with the first
+/// window's active tab.
+pub fn merge_windows(ctx: &Ctx) -> Result<Outcome> {
+    let window = |active: usize| format!("[[windows]]\nwidth = 1000.0\nheight = 660.0\nactive = {active}\n\n");
+    let text = format!(
+        "version = 1\n\n{}{}{}\n{}{}",
+        window(1),
+        titled("one", &ctx.dir),
+        titled("two", &ctx.dir),
+        window(0),
+        titled("three", &ctx.dir)
+    );
+    write_state(ctx, &text)?;
+    let out = Run::new(ctx, "run").restore().dump_at(4.0).run()?;
+    ensure!(titles(&out.dump.tabs) == ["one", "two*", "three"], "restored tabs {:?}", out.dump.tabs);
+    let recorded = state_text(ctx)?;
+    ctx.save("recorded.toml", &recorded);
+    ensure!(recorded.matches("[[windows]]").count() == 1, "the saved state has more than one window:\n{recorded}");
+    Ok(Outcome::Pass)
 }
 
-/// Each window's index, current flag and last-window flag.
-fn selection(server: &TmuxServer) -> Result<String> {
-    server.run(&["list-windows", "-t", "e2e", "-F", "#{window_index}:#{window_active}#{window_last_flag}"])
-}
+/// What a version with tmux support left behind: a config with its default
+/// `tmux` and `tmux (classic)` profiles and `tmux_session_end`, and a state
+/// file with a control-mode session between two local tabs. Brindle starts
+/// as usual (no config error, a warning per removed key), restores only the
+/// local tabs and saves no tmux entry, and the legacy profile opens a
+/// shell, not tmux.
+pub fn tmux_legacy_config(ctx: &Ctx) -> Result<Outcome> {
+    const PROFILES: &str = "\n[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\ntmux_session = \"main\"\n\n\
+                            [[profiles]]\nname = \"tmux (classic)\"\ntmux = \"plain\"\ntmux_session = \"main\"\n";
+    fn legacy(run: Run<'_>) -> Run<'_> {
+        run.top("tmux_session_end = \"ask\"").config(PROFILES)
+    }
 
-/// A local tab followed by a control-mode session with three windows.
-pub fn tmux_session(ctx: &Ctx) -> Result<Outcome> {
-    let server = three_windows()?;
-    let before = selection(&server)?;
-
-    // The local tab was active: it stays active once the session attaches.
-    write_state(ctx, &state(0, &[local("Shell", &ctx.dir), tmux("e2e")]))?;
-    let out = Run::new(ctx, &server, "local-active").restore().dump_at(5.0).run()?;
-    ensure!(titles(&out.dump.tabs) == ["bash*", "w0", "w1", "w2"], "tabs {:?}", out.dump.tabs);
-    ensure!(selection(&server)? == before, "tmux's selection changed: {before:?} -> {:?}", selection(&server)?);
+    write_state(ctx, &state(0, &[titled("one", &ctx.dir), tmux("work"), titled("two", &ctx.dir)]))?;
+    let out = legacy(Run::new(ctx, "restore")).restore().dump_at(4.0).run()?;
+    ensure!(titles(&out.dump.tabs) == ["one*", "two"], "restored tabs {:?}", out.dump.tabs);
+    let log = std::fs::read_to_string(ctx.dir.join("restore.log")).unwrap_or_default();
+    ensure!(!log.contains("invalid config"), "the config didn't load:\n{log}");
+    ensure!(!log.contains("ignoring session state"), "the state file was rejected:\n{log}");
+    for want in [
+        "tmux_session_end is ignored",
+        "profile \"tmux\": tmux is ignored",
+        "profile \"tmux\": tmux_session is ignored",
+        "profile \"tmux (classic)\": tmux is ignored",
+        "profile \"tmux (classic)\": tmux_session is ignored",
+    ] {
+        ensure!(log.contains(want), "the log doesn't warn {want:?}:\n{log}");
+    }
     let recorded = state_text(ctx)?;
-    ctx.save("local-active.toml", &recorded);
-    ensure!(recorded.matches("kind = \"tmux\"").count() == 1, "one entry for the session:\n{recorded}");
-    ensure!(recorded.contains("active = 0"), "active after restore:\n{recorded}");
+    ctx.save("recorded.toml", &recorded);
+    ensure!(recorded.matches("kind = \"local\"").count() == 2, "recorded tabs:\n{recorded}");
+    ensure!(!recorded.contains("kind = \"tmux\""), "a tmux entry was saved again:\n{recorded}");
 
-    // The session first and active: its tabs go to the front, and tmux's
-    // current window is the active tab.
-    write_state(ctx, &state(0, &[tmux("e2e"), local("Shell", &ctx.dir)]))?;
-    let out = Run::new(ctx, &server, "tmux-active").restore().dump_at(5.0).run()?;
-    ensure!(titles(&out.dump.tabs) == ["w0", "w1", "w2*", "bash"], "tabs {:?}", out.dump.tabs);
-    ensure!(selection(&server)? == before, "tmux's selection changed: {before:?} -> {:?}", selection(&server)?);
-    let recorded = state_text(ctx)?;
-    ctx.save("tmux-active.toml", &recorded);
-    ensure!(recorded.find("kind = \"tmux\"") < recorded.find("kind = \"local\""), "order:\n{recorded}");
-
-    // A session that no longer exists is created again.
-    write_state(ctx, &state(0, &[tmux("e2e-gone")]))?;
-    let out = Run::new(ctx, &server, "recreated").restore().dump_at(5.0).run()?;
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].1, "tabs {:?}", out.dump.tabs);
-    server.run(&["has-session", "-t", "e2e-gone"])?;
+    // The classic profile has no command left: its tab runs the default
+    // shell, with no tmux around it.
+    let out = legacy(Run::new(ctx, "classic"))
+        .profile("tmux (classic)")
+        .env("SHELL", "/bin/sh")
+        .env_remove("TMUX")
+        // `--send` turns `\n` into a newline, so printf gets octal.
+        .send("printf 'tmux=[%s] %s\\012' \"$TMUX\" ok\r")
+        .wait_for("tmux=[] ok")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(out.dump.tabs.len() == 1, "tabs {:?}", out.dump.tabs);
+    ensure!(out.dump.screen.iter().any(|l| l == "tmux=[] ok"), "screen {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }
 

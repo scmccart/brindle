@@ -16,18 +16,15 @@ use crate::brindle::{self, Dump};
 use crate::{Ctx, Outcome, Result, ensure};
 
 const CONTAINER_PROFILE: &str = "Remote container";
-const TMUX_PROFILE: &str = "Remote tmux";
 const SSH_PROFILE: &str = "Remote SSH";
 const REMOTE_CWD: &str = "/tmp/brindle-e2e-osc7";
-const TMUX_SOCKET: &str = "brindle-e2e-remote";
-const TMUX_SESSION: &str = "remote";
 
 static CONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static FIXTURE_IMAGE: OnceLock<Result<String>> = OnceLock::new();
 
 /// A vanilla container profile covers helper injection, PTY input/output,
-/// OSC 7 directory inheritance, OSC 7501, and direct remote tmux control
-/// mode. The two Brindle launches share only this disposable container.
+/// OSC 7 directory inheritance in a split zone, OSC 7501, and OSC 9/777
+/// notifications, in one disposable container.
 pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     if let Some(outcome) = docker_outcome()? {
         return Ok(outcome);
@@ -57,7 +54,7 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
          args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
          env = {{ SHELL = \"/bin/bash\", PS1 = \"REMOTE_CONTAINER_READY> \", BRINDLE_E2E_MARKER = \"container-exec\" }}\n\
          remote = {{ type = \"container\", engine = \"docker\", container = {container_name:?}, user = \"remote\" }}\n",
-        brindle::config_with("remote-unused", "e2e", CONTAINER_PROFILE, ""),
+        brindle::config_with("e2e", CONTAINER_PROFILE, ""),
         profile = CONTAINER_PROFILE,
         container_name = container.name,
     );
@@ -139,119 +136,7 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     );
     container.assert_absent(marker)?;
     container.exec(&["rm", "--force", &planted])?;
-    // Remote control mode is a direct tmux byte stream, so it needs no
-    // deployed PTY helper at all.
 
-    setup_tmux(ctx, &container)?;
-    let config = format!(
-        "{}\n[[profiles]]\n\
-         name = {profile:?}\n\
-         tmux = \"control\"\n\
-         tmux_session = {session:?}\n\
-         tmux_args = [\"-L\", {socket:?}, \"-f\", \"/dev/null\"]\n\
-         remote = {{ type = \"container\", engine = \"docker\", container = {container_name:?} }}\n",
-        brindle::config_with("remote-unused", "e2e", TMUX_PROFILE, ""),
-        profile = TMUX_PROFILE,
-        session = TMUX_SESSION,
-        socket = TMUX_SOCKET,
-        container_name = container.name,
-    );
-    let steps = vec![
-        "--wait-for".into(),
-        "REMOTE_TMUX_ALPHA".into(),
-        "--action".into(),
-        "next_tab".into(),
-        "--wait-for".into(),
-        "REMOTE_TMUX_BETA".into(),
-        "--send".into(),
-        "printf 'REMOTE_TMUX_%s' INPUT; echo\\r".into(),
-        "--wait-for".into(),
-        "REMOTE_TMUX_INPUT".into(),
-    ];
-    let dump = run_brindle(
-        ctx,
-        "container-tmux",
-        &config,
-        TMUX_PROFILE,
-        &steps,
-        &agent,
-        14.0,
-    )?;
-    ensure!(
-        dump.tabs.len() == 2
-            && dump.tabs[0].0 == "alpha"
-            && !dump.tabs[0].1
-            && dump.tabs[1].0 == "beta"
-            && dump.tabs[1].1,
-        "remote tmux native tabs: {:?}",
-        dump.tabs
-    );
-    ensure!(
-        dump.screen.iter().any(|line| line == "REMOTE_TMUX_BETA")
-            && dump.screen.iter().any(|line| line == "REMOTE_TMUX_INPUT"),
-        "remote tmux output/input missing from active native tab: {:?}",
-        dump.screen
-    );
-
-    Ok(Outcome::Pass)
-}
-
-/// A remote control session whose transport goes silent without closing
-/// (the local `docker exec` is stopped) is detached as a lost connection
-/// within the detection limit, and leaves no client on the server.
-pub fn tmux_connection_lost(ctx: &Ctx) -> Result<Outcome> {
-    if let Some(outcome) = docker_outcome()? {
-        return Ok(outcome);
-    }
-    let Some(agent) = remote_agent(ctx)? else {
-        return Ok(Outcome::Skip(
-            "Linux remote helper was not built; run `cargo build -p brindle-remote-agent`".into(),
-        ));
-    };
-    let image = fixture_image(ctx)?;
-    let container = Container::start(ctx, &image, false)?;
-    setup_tmux(ctx, &container)?;
-    let config = format!(
-        "{}\n[[profiles]]\n\
-         name = {profile:?}\n\
-         tmux = \"control\"\n\
-         tmux_session = {session:?}\n\
-         tmux_args = [\"-L\", {socket:?}, \"-f\", \"/dev/null\"]\n\
-         remote = {{ type = \"container\", engine = \"docker\", container = {container_name:?} }}\n",
-        brindle::config_with("remote-unused", "e2e", TMUX_PROFILE, "tmux_session_end = \"ask\"\n"),
-        profile = TMUX_PROFILE,
-        session = TMUX_SESSION,
-        socket = TMUX_SOCKET,
-        container_name = container.name,
-    );
-    // Stop the local `docker exec` that carries the control stream once the
-    // session is up: the pipe stays open and says nothing.
-    let pattern = format!("docker exec -i .*{}", container.name);
-    let freeze_after = ctx.secs(8.0);
-    let freezer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs_f64(freeze_after));
-        Command::new("pkill").args(["-STOP", "-f", &pattern]).status().ok();
-    });
-    let steps = vec!["--wait-for".into(), "REMOTE_TMUX_ALPHA".into()];
-    let dump = run_brindle(ctx, "container-tmux-lost", &config, TMUX_PROFILE, &steps, &agent, freeze_after + 50.0);
-    freezer.join().ok();
-    let dump = dump?;
-    ensure!(
-        dump.palette.len() > 1,
-        "the lost connection should end the session and ask what to do: tabs {:?}, palette {:?}",
-        dump.tabs,
-        dump.palette
-    );
-    // The server lets go of the client (by our detach, or the closed pipe).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let clients = container.exec(&["tmux", "-L", TMUX_SOCKET, "list-clients"]).unwrap_or_default();
-        if clients.trim().is_empty() {
-            break;
-        }
-        ensure!(Instant::now() < deadline, "a tmux client is still attached: {clients:?}");
-        std::thread::sleep(Duration::from_millis(500));
-    }
     Ok(Outcome::Pass)
 }
 
@@ -291,7 +176,7 @@ pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {
          args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
          env = {{ SHELL = \"/bin/bash\", PS1 = \"REMOTE_SSH_READY> \", BRINDLE_E2E_MARKER = \"ssh-upload\" }}\n\
          remote = {{ type = \"ssh\", host = {host:?}, user = \"root\", port = {port}, identity_file = {identity:?}, ssh_args = [\"-F\", \"/dev/null\", \"-o\", \"BatchMode=yes\", \"-o\", \"IdentitiesOnly=yes\", \"-o\", \"StrictHostKeyChecking=no\", \"-o\", \"UserKnownHostsFile=/dev/null\", \"-o\", \"GlobalKnownHostsFile=/dev/null\", \"-o\", \"LogLevel=ERROR\"] }}\n",
-        brindle::config_with("remote-unused", "e2e", SSH_PROFILE, ""),
+        brindle::config_with("e2e", SSH_PROFILE, ""),
         profile = SSH_PROFILE,
     );
     let steps = vec![
@@ -656,79 +541,6 @@ fn ssh_command(identity: &Path, port: u16) -> Command {
             "ConnectTimeout=2",
         ]);
     command
-}
-
-fn setup_tmux(ctx: &Ctx, container: &Container) -> Result {
-    container.exec(&[
-        "tmux",
-        "-L",
-        TMUX_SOCKET,
-        "-f",
-        "/dev/null",
-        "new-session",
-        "-d",
-        "-s",
-        TMUX_SESSION,
-        "-n",
-        "alpha",
-        "printf 'REMOTE_TMUX_ALPHA\\n'; exec bash --norc --noprofile",
-    ])?;
-    container.exec(&[
-        "tmux",
-        "-L",
-        TMUX_SOCKET,
-        "-f",
-        "/dev/null",
-        "new-window",
-        "-d",
-        "-t",
-        TMUX_SESSION,
-        "-n",
-        "beta",
-        "printf 'REMOTE_TMUX_BETA\\n'; exec bash --norc --noprofile",
-    ])?;
-    container.exec(&[
-        "tmux",
-        "-L",
-        TMUX_SOCKET,
-        "-f",
-        "/dev/null",
-        "select-window",
-        "-t",
-        &format!("{TMUX_SESSION}:alpha"),
-    ])?;
-    wait_for_tmux_text(ctx, container, "alpha", "REMOTE_TMUX_ALPHA")?;
-    wait_for_tmux_text(ctx, container, "beta", "REMOTE_TMUX_BETA")
-}
-
-fn wait_for_tmux_text(ctx: &Ctx, container: &Container, window: &str, text: &str) -> Result {
-    let deadline = Instant::now() + Duration::from_secs_f64(ctx.secs(10.0));
-    let target = format!("{TMUX_SESSION}:{window}");
-    loop {
-        let output = container.exec_output(&[
-            "tmux",
-            "-L",
-            TMUX_SOCKET,
-            "-f",
-            "/dev/null",
-            "capture-pane",
-            "-p",
-            "-t",
-            &target,
-        ])?;
-        let message = output_message(&output);
-        if output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .any(|line| line == text)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("tmux window {window:?} was not ready: {message}"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn run_brindle(

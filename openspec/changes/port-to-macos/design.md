@@ -67,7 +67,6 @@ The custom window buttons stay `csd`-only, so none are drawn.
 - `ctrl-<punct|0|insert>` becomes `cmd-<…>`;
 - `alt-<1-9>` becomes `cmd-<1-9>`;
 - `ctrl-alt-<1-9>` becomes `cmd-alt-<1-9>`;
-- in `TmuxWindow`, `alt-<arrow>` becomes `cmd-alt-<arrow>`;
 - everything else is unchanged: `ctrl-tab`, `shift-pageup` and so on, and the picker's ctrl-p and ctrl-n.
 
 Three cases are handled outside the mapping: `ctrl-shift-space` becomes `cmd-shift-space` (cmd-space is Spotlight), `ctrl-shift-tab` is left alone (cmd-tab is the app switcher), and macOS also gets `cmd-shift-[` and `cmd-shift-]` for previous and next tab. The mapping is a pure function with unit tests that run on every platform. Applying it to the whole table means new actions get Mac keys automatically.
@@ -85,17 +84,15 @@ The resulting macOS keys:
 | Prev / next tab | cmd-shift-[ / cmd-shift-], ctrl-tab / ctrl-shift-tab, ctrl-pageup/down |
 | Move tab | cmd-pageup / cmd-pagedown |
 | Jump to tab / profile N | cmd-N / cmd-alt-N |
-| tmux split right / down, close, zoom, detach | cmd-e / cmd-o, cmd-x, cmd-z, cmd-d |
-| tmux pane focus | cmd-alt-arrows |
 | Scroll line | cmd-up / cmd-down |
 
-`Swallow` on cmd-d is harmless, because cmd keys never reach the PTY (`to_esc_str` bails on `platform`), so it's kept for uniformity. User `[keybindings]` are unchanged: users write `cmd-…` themselves.
+User `[keybindings]` are unchanged: users write `cmd-…` themselves.
 
 *Alternative:* keep ctrl-shift on macOS (like kitty's default). Rejected because cmd-c and cmd-v are the one thing every Mac user tries first.
 
 ### 5. Menu bar from the same actions
 
-At startup on macOS, `cx.set_menus(...)` builds the menus listed in the spec from existing actions, and GPUI shows each item's binding. About is the system about panel, with name and version from the bundle. Quit is the existing `Quit` action. Menu items dispatch through the focused window, so tmux-only items aren't in the menu. They stay in the command palette.
+At startup on macOS, `cx.set_menus(...)` builds the menus listed in the spec from existing actions, and GPUI shows each item's binding. About is the system about panel, with name and version from the bundle. Quit is the existing `Quit` action. Menu items dispatch through the focused window.
 
 ### 6. Option key: pass through or Meta, chosen by config
 
@@ -119,7 +116,7 @@ Linux is unchanged, and Windows is out of scope here.
 ### 8. Shell startup and PATH
 
 - **Login shell:** on macOS, `spawn_pty` passes `shell: None` when the profile sets no command and there's no `-e`. alacritty then uses `login -flp`, so the shell is a login shell, `.zprofile` runs, and the session gets a proper tty and utmp entry. Profiles with an explicit `command` behave as on Linux.
-- **PATH import:** this runs only when `getppid() == 1`, which is how a Finder, Dock, Spotlight or `open` launch looks: launchd is the parent and the environment is launchd's minimal one. Before `Application::new()`, Brindle runs `<pw_shell> -l -c 'printf %s "$PATH"'` with stdin closed and a 2 s timeout. If the output is non-empty, it becomes `PATH` for the process, so the PTY children and `tmux -C` inherit it. On failure or timeout, `/opt/homebrew/bin` and `/usr/local/bin` are appended if missing, and a warning is logged. A non-interactive `-l` avoids prompts and `.zshrc` noise, and the cost is one shell start, only on GUI launches.
+- **PATH import:** this runs only when `getppid() == 1`, which is how a Finder, Dock, Spotlight or `open` launch looks: launchd is the parent and the environment is launchd's minimal one. Before `Application::new()`, Brindle runs `<pw_shell> -l -c 'printf %s "$PATH"'` with stdin closed and a 2 s timeout. If the output is non-empty, it becomes `PATH` for the process, so the PTY children inherit it. On failure or timeout, `/opt/homebrew/bin` and `/usr/local/bin` are appended if missing, and a warning is logged. A non-interactive `-l` avoids prompts and `.zshrc` noise, and the cost is one shell start, only on GUI launches.
 
 *Alternative:* `-l -i` would also pick up PATH changes in `.zshrc`, but interactive startup can print output or block on prompts (oh-my-zsh updates). Users who set PATH only in `.zshrc` get the fallback.
 

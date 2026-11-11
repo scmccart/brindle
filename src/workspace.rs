@@ -2,11 +2,8 @@
 //! active tab's content, and the palettes.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-
-use futures::channel::oneshot;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -16,13 +13,12 @@ use gpui::{
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
-use gpui::EntityId;
 
 use crate::actions::*;
-use crate::config::{Config, Profile, TmuxMode, TmuxSessionEnd};
+use crate::config::{Config, Profile};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn, ready};
+use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn};
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
@@ -37,9 +33,6 @@ use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::tmux::protocol::WindowId;
-use crate::tmux::{AttachSpec, SessionKey, TmuxEvent, TmuxSession};
-use crate::tmux_view::TmuxWindowView;
 use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
 
 /// The tab strip's height in logical pixels: the pill tab list's
@@ -53,18 +46,11 @@ pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16
 const TAB_FACE_GAP: f32 = 4.0;
 const RESIZE_BORDER: f32 = 6.0;
 
-pub enum TabContent {
-    Zones(Entity<ZoneTreeView>),
-    Tmux { session: Entity<TmuxSession>, view: Entity<TmuxWindowView> },
-}
-
 /// What a tab was opened as, for session restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabOrigin {
-    /// A program in a PTY (a profile, a command override, classic tmux).
+    /// A program in a PTY (a profile or a command override).
     Local,
-    /// A tmux control-mode window.
-    Tmux,
     /// A message, such as an attach failure; never recorded.
     Message,
 }
@@ -72,11 +58,12 @@ pub enum TabOrigin {
 pub struct Tab {
     pub id: u64,
     pub profile: Profile,
-    pub content: TabContent,
+    /// The tab's zones: one terminal, or a split tree of them.
+    pub zones: Entity<ZoneTreeView>,
     pub origin: TabOrigin,
     pub bell: bool,
-    /// The most pressing program status (OSC 7501) in the tab's terminal,
-    /// or in any pane of its tmux window; see [`Workspace::refresh_status`].
+    /// The most pressing program status (OSC 7501) across the tab's
+    /// terminals; see [`Workspace::refresh_status`].
     pub status: Option<State>,
     /// A user-chosen label (`Rename Tab`), shown instead of the automatic
     /// title until changed or cleared.
@@ -89,7 +76,7 @@ pub struct Tab {
 impl Tab {
     fn new(
         profile: Profile,
-        content: TabContent,
+        zones: Entity<ZoneTreeView>,
         origin: TabOrigin,
         subscriptions: Vec<Subscription>,
         cx: &mut App,
@@ -98,7 +85,7 @@ impl Tab {
         let mut tab = Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             profile,
-            content,
+            zones,
             origin,
             bell: false,
             status: None,
@@ -118,10 +105,7 @@ impl Tab {
     /// only when a title needs it (a program's own title, which can change
     /// thousands of times a second, never does).
     fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
-        let zone_changed = match &self.content {
-            TabContent::Zones(view) => view.update(cx, |v, cx| v.refresh_titles(snapshot, cx)),
-            TabContent::Tmux { .. } => false,
-        };
+        let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(snapshot, cx));
         let mut displayed = std::mem::take(&mut self.title);
         let changed = refresh_displayed_title(&mut displayed, self.manual_title.as_deref(), || {
             self.automatic_title(snapshot, cx)
@@ -131,10 +115,7 @@ impl Tab {
     }
 
     fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).automatic_title(snapshot, cx),
-            TabContent::Tmux { view, .. } => view.read(cx).title(cx),
-        }
+        self.zones.read(cx).automatic_title(snapshot, cx)
     }
 
     fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
@@ -142,51 +123,29 @@ impl Tab {
         self.refresh_title(snapshot, cx)
     }
 
-    /// Whether this tab shows `session` (and, if given, its `window`).
-    fn shows_tmux(&self, session: &Entity<TmuxSession>, window: Option<WindowId>, cx: &App) -> bool {
-        matches!(&self.content, TabContent::Tmux { session: s, view }
-            if s == session && window.is_none_or(|w| view.read(cx).window_id == w))
-    }
-
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).focus_handle(cx),
-            TabContent::Tmux { view, .. } => view.read(cx).focus_handle(cx),
-        }
+        self.zones.read(cx).focus_handle(cx)
     }
 
     fn theme(&self, cx: &App) -> Theme {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).theme.clone(),
-            TabContent::Tmux { view, .. } => view.read(cx).theme.clone(),
-        }
+        self.zones.read(cx).theme.clone()
     }
 
     /// The colours of the tab's face in the strip, active or not: its
     /// terminal's background (the face's surface) and foreground (its
-    /// text, icons and close button). A tmux tab's panes share the window
-    /// view's theme.
+    /// text, icons and close button).
     fn face_colors(&self, cx: &App) -> (Hsla, Hsla) {
-        let theme = match &self.content {
-            TabContent::Zones(view) => &view.read(cx).theme,
-            TabContent::Tmux { view, .. } => &view.read(cx).theme,
-        };
+        let theme = &self.zones.read(cx).theme;
         (theme.background.hsla(), theme.foreground.hsla())
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).active_terminal(cx),
-            TabContent::Tmux { view, .. } => view.read(cx).active_terminal(cx),
-        }
+        self.zones.read(cx).active_terminal(cx)
     }
 
     /// The view of the terminal that has (or last had) focus in this tab.
     fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).active_view(),
-            TabContent::Tmux { view, .. } => view.read(cx).active_view(),
-        }
+        self.zones.read(cx).active_view()
     }
 
     /// Where the active terminal was last painted.
@@ -194,16 +153,9 @@ impl Tab {
         self.active_view(cx)?.read(cx).layout.get()
     }
 
-    fn is_tmux(&self) -> bool {
-        matches!(self.content, TabContent::Tmux { .. })
-    }
-
     /// The most pressing program status across the tab's terminals.
     fn status_summary(&self, cx: &App) -> Option<State> {
-        match &self.content {
-            TabContent::Zones(view) => view.read(cx).status_summary(cx),
-            TabContent::Tmux { view, .. } => view.read(cx).status_summary(cx),
-        }
+        self.zones.read(cx).status_summary(cx)
     }
 }
 
@@ -230,25 +182,12 @@ pub enum Launch {
     Attach { session: u32, target: Result<SessionInfo, String> },
 }
 
-/// A row of the palette that asks about a session another Brindle shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OpenChoice {
-    NewSession,
-    Profile(usize),
-}
-
 enum PaletteKind {
     NewTab,
     /// The command palette: its actions by row, and the tab that had focus
     /// when it opened, which they run in.
     Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
     Prompt,
-    /// Asks what to do after a session that was all the window showed
-    /// ended: row 0 closes the window, row n opens profile n - 1.
-    SessionEnded { session: Entity<TmuxSession> },
-    /// Asks what to open instead of attaching a session another Brindle
-    /// shows: `profile` was asked for.
-    SessionOpenElsewhere { choices: Vec<OpenChoice>, profile: usize },
     /// The terminal server's detached sessions, by row: enter attaches one
     /// into a new tab, `picker_kill` ends it.
     Sessions { sessions: Vec<SessionInfo> },
@@ -305,54 +244,6 @@ fn sessions_empty_message(count: usize) -> Option<SharedString> {
     (count == 0).then(|| "No detached sessions".into())
 }
 
-/// What a [`PaletteKind`] is, without its payload (entities and focus
-/// handles), so the rules that depend only on that are testable for every
-/// kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaletteTag {
-    NewTab,
-    Commands,
-    Prompt,
-    SessionEnded,
-    SessionOpenElsewhere,
-    Sessions,
-}
-
-impl PaletteTag {
-    #[cfg(test)]
-    const ALL: [PaletteTag; 6] = [
-        PaletteTag::NewTab,
-        PaletteTag::Commands,
-        PaletteTag::Prompt,
-        PaletteTag::SessionEnded,
-        PaletteTag::SessionOpenElsewhere,
-        PaletteTag::Sessions,
-    ];
-
-    fn of(kind: &PaletteKind) -> Self {
-        match kind {
-            PaletteKind::NewTab => PaletteTag::NewTab,
-            PaletteKind::Commands { .. } => PaletteTag::Commands,
-            PaletteKind::Prompt => PaletteTag::Prompt,
-            PaletteKind::SessionEnded { .. } => PaletteTag::SessionEnded,
-            PaletteKind::SessionOpenElsewhere { .. } => PaletteTag::SessionOpenElsewhere,
-            PaletteKind::Sessions { .. } => PaletteTag::Sessions,
-        }
-    }
-}
-
-/// Whether a palette of this kind, opened on its own, ignores a press
-/// outside it: those that ask a question the user must answer (after a
-/// session ended or opened elsewhere) close only on escape, their close
-/// button or a choice. A prompt opened on its own is a plain palette; one
-/// that follows a question takes its place in the same slot and keeps its
-/// flag (`open_prompt`).
-fn ignores_outside_press(tag: PaletteTag) -> bool {
-    match tag {
-        PaletteTag::SessionEnded | PaletteTag::SessionOpenElsewhere => true,
-        PaletteTag::NewTab | PaletteTag::Commands | PaletteTag::Prompt | PaletteTag::Sessions => false,
-    }
-}
 
 pub struct Workspace {
     tabs: Vec<Tab>,
@@ -370,7 +261,7 @@ pub struct Workspace {
     /// The strip's `⌄` button and its profile menu, the third overlay: at
     /// most one of the palette, the settings dialog and this menu is open.
     /// Its items are rebuilt each time it opens (`refresh_profile_menu`),
-    /// since they say which sessions the window shows.
+    /// so they follow config reloads and keymap changes.
     profile_menu: Entity<DropdownMenu>,
     _profile_menu_subscription: Subscription,
     /// The tab and zone header menus' slot, the fourth overlay (one of the
@@ -395,25 +286,11 @@ pub struct Workspace {
     /// terminal). Focus rests on the active tab; arrows, home and end
     /// switch tabs, and enter or escape give focus back to the terminal.
     strip_focus: FocusHandle,
-    /// tmux control-mode sessions attached in this window.
-    tmux_sessions: Vec<(Entity<TmuxSession>, Subscription)>,
     last_title: SharedString,
     _title_refresh: Task<()>,
     /// This window's id and creation order, for session restore.
     window_id: u64,
     order: u64,
-    /// Restored tmux sessions whose first `WindowActivated` must not take
-    /// the active tab (another tab was active when they were recorded).
-    quiet_sessions: HashSet<EntityId>,
-    /// Restored tmux sessions without tabs yet: their first tab goes after
-    /// this tab (`None`: at the front).
-    anchors: HashMap<EntityId, Option<u64>>,
-    /// Sessions attached from the "session ended" palette, keyed by the new
-    /// session, with the ended session whose tabs stay until it shows up.
-    replacing: HashMap<EntityId, Entity<TmuxSession>>,
-    /// Sessions created from a prompt, which waits to hear whether tmux
-    /// attached them.
-    creating: HashMap<EntityId, oneshot::Sender<Result<(), String>>>,
     /// The window's size as recorded for restore: the size it opened
     /// with, until the user resizes it (see [`recorded_size`]).
     windowed_size: std::cell::Cell<Size<Pixels>>,
@@ -453,15 +330,10 @@ impl Workspace {
             profile_preview: None,
             focus_handle,
             strip_focus: cx.focus_handle(),
-            tmux_sessions: Vec::new(),
             last_title: SharedString::default(),
             _title_refresh: Task::ready(()),
             window_id: window.window_handle().window_id().as_u64(),
             order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            quiet_sessions: HashSet::new(),
-            anchors: HashMap::new(),
-            replacing: HashMap::new(),
-            creating: HashMap::new(),
             windowed_size: std::cell::Cell::new(window.bounds().size),
         };
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
@@ -506,28 +378,25 @@ impl Workspace {
         match target {
             Ok(info) => self.attach_detached_here(info, window, cx),
             Err(why) => {
-                let config = Self::settings(cx).clone();
+                // A message tab: never recorded for session restore.
+                let config = Self::settings(cx);
                 let profile = config.profiles[config.default_profile_index()].clone();
                 let text = format!("\x1b[31mBrindle could not attach session {session}:\x1b[0m\r\n{why}\r\n");
-                let theme = config.profile_theme(&profile);
-                let terminal = cx.new(|cx| Terminal::message(&text, theme, &config, cx));
-                self.insert_terminal_tab(profile, terminal, true, window, cx);
+                self.open_message_tab(profile, &text, window, cx);
             }
         }
     }
 
-    /// Opens a recorded window's tabs. Local tabs open in order; each tmux
-    /// session is attached once and its windows arrive later, placed after
-    /// the tab recorded before it. The recorded active tab is activated if
-    /// it is local; for a tmux session, tmux's current window decides.
+    /// Opens a recorded window's tabs in order, and activates the recorded
+    /// active tab.
     fn restore(&mut self, state: WindowState, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let mut previous: Option<u64> = None;
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
-                RestoredTab::Local { profile, cwd, title, zones, session } => {
+                None => {}
+                Some(RestoredTab::Local { profile, cwd, title, zones, session }) => {
                     let found = match zones {
                         Some(_) => None,
                         None => Self::take_detached(session.as_ref(), cx),
@@ -535,7 +404,7 @@ impl Workspace {
                     match (zones, found) {
                         (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
                         #[cfg(target_os = "linux")]
-                        (None, Some(info)) if config.profiles[profile].tmux == TmuxMode::None => {
+                        (None, Some(info)) => {
                             let profile = config.profiles[profile].clone();
                             let terminal = Self::attached_terminal(&info, &profile, &config, cx);
                             self.insert_terminal_tab(profile, terminal, true, window, cx);
@@ -546,20 +415,8 @@ impl Workspace {
                     if let Some(title) = title {
                         tab.set_manual_title(&title, &mut None, cx);
                     }
-                    previous = Some(tab.id);
                     if ix == state.active {
                         active_tab = Some(tab.id);
-                    }
-                }
-                RestoredTab::Tmux { profile, session } => {
-                    let mut profile = config.profiles[profile].clone();
-                    profile.tmux_session = Some(session);
-                    if let Some(session) = self.attach_tmux(profile, None, window, cx) {
-                        let id = session.entity_id();
-                        self.anchors.insert(id, previous);
-                        if ix != state.active {
-                            self.quiet_sessions.insert(id);
-                        }
                     }
                 }
             }
@@ -578,24 +435,11 @@ impl Workspace {
     ) {
         let config = Self::settings(cx).clone();
         let Some(profile) = config.profiles.get(profile_ix).cloned() else { return };
-        let command = match profile.tmux {
-            TmuxMode::Plain => {
-                let mut args = profile.tmux_args.clone();
-                args.extend([
-                    "new-session".into(),
-                    "-A".into(),
-                    "-s".into(),
-                    profile.tmux_session_name().to_string(),
-                ]);
-                Some(("tmux".into(), args))
-            }
-            _ => None,
-        };
         let (tree, leaves, active_id) = zones.into_tree();
         let terminals: Vec<_> = leaves
             .into_iter()
             .map(|(id, cwd, session)| {
-                let terminal = Self::restored_terminal(&profile, command.clone(), cwd, session.as_ref(), &config, cx);
+                let terminal = Self::restored_terminal(&profile, cwd, session.as_ref(), &config, cx);
                 (id, terminal)
             })
             .collect();
@@ -606,50 +450,22 @@ impl Workspace {
             ZoneTreeView::from_restored(p_clone, theme, font_size, tree, terminals, active_id, window, cx)
         });
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
     /// This window as session restore records it.
     pub fn snapshot(&self, window: &Window, cx: &App) -> WindowState {
-        // A session tmux hasn't named yet can't be reattached by name.
-        let session_tab = |session: &Entity<TmuxSession>| {
-            let s = session.read(cx);
-            match &s.session_name {
-                Some(name) => SnapshotTab::Tmux {
-                    profile: s.profile.name.clone(),
-                    session: name.clone(),
-                    key: session.entity_id().as_u64(),
-                },
-                None => SnapshotTab::Skip,
-            }
-        };
-        // Sessions still attaching have no tabs yet; record them where
-        // their tabs will go, so a quit meanwhile doesn't lose them.
-        let pending: Vec<&Entity<TmuxSession>> = self
-            .tmux_sessions
-            .iter()
-            .map(|(s, _)| s)
-            .filter(|s| !self.tabs.iter().any(|t| t.shows_tmux(s, None, cx)))
-            .collect();
-        let pending_after = |anchor: Option<u64>| -> Vec<SnapshotTab> {
-            pending
-                .iter()
-                .filter(|s| self.anchors.get(&s.entity_id()) == Some(&anchor))
-                .map(|s| session_tab(s))
-                .collect()
-        };
-        let mut tabs: Vec<SnapshotTab> = pending_after(None);
+        let mut tabs: Vec<SnapshotTab> = Vec::new();
         let mut active = None;
         for (ix, tab) in self.tabs.iter().enumerate() {
             if ix == self.active {
                 active = Some(tabs.len());
             }
-            tabs.push(match (&tab.origin, &tab.content) {
-                (TabOrigin::Message, _) => SnapshotTab::Skip,
-                (_, TabContent::Tmux { session, .. }) => session_tab(session),
-                (_, TabContent::Zones(view)) => {
-                    let z = view.read(cx);
+            tabs.push(match tab.origin {
+                TabOrigin::Message => SnapshotTab::Skip,
+                TabOrigin::Local => {
+                    let z = tab.zones.read(cx);
                     let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
                         (z.zone_working_directory(id, cx), z.zone_server_session(id, cx))
                     });
@@ -665,9 +481,7 @@ impl Workspace {
                     }
                 }
             });
-            tabs.extend(pending_after(Some(tab.id)));
         }
-        tabs.extend(pending.iter().filter(|s| !self.anchors.contains_key(&s.entity_id())).map(|s| session_tab(s)));
         let (tabs, active) = session::collapse(&tabs, active.unwrap_or(0));
         let maximized = matches!(window.window_bounds(), WindowBounds::Maximized(_));
         if !maximized {
@@ -708,7 +522,7 @@ impl Workspace {
     }
 
     /// The active directory only has meaning to a profile on the same host
-    /// or container. In particular, never pass a Windows path to remote tmux.
+    /// or container.
     fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
         if tab.profile.remote != profile.remote {
@@ -717,8 +531,7 @@ impl Workspace {
         tab.active_terminal(cx)?.read(cx).working_directory()
     }
 
-    /// Opens a tab for the request. tmux control-mode profiles attach a
-    /// session whose windows arrive as tabs asynchronously.
+    /// Opens a tab for the request.
     pub fn launch(&mut self, request: LaunchRequest, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let Some(profile) = config.profiles.get(request.profile).cloned() else {
@@ -732,26 +545,7 @@ impl Workspace {
             let cwd = cwd.to_string_lossy();
             cwd.starts_with('/') || cwd == "~" || cwd.starts_with("~/")
         });
-
-        if profile.tmux == TmuxMode::Control && request.command.is_none() {
-            let cwd = requested_cwd.or_else(|| profile.working_directory());
-            self.attach_tmux(profile, cwd, window, cx);
-            return;
-        }
-
-        let command = request.command.or_else(|| match profile.tmux {
-            TmuxMode::Plain => {
-                let mut args = profile.tmux_args.clone();
-                args.extend([
-                    "new-session".into(),
-                    "-A".into(),
-                    "-s".into(),
-                    profile.tmux_session_name().to_string(),
-                ]);
-                Some(("tmux".into(), args))
-            }
-            _ => None,
-        });
+        let command = request.command;
 
         let cwd = requested_cwd.or_else(|| {
             // New tabs follow the current directory only on the same endpoint,
@@ -765,12 +559,14 @@ impl Workspace {
         let p_clone = profile.clone();
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
     /// A local tab showing `terminal` alone, inserted after the active tab,
-    /// and activated when `activate`.
+    /// and activated when `activate`. Only attached sessions open this way,
+    /// and only Linux has the terminal server.
+    #[cfg(target_os = "linux")]
     fn insert_terminal_tab(
         &mut self,
         profile: Profile,
@@ -785,7 +581,7 @@ impl Workspace {
         let p_clone = profile.clone();
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
         if activate {
             self.insert_tab(tab, None, window, cx);
@@ -821,21 +617,19 @@ impl Workspace {
     /// launch found it still detached, else `profile` spawned in `cwd`.
     fn restored_terminal(
         profile: &Profile,
-        command: Option<(String, Vec<String>)>,
         cwd: PathBuf,
         recorded: Option<&session::ServerSession>,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        // Only a profile's own program runs in a reattachable session.
-        let found = if command.is_none() { Self::take_detached(recorded, cx) } else { None };
+        let found = Self::take_detached(recorded, cx);
         #[cfg(target_os = "linux")]
         if let Some(info) = found {
             return Self::attached_terminal(&info, profile, config, cx);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = found;
-        cx.new(|cx| Terminal::spawn(profile, command, Some(cwd), config, cx))
+        cx.new(|cx| Terminal::spawn(profile, None, Some(cwd), config, cx))
     }
 
     /// Opens a tab for each of `sessions` (detached sessions nothing
@@ -869,8 +663,7 @@ impl Workspace {
     }
 
     /// Inserts `tab` at `index` without activating it; the active tab stays
-    /// the same. Used for tmux windows, which come to the front only when
-    /// tmux makes them current.
+    /// the same.
     fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) -> usize {
         let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 }).min(self.tabs.len());
         if !self.tabs.is_empty() && index <= self.active {
@@ -886,370 +679,9 @@ impl Workspace {
         index
     }
 
-    /// Attaches `profile`'s session, or focuses it if the window already
-    /// shows it. Returns the newly attached session.
-    fn attach_tmux(
-        &mut self,
-        profile: Profile,
-        cwd: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<TmuxSession>> {
-        if let Some(session) = SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, cx)) {
-            self.show_session(&session, window, cx);
-            return None;
-        }
-        Some(self.create_session(profile, AttachSpec::Named, cwd, None, window, cx))
-    }
-
-    /// Starts a control client for `profile`'s server as `spec` says.
-    /// `reply` hears whether tmux attached it (its first tab arrived) or
-    /// refused, with tmux's message.
-    fn create_session(
-        &mut self,
-        profile: Profile,
-        spec: AttachSpec,
-        cwd: Option<PathBuf>,
-        reply: Option<oneshot::Sender<Result<(), String>>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TmuxSession> {
-        let config = Self::settings(cx).clone();
-        let cwd = cwd.or_else(|| self.active_cwd_for(&profile, cx));
-        let session = cx.new(|cx| TmuxSession::attach(profile, spec, cwd, &config, cx));
-        let subscription = cx.subscribe_in(&session, window, |this, session, event, window, cx| {
-            this.on_tmux_event(session.clone(), event, window, cx)
-        });
-        self.tmux_sessions.push((session.clone(), subscription));
-        if let Some(reply) = reply {
-            self.creating.insert(session.entity_id(), reply);
-        }
-        session
-    }
-
-    /// The window's session for `key`, if it shows one.
-    fn find_session(&self, key: &SessionKey, cx: &App) -> Option<Entity<TmuxSession>> {
-        self.tmux_sessions.iter().map(|(s, _)| s).find(|s| s.read(cx).key().as_ref() == Some(key)).cloned()
-    }
-
-    /// The sessions the window shows.
-    fn open_sessions(&self, cx: &App) -> Vec<SessionKey> {
-        self.tmux_sessions.iter().filter_map(|(s, _)| s.read(cx).key()).collect()
-    }
-
-    /// Activates `session`'s tab for tmux's current window, else its first.
-    fn show_session(&mut self, session: &Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
-        let current = session.read(cx).active_window;
-        let ix = current
-            .and_then(|w| self.tabs.iter().position(|t| t.shows_tmux(session, Some(w), cx)))
-            .or_else(|| self.tabs.iter().position(|t| t.shows_tmux(session, None, cx)));
-        if let Some(ix) = ix {
-            self.activate(ix, window, cx);
-        }
-    }
-
-    /// Opens profile `ix` in a new tab, or activates its tmux session's tab
-    /// when the window already shows it.
+    /// Opens profile `ix` in a new tab.
     fn open_profile(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = Self::settings(cx).profiles.get(ix).cloned() else { return };
-        match SessionKey::for_profile(&profile).and_then(|key| self.find_session(&key, cx)) {
-            Some(session) => self.show_session(&session, window, cx),
-            None => self.launch(LaunchRequest::profile(ix), window, cx),
-        }
-    }
-
-    /// Asks what to open instead of profile `profile`'s session `name`,
-    /// which another Brindle shows.
-    fn ask_session_open(&mut self, profile: usize, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let open = self.open_sessions(cx);
-        let (rows, choices) = session_open_rows(&Self::settings(cx).profiles, profile, &open).into_iter().unzip();
-        let placeholder = format!("tmux session \"{name}\" is open in another Brindle");
-        let palette = cx.new(|cx| Palette::list(rows, placeholder, cx));
-        self.show_palette(palette, PaletteKind::SessionOpenElsewhere { choices, profile }, window, cx);
-    }
-
-    /// Asks for a name, then creates that tmux session on `profile`'s
-    /// server, in the window.
-    fn ask_new_session(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = window.window_handle().downcast::<Workspace>();
-        let cwd = self.active_cwd_for(&profile, cx);
-        let submit: SubmitFn = Rc::new(move |name, cx| {
-            let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
-            let (reply, result) = oneshot::channel();
-            let (profile, cwd) = (profile.clone(), cwd.clone());
-            // The palette is updating the window: attach once it's done.
-            cx.defer(move |cx| {
-                if let Some(handle) = handle {
-                    handle
-                        .update(cx, |ws, window, cx| {
-                            ws.create_session(profile, AttachSpec::New(name), cwd, Some(reply), window, cx);
-                        })
-                        .ok();
-                }
-            });
-            result
-        });
-        let label = "New tmux session name (empty: tmux picks one)".into();
-        self.open_prompt(PromptRequest { label, initial: String::new(), submit }, window, cx);
-    }
-
-    fn tmux_new_session(&mut self, _: &TmuxNewSession, window: &mut Window, cx: &mut Context<Self>) {
-        let config = Self::settings(cx);
-        let tab_profile = self.tabs.get(self.active).and_then(|t| match &t.content {
-            TabContent::Tmux { session, .. } => Some(session.read(cx).profile.clone()),
-            TabContent::Zones(_) => None,
-        });
-        let default = &config.profiles[config.default_profile_index()];
-        let profile = tab_profile
-            .or_else(|| (default.tmux == TmuxMode::Control).then(|| default.clone()))
-            .or_else(|| config.profiles.iter().find(|p| p.tmux == TmuxMode::Control).cloned());
-        if let Some(profile) = profile {
-            self.ask_new_session(profile, window, cx);
-        }
-    }
-
-    fn on_tmux_event(
-        &mut self,
-        session: Entity<TmuxSession>,
-        event: &TmuxEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            TmuxEvent::WindowAdded(window_id) => {
-                let window_id = *window_id;
-                if self.tabs.iter().any(|t| t.shows_tmux(&session, Some(window_id), cx)) {
-                    return;
-                }
-                let profile = session.read(cx).profile.clone();
-                let theme = self.tab_theme(&profile, Self::settings(cx));
-                let view = cx.new(|cx| TmuxWindowView::new(session.clone(), window_id, theme, profile.font_size, window, cx));
-                let subscriptions = vec![
-                    cx.observe(&view, |this, _, cx| {
-                        // Window renames arrive through the view.
-                        for tab in this.tabs.iter_mut().filter(|t| t.is_tmux()) {
-                            tab.refresh_title(&mut None, cx);
-                        }
-                        cx.notify();
-                    }),
-                    cx.subscribe_in(&view, window, |this, _, request: &PromptRequest, window, cx| {
-                        this.open_prompt(request.clone(), window, cx)
-                    }),
-                    // Bells, notifications and status from the window's panes.
-                    cx.subscribe_in(&view, window, |this, view, event: &TerminalEvent, window, cx| {
-                        let tab = this.tabs.iter().position(|t| {
-                            matches!(&t.content, TabContent::Tmux { view: v, .. } if v == view)
-                        });
-                        if let Some(ix) = tab {
-                            this.on_attention(ix, event, window, cx);
-                        }
-                    }),
-                ];
-                let tab = Tab::new(
-                    profile,
-                    TabContent::Tmux { session: session.clone(), view },
-                    TabOrigin::Tmux,
-                    subscriptions,
-                    cx,
-                );
-                // Keep a session's tabs together, in tmux's window order. A
-                // restored session's first tab goes where it was recorded.
-                let anchor = self.anchors.remove(&session.entity_id());
-                let index = match self.tabs.iter().rposition(|t| t.shows_tmux(&session, None, cx)) {
-                    Some(last) => Some(last + 1),
-                    None => match anchor {
-                        Some(Some(id)) => self.tabs.iter().position(|t| t.id == id).map(|i| i + 1),
-                        Some(None) => Some(0),
-                        None => None,
-                    },
-                };
-                self.insert_tab_inactive(tab, index, cx);
-                self.finish_replacing(&session, window, cx);
-                if let Some(reply) = self.creating.remove(&session.entity_id()) {
-                    reply.send(Ok(())).ok();
-                }
-            }
-            TmuxEvent::WindowClosed(window_id) => {
-                // The window's last tab, for the session's last window: the
-                // session is ending, and `Detached` decides what follows.
-                if self.tabs.len() == 1 && self.tabs[0].shows_tmux(&session, Some(*window_id), cx) {
-                    return;
-                }
-                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
-                    self.remove_tab(ix, window, cx);
-                }
-            }
-            TmuxEvent::WindowActivated(window_id) => {
-                // A restored session that wasn't the active tab stays in the
-                // background once; nothing is sent to tmux either way.
-                if self.quiet_sessions.remove(&session.entity_id()) {
-                    return;
-                }
-                // Always activate: tabs are added without activation, so the
-                // current window's tab may already be `active` yet unfocused.
-                if let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(&session, Some(*window_id), cx)) {
-                    self.activate(ix, window, cx);
-                }
-            }
-            TmuxEvent::Failed(reason) => {
-                self.tmux_sessions.retain(|(s, _)| *s != session);
-                self.forget_restore(&session);
-                // A prompt that created the session shows tmux's message;
-                // if it has been dismissed, a tab explains instead.
-                if let Some(reply) = self.creating.remove(&session.entity_id())
-                    && reply.send(Err(reason.clone())).is_ok()
-                {
-                    self.finish_replacing(&session, window, cx);
-                    return;
-                }
-                let profile = session.read(cx).profile.clone();
-                let text = format!(
-                    "\x1b[1mtmux ({}) ended before attaching:\x1b[0m {reason}\r\n\r\n\
-                     Is tmux installed and on PATH? Profile settings: tmux_session, tmux_args, command.\r\n",
-                    profile.name
-                );
-                self.open_message_tab(profile, &text, window, cx);
-                self.finish_replacing(&session, window, cx);
-            }
-            TmuxEvent::ShownByAnotherBrindle(name) => {
-                self.tmux_sessions.retain(|(s, _)| *s != session);
-                self.forget_restore(&session);
-                self.creating.remove(&session.entity_id());
-                // An ended session it was to replace stays until the user
-                // picks something (see `orphaned_sessions`).
-                self.replacing.remove(&session.entity_id());
-                let profile = session.read(cx).profile.name.clone();
-                match Self::settings(cx).profiles.iter().position(|p| p.name == profile) {
-                    Some(ix) => {
-                        self.ask_session_open(ix, &name, window, cx)
-                    }
-                    None => self.close_orphans(window, cx),
-                }
-            }
-            TmuxEvent::Detached(reason) => {
-                log::info!("tmux session detached: {reason}");
-                self.creating.remove(&session.entity_id());
-                self.finish_replacing(&session, window, cx);
-                if self.tabs.is_empty() {
-                    return;
-                }
-                self.tmux_sessions.retain(|(s, _)| *s != session);
-                self.forget_restore(&session);
-                if self.tabs.iter().all(|t| t.shows_tmux(&session, None, cx)) {
-                    // Nothing else would be left: the setting decides.
-                    match Self::settings(cx).tmux_session_end {
-                        TmuxSessionEnd::CloseWindow => {}
-                        TmuxSessionEnd::NewTab => {
-                            if let Some(profile) = Self::fallback_profile(Self::settings(cx)) {
-                                self.launch(LaunchRequest::profile(profile), window, cx);
-                            }
-                        }
-                        TmuxSessionEnd::Ask => {
-                            // The ended tabs stay until the user chooses.
-                            self.ask_session_ended(session, window, cx);
-                            return;
-                        }
-                    }
-                }
-                self.remove_session_tabs(&session, window, cx);
-            }
-        }
-    }
-
-    /// The profile a window falls back to when tmux leaves it empty: the
-    /// default, or the first non-tmux profile when the default would attach
-    /// a control-mode session again.
-    fn fallback_profile(config: &Config) -> Option<usize> {
-        let default = config.default_profile_index();
-        if config.profiles[default].tmux == TmuxMode::Control {
-            config.profiles.iter().position(|p| p.tmux == TmuxMode::None)
-        } else {
-            Some(default)
-        }
-    }
-
-    /// Closes every tab of `session`. Removing the last tab closes the
-    /// window, as for any tab.
-    fn remove_session_tabs(&mut self, session: &Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
-        while let Some(ix) = self.tabs.iter().position(|t| t.shows_tmux(session, None, cx)) {
-            self.remove_tab(ix, window, cx);
-            if self.tabs.is_empty() {
-                return;
-            }
-        }
-    }
-
-    fn ask_session_ended(&mut self, session: Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = session_ended_rows(&Self::settings(cx).profiles);
-        let placeholder = format!("tmux session \"{}\" ended", session.read(cx).session_name.as_deref().unwrap_or("?"));
-        let palette = cx.new(|cx| Palette::list(rows, placeholder, cx));
-        self.show_palette(palette, PaletteKind::SessionEnded { session }, window, cx);
-    }
-
-    /// `session` showed up (or failed): the ended session it replaces goes.
-    fn finish_replacing(&mut self, session: &Entity<TmuxSession>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ended) = self.replacing.remove(&session.entity_id()) {
-            self.remove_session_tabs(&ended, window, cx);
-        }
-    }
-
-    fn forget_restore(&mut self, session: &Entity<TmuxSession>) {
-        self.quiet_sessions.remove(&session.entity_id());
-        self.anchors.remove(&session.entity_id());
-    }
-
-    /// Sessions whose tabs are shown but which are no longer attached, and
-    /// that no attaching session waits to replace: a session that ended,
-    /// whose replacement another Brindle turned out to show.
-    fn orphaned_sessions(&self) -> Vec<Entity<TmuxSession>> {
-        let mut orphans: Vec<Entity<TmuxSession>> = Vec::new();
-        for tab in &self.tabs {
-            if let TabContent::Tmux { session, .. } = &tab.content
-                && !self.tmux_sessions.iter().any(|(s, _)| s == session)
-                && !self.replacing.values().any(|ended| ended == session)
-                && !orphans.contains(session)
-            {
-                orphans.push(session.clone());
-            }
-        }
-        orphans
-    }
-
-    /// Closes the tabs of [`orphaned_sessions`], then the window if nothing
-    /// is left in it or on its way (a second Brindle's window that asked
-    /// about a session, and was dismissed).
-    fn close_orphans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for session in self.orphaned_sessions() {
-            self.remove_session_tabs(&session, window, cx);
-            if self.tabs.is_empty() {
-                return;
-            }
-        }
-        if self.tabs.is_empty() && self.tmux_sessions.is_empty() {
-            let id = self.window_id;
-            cx.update_global(|store: &mut SessionStore, _| store.forget(id));
-            window.remove_window();
-        }
-    }
-
-    /// Opens profile `ix` in a tab, in place of any [`orphaned_sessions`]:
-    /// their tabs close once it shows up.
-    fn launch_replacing_orphans(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let orphan = self.orphaned_sessions().into_iter().next();
-        let profile = Self::settings(cx).profiles.get(ix).cloned();
-        match profile {
-            Some(profile) if profile.tmux == TmuxMode::Control => {
-                if let Some(new) = self.attach_tmux(profile, None, window, cx) {
-                    if let Some(orphan) = orphan {
-                        self.replacing.insert(new.entity_id(), orphan);
-                    }
-                    return;
-                }
-            }
-            Some(_) => self.launch(LaunchRequest::profile(ix), window, cx),
-            None => {}
-        }
-        self.close_orphans(window, cx);
+        self.launch(LaunchRequest::profile(ix), window, cx);
     }
 
     fn zone_tab_subscriptions(
@@ -1274,11 +706,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shown = matches!(self.tabs.get(self.active).map(|t| &t.content), Some(TabContent::Zones(v)) if v == view);
+        let shown = self.tabs.get(self.active).is_some_and(|t| &t.zones == view);
         if !shown {
             return;
         }
-        let menu = ActionMenu::new(request.rows.clone(), |action| tab_shortcut(action, false, cx));
+        let menu = ActionMenu::new(request.rows.clone(), |action| tab_shortcut(action, cx));
         self.open_context_menu(menu, request.at, request.press.as_ref(), window, cx);
     }
 
@@ -1289,9 +721,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ix) = self.tabs.iter().position(|t| {
-            matches!(&t.content, TabContent::Zones(v) if v == view)
-        }) else {
+        let Some(ix) = self.tabs.iter().position(|t| &t.zones == view) else {
             return;
         };
         match event {
@@ -1308,7 +738,7 @@ impl Workspace {
     }
 
     /// A bell, a notification request or a program status change from tab
-    /// `ix`, local or tmux: marks the tab (the bell dot, the status dot),
+    /// `ix`: marks the tab (the bell dot, the status dot),
     /// and raises a desktop notification if the tab isn't in front of the
     /// user (or the settings say always).
     fn on_attention(&mut self, ix: usize, event: &TerminalEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1372,19 +802,14 @@ impl Workspace {
         }
     }
 
-    /// Shows tab `index` (clamped) without moving focus: its bell clears and
-    /// a tmux window becomes its session's current one. False with no tabs.
+    /// Shows tab `index` (clamped) without moving focus: its bell clears.
+    /// False with no tabs.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
         if self.tabs.is_empty() {
             return false;
         }
         self.active = index.min(self.tabs.len() - 1);
-        let tab = &mut self.tabs[self.active];
-        tab.bell = false;
-        if let TabContent::Tmux { session, view } = &tab.content {
-            let window_id = view.read(cx).window_id;
-            session.update(cx, |s, _| s.select_window(window_id));
-        }
+        self.tabs[self.active].bell = false;
         cx.notify();
         true
     }
@@ -1437,9 +862,7 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(ix);
-        if let TabContent::Zones(view) = &tab.content {
-            view.update(cx, |v, cx| v.shutdown_all(cx));
-        }
+        tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
         if self.tabs.is_empty() {
             // Nothing to restore for a window whose tabs all closed.
             let id = self.window_id;
@@ -1461,18 +884,11 @@ impl Workspace {
         let terminal = cx.new(|cx| Terminal::message(text, theme.clone(), &config, cx));
         let p_clone = profile.clone();
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, profile.font_size, terminal, window, cx));
-        let tab = Tab::new(profile, TabContent::Zones(view), TabOrigin::Message, Vec::new(), cx);
+        let tab = Tab::new(profile, view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
-        // In a tmux tab, a new tab is a new tmux window in the same session.
-        if let Some(tab) = self.tabs.get(self.active)
-            && let TabContent::Tmux { session, .. } = &tab.content
-        {
-            session.update(cx, |s, _| s.new_window());
-            return;
-        }
         let profile = Self::settings(cx).default_profile_index();
         self.open_profile(profile, window, cx);
     }
@@ -1486,16 +902,6 @@ impl Workspace {
     }
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(ix) else { return };
-        if let TabContent::Tmux { session, view } = &tab.content
-            && !session.read(cx).is_detached()
-        {
-            // Closing a tmux tab closes that tmux window; tmux tells us when
-            // it is gone and the tab is removed then.
-            let window_id = view.read(cx).window_id;
-            session.update(cx, |s, _| s.kill_window(window_id));
-            return;
-        }
         self.remove_tab(ix, window, cx);
     }
 
@@ -1552,7 +958,6 @@ impl Workspace {
                 }
             })
             .ok();
-            ready(Ok(()))
         });
         let label = "Rename tab".into();
         self.open_prompt(PromptRequest { label, initial, submit }, window, cx);
@@ -1588,8 +993,7 @@ impl Workspace {
     /// ([`profile_rows`]), with the keys that open each in the active tab.
     fn profile_rows(&self, window: &Window, cx: &App) -> Vec<PaletteRow> {
         let focus = self.tabs.get(self.active).map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
-        let open = self.open_sessions(cx);
-        profile_rows(&Self::settings(cx).profiles, &open, |ix| shortcut(&NewTabWithProfile(ix), &focus, window))
+        profile_rows(&Self::settings(cx).profiles, |ix| shortcut(&NewTabWithProfile(ix), &focus, window))
     }
 
     /// Gives the profile menu the picker's rows as they are now, for its
@@ -1639,8 +1043,7 @@ impl Workspace {
             return;
         }
         self.select(ix, cx);
-        let is_tmux = self.tabs[ix].is_tmux();
-        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, self.tabs.len()), |action| tab_shortcut(action, is_tmux, cx));
+        let menu = ActionMenu::new(tab_menu_rows(ix, self.tabs.len()), |action| tab_shortcut(action, cx));
         self.open_context_menu(menu, at, press, window, cx);
     }
 
@@ -1703,18 +1106,8 @@ impl Workspace {
         self.show_palette(palette, PaletteKind::Commands { actions, tab_focus }, window, cx);
     }
 
-    /// Asks for a line of text. An open palette becomes the prompt in
-    /// place (a list followed by a prompt keeps one overlay layer and the
-    /// focus it gives back, and the slot's outside-press rule: the prompt
-    /// that follows a question ignores outside presses as the question
-    /// did); otherwise one opens, replacing any overlay.
+    /// Asks for a line of text, replacing any overlay.
     fn open_prompt(&mut self, request: PromptRequest, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(palette) = self.palette.view().cloned() {
-            palette.update(cx, |palette, cx| palette.show_prompt(request, window, cx));
-            self.palette_kind = Some(PaletteKind::Prompt);
-            cx.notify();
-            return;
-        }
         let palette = cx.new(|cx| Palette::prompt(request, cx));
         self.show_palette(palette, PaletteKind::Prompt, window, cx);
     }
@@ -1751,30 +1144,15 @@ impl Workspace {
             PaletteEvent::Kill(ix) => this.palette_kill(*ix, window, cx),
             PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
-        self.palette.set_ignore_outside_press(ignores_outside_press(PaletteTag::of(&kind)));
         self.palette_kind = Some(kind);
         self._palette_subscription = Some(subscription);
         self.palette.open(palette, |this| &mut this.palette, window, cx);
         cx.notify();
     }
 
-    /// Escape (or a click outside) on a palette. After a session ended,
-    /// that closes the window. After asking about another Brindle's session
-    /// (or a prompt that followed), tabs nothing replaces close, and so does
-    /// a window left without tabs.
+    /// Escape (or a click outside) on a palette.
     fn palette_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (ended, orphans) = match &self.palette_kind {
-            Some(PaletteKind::SessionEnded { session }) => (Some(session.clone()), false),
-            Some(PaletteKind::SessionOpenElsewhere { .. } | PaletteKind::Prompt) => (None, true),
-            _ => (None, false),
-        };
         self.dismiss_overlay(window, cx);
-        if let Some(session) = ended {
-            self.remove_session_tabs(&session, window, cx);
-        }
-        if orphans {
-            self.close_orphans(window, cx);
-        }
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1784,19 +1162,6 @@ impl Workspace {
                 self.dismiss_overlay(window, cx);
                 self.open_profile(ix, window, cx);
             }
-            PaletteKind::SessionOpenElsewhere { choices, profile } => match choices.get(ix) {
-                // The question turns into the prompt for the session's
-                // name, in place.
-                Some(OpenChoice::NewSession) => match Self::settings(cx).profiles.get(profile).cloned() {
-                    Some(profile) => self.ask_new_session(profile, window, cx),
-                    None => self.dismiss_overlay(window, cx),
-                },
-                Some(&OpenChoice::Profile(other)) => {
-                    self.dismiss_overlay(window, cx);
-                    self.launch_replacing_orphans(other, window, cx);
-                }
-                None => self.dismiss_overlay(window, cx),
-            },
             PaletteKind::Commands { actions, tab_focus } => {
                 // Run it from the tab, exactly as its keybinding would: the
                 // palette closes first (giving focus back to the tab), since
@@ -1816,23 +1181,6 @@ impl Workspace {
                 if let Some(info) = sessions.into_iter().nth(ix) {
                     self.attach_detached_here(info, window, cx);
                 }
-            }
-            PaletteKind::SessionEnded { session } => {
-                self.dismiss_overlay(window, cx);
-                let profile = ix.checked_sub(1).and_then(|p| Self::settings(cx).profiles.get(p).cloned());
-                match profile {
-                    // A control-mode session's tabs arrive later; keep the
-                    // window open with the ended tabs until they do.
-                    Some(profile) if profile.tmux == TmuxMode::Control => {
-                        if let Some(new) = self.attach_tmux(profile, None, window, cx) {
-                            self.replacing.insert(new.entity_id(), session);
-                            return;
-                        }
-                    }
-                    Some(_) => self.launch(LaunchRequest::profile(ix - 1), window, cx),
-                    None => {}
-                }
-                self.remove_session_tabs(&session, window, cx);
             }
         }
     }
@@ -1932,7 +1280,6 @@ impl Workspace {
             config.themes.clone(),
             config.profiles.clone(),
             config.default_profile.clone(),
-            config.tmux_session_end,
         );
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, window, cx));
@@ -2060,8 +1407,7 @@ impl Workspace {
     }
 
     /// Shows the edited profile's theme and font size on its tabs, or, with
-    /// `None`, puts their configured ones back. As with the theme preview,
-    /// tmux isn't told.
+    /// `None`, puts their configured ones back.
     pub fn set_profile_preview(&mut self, preview: Option<(String, Profile)>, cx: &mut Context<Self>) {
         self.profile_preview = preview;
         self.apply_tab_themes(cx);
@@ -2069,8 +1415,7 @@ impl Workspace {
     }
 
     /// Shows `preview` on the tabs that follow the global theme, or, with
-    /// `None`, puts their configured theme back. tmux isn't told: color
-    /// reports are only sent on a real config change.
+    /// `None`, puts their configured theme back.
     pub fn set_theme_preview(&mut self, preview: Option<Theme>, cx: &mut Context<Self>) {
         match &preview {
             Some(theme) => Settings::set_ui_theme(theme, cx),
@@ -2091,13 +1436,6 @@ impl Workspace {
                 tab.profile.name = new.to_string();
             }
         }
-        for (session, _) in &self.tmux_sessions {
-            session.update(cx, |s, _| {
-                if let Some(new) = renamed(&s.profile.name, renames) {
-                    s.profile.name = new.to_string();
-                }
-            });
-        }
         for tab in &mut self.tabs {
             if let Some(p) = config.profile(&tab.profile.name) {
                 let remote = tab.profile.remote.clone();
@@ -2110,12 +1448,6 @@ impl Workspace {
             tab.refresh_title(&mut snapshot, cx);
         }
         self.apply_tab_themes(cx);
-        for (session, _) in &self.tmux_sessions {
-            session.update(cx, |s, cx| {
-                let profile = config.profile(&s.profile.name).cloned().unwrap_or_else(|| s.profile.clone());
-                s.set_config(profile, &config, cx);
-            });
-        }
         cx.notify();
     }
 
@@ -2195,8 +1527,8 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
-            if let Some(TabContent::Zones(zones)) = self.tabs.get(self.active).map(|t| &t.content) {
-                out.push_str(&zones.read(cx).describe_zones());
+            if let Some(tab) = self.tabs.get(self.active) {
+                out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&terminal.screen_text());
         }
@@ -2304,10 +1636,6 @@ impl Workspace {
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
                     .text_color(text);
-                if tab.is_tmux() {
-                    // In the face's text colour, as its label.
-                    trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
-                }
                 if let Some(state) = tab.status {
                     trigger = trigger.adornment(dot(status_color(state)));
                 }
@@ -2498,9 +1826,8 @@ impl Workspace {
     }
 
     fn render_content(&self) -> AnyElement {
-        match self.tabs.get(self.active).map(|t| &t.content) {
-            Some(TabContent::Zones(view)) => view.clone().into_any_element(),
-            Some(TabContent::Tmux { view, .. }) => view.clone().into_any_element(),
+        match self.tabs.get(self.active) {
+            Some(tab) => tab.zones.clone().into_any_element(),
             None => div().into_any_element(),
         }
     }
@@ -2575,13 +1902,8 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
 
 /// Gives a tab's terminals `theme`, keeping its font size.
 fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
-    match &tab.content {
-        TabContent::Zones(view) => {
-            let profile = tab.profile.clone();
-            view.update(cx, |view, cx| view.set_profile(profile, theme, font_size, cx))
-        }
-        TabContent::Tmux { view, .. } => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
-    }
+    let profile = tab.profile.clone();
+    tab.zones.update(cx, |view, cx| view.set_profile(profile, theme, font_size, cx))
 }
 
 /// The size to record for a window last recorded (or opened) at `known`,
@@ -2602,24 +1924,14 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
 /// The profiles as the profile picker and the profile menu list them, in
 /// configuration order: each one's name, what it runs and the keys bound to
 /// opening it (`shortcut(ix)`, the keymap's ctrl-alt-N for the first nine).
-/// A control-mode profile whose session the window shows (`open`) adds
-/// " · open in this window", since choosing it activates that tab.
-fn profile_rows(
-    profiles: &[Profile],
-    open: &[SessionKey],
-    shortcut: impl Fn(usize) -> Option<SharedString>,
-) -> Vec<PaletteRow> {
+fn profile_rows(profiles: &[Profile], shortcut: impl Fn(usize) -> Option<SharedString>) -> Vec<PaletteRow> {
     profiles
         .iter()
         .enumerate()
-        .map(|(ix, profile)| {
-            let shown = SessionKey::for_profile(profile).is_some_and(|key| open.contains(&key));
-            let state = if shown { " · open in this window" } else { "" };
-            PaletteRow {
-                label: profile.name.clone().into(),
-                detail: Some(format!("{}{state}", profile.description()).into()),
-                shortcut: shortcut(ix),
-            }
+        .map(|(ix, profile)| PaletteRow {
+            label: profile.name.clone().into(),
+            detail: Some(profile.description().into()),
+            shortcut: shortcut(ix),
         })
         .collect()
 }
@@ -2633,14 +1945,12 @@ fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
         .collect()
 }
 
-/// The menu of tab `ix` of `count`: Rename Tab (a tmux tab's is tmux's
-/// Rename Window, shown as "Rename Window"), Move Tab Left (disabled on the
-/// first tab), Move Tab Right (disabled on the last), a separator and Close
-/// Tab, which on a tmux tab closes that tmux window.
-fn tab_menu_rows(is_tmux: bool, ix: usize, count: usize) -> Vec<ActionRow> {
-    let rename = if is_tmux { ActionRow::item(TmuxRenameWindow, true) } else { ActionRow::item(RenameTab, true) };
+/// The menu of tab `ix` of `count`: Rename Tab, Move Tab Left (disabled on
+/// the first tab), Move Tab Right (disabled on the last), a separator and
+/// Close Tab.
+fn tab_menu_rows(ix: usize, count: usize) -> Vec<ActionRow> {
     vec![
-        rename,
+        ActionRow::item(RenameTab, true),
         ActionRow::item(MoveTabLeft, ix > 0),
         ActionRow::item(MoveTabRight, ix + 1 < count),
         ActionRow::Separator,
@@ -2659,20 +1969,20 @@ fn strip_button(id: &'static str, icon: Icon, color: Hsla) -> Button {
         .text_color(color)
 }
 
-/// The keys that run `action` in a terminal of a local or tmux tab, as the
-/// keymap resolves them in that terminal's contexts (`Workspace`, then
-/// `ZoneTree` or `TmuxWindow`, then `Terminal`, where user bindings go).
-/// Unlike [`shortcut`] it needs no drawn frame, so a background tab that a
-/// right-click just activated shows its keys.
-fn tab_shortcut(action: &dyn Action, is_tmux: bool, cx: &App) -> Option<SharedString> {
+/// The keys that run `action` in a terminal of a tab, as the keymap
+/// resolves them in that terminal's contexts (`Workspace`, then `ZoneTree`,
+/// then `Terminal`, where user bindings go). Unlike [`shortcut`] it needs
+/// no drawn frame, so a background tab that a right-click just activated
+/// shows its keys.
+fn tab_shortcut(action: &dyn Action, cx: &App) -> Option<SharedString> {
     let keymap = cx.key_bindings();
     let keymap = keymap.borrow();
-    tab_keys(&keymap, action, is_tmux)
+    tab_keys(&keymap, action)
 }
 
 /// [`tab_shortcut`] in `keymap`.
-fn tab_keys(keymap: &gpui::Keymap, action: &dyn Action, is_tmux: bool) -> Option<SharedString> {
-    let contexts: Vec<gpui::KeyContext> = ["Workspace", if is_tmux { "TmuxWindow" } else { "ZoneTree" }, "Terminal"]
+fn tab_keys(keymap: &gpui::Keymap, action: &dyn Action) -> Option<SharedString> {
+    let contexts: Vec<gpui::KeyContext> = ["Workspace", "ZoneTree", "Terminal"]
         .into_iter()
         .filter_map(|name| gpui::KeyContext::parse(name).ok())
         .collect();
@@ -2729,39 +2039,6 @@ fn describe_menu(entries: &[MenuEntry], highlighted: Option<usize>) -> String {
         out.push('\n');
     }
     out
-}
-
-/// The rows of the palette shown after a session that was all the window
-/// showed ended: "Close window", then a new tab with each profile.
-/// Rows for a window whose only session ended. A control-mode profile
-/// whose session another window shows goes there instead of a new tab.
-fn session_ended_rows(profiles: &[Profile]) -> Vec<PaletteRow> {
-    std::iter::once(PaletteRow { label: "Close window".into(), detail: None, shortcut: None })
-        .chain(profiles.iter().map(|profile| PaletteRow {
-            label: format!("New tab: {}", profile.name).into(),
-            detail: Some(profile.description().into()),
-            shortcut: None,
-        }))
-        .collect()
-}
-
-/// Rows for a profile whose session another Brindle shows: make a new
-/// session instead, or open another profile. Profiles whose session the
-/// window shows (`open`) are left out.
-fn session_open_rows(profiles: &[Profile], picked: usize, open: &[SessionKey]) -> Vec<(PaletteRow, OpenChoice)> {
-    let row = |label: String, detail: String| PaletteRow { label: label.into(), detail: Some(detail.into()), shortcut: None };
-    let mut rows =
-        vec![(row("New tmux session…".into(), format!("with profile {}", profiles[picked].name)), OpenChoice::NewSession)];
-    rows.extend(
-        profiles
-            .iter()
-            .enumerate()
-            .filter(|&(ix, profile)| {
-                ix != picked && SessionKey::for_profile(profile).is_none_or(|key| !open.contains(&key))
-            })
-            .map(|(ix, profile)| (row(format!("New tab: {}", profile.name), profile.description()), OpenChoice::Profile(ix))),
-    );
-    rows
 }
 
 /// The keys that run `action` in the element `focus`, as the palettes show them.
@@ -2846,11 +2123,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_profile_menu))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::open_settings))
-            .when(Settings::get(cx).config.profiles.iter().any(|p| p.tmux == TmuxMode::Control), |d| {
-                d.on_action(cx.listener(Self::tmux_new_session))
-            })
-            // Consumes keys bound to `Swallow` (ctrl-shift-d outside tmux tabs).
-            .on_action(cx.listener(|_, _: &Swallow, _, _| {}))
             .when(!settings_open, |d| {
                 d.on_action(cx.listener(Self::new_tab))
                     .on_action(cx.listener(Self::new_tab_with_profile))
@@ -2981,25 +2253,6 @@ mod tests {
     use super::*;
     use gpui::size;
 
-    /// The click-outside rule per palette (pointer presses can't be posted
-    /// on Linux, so this stands in for an e2e case): questions ignore a
-    /// press outside, plain lists and a prompt opened on its own close on
-    /// it. The prompt that follows a question replaces it in place and
-    /// keeps the slot's flag (`open_prompt` doesn't set it). Every kind is
-    /// covered through its tag; `PaletteTag::of` is an exhaustive match, so
-    /// a new kind needs a decision.
-    #[test]
-    fn questions_ignore_outside_presses() {
-        let sticky: Vec<PaletteTag> = PaletteTag::ALL.into_iter().filter(|&tag| ignores_outside_press(tag)).collect();
-        assert_eq!(sticky, [PaletteTag::SessionEnded, PaletteTag::SessionOpenElsewhere]);
-        // The kinds that build without an app map to their tags.
-        let elsewhere = PaletteKind::SessionOpenElsewhere { choices: Vec::new(), profile: 0 };
-        assert_eq!(PaletteTag::of(&elsewhere), PaletteTag::SessionOpenElsewhere);
-        assert_eq!(PaletteTag::of(&PaletteKind::Prompt), PaletteTag::Prompt);
-        assert_eq!(PaletteTag::of(&PaletteKind::NewTab), PaletteTag::NewTab);
-        assert_eq!(PaletteTag::of(&PaletteKind::Sessions { sessions: Vec::new() }), PaletteTag::Sessions);
-    }
-
     /// The spec's drag scenario: the first tab dropped on the third lands in
     /// the third place; one dropped from the right lands before its target;
     /// a drop on itself or out of range moves nothing.
@@ -3040,48 +2293,6 @@ mod tests {
         assert_eq!(sessions_empty_message(3), None);
     }
 
-    #[test]
-    fn session_ended_rows_offer_closing_first_then_each_profile() {
-        let config = Config::parse(
-            "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n[[profiles]]\nname = \"Shell\"\n",
-        )
-        .unwrap();
-        let rows = session_ended_rows(&config.profiles);
-        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
-        assert_eq!(labels, ["Close window", "New tab: tmux", "New tab: Shell"]);
-        assert!(rows[0].detail.is_none());
-        assert_eq!(rows[1].detail.as_ref().map(|d| d.to_string()), Some(config.profiles[0].description().to_string()));
-    }
-
-    fn open_rows_config() -> Config {
-        Config::parse(
-            "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n\
-             [[profiles]]\nname = \"Shell\"\n\
-             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n\
-             [[profiles]]\nname = \"classic\"\ntmux = \"plain\"\n",
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn session_open_rows_offer_a_new_session_then_other_profiles() {
-        let config = open_rows_config();
-        let rows = session_open_rows(&config.profiles, 0, &[]);
-        let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
-        assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: work", "New tab: classic"]);
-        let choices: Vec<OpenChoice> = rows.into_iter().map(|(_, c)| c).collect();
-        assert_eq!(choices, [OpenChoice::NewSession, OpenChoice::Profile(1), OpenChoice::Profile(2), OpenChoice::Profile(3)]);
-    }
-
-    #[test]
-    fn session_open_rows_skip_sessions_the_window_shows() {
-        let config = open_rows_config();
-        let open = [SessionKey::for_profile(&config.profiles[2]).unwrap()];
-        let rows = session_open_rows(&config.profiles, 0, &open);
-        let labels: Vec<&str> = rows.iter().map(|(r, _)| r.label.as_ref()).collect();
-        assert_eq!(labels, ["New tmux session…", "New tab: Shell", "New tab: classic"]);
-    }
-
     /// The keys `shortcut` shows for `action` in a local tab's terminal with
     /// the default keymap: the last binding that matches there and isn't
     /// shadowed, as gpui's `highest_precedence_binding_for_action_in` finds it.
@@ -3103,25 +2314,22 @@ mod tests {
     }
 
     /// The picker's rows and the menu's items: names in configuration
-    /// order, what each runs (a control-mode profile names its session, and
-    /// says so when the window shows it) and ctrl-alt-N from the keymap.
+    /// order, what each runs and ctrl-alt-N from the keymap.
     #[test]
     fn profile_rows_and_menu_items_match_the_picker() {
         let config = Config::parse(
             "[[profiles]]\nname = \"Shell\"\ncommand = \"bash\"\n\
-             [[profiles]]\nname = \"tmux\"\ntmux = \"control\"\ntmux_session = \"main\"\n\
-             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n",
+             [[profiles]]\nname = \"htop\"\ncommand = \"htop\"\n[[profiles]]\nname = \"work\"\n",
         )
         .unwrap();
         let keymap = gpui::Keymap::new(crate::actions::default_bindings());
-        let open = [SessionKey::for_profile(&config.profiles[1]).unwrap()];
-        let build = || profile_rows(&config.profiles, &open, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));
+        let build = || profile_rows(&config.profiles, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));
         let rows = build();
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
-        assert_eq!(labels, ["Shell", "tmux", "work"]);
+        assert_eq!(labels, ["Shell", "htop", "work"]);
         assert_eq!(text(&rows[0].detail), Some(config.profiles[0].description().as_str()));
-        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main · open in this window"));
-        assert_eq!(text(&rows[2].detail), Some("tmux control mode · work"));
+        assert_eq!(text(&rows[1].detail), Some("htop"));
+        assert_eq!(text(&rows[2].detail), Some("default shell"));
         let keys: Vec<Option<&str>> = rows.iter().map(|r| text(&r.shortcut)).collect();
         assert_eq!(keys, [Some("ctrl-alt-1"), Some("ctrl-alt-2"), Some("ctrl-alt-3")]);
 
@@ -3136,11 +2344,6 @@ mod tests {
             assert_eq!(item.shortcut, row.shortcut);
             assert!(!item.disabled);
         }
-
-        // Nothing open: no profile says "open in this window".
-        let rows = profile_rows(&config.profiles, &[], |_| None);
-        assert!(rows.iter().all(|r| !r.detail.as_ref().is_some_and(|d| d.contains("open in"))));
-        assert_eq!(text(&rows[1].detail), Some("tmux control mode · main"));
     }
 
     /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth
@@ -3150,7 +2353,7 @@ mod tests {
         let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
         let config = Config::parse(&toml).unwrap();
         let keymap = gpui::Keymap::new(crate::actions::default_bindings());
-        let entries = profile_menu_entries(profile_rows(&config.profiles, &[], |ix| {
+        let entries = profile_menu_entries(profile_rows(&config.profiles, |ix| {
             default_keys(&keymap, &NewTabWithProfile(ix))
         }));
         assert_eq!(entries.len(), 11);
@@ -3168,45 +2371,41 @@ mod tests {
             MenuItem::new("Shell").description("bash").shortcut("ctrl-alt-1").into(),
             MenuItem::new("Off").disabled(true).into(),
             MenuEntry::Separator,
-            MenuItem::new("tmux").into(),
+            MenuItem::new("htop").into(),
         ];
         assert_eq!(
             describe_menu(&entries, None),
-            "--- menu items=Shell|[Off]|-|tmux highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\ntmux\n"
+            "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
-        assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|tmux highlighted=3\n"));
+        assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
     }
 
     /// The first line `--- menu` prints for the menu of tab `ix` of `count`,
     /// with the default keys.
-    fn tab_menu_line(is_tmux: bool, ix: usize, count: usize) -> String {
+    fn tab_menu_line(ix: usize, count: usize) -> String {
         let keymap = gpui::Keymap::new(default_bindings());
-        let menu = ActionMenu::new(tab_menu_rows(is_tmux, ix, count), |action| tab_keys(&keymap, action, is_tmux));
+        let menu = ActionMenu::new(tab_menu_rows(ix, count), |action| tab_keys(&keymap, action));
         describe_menu(&menu.entries, None)
     }
 
     /// The spec's tab menu: Move Tab Left disabled on the first tab, Move
-    /// Tab Right on the last (both on a lone tab), a tmux tab's Rename
-    /// Window in place of Rename Tab, and each item's default key. The menu
-    /// of the third of four tabs has both moves enabled.
+    /// Tab Right on the last (both on a lone tab), and each item's default
+    /// key. The menu of the third of four tabs has both moves enabled.
     #[test]
     fn tab_menu_items() {
         assert_eq!(
-            tab_menu_line(false, 0, 3),
+            tab_menu_line(0, 3),
             "--- menu items=Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab highlighted=none\n\
              Rename Tab\nMove Tab Left  [ctrl-shift-pageup]\nMove Tab Right  [ctrl-shift-pagedown]\n\
              Close Tab  [ctrl-shift-w]\n"
         );
-        assert!(tab_menu_line(false, 2, 4).starts_with("--- menu items=Rename Tab|Move Tab Left|Move Tab Right|-|Close Tab "));
-        assert!(tab_menu_line(false, 2, 3).starts_with("--- menu items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "));
-        assert!(
-            tab_menu_line(false, 0, 1).starts_with("--- menu items=Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab ")
-        );
-        assert!(tab_menu_line(true, 1, 3).starts_with("--- menu items=Rename Window|Move Tab Left|Move Tab Right|-|Close Tab "));
-        let tmux = ActionMenu::new(tab_menu_rows(true, 0, 2), |_| None);
-        assert!(tmux.action(0).is_some_and(|a| a.partial_eq(&TmuxRenameWindow)));
-        assert!(tmux.action(1).is_none(), "Move Tab Left on the first tab runs nothing");
-        assert!(tmux.action(4).is_some_and(|a| a.partial_eq(&CloseTab)));
+        assert!(tab_menu_line(2, 4).starts_with("--- menu items=Rename Tab|Move Tab Left|Move Tab Right|-|Close Tab "));
+        assert!(tab_menu_line(2, 3).starts_with("--- menu items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "));
+        assert!(tab_menu_line(0, 1).starts_with("--- menu items=Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab "));
+        let menu = ActionMenu::new(tab_menu_rows(0, 2), |_| None);
+        assert!(menu.action(0).is_some_and(|a| a.partial_eq(&RenameTab)));
+        assert!(menu.action(1).is_none(), "Move Tab Left on the first tab runs nothing");
+        assert!(menu.action(4).is_some_and(|a| a.partial_eq(&CloseTab)));
     }
 
     /// A tab menu's keys come from the keymap for the tab's own contexts,
@@ -3217,14 +2416,13 @@ mod tests {
     fn tab_menu_keys_follow_the_tab_contexts() {
         let mut bindings = default_bindings();
         bindings.push(gpui::KeyBinding::new("f2", RenameTab, Some("Terminal")));
-        bindings.push(gpui::KeyBinding::new("f3", TmuxRenameWindow, Some("TmuxWindow")));
-        bindings.push(gpui::KeyBinding::new("ctrl-shift-w", Swallow, Some("Terminal")));
+        bindings.push(gpui::KeyBinding::new("f3", MoveTabRight, Some("SettingsDialog")));
+        bindings.push(gpui::KeyBinding::new("ctrl-shift-w", NewTab, Some("Terminal")));
         let keymap = gpui::Keymap::new(bindings);
-        assert_eq!(tab_keys(&keymap, &RenameTab, false), Some("f2".into()));
-        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, true), Some("f3".into()));
-        assert_eq!(tab_keys(&keymap, &TmuxRenameWindow, false), None);
-        assert_eq!(tab_keys(&keymap, &CloseTab, false), None);
-        assert_eq!(tab_keys(&keymap, &MoveTabLeft, true), Some("ctrl-shift-pageup".into()));
+        assert_eq!(tab_keys(&keymap, &RenameTab), Some("f2".into()));
+        assert_eq!(tab_keys(&keymap, &MoveTabRight), Some("ctrl-shift-pagedown".into()));
+        assert_eq!(tab_keys(&keymap, &CloseTab), None);
+        assert_eq!(tab_keys(&keymap, &MoveTabLeft), Some("ctrl-shift-pageup".into()));
     }
 
     #[test]
@@ -3287,7 +2485,7 @@ mod tests {
         }));
         assert_eq!(displayed.as_ref(), "vim: Cargo.toml");
 
-        // Manual title trims input and overrides OSC, foreground, profile and tmux changes.
+        // Manual title trims input and overrides OSC, foreground and profile changes.
         manual = parse_manual_title("  prod logs  ");
         assert_eq!(manual.as_deref(), Some("prod logs"));
         assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || "ignored".into()));
@@ -3300,7 +2498,7 @@ mod tests {
         }));
         assert!(!probed, "automatic source is not even queried while manual title is set");
         assert_eq!(displayed.as_ref(), "prod logs");
-        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || "tmux-window-2".into()));
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || "other-title".into()));
         assert_eq!(displayed.as_ref(), "prod logs");
 
         // Clearing with empty/whitespace input resumes automatic title calculation.

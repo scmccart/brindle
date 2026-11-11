@@ -140,7 +140,7 @@ fn dropdown_entries() -> Vec<MenuEntry> {
     vec![
         MenuItem::new("bash").description("the default shell").shortcut("ctrl-alt-1").into(),
         MenuItem::new("fish").shortcut("ctrl-alt-2").into(),
-        MenuItem::new("tmux").description("tmux control mode · main").shortcut("ctrl-alt-3").into(),
+        MenuItem::new("toolbox").description("toolbox container · dev").shortcut("ctrl-alt-3").into(),
         MenuItem::new("zsh").description("not installed").disabled(true).into(),
         MenuEntry::Separator,
         MenuItem::new("Settings…").into(),
@@ -167,7 +167,7 @@ pub struct DemoTab {
     /// The surface and text colours it is drawn in, active or not, as a
     /// terminal's background and foreground.
     colors: Option<(u32, u32)>,
-    /// A leading icon, as a tmux window's marker.
+    /// A leading icon, as a remote tab's marker.
     icon: bool,
     /// A status dot in this colour, and a bell dot.
     status: Option<u32>,
@@ -193,7 +193,7 @@ pub struct TabsDemo {
 /// - `plain`: Overview, Analytics (active), Reports, Notifications;
 /// - `strip`: a tab strip whose tabs close, move and show a tooltip: bash
 ///   (active, the spec's `#c0caf5` on `#1a1b26`), a long nvim title
-///   (Solarized light colours, inactive but on its own surface), tmux (a
+///   (Solarized light colours, inactive but on its own surface), ssh (a
 ///   leading icon, the tokens' colours) and a build with a status dot and
 ///   a bell;
 /// - `crowded`: six sessions in a list too narrow for them.
@@ -207,7 +207,7 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let strip = vec![
         DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
         DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
-        DemoTab { icon: true, ..DemoTab::new(2, "tmux: main") },
+        DemoTab { icon: true, ..DemoTab::new(2, "ssh: work") },
         DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
     ];
     let crowded = (0..6).map(|n| DemoTab::new(n, format!("Session {}", n + 1))).collect();
@@ -2440,7 +2440,7 @@ mod check {
         let check = dropdown_keys(&mut c).await;
         c.run_check("dropdown-enter-space-down-open-below-the-trigger-other-keys-do-not", check).await;
         let check = dropdown_description(&mut c).await;
-        c.run_check("dropdown-description-under-the-label-and-t-highlights-tmux", check).await;
+        c.run_check("dropdown-description-under-the-label-and-t-highlights-toolbox", check).await;
         let check = dropdown_long_menu(&mut c).await;
         c.run_check("dropdown-long-menu-fits-the-window-scrolls-and-keeps-the-highlight-in-view", check).await;
         // Menus: the pointer (Windows only).
@@ -3983,25 +3983,25 @@ mod check {
         Ok(())
     }
 
-    /// The spec's scenario: the tmux item shows its description on a second
-    /// line, and `t` highlights it (bash's description starts with `t`, its
-    /// label doesn't). Typing passes the disabled zsh, and a letter only a
-    /// description starts with matches nothing.
+    /// The spec's scenario: the toolbox item shows its description on a
+    /// second line, and `t` highlights it (bash's description starts with
+    /// `t`, its label doesn't). Typing passes the disabled zsh, and a letter
+    /// only a description starts with matches nothing.
     async fn dropdown_description(c: &mut Checker) -> Check {
         c.focus("dropdown-trigger").await?;
         c.key("down").await?;
         c.key("t").await?;
         let highlight = menu_highlight(c, Which::Dropdown)?;
-        ensure!(highlight == Some(2), "t highlighted {highlight:?}, not tmux");
-        let (bash, fish, tmux) =
+        ensure!(highlight == Some(2), "t highlighted {highlight:?}, not toolbox");
+        let (bash, fish, toolbox) =
             (entry_bounds(c, Which::Dropdown, 0)?, entry_bounds(c, Which::Dropdown, 1)?, entry_bounds(c, Which::Dropdown, 2)?);
         ensure!(
-            tmux.size.height > fish.size.height + px(8.),
-            "the tmux row ({:?} tall) holds no second line beside fish's ({:?})",
-            tmux.size.height,
+            toolbox.size.height > fish.size.height + px(8.),
+            "the toolbox row ({:?} tall) holds no second line beside fish's ({:?})",
+            toolbox.size.height,
             fish.size.height
         );
-        ensure!(close_to(bash.size.height, tmux.size.height), "the described rows differ in height");
+        ensure!(close_to(bash.size.height, toolbox.size.height), "the described rows differ in height");
         c.cx.background_executor().timer(TYPEAHEAD_GAP).await;
         c.key("s").await?;
         let highlight = menu_highlight(c, Which::Dropdown)?;
@@ -4177,9 +4177,9 @@ mod check {
         ensure!(c.layers()? == 0, "escape didn't close the menu opened to find the row");
         let before = menu_log(c)?.len();
         c.drag(center(trigger), row).await?;
-        ensure!(c.layers()? == 0, "the release on tmux didn't close the menu");
+        ensure!(c.layers()? == 0, "the release on toolbox didn't close the menu");
         let log = menu_log(c)?;
-        ensure!(log[before..] == ["dropdown:tmux"], "the owner heard {:?}", &log[before..]);
+        ensure!(log[before..] == ["dropdown:toolbox"], "the owner heard {:?}", &log[before..]);
         ensure!(c.focused_name("dropdown-trigger")?, "focus didn't return to the trigger");
         Ok(())
     }
@@ -4327,7 +4327,7 @@ mod check {
         Ok(())
     }
 
-    /// The long nvim title is cut at the 15rem maximum, the tmux tab keeps
+    /// The long nvim title is cut at the 15rem maximum, the ssh tab keeps
     /// its own width between the limits, and the crowded list's triggers
     /// shrink to the 5rem minimum.
     async fn tabs_widths(c: &mut Checker) -> Check {
@@ -4337,8 +4337,8 @@ mod check {
         let close = |a: f32, b: f32| (a - b).abs() < 0.5;
         let long = f32::from(trigger(c, "strip", 1).await?.size.width);
         ensure!(close(long, max), "the long title's trigger is {long}px wide, not the {max}px maximum");
-        let tmux = f32::from(trigger(c, "strip", 2).await?.size.width);
-        ensure!(tmux > min + 0.5 && tmux < max - 0.5, "the tmux trigger is {tmux}px wide, not its own width within {min}..{max}");
+        let ssh = f32::from(trigger(c, "strip", 2).await?.size.width);
+        ensure!(ssh > min + 0.5 && ssh < max - 0.5, "the ssh trigger is {ssh}px wide, not its own width within {min}..{max}");
         for ix in 0..6 {
             let width = f32::from(trigger(c, "crowded", ix).await?.size.width);
             ensure!(close(width, min), "crowded trigger {ix} is {width}px wide, not the {min}px minimum");
@@ -4424,8 +4424,8 @@ mod check {
             "the active bash close button's X is at most {x} light, not #c0caf5 at full opacity (60% is {dim})"
         );
         set_tab_active(c, "strip", 2).await?;
-        let (bash, tmux) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 2).await?);
-        let shown = c.pixels(&[inside(tmux), top(tmux), inside(bash), top(bash)]).await?;
+        let (bash, ssh) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 2).await?);
+        let shown = c.pixels(&[inside(ssh), top(ssh), inside(bash), top(bash)]).await?;
         ensure!(near(shown[0], raised), "a trigger without colours is active on {:?}, not the raised pill {raised:?}", shown[0]);
         ensure!(near(shown[1], raised), "its top edge is {:?}, not the raised pill (a line?)", shown[1]);
         ensure!(near(shown[2], bash_surface), "the inactive bash trigger lost its surface ({:?})", shown[2]);

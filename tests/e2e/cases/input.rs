@@ -5,15 +5,11 @@
 //! Steps run 1 s apart starting about 1.5 s after launch, so each dump is
 //! taken a second after the last step.
 
-use super::server;
 use crate::brindle::{Input, Run};
 use crate::{Ctx, Outcome, Result, ensure};
 
 pub fn palette(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    server.type_line("%0", "clear")?;
-    ctx.sleep(0.5);
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .action("open_command_palette")
         .send("splt")
         .action("text_input_left")
@@ -28,8 +24,8 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
         out.dump.palette
     );
     ensure!(
-        out.dump.palette.iter().any(|l| l.starts_with("tmux: Split Right")),
-        "the filter doesn't list Split Right: {:?}",
+        out.dump.palette.iter().any(|l| l.starts_with("Split Zone Right")),
+        "the filter doesn't list Split Zone Right: {:?}",
         out.dump.palette
     );
     ensure!(!out.dump.screen.iter().any(|l| l.contains("spl")), "typed into the terminal: {:?}", out.dump.screen);
@@ -38,8 +34,7 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
 
 /// ctrl-a's action selects the whole filter, and typing replaces it.
 pub fn select_all(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .action("open_command_palette")
         .send("splt")
         .action("text_input_left")
@@ -53,9 +48,8 @@ pub fn select_all(ctx: &Ctx) -> Result<Outcome> {
 }
 
 pub fn palette_run(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let before = Run::new(ctx, &server, "before").dump_at(3.0).run()?;
-    let out = Run::new(ctx, &server, "run")
+    let before = Run::new(ctx, "before").dump_at(3.0).run()?;
+    let out = Run::new(ctx, "run")
         .action("open_command_palette")
         .send("incfs")
         .action("picker_confirm")
@@ -74,8 +68,7 @@ pub fn palette_run(ctx: &Ctx) -> Result<Outcome> {
 }
 
 pub fn settings_tab(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .action("open_settings")
         .action("settings_section_prev")
         .action("settings_new")
@@ -93,8 +86,7 @@ pub fn settings_tab(ctx: &Ctx) -> Result<Outcome> {
 }
 
 pub fn prompt_preselected(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run").action("tmux_rename_window").send("x").dump_at(4.0).run()?;
+    let out = Run::new(ctx, "run").action("rename_tab").send("x").dump_at(4.0).run()?;
     ensure!(
         out.dump.palette.first().is_some_and(|l| l.starts_with("prompt ")),
         "no prompt open: {:?}",

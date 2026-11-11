@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget, TmuxMode, TmuxSessionEnd};
+use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget};
 use crate::theme::{BUILTIN_THEMES, Theme};
 
 pub fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -43,11 +43,6 @@ pub fn save(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(), Strin
 /// Sets the top-level `theme`.
 pub fn set_global_theme(doc: &mut DocumentMut, name: &str) {
     set_value(doc.as_table_mut(), "theme", Value::from(name));
-}
-
-/// Sets the top-level `tmux_session_end`.
-pub fn set_tmux_session_end(doc: &mut DocumentMut, value: TmuxSessionEnd) {
-    set_value(doc.as_table_mut(), "tmux_session_end", Value::from(value.as_str()));
 }
 
 /// Writes `[themes.<name>]` with every color of `theme`. An existing table
@@ -340,15 +335,10 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
     // Through the shortest decimal, so 13.3 isn't written as 13.300000190734863.
     let font_size = p.font_size.and_then(|s| s.to_string().parse::<f64>().ok()).map(Value::from);
     set_or_remove(table, "font_size", font_size);
-    let tmux = match p.tmux {
-        TmuxMode::None => None,
-        TmuxMode::Plain => Some(Value::from("plain")),
-        TmuxMode::Control => Some(Value::from("control")),
-    };
-    let is_tmux = tmux.is_some();
-    set_or_remove(table, "tmux", tmux);
-    set_or_remove(table, "tmux_session", p.tmux_session.as_deref().filter(|_| is_tmux).map(Value::from));
-    set_or_remove(table, "tmux_args", if is_tmux { strings(&p.tmux_args) } else { None });
+    // The removed tmux settings: saving a profile cleans them out of it.
+    for key in ["tmux", "tmux_session", "tmux_args"] {
+        set_or_remove(table, key, None);
+    }
 }
 
 /// Rewrites `default_profile` when it names `old` (ignoring case, as
@@ -684,32 +674,12 @@ background = "nope"
     }
 
     #[test]
-    fn tmux_session_end_changes_only_its_line() {
-        let mut doc = parse(DEFAULT_CONFIG).unwrap();
-        set_tmux_session_end(&mut doc, TmuxSessionEnd::Ask);
-        assert_eq!(
-            doc.to_string(),
-            DEFAULT_CONFIG.replace("tmux_session_end = \"close_window\"", "tmux_session_end = \"ask\"")
-        );
-    }
-
-    #[test]
-    fn tmux_session_end_goes_before_the_first_table() {
-        let mut doc = parse("# top\ntheme = \"x\"\n\n[font]\nsize = 12\n").unwrap();
-        set_tmux_session_end(&mut doc, TmuxSessionEnd::NewTab);
-        assert_eq!(doc.to_string(), "# top\ntheme = \"x\"\ntmux_session_end = \"new_tab\"\n\n[font]\nsize = 12\n");
-        let config = crate::config::Config::parse(&doc.to_string()).unwrap();
-        assert_eq!(config.tmux_session_end, TmuxSessionEnd::NewTab);
-        assert_eq!(config.font.size, 12.0);
-    }
-
-    #[test]
-    fn tmux_session_end_refused_on_malformed_file() {
-        let dir = temp_dir("session-end-malformed");
+    fn edits_refused_on_malformed_file() {
+        let dir = temp_dir("malformed");
         let path = dir.join("config.toml");
         let text = "theme = \"x\n";
         std::fs::write(&path, text).unwrap();
-        let err = save(&path, |doc| Ok(set_tmux_session_end(doc, TmuxSessionEnd::Ask))).unwrap_err();
+        let err = save(&path, |doc| Ok(set_global_theme(doc, "y"))).unwrap_err();
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::remove_dir_all(dir).ok();
@@ -759,7 +729,8 @@ background = "nope"
         assert_eq!(read[0].1.as_ref().unwrap().name, "A");
         assert_eq!(read[1].0, None);
         assert!(read[1].1.is_err());
-        assert_eq!(read[2].1.as_ref().unwrap().tmux, TmuxMode::Control);
+        // A removed tmux key doesn't make the profile unreadable.
+        assert_eq!(read[2].1.as_ref().unwrap().name, "C");
         let inline = parse("profiles = [{ name = \"X\" }, { name = \"Y\", args = [\"-l\"] }]\n").unwrap();
         assert_eq!(names_of(&inline), ["X", "Y"]);
         assert!(profiles(&parse("").unwrap()).is_empty());
@@ -802,22 +773,46 @@ background = "nope"
     }
 
     #[test]
-    fn tmux_settings_only_for_tmux_profiles() {
-        let mut doc = parse("[[profiles]]\nname = \"T\"\ntmux = \"plain\"\ntmux_session = \"s\"\ntmux_args = [\"-L\", \"x\"]\n").unwrap();
-        let mut p = reparse(&doc).profiles[0].clone();
-        p.tmux = TmuxMode::None;
+    fn saving_a_profile_removes_the_old_tmux_keys() {
+        let text = "# top\ntmux_session_end = \"ask\" # old\n\n# the work profile\n[[profiles]]\nname = \"T\" # mine\n\
+                    tmux = \"plain\"\ntmux_session = \"s\"\ncommand = \"/bin/zsh\" # zsh\ntmux_args = [\"-L\", \"x\"]\n\n\
+                    [[profiles]]\nname = \"U\"\ntmux = \"control\"\n";
+        let mut doc = parse(text).unwrap();
+        let p = reparse(&doc).profiles[0].clone();
         upsert_profile(&mut doc, Some(&ProfileRef { index: 0, name: Some("T".into()) }), &p).unwrap();
-        assert_eq!(doc.to_string(), "[[profiles]]\nname = \"T\"\n");
+        // Only the saved profile is cleaned; the top-level key is left alone.
+        assert_eq!(
+            doc.to_string(),
+            "# top\ntmux_session_end = \"ask\" # old\n\n# the work profile\n[[profiles]]\nname = \"T\" # mine\n\
+             command = \"/bin/zsh\" # zsh\n\n[[profiles]]\nname = \"U\"\ntmux = \"control\"\n"
+        );
+        // The inline form too.
+        let mut inline = parse("profiles = [{ name = \"X\", tmux = \"plain\", tmux_args = [] }]\n").unwrap();
+        upsert_profile(&mut inline, Some(&ProfileRef { index: 0, name: Some("X".into()) }), &Profile { name: "X".into(), ..Default::default() }).unwrap();
+        assert!(!inline.to_string().contains("tmux"), "{inline}");
+        assert_eq!(names_of(&inline), ["X"]);
+    }
+
+    #[test]
+    fn writes_leave_the_old_tmux_session_end_alone() {
+        let text = "theme = \"a\"\ntmux_session_end = \"new_tab\" # old\n";
+        let mut doc = parse(text).unwrap();
+        set_global_theme(&mut doc, "b");
+        assert_eq!(doc.to_string(), "theme = \"b\"\ntmux_session_end = \"new_tab\" # old\n");
+        upsert_profile(&mut doc, None, &Profile { name: "Work".into(), ..Default::default() }).unwrap();
+        assert!(doc.to_string().contains("tmux_session_end = \"new_tab\" # old\n"), "{doc}");
     }
 
     #[test]
     fn new_profiles_go_last() {
         let mut doc = doc();
-        let p = Profile { name: "New".into(), tmux: TmuxMode::Control, ..Default::default() };
+        // Nothing writes the removed tmux settings, whatever the profile holds.
+        let p = Profile { name: "New".into(), removed_tmux: Some("control".into()), ..Default::default() };
         upsert_profile(&mut doc, None, &p).unwrap();
         assert_eq!(names_of(&doc), ["Shell", "Work", "New"]);
         let text = doc.to_string();
-        assert!(text.contains("[[profiles]]\nname = \"New\"\ntmux = \"control\"\n"), "{text}");
+        assert!(text.contains("[[profiles]]\nname = \"New\"\n"), "{text}");
+        assert!(!text.contains("tmux"), "{text}");
         assert!(text.find("name = \"New\"").unwrap() < text.find("[themes.mine]").unwrap(), "{text}");
         // The inline form too.
         let mut inline = parse("profiles = [{ name = \"X\" }]\n").unwrap();
@@ -900,11 +895,13 @@ background = "nope"
 
     #[test]
     fn moving_up_and_back_round_trips_the_default_config() {
-        let mut doc = parse(DEFAULT_CONFIG).unwrap();
-        let tmux = ProfileRef { index: 1, name: Some("tmux".into()) };
-        assert_eq!(move_profile(&mut doc, &tmux, true).unwrap(), 0);
-        assert_eq!(names_of(&doc), ["tmux", "Shell", "tmux (classic)"]);
-        move_profile(&mut doc, &ProfileRef { index: 0, name: Some("tmux".into()) }, false).unwrap();
-        assert_eq!(doc.to_string(), DEFAULT_CONFIG);
+        // The default config has one profile: add a second after it.
+        let text = DEFAULT_CONFIG.replace("# font_size = 13\n", "# font_size = 13\n\n[[profiles]]\nname = \"Work\"\n");
+        let mut doc = parse(&text).unwrap();
+        let work = ProfileRef { index: 1, name: Some("Work".into()) };
+        assert_eq!(move_profile(&mut doc, &work, true).unwrap(), 0);
+        assert_eq!(names_of(&doc), ["Work", "Shell"]);
+        move_profile(&mut doc, &ProfileRef { index: 0, name: Some("Work".into()) }, false).unwrap();
+        assert_eq!(doc.to_string(), text);
     }
 }

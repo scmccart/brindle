@@ -1,6 +1,6 @@
-//! Opt-in end-to-end suite: runs Brindle against throwaway tmux servers and
-//! checks what it shows against tmux (screen text, window pixels, replies
-//! to color queries), plus the tmux behaviour Brindle relies on.
+//! Opt-in end-to-end suite: runs Brindle with the debug hooks and checks
+//! what it shows (screen text, window pixels, replies to color queries,
+//! notifications, the terminal server's sessions).
 //!
 //! ```sh
 //! BRINDLE_E2E=1 cargo test --test e2e                 # every case
@@ -22,7 +22,6 @@ mod common;
 mod capture;
 mod cases;
 mod query;
-mod tmux;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -337,7 +336,6 @@ fn self_test() -> i32 {
         ("dump parsing", brindle::self_test_dump),
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),
-        ("divider junctions", capture::self_test_junction),
         ("pixel scans", capture::self_test_scan),
     ];
     let mut failed = 0;

@@ -15,7 +15,7 @@ Shell output runs together in one long stream, so a noisy command buries the com
 - Replace the failed-command bar with the block's rail while blocks are on, and stop drawing failed-command marks over the alternate screen.
 - Make search reveal a match inside a collapsed block or a block's scrolled-away output.
 
-Out of scope: collapsing running blocks, keeping collapse state across restarts or tmux reattach, per-block actions such as sharing or rerunning, and changes to the shell scripts.
+Out of scope: collapsing running blocks, keeping collapse state across restarts, per-block actions such as sharing or rerunning, and changes to the shell scripts.
 
 ## Capabilities
 
@@ -33,5 +33,5 @@ Out of scope: collapsing running blocks, keeping collapse state across restarts 
 - **Rendering and input:** `src/terminal_element.rs` stops reading the viewport straight from alacritty when blocks are active, and `src/terminal_view.rs` (mouse, wheel, links, selection) maps through the same row table.
 - **Terminal model:** `src/terminal/shell_integration.rs` gains per-command view state and command timing, `src/terminal/mod.rs` and `src/terminal/search.rs` gain a Brindle-owned view position, and `src/find_bar.rs` reveals matches through it.
 - **Other code:** `src/actions.rs` (new actions), `src/config.rs`, `assets/default-config.toml`, the `--dump-screen-after` output, `tests/e2e/`, README.md and CLAUDE.md.
-- **Local tabs and control-mode panes** both gain blocks. Classic tmux, shells without integration and alternate-screen programs are unchanged.
+- **Local tabs** gain blocks. Shells without integration and alternate-screen programs are unchanged.
 - **Dependencies:** none. The PTY size and grid are unchanged, so programs can't observe blocks.

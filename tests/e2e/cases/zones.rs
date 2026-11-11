@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::{CARD_BORDER, ZONE_GAP, server};
+use super::{CARD_BORDER, ZONE_GAP};
 use crate::brindle::{Run, state_dir, theme};
 use crate::capture::{Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -19,9 +19,8 @@ fn dir(ctx: &Ctx, name: &str) -> Result<PathBuf> {
 /// inherits the active zone's working directory, and supports directional
 /// focus (`focus_zone_*`).
 pub fn split_and_focus(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let sub = dir(ctx, "work-sub")?;
-    let out = Run::new(ctx, &server, "split")
+    let out = Run::new(ctx, "split")
         .profile("Shell")
         .send(&format!("cd '{}'\r", sub.display()))
         .action("split_zone_right")
@@ -52,7 +51,7 @@ pub fn split_and_focus(ctx: &Ctx) -> Result<Outcome> {
 
     // Move right from the tall left zone: tie-breaker picks the top-right zone (id=2),
     // which ran `pwd` inside `sub`.
-    let out2 = Run::new(ctx, &server, "tie-break")
+    let out2 = Run::new(ctx, "tie-break")
         .profile("Shell")
         .send(&format!("cd '{}'\r", sub.display()))
         .action("split_zone_right")
@@ -76,11 +75,10 @@ pub fn split_and_focus(ctx: &Ctx) -> Result<Outcome> {
 /// hides the zone lines when back to a single zone; `close_tab` closes all
 /// zones and the tab together.
 pub fn close(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
 
     // Split right, type in zone 1 first, then close zone 2 with `close_zone`:
     // zone 1 remains and is back to a single unsplit zone (no `--- zones` line).
-    let out = Run::new(ctx, &server, "close-zone")
+    let out = Run::new(ctx, "close-zone")
         .profile("Shell")
         .send("echo kept-zone1\r")
         .action("split_zone_right")
@@ -96,7 +94,7 @@ pub fn close(ctx: &Ctx) -> Result<Outcome> {
     );
 
     // Shell `exit` in one of two zones closes only that zone.
-    let out_exit = Run::new(ctx, &server, "exit-zone")
+    let out_exit = Run::new(ctx, "exit-zone")
         .profile("Shell")
         .send("echo survivor\r")
         .action("split_zone_down")
@@ -112,7 +110,7 @@ pub fn close(ctx: &Ctx) -> Result<Outcome> {
     );
 
     // `close_tab` on a split tab closes the whole tab (leaving the second tab).
-    let out_tab = Run::new(ctx, &server, "close-tab")
+    let out_tab = Run::new(ctx, "close-tab")
         .profile("Shell")
         .action("new_tab")
         .send("echo second-tab\r")
@@ -166,8 +164,7 @@ fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
 /// foreground, neither in the global theme's foreground; and no line marks
 /// the active header, in the global accent (`primary`) or the zone's.
 pub fn header_colors(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Alt")
         .config(ZONE_PROFILE)
         .action("split_zone_right")
@@ -214,9 +211,8 @@ pub fn header_colors(ctx: &Ctx) -> Result<Outcome> {
 /// Session restore records and reconstructs a tab's zone split tree,
 /// per-zone working directories, and active zone.
 pub fn restore(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let (a, b) = (dir(ctx, "zone-a")?, dir(ctx, "zone-b")?);
-    Run::new(ctx, &server, "record")
+    Run::new(ctx, "record")
         // The next run attaches the same shells, in their directories.
         .keep_detached()
         .restore()
@@ -231,7 +227,7 @@ pub fn restore(ctx: &Ctx) -> Result<Outcome> {
     ctx.save("recorded-zones.toml", &state);
     ensure!(state.contains("split = \"horizontal\""), "recorded state lacks split:\n{state}");
 
-    let out = Run::new(ctx, &server, "restore")
+    let out = Run::new(ctx, "restore")
         .restore()
         .default_profile("Shell")
         .send("pwd\r")

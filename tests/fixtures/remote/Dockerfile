@@ -6,7 +6,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         openssh-server \
-        tmux \
     && useradd --create-home --shell /bin/bash remote \
     && mkdir -p /run/sshd /root/.ssh \
     && chmod 0700 /root/.ssh \

@@ -53,11 +53,10 @@ None of this can run on the Linux dev machine. "CI" means the macOS job from gro
   - "Open from Finder", "Found by Spotlight" and "Install from the disk image", from the CI `.dmg`, using right-click → Open for the quarantine prompt;
   - "Install after cargo install", "Reinstall after upgrade", "System-wide install", "Unrelated app in the way", "Uninstall" and "Nothing to uninstall".
 
-  Then check "Homebrew tmux from the Dock" and "Started from a terminal" from specs/macos-platform.
+  Then check "Homebrew program from the Dock" and "Started from a terminal" from specs/macos-platform.
 - [ ] 6.6 Add a "Installing on macOS" section to README.md covering the `.dmg` (including the Gatekeeper right-click → Open step) and `cargo install --path . && brindle --install-desktop`. Verify the commands as written on a Mac.
 
 ## 7. Integration
 
-- [ ] 7.1 On a Mac, run a tmux control-mode session (Homebrew tmux, throwaway server `-L brindle-e2e -f /dev/null`) from the installed app. Check attach, splits (cmd-e, cmd-o), pane focus (cmd-alt-arrows), detach (cmd-d) and reattach, then kill the server.
-- [ ] 7.2 Confirm Linux is unchanged: run `cargo test`, `cargo build --release`, and a `--dump-screen-after` smoke run on Linux, warning the user before opening a window. The default bindings on Linux must still be ctrl-shift-*: check this with `--list-actions` and the existing tests.
-- [ ] 7.3 Run `openspec validate port-to-macos --strict` and confirm both CI jobs are green on the final commit.
+- [ ] 7.1 Confirm Linux is unchanged: run `cargo test`, `cargo build --release`, and a `--dump-screen-after` smoke run on Linux, warning the user before opening a window. The default bindings on Linux must still be ctrl-shift-*: check this with `--list-actions` and the existing tests.
+- [ ] 7.2 Run `openspec validate port-to-macos --strict` and confirm both CI jobs are green on the final commit.
