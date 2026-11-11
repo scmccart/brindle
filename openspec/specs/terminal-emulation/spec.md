@@ -213,7 +213,7 @@ Closing a Windows tab, or its program exiting, SHALL release its pseudoconsole w
 - **THEN** the tab closes at once and the window stays responsive
 
 ### Requirement: The window stays responsive during continuous output
-While any terminal in a window (a local tab or zone, a remote terminal or a tmux pane) receives output continuously, the window SHALL keep repainting that terminal's latest output, SHALL keep handling input and actions, and Brindle SHALL still quit when asked. Updates during continuous output MAY be grouped, but output that arrives after a quiet spell SHALL be shown without added delay.
+While any terminal in a window (a local tab or zone, or a remote terminal) receives output continuously, the window SHALL keep repainting that terminal's latest output, SHALL keep handling input and actions, and Brindle SHALL still quit when asked. Updates during continuous output MAY be grouped, but output that arrives after a quiet spell SHALL be shown without added delay.
 
 #### Scenario: Flooding tab keeps painting
 - **WHEN** a Windows tab runs `for /L %i in (1,0,2) do @echo flood %i` in `cmd` for several seconds

@@ -30,14 +30,14 @@ Unknown keys, wrong types and malformed TOML SHALL be reported. Brindle SHALL st
 ### Requirement: Live reload
 Saving the config file SHALL reload it automatically, within about a second, and apply the result to open windows:
 - theme changes;
-- profile theme and font-size changes, including in tmux panes;
+- profile theme and font-size changes;
 - keybindings;
 - fonts.
 
 ctrl-shift-r SHALL force a reload, and ctrl-, SHALL open the config in `$VISUAL` or `$EDITOR` in a new tab.
 
 #### Scenario: Theme change while attached
-- **WHEN** the user changes `theme` and saves while tabs and tmux panes are open
+- **WHEN** the user changes `theme` and saves while tabs are open
 - **THEN** all of them redraw with the new theme without being restarted
 
 ### Requirement: Themes
@@ -54,10 +54,11 @@ The config SHALL control:
 - cursor shape and blinking;
 - `copy_on_select`;
 - `osc52_paste` (whether programs may read the clipboard);
-- `mark_failed_commands` (whether failed commands get a gutter mark; on by default);
-- `tmux_session_end` (what happens when a control-mode session leaves a window that showed only its tabs: `close_window`, `new_tab` or `ask`, as defined by the `tmux-control-mode` capability; default `close_window`).
+- `mark_failed_commands` (whether failed commands get a gutter mark; on by default).
 
 Session restore is always on (see `session-restore`). A config that still sets `restore_session` SHALL load, with the key ignored and a warning logged that it no longer has an effect.
+
+Brindle has no tmux support. A config that still sets `tmux_session_end` at the top level SHALL load, with the key ignored and a warning logged that tmux support was removed, whatever its value.
 
 #### Scenario: Blinking disabled
 - **WHEN** `cursor.blink = false`
@@ -76,8 +77,12 @@ Session restore is always on (see `session-restore`). A config that still sets `
 - **THEN** existing failed-command marks disappear from every terminal
 
 #### Scenario: Unknown session-end value
-- **WHEN** the config contains `tmux_session_end = "shell"`
-- **THEN** Brindle starts with defaults and shows a config error banner naming the problem
+- **WHEN** the config contains `tmux_session_end = "ask"` or `tmux_session_end = "shell"`
+- **THEN** Brindle loads the config without an error banner and logs that `tmux_session_end` is ignored because tmux support was removed
+
+#### Scenario: Other unknown keys still fail
+- **WHEN** the config contains a top-level key that no version of Brindle defined, such as `tmux_sesion_end`
+- **THEN** Brindle starts with defaults and shows a config error banner naming the key
 
 ### Requirement: Keybinding overrides
 `[keybindings]` SHALL map key combinations to named actions. User bindings SHALL take precedence over the defaults, and binding a key to `"none"` SHALL disable the default binding so the key reaches the program. Unknown action names and invalid keys SHALL be logged and ignored. The set of bindable actions SHALL be listable.
