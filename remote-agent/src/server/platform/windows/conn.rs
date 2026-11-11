@@ -11,8 +11,9 @@
 //!   starts to grow that much later than on Linux. A blocking write returns
 //!   once the pipe has taken its bytes, like a write to a socket.
 //! - **Dropping** the stream cancels what the pipe hadn't taken yet, as
-//!   closing a socket drops what the kernel hadn't accepted. What the pipe
-//!   has taken stays readable by the peer, also when this side leaves
+//!   closing a socket drops what the kernel hadn't accepted;
+//!   [`Stream::unsent`] counts it and [`Stream::drain_for`] waits for it.
+//!   What the pipe has taken stays readable by the peer, also when this side leaves
 //!   input unread: a pipe has no reset.
 //! - **[`Stream::shutdown_write`]** can't half-close: a pipe handle is
 //!   either open or closed. It closes the handle once the pipe has taken
@@ -30,10 +31,10 @@
 use std::io::{self, Read, Write};
 use std::os::windows::io::OwnedHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::event_loop::Source;
+use super::event_loop::{Port, Source};
 use super::pipe::{self, Need, Pipe};
 use crate::server::event_loop::Interest;
 
@@ -70,10 +71,19 @@ pub struct Stream {
 impl Stream {
     /// Wraps one end of a connected duplex pipe, opened for overlapped I/O
     /// and read as bytes.
-    #[allow(dead_code, reason = "for the listener and connecting (task 3.2)")]
     pub(super) fn new(handle: OwnedHandle) -> Self {
+        Self::over(Pipe::duplex(handle))
+    }
+
+    /// [`Stream::new`] for a handle that is associated with `port` already:
+    /// a connection a listener registered with that port's loop accepted.
+    pub(super) fn on(handle: OwnedHandle, port: &Arc<Port>) -> Self {
+        Self::over(Pipe::duplex_on(handle, port))
+    }
+
+    fn over(pipe: Pipe) -> Self {
         Self {
-            pipe: Pipe::duplex(handle),
+            pipe,
             nonblocking: AtomicBool::new(false),
             read_timeout: Mutex::new(None),
         }
@@ -111,6 +121,29 @@ impl Stream {
     pub fn shutdown_write(&self) -> io::Result<()> {
         self.pipe.shutdown_write();
         Ok(())
+    }
+
+    /// How many bytes this stream took that the pipe hasn't taken yet.
+    /// Dropping the stream cancels them.
+    pub fn unsent(&self) -> usize {
+        self.pipe.unsent()
+    }
+
+    /// Waits up to `limit` until the pipe has taken everything written, so
+    /// that dropping the stream loses nothing. `Ok(false)` means the peer
+    /// didn't read that fast; an error is the write's.
+    pub fn drain_for(&self, limit: Duration) -> io::Result<bool> {
+        let start = Instant::now();
+        loop {
+            if self.pipe.sent()? {
+                return Ok(true);
+            }
+            let remaining = limit.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            pipe::wait(&[(&self.pipe, SENT)], remaining);
+        }
     }
 
     fn blocking(&self) -> bool {
@@ -196,7 +229,7 @@ pub fn wait(streams: &[(&Stream, Interest)], timeout: Duration) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::thread;
 
     use super::super::pipe::WRITE_MARK;
@@ -206,7 +239,7 @@ mod tests {
 
     /// Position-dependent bytes: a block whose length shares no factor with
     /// any buffer size, repeated.
-    fn pattern() -> Vec<u8> {
+    pub fn pattern() -> Vec<u8> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         (0..1_000_003)
             .map(|_| {
@@ -219,7 +252,7 @@ mod tests {
     }
 
     /// Checks `bytes` against the pattern at `offset`.
-    fn check(pattern: &[u8], offset: u64, bytes: &[u8]) {
+    pub fn check(pattern: &[u8], offset: u64, bytes: &[u8]) {
         let mut at = (offset % pattern.len() as u64) as usize;
         let mut bytes = bytes;
         while !bytes.is_empty() {
@@ -234,7 +267,7 @@ mod tests {
     }
 
     /// Writes `total` bytes of the pattern through a blocking stream.
-    fn send_pattern(stream: &mut Stream, pattern: &[u8], total: u64) {
+    pub fn send_pattern(stream: &mut Stream, pattern: &[u8], total: u64) {
         let mut sent = 0u64;
         while sent < total {
             let at = (sent % pattern.len() as u64) as usize;

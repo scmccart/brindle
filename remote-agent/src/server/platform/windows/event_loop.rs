@@ -1,11 +1,13 @@
 //! The event loop: one I/O completion port, with the level-triggered
-//! readiness the core and the holders expect laid over overlapped pipes.
+//! readiness the core and the holders expect laid over overlapped pipes
+//! and pipe listeners.
 //!
 //! Windows reports that an operation has *completed*, not that a handle is
 //! ready. So a [`Source`] does its I/O itself, into and out of buffers it
 //! owns, and the loop reports what the buffers hold (see [`super::pipe`]):
 //! readable while input is buffered or has ended, writable while the output
-//! buffer is under its mark. A wait first takes the completion packets that
+//! buffer is under its mark. A listener ([`super::listen`]) is readable
+//! once a client has connected. A wait first takes the completion packets that
 //! are queued, then looks at every registered source, and only blocks on
 //! the port when none is ready. That makes readiness level-triggered, as
 //! with `poll(2)`.
@@ -53,7 +55,6 @@ use windows::Win32::System::Threading::{
     INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEONLYONCE,
 };
 
-use super::pipe;
 use crate::server::event_loop::{Event, EventLoop, Interest, Token};
 
 /// The completion key of a wake packet. I/O packets carry the key their
@@ -108,7 +109,32 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Called once, with the `OVERLAPPED` it was given to [`Port::expect`] for.
 pub(super) type Completion = unsafe fn(overlapped: *mut OVERLAPPED, bytes: u32, error: u32);
 
-/// A loop's completion port, shared with its wakers and the pipes
+/// What a loop reports: the state a source's owner (a pipe, a listener)
+/// shares with the loop, which does the I/O itself.
+pub(super) trait Watched: Send + Sync {
+    /// Makes `port`'s loop the one that reports this: associates its
+    /// handles with the port the first time, and issues what it waits for.
+    fn attach(self: Arc<Self>, port: &Arc<Port>) -> io::Result<()>;
+
+    /// The loop stops reporting this.
+    fn detach(&self);
+
+    /// Cancels the operations that are due a packet, for a port that is
+    /// shutting down. Their packets still come.
+    fn cancel_packets(&self);
+
+    /// What the loop reports for it. `polling` is set when an operation in
+    /// flight reports through an event, which the loop then has to come
+    /// back for.
+    fn readiness(
+        self: Arc<Self>,
+        token: Token,
+        interest: Interest,
+        polling: &mut bool,
+    ) -> Option<Event>;
+}
+
+/// A loop's completion port, shared with its wakers and the sources
 /// registered with it.
 pub(super) struct Port {
     handle: OwnedHandle,
@@ -122,8 +148,8 @@ pub(super) struct Port {
     /// `OVERLAPPED`, each with what takes its result. Any other packet is
     /// ignored.
     due: Mutex<HashMap<usize, Completion>>,
-    /// Every pipe whose handles are associated with the port.
-    pipes: Mutex<Vec<Weak<pipe::Shared>>>,
+    /// Every source whose handles are associated with the port.
+    sources: Mutex<Vec<Weak<dyn Watched>>>,
 }
 
 impl Port {
@@ -138,7 +164,7 @@ impl Port {
             woken: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             due: Mutex::new(HashMap::new()),
-            pipes: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
         }))
     }
 
@@ -152,7 +178,8 @@ impl Port {
         self.alive.load(Ordering::Acquire)
     }
 
-    /// Associates a pipe handle with the port, for good.
+    /// Associates a pipe handle with the port, for good: once only, and
+    /// with no other port.
     pub(super) fn associate(&self, handle: HANDLE) -> io::Result<()> {
         // SAFETY: both handles are open.
         unsafe { CreateIoCompletionPort(handle, Some(self.raw()), IO, 0) }
@@ -160,12 +187,13 @@ impl Port {
             .map_err(|error| os_error(win32(&error)))
     }
 
-    /// Remembers a pipe whose handles are associated with the port, to
+    /// Remembers a source whose handles are associated with the port, to
     /// cancel its operations when the loop goes.
-    pub(super) fn adopt(&self, pipe: &Arc<pipe::Shared>) {
-        let mut pipes = lock(&self.pipes);
-        pipes.retain(|pipe| pipe.strong_count() > 0);
-        pipes.push(Arc::downgrade(pipe));
+    pub(super) fn adopt<W: Watched + 'static>(&self, source: &Arc<W>) {
+        let source: Weak<dyn Watched> = Arc::<W>::downgrade(source);
+        let mut sources = lock(&self.sources);
+        sources.retain(|source| source.strong_count() > 0);
+        sources.push(source);
     }
 
     /// Expects a packet for the operation with this `OVERLAPPED`, which
@@ -230,19 +258,19 @@ impl Port {
 
     /// The loop is going: cancels every operation that is due a packet and
     /// takes the packets, so that no operation is left to write to memory
-    /// its pipe frees. Pipes issue nothing for the port from here on.
+    /// its source frees. Sources issue nothing for the port from here on.
     fn shut_down(&self) {
         self.alive.store(false, Ordering::Release);
-        let pipes = mem::take(&mut *lock(&self.pipes));
-        for pipe in pipes.iter().filter_map(Weak::upgrade) {
-            pipe.cancel_packets();
+        let sources = mem::take(&mut *lock(&self.sources));
+        for source in sources.iter().filter_map(Weak::upgrade) {
+            source.cancel_packets();
         }
         let start = Instant::now();
         loop {
             let due = lock(&self.due).len();
             let remaining = DRAIN_LIMIT.saturating_sub(start.elapsed());
             if due == 0 || remaining.is_zero() || self.pump(remaining).is_err() {
-                // Each operation left holds a reference to its pipe's
+                // Each operation left holds a reference to its source's
                 // state, which is never given back: a leak, not a
                 // use-after-free.
                 break;
@@ -253,7 +281,7 @@ impl Port {
 
 struct Entry {
     token: Token,
-    pipe: Arc<pipe::Shared>,
+    source: Arc<dyn Watched>,
     interest: Interest,
 }
 
@@ -283,20 +311,20 @@ impl Loop {
 impl Drop for Loop {
     fn drop(&mut self) {
         for entry in self.entries.drain(..) {
-            entry.pipe.detach();
+            entry.source.detach();
         }
         self.port.shut_down();
     }
 }
 
-/// Something a loop waits on: the state a pipe shares with its owner (a
-/// stream; later a listener, a PTY, a ready pipe), which does the I/O. It
-/// stays valid when the owner is gone, and then reports nothing.
+/// Something a loop waits on: the state a pipe or a listener shares with
+/// its owner (a stream, a listener; later a PTY, a ready pipe), which does
+/// the I/O. It stays valid when the owner is gone, and then reports nothing.
 #[derive(Clone)]
-pub struct Source(Arc<pipe::Shared>);
+pub struct Source(Arc<dyn Watched>);
 
 impl Source {
-    pub(super) fn pipe(shared: Arc<pipe::Shared>) -> Self {
+    pub(super) fn of(shared: Arc<dyn Watched>) -> Self {
         Self(shared)
     }
 }
@@ -409,10 +437,10 @@ impl EventLoop for Loop {
                 format!("token {token} is already registered"),
             ));
         }
-        source.0.attach(&self.port)?;
+        Arc::clone(&source.0).attach(&self.port)?;
         self.entries.push(Entry {
             token,
-            pipe: Arc::clone(&source.0),
+            source: Arc::clone(&source.0),
             interest,
         });
         Ok(())
@@ -426,7 +454,7 @@ impl EventLoop for Loop {
 
     fn deregister(&mut self, token: Token) -> io::Result<()> {
         let index = self.position(token)?;
-        self.entries.remove(index).pipe.detach();
+        self.entries.remove(index).source.detach();
         Ok(())
     }
 
@@ -439,11 +467,11 @@ impl EventLoop for Loop {
         loop {
             let mut polling = false;
             for entry in &self.entries {
-                events.extend(
-                    entry
-                        .pipe
-                        .readiness(entry.token, entry.interest, &mut polling),
-                );
+                events.extend(Arc::clone(&entry.source).readiness(
+                    entry.token,
+                    entry.interest,
+                    &mut polling,
+                ));
             }
             if !events.is_empty() || self.port.woken.load(Ordering::Acquire) {
                 return Ok(self.port.woken.swap(false, Ordering::AcqRel));
@@ -477,7 +505,7 @@ mod tests {
     use std::os::windows::io::AsHandle;
     use std::process::{Command, Stdio};
 
-    use super::super::pipe::testing::pipes;
+    use super::super::pipe::{self, testing::pipes};
     use super::*;
 
     const SOON: Option<Duration> = Some(Duration::from_secs(10));

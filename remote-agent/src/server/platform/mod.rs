@@ -12,9 +12,9 @@
 //! - `dir`: finding and securing the server directory;
 //! - `sys`: the running binary and random numbers.
 //!
-//! Linux has the implementations. Windows has `event_loop` and `conn`, and
-//! stubs for the rest until the `terminal-server-windows` change fills them
-//! in.
+//! Linux has the implementations. Windows has `event_loop`, `conn` and
+//! `listen` (whose paths are pipe names), and stubs for the rest until the
+//! `terminal-server-windows` change fills them in.
 
 #[cfg(unix)]
 mod unix;

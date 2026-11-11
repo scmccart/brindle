@@ -181,31 +181,34 @@ impl Conn {
 
     /// Why a graceful close didn't finish.
     pub fn unfinished(&self) -> io::Error {
-        let message = if self.write_shut {
+        // What the stream took and hasn't passed on is unsent too (Windows).
+        let unsent = self.queued() + self.stream.unsent();
+        let message = if self.write_shut && unsent == 0 {
             "the peer didn't close its side".to_string()
         } else {
-            format!(
-                "the peer stopped reading with {} bytes unsent",
-                self.queued()
-            )
+            format!("the peer stopped reading with {unsent} bytes unsent")
         };
         io::Error::new(io::ErrorKind::TimedOut, message)
     }
 
     /// Flushes the whole queue, waiting for the peer for at most `limit`.
+    /// Once it returns `Ok`, dropping the connection loses none of it.
     pub fn flush_for(&mut self, limit: Duration) -> io::Result<()> {
         let deadline = Instant::now() + limit;
+        let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "the peer stopped reading");
         loop {
             self.flush()?;
-            if self.queued() == 0 {
-                return Ok(());
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if self.queued() == 0 {
+                // The stream may still hold part of it (Windows), which a
+                // drop would cancel.
+                return match self.stream.drain_for(remaining)? {
+                    true => Ok(()),
+                    false => Err(timed_out()),
+                };
+            }
             if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the peer stopped reading",
-                ));
+                return Err(timed_out());
             }
             let writable = Interest {
                 readable: false,
@@ -319,6 +322,42 @@ mod tests {
         });
         closer.close_for(Duration::from_secs(10)).unwrap();
         assert_eq!(reader.join().unwrap(), [frame]);
+    }
+
+    #[test]
+    fn a_drop_after_a_timed_flush_loses_nothing() {
+        // More than a socket's or a pipe's buffer holds, so the peer has to
+        // read before the last of it has left this side.
+        let frame = Frame::new(9, vec![5; 400_000]).unwrap();
+        let (a, b) = Stream::pair().unwrap();
+        let mut sender = Conn::new(a).unwrap();
+        let mut peer = Conn::new(b).unwrap();
+        sender.queue(&frame);
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            // The sender is waiting by now.
+            std::thread::sleep(Duration::from_millis(50));
+            loop {
+                let eof = peer.read_available().unwrap();
+                if let Some(frame) = peer.next_frame().unwrap() {
+                    return frame;
+                }
+                assert!(!eof, "the connection ended before the frame did");
+                assert!(Instant::now() < deadline, "no frame");
+                wait(&[&peer], Duration::from_millis(100));
+            }
+        });
+        sender.flush_for(Duration::from_secs(10)).unwrap();
+        drop(sender);
+        assert_eq!(reader.join().unwrap(), frame);
+
+        // A peer that doesn't read is reported, not waited for.
+        let (a, _b) = Stream::pair().unwrap();
+        let mut sender = Conn::new(a).unwrap();
+        sender.queue(&frame);
+        let error = sender.flush_for(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(sender.unfinished().to_string().contains("bytes unsent"));
     }
 
     #[test]

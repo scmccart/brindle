@@ -77,7 +77,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-use super::event_loop::{Port, Source, millis, os_error, win32};
+use super::event_loop::{Port, Source, Watched, millis, os_error, win32};
 use crate::server::event_loop::{Event, Interest, Token};
 
 /// How much one read takes from a pipe, and so how much input a pipe holds
@@ -839,6 +839,29 @@ impl Shared {
     }
 }
 
+impl Watched for Shared {
+    fn attach(self: Arc<Self>, port: &Arc<Port>) -> io::Result<()> {
+        Shared::attach(&self, port)
+    }
+
+    fn detach(&self) {
+        Shared::detach(self);
+    }
+
+    fn cancel_packets(&self) {
+        Shared::cancel_packets(self);
+    }
+
+    fn readiness(
+        self: Arc<Self>,
+        token: Token,
+        interest: Interest,
+        polling: &mut bool,
+    ) -> Option<Event> {
+        Shared::readiness(&self, token, interest, polling)
+    }
+}
+
 /// Records the end of the operation a packet names, and issues what is due
 /// next: the [`Completion`](super::event_loop::Completion) of every
 /// operation issued for a packet.
@@ -916,6 +939,17 @@ impl Pipe {
         )
     }
 
+    /// A duplex pipe whose handle is associated with `port` already: a
+    /// listener's instance that a client connected to. Its operations are
+    /// due packets there from the start, and only that port's loop can
+    /// report it.
+    pub(super) fn duplex_on(handle: OwnedHandle, port: &Arc<Port>) -> Self {
+        let pipe = Self::duplex(handle);
+        pipe.shared.lock().port = Some(Arc::clone(port));
+        port.adopt(&pipe.shared);
+        pipe
+    }
+
     fn with(reader: Option<Reader>, writer: Option<Writer>) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -932,7 +966,7 @@ impl Pipe {
 
     /// What an event loop waits on for this pipe.
     pub(super) fn source(&self) -> Source {
-        Source::pipe(Arc::clone(&self.shared))
+        Source::of(Arc::clone(&self.shared) as Arc<dyn Watched>)
     }
 
     /// Takes bytes that were read. `Ok(0)` is the end of input, and
@@ -1065,6 +1099,12 @@ impl Pipe {
         // SAFETY: the handle is open, and only the count is asked for.
         unsafe { PeekNamedPipe(raw(handle), None, 0, None, Some(&mut waiting), None) }.is_ok()
             && waiting > 0
+    }
+
+    /// How many bytes written here the pipe hasn't taken yet.
+    pub(super) fn unsent(&self) -> usize {
+        let state = self.shared.lock();
+        state.writer.as_ref().map_or(0, Writer::unsent)
     }
 
     /// Whether the pipe has taken everything written. An error is the

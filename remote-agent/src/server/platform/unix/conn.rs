@@ -45,6 +45,18 @@ impl Stream {
         self.0.shutdown(std::net::Shutdown::Write)
     }
 
+    /// How many bytes this stream took that the kernel hasn't: none, since
+    /// a socket's writes go straight to the kernel.
+    pub fn unsent(&self) -> usize {
+        0
+    }
+
+    /// Waits up to `limit` until everything written has left this process:
+    /// at once here (see [`Stream::unsent`]).
+    pub fn drain_for(&self, _limit: Duration) -> io::Result<bool> {
+        Ok(true)
+    }
+
     /// Two connected streams.
     #[cfg(test)]
     pub fn pair() -> io::Result<(Self, Self)> {
