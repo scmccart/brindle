@@ -83,7 +83,7 @@ Each session SHALL have a close policy, chosen when it is started. With `kill`, 
 - **THEN** the session is listed as detached with policy `detach`, and its program keeps running
 
 ### Requirement: Clients reconnect after a core restart
-When the core restarts, its clients' connections end. A client that reconnects within the reconnect grace period and identifies itself SHALL get back every session it was attached to when its connection ended, without the close policy applying, and SHALL receive each one's replay before live output resumes. Sessions the client had explicitly detached, or that another client attached since, SHALL NOT be given back to it. This SHALL hold across core restarts and upgrades: the server keeps each session's owner and policy as they last changed.
+When the core restarts, its clients' connections end. A client that reconnects within the reconnect grace period and identifies itself SHALL get back every session it was attached to when its connection ended, without the close policy applying, and SHALL receive each one's replay before live output resumes. Sessions the client had explicitly detached, or that another client attached since, SHALL NOT be given back to it. This SHALL hold across core restarts and upgrades: the server keeps each session's owner and policy as they last changed. An attach's change of owner and policy SHALL be kept from the moment the attaching client receives the start of its replay: a core restart after that, however soon, SHALL give the session back to that client and not to its previous owner.
 
 #### Scenario: Reconnect keeps kill sessions
 - **WHEN** the core restarts while a client has a `kill` session running `htop`, and the client reconnects within the grace period
@@ -100,6 +100,10 @@ When the core restarts, its clients' connections end. A client that reconnects w
 #### Scenario: Attached by another client
 - **WHEN** client B attaches a session that client A started, and the core restarts
 - **THEN** after both reconnect, B gets the session back and A doesn't
+
+#### Scenario: Core killed right after an attach
+- **WHEN** client B attaches a session that client A started, and the core is killed with SIGKILL as soon as B receives the start of its replay
+- **THEN** after both reconnect to the next core, B gets the session back and A doesn't
 
 ### Requirement: Attach replays the screen
 A client SHALL be able to attach to a detached session. Before any live output, the server SHALL send a replay that recreates the session's screen: a reset, the terminal modes, the scrollback within the session's limit, the visible grid with its colors and attributes, the cursor position and shape, and the title. The replay SHALL be delimited, so the client can tell it from live output.
