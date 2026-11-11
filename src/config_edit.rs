@@ -652,7 +652,7 @@ background = "nope"
 
     #[test]
     fn save_refuses_malformed_files() {
-        let dir = temp_dir("malformed");
+        let dir = temp_dir("malformed-save");
         let path = dir.join("config.toml");
         let text = "theme = \"x\"\n[broken\n";
         std::fs::write(&path, text).unwrap();
@@ -675,7 +675,7 @@ background = "nope"
 
     #[test]
     fn edits_refused_on_malformed_file() {
-        let dir = temp_dir("malformed");
+        let dir = temp_dir("malformed-edit");
         let path = dir.join("config.toml");
         let text = "theme = \"x\n";
         std::fs::write(&path, text).unwrap();

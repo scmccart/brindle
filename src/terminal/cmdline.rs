@@ -326,10 +326,21 @@ mod tests {
         assert_eq!(launch_line("pwsh.exe", &args(&["/S", "a b"])), r#"pwsh.exe /S "a b""#);
     }
 
-    fn bin_dirs(name: &str, exes: &[&[&str]]) -> Vec<std::path::PathBuf> {
+    /// Removes a test's directory tree when dropped, so a failing assertion still cleans up.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn bin_dirs(name: &str, exes: &[&[&str]]) -> (Vec<std::path::PathBuf>, RemoveOnDrop) {
         let root = std::env::temp_dir().join(format!("brindle-default-{}-{name}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
-        exes.iter()
+        let guard = RemoveOnDrop(root.clone());
+        let dirs = exes
+            .iter()
             .enumerate()
             .map(|(i, files)| {
                 let dir = root.join(i.to_string());
@@ -339,17 +350,18 @@ mod tests {
                 }
                 dir
             })
-            .collect()
+            .collect();
+        (dirs, guard)
     }
 
     #[test]
     fn default_program_prefers_pwsh_then_powershell() {
-        let dirs = bin_dirs("both", &[&["powershell.exe"], &["pwsh.exe"]]);
+        let (dirs, _both) = bin_dirs("both",&[&["powershell.exe"], &["pwsh.exe"]]);
         let (program, args) = windows_default_program(dirs.clone(), Some("C:\\Windows\\system32\\cmd.exe"));
         assert_eq!(program, dirs[1].join("pwsh.exe").display().to_string());
         assert_eq!(args, ["-NoLogo"]);
 
-        let dirs = bin_dirs("ps51", &[&["notepad.exe"], &["powershell.exe"]]);
+        let (dirs, _ps51) = bin_dirs("ps51",&[&["notepad.exe"], &["powershell.exe"]]);
         let (program, args) = windows_default_program(dirs.clone(), None);
         assert_eq!(program, dirs[1].join("powershell.exe").display().to_string());
         assert_eq!(args, ["-NoLogo"]);
@@ -357,12 +369,12 @@ mod tests {
 
     #[test]
     fn default_program_falls_back_to_comspec_then_cmd() {
-        let dirs = bin_dirs("none", &[&["notepad.exe"]]);
+        let (dirs, _none) = bin_dirs("none",&[&["notepad.exe"]]);
         assert_eq!(windows_default_program(dirs.clone(), Some("C:\\tcc\\tcc.exe")), ("C:\\tcc\\tcc.exe".to_string(), vec![]));
         assert_eq!(windows_default_program(dirs.clone(), Some(" ")), ("cmd.exe".to_string(), vec![]));
         assert_eq!(windows_default_program(dirs, None), ("cmd.exe".to_string(), vec![]));
         // A directory named like the program doesn't count.
-        let dirs = bin_dirs("dir-named", &[&[]]);
+        let (dirs, _dir_named) = bin_dirs("dir-named",&[&[]]);
         std::fs::create_dir_all(dirs[0].join("pwsh.exe")).unwrap();
         assert_eq!(windows_default_program(dirs, None).0, "cmd.exe");
     }
