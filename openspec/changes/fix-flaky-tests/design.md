@@ -14,7 +14,7 @@ Three properties of the code constrain the fixes:
 
 - Every test binary runs its tests on parallel threads that fork children (the terminal server's roles, `update-desktop-database`, fake helpers). Any fd open in one thread at the moment another forks is shared by that child until its `exec`, even when it is close-on-exec. `ETXTBSY` and the lock retake both come from this.
 - The core is one thread on a poll loop. `flush_all` (`remote-agent/src/server/core.rs:382`) flushes clients before holders. A holder socket can also hold back many MiB of checkpoint chunks, so even holders-first flushing isn't a guarantee.
-- The holder handles every frame it has read before acting on a closed core connection (`holder.rs` `read_core`: "What was read before a failure still counts"). Bytes the core wrote into the socket before dying still reach the holder.
+- The holder handles every frame it has read before acting on a closed core connection (`holder.rs` `read_core`: "What was read before a failure still counts"). Its write path does not: `flush_core` (`holder.rs:608`) runs first in each turn and drops the core on a write error without reading. A holder with output queued for a core that just died therefore loses frames still unread in its socket. This was measured at the holder alone: 14 of 20 with a printing session, though 0 of 400 through the real core. `flush_core` will read and handle what is available before dropping the core, as `read_core` does. Then bytes the core wrote before dying always reach the holder.
 
 ## Goals / Non-Goals
 
@@ -39,6 +39,12 @@ Use `send_event(...)?.check()` (x11rb's sync round trip) instead of `send_event`
 ### Window waits scale with `BRINDLE_E2E_SLOW`, and early returns reap Brindle
 
 `capture`'s 3 s viewable-window wait (`tests/e2e/capture.rs:248`) becomes `ctx`-scaled with a 10 s base. The function takes the scale it needs as a parameter; it has no `ctx` today. The longer wait costs nothing on passing runs, since it ends when the window appears.
+
+A longer wait alone turns a slow start's "no viewable window" into a pixel mismatch. Brindle starts its steps relative to its window opening (`src/main.rs:716-718`), but `capture_at(T)` counts from the spawn, so a late window is captured before its steps ran. Captures therefore count from the window's first appearance, on Brindle's clock:
+- A watcher thread, started at spawn, polls for the viewable window every 100 ms and records when it first appears.
+- `capture_at(T)` captures `T` seconds after that moment, waiting for the window first (with the scaled limit above).
+- Other timeline events (`during`, `request_close`) are not covered by the CI failures and keep counting from the spawn.
+- Alternative: capture after a `--wait-for` marker. That changes every capture case's command line for the same effect.
 
 Every early `?` return in `tests/e2e/brindle.rs` after Brindle is spawned goes through a guard that kills and waits the child. Today one path (`brindle.rs:494`) leaves Brindle running, and it later panics on a broken stdout.
 
@@ -75,9 +81,17 @@ After `drop`, the test retries `Lock::acquire` for up to 5 s. A child forked by 
 
 The two `config_edit` tests stop sharing `temp_dir("malformed")`, each taking a name of its own. The `cmdline` tests remove the `/tmp/brindle-default-*` directories they create, with a drop guard so a failing assertion still cleans up.
 
+### `pace::drain_stops_at_the_budget` checks the rule, not a fixed count
+
+This flake was found during verification. The test sleeps `BUDGET / 2 + 1 ms` per item and expects exactly two items. Under load, one sleep can overrun the whole budget, and then `drain` correctly stops after one item. The test instead records when each callback started and ended. It asserts the rule itself: `drain` takes another item only while the budget hasn't run out, and stops at the first check after it has. That holds however long the sleeps take.
+
 ### Windows: probes poll, and PowerShell 5.1 is warmed up
 
-`windows-conpty-host`, `conpty_fallback` and `caption` run their `during` probe as a poll, every 100 ms, until the condition holds, Brindle exits, or `ctx.secs(dump_at)` passes. They then assert on the last snapshot, so a failure still reports what was seen.
+`windows-conpty-host`, `conpty_fallback` and `caption` run their `during` probe as a poll, every 100 ms from the spawn, until the condition holds or Brindle exits (right after its own dump), within the run's existing deadline. They then assert on the last snapshot, so a failure still reports what was seen.
+
+A poll that stopped at the harness's `ctx.secs(dump_at)` would not have fixed the CI failure: Brindle started about 10 s after the spawn, against a dump time of 8 s. Brindle's exit is on its own clock, as the dump is.
+
+`caption`'s probe clicks only once its hit tests match, so polling it clicks exactly once.
 
 `windows-pwsh-integration` runs a timed headless 5.1 warm-up before its GUI iteration and writes the duration to `powershell-warmup.txt` in the case directory.
 
