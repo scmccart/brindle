@@ -26,9 +26,9 @@
 
 ## 4. Locks, starting roles, the per-build copy
 
-- [ ] 4.1 Implement the Windows `lock` with `LockFileEx` on `core.lock` and `holder-<build>-<n>.lock` (which also picks `n`). Verify: a test takes a lock in a child process, fails to take it in the test, and takes it once the child is killed.
+- [x] 4.1 Implement the Windows `lock` with `LockFileEx` on `core.lock` and `holder-<build>-<n>.lock` (which also picks `n`). Verify: a test takes a lock in a child process, fails to take it in the test, and takes it once the child is killed.
 - [ ] 4.2 Implement the Windows `daemon` start: the `launch` trampoline that starts the role and exits, `--ready-handle` passed through it, the detached flags with `CREATE_BREAKAWAY_FROM_JOB`, the handle list, the retry without breakaway on `ERROR_ACCESS_DENIED` with one log line, and a 2 s wait for the ready byte. Verify: tests start a role inside a job without breakaway (it starts, and logs), inside a job with breakaway (it survives the job's `KILL_ON_JOB_CLOSE`), and check that `taskkill /T /F` on the starter leaves the role running.
-- [ ] 4.3 Implement the per-build copy: copy to a temporary name, rename into `<copies>\<build>\brindle-remote.exe` (`%LOCALAPPDATA%\brindle\server`, or `bin` in `BRINDLE_SERVER_DIR` when set), accept a racing winner whose build id matches, and prune other build directories that can be deleted. Roles restart roles from `GetModuleFileNameW`. Verify: tests for two racing copies, the kept last-write time, and pruning skipping a directory whose exe is running.
+- [x] 4.3 Implement the per-build copy: copy to a temporary name, rename into `<copies>\<build>\brindle-remote.exe` (`%LOCALAPPDATA%\brindle\server`, or `bin` in `BRINDLE_SERVER_DIR` when set), accept a racing winner whose build id matches, and prune other build directories that can be deleted. Roles restart roles from `GetModuleFileNameW`. Verify: tests for two racing copies, the kept last-write time, and pruning skipping a directory whose exe is running.
 
 ## 5. The holder on Windows
 
