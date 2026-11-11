@@ -83,6 +83,10 @@ On Windows, server roles SHALL start outside the job object of the process that 
 - **WHEN** Brindle was started from the Start Menu with a `detach` session running `ping -t localhost`, and Brindle is ended with `taskkill /F`
 - **THEN** the `ping` keeps running and is listed as detached
 
+#### Scenario: Process tree ended
+- **WHEN** Brindle has a `detach` session running `ping -t localhost`, and Brindle's process tree is ended with `taskkill /T /F`
+- **THEN** the `ping` keeps running and is listed as detached
+
 #### Scenario: Job that forbids breakaway
 - **WHEN** Brindle runs inside a job that forbids breakaway, and opens a local tab
 - **THEN** the tab works, and Brindle's log says sessions won't outlive the job
@@ -95,7 +99,7 @@ On Windows, no server role SHALL run from the installed `brindle-remote.exe`. Ea
 - **THEN** the replacement succeeds, and the tabs keep working
 
 ### Requirement: Console windows follow Brindle's window on Windows
-On Windows, a client SHALL be able to name the window that owns a session's console window. The server SHALL apply it asynchronously, ignore a window that no longer exists, and clear the owner when given none. A client SHALL name its window again after attaching, after reconnecting, and whenever the session moves to another window, and SHALL clear it before its window closes. A Linux core SHALL refuse the request.
+On Windows, a client SHALL be able to name the window that owns a session's console window. The server SHALL apply it asynchronously, ignore a window that no longer exists, and clear the owner when given none. A client SHALL name its window again after attaching, after reconnecting, and whenever the session moves to another window. A session whose owner window is gone SHALL keep its console window, without an owner. A Linux core SHALL refuse the request.
 
 #### Scenario: Dialog owned by Brindle
 - **WHEN** a program in a Windows tab opens a message box owned by its console window

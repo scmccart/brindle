@@ -12,7 +12,11 @@ Phase 3 of the terminal-server series. Phase 1's design is in `openspec/changes/
 - **Helper lookup** (`remote::find_helper`): `BRINDLE_REMOTE_AGENT`, else beside the exe. On Windows that variable already names the *Linux* helper, for the `remote-*` e2e cases.
 - **`build_id::of_binary`** reads the ELF build-id note and otherwise hashes the bytes, so it already works for a PE file.
 - **The instance pipe** (`instance.rs`) already uses `CreateNamedPipeW` with `PIPE_REJECT_REMOTE_CLIENTS`, a per-user name, and `GetNamedPipeServerProcessId` on the client side.
-- **The spike** proved reparenting across processes (asynchronous; a dead HWND is ignored), that an HPCON can't move between processes, detached survival with breakaway, the user-only pipe DACL with a SID check, and one IOCP loop over overlapped pipes for two pseudoconsoles. Not covered: destroying the *current* owner window, an owner in another process from the console host's creator, a real Start Menu launch and kill, Windows Terminal and CI jobs, and a second user account.
+- **The spike** proved reparenting across processes (asynchronous; a dead HWND is ignored), that an HPCON can't move between processes, detached survival with breakaway, the user-only pipe DACL with a SID check, and one IOCP loop over overlapped pipes for two pseudoconsoles.
+- **Its follow-up (tasks 0.1–0.3, on `spike/windows-conpty`: `spike reparent-ext`, `spike survive none --log FILE [--stay N]` launched through a `.lnk`, `wt.exe -w new nt` and Git Bash, and `spike access run|first …`)** found:
+  - **Losing the owner:** destroying the current owner window, in the same process or another, or killing that process, leaves the console window alive with no owner. Open dialogs survive, new ones open, and reparenting to a new window (in any process) works. Reparenting to null first changes nothing.
+  - **Launch contexts:** an Explorer-launched process (a `.lnk` started through `explorer.exe`, standing in for the Start Menu) is in a job that allows breakaway. Windows Terminal tabs and Git Bash are in no job. Sessions survived closing the tab, killing its shell and closing the WT window. Only `taskkill /T` on a still-running ancestor killed them, because it walks parent pids. Not tested: a GitHub runner, a real Start Menu click, a second user account.
+  - **Access:** a process can label a pipe only at or below its own integrity (an `HI` label from a Medium process fails with 1314). A lower-integrity client can't open a labelled pipe for writing (5), but it *can* open it read-only and connect. `GetNamedPipeClientProcessId` → `OpenProcessToken` reads the true user and integrity before any data, for higher and lower clients alike. `ImpersonateNamedPipeClient` fails with 1368 until a byte has been read. `FILE_FLAG_FIRST_PIPE_INSTANCE` on a taken name fails with 5 (231 when the holder allows one instance). Only Medium/Low was tested; the elevated pair wasn't available.
 
 ## Goals / Non-Goals
 
@@ -64,11 +68,12 @@ Linux keeps its implementations; Windows adds its own. `main.rs` compiles `serve
 
 ### Access
 - **Pipes are created with these protections:**
-  - the SDDL `D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)` plus a mandatory label at the creator's integrity level (`S:(ML;;NW;;;HI)` when elevated), so a lower-integrity process can't open a pipe for writing;
+  - the SDDL `D:P(A;;GA;;;<user SID>)(A;;GA;;;SY)` plus a mandatory label at the creator's own integrity level (`S:(ML;;NW;;;HI)` when elevated, `ME` otherwise; a process can't label above its own level), so a lower-integrity process can't open a pipe for writing. It can still open one read-only and connect, so the label alone isn't enough and the integrity check below is what refuses it;
   - `PIPE_REJECT_REMOTE_CLIENTS`;
-  - `FILE_FLAG_FIRST_PIPE_INSTANCE` on a name's first instance, so a pipe someone else already created under that name (squatting) fails the create, and the core or holder exits with a log line.
+  - `FILE_FLAG_FIRST_PIPE_INSTANCE` on a name's first instance, so a pipe someone else already created under that name (squatting) fails the create, with error 5 or 231, both read as "name taken", and the core or holder exits with a log line.
 - **Server side:** before reading anything, the server identifies each client as the spike did. It calls `GetNamedPipeClientProcessId`, then `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `OpenProcessToken(TOKEN_QUERY)`, and reads `TokenUser` and `TokenIntegrityLevel`. It refuses a different SID, a lower integrity than its own, or a token it can't open; an elevated client of an unelevated server is refused that way, which the elevation rule wants anyway.
-  - `ImpersonateNamedPipeClient` would also work for elevated clients, but it needs data read from the pipe first (`ERROR_CANNOT_IMPERSONATE`), so the check couldn't run before reading. Task 0.3 confirms this.
+  - `ImpersonateNamedPipeClient` can't be used: it fails with `ERROR_CANNOT_IMPERSONATE` until data has been read (task 0.3), so the check couldn't run before reading.
+  - The elevated/unelevated pair is checked by the e2e case in task 8.3 where a runner allows it (CI's runner is elevated).
 - **Client side:** Brindle, the CLI commands and a holder dialling its core each check the server with `GetNamedPipeServerProcessId`, then that process's token user and integrity. A different SID or integrity is refused, so a squatter is never sent a request.
 - **The integrity check runs both ways.** A process never uses a server running at another integrity level, which also keeps an elevated server from being driven to start elevated programs.
 
@@ -77,7 +82,9 @@ An elevated Brindle (Run as administrator, or started from an elevated console a
 
 ### Starting a role detached
 - **`daemon.rs` gains a Windows start:** `CreateProcessW` of `<helper> <role> --ready-handle <h>`. The flags are `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB | CREATE_UNICODE_ENVIRONMENT`, and a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` lets the child inherit only the ready pipe's write end.
-- **The role writes one byte once it is listening;** the starter waits up to 2 s, as with `--ready-fd`.
+- **Through a trampoline:** the starter runs `<helper> launch <role> …`, which starts the role with these flags and exits at once, as Linux's double fork does. So no role's parent pid is a live process: `taskkill /T` or Task Manager's "End process tree" on Brindle, which walk parent pids, don't reach the server (task 0.2 saw them do so without it).
+- **The role writes one byte once it is listening;** the starter waits up to 2 s, as with `--ready-fd`. The ready pipe's write end passes through the trampoline to the role.
+- **Where breakaway is needed:** Explorer and Start Menu launches run in a job that allows it, and Windows Terminal and consoles run in none (task 0.2). The GitHub runner is unknown until the `windows-e2e` job runs the new cases.
 - **A job that refuses breakaway** fails the create with `ERROR_ACCESS_DENIED`. The starter then retries without `CREATE_BREAKAWAY_FROM_JOB` and logs once that sessions won't outlive the starter's job. A `KILL_ON_JOB_CLOSE` job then still ends them; that is accepted and logged.
 - **No console window:** `brindle-remote.exe` stays a console-subsystem program for its CLI, and the detached flags keep server roles from opening a console.
 - **The same start serves all three cases:** Brindle starting a core, a core starting a holder, and a holder restarting its core.
@@ -119,10 +126,10 @@ An elevated Brindle (Run as administrator, or started from an elevated console a
 
 ### REPARENT
 - **No protocol change.** Protocol 1 (message 13) and H1 (message 11) have carried `REPARENT { session, hwnd }` since phase 1, and a Linux core and holder refuse it. A Windows core forwards a client's `REPARENT` to the session's holder, which applies it with `ConptyReparentPseudoConsole`. With the inbox ConPTY, which has no such export, the holder logs and ignores it.
-- **Brindle sends it** where `parent_console_to` runs today: when a terminal's view is first in a window, after spawn, attach and each reconnect's replay, and with `hwnd: 0` for every attached session as its window is destroyed on quit, so no console window stays owned by a dead HWND.
+- **Brindle sends it** where `parent_console_to` runs today: when a terminal's view is first in a window, and after spawn, attach and each reconnect's replay.
+- **Nothing is sent on quit.** Task 0.1 found that a destroyed owner (a quit, a crash, the process killed) leaves the console window alive and ownerless, and the next `REPARENT` re-owns it; clearing the owner first made no difference.
 - **It is advisory:** there is no reply, the call is asynchronous, and the holder ignores errors.
 - **The core doesn't remember the HWND across restarts;** the client re-sends after reconnecting.
-- **Task 0.1 checks the two cases the spike didn't cover,** which are now the normal path: the owner destroyed while the session lives (a crash), and an owner in a different process from the console host's creator.
 
 ### Brindle's client on Windows
 - **`Backend::Server` and `server::Sink` build on Windows.** `Backend::Pty`, `pty::MarkedPty`, `ParsingReader` over ConPTY, `terminal/scan.rs`'s Windows path and `conpty.rs` leave Brindle. alacritty's `tty` and `EventLoop` are then unused on every platform.
@@ -145,8 +152,8 @@ An elevated Brindle (Run as administrator, or started from an elevated console a
 
 ## Risks / Trade-offs
 
-- [A destroyed owner HWND could take the console window with it, or confuse ConPTY] → Brindle clears ownership (`hwnd: 0`) on quit. A crash can't do that, so task 0.1 checks it first; if a crash breaks the session's console window, the fallback is never reparenting across processes and keeping only the dialog-owner gap.
-- [Jobs that forbid breakaway (some CI runners, some launchers) end sessions with the starter] → It is logged once, and sessions still survive the core's restarts. Task 0.2 checks Start Menu, Explorer, Windows Terminal and the CI runner.
+- [Jobs that forbid breakaway (possibly CI runners and some launchers) end sessions with the starter] → It is logged once, and sessions still survive the core's restarts. Explorer, Windows Terminal and consoles are fine (task 0.2); the CI runner shows up in `windows-e2e`.
+- [A parent-pid tree kill reaching the server] → The trampoline leaves no live parent. A pid reused by an unrelated process could still be walked into, which is accepted as rare.
 - [Two hops each way on Windows] → Measure latency against `main` (task 9.3). The data fast path from phase 1's risks stays available.
 - [The per-build copy uses disk and could leak] → It is one helper per build, pruned when not running. The copies live in `%LOCALAPPDATA%\brindle`, which uninstall keeps, as it keeps state.
 - [Antivirus scanning or blocking a copied exe under `%LOCALAPPDATA%`] → The helper is signed as Brindle is (or not, as today), and the copy is byte-identical to the installed one. The tab's error names the start failure.
