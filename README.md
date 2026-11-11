@@ -111,7 +111,7 @@ Their sockets, locks and logs (`core.log`, `holder-*.log`) are in
 `~/.cache/brindle/run`. A socket path must fit in 108 bytes, so keep a custom
 `BRINDLE_SERVER_DIR` short.
 
-The helper is therefore required on Linux, found as for remote profiles:
+The helper is therefore required on Linux, found through `BRINDLE_SERVER_HELPER`, else
 `BRINDLE_REMOTE_AGENT`, else `brindle-remote-linux-x86_64` or `brindle-remote`
 beside `brindle`. Without it, a new tab says so and tries again for the next
 one. The release archive and `scripts/install.sh` ship it. Windows tabs don't

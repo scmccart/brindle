@@ -53,6 +53,41 @@ fn find_helper_in(variable: Option<OsString>, exe: &Path) -> Result<Option<PathB
     Ok(HELPER_NAMES.iter().map(|name| exe.with_file_name(name)).find(|path| path.is_file()))
 }
 
+/// The helper the local terminal server runs: `BRINDLE_SERVER_HELPER`, then on
+/// Linux `BRINDLE_REMOTE_AGENT`, then beside Brindle's executable. On Windows
+/// `BRINDLE_REMOTE_AGENT` names the Linux helper for remote profiles, so it is
+/// ignored and only `brindle-remote.exe` beside `brindle.exe` is looked for.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn find_server_helper() -> Result<Option<PathBuf>> {
+    let exe = std::env::current_exe().context("locating Brindle executable")?;
+    find_server_helper_in(
+        std::env::var_os("BRINDLE_SERVER_HELPER"),
+        std::env::var_os("BRINDLE_REMOTE_AGENT"),
+        &exe,
+        cfg!(windows),
+    )
+}
+
+fn find_server_helper_in(
+    server_variable: Option<OsString>,
+    remote_variable: Option<OsString>,
+    exe: &Path,
+    windows: bool,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = server_variable.filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+        bail!("BRINDLE_SERVER_HELPER does not name a file: {}", path.display());
+    }
+    if windows {
+        let path = exe.with_file_name("brindle-remote.exe");
+        return Ok(path.is_file().then_some(path));
+    }
+    find_helper_in(remote_variable, exe)
+}
+
 /// Waits for `child` to exit, killing it if `cancel` is set or `timeout`
 /// passes first.
 pub(crate) fn wait_process(
@@ -400,6 +435,47 @@ mod tests {
         assert!(error.to_string().contains("does not name a file"), "{error}");
         std::fs::write(&named, b"").unwrap();
         assert_eq!(find_helper_in(Some(named.clone().into()), &exe).unwrap(), Some(named));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_server_helper_order_holds_on_both_platforms() {
+        let dir = std::env::temp_dir().join(format!("brindle-server-helper-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("brindle");
+        let remote = dir.join("linux-helper");
+        let server = dir.join("server-helper");
+        let find = |s: Option<&Path>, r: Option<&Path>, windows| {
+            find_server_helper_in(s.map(Into::into), r.map(Into::into), &exe, windows)
+        };
+        for windows in [false, true] {
+            assert_eq!(find(None, None, windows).unwrap(), None);
+        }
+        // Beside the exe: Linux names, or brindle-remote.exe on Windows.
+        std::fs::write(dir.join("brindle-remote"), b"").unwrap();
+        assert_eq!(find(None, None, false).unwrap(), Some(dir.join("brindle-remote")));
+        assert_eq!(find(None, None, true).unwrap(), None);
+        std::fs::write(dir.join("brindle-remote.exe"), b"").unwrap();
+        assert_eq!(find(None, None, true).unwrap(), Some(dir.join("brindle-remote.exe")));
+        // BRINDLE_REMOTE_AGENT: honoured on Linux, ignored on Windows.
+        std::fs::write(&remote, b"").unwrap();
+        assert_eq!(find(None, Some(&remote), false).unwrap(), Some(remote.clone()));
+        assert_eq!(find(None, Some(&remote), true).unwrap(), Some(dir.join("brindle-remote.exe")));
+        // BRINDLE_SERVER_HELPER wins on both; empty counts as unset.
+        std::fs::write(&server, b"").unwrap();
+        for windows in [false, true] {
+            assert_eq!(find(Some(&server), Some(&remote), windows).unwrap(), Some(server.clone()));
+            assert_eq!(
+                find(Some(Path::new("")), None, windows).unwrap().is_some(),
+                true
+            );
+            let missing = dir.join("missing");
+            let error = find(Some(&missing), Some(&remote), windows).unwrap_err();
+            assert!(
+                error.to_string().contains("BRINDLE_SERVER_HELPER does not name a file"),
+                "{error}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

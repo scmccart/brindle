@@ -1,8 +1,8 @@
 //! Brindle's client for the local terminal server (Linux).
 //!
 //! Local tabs run in sessions of the terminal server, `brindle-remote serve`
-//! (the core) and the holders it drives. This module finds the helper (as
-//! [`super::find_helper`] does for remote tabs), resolves the server
+//! (the core) and the holders it drives. This module finds the helper
+//! ([`super::find_server_helper`]), resolves the server
 //! directory as the helper does ([`server_dir::resolve`]), starts the core
 //! when none is listening (`serve --ready-fd 3`, which detaches itself and
 //! writes one byte once it accepts connections), connects to `core.sock`
@@ -47,7 +47,7 @@ const HELLO_LIMIT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY: Duration = Duration::from_secs(1);
 
 pub const HELPER_MISSING: &str =
-    "terminal server helper not found: set BRINDLE_REMOTE_AGENT or install brindle-remote beside brindle";
+    "terminal server helper not found: set BRINDLE_SERVER_HELPER or install brindle-remote beside brindle";
 
 /// This process's `client_token`: random, and the same for every
 /// connection it makes, so a reconnect gets its sessions back.
@@ -126,7 +126,7 @@ pub struct Endpoint {
 impl Endpoint {
     /// The helper and the server directory for this process's environment.
     pub fn from_env() -> Result<Self> {
-        let helper = super::find_helper()?.context(HELPER_MISSING)?;
+        let helper = super::find_server_helper()?.context(HELPER_MISSING)?;
         let dir = server_dir::resolve(
             std::env::var_os("BRINDLE_SERVER_DIR"),
             std::env::var_os("XDG_RUNTIME_DIR"),
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn a_missing_helper_says_how_to_point_at_one() {
         assert!(HELPER_MISSING.contains("terminal server helper not found"));
-        assert!(HELPER_MISSING.contains("BRINDLE_REMOTE_AGENT"));
+        assert!(HELPER_MISSING.contains("BRINDLE_SERVER_HELPER"));
         assert!(HELPER_MISSING.contains("beside brindle"));
     }
 

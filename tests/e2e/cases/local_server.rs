@@ -839,6 +839,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, &tmux, "run").keep_detached()
         .bin(&bin)
         .env_remove("BRINDLE_REMOTE_AGENT")
+        .env_remove("BRINDLE_SERVER_HELPER")
         .profile("Shell")
         .default_profile("Shell")
         .wait_for("helper not found")
@@ -858,7 +859,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(out.dump.tabs.len() == 2, "tabs: {:?}", out.dump.tabs);
     screen_has(&out, "terminal server helper not found")?;
-    screen_has(&out, "BRINDLE_REMOTE_AGENT")?;
+    screen_has(&out, "BRINDLE_SERVER_HELPER")?;
     let wrote = std::fs::read_to_string(ctx.dir.join("in-server")).unwrap_or_default();
     ensure!(wrote.trim() == "in-server", "the second tab didn't run its command");
     Ok(Outcome::Pass)
