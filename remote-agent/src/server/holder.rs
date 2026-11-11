@@ -7,8 +7,8 @@
 //! doesn't interpret, so a new core can rebuild the screens.
 //!
 //! - **Socket:** `holder-<build>-<n>.sock` in the server directory, beside
-//!   `holder-<build>-<n>.lock`, which it flocks for its whole life (a
-//!   socket path can't be opened to flock), and its log.
+//!   `holder-<build>-<n>.lock`, which it holds for its whole life, and its
+//!   log.
 //! - **One core at a time:** a newer `HELLO` takes the holder over from the
 //!   connected core. `WELCOME` lists the sessions, then each one's
 //!   checkpoint and tail follow.
@@ -17,34 +17,33 @@
 //!   no core, it reads a session until its tail is full, so the program
 //!   blocks instead of losing output.
 //! - **Supervision:** with sessions but no core for [`CORE_GRACE`], it
-//!   starts `serve` from `/proc/self/exe` (which survives the file being
+//!   starts `serve` from its own binary (which survives the file being
 //!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`].
 //! - **Exit:** once it has no sessions (after having one, after `DRAIN`, or
 //!   when no core used it within [`UNUSED_LIMIT`] of starting).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::net::UnixListener;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::{SessionId, scope};
+use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
     Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
 };
 
 use super::conn::Conn;
-use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
-use super::{build_id, daemon, dir, peer};
+use super::daemon::ReadyPipe;
+use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
+use super::platform::listen::{self, Identity, Listener};
+use super::platform::lock::Lock;
+use super::platform::pty::{self, Group, Program, Pty};
+use super::{build_id, daemon, dir};
 use crate::pty::{
-    self, GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
+    GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
 };
 
 /// Past this much queued to the core, the holder stops reading PTYs.
@@ -70,14 +69,12 @@ const READS_PER_EVENT: usize = 4;
 const TICK_FAST: Duration = Duration::from_millis(50);
 const TICK_SLOW: Duration = Duration::from_millis(500);
 
-/// The core the holder starts is run from its own binary
-/// (`/proc/<pid>/exe`, see [`scope::command`]). Tests replace the arguments
-/// with `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated); `{ready_fd}`
-/// stands for the ready pipe's fd number.
-const DEFAULT_CORE_ARGS: &[&str] = &["serve", "--ready-fd", "{ready_fd}"];
+/// The core the holder starts is run from its own binary, with
+/// [`daemon::role_args`]. Tests replace the arguments with
+/// `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated), where the
+/// platform's placeholder (`{ready_fd}` on Linux) stands for the ready
+/// pipe.
 const CORE_ARGS_ENV: &str = "BRINDLE_TEST_HOLDER_CORE_ARGS";
-/// The fd the started core's ready pipe gets.
-const CORE_READY_FD: libc::c_int = 3;
 
 macro_rules! log {
     ($($arg:tt)*) => {
@@ -93,11 +90,7 @@ macro_rules! log {
 /// Runs `brindle-remote hold [--ready-fd N]`. Without `--ready-fd` it stays
 /// in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let ready_fd = daemon::parse_ready_fd("hold", args)?;
-    let ready = ready_fd
-        .map(daemon::Ready::from_fd)
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let ready = daemon::ready_from_args("hold", args)?;
     let dir = dir::from_env().map_err(|error| error.to_string())?;
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
     let slot = Slot::claim(&dir, &build).map_err(|error| error.to_string())?;
@@ -109,13 +102,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let core_args = std::env::var(CORE_ARGS_ENV)
         .ok()
         .map(|args| args.split_whitespace().map(String::from).collect())
-        .unwrap_or_else(|| {
-            DEFAULT_CORE_ARGS
-                .iter()
-                .map(|arg| arg.to_string())
-                .collect()
-        });
-    let ev = PollLoop::new().map_err(|error| error.to_string())?;
+        .unwrap_or_else(|| daemon::role_args("serve"));
+    let ev = Loop::new().map_err(|error| error.to_string())?;
     let holder = Holder::new(ev, build, slot, core_args).map_err(|error| {
         log!("can't start: {error}");
         error.to_string()
@@ -131,10 +119,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     })
 }
 
-/// The holder's place in the server directory: index `n`, its flocked lock
+/// The holder's place in the server directory: index `n`, its held lock
 /// file, socket and log.
 struct Slot {
-    _lock: File,
+    _lock: Lock,
     lock_path: PathBuf,
     socket_path: PathBuf,
     log_path: PathBuf,
@@ -150,39 +138,17 @@ impl Slot {
             attempts += 1;
             let name = format!("holder-{build}-{index}");
             let lock_path = dir.join(format!("{name}.lock"));
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(&lock_path)?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    return Err(error);
-                }
+            let Some(lock) = Lock::create(&lock_path)? else {
                 index += 1;
                 continue;
-            }
-            // An exiting holder unlinks its lock file; if that happened
-            // between the open and the flock, this lock is on a dead inode.
-            let locked = lock.metadata()?;
-            match fs::metadata(&lock_path) {
-                Ok(now) if now.ino() == locked.ino() && now.dev() == locked.dev() => {}
-                _ => continue,
+            };
+            // An exiting holder removes its lock file; if that happened
+            // between the open and the lock, this lock protects nothing.
+            if !lock.is_at(&lock_path)? {
+                continue;
             }
             let socket_path = dir.join(format!("{name}.sock"));
-            // sun_path holds 108 bytes with the terminating NUL.
-            if socket_path.as_os_str().len() > 107 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "the socket path {} is too long for a Unix socket; set a shorter BRINDLE_SERVER_DIR",
-                        socket_path.display()
-                    ),
-                ));
-            }
+            listen::check_path(&socket_path)?;
             return Ok(Self {
                 _lock: lock,
                 lock_path,
@@ -250,9 +216,9 @@ struct Session {
     /// The entry `WELCOME` reports; `exit` is set once the program has
     /// exited and its output is drained.
     held: HeldSession,
-    child: Child,
+    program: Program,
     /// Closed on hang-up and once the session is finished.
-    master: Option<OwnedFd>,
+    pty: Option<Pty>,
     token: Token,
     interest: Interest,
     checkpoint: Vec<u8>,
@@ -298,8 +264,7 @@ struct Holder<L: EventLoop> {
     ev: L,
     build: String,
     slot: Slot,
-    listener: UnixListener,
-    uid: u32,
+    listener: Listener,
     sources: HashMap<Token, Source>,
     next_token: Token,
     core: Option<Core>,
@@ -313,29 +278,18 @@ struct Holder<L: EventLoop> {
     backoff: Duration,
     core_args: Vec<String>,
     core_starts: Vec<Child>,
-    core_ready: HashMap<Token, OwnedFd>,
-    /// Process groups to `SIGKILL` when their hang-up grace ends, with the
+    core_ready: HashMap<Token, ReadyPipe>,
+    /// Process groups to kill when their hang-up grace ends, with the
     /// session whose program leads each one.
-    kills: Vec<(SessionId, libc::pid_t, Instant)>,
+    kills: Vec<(SessionId, Group, Instant)>,
 }
 
 impl<L: EventLoop> Holder<L> {
     fn new(mut ev: L, build: String, slot: Slot, core_args: Vec<String>) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
-        match fs::remove_file(&slot.socket_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let listener = UnixListener::bind(&slot.socket_path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("can't listen on {}: {error}", slot.socket_path.display()),
-            )
-        })?;
-        listener.set_nonblocking(true)?;
-        ev.register(listener.as_raw_fd(), LISTENER, Interest::READABLE)?;
-        ev.waker().wake_on_signal(libc::SIGCHLD)?;
+        let listener = Listener::bind(&slot.socket_path, Identity::own())?;
+        ev.register(&listener.source(), LISTENER, Interest::READABLE)?;
+        ev.waker().wake_on_child_exit()?;
         log!(
             "listening on {} (build {build})",
             slot.socket_path.display()
@@ -345,7 +299,6 @@ impl<L: EventLoop> Holder<L> {
             build,
             slot,
             listener,
-            uid: dir::own_uid(),
             sources: HashMap::from([(LISTENER, Source::Listener)]),
             next_token: LISTENER + 1,
             core: None,
@@ -428,7 +381,7 @@ impl<L: EventLoop> Holder<L> {
     fn accept(&mut self) {
         loop {
             // The peer check comes before reading anything.
-            let stream = match peer::accept(&self.listener, self.uid) {
+            let stream = match self.listener.accept() {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -452,7 +405,7 @@ impl<L: EventLoop> Holder<L> {
                 }
             };
             let token = self.token();
-            if let Err(error) = self.ev.register(conn.fd(), token, Interest::READABLE) {
+            if let Err(error) = self.ev.register(&conn.source(), token, Interest::READABLE) {
                 log!("can't watch a connection: {error}");
                 continue;
             }
@@ -677,16 +630,10 @@ impl<L: EventLoop> Holder<L> {
                 let Some(session) = self.sessions.get_mut(&resize.session) else {
                     return self.send_error(Some(resize.session), no_session(resize.session));
                 };
-                let Some(master) = &session.master else {
+                let Some(pty) = &session.pty else {
                     return;
                 };
-                let result = pty::resize(
-                    master.as_raw_fd(),
-                    resize.cols,
-                    resize.rows,
-                    resize.cell_w,
-                    resize.cell_h,
-                );
+                let result = pty.resize(resize.cols, resize.rows, resize.cell_w, resize.cell_h);
                 session.held.cols = resize.cols;
                 session.held.rows = resize.rows;
                 if let Err(error) = result {
@@ -785,10 +732,10 @@ impl<L: EventLoop> Holder<L> {
             cell_height: spawn.cell_h,
             exact_env: true,
         };
-        let spawned = match pty::spawn(&request) {
+        let (pty, mut program) = match pty::spawn(&request) {
             Ok(spawned) => spawned,
             Err(error) => {
-                let message = format!("{}: {error}", request.program().to_string_lossy());
+                let message = format!("{}: {error}", pty::program_name(&request).to_string_lossy());
                 log!("session {id}: {message}");
                 return self.send(ToCore::SpawnFailed(SpawnFailed {
                     session: id,
@@ -797,23 +744,19 @@ impl<L: EventLoop> Holder<L> {
             }
         };
         let token = self.token();
-        if let Err(error) = self
-            .ev
-            .register(spawned.master.as_raw_fd(), token, Interest::READABLE)
-        {
-            pty::signal_process_group(spawned.pid, libc::SIGKILL);
-            let mut child = spawned.child;
-            let _ = child.wait();
+        if let Err(error) = self.ev.register(&pty.source(), token, Interest::READABLE) {
+            program.group().kill();
+            let _ = program.wait();
             return self.send(ToCore::SpawnFailed(SpawnFailed {
                 session: id,
                 message: format!("can't watch the PTY: {error}"),
             }));
         }
         self.sources.insert(token, Source::Master(id));
-        let pid = spawned.pid as u32;
+        let pid = program.pid();
         log!(
             "session {id}: started {} as pid {pid}",
-            request.program().to_string_lossy()
+            pty::program_name(&request).to_string_lossy()
         );
         self.sessions.insert(
             id,
@@ -827,8 +770,8 @@ impl<L: EventLoop> Holder<L> {
                     meta: spawn.meta,
                     truncated: false,
                 },
-                child: spawned.child,
-                master: Some(spawned.master),
+                program,
+                pty: Some(pty),
                 token,
                 interest: Interest::READABLE,
                 checkpoint: Vec::new(),
@@ -848,7 +791,7 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&data.session) else {
             return self.send_error(Some(data.session), no_session(data.session));
         };
-        if session.master.is_none() {
+        if session.pty.is_none() {
             // Hung up: the program is going, so its input is moot.
             return;
         }
@@ -861,23 +804,23 @@ impl<L: EventLoop> Holder<L> {
         session.input.extend(data.bytes);
     }
 
-    /// Closes the session's PTY and sends `SIGHUP` to its process group,
-    /// then `SIGKILL` after the grace period. Says whether it exists.
+    /// Closes the session's PTY and hangs its process group up, then kills
+    /// it after the grace period. Says whether it exists.
     fn hang_up(&mut self, id: SessionId) -> bool {
         let Some(session) = self.sessions.get_mut(&id) else {
             return false;
         };
-        if session.master.take().is_some() {
+        if session.pty.take().is_some() {
             let _ = self.ev.deregister(session.token);
             self.sources.remove(&session.token);
         }
         session.input.clear();
         session.output_closed = true;
         if session.reaped.is_none() {
-            let pid = session.held.pid as libc::pid_t;
-            pty::signal_process_group(pid, libc::SIGHUP);
+            let group = session.program.group();
+            group.hang_up();
             self.kills
-                .push((id, pid, Instant::now() + GRACEFUL_SHUTDOWN));
+                .push((id, group, Instant::now() + GRACEFUL_SHUTDOWN));
             log!("session {id}: hung up");
         }
         true
@@ -887,10 +830,9 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let Some(master) = &session.master else {
+        let Some(pty) = &mut session.pty else {
             return;
         };
-        let fd = master.as_raw_fd();
         let mut buffer = [0u8; OUTPUT_CHUNK_SIZE];
         for _ in 0..READS_PER_EVENT {
             if session.output_closed {
@@ -906,36 +848,29 @@ impl<L: EventLoop> Holder<L> {
             if limit == 0 {
                 break;
             }
-            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), limit) };
-            if read > 0 {
-                let bytes = &buffer[..read as usize];
-                session.tail.push(bytes);
-                session.last_output = Instant::now();
-                if let Some(core) = self.core.as_mut() {
-                    queue(
-                        &mut core.conn,
-                        ToCore::Output(Data {
-                            session: id,
-                            bytes: bytes.to_vec(),
-                        }),
-                    );
-                }
-                continue;
-            }
-            if read == 0 {
-                session.output_closed = true;
-                break;
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EAGAIN) => break,
-                Some(libc::EINTR) => continue,
-                // Every slave fd is closed.
-                Some(libc::EIO) => {
+            match pty.read(&mut buffer[..limit]) {
+                // The program's side is closed.
+                Ok(0) => {
                     session.output_closed = true;
                     break;
                 }
-                _ => {
+                Ok(read) => {
+                    let bytes = &buffer[..read];
+                    session.tail.push(bytes);
+                    session.last_output = Instant::now();
+                    if let Some(core) = self.core.as_mut() {
+                        queue(
+                            &mut core.conn,
+                            ToCore::Output(Data {
+                                session: id,
+                                bytes: bytes.to_vec(),
+                            }),
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
                     log!("session {id}: reading output failed: {error}");
                     session.output_closed = true;
                     break;
@@ -948,22 +883,18 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let Some(master) = &session.master else {
+        let Some(pty) = &mut session.pty else {
             return;
         };
-        let fd = master.as_raw_fd();
         while !session.input.is_empty() {
             let (front, _) = session.input.as_slices();
-            let written = unsafe { libc::write(fd, front.as_ptr().cast(), front.len()) };
-            if written > 0 {
-                session.input.drain(..written as usize);
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EAGAIN) => break,
-                Some(libc::EINTR) => continue,
-                _ => {
+            match pty.write(front) {
+                Ok(written) => {
+                    session.input.drain(..written);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
                     log!("session {id}: writing input failed: {error}");
                     session.input.clear();
                     break;
@@ -973,15 +904,13 @@ impl<L: EventLoop> Holder<L> {
     }
 
     fn read_core_ready(&mut self, token: Token) {
-        let Some(fd) = self.core_ready.get(&token) else {
+        let Some(ready) = self.core_ready.get(&token) else {
             return;
         };
-        let mut buffer = [0u8; 16];
-        let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+        let Some(listening) = ready.read() else {
             return;
-        }
-        if read > 0 {
+        };
+        if listening {
             log!("the core it started is listening");
         } else {
             log!("the core it started exited before listening");
@@ -992,27 +921,27 @@ impl<L: EventLoop> Holder<L> {
 
     fn remove_session(&mut self, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id)
-            && session.master.is_some()
+            && session.pty.is_some()
         {
             self.drop_source(session.token);
         }
     }
 
     /// Reaps exited programs and started cores; run after every wake-up
-    /// (`SIGCHLD` wakes the loop).
+    /// (a child's exit wakes the loop).
     fn reap(&mut self) {
         let now = Instant::now();
         for (id, session) in &mut self.sessions {
             if session.reaped.is_some() {
                 continue;
             }
-            match session.child.try_wait() {
-                Ok(Some(status)) => {
-                    match (status.code(), status.signal()) {
+            match session.program.try_wait() {
+                Ok(Some(exit)) => {
+                    match (exit.code, exit.signal) {
                         (Some(code), _) => log!("session {id}: exited with {code}"),
                         (None, signal) => log!("session {id}: killed by signal {signal:?}"),
                     }
-                    session.reaped = Some((status.code(), now));
+                    session.reaped = Some((exit.code, now));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1036,13 +965,13 @@ impl<L: EventLoop> Holder<L> {
                 continue;
             }
             let quiet_since = reaped_at.max(session.last_output);
-            if session.master.is_none()
+            if session.pty.is_none()
                 || session.output_closed
                 || now >= quiet_since + OUTPUT_DRAIN_IDLE
                 || now >= reaped_at + OUTPUT_DRAIN_LIMIT
             {
                 session.held.exit = Some(ExitStatus { code });
-                if session.master.take().is_some() {
+                if session.pty.take().is_some() {
                     let _ = self.ev.deregister(session.token);
                     self.sources.remove(&session.token);
                 }
@@ -1058,16 +987,13 @@ impl<L: EventLoop> Holder<L> {
             }
         }
 
-        self.kills.retain(|&(_, pid, at)| {
+        self.kills.retain(|&(_, group, at)| {
             if now < at {
                 return true;
             }
-            // A group id can't be reused while the group has members, the
-            // reaped leader's children that ignored SIGHUP included. So the
-            // group gets the SIGKILL as long as it still exists.
-            if pid > 0 && unsafe { libc::kill(-pid, 0) } == 0 {
-                pty::signal_process_group(pid, libc::SIGKILL);
-            }
+            // The reaped leader's children that ignored the hang-up are
+            // still in the group, so it is killed as long as it exists.
+            group.kill_remaining();
             false
         });
 
@@ -1092,37 +1018,29 @@ impl<L: EventLoop> Holder<L> {
         }
     }
 
-    /// Starts a core from this holder's own binary, which `/proc/self/exe`
-    /// names even after an install replaced the file.
+    /// Starts a core from this holder's own binary, detached
+    /// ([`daemon::start_role`]).
     fn start_core(&mut self) {
-        let args: Vec<OsString> = self
-            .core_args
-            .iter()
-            .map(|arg| arg.replace("{ready_fd}", &CORE_READY_FD.to_string()).into())
-            .collect();
-        let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
-        let decision = scope::current();
-        if let scope::Decision::Plain(reason) = &decision {
-            log!("starting the core without a scope of its own: {reason}");
-        }
-        let mut command = scope::command(&decision, "serve", &program, &args);
-        let ready_read = match daemon::spawn_with_ready_pipe(&mut command, CORE_READY_FD) {
-            Ok((child, ready_read)) => {
+        let started = daemon::start_role("serve", &self.core_args, &[], |reason| {
+            log!("starting the core without a scope of its own: {reason}")
+        });
+        let ready_read = match started {
+            Ok(started) => {
                 log!(
                     "no core for a while; started {} {} as pid {}",
-                    program.to_string_lossy(),
+                    started.program.to_string_lossy(),
                     self.core_args.join(" "),
-                    child.id()
+                    started.child.id()
                 );
-                self.core_starts.push(child);
-                ready_read
+                self.core_starts.push(started.child);
+                started.ready
             }
             Err(error) => return log!("can't start a core: {error}"),
         };
         let token = self.token();
         if self
             .ev
-            .register(ready_read.as_raw_fd(), token, Interest::READABLE)
+            .register(&ready_read.source(), token, Interest::READABLE)
             .is_ok()
         {
             self.sources.insert(token, Source::CoreReady);
@@ -1134,7 +1052,7 @@ impl<L: EventLoop> Holder<L> {
         self.flush_core();
         let queued = self.core.as_ref().map(|core| core.conn.queued());
         for session in self.sessions.values_mut() {
-            if session.master.is_none() {
+            if session.pty.is_none() {
                 continue;
             }
             let readable = !session.output_closed
@@ -1272,6 +1190,7 @@ mod tests {
         assert_eq!(tail.to_vec().len(), Tail::LIMIT - 5);
     }
 
+    #[cfg(unix)]
     #[test]
     fn slots_take_the_first_free_index() {
         let temp = crate::server::dir::tests::TempDir::new("slots");

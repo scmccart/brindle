@@ -1,15 +1,14 @@
 //! The running binary's build id ([`brindle_remote_protocol::build_id`]).
-//! It is computed once at startup from `/proc/self/exe`, which still names
-//! the running binary after an install replaces the file.
+//! It is computed once at startup from the running binary itself, which an
+//! install may since have replaced on disk.
 
-use std::fs;
 use std::io;
 
 use brindle_remote_protocol::build_id::of_binary;
 
-/// The build id of `/proc/self/exe`, as lower-case hex.
+/// The build id of the running binary, as lower-case hex.
 pub fn current() -> io::Result<String> {
-    let bytes = fs::read("/proc/self/exe")?;
+    let bytes = super::platform::sys::read_own_binary()?;
     Ok(of_binary(&bytes))
 }
 

@@ -4,8 +4,8 @@
 //! PTYs. It can restart at any time without ending a session: a new core
 //! adopts the running holders and their sessions.
 //!
-//! - **Single instance:** `core.lock` is flocked for the core's whole life,
-//!   and only then is a stale `core.sock` unlinked and bound. A second
+//! - **Single instance:** `core.lock` is held for the core's whole life,
+//!   and only then is a stale `core.sock` replaced. A second
 //!   `serve` that can't take the lock waits until the winner accepts
 //!   connections, tells its starter it is ready, and exits 0.
 //! - **Clients** ([`clients`]): the peer check before reading anything, the
@@ -37,11 +37,8 @@ mod screen;
 mod sessions;
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -52,7 +49,10 @@ use brindle_remote_protocol::{RequestId, SessionId};
 use self::clients::{Client, Pending};
 use self::holders::{Holder, HolderStart, WaitingSpawn};
 use self::sessions::Session;
-use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
+use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
+use super::platform::listen::{self, Identity, Listener};
+use super::platform::lock::Lock;
+use super::platform::sys;
 use super::{build_id, conn, daemon, dir};
 
 /// With no sessions and no clients for this long, the core exits.
@@ -90,11 +90,7 @@ pub(crate) use log;
 /// Runs `brindle-remote serve [--ready-fd N]`. Without `--ready-fd` it stays
 /// in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let ready_fd = daemon::parse_ready_fd("serve", args)?;
-    let ready = ready_fd
-        .map(daemon::Ready::from_fd)
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let ready = daemon::ready_from_args("serve", args)?;
     let dir = dir::from_env().map_err(|error| error.to_string())?;
     let paths = Paths::new(&dir).map_err(|error| error.to_string())?;
     let lock = match claim(&paths).map_err(|error| error.to_string())? {
@@ -113,8 +109,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         daemon::daemonize(&log).map_err(|error| error.to_string())?;
     }
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
-    let ev = PollLoop::new().map_err(|error| error.to_string())?;
-    let core = Core::new(ev, dir, paths, lock, build, dir::own_uid()).map_err(|error| {
+    let ev = Loop::new().map_err(|error| error.to_string())?;
+    let core = Core::new(ev, dir, paths, lock, build, Identity::own()).map_err(|error| {
         log!("can't start: {error}");
         error.to_string()
     })?;
@@ -139,16 +135,7 @@ struct Paths {
 impl Paths {
     fn new(dir: &Path) -> io::Result<Self> {
         let socket = dir.join("core.sock");
-        // sun_path holds 108 bytes with the terminating NUL.
-        if socket.as_os_str().len() > 107 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "the socket path {} is too long for a Unix socket; set a shorter BRINDLE_SERVER_DIR",
-                    socket.display()
-                ),
-            ));
-        }
+        listen::check_path(&socket)?;
         Ok(Self {
             lock: dir.join("core.lock"),
             socket,
@@ -159,7 +146,7 @@ impl Paths {
 
 enum Claim {
     /// This process holds `core.lock` and becomes the core.
-    Core(File),
+    Core(Lock),
     /// Another core holds it and accepts connections.
     Running,
 }
@@ -169,21 +156,10 @@ enum Claim {
 fn claim(paths: &Paths) -> io::Result<Claim> {
     let deadline = Instant::now() + LOSER_WAIT;
     loop {
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&paths.lock)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if let Some(lock) = Lock::create(&paths.lock)? {
             return Ok(Claim::Core(lock));
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(error);
-        }
-        if UnixStream::connect(&paths.socket).is_ok() {
+        if listen::connect(&paths.socket).is_ok() {
             return Ok(Claim::Running);
         }
         if Instant::now() >= deadline {
@@ -198,10 +174,8 @@ fn claim(paths: &Paths) -> io::Result<Claim> {
 
 /// A random id for this core process, for the holders' logs and takeovers.
 fn random_instance() -> u64 {
-    let mut bytes = [0u8; 8];
-    let read = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-    if read == bytes.len() as isize {
-        return u64::from_ne_bytes(bytes);
+    if let Some(random) = sys::random_u64() {
+        return random;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,11 +205,10 @@ pub(super) struct Core<L: EventLoop> {
     ev: L,
     dir: PathBuf,
     paths: Paths,
-    _lock: File,
-    listener: UnixListener,
+    _lock: Lock,
+    listener: Listener,
     /// Clients are accepted once the startup adoption is done.
     accepting: bool,
-    uid: u32,
     build: String,
     instance: u64,
     started: Instant,
@@ -265,24 +238,13 @@ impl<L: EventLoop> Core<L> {
         mut ev: L,
         dir: PathBuf,
         paths: Paths,
-        lock: File,
+        lock: Lock,
         build: String,
-        uid: u32,
+        identity: Identity,
     ) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
-        match fs::remove_file(&paths.socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let listener = UnixListener::bind(&paths.socket).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("can't listen on {}: {error}", paths.socket.display()),
-            )
-        })?;
-        listener.set_nonblocking(true)?;
-        ev.register(listener.as_raw_fd(), LISTENER, Interest::NONE)?;
+        let listener = Listener::bind(&paths.socket, identity)?;
+        ev.register(&listener.source(), LISTENER, Interest::NONE)?;
         log!(
             "listening on {} (version {}, build {build})",
             paths.socket.display(),
@@ -295,7 +257,6 @@ impl<L: EventLoop> Core<L> {
             _lock: lock,
             listener,
             accepting: false,
-            uid,
             build,
             instance: random_instance(),
             started: Instant::now(),
@@ -586,40 +547,40 @@ impl<L: EventLoop> Core<L> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::server::dir::tests::TempDir;
-    use crate::server::peer::tests::{closed_unread, send_hello};
+    use crate::server::platform::listen::tests::TestPeer;
 
     /// A core in a fresh directory that runs, as far as its peer check is
-    /// concerned, as `uid`.
-    fn core_as(temp: &TempDir, uid: u32) -> Core<PollLoop> {
+    /// concerned, as `identity`.
+    fn core_as(temp: &TempDir, identity: Identity) -> Core<Loop> {
         let paths = Paths::new(&temp.0).unwrap();
         let Claim::Core(lock) = claim(&paths).unwrap() else {
             panic!("another core holds the lock");
         };
-        let ev = PollLoop::new().unwrap();
-        Core::new(ev, temp.0.clone(), paths, lock, "test".into(), uid).unwrap()
+        let ev = Loop::new().unwrap();
+        Core::new(ev, temp.0.clone(), paths, lock, "test".into(), identity).unwrap()
     }
 
     #[test]
     fn a_foreign_uid_is_closed_without_being_read() {
         let temp = TempDir::new("core-peer");
         // As if this core ran as someone else.
-        let mut core = core_as(&temp, dir::own_uid().wrapping_add(1));
-        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
-        send_hello(&mut stream);
+        let mut core = core_as(&temp, Identity::own().other());
+        let mut peer = TestPeer::connect(&temp.0.join("core.sock"));
+        peer.send_hello();
         core.accept();
         assert!(core.pending.is_empty() && core.clients.is_empty());
-        assert!(closed_unread(&mut stream));
+        assert!(peer.closed_unread());
         drop(core);
 
         // The same connection from its own user waits for its HELLO.
         let temp = TempDir::new("core-peer-own");
-        let mut core = core_as(&temp, dir::own_uid());
-        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
-        send_hello(&mut stream);
+        let mut core = core_as(&temp, Identity::own());
+        let mut peer = TestPeer::connect(&temp.0.join("core.sock"));
+        peer.send_hello();
         core.accept();
         assert_eq!(core.pending.len(), 1);
     }

@@ -2,31 +2,30 @@
 //! their sessions, starting one of the core's own build, and H1.
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::ffi::OsStr;
+use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::ffi::OsString;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::{SessionId, client, scope};
+use brindle_remote_protocol::{SessionId, client};
 use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHolder, Welcome};
 
 use super::clients::error;
 use super::sessions::Session;
 use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};
 use crate::server::conn::Conn;
-use crate::server::daemon;
+use crate::server::daemon::{self, ReadyPipe};
 use crate::server::event_loop::{EventLoop, Interest, Token};
+use crate::server::platform::conn::Stream;
+use crate::server::platform::listen;
+use crate::server::platform::lock::Lock;
 
 /// How long a started holder has to say it is listening.
 const HOLDER_START_LIMIT: Duration = Duration::from_secs(10);
 /// How long a holder found at startup may refuse connections (it may be
 /// between taking its lock and listening).
 const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(1);
-/// The fd a started holder's ready pipe gets.
-const HOLDER_READY_FD: libc::c_int = 3;
 
 pub(super) struct Holder {
     pub(super) conn: Conn,
@@ -79,7 +78,7 @@ impl Holder {
 /// A holder this core started, until it says it is listening.
 pub(super) struct HolderStart {
     token: Token,
-    ready: OwnedFd,
+    ready: ReadyPipe,
     deadline: Instant,
 }
 
@@ -105,27 +104,21 @@ enum Liveness {
 /// lock file are removed.
 fn liveness(socket: &Path) -> io::Result<Liveness> {
     let lock_path = socket.with_extension("lock");
-    let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
-        Ok(lock) => lock,
+    let _lock = match Lock::existing(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Ok(Liveness::Live),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Liveness::Unknown),
         Err(error) => return Err(error),
     };
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(Liveness::Live);
-        }
-        return Err(error);
-    }
     let _ = fs::remove_file(socket);
     let _ = fs::remove_file(&lock_path);
     Ok(Liveness::Stale)
 }
 
-fn connect(socket: &Path, retry_for: Duration) -> io::Result<UnixStream> {
+fn connect(socket: &Path, retry_for: Duration) -> io::Result<Stream> {
     let deadline = Instant::now() + retry_for;
     loop {
-        match UnixStream::connect(socket) {
+        match listen::connect(socket) {
             Ok(stream) => return Ok(stream),
             Err(error)
                 if Instant::now() < deadline
@@ -201,7 +194,7 @@ impl<L: EventLoop> Core<L> {
             }),
         );
         let token = self.token();
-        self.ev.register(conn.fd(), token, Interest::READABLE)?;
+        self.ev.register(&conn.source(), token, Interest::READABLE)?;
         self.sources.insert(token, Source::Holder);
         let name = socket.file_name().unwrap_or_default().to_string_lossy();
         let own_build = name.starts_with(&format!("holder-{}-", self.build));
@@ -543,20 +536,15 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Starts `brindle-remote hold` from the core's own binary, which
-    /// `/proc/<pid>/exe` names even after an install replaced the file, in a
-    /// systemd scope of its own when there is a user manager.
+    /// Starts `brindle-remote hold` from the core's own binary, detached
+    /// ([`daemon::start_role`]).
     fn start_holder(&mut self) {
-        let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
-        let args = ["hold".into(), "--ready-fd".into(), HOLDER_READY_FD.to_string().into()];
-        let decision = scope::current();
-        if let scope::Decision::Plain(reason) = &decision {
-            log!("starting a holder without a scope of its own: {reason}");
-        }
-        let mut command = scope::command(&decision, "hold", &program, &args);
-        command.env("BRINDLE_SERVER_DIR", &self.dir);
-        let (child, ready) = match daemon::spawn_with_ready_pipe(&mut command, HOLDER_READY_FD) {
-            Ok(started) => started,
+        let env: [(&str, &OsStr); 1] = [("BRINDLE_SERVER_DIR", self.dir.as_os_str())];
+        let started = daemon::start_role("hold", &daemon::role_args("hold"), &env, |reason| {
+            log!("starting a holder without a scope of its own: {reason}")
+        });
+        let (child, ready) = match started {
+            Ok(started) => (started.child, started.ready),
             Err(error) => {
                 log!("can't start a holder: {error}");
                 return self.fail_waiting(&format!("can't start a holder: {error}"));
@@ -567,7 +555,7 @@ impl<L: EventLoop> Core<L> {
         let token = self.token();
         if let Err(error) = self
             .ev
-            .register(ready.as_raw_fd(), token, Interest::READABLE)
+            .register(&ready.source(), token, Interest::READABLE)
         {
             log!("can't watch the holder's ready pipe: {error}");
             return self.fail_waiting("can't start a holder");
@@ -584,14 +572,12 @@ impl<L: EventLoop> Core<L> {
         let Some(start) = &self.holder_start else {
             return;
         };
-        let mut byte = [0u8; 1];
-        let read = unsafe { libc::read(start.ready.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+        let Some(listening) = start.ready.read() else {
             return;
-        }
+        };
         let start = self.holder_start.take().expect("a holder start");
         self.drop_source(start.token);
-        if read != 1 {
+        if !listening {
             log!("the holder exited before listening; see its log");
             return self.fail_waiting(
                 "the holder exited before listening; see its log in the server directory",

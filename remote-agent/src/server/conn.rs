@@ -1,20 +1,21 @@
 //! A non-blocking framed connection for the event loops: an input buffer
 //! that yields whole frames, and an outgoing queue whose length is the
-//! backpressure signal.
+//! backpressure signal. The platform provides the [`Stream`] under it.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::{FRAME_HEADER_LEN, Frame, MAX_FRAME_PAYLOAD_SIZE};
+
+use super::event_loop::{Interest, Source};
+use super::platform::conn::{self as sys, Stream};
 
 /// How much one `read_available` call reads before giving other sources a
 /// turn; the loop is level-triggered, so the rest is read next time.
 const READ_BUDGET: usize = 1024 * 1024;
 
 pub struct Conn {
-    stream: UnixStream,
+    stream: Stream,
     input: Vec<u8>,
     input_start: usize,
     output: Vec<u8>,
@@ -24,8 +25,8 @@ pub struct Conn {
 
 impl Conn {
     /// Wraps a connected stream, making it non-blocking.
-    pub fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_nonblocking(true)?;
+    pub fn new(stream: Stream) -> io::Result<Self> {
+        stream.set_nonblocking()?;
         Ok(Self {
             stream,
             input: Vec::new(),
@@ -36,20 +37,15 @@ impl Conn {
         })
     }
 
-    pub fn fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
+    /// What an event loop waits on for this connection.
+    pub fn source(&self) -> Source {
+        self.stream.source()
     }
 
     /// Whether the peer has sent more than this side has read: bytes are
     /// waiting in the socket, or part of a frame was read.
     pub fn input_waiting(&self) -> bool {
-        if self.input.len() > self.input_start {
-            return true;
-        }
-        let mut waiting: libc::c_int = 0;
-        // SAFETY: FIONREAD writes one int, and the fd is open while `self` is.
-        let result = unsafe { libc::ioctl(self.fd(), libc::FIONREAD, &mut waiting) };
-        result == 0 && waiting > 0
+        self.input.len() > self.input_start || self.stream.input_waiting()
     }
 
     /// Reads what the socket has, up to a budget. Returns `true` at EOF.
@@ -153,7 +149,7 @@ impl Conn {
             if self.queued() == 0 {
                 self.write_shut = true;
                 // The peer may have closed already; reading tells.
-                let _ = self.stream.shutdown(std::net::Shutdown::Write);
+                let _ = self.stream.shutdown_write();
             }
         }
         self.read_available()
@@ -211,13 +207,11 @@ impl Conn {
                     "the peer stopped reading",
                 ));
             }
-            let mut pollfd = libc::pollfd {
-                fd: self.fd(),
-                events: libc::POLLOUT,
-                revents: 0,
+            let writable = Interest {
+                readable: false,
+                writable: true,
             };
-            let timeout = remaining.as_millis().clamp(1, 100) as libc::c_int;
-            unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            sys::wait(&[(&self.stream, writable)], wait_slice(remaining));
         }
     }
 }
@@ -226,24 +220,25 @@ impl Conn {
 /// make progress on a graceful close: readable, or writable while it has
 /// output queued.
 pub fn wait(conns: &[&Conn], limit: Duration) {
-    let mut pollfds: Vec<libc::pollfd> = conns
+    let streams: Vec<(&Stream, Interest)> = conns
         .iter()
-        .map(|conn| libc::pollfd {
-            fd: conn.fd(),
-            events: libc::POLLIN
-                | if !conn.write_shut && conn.queued() > 0 {
-                    libc::POLLOUT
-                } else {
-                    0
-                },
-            revents: 0,
+        .map(|conn| {
+            let interest = Interest {
+                readable: true,
+                writable: !conn.write_shut && conn.queued() > 0,
+            };
+            (&conn.stream, interest)
         })
         .collect();
-    let timeout = limit.as_millis().clamp(1, 100) as libc::c_int;
-    unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
+    sys::wait(&streams, wait_slice(limit));
 }
 
-#[cfg(test)]
+/// One wait of a blocking flush or close: `limit`, but between 1 and 100 ms.
+fn wait_slice(limit: Duration) -> Duration {
+    Duration::from_millis(limit.as_millis().clamp(1, 100) as u64)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -254,7 +249,7 @@ mod tests {
             Frame::new(2, Vec::new()).unwrap(),
             Frame::new(3, vec![7; 70_000]).unwrap(),
         ];
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = Stream::pair().unwrap();
         let mut sender = Conn::new(a).unwrap();
         let mut receiver = Conn::new(b).unwrap();
         for frame in &frames {
@@ -278,7 +273,7 @@ mod tests {
 
     #[test]
     fn input_waiting_sees_unread_bytes_and_partial_frames() {
-        let (mut a, b) = UnixStream::pair().unwrap();
+        let (mut a, b) = Stream::pair().unwrap();
         let mut receiver = Conn::new(b).unwrap();
         assert!(!receiver.input_waiting());
         let frame = [1, 0, 0, 0, 2, b'h', b'i'];
@@ -296,7 +291,7 @@ mod tests {
 
     #[test]
     fn an_oversized_header_is_an_error() {
-        let (mut a, b) = UnixStream::pair().unwrap();
+        let (mut a, b) = Stream::pair().unwrap();
         let mut receiver = Conn::new(b).unwrap();
         a.write_all(&[1, 0xff, 0xff, 0xff, 0xff]).unwrap();
         receiver.read_available().unwrap();

@@ -7,7 +7,6 @@
 //! and `stop` say so on stderr; all of them exit 0.
 
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brindle_remote_protocol::client::{
@@ -16,6 +15,8 @@ use brindle_remote_protocol::client::{
 use brindle_remote_protocol::serde_json::{self, Value};
 use brindle_remote_protocol::{Frame, RequestId};
 
+use super::platform::conn::Stream;
+use super::platform::listen;
 use super::{check, dir};
 
 /// How long a command waits for the core's answer. `stop` waits for every
@@ -226,7 +227,7 @@ fn unexpected(reply: &ToClient) -> String {
 
 /// A protocol 1 connection to the core, past its `WELCOME`.
 struct Connection {
-    stream: UnixStream,
+    stream: Stream,
     next_req: RequestId,
 }
 
@@ -236,7 +237,7 @@ impl Connection {
         let socket = dir::resolve_from_env()
             .map_err(|error| error.to_string())?
             .join("core.sock");
-        let stream = match UnixStream::connect(&socket) {
+        let stream = match listen::connect(&socket) {
             Ok(stream) => stream,
             Err(error)
                 if matches!(

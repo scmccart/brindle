@@ -11,7 +11,6 @@ use brindle_remote_protocol::{RequestId, SessionId};
 use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, Source, log};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
-use crate::server::peer;
 
 /// A connection must send `HELLO` within this long.
 const HELLO_LIMIT: Duration = Duration::from_secs(5);
@@ -44,7 +43,7 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn accept(&mut self) {
         loop {
             // The peer check comes before reading anything.
-            let stream = match peer::accept(&self.listener, self.uid) {
+            let stream = match self.listener.accept() {
                 Ok(Some(stream)) => stream,
                 Ok(None) => return,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -68,7 +67,7 @@ impl<L: EventLoop> Core<L> {
                 }
             };
             let token = self.token();
-            if let Err(error) = self.ev.register(conn.fd(), token, Interest::READABLE) {
+            if let Err(error) = self.ev.register(&conn.source(), token, Interest::READABLE) {
                 log!("can't watch a connection: {error}");
                 continue;
             }

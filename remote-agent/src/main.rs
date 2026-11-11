@@ -1,15 +1,15 @@
 mod agent;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod pty;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod server;
 
 use std::env;
 use std::process::ExitCode;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const USAGE: &str = server::cli::USAGE;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 const USAGE: &str = "usage: brindle-remote --version | --server";
 
 fn main() -> ExitCode {
@@ -54,33 +54,33 @@ fn run() -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn serve(args: &[String]) -> Result<(), String> {
     server::core::run(args)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn hold(args: &[String]) -> Result<(), String> {
     server::holder::run(args)
 }
 
 /// `check`, `list`, `kill`, `status` and `stop`; `None` for anything else.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn manage(command: &str, args: &[String]) -> Option<Result<(), String>> {
     server::cli::run(command, args)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn serve(_args: &[String]) -> Result<(), String> {
     Err("the terminal server runs only on Linux".into())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn hold(_args: &[String]) -> Result<(), String> {
     Err("the terminal server runs only on Linux".into())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn manage(command: &str, _args: &[String]) -> Option<Result<(), String>> {
     matches!(command, "check" | "list" | "kill" | "status" | "stop")
         .then(|| Err("the terminal server runs only on Linux".into()))
