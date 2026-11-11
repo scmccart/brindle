@@ -315,9 +315,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("opened");
         let script = dir.join("record");
-        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s|%s' \"$#\" \"$1\" > '{}'\n", out.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(
+            &script,
+            &format!("#!/bin/sh\nprintf '%s|%s' \"$#\" \"$1\" > '{}'\n", out.display()),
+        );
 
         let uri = "https://example.com/a b?c=1&d='e'";
         open_with(script.display().to_string(), uri.into()).unwrap().join().unwrap();

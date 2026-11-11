@@ -105,7 +105,7 @@ fn kill_hangs_up_one_session_or_all_and_names_an_unknown_id() {
 
     let output = succeeded(cli(&dir.path, &["kill", &session.to_string()]));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
-    assert_eq!(client.exit_code(session), None);
+    client.hung_up(session);
     assert!(gone(pid));
     assert!(alive(other_pid));
 
@@ -116,8 +116,8 @@ fn kill_hangs_up_one_session_or_all_and_names_an_unknown_id() {
 
     let (third, third_pid) = client.spawn(client_spawn("cat", &[]));
     succeeded(cli(&dir.path, &["kill", "--all"]));
-    assert_eq!(client.exit_code(other), None);
-    assert_eq!(client.exit_code(third), None);
+    client.hung_up(other);
+    client.hung_up(third);
     assert!(gone(other_pid) && gone(third_pid));
 }
 
@@ -173,8 +173,8 @@ fn stop_ends_every_session_the_core_and_the_holders() {
 
     let output = succeeded(cli(&dir.path, &["stop"]));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
-    assert_eq!(client.exit_code(killed), None);
-    assert_eq!(client.exit_code(kept), None);
+    client.hung_up(killed);
+    client.hung_up(kept);
     assert!(client.closes());
     assert!(gone(killed_pid) && gone(kept_pid));
     assert!(gone(core_pid) && gone(holder));

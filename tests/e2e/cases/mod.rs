@@ -47,6 +47,9 @@ fn unix() -> Vec<Case> {
     let display = |name, run| Case { name, display: true, run };
     vec![
         display("dump-grid-geometry", dump::grid_geometry),
+        display("dump-wait-for-timeout", dump::wait_for_timeout),
+        display("dump-wait-for-pending", dump::wait_for_pending),
+        display("dump-wait-for-clean", dump::wait_for_clean),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
         display("colors-local", colors::local),
@@ -183,9 +186,9 @@ impl Shots {
     /// Captures the window as `name` a little after step `step` ran, before
     /// the next one.
     fn after<'a>(&self, run: Run<'a>, ctx: &Ctx, step: usize, name: &'static str) -> Run<'a> {
-        let (display, shots) = (ctx.display.clone(), self.0.clone());
+        let (display, shots, slow) = (ctx.display.clone(), self.0.clone(), ctx.secs(1.0));
         run.call_at(step_time(step) + 0.55, move |pid| {
-            let image = capture::grab(&display, pid)?;
+            let image = capture::grab(&display, pid, slow)?;
             shots.lock().unwrap().push((name, image));
             Ok(())
         })

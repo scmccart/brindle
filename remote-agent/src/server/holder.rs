@@ -609,6 +609,11 @@ impl<L: EventLoop> Holder<L> {
         if let Some(core) = self.core.as_mut()
             && let Err(error) = core.conn.flush()
         {
+            // What the core sent before it went still counts, as in
+            // `read_core`: it may already have told a client about it (an
+            // attach's `SET_META`).
+            let _ = core.conn.read_available();
+            self.process_core_frames();
             self.lose_core(&format!("write failed: {error}"));
         }
     }

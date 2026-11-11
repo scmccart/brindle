@@ -212,7 +212,7 @@ fn an_old_build_holder_drains_and_new_sessions_go_to_a_new_holder() {
     }
     for session in [one, two] {
         client.send(client::ToCore::Close(client::SessionRef { session }));
-        assert_eq!(client.exit_code(session), None);
+        client.hung_up(session);
     }
     assert!(gone(old_holder), "the drained holder didn't exit");
     assert!(eventually(TIMEOUT, || !old_socket.exists()));

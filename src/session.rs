@@ -740,7 +740,19 @@ mod tests {
         let first = Lock::acquire(&dir).unwrap();
         assert!(Lock::acquire(&dir).is_err());
         drop(first);
-        assert!(Lock::acquire(&dir).is_ok());
+        // A child forked by another test in this binary briefly shares the lock's
+        // open file description (until its own exec), so the retake can fail for
+        // a few milliseconds after the drop. Retry for a bounded time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let retaken = loop {
+            match Lock::acquire(&dir) {
+                Ok(lock) => break Ok(lock),
+                Err(e) if std::time::Instant::now() >= deadline => break Err(e),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert!(retaken.is_ok(), "lock not retaken within 5 s: {:?}", retaken.err());
+        drop(retaken);
         std::fs::remove_dir_all(&dir).ok();
     }
 
