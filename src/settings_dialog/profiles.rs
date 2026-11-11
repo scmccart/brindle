@@ -511,6 +511,7 @@ impl ProfileEditor {
             tmux,
             tmux_session: optional(Field::Session).filter(|_| tmux != TmuxMode::None),
             tmux_args,
+            ..Default::default()
         })
     }
 
@@ -1423,16 +1424,6 @@ theme = "gone"
         assert_eq!(work.env["PAGER"], "less -R");
         assert_eq!(work.theme.as_deref(), Some("gone"));
         assert!(f.text().contains("# my work profile\n[[profiles]]\nname = \"Work\""), "{}", f.text());
-    }
-
-    #[test]
-    fn tmux_arguments_as_shell_words() {
-        let f = Fixture::new("tmux-args", CONFIG);
-        let mut state = f.state();
-        let editor = edit(&mut state, "tmux");
-        editor.set_text(Field::TmuxArgs, r#"-L work -f "~/my tmux.conf""#);
-        state.save(&f.path, &[]).unwrap();
-        assert_eq!(f.config().profiles[1].tmux_args, ["-L", "work", "-f", "~/my tmux.conf"]);
     }
 
     #[test]

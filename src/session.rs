@@ -7,7 +7,6 @@
 //! holding `session.lock` reads or writes it, so a second Brindle never
 //! duplicates the first one's tabs.
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,8 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, TmuxMode};
-use crate::tmux::SessionKey;
+use crate::config::Config;
 use crate::zone_view::{SplitAxis, ZoneId, ZoneTree};
 
 /// The state file format this build reads and writes.
@@ -43,7 +41,7 @@ pub struct WindowState {
     pub height: Option<f32>,
     #[serde(default)]
     pub maximized: bool,
-    /// Index into `tabs`. A tmux entry means "that session's tab".
+    /// Index into `tabs`.
     #[serde(default)]
     pub active: usize,
     #[serde(default)]
@@ -149,8 +147,31 @@ pub enum TabState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<ServerSession>,
     },
-    /// A tmux control-mode session, attached once for all its windows.
-    Tmux { profile: String, session: String },
+    /// An entry of a kind this build doesn't restore, such as the tmux
+    /// sessions (`kind = "tmux"`) older versions recorded: parsing drops it,
+    /// so the other entries still restore, and snapshots never write it.
+    #[serde(other)]
+    Skipped,
+}
+
+impl WindowState {
+    /// Drops the entries this build doesn't restore; `active` follows its
+    /// entry, or the entry before it when that one was dropped.
+    fn drop_skipped(&mut self) {
+        let mut active = None;
+        let mut tabs = Vec::new();
+        for (ix, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if tab == TabState::Skipped {
+                continue;
+            }
+            if ix <= self.active {
+                active = Some(tabs.len());
+            }
+            tabs.push(tab);
+        }
+        self.tabs = tabs;
+        self.active = active.unwrap_or(0);
+    }
 }
 
 impl State {
@@ -173,6 +194,9 @@ impl State {
             None => return Err("no format version".into()),
         }
         let mut state: State = toml::from_str(text).map_err(|e| format!("not a valid state file: {}", e.message()))?;
+        for window in &mut state.windows {
+            window.drop_skipped();
+        }
         state.windows.retain(|w| !w.tabs.is_empty());
         for window in &mut state.windows {
             window.active = window.active.min(window.tabs.len() - 1);
@@ -352,8 +376,6 @@ pub enum RestoredTab {
         /// A single-zone tab's recorded session, attached when still detached.
         session: Option<ServerSession>,
     },
-    /// Attach profile `profile` (a control-mode profile) to `session`.
-    Tmux { profile: usize, session: String },
 }
 
 fn resolve_cwd(cwd: Option<&Path>, profile: &crate::config::Profile, home: &Path) -> PathBuf {
@@ -386,9 +408,9 @@ fn resolve_zone_node(node: &ZoneNodeState, profile: &crate::config::Profile, hom
 }
 
 /// Resolves a recorded tab against the current config: an unknown profile
-/// becomes the default one, a vanished directory the profile's own (or
-/// home), and the profile's current tmux mode decides how it opens.
-pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab {
+/// becomes the default one, and a vanished directory the profile's own (or
+/// home). `None` for an entry that isn't restored (parsing drops those).
+pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> Option<RestoredTab> {
     let (name, recorded_remote, cwd, title, zones, session) = match tab {
         TabState::Local { profile, remote, cwd, title, zones, session } => (
             profile,
@@ -401,13 +423,10 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab 
             zones.as_ref(),
             session.as_ref(),
         ),
-        TabState::Tmux { profile, .. } => (profile, None, None, None, None, None),
+        TabState::Skipped => return None,
     };
     if config.profile_index(name).is_none() {
         log::warn!("session restore: no profile named {name:?}, using the default profile");
-    }
-    if let Some((profile, session)) = tmux_target(tab, config) {
-        return RestoredTab::Tmux { profile, session };
     }
     let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
     let profile = &config.profiles[index];
@@ -419,60 +438,7 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> RestoredTab 
         .filter(|z| matches!(z, RestoredZoneNode::Split { .. }));
     // A session runs on this machine only: not for a remote profile.
     let session = session.filter(|_| profile.remote.is_none()).cloned();
-    RestoredTab::Local { profile: index, cwd, title, zones, session }
-}
-
-/// The control-mode profile and session a recorded tab attaches, if its
-/// profile (or the default one, for an unknown profile) is control mode.
-fn tmux_target(tab: &TabState, config: &Config) -> Option<(usize, String)> {
-    let (name, session) = match tab {
-        TabState::Local { profile, .. } => (profile, None),
-        TabState::Tmux { profile, session } => (profile, Some(session)),
-    };
-    let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
-    let profile = &config.profiles[index];
-    if profile.tmux != TmuxMode::Control {
-        return None;
-    }
-    // Only a recorded session of this same profile keeps its name;
-    // otherwise the profile's own session is used.
-    let session = session
-        .filter(|_| profile.name.eq_ignore_ascii_case(name))
-        .cloned()
-        .unwrap_or_else(|| profile.tmux_session_name().to_string());
-    Some((index, session))
-}
-
-/// Keeps each tmux session in the first window (and at the first tab) that
-/// records it, so restoring attaches it once. Windows left with nothing to
-/// restore are dropped; `active` follows its entry, or resets to the first
-/// when that entry was dropped.
-pub fn dedupe_windows(windows: Vec<WindowState>, config: &Config) -> Vec<WindowState> {
-    let mut seen = HashSet::new();
-    windows
-        .into_iter()
-        .filter_map(|mut window| {
-            let mut active = None;
-            let mut tabs = Vec::new();
-            for (ix, tab) in std::mem::take(&mut window.tabs).into_iter().enumerate() {
-                if let Some((profile, session)) = tmux_target(&tab, config)
-                    && !seen.insert(SessionKey::new(&config.profiles[profile], &session))
-                {
-                    continue;
-                }
-                if ix == window.active {
-                    active = Some(tabs.len());
-                }
-                tabs.push(tab);
-            }
-            if tabs.is_empty() {
-                return None;
-            }
-            window.tabs = tabs;
-            window.active = active.unwrap_or(0);
-            Some(window)
-        })
-        .collect()
+    Some(RestoredTab::Local { profile: index, cwd, title, zones, session })
 }
 
 /// The recorded windows as the one window Brindle has: every window's tabs
@@ -490,7 +456,7 @@ pub fn merge_windows(windows: Vec<WindowState>) -> Option<WindowState> {
 /// `window` without the local zones whose recorded terminal server session
 /// is gone (`alive` says which are left): a split's other side takes a
 /// dropped zone's place, and a tab with no zone left is dropped. Zones with
-/// no record, and tmux tabs, stay. `None` when no tab is left.
+/// no record stay. `None` when no tab is left.
 pub fn drop_lost_zones(mut window: WindowState, alive: impl Fn(&ServerSession) -> bool) -> Option<WindowState> {
     let lost = |session: &Option<ServerSession>| session.as_ref().is_some_and(|s| !alive(s));
     let mut active = None;
@@ -573,18 +539,14 @@ pub enum SnapshotTab {
         zones: Option<ZoneNodeState>,
         session: Option<ServerSession>,
     },
-    /// A tab of a control-mode session; `key` identifies the session.
-    Tmux { profile: String, session: String, key: u64 },
     /// Not recorded (message tabs).
     Skip,
 }
 
-/// Turns a window's tabs into recorded entries: one entry per tmux session
-/// at its first tab, skipped tabs dropped. Returns the entries and the
-/// entry the active tab maps to.
+/// Turns a window's tabs into recorded entries, skipped tabs dropped.
+/// Returns the entries and the entry the active tab maps to.
 pub fn collapse(tabs: &[SnapshotTab], active: usize) -> (Vec<TabState>, usize) {
     let mut entries = Vec::new();
-    let mut sessions: HashMap<u64, usize> = HashMap::new();
     let mut active_entry = None;
     for (ix, tab) in tabs.iter().enumerate() {
         let entry = match tab {
@@ -599,10 +561,6 @@ pub fn collapse(tabs: &[SnapshotTab], active: usize) -> (Vec<TabState>, usize) {
                 });
                 Some(entries.len() - 1)
             }
-            SnapshotTab::Tmux { profile, session, key } => Some(*sessions.entry(*key).or_insert_with(|| {
-                entries.push(TabState::Tmux { profile: profile.clone(), session: session.clone() });
-                entries.len() - 1
-            })),
             SnapshotTab::Skip => None,
         };
         if ix == active {
@@ -712,7 +670,6 @@ mod tests {
                 active: 1,
                 tabs: vec![
                     TabState::Local { profile: "Shell".into(), remote: None, cwd: Some("/tmp".into()), title: Some("server".into()), zones: None, session: None },
-                    TabState::Tmux { profile: "tmux".into(), session: "main".into() },
                     TabState::Local { profile: "Shell".into(), remote: None, cwd: None, title: None, zones: None, session: None },
                 ],
             },
@@ -724,7 +681,7 @@ mod tests {
     fn round_trip() {
         let text = sample().to_text();
         assert!(text.contains("version = 1"), "{text}");
-        assert!(text.contains("kind = \"tmux\""), "{text}");
+        assert!(text.contains("kind = \"local\""), "{text}");
         assert!(text.contains("title = \"server\""), "{text}");
         assert_eq!(text.matches("title = ").count(), 1, "{text}");
         assert_eq!(State::parse(&text).unwrap(), sample());
@@ -735,8 +692,8 @@ mod tests {
         assert!(State::parse("version = 2\n[[windows]]\n").unwrap_err().contains("version 2"));
         assert!(State::parse("this is not toml [").unwrap_err().contains("not a valid"));
         assert!(State::parse("[[windows]]\nactive = 0\n").unwrap_err().contains("no format version"));
-        let unknown_kind = "version = 1\n[[windows]]\n[[windows.tabs]]\nkind = \"ssh\"\nprofile = \"x\"\n";
-        assert!(State::parse(unknown_kind).is_err());
+        // A local entry missing its profile is malformed.
+        assert!(State::parse("version = 1\n[[windows]]\n[[windows.tabs]]\nkind = \"local\"\n").is_err());
         assert!(State::parse("version = 1\n").unwrap().windows.is_empty());
         // Windows without tabs are dropped, then nothing is left.
         assert!(State::parse("version = 1\n[[windows]]\nactive = 0\n").unwrap().windows.is_empty());
@@ -796,13 +753,6 @@ mod tests {
             [[profiles]]
             name = "Pinned"
             cwd = "/"
-            [[profiles]]
-            name = "tmux"
-            tmux = "control"
-            tmux_session = "work"
-            [[profiles]]
-            name = "classic"
-            tmux = "plain"
             "#,
         )
         .unwrap()
@@ -815,33 +765,57 @@ mod tests {
         let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), remote: None, cwd: cwd.map(PathBuf::from), title: None, zones: None, session: None };
         let tmp = std::env::temp_dir();
         let tmp = tmp.to_str().unwrap();
+        let restored = |profile, cwd: &str, title: Option<&str>| {
+            Some(RestoredTab::Local { profile, cwd: cwd.into(), title: title.map(Into::into), zones: None, session: None })
+        };
         // Recorded directory kept.
-        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None, zones: None, session: None });
+        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), restored(0, tmp, None));
         // Missing profile: the default one.
-        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None, zones: None, session: None });
+        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), restored(0, tmp, None));
         // Deleted directory: home, or the profile's own directory.
         let gone = "/nonexistent/brindle-dir";
-        assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None, zones: None, session: None });
-        assert_eq!(resolve_tab(&local("shell", None), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None, zones: None, session: None });
-        assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), RestoredTab::Local { profile: 1, cwd: "/".into(), title: None, zones: None, session: None });
-        // Classic tmux is a local tab.
-        assert_eq!(resolve_tab(&local("classic", Some(tmp)), &config, home), RestoredTab::Local { profile: 3, cwd: tmp.into(), title: None, zones: None, session: None });
-        // Control mode keeps the recorded (possibly renamed) session.
-        let tmux = |profile: &str, session: &str| TabState::Tmux { profile: profile.into(), session: session.into() };
-        assert_eq!(resolve_tab(&tmux("TMUX", "renamed"), &config, home), RestoredTab::Tmux { profile: 2, session: "renamed".into() });
-        // A tmux entry whose profile isn't a control profile any more opens as a tab.
-        assert_eq!(resolve_tab(&tmux("Shell", "x"), &config, home), RestoredTab::Local { profile: 0, cwd: home.into(), title: None, zones: None, session: None });
-        // A local entry whose profile is now control mode attaches its session.
-        assert_eq!(resolve_tab(&local("tmux", Some("/tmp")), &config, home), RestoredTab::Tmux { profile: 2, session: "work".into() });
+        assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), restored(0, "/home/nobody", None));
+        assert_eq!(resolve_tab(&local("shell", None), &config, home), restored(0, "/home/nobody", None));
+        assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), restored(1, "/", None));
         // Recorded manual title is preserved for local tabs (and trimmed/ignored if empty).
         assert_eq!(
             resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("server".into()), zones: None, session: None }, &config, home),
-            RestoredTab::Local { profile: 0, cwd: tmp.into(), title: Some("server".into()), zones: None, session: None }
+            restored(0, tmp, Some("server"))
         );
         assert_eq!(
             resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("  ".into()), zones: None, session: None }, &config, home),
-            RestoredTab::Local { profile: 0, cwd: tmp.into(), title: None, zones: None, session: None }
+            restored(0, tmp, None)
         );
+        assert_eq!(resolve_tab(&TabState::Skipped, &config, home), None);
+    }
+
+    #[test]
+    fn old_tmux_entries_are_skipped() {
+        let local = |profile: &str| TabState::Local { profile: profile.into(), remote: None, cwd: None, title: None, zones: None, session: None };
+        // A tmux entry between two local tabs: the two local tabs restore,
+        // in order, and the active tab follows its entry.
+        let text = "version = 1\n[[windows]]\nactive = 2\n\
+                    [[windows.tabs]]\nkind = \"local\"\nprofile = \"a\"\n\
+                    [[windows.tabs]]\nkind = \"tmux\"\nprofile = \"tmux\"\nsession = \"work\"\n\
+                    [[windows.tabs]]\nkind = \"local\"\nprofile = \"b\"\n";
+        let state = State::parse(text).unwrap();
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(state.windows[0].tabs, vec![local("a"), local("b")]);
+        assert_eq!(state.windows[0].active, 1);
+        // The active entry was the tmux one: the tab before it is active.
+        let state = State::parse(&text.replace("active = 2", "active = 1")).unwrap();
+        assert_eq!(state.windows[0].active, 0);
+        // Saving it again writes no tmux entry.
+        assert!(!state.to_text().contains("tmux"), "{}", state.to_text());
+
+        // Only tmux entries: nothing to restore, as with no state file.
+        let only = "version = 1\n[[windows]]\n[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"tmux\"\nsession = \"main\"\n\
+                    [[windows]]\n[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"work\"\nsession = \"work\"\n";
+        assert!(State::parse(only).unwrap().windows.is_empty());
+        let dir = tmp_dir("only-tmux");
+        write_atomic(&dir, only, next_generation()).unwrap();
+        assert_eq!(load(&dir), Ok(None));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -873,7 +847,7 @@ mod tests {
         )
         .unwrap();
         let home = Path::new("/");
-        let RestoredTab::Local { session: kept, .. } = resolve_tab(&state.windows[0].tabs[0], &config, home) else {
+        let Some(RestoredTab::Local { session: kept, .. }) = resolve_tab(&state.windows[0].tabs[0], &config, home) else {
             panic!("not local")
         };
         assert_eq!(kept, Some(session.clone()));
@@ -885,7 +859,7 @@ mod tests {
             zones: None,
             session: Some(session),
         };
-        let RestoredTab::Local { session: dropped, .. } = resolve_tab(&remote, &config, home) else { panic!("not local") };
+        let Some(RestoredTab::Local { session: dropped, .. }) = resolve_tab(&remote, &config, home) else { panic!("not local") };
         assert_eq!(dropped, None);
     }
 
@@ -911,55 +885,14 @@ mod tests {
         };
         assert_eq!(
             resolve_tab(&tab, &config, Path::new("/local/home")),
-            RestoredTab::Local {
+            Some(RestoredTab::Local {
                 profile: 0,
                 cwd: "/home/current".into(),
                 title: None,
                 zones: None,
                 session: None,
-            }
+            })
         );
-    }
-
-    #[test]
-    fn dedupe_keeps_each_session_once() {
-        let config = config();
-        let tmux = |session: &str| TabState::Tmux { profile: "tmux".into(), session: session.into() };
-        let local = || TabState::Local { profile: "Shell".into(), remote: None, cwd: None, title: None, zones: None, session: None };
-        let window = |active: usize, tabs: Vec<TabState>| WindowState { width: None, height: None, maximized: false, active, tabs };
-        let windows = vec![
-            window(0, vec![tmux("main")]),
-            // A duplicate before the active tab: `active` follows its entry.
-            window(2, vec![tmux("main"), local(), local()]),
-            // Only a duplicate: the window goes.
-            window(0, vec![tmux("main")]),
-            // The active entry is the duplicate: the first tab becomes active.
-            window(1, vec![local(), tmux("main"), tmux("other")]),
-        ];
-        let deduped = dedupe_windows(windows, &config);
-        assert_eq!(
-            deduped,
-            vec![
-                window(0, vec![tmux("main")]),
-                window(1, vec![local(), local()]),
-                window(0, vec![local(), tmux("other")]),
-            ]
-        );
-    }
-
-    #[test]
-    fn dedupe_matches_profiles_on_the_same_server() {
-        let mut config = config();
-        // A second control profile for the same server and session.
-        let mut alias = config.profiles[2].clone();
-        alias.name = "alias".into();
-        alias.tmux_session = Some("main".into());
-        config.profiles.push(alias);
-        let windows = vec![
-            WindowState { width: None, height: None, maximized: false, active: 0, tabs: vec![TabState::Tmux { profile: "tmux".into(), session: "main".into() }] },
-            WindowState { width: None, height: None, maximized: false, active: 0, tabs: vec![TabState::Tmux { profile: "alias".into(), session: "main".into() }] },
-        ];
-        assert_eq!(dedupe_windows(windows, &config).len(), 1);
     }
 
     #[test]
@@ -983,28 +916,26 @@ mod tests {
         let single = |id: u32| TabState::Local { profile: "p".into(), remote: None, cwd: None, title: None, zones: None, session: s(id) };
         let split = |zones| TabState::Local { profile: "p".into(), remote: None, cwd: None, title: None, zones: Some(zones), session: None };
         let unrecorded = TabState::Local { profile: "p".into(), remote: None, cwd: None, title: None, zones: None, session: None };
-        let tmux = TabState::Tmux { profile: "tmux".into(), session: "main".into() };
         let window = |active, tabs| WindowState { width: None, height: None, maximized: false, active, tabs };
         // Sessions 1, 4 and 6 are gone.
         let alive = |session: &ServerSession| ![1, 4, 6].contains(&session.id);
 
         let three = ZoneNodeState::split(SplitAxis::Horizontal, leaf(2, false), ZoneNodeState::split(SplitAxis::Vertical, leaf(4, true), leaf(5, false)));
         let pruned = drop_lost_zones(
-            window(3, vec![single(1), unrecorded.clone(), tmux.clone(), split(three), split(ZoneNodeState::split(SplitAxis::Vertical, leaf(6, true), leaf(7, false)))]),
+            window(2, vec![single(1), unrecorded.clone(), split(three), split(ZoneNodeState::split(SplitAxis::Vertical, leaf(6, true), leaf(7, false)))]),
             alive,
         )
         .unwrap();
-        assert_eq!(pruned.active, 2, "the active tab follows its entry");
+        assert_eq!(pruned.active, 1, "the active tab follows its entry");
         assert_eq!(pruned.tabs[0], unrecorded);
-        assert_eq!(pruned.tabs[1], tmux);
         // The lost zone's sibling takes its place; the active zone is gone,
         // so the first left becomes active.
         let mut first = leaf(2, false);
         first.active = true;
-        assert_eq!(pruned.tabs[2], split(ZoneNodeState::split(SplitAxis::Horizontal, first, leaf(5, false))));
+        assert_eq!(pruned.tabs[1], split(ZoneNodeState::split(SplitAxis::Horizontal, first, leaf(5, false))));
         // One zone left: a single-zone tab with that zone's directory.
         assert_eq!(
-            pruned.tabs[3],
+            pruned.tabs[2],
             TabState::Local { profile: "p".into(), remote: None, cwd: Some("/d7".into()), title: None, zones: None, session: s(7) }
         );
 
@@ -1015,18 +946,14 @@ mod tests {
     }
 
     #[test]
-    fn collapse_sessions() {
+    fn collapse_drops_skipped_tabs() {
         let local = |p: &str| SnapshotTab::Local { profile: p.into(), remote: None, cwd: None, title: None, zones: None, session: None };
-        let tmux = |key| SnapshotTab::Tmux { profile: "tmux".into(), session: format!("s{key}"), key };
-        let tabs = [local("a"), tmux(1), tmux(1), SnapshotTab::Skip, tmux(2), tmux(1), local("b")];
-        let (entries, active) = collapse(&tabs, 5);
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[1], TabState::Tmux { profile: "tmux".into(), session: "s1".into() });
-        assert_eq!(entries[2], TabState::Tmux { profile: "tmux".into(), session: "s2".into() });
+        let tabs = [local("a"), SnapshotTab::Skip, local("b")];
+        let (entries, active) = collapse(&tabs, 2);
+        assert_eq!(entries.len(), 2);
         assert_eq!(active, 1);
-        assert_eq!(collapse(&tabs, 6).1, 3);
         // An active message tab maps to the first entry.
-        assert_eq!(collapse(&tabs, 3).1, 0);
+        assert_eq!(collapse(&tabs, 1).1, 0);
         assert_eq!(collapse(&[], 0), (vec![], 0));
         let titled = SnapshotTab::Local { profile: "a".into(), remote: None, cwd: None, title: Some("server".into()), zones: None, session: None };
         assert_eq!(
@@ -1159,7 +1086,7 @@ mod tests {
             zones: Some(mixed),
             session: None,
         };
-        let RestoredTab::Local { profile, cwd, title, zones, .. } = resolve_tab(&tab, &config, home) else {
+        let Some(RestoredTab::Local { profile, cwd, title, zones, .. }) = resolve_tab(&tab, &config, home) else {
             panic!("expected RestoredTab::Local");
         };
         assert_eq!(profile, 0);

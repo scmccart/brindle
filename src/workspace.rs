@@ -516,18 +516,16 @@ impl Workspace {
         }
     }
 
-    /// Opens a recorded window's tabs. Local tabs open in order; each tmux
-    /// session is attached once and its windows arrive later, placed after
-    /// the tab recorded before it. The recorded active tab is activated if
-    /// it is local; for a tmux session, tmux's current window decides.
+    /// Opens a recorded window's tabs in order, and activates the recorded
+    /// active tab.
     fn restore(&mut self, state: WindowState, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let mut previous: Option<u64> = None;
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
-                RestoredTab::Local { profile, cwd, title, zones, session } => {
+                None => {}
+                Some(RestoredTab::Local { profile, cwd, title, zones, session }) => {
                     let found = match zones {
                         Some(_) => None,
                         None => Self::take_detached(session.as_ref(), cx),
@@ -546,20 +544,8 @@ impl Workspace {
                     if let Some(title) = title {
                         tab.set_manual_title(&title, &mut None, cx);
                     }
-                    previous = Some(tab.id);
                     if ix == state.active {
                         active_tab = Some(tab.id);
-                    }
-                }
-                RestoredTab::Tmux { profile, session } => {
-                    let mut profile = config.profiles[profile].clone();
-                    profile.tmux_session = Some(session);
-                    if let Some(session) = self.attach_tmux(profile, None, window, cx) {
-                        let id = session.entity_id();
-                        self.anchors.insert(id, previous);
-                        if ix != state.active {
-                            self.quiet_sessions.insert(id);
-                        }
                     }
                 }
             }
@@ -612,42 +598,15 @@ impl Workspace {
 
     /// This window as session restore records it.
     pub fn snapshot(&self, window: &Window, cx: &App) -> WindowState {
-        // A session tmux hasn't named yet can't be reattached by name.
-        let session_tab = |session: &Entity<TmuxSession>| {
-            let s = session.read(cx);
-            match &s.session_name {
-                Some(name) => SnapshotTab::Tmux {
-                    profile: s.profile.name.clone(),
-                    session: name.clone(),
-                    key: session.entity_id().as_u64(),
-                },
-                None => SnapshotTab::Skip,
-            }
-        };
-        // Sessions still attaching have no tabs yet; record them where
-        // their tabs will go, so a quit meanwhile doesn't lose them.
-        let pending: Vec<&Entity<TmuxSession>> = self
-            .tmux_sessions
-            .iter()
-            .map(|(s, _)| s)
-            .filter(|s| !self.tabs.iter().any(|t| t.shows_tmux(s, None, cx)))
-            .collect();
-        let pending_after = |anchor: Option<u64>| -> Vec<SnapshotTab> {
-            pending
-                .iter()
-                .filter(|s| self.anchors.get(&s.entity_id()) == Some(&anchor))
-                .map(|s| session_tab(s))
-                .collect()
-        };
-        let mut tabs: Vec<SnapshotTab> = pending_after(None);
+        let mut tabs: Vec<SnapshotTab> = Vec::new();
         let mut active = None;
         for (ix, tab) in self.tabs.iter().enumerate() {
             if ix == self.active {
                 active = Some(tabs.len());
             }
             tabs.push(match (&tab.origin, &tab.content) {
-                (TabOrigin::Message, _) => SnapshotTab::Skip,
-                (_, TabContent::Tmux { session, .. }) => session_tab(session),
+                // Session restore records no tmux tabs.
+                (TabOrigin::Message, _) | (_, TabContent::Tmux { .. }) => SnapshotTab::Skip,
                 (_, TabContent::Zones(view)) => {
                     let z = view.read(cx);
                     let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
@@ -665,9 +624,7 @@ impl Workspace {
                     }
                 }
             });
-            tabs.extend(pending_after(Some(tab.id)));
         }
-        tabs.extend(pending.iter().filter(|s| !self.anchors.contains_key(&s.entity_id())).map(|s| session_tab(s)));
         let (tabs, active) = session::collapse(&tabs, active.unwrap_or(0));
         let maximized = matches!(window.window_bounds(), WindowBounds::Maximized(_));
         if !maximized {
@@ -3053,14 +3010,22 @@ mod tests {
         assert_eq!(rows[1].detail.as_ref().map(|d| d.to_string()), Some(config.profiles[0].description().to_string()));
     }
 
+    /// Sets a profile's tmux mode and session, which configs no longer can.
+    fn set_tmux(profile: &mut Profile, mode: TmuxMode, session: Option<&str>) {
+        profile.tmux = mode;
+        profile.tmux_session = session.map(Into::into);
+    }
+
     fn open_rows_config() -> Config {
-        Config::parse(
-            "[[profiles]]\nname = \"tmux\"\ntmux = \"control\"\n\
-             [[profiles]]\nname = \"Shell\"\n\
-             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n\
-             [[profiles]]\nname = \"classic\"\ntmux = \"plain\"\n",
+        let mut config = Config::parse(
+            "[[profiles]]\nname = \"tmux\"\n[[profiles]]\nname = \"Shell\"\n\
+             [[profiles]]\nname = \"work\"\n[[profiles]]\nname = \"classic\"\n",
         )
-        .unwrap()
+        .unwrap();
+        set_tmux(&mut config.profiles[0], TmuxMode::Control, None);
+        set_tmux(&mut config.profiles[2], TmuxMode::Control, Some("work"));
+        set_tmux(&mut config.profiles[3], TmuxMode::Plain, None);
+        config
     }
 
     #[test]
@@ -3107,12 +3072,13 @@ mod tests {
     /// says so when the window shows it) and ctrl-alt-N from the keymap.
     #[test]
     fn profile_rows_and_menu_items_match_the_picker() {
-        let config = Config::parse(
+        let mut config = Config::parse(
             "[[profiles]]\nname = \"Shell\"\ncommand = \"bash\"\n\
-             [[profiles]]\nname = \"tmux\"\ntmux = \"control\"\ntmux_session = \"main\"\n\
-             [[profiles]]\nname = \"work\"\ntmux = \"control\"\ntmux_session = \"work\"\n",
+             [[profiles]]\nname = \"tmux\"\n[[profiles]]\nname = \"work\"\n",
         )
         .unwrap();
+        set_tmux(&mut config.profiles[1], TmuxMode::Control, Some("main"));
+        set_tmux(&mut config.profiles[2], TmuxMode::Control, Some("work"));
         let keymap = gpui::Keymap::new(crate::actions::default_bindings());
         let open = [SessionKey::for_profile(&config.profiles[1]).unwrap()];
         let build = || profile_rows(&config.profiles, &open, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));

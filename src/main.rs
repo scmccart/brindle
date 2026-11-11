@@ -477,7 +477,7 @@ fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
             return None;
         }
     };
-    let window = session::merge_windows(session::dedupe_windows(state.windows, &Settings::get(cx).config))?;
+    let window = session::merge_windows(state.windows)?;
     if !listed {
         return Some(window);
     }

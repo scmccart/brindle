@@ -4,10 +4,10 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 
 ## 1. Tolerate the removed settings and state records
 
-- [ ] 1.1 Add `removed_*` fields for top-level `tmux_session_end` and profile `tmux`, `tmux_session`, `tmux_args` (typed `Option<toml::Value>`), warn once per key in `Config::parse` (profile keys name the profile), and never read them in `normalized()`. Verify with config tests: a config with all four keys and odd values loads and logs four warnings, and `tmux_sesion_end` still fails (`unknown_keys_are_errors`).
-- [ ] 1.2 In `config_edit`, make saving a profile remove the three legacy keys from its table and leave top-level `tmux_session_end` alone. Verify with `config_edit` tests: editing a profile with `tmux = "plain"` drops the keys and keeps comments; the top-level line survives a theme write.
-- [ ] 1.3 In `session.rs`, replace `TabState::Tmux` with a `#[serde(other)]` unit variant that restore filters out and snapshots never write. Verify with a session test that a state file with a `kind = "tmux"` entry between two local tabs restores the two tabs, and one holding only tmux entries gives the default-profile tab (the `session-restore` scenarios).
-- [ ] 1.4 Commit as `feat(tmux)!: ignore the removed tmux settings and state records`, then run `cargo test --workspace`.
+- [x] 1.1 Add `removed_*` fields for top-level `tmux_session_end` and profile `tmux`, `tmux_session`, `tmux_args` (typed `Option<toml::Value>`), warn once per key in `Config::parse` (profile keys name the profile), and never read them in `normalized()`. Verify with config tests: a config with all four keys and odd values loads and logs four warnings, and `tmux_sesion_end` still fails (`unknown_keys_are_errors`).
+- [x] 1.2 In `config_edit`, make saving a profile remove the three legacy keys from its table and leave top-level `tmux_session_end` alone. Verify with `config_edit` tests: editing a profile with `tmux = "plain"` drops the keys and keeps comments; the top-level line survives a theme write.
+- [x] 1.3 In `session.rs`, replace `TabState::Tmux` with a `#[serde(other)]` unit variant that restore filters out and snapshots never write. Verify with a session test that a state file with a `kind = "tmux"` entry between two local tabs restores the two tabs, and one holding only tmux entries gives the default-profile tab (the `session-restore` scenarios).
+- [x] 1.4 Commit as `feat(tmux)!: ignore the removed tmux settings and state records`, then run `cargo test --workspace`.
 
 ## 2. Remove control mode and classic profiles
 
