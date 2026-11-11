@@ -1190,7 +1190,7 @@ impl SettingsDialog {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
-                        "Theme and font size show on this profile's tabs now; the rest applies to new tabs.",
+                        "Theme and font size show on this profile's tabs now; command, arguments, directory and environment apply to new tabs only.",
                     ))
                     .child(self.editor_buttons(cx)),
             )

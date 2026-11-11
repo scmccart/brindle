@@ -895,11 +895,13 @@ background = "nope"
 
     #[test]
     fn moving_up_and_back_round_trips_the_default_config() {
-        let mut doc = parse(DEFAULT_CONFIG).unwrap();
-        let tmux = ProfileRef { index: 1, name: Some("tmux".into()) };
-        assert_eq!(move_profile(&mut doc, &tmux, true).unwrap(), 0);
-        assert_eq!(names_of(&doc), ["tmux", "Shell", "tmux (classic)"]);
-        move_profile(&mut doc, &ProfileRef { index: 0, name: Some("tmux".into()) }, false).unwrap();
-        assert_eq!(doc.to_string(), DEFAULT_CONFIG);
+        // The default config has one profile: add a second after it.
+        let text = DEFAULT_CONFIG.replace("# font_size = 13\n", "# font_size = 13\n\n[[profiles]]\nname = \"Work\"\n");
+        let mut doc = parse(&text).unwrap();
+        let work = ProfileRef { index: 1, name: Some("Work".into()) };
+        assert_eq!(move_profile(&mut doc, &work, true).unwrap(), 0);
+        assert_eq!(names_of(&doc), ["Work", "Shell"]);
+        move_profile(&mut doc, &ProfileRef { index: 0, name: Some("Work".into()) }, false).unwrap();
+        assert_eq!(doc.to_string(), text);
     }
 }
