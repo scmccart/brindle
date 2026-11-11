@@ -45,7 +45,7 @@ impl ReadyPipe {
     /// What an event loop waits on: readable once the role is listening or
     /// has failed.
     pub fn source(&self) -> Source {
-        Source
+        unreachable!("a stub, never constructed")
     }
 
     /// Whether the role is listening (`true`) or ended before it was

@@ -16,7 +16,7 @@ impl Pty {
     /// What an event loop waits on: readable while the program's output is
     /// waiting, writable while the pseudoconsole takes input.
     pub fn source(&self) -> Source {
-        Source
+        unreachable!("a stub, never constructed")
     }
 
     /// Reads the program's output. `Ok(0)` means there will be no more;

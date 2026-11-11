@@ -238,7 +238,7 @@ fn wait_slice(limit: Duration) -> Duration {
     Duration::from_millis(limit.as_millis().clamp(1, 100) as u64)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -287,6 +287,38 @@ mod tests {
         receiver.read_available().unwrap();
         assert!(receiver.next_frame().unwrap().is_none());
         assert!(receiver.input_waiting(), "part of a frame");
+    }
+
+    #[test]
+    fn a_graceful_close_delivers_the_queue_and_then_the_end() {
+        // More than a socket's or a pipe's buffer holds.
+        let frame = Frame::new(9, vec![3; 400_000]).unwrap();
+        let (a, b) = Stream::pair().unwrap();
+        let mut closer = Conn::new(a).unwrap();
+        let mut peer = Conn::new(b).unwrap();
+        closer.queue(&frame);
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut got = Vec::new();
+            loop {
+                let eof = peer.read_available().unwrap();
+                while let Some(frame) = peer.next_frame().unwrap() {
+                    got.push(frame);
+                }
+                if eof {
+                    // Dropping `peer` closes its side, which ends the close.
+                    return got;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no EOF after {} frames",
+                    got.len()
+                );
+                wait(&[&peer], Duration::from_millis(100));
+            }
+        });
+        closer.close_for(Duration::from_secs(10)).unwrap();
+        assert_eq!(reader.join().unwrap(), [frame]);
     }
 
     #[test]

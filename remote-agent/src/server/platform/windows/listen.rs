@@ -41,7 +41,7 @@ impl Listener {
 
     /// What an event loop waits on: readable when a connection is waiting.
     pub fn source(&self) -> Source {
-        Source
+        unreachable!("a stub, never constructed")
     }
 
     /// Accepts the next connection waiting; `Ok(None)` means none is. A
