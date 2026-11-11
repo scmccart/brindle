@@ -370,9 +370,11 @@ fn hangup_kills_the_process_group() {
 fn hangup_kills_a_child_that_outlives_its_exited_leader() {
     let (_dir, mut core, _) = holder("hangup-orphan");
     // The leader goes on SIGHUP; its child ignores it and stays in the group.
+    // The child reports its own pid, and only once it ignores the signal: a
+    // pid the leader printed could be hung up before the child's trap ran.
     let pid = core.spawn(shell(
         1,
-        "(trap '' HUP; exec sleep 1000) & echo \"bg=$!.\"; wait",
+        "(trap '' HUP; exec sh -c 'echo \"bg=$$.\"; exec sleep 1000') & wait",
     ));
     let background = reported_pid(&core.output_until(1, b"."), "bg");
     assert!(alive(background));
@@ -400,10 +402,31 @@ fn meta() -> h1::Spawn {
     }
 }
 
+/// Makes a FIFO at `path`. A session's program that reads it waits until the
+/// test writes to it, which needs no core.
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+    let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(result, 0, "mkfifo: {}", std::io::Error::last_os_error());
+}
+
 #[test]
 fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
+    use std::io::Write;
+
     let (dir, mut first, holder_pid) = holder("adopt");
-    let mut request = shell(1, "echo one; read x; echo \"two:$x\"; read y");
+    let go = dir.path.join("go");
+    make_fifo(&go);
+    let mut request = shell(
+        1,
+        &format!(
+            "echo one; read x; echo \"two:$x\"; read y <'{}'",
+            go.display()
+        ),
+    );
     request.meta = meta().meta;
     let pid = first.spawn(request.clone());
     first.output_until(1, b"one\r\n");
@@ -448,20 +471,27 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
     );
 
     // An exit while no core is connected is reported in the next WELCOME.
+    // The program is let go through the FIFO once the core has gone. Input
+    // would need a core to carry it, and the exit it causes can reach the
+    // holder before that core's disconnect does: the holder then reports
+    // the exit to that core and, left without sessions, exits.
     drop(third);
-    let mut fourth = TestCore::connect_to(&dir);
-    fourth.hello(4);
-    fourth.input(1, b"\n");
-    drop(fourth);
+    // Opened for reading too, so the open doesn't wait for the program's.
+    let mut release = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&go)
+        .unwrap();
+    release.write_all(b"\n").unwrap();
     assert!(eventually(TIMEOUT, || !alive(pid)));
-    let mut fifth = TestCore::connect_to(&dir);
-    let adopted = fifth.hello(5);
+    let mut fourth = TestCore::connect_to(&dir);
+    let adopted = fourth.hello(4);
     match adopted.welcome().sessions[0].exit {
         Some(exit) => assert_eq!(exit.code, Some(0)),
         // Reaped, but its output was still being drained.
-        None => assert_eq!(fifth.exit_code(1), Some(0)),
+        None => assert_eq!(fourth.exit_code(1), Some(0)),
     }
-    assert!(fifth.closes(), "the holder had nothing left");
+    assert!(fourth.closes(), "the holder had nothing left");
     assert!(holder_exits(&dir, holder_pid));
 }
 
@@ -586,8 +616,7 @@ fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
     assert_eq!(adopted.checkpoints[&1], b"CP");
     assert_eq!(adopted.tails[&1], b"a\r\nb\r\nb\r\n");
     assert!(!adopted.welcome().sessions[0].truncated);
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
 }
 
 #[test]
@@ -615,8 +644,7 @@ fn a_tail_past_its_limit_is_truncated() {
     let adopted = core.hello(3);
     assert!(!adopted.welcome().sessions[0].truncated);
     assert_eq!(adopted.tails[&1], b"");
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
 }
 
 #[test]
@@ -637,9 +665,9 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
         seq = children_named(pid, "seq");
         !seq.is_empty()
     }));
-    std::thread::sleep(Duration::from_millis(500));
+    let blocked = stays_blocked(seq[0], holder_pid);
     assert!(alive(seq[0]), "seq finished, so output went somewhere");
-    assert_eq!(state(seq[0]), Some('S'));
+    assert!(blocked, "seq never stopped: the holder kept reading");
 
     let mut core = TestCore::connect_to(&dir);
     let adopted = core.hello(2);
@@ -659,14 +687,13 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
         stream[..expected.len()] == expected[..],
         "the output has a gap or is out of order"
     );
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
     assert!(holder_exits(&dir, holder_pid));
 }
 
 #[test]
 fn a_paused_session_blocks_until_resumed() {
-    let (_dir, mut core, _) = holder("pause");
+    let (_dir, mut core, holder_pid) = holder("pause");
     let pid = core.spawn(shell(1, "read go; seq 1 300000; echo DONE; read z"));
     core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
     core.input(1, b"go\n");
@@ -675,15 +702,14 @@ fn a_paused_session_blocks_until_resumed() {
         seq = children_named(pid, "seq");
         !seq.is_empty()
     }));
-    std::thread::sleep(Duration::from_millis(500));
+    let blocked = stays_blocked(seq[0], holder_pid);
     assert!(alive(seq[0]), "seq finished, so the PTY was read");
-    assert_eq!(state(seq[0]), Some('S'));
+    assert!(blocked, "seq never stopped: the PTY was read");
 
     core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
     let output = core.output_until(1, b"DONE\r\n");
     assert!(contains(&output, b"\r\n300000\r\n"));
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
 }
 
 #[test]
