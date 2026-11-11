@@ -49,9 +49,9 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - `--action` runs a named action;
 - `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
 - `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it;
-- `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 seconds without it, Brindle SHALL log a warning and run the remaining steps.
+- `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 step intervals without it (30 seconds at the default interval), Brindle SHALL log a warning, record the wait as timed out, and run the remaining steps.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. For each `--wait-for` step that timed out, the dump SHALL print a `--- wait-for timeout "TEXT"` line (TEXT escaped onto one line), and for a `--wait-for` step still waiting when the dump is taken, a `--- wait-for pending "TEXT"` line, so a dump that shows an unexpected screen says which wait failed. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -96,6 +96,18 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 #### Scenario: Waiting for the screen
 - **WHEN** a slow shell shows its first prompt `MYPROMPT>` four seconds after launch, and Brindle runs with `--wait-for 'MYPROMPT>' --send 'cd /tmp\r' --dump-screen-after 8`
 - **THEN** `cd /tmp` is typed at that prompt, about a second after it appears, rather than before the shell is ready
+
+#### Scenario: The wait scales with the interval
+- **WHEN** Brindle runs with `--step-interval 2 --wait-for 'NEVER' --send 'x'`, and `NEVER` never appears
+- **THEN** `x` is typed about 61 seconds after launch (one second before the first step, then 60 seconds of waiting), not about 31
+
+#### Scenario: A timed-out wait in the dump
+- **WHEN** Brindle runs with `--step-interval 0.1 --wait-for 'NEVER' --dump-screen-after 6`, and `NEVER` never appears
+- **THEN** the dump contains the line `--- wait-for timeout "NEVER"`
+
+#### Scenario: A pending wait in the dump
+- **WHEN** Brindle runs with `--wait-for 'NEVER' --dump-screen-after 3`, and `NEVER` never appears
+- **THEN** the dump contains the line `--- wait-for pending "NEVER"`, and a dump with no `--wait-for` step prints neither line
 
 #### Scenario: Invalid interval
 - **WHEN** Brindle runs with `--step-interval 0`
