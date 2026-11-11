@@ -131,16 +131,42 @@ mod tests {
 
     #[test]
     fn drain_stops_at_the_budget() {
+        // Each item takes over half the budget, so the queue outlasts it. How
+        // long the sleeps really take is up to the scheduler, so the rule is
+        // checked against the recorded times rather than a count of items.
+        const ITEMS: usize = 10;
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        for i in 1..=10 {
+        for i in 1..=ITEMS {
             tx.unbounded_send(i).unwrap();
         }
         let mut seen = Vec::new();
+        let mut calls: Vec<(Instant, Instant)> = Vec::new();
+        let before = Instant::now();
         drain(&mut rx, 0, |i| {
+            let start = Instant::now();
             seen.push(i);
             std::thread::sleep(BUDGET / 2 + MS);
+            calls.push((start, Instant::now()));
         });
-        assert_eq!(seen, [0, 1]);
+        let after = Instant::now();
+
+        // `first`, then the queue in order.
+        assert!(!seen.is_empty());
+        assert!(seen.iter().copied().eq(0..seen.len()), "{seen:?}");
+
+        // drain's clock starts between `before` and the first call, and each
+        // check comes between one call's end and the next call (or `after`).
+        // So the check that took item k came at least `end[k-1] - start[0]`
+        // into the budget, which must not have run out.
+        let first = calls[0].0;
+        for k in 1..calls.len() {
+            let least = calls[k - 1].1 - first;
+            assert!(least < BUDGET, "item {k} taken {least:?} into the budget");
+        }
+        // The check that stopped it came at most `after - before` in: past the
+        // budget, unless the queue was empty.
+        let most = after - before;
+        assert!(seen.len() == ITEMS + 1 || most >= BUDGET, "stopped {most:?} in, after {seen:?}");
     }
 
     #[test]
