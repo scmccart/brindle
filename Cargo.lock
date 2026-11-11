@@ -715,6 +715,7 @@ dependencies = [
  "brindle-remote-protocol",
  "brindle-term-core",
  "libc",
+ "windows 0.61.3",
 ]
 
 [[package]]
