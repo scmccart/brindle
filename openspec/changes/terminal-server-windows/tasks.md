@@ -9,9 +9,9 @@
 
 ## 1. Platform seams in the server (Linux behaviour unchanged)
 
-- [ ] 1.1 Change `EventLoop` to take a platform `Source` instead of `RawFd`, with `PollLoop` wrapping fds. Verify: `cargo test -p brindle-remote-agent` passes on Linux, including `event_loop`'s tests.
-- [ ] 1.2 Put `conn` (framed connection over a stream, with `input_waiting`), `listen` (accept plus peer check), `lock` (single-instance locks), `daemon` (detached start with a ready signal) and `pty` (spawn, resize, hang up, child exit) behind per-platform modules. The core's and the holder's logic must not name a Unix type. Verify: `grep -n 'std::os::unix\|libc::' remote-agent/src/server/core*.rs remote-agent/src/server/core/` finds nothing, and the Linux agent tests pass.
-- [ ] 1.3 Compile `server` on `any(target_os = "linux", windows)` in `main.rs`, with Windows stubs that return "not implemented yet". Verify: `cargo build --workspace --locked` succeeds on Windows and Linux, with no warnings from Brindle's crates.
+- [x] 1.1 Change `EventLoop` to take a platform `Source` instead of `RawFd`, with `PollLoop` wrapping fds. Verify: `cargo test -p brindle-remote-agent` passes on Linux, including `event_loop`'s tests.
+- [x] 1.2 Put `conn` (framed connection over a stream, with `input_waiting`), `listen` (accept plus peer check), `lock` (single-instance locks), `daemon` (detached start with a ready signal) and `pty` (spawn, resize, hang up, child exit) behind per-platform modules. The core's and the holder's logic must not name a Unix type. Verify: `grep -n 'std::os::unix\|libc::' remote-agent/src/server/core*.rs remote-agent/src/server/core/` finds nothing, and the Linux agent tests pass.
+- [x] 1.3 Compile `server` on `any(target_os = "linux", windows)` in `main.rs`, with Windows stubs that return "not implemented yet". Verify: `cargo build --workspace --locked` succeeds on Windows and Linux, with no warnings from Brindle's crates.
 
 ## 2. Directory and names
 
