@@ -20,6 +20,8 @@ mod pcon;
 mod pipe;
 mod reparent;
 mod survive;
+mod access;
+mod reparent_ext;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -35,6 +37,13 @@ fn main() {
         "pipe-client" => pipe::run_client(rest),
         "reparent" => reparent::run(),
         "dialog" => reparent::run_dialog(),
+        "access" => access::run(rest),
+        "access-server" => access::run_server(rest),
+        "access-client" => access::run_client(rest),
+        "access-first" => access::run_first_child(rest),
+        "reparent-ext" => reparent_ext::run(rest),
+        "owner-window" => reparent_ext::run_owner_window(),
+        "dialog-ext" => reparent_ext::run_dialog_ext(rest),
         other => {
             eprintln!("unknown subcommand {other:?}");
             eprintln!("usage: spike <exports|handover|reparent|survive|pipe> [args]");

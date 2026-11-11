@@ -26,7 +26,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     unsafe { DefWindowProcW(h, msg, w, l) }
 }
 
-fn make_window(title: PCWSTR) -> HWND {
+pub fn make_window(title: PCWSTR) -> HWND {
     // SAFETY: module handle of the current process.
     let hinst = unsafe { GetModuleHandleW(None) }.unwrap();
     let class = WNDCLASSW {
@@ -57,7 +57,7 @@ fn make_window(title: PCWSTR) -> HWND {
     .expect("CreateWindowExW")
 }
 
-fn pump() {
+pub fn pump() {
     let mut msg = MSG::default();
     // SAFETY: standard non-blocking message drain for our windows.
     while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
@@ -83,12 +83,12 @@ fn wait_dialog() -> Option<HWND> {
     None
 }
 
-fn owner(h: HWND) -> HWND {
+pub fn owner(h: HWND) -> HWND {
     // SAFETY: GetWindow over a valid HWND.
     unsafe { GetWindow(h, GW_OWNER) }.unwrap_or_default()
 }
 
-fn hwndparent(h: HWND) -> isize {
+pub fn hwndparent(h: HWND) -> isize {
     // SAFETY: reading the owner/parent slot.
     unsafe { GetWindowLongPtrW(h, GWLP_HWNDPARENT) }
 }
