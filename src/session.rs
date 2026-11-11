@@ -130,7 +130,7 @@ impl ZoneNodeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TabState {
-    /// A local tab (including classic tmux): rerun the profile in `cwd` (or
+    /// A local tab: rerun the profile in `cwd` (or
     /// `zones` when split into 2+ zones).
     Local {
         profile: String,

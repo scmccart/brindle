@@ -246,7 +246,7 @@ impl Theme {
         self.muted_foreground().legible_on(self.background, 3.0)
     }
 
-    /// A card drawn round this theme's terminal (a zone, a tmux window):
+    /// A card drawn round this theme's terminal (a zone):
     /// on the terminal's background (the owner sets `surround`, the chrome
     /// background round the card, itself), with its foreground for an active title, the muted text for
     /// an inactive one and the buttons, and the `card_border` line.
@@ -504,7 +504,7 @@ mod tests {
             if mix.contrast(theme.background) >= 3.0 {
                 assert_eq!(muted, mix, "{name}");
             }
-            // The card a zone or tmux window is drawn in.
+            // The card a zone is drawn in.
             let card = theme.card_colors();
             assert_eq!(card.surface, Some(theme.background.hsla()), "{name}");
             assert_eq!(card.surround, Some(theme.background.hsla()), "{name}");

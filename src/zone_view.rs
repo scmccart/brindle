@@ -19,7 +19,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
-use crate::config::{Config, Profile, TmuxMode};
+use crate::config::{Config, Profile};
 use crate::settings::Settings;
 use crate::terminal::process::Snapshot;
 use crate::terminal::status::State;
@@ -27,7 +27,6 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
-use crate::tmux::Direction;
 use crate::workspace::{shortcut, terminal_automatic_title};
 
 /// Height of a zone card's header bar, shown when a tab has 2+ zones, its
@@ -39,6 +38,15 @@ pub const ZONE_GAP: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ZoneId(pub u64);
+
+/// Which way `FocusZone*` moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -725,19 +733,6 @@ impl ZoneTreeView {
         // A split inherits the target zone's current working directory; if
         // unavailable, `Terminal::spawn` falls back to the profile's cwd or home.
         let cwd = self.zone_working_directory(target, cx);
-        let command = match self.profile.tmux {
-            TmuxMode::Plain => {
-                let mut args = self.profile.tmux_args.clone();
-                args.extend([
-                    "new-session".into(),
-                    "-A".into(),
-                    "-s".into(),
-                    self.profile.tmux_session_name().to_string(),
-                ]);
-                Some(("tmux".into(), args))
-            }
-            _ => None,
-        };
 
         let new_id = ZoneId(self.next_id);
         self.next_id += 1;
@@ -745,7 +740,7 @@ impl ZoneTreeView {
             return;
         }
 
-        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, command, cwd, &config, cx));
+        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, None, cwd, &config, cx));
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         let mut snapshot = None;
         self.refresh_zone_title(target, &mut snapshot, cx);

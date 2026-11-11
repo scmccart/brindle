@@ -132,11 +132,16 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
     Ok(command)
 }
 
+// The remote tmux helpers below lost their last caller with control mode;
+// drop-tmux task 3.1 deletes them (and their tests).
+
 /// How long [`detach_client`] may take, connecting included.
+#[allow(dead_code)]
 const DETACH_LIMIT: Duration = Duration::from_secs(10);
 
 /// The command that detaches the tmux client `client` on the profile's
 /// endpoint: `tmux_program <tmux_options> detach-client -t <client>`.
+#[allow(dead_code)]
 pub fn detach_command(
     profile: &Profile,
     tmux_program: &str,
@@ -159,6 +164,7 @@ pub fn detach_command(
 
 /// Runs `command` to completion in at most [`DETACH_LIMIT`], silently. Meant
 /// for a background thread: the connection it needs may be gone.
+#[allow(dead_code)]
 pub fn detach_client(mut command: Command) {
     use std::process::Stdio;
     command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -175,6 +181,7 @@ pub fn detach_client(mut command: Command) {
 
 /// A tmux process ready to spawn, and what to write to its stdin first.
 /// The caller sets its stdio.
+#[allow(dead_code)]
 pub struct TmuxProcess {
     pub command: Command,
     pub initial_input: Vec<u8>,
@@ -182,6 +189,7 @@ pub struct TmuxProcess {
 
 /// Builds the remote tmux process used by `TmuxSession`, starting in `cwd`
 /// on the endpoint when given (`~` is expanded there, not here).
+#[allow(dead_code)]
 pub fn tmux_command(
     profile: &Profile,
     program: &str,
@@ -234,6 +242,7 @@ pub fn tmux_command(
     })
 }
 
+#[allow(dead_code)]
 fn valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars

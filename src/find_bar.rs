@@ -1,7 +1,7 @@
 //! The find bar: searching one terminal's scrollback from a small bar at its
 //! top right. It lives inside its [`TerminalView`] (see the design of
-//! `add-scrollback-search`): every terminal on screen, local tab or tmux
-//! pane, gets its own, and focus moves between a terminal and its bar
+//! `add-scrollback-search`): every terminal on screen, a tab's or a zone's,
+//! gets its own, and focus moves between a terminal and its bar
 //! without leaving the terminal's focus subtree.
 
 use std::time::Duration;

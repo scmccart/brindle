@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::config::{Profile, RemoteTarget, TmuxMode};
+use crate::config::{Profile, RemoteTarget};
 use crate::config_edit::{self, IMPLICIT_PROFILE, ProfileRef};
 
 /// A profile in the list.
@@ -30,9 +30,6 @@ pub enum Field {
     Env,
     Theme,
     FontSize,
-    Tmux,
-    Session,
-    TmuxArgs,
     Default,
     Remote,
     SshHost,
@@ -45,7 +42,7 @@ pub enum Field {
     ContainerUser,
 }
 
-pub const FIELDS: [Field; 20] = [
+pub const FIELDS: [Field; 17] = [
     Field::Name,
     Field::Remote,
     Field::SshHost,
@@ -62,22 +59,17 @@ pub const FIELDS: [Field; 20] = [
     Field::Env,
     Field::Theme,
     Field::FontSize,
-    Field::Tmux,
-    Field::Session,
-    Field::TmuxArgs,
     Field::Default,
 ];
 
 /// The fields edited as text, in [`Values::texts`] order.
-pub const TEXT_FIELDS: [Field; 15] = [
+pub const TEXT_FIELDS: [Field; 13] = [
     Field::Name,
     Field::Command,
     Field::Args,
     Field::Cwd,
     Field::Env,
     Field::FontSize,
-    Field::Session,
-    Field::TmuxArgs,
     Field::SshHost,
     Field::SshUser,
     Field::SshPort,
@@ -117,9 +109,6 @@ impl Field {
             Field::Env => "Environment",
             Field::Theme => "Theme",
             Field::FontSize => "Font size",
-            Field::Tmux => "tmux",
-            Field::Session => "Session",
-            Field::TmuxArgs => "tmux arguments",
             Field::Default => "Default",
             Field::Remote => "Remote",
             Field::SshHost => "Host",
@@ -141,8 +130,6 @@ impl Field {
             Field::Cwd => "default (home, or the current tab's directory)",
             Field::Env => "KEY=value …",
             Field::FontSize => "global size",
-            Field::Session => "main",
-            Field::TmuxArgs => "shell words, e.g. -L work",
             Field::SshHost => "hostname or ssh config alias",
             Field::SshUser | Field::ContainerUser => "default user",
             Field::SshPort => "22",
@@ -163,20 +150,6 @@ impl Field {
 
     pub fn text_index(self) -> Option<usize> {
         TEXT_FIELDS.iter().position(|f| *f == self)
-    }
-
-    fn tmux_only(self) -> bool {
-        matches!(self, Field::Session | Field::TmuxArgs)
-    }
-}
-
-pub const TMUX_MODES: [TmuxMode; 3] = [TmuxMode::None, TmuxMode::Plain, TmuxMode::Control];
-
-pub fn tmux_label(mode: TmuxMode) -> &'static str {
-    match mode {
-        TmuxMode::None => "none",
-        TmuxMode::Plain => "plain",
-        TmuxMode::Control => "control",
     }
 }
 
@@ -206,7 +179,6 @@ struct Values {
     texts: [String; TEXT_FIELDS.len()],
     /// `None` follows the global theme.
     theme: Option<String>,
-    tmux: TmuxMode,
     remote: RemoteKind,
     /// `docker` or `podman`.
     engine: String,
@@ -223,8 +195,6 @@ impl Values {
             p.cwd.clone().unwrap_or_default(),
             env.join(" "),
             p.font_size.map(|s| s.to_string()).unwrap_or_default(),
-            p.tmux_session.clone().unwrap_or_default(),
-            join_words(&p.tmux_args),
             String::new(),
             String::new(),
             String::new(),
@@ -252,7 +222,7 @@ impl Values {
                 RemoteKind::Container
             }
         };
-        Self { texts, theme: p.theme.clone(), remote: kind, engine, tmux: p.tmux, default }
+        Self { texts, theme: p.theme.clone(), remote: kind, engine, default }
     }
 
     fn text(&self, field: Field) -> &str {
@@ -317,10 +287,6 @@ impl ProfileEditor {
         self.values.theme.as_deref()
     }
 
-    pub fn tmux(&self) -> TmuxMode {
-        self.values.tmux
-    }
-
     pub fn is_default(&self) -> bool {
         self.values.default
     }
@@ -335,12 +301,10 @@ impl ProfileEditor {
         self.values != self.initial
     }
 
-    /// The fields shown: the tmux session and arguments only for tmux, and
-    /// the target's fields only for its kind.
+    /// The fields shown: the target's fields only for its kind.
     pub fn visible_fields(&self) -> Vec<Field> {
         FIELDS
             .into_iter()
-            .filter(|f| !f.tmux_only() || self.values.tmux != TmuxMode::None)
             .filter(|f| !f.ssh_only() || self.values.remote == RemoteKind::Ssh)
             .filter(|f| !f.container_only() || self.values.remote == RemoteKind::Container)
             .collect()
@@ -365,7 +329,6 @@ impl ProfileEditor {
     pub fn choice_count(&self, field: Field) -> usize {
         match field {
             Field::Theme => self.theme_choices.len(),
-            Field::Tmux => TMUX_MODES.len(),
             Field::Remote => REMOTE_KINDS.len(),
             Field::Engine => ENGINES.len(),
             _ => 0,
@@ -373,11 +336,10 @@ impl ProfileEditor {
     }
 
     /// The option choice field `field` shows, as an index into its options
-    /// (`theme_choices`, [`TMUX_MODES`], [`REMOTE_KINDS`], [`ENGINES`]).
+    /// (`theme_choices`, [`REMOTE_KINDS`], [`ENGINES`]).
     pub fn choice_index(&self, field: Field) -> Option<usize> {
         match field {
             Field::Theme => self.theme_choices.iter().position(|t| *t == self.values.theme),
-            Field::Tmux => TMUX_MODES.iter().position(|m| *m == self.values.tmux),
             Field::Remote => REMOTE_KINDS.iter().position(|k| *k == self.values.remote),
             Field::Engine => ENGINES.iter().position(|e| *e == self.values.engine),
             _ => None,
@@ -391,11 +353,6 @@ impl ProfileEditor {
             Field::Theme => {
                 if let Some(theme) = self.theme_choices.get(ix) {
                     self.values.theme = theme.clone();
-                }
-            }
-            Field::Tmux => {
-                if let Some(&mode) = TMUX_MODES.get(ix) {
-                    self.values.tmux = mode;
                 }
             }
             Field::Remote => {
@@ -439,7 +396,6 @@ impl ProfileEditor {
             errors.push((Field::Name, format!("a profile named {name:?} already exists")));
         }
         let args = words(Field::Args, &mut errors);
-        let tmux_args = if self.values.tmux == TmuxMode::None { Vec::new() } else { words(Field::TmuxArgs, &mut errors) };
         let mut env = std::collections::BTreeMap::new();
         for word in words(Field::Env, &mut errors) {
             match word.split_once('=') {
@@ -498,7 +454,6 @@ impl ProfileEditor {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let tmux = self.values.tmux;
         Ok(Profile {
             name: name.to_string(),
             remote,
@@ -508,9 +463,6 @@ impl ProfileEditor {
             env,
             theme: self.values.theme.clone(),
             font_size,
-            tmux,
-            tmux_session: optional(Field::Session).filter(|_| tmux != TmuxMode::None),
-            tmux_args,
             ..Default::default()
         })
     }
@@ -836,11 +788,10 @@ impl ProfilesState {
                     _ => Vec::new(),
                 };
                 format!(
-                    "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} tmux={:?} default={} invalid={:?} can_save={} error={:?}\n",
+                    "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} default={} invalid={:?} can_save={} error={:?}\n",
                     editor.text(Field::Name),
                     field,
                     editor.theme().unwrap_or("follow global"),
-                    tmux_label(editor.tmux()),
                     editor.is_default(),
                     invalid,
                     invalid.is_empty(),
@@ -871,7 +822,7 @@ use crate::actions::{
 use brindle_ui::{ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, TextInput, TextInputEvent};
 
 /// The fields shown as a select rather than text.
-const SELECT_FIELDS: [Field; 4] = [Field::Theme, Field::Tmux, Field::Remote, Field::Engine];
+const SELECT_FIELDS: [Field; 3] = [Field::Theme, Field::Remote, Field::Engine];
 
 impl SettingsDialog {
     /// Creates the profile editor's inputs and selects when it opens and
@@ -934,7 +885,6 @@ impl SettingsDialog {
                     })
                     .collect()
             }
-            Field::Tmux => TMUX_MODES.iter().map(|&m| tmux_label(m).into()).collect(),
             Field::Remote => REMOTE_KINDS.iter().map(|&k| remote_label(k).into()).collect(),
             Field::Engine => ENGINES.iter().map(|&e| e.into()).collect(),
             _ => Vec::new(),
@@ -1303,9 +1253,8 @@ default_profile = "work"
 name = "Shell"
 
 [[profiles]]
-name = "tmux"
-tmux = "control"
-tmux_session = "main"
+name = "htop"
+command = "htop"
 
 # my work profile
 [[profiles]]
@@ -1377,7 +1326,7 @@ theme = "gone"
     fn list_order_default_and_initial_selection() {
         let f = Fixture::new("list", CONFIG);
         let state = f.state();
-        assert_eq!(names(&state), ["Shell", "tmux", "Work"]);
+        assert_eq!(names(&state), ["Shell", "htop", "Work"]);
         assert_eq!(state.default_index(), 2);
         assert_eq!(state.selected, 2);
         assert!(state.describe(&None, "").contains("default=\"Work\""));
@@ -1456,33 +1405,15 @@ theme = "gone"
         assert!(invalid(&state).is_empty());
     }
 
+    /// A local profile's fields end with the font size, then the default
+    /// checkbox.
     #[test]
-    fn tmux_fields_follow_the_mode() {
-        let f = Fixture::new("tmux", CONFIG);
+    fn local_fields_end_with_font_size_then_default() {
+        let f = Fixture::new("fields", CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Shell");
-        assert!(!editor.visible_fields().contains(&Field::Session));
-        editor.choose(Field::Tmux, 1);
-        assert_eq!(editor.tmux(), TmuxMode::Plain);
-        assert!(editor.visible_fields().contains(&Field::Session));
-        editor.set_text(Field::Session, "dev");
-        // Hidden again, the values are kept but not saved.
-        editor.choose(Field::Tmux, 0);
-        assert_eq!(editor.text(Field::Session), "dev");
-        editor.choose(Field::Tmux, 2);
-        assert_eq!(editor.tmux(), TmuxMode::Control);
-        // After the tmux arguments comes the default checkbox.
         let visible = editor.visible_fields();
-        let at = visible.iter().position(|f| *f == Field::TmuxArgs).unwrap();
-        assert_eq!(visible[at + 1], Field::Default);
-        editor.choose(Field::Tmux, 0);
-        assert_eq!(editor.tmux(), TmuxMode::None);
-        let visible = editor.visible_fields();
-        let at = visible.iter().position(|f| *f == Field::Tmux).unwrap();
-        assert_eq!(visible[at + 1], Field::Default);
-        state.save(&f.path, &[]).unwrap();
-        let shell = f.config().profiles[0].clone();
-        assert_eq!((shell.tmux, shell.tmux_session), (TmuxMode::None, None));
+        assert_eq!(visible[visible.len() - 2..], [Field::FontSize, Field::Default]);
     }
 
     #[test]
@@ -1579,7 +1510,7 @@ theme = "gone"
         // Out of range changes nothing.
         editor.choose(Field::Theme, 9);
         assert_eq!(editor.theme(), Some("tokyo-night"));
-        for field in [Field::Tmux, Field::Remote, Field::Engine] {
+        for field in [Field::Remote, Field::Engine] {
             assert_eq!(editor.choice_index(field), Some(0), "{field:?}");
             for ix in 0..editor.choice_count(field) {
                 editor.choose(field, ix);
@@ -1636,13 +1567,13 @@ theme = "gone"
     fn make_default() {
         let f = Fixture::new("default", CONFIG);
         let mut state = f.state();
-        let editor = edit(&mut state, "tmux");
+        let editor = edit(&mut state, "htop");
         assert!(!editor.is_default());
         editor.toggle_default();
         state.save(&f.path, &[]).unwrap();
-        assert_eq!(f.config().default_profile.as_deref(), Some("tmux"));
+        assert_eq!(f.config().default_profile.as_deref(), Some("htop"));
         // The default can't be unchecked.
-        let editor = edit(&mut state, "tmux");
+        let editor = edit(&mut state, "htop");
         editor.toggle_default();
         assert!(editor.is_default());
     }
@@ -1661,7 +1592,7 @@ theme = "gone"
         assert!(!editor.is_default());
         assert_eq!(editor.text(Field::Cwd), "~/src");
         state.save(&f.path, &[]).unwrap();
-        assert_eq!(names(&state), ["Shell", "tmux", "Work", "Work copy"]);
+        assert_eq!(names(&state), ["Shell", "htop", "Work", "Work copy"]);
         assert_eq!(state.selected_entry().unwrap().name, "Work copy");
         assert_eq!(f.config().default_profile.as_deref(), Some("work"));
         state.select(2);
@@ -1687,14 +1618,14 @@ theme = "gone"
         state.request_delete().unwrap();
         assert!(state.delete_question().contains("default profile"));
         state.delete_selected(&f.path, &[]).unwrap();
-        assert_eq!(names(&state), ["Shell", "tmux"]);
+        assert_eq!(names(&state), ["Shell", "htop"]);
         assert_eq!(f.config().default_profile, None);
         assert!(f.text().starts_with("# test config\n"));
         state.select(0);
         assert_eq!(state.delete_question(), "Delete \"Shell\"?");
         state.delete_selected(&f.path, &[]).unwrap();
         assert!(state.request_delete().unwrap_err().contains("last profile"));
-        assert_eq!(names(&state), ["tmux"]);
+        assert_eq!(names(&state), ["htop"]);
     }
 
     #[test]
@@ -1703,7 +1634,7 @@ theme = "gone"
         let mut state = f.state();
         state.select(2);
         assert!(matches!(state.move_selected(true, &f.path, &[]).unwrap(), Done::Written));
-        assert_eq!(names(&state), ["Shell", "Work", "tmux"]);
+        assert_eq!(names(&state), ["Shell", "Work", "htop"]);
         assert_eq!(state.selected, 1);
         assert!(f.text().contains("# my work profile\n[[profiles]]\nname = \"Work\""));
         state.select(0);

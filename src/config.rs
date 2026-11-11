@@ -36,11 +36,6 @@ pub struct Config {
     /// Draw a red bar beside prompts whose command failed (needs shell
     /// integration; see `shell-integration/`).
     pub mark_failed_commands: bool,
-    /// What happens when a tmux control-mode session leaves a window that
-    /// showed only its tabs. No longer read from the file (always the
-    /// default); removed with the rest of tmux support.
-    #[serde(skip)]
-    pub tmux_session_end: TmuxSessionEnd,
     /// The removed `tmux_session_end` key, still accepted (whatever its
     /// value) so old configs load. Parsing logs that it's ignored.
     #[serde(rename = "tmux_session_end")]
@@ -66,7 +61,6 @@ impl Default for Config {
             osc52_paste: false,
             removed_restore_session: None,
             mark_failed_commands: true,
-            tmux_session_end: TmuxSessionEnd::default(),
             removed_tmux_session_end: None,
             notifications: NotificationConfig::default(),
             profiles: Vec::new(),
@@ -125,33 +119,6 @@ pub struct CursorConfig {
 impl Default for CursorConfig {
     fn default() -> Self {
         Self { shape: CursorShapeConfig::Block, blink: true }
-    }
-}
-
-/// What a window does when a tmux session that was all it showed detaches or
-/// ends.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TmuxSessionEnd {
-    /// Close the window, as when a local tab's shell exits.
-    #[default]
-    CloseWindow,
-    /// Open a tab with the default profile (or the first non-tmux one).
-    NewTab,
-    /// Ask: close the window, or open a tab with a chosen profile.
-    Ask,
-}
-
-impl TmuxSessionEnd {
-    pub const ALL: [TmuxSessionEnd; 3] = [TmuxSessionEnd::CloseWindow, TmuxSessionEnd::NewTab, TmuxSessionEnd::Ask];
-
-    /// The value as written in the config.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TmuxSessionEnd::CloseWindow => "close_window",
-            TmuxSessionEnd::NewTab => "new_tab",
-            TmuxSessionEnd::Ask => "ask",
-        }
     }
 }
 
@@ -216,20 +183,6 @@ fn default_container_engine() -> String {
     "docker".into()
 }
 
-/// How a profile uses tmux.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum TmuxMode {
-    /// Not a tmux profile.
-    #[default]
-    None,
-    /// Run tmux normally inside the terminal (`tmux new -A -s <session>`).
-    Plain,
-    /// Attach in control mode (`tmux -CC`): tmux windows become native tabs
-    /// and panes are drawn natively.
-    Control,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
@@ -248,16 +201,6 @@ pub struct Profile {
     pub theme: Option<String>,
     /// Font size override.
     pub font_size: Option<f32>,
-    /// No longer read from the file (always `None`); removed with the rest
-    /// of tmux support.
-    #[serde(skip)]
-    pub tmux: TmuxMode,
-    /// tmux session name to create or attach to (tmux profiles only).
-    #[serde(skip)]
-    pub tmux_session: Option<String>,
-    /// Extra arguments passed to tmux before the command, e.g. `["-L", "work"]`.
-    #[serde(skip)]
-    pub tmux_args: Vec<String>,
     /// The removed `tmux`, `tmux_session` and `tmux_args` keys, still
     /// accepted (whatever their values) so old configs load. Parsing logs
     /// that each is ignored.
@@ -274,10 +217,6 @@ impl Profile {
         Self { name: "Shell".into(), ..Default::default() }
     }
 
-    pub fn tmux_session_name(&self) -> &str {
-        self.tmux_session.as_deref().unwrap_or("main")
-    }
-
     /// A short description of what the profile runs.
     pub fn description(&self) -> String {
         let target_prefix = match &self.remote {
@@ -285,11 +224,7 @@ impl Profile {
             Some(RemoteTarget::Container { container, .. }) => format!("container:{container} · "),
             None => String::new(),
         };
-        let base = match self.tmux {
-            TmuxMode::Control => format!("tmux control mode · {}", self.tmux_session_name()),
-            TmuxMode::Plain => format!("tmux · {}", self.tmux_session_name()),
-            TmuxMode::None => self.command.clone().unwrap_or_else(|| "default shell".into()),
-        };
+        let base = self.command.clone().unwrap_or_else(|| "default shell".into());
         format!("{target_prefix}{base}")
     }
 
@@ -589,7 +524,6 @@ mod tests {
         // The profile runs the default shell, not tmux.
         let work = &config.profiles[0];
         assert_eq!(work.command, None);
-        assert_eq!(work.tmux, TmuxMode::None);
         assert_eq!(work.description(), "default shell");
         for old in ["tmux_session_end = \"ask\"", "tmux_session_end = \"shell\""] {
             assert_eq!(Config::parse(old).unwrap().removed_tmux_warnings().len(), 1, "{old}");

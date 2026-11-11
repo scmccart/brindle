@@ -21,8 +21,6 @@ mod terminal;
 mod terminal_element;
 mod terminal_view;
 mod theme;
-mod tmux;
-mod tmux_view;
 #[cfg(windows)]
 mod win;
 mod workspace;
@@ -825,7 +823,7 @@ async fn latency_bench_run(window: gpui::WindowHandle<Workspace>, samples: usize
             return;
         }
         if cx.update(|cx| Latency::started(cx)).ok() == Some(before) {
-            // No terminal took it: the tab isn't ready yet (tmux attaching).
+            // No terminal took it: the tab isn't ready yet.
             waiting_for_tab += 1;
             if waiting_for_tab > 50 {
                 log::error!("--latency-bench: the active tab doesn't take keystrokes");
@@ -860,14 +858,14 @@ mod tests {
         for args in [&[][..], &["--send", "x", "--dump-screen-after", "3"], &["--no-restore"]] {
             assert!(!parse(args).asks_for_a_tab(), "{args:?}");
         }
-        for args in [&["-p", "tmux"][..], &["-d", "/tmp"], &["-e", "htop"]] {
+        for args in [&["-p", "work"][..], &["-d", "/tmp"], &["-e", "htop"]] {
             assert!(parse(args).asks_for_a_tab(), "{args:?}");
         }
     }
 
     #[test]
     fn debug_options_make_a_debug_run() {
-        assert!(!parse(&["-p", "tmux", "-e", "htop"]).is_debug_run());
+        assert!(!parse(&["-p", "work", "-e", "htop"]).is_debug_run());
         for args in [
             &["--send", "x"][..],
             &["--action", "new_tab"],
@@ -889,9 +887,9 @@ mod tests {
 
     #[test]
     fn a_launch_becomes_a_request_for_the_instance() {
-        let request = parse(&["-p", "tmux", "-d", "rel", "-e", "htop", "-d", "1"]).instance_request();
+        let request = parse(&["-p", "work", "-d", "rel", "-e", "htop", "-d", "1"]).instance_request();
         let here = std::env::current_dir().unwrap();
-        assert_eq!(request.profile.as_deref(), Some("tmux"));
+        assert_eq!(request.profile.as_deref(), Some("work"));
         assert_eq!(request.cwd, Some(here.join("rel")), "-d is made absolute here");
         assert_eq!(request.command, Some(vec!["htop".into(), "-d".into(), "1".into()]));
         assert_eq!(request.launch_dir, Some(here));

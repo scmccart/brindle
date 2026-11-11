@@ -18,7 +18,7 @@ use gpui::{
 
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, Dialog, Dismiss, FocusRing as _, FocusStops, Input, Select,
-    SelectEvent, TextInput, TextInputEvent, Tokens,
+    TextInput, TextInputEvent, Tokens,
 };
 
 use crate::actions::{
@@ -29,7 +29,7 @@ use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 mod profiles;
 
-use crate::config::{Profile, TmuxSessionEnd};
+use crate::config::Profile;
 use profiles::ProfilesState;
 
 /// The dialog's sections, in the order they are listed.
@@ -49,14 +49,6 @@ impl Section {
             Section::Profiles => "Profiles",
             Section::Theme => "Theme",
         }
-    }
-}
-
-fn session_end_label(value: TmuxSessionEnd) -> &'static str {
-    match value {
-        TmuxSessionEnd::CloseWindow => "Close window",
-        TmuxSessionEnd::NewTab => "Open a new tab",
-        TmuxSessionEnd::Ask => "Ask",
     }
 }
 
@@ -331,8 +323,6 @@ pub struct Model {
     profiles: ProfilesState,
     /// Profiles to list (read-only) when the file can't be parsed.
     fallback_profiles: Vec<Profile>,
-    /// The General section's `tmux_session_end`, as last written.
-    session_end: TmuxSessionEnd,
 }
 
 impl Model {
@@ -342,7 +332,6 @@ impl Model {
         fallback: BTreeMap<String, Theme>,
         fallback_profiles: Vec<Profile>,
         fallback_default: Option<String>,
-        session_end: TmuxSessionEnd,
     ) -> Self {
         let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
         let mut model = Self {
@@ -356,7 +345,6 @@ impl Model {
             section: Section::General,
             profiles,
             fallback_profiles,
-            session_end,
         };
         model.reload_entries();
         let active = model.active.clone();
@@ -887,33 +875,11 @@ impl Model {
         self.profiles.take_renames()
     }
 
-    pub fn session_end(&self) -> TmuxSessionEnd {
-        self.session_end
-    }
-
-    /// Writes `tmux_session_end`; the value changes only if the write did.
-    pub fn set_session_end(&mut self, value: TmuxSessionEnd) -> Outcome {
-        if self.section != Section::General || value == self.session_end {
-            return Outcome::Nothing;
-        }
-        match self.save(|doc| Ok(config_edit::set_tmux_session_end(doc, value))) {
-            Ok(()) => {
-                self.session_end = value;
-                Outcome::Written
-            }
-            Err(()) => Outcome::Nothing,
-        }
-    }
-
     /// Debug description for `--dump-screen-after`. `field` names the
     /// focused control, which an editor reports as its `field=`.
     pub fn describe(&self, field: &str) -> String {
         if self.section == Section::General {
-            return format!(
-                "--- settings section=General tmux_session_end={:?} error={:?}\n",
-                self.session_end.as_str(),
-                self.error
-            );
+            return format!("--- settings section=General error={:?}\n", self.error);
         }
         if self.section == Section::Profiles {
             return self.profiles.describe(&self.error, field);
@@ -1057,11 +1023,9 @@ fn enter_confirms(on_button: bool) -> bool {
     !on_button
 }
 
-/// A choice field: the General section's session-end setting, or one of the
-/// profile editor's selects.
+/// A choice field: one of the profile editor's selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
-    SessionEnd,
     Profile(profiles::Field),
 }
 
@@ -1094,9 +1058,6 @@ pub struct SettingsDialog {
     default_handle: FocusHandle,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
-    /// The General section's choice field.
-    session_end: Entity<Select>,
-    _session_end_changed: Subscription,
     /// The section and kind of view focus was last placed for.
     placed_for: (Section, ModeKind),
     /// The focused handle an editor last scrolled into view.
@@ -1119,7 +1080,7 @@ impl FocusStops for SettingsDialog {
         let mut stops = vec![self.sections_handle.clone()];
         let (section, kind) = (self.model.section(), self.model.mode_kind());
         match (section, kind) {
-            (Section::General, _) => stops.push(self.session_end.focus_handle(cx)),
+            (Section::General, _) => {}
             (Section::Theme | Section::Profiles, ModeKind::List) => stops.push(self.list_handle.clone()),
             (Section::Theme, ModeKind::Editor) => {
                 for (field, input) in self.fields.iter().enumerate() {
@@ -1138,26 +1099,13 @@ impl FocusStops for SettingsDialog {
         stops.push(self.close_handle.clone());
         stops
     }
-
-    /// The General section opens with its choice focused, so enter, space,
-    /// up and down open its menu at once.
-    fn initial_focus(&self, cx: &App) -> Option<FocusHandle> {
-        (self.model.section() == Section::General).then(|| self.session_end.focus_handle(cx))
-    }
 }
 
 impl SettingsDialog {
-    pub fn new(model: Model, theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Model, theme: Theme, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = model.preview().unwrap_or(theme);
         let list_scroll = ScrollHandle::new();
         list_scroll.scroll_to_item(model.selected);
-        let labels = TmuxSessionEnd::ALL.map(session_end_label);
-        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == model.session_end());
-        let session_end = cx.new(|cx| Select::new(labels, current, cx));
-        let session_end_changed = cx.subscribe_in(&session_end, window, |this, _, event: &SelectEvent, window, cx| {
-            let SelectEvent::Changed(ix) = *event;
-            this.apply_choice(Choice::SessionEnd, ix, window, cx);
-        });
         let placed_for = (model.section(), model.mode_kind());
         Self {
             focus_handle: cx.focus_handle(),
@@ -1178,8 +1126,6 @@ impl SettingsDialog {
             default_handle: cx.focus_handle(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
-            session_end,
-            _session_end_changed: session_end_changed,
             placed_for,
             scrolled_to: None,
         }
@@ -1198,18 +1144,13 @@ impl SettingsDialog {
     }
 
     /// The name of the focused control: an editor field's label, a
-    /// button's, `list` for a list, `close` for the `X`, `session_end` for
-    /// General's choice, or empty.
+    /// button's, `list` for a list, `close` for the `X`, or empty.
     pub fn focused_label(&self, window: &Window, cx: &App) -> &'static str {
         if self.sections_handle.is_focused(window) {
             return "sections";
         }
         if self.list_handle.is_focused(window) {
             return "list";
-        }
-        let session_end = self.session_end.read(cx);
-        if session_end.is_open() || session_end.focus_handle(cx).is_focused(window) {
-            return "session_end";
         }
         if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
             return field_label(field);
@@ -1276,11 +1217,12 @@ impl SettingsDialog {
         }
     }
 
-    /// Where focus goes when a view opens: General's choice, a list, an
-    /// editor's name, or (asking to confirm a delete) the dialog itself.
+    /// Where focus goes when a view opens: the section list (General has
+    /// no controls), a list, an editor's name, or (asking to confirm a
+    /// delete) the dialog itself.
     fn default_focus(&self, cx: &App) -> FocusHandle {
         match (self.model.section(), self.model.mode_kind()) {
-            (Section::General, _) => self.session_end.focus_handle(cx),
+            (Section::General, _) => self.sections_handle.clone(),
             (_, ModeKind::List) => self.list_handle.clone(),
             _ => self.field_stops(cx).into_iter().next().unwrap_or_else(|| self.focus_handle.clone()),
         }
@@ -1288,7 +1230,7 @@ impl SettingsDialog {
 
     /// Whether a select's menu is open; it holds focus while it is.
     fn menu_open(&self, cx: &App) -> bool {
-        self.session_end.read(cx).is_open() || self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
+        self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
     }
 
     /// Moves focus to the new view's first control when the section or the
@@ -1340,10 +1282,6 @@ impl SettingsDialog {
     /// Shows the model's values in the selects: a refused write leaves the
     /// model as it was, and a reload or a newly opened editor sets them.
     fn sync_selects(&mut self, cx: &mut Context<Self>) {
-        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == self.model.session_end());
-        if self.session_end.read(cx).selected() != current {
-            self.session_end.update(cx, |s, cx| s.set_selected(current, cx));
-        }
         let Some(editor) = self.model.profiles.editor() else { return };
         for (field, select) in &self.profile_selects {
             let current = editor.choice_index(*field);
@@ -1356,20 +1294,13 @@ impl SettingsDialog {
     /// The select behind a choice field.
     fn choice_select(&self, choice: Choice) -> Option<Entity<Select>> {
         match choice {
-            Choice::SessionEnd => Some(self.session_end.clone()),
             Choice::Profile(field) => self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s.clone()),
         }
     }
 
-    /// Option `ix` of a choice field was chosen: write the setting, or
-    /// change the edited profile.
+    /// Option `ix` of a choice field was chosen: change the edited profile.
     fn apply_choice(&mut self, choice: Choice, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         match choice {
-            Choice::SessionEnd => {
-                let Some(&value) = TmuxSessionEnd::ALL.get(ix) else { return };
-                let outcome = self.model.set_session_end(value);
-                self.outcome(outcome, window, cx);
-            }
             Choice::Profile(field) => self.edit_profile(window, cx, |e| e.choose(field, ix)),
         }
     }
@@ -1543,24 +1474,9 @@ impl SettingsDialog {
 
     // ---- rendering ----
 
+    /// The General section has no settings left; only its Close button.
     fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
-        // Wide enough for the longest option, "Open a new tab".
-        let choice = self.choice_slot(Choice::SessionEnd).w(px(280.0));
-        let body = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap_2()
-            .child(div().text_color(t.foreground).child("When a tmux session ends and its tabs were the window's only tabs"))
-            .child(div().flex().child(choice))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(t.muted_foreground)
-                    .child("Applies to detaching (ctrl-shift-d), closing the last tab, and the last shell exiting. Saved at once."),
-            );
-        // Changes are already saved, so Close is all the footer needs.
+        let body = div().flex_1();
         let footer = div()
             .flex()
             .items_center()
@@ -2022,7 +1938,7 @@ background = "nope"
 
         /// A model as the dialog opens: on the General section.
         fn general(&self, active: &str) -> Model {
-            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None, TmuxSessionEnd::default())
+            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None)
         }
 
         fn text(&self) -> String {
@@ -2136,7 +2052,6 @@ background = "nope"
             BTreeMap::from([("mine".into(), Theme::default())]),
             Vec::new(),
             None,
-            TmuxSessionEnd::default(),
         );
         model.select_section(Section::Theme);
         // The fallback themes are still listed.
@@ -2423,39 +2338,11 @@ background = "nope"
     }
 
     #[test]
-    fn general_choices_write_tmux_session_end() {
+    fn general_has_no_settings() {
         let f = Fixture::new("general-write", CONFIG);
-        let mut model = f.general("mine");
-        assert_eq!(
-            model.describe(""),
-            "--- settings section=General tmux_session_end=\"close_window\" error=None\n"
-        );
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::NewTab);
-        assert!(f.text().starts_with("# test config\ntheme = \"mine\"\ntmux_session_end = \"new_tab\"\n"), "{}", f.text());
-        assert_eq!(model.set_session_end(TmuxSessionEnd::CloseWindow), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
-        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
-        assert!(f.text().contains("tmux_session_end = \"ask\""));
-        // Choosing the current value writes nothing.
-        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Nothing);
-        // Only from the General section.
-        model.select_section(Section::Theme);
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
-        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
-    }
-
-    #[test]
-    fn general_on_a_malformed_file_keeps_the_value() {
-        let text = "theme = \"mine\"\n[oops\n";
-        let f = Fixture::new("general-malformed", text);
-        let mut model = f.general("mine");
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
-        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
-        assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
-        assert!(model.describe("").contains("error=Some("));
-        assert_eq!(f.text(), text);
+        let model = f.general("mine");
+        assert_eq!(model.describe(""), "--- settings section=General error=None\n");
+        assert_eq!(f.text(), CONFIG);
     }
 
     #[test]
