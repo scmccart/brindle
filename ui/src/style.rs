@@ -929,6 +929,108 @@ pub fn tab_drag_style(t: &Tokens) -> TabDragStyle {
     TabDragStyle { background: t.background, foreground: t.foreground, border: t.primary, radius: t.radius_md() }
 }
 
+/// A card's border width: shadcn's `border`, one pixel.
+pub const CARD_BORDER: Pixels = px(1.);
+
+/// A card header's height, its bottom border line included. In pixels, so
+/// an owner that sizes what goes inside a card by hand (a terminal's grid)
+/// can count it without a rem size; it fits `text-xs` and an `IconXs`
+/// button (1.5rem) at the 16px root.
+pub const CARD_HEADER_HEIGHT: Pixels = px(28.);
+
+/// A card's own colours, which its owner may give it (a pane drawn in its
+/// terminal's colours). A colour left `None` comes from the tokens, so a
+/// card given none looks as shadcn's does.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CardColors {
+    /// The card's surface, behind the header and the content.
+    pub surface: Option<Hsla>,
+    /// The header's title.
+    pub text: Option<Hsla>,
+    /// A muted title, and what the header's action slot holds.
+    pub muted: Option<Hsla>,
+    /// The border round the card and the line under the header.
+    pub border: Option<Hsla>,
+    /// What lies round the card: painted outside its rounded corners, above
+    /// the content, so a content with a square background stays inside the
+    /// rounded border.
+    pub surround: Option<Hsla>,
+}
+
+/// A card's resolved look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardStyle {
+    /// `bg-card`.
+    pub surface: Hsla,
+    /// `text-card-foreground`; the title's colour.
+    pub text: Hsla,
+    /// `text-muted-foreground`.
+    pub muted: Hsla,
+    /// `border` (the colour).
+    pub border: Hsla,
+    /// What the corners outside the rounded border are painted in.
+    pub surround: Hsla,
+    /// The focus ring's colour while it shows. Always the tokens', since
+    /// the ring is chrome round the card, not part of it.
+    pub ring: Hsla,
+    pub border_width: Pixels,
+    /// `rounded-lg`.
+    pub radius: Rems,
+    pub header_height: Pixels,
+    pub header_padding_left: Rems,
+    pub header_padding_right: Rems,
+    /// Between the leading adornment, the title and the action slot.
+    pub header_gap: Rems,
+    /// `text-xs`.
+    pub text_size: Rems,
+}
+
+impl CardStyle {
+    /// This style with the owner's colours in place of the tokens'. The
+    /// ring keeps the tokens' colour.
+    pub fn with_colors(mut self, colors: CardColors) -> Self {
+        let CardColors { surface, text, muted, border, surround } = colors;
+        self.surface = surface.unwrap_or(self.surface);
+        self.text = text.unwrap_or(self.text);
+        self.muted = muted.unwrap_or(self.muted);
+        self.border = border.unwrap_or(self.border);
+        self.surround = surround.unwrap_or(self.surround);
+        self
+    }
+
+    /// The focus ring round a card with this style, at a root text size of
+    /// `rem_size`: just outside the border, its corners following the
+    /// card's (`ring_geometry`).
+    pub fn ring_geometry(&self, rem_size: Pixels, width: Pixels) -> RingGeometry {
+        ring_geometry(Edges::all(self.border_width), Corners::all(self.radius.to_pixels(rem_size)), width)
+    }
+}
+
+/// shadcn's Card (new-york-v4), compact: `bg-card text-card-foreground
+/// rounded-lg border` in the colours of `t`, with no shadow, no padding
+/// round the content and a one-line header (`text-xs`, a 28px row with
+/// `pl-2.5 pr-0.5 gap-1.5`) instead of shadcn's `py-6 gap-6` sections.
+/// The text is the `foreground` token, the muted text `muted_foreground`,
+/// the border `border`, and the surround `background`, the colour a card
+/// usually sits on.
+pub fn card_style(t: &Tokens) -> CardStyle {
+    CardStyle {
+        surface: t.card,
+        text: t.foreground,
+        muted: t.muted_foreground,
+        border: t.border,
+        surround: t.background,
+        ring: focus_ring(t),
+        border_width: CARD_BORDER,
+        radius: t.radius_lg(),
+        header_height: CARD_HEADER_HEIGHT,
+        header_padding_left: rems(0.625),
+        header_padding_right: rems(0.125),
+        header_gap: rems(0.375),
+        text_size: rems(0.75),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::hsla;
@@ -1583,6 +1685,58 @@ mod tests {
         assert_eq!(pill.padding, Edges::all(px(3.)));
         // The padding is room for the focus ring.
         assert_eq!(TAB_LIST_PADDING, crate::components::RING_WIDTH);
+    }
+
+    /// The spec's default colours: a card given none is the card token's
+    /// surface with the foreground's text and the border token's line, on
+    /// the background, ringed in the focus ring's colour; rounded-lg with a
+    /// 1px border and a 28px header.
+    #[test]
+    fn card_defaults_come_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = card_style(&t);
+            assert_eq!((s.surface, s.text, s.muted, s.border), (t.card, t.foreground, t.muted_foreground, t.border));
+            assert_eq!((s.surround, s.ring), (t.background, focus_ring(&t)));
+            assert_eq!((s.border_width, s.radius, s.header_height), (px(1.), t.radius_lg(), px(28.)));
+            assert_eq!((s.header_padding_left, s.header_padding_right, s.header_gap), (rems(0.625), rems(0.125), rems(0.375)));
+            assert_eq!(s.text_size, rems(0.75));
+            assert_eq!(s.with_colors(CardColors::default()), s);
+        }
+    }
+
+    /// The spec's owner colours replace the tokens' one by one; the ring
+    /// stays the tokens'.
+    #[test]
+    fn card_owner_colours_replace_the_tokens() {
+        let own = CardColors {
+            surface: Some(gpui::rgb(0x1a1b26).into()),
+            text: Some(gpui::rgb(0xc0caf5).into()),
+            muted: Some(gpui::rgb(0x737aa2).into()),
+            border: Some(gpui::rgb(0x2f3146).into()),
+            surround: Some(gpui::rgb(0x16161e).into()),
+        };
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = card_style(&t).with_colors(own);
+            assert_eq!(
+                (Some(s.surface), Some(s.text), Some(s.muted), Some(s.border), Some(s.surround)),
+                (own.surface, own.text, own.muted, own.border, own.surround)
+            );
+            assert_eq!(s.ring, focus_ring(&t));
+            // One colour alone: the others come from the tokens.
+            let border_only = card_style(&t).with_colors(CardColors { border: own.border, ..CardColors::default() });
+            assert_eq!(border_only, CardStyle { border: own.border.unwrap(), ..card_style(&t) });
+        }
+    }
+
+    /// The ring is a 3px band just outside the 1px border, its corners the
+    /// card's rounded-lg (10px at the 16px root) grown by its width.
+    #[test]
+    fn card_ring_sits_outside_the_border() {
+        let s = card_style(&Tokens::neutral_light());
+        let ring = s.ring_geometry(px(16.), crate::components::RING_WIDTH);
+        assert_eq!(ring, RingGeometry { outset: Edges::all(px(4.)), radii: Corners::all(px(13.)), width: px(3.) });
+        // It follows the rem size, as the radius does.
+        assert_eq!(s.ring_geometry(px(20.), px(3.)).radii, Corners::all(px(15.5)));
     }
 
     /// A trigger keeps its natural width between the limits, grows to the

@@ -108,6 +108,89 @@ impl Image {
         out.extend_from_slice(&self.data);
         std::fs::write(path, out).ok();
     }
+
+    /// The whole image, as a rectangle.
+    pub fn all(&self) -> PxRect {
+        PxRect { x0: 0, y0: 0, x1: self.width, y1: self.height }
+    }
+
+    /// Where `self` and `other`, two captures of the same window, differ
+    /// within `r`: the pixels more than `tolerance` apart on some channel.
+    pub fn changes(&self, other: &Image, r: PxRect, tolerance: u8) -> Result<Changes> {
+        ensure!((self.width, self.height) == (other.width, other.height), "the window changed size");
+        let (x1, y1) = (r.x1.min(self.width), r.y1.min(self.height));
+        let mut changes = Changes { count: 0, bbox: None, color: None };
+        let mut colors: HashMap<Rgb, usize> = HashMap::new();
+        for y in r.y0..y1 {
+            for x in r.x0..x1 {
+                let p = self.pixel(x, y);
+                if p.near(other.pixel(x, y), tolerance) {
+                    continue;
+                }
+                changes.count += 1;
+                *colors.entry(p).or_default() += 1;
+                changes.bbox = Some(match changes.bbox {
+                    None => PxRect { x0: x, y0: y, x1: x + 1, y1: y + 1 },
+                    Some(b) => PxRect { x0: b.x0.min(x), y0: b.y0.min(y), x1: b.x1.max(x + 1), y1: b.y1.max(y + 1) },
+                });
+            }
+        }
+        changes.color = colors.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c);
+        Ok(changes)
+    }
+
+    /// The runs of pixels within `tolerance` of `color` along row `y`, from
+    /// column `x0` up to `x1`: each run's first column and the one after its
+    /// last.
+    pub fn runs_in_row(&self, y: u32, (x0, x1): (u32, u32), color: Rgb, tolerance: u8) -> Vec<(u32, u32)> {
+        if y >= self.height {
+            return Vec::new();
+        }
+        runs((x0..x1.min(self.width)).map(|x| (x, self.pixel(x, y).near(color, tolerance))))
+    }
+
+    /// As [`Image::runs_in_row`], down column `x` from row `y0` up to `y1`.
+    pub fn runs_in_column(&self, x: u32, (y0, y1): (u32, u32), color: Rgb, tolerance: u8) -> Vec<(u32, u32)> {
+        if x >= self.width {
+            return Vec::new();
+        }
+        runs((y0..y1.min(self.height)).map(|y| (y, self.pixel(x, y).near(color, tolerance))))
+    }
+}
+
+/// Where two captures differ ([`Image::changes`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Changes {
+    /// How many pixels differ.
+    pub count: usize,
+    /// The rectangle round them, when any do.
+    pub bbox: Option<PxRect>,
+    /// The most common colour the differing pixels have in the first
+    /// capture.
+    pub color: Option<Rgb>,
+}
+
+/// The runs of `true` in a line of `(position, matches)`, as the first
+/// position and the one after the last.
+fn runs(line: impl Iterator<Item = (u32, bool)>) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut open: Option<u32> = None;
+    let mut end = 0;
+    for (at, matches) in line {
+        end = at + 1;
+        match (matches, open) {
+            (true, None) => open = Some(at),
+            (false, Some(start)) => {
+                runs.push((start, at));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        runs.push((start, end));
+    }
+    runs
 }
 
 /// One arm of a divider junction: the line running from the crossing point
@@ -358,5 +441,48 @@ pub fn self_test_junction() -> Result {
     let mixed = image(&|x, y| (on(x) || on(y)).then_some(if y < 4 { B } else { A }));
     let got = mixed.junction(all, &colors)?;
     ensure!(got.up == Arm::Mixed && got.down == Arm::Color(A), "mixed: {got:?}");
+    Ok(())
+}
+
+/// Runs along a row or a column, and the changes between two captures.
+pub fn self_test_scan() -> Result {
+    const BG: Rgb = Rgb(0x28, 0x20, 0x20);
+    const LINE: Rgb = Rgb(0x36, 0x2f, 0x2f);
+    const RING: Rgb = Rgb(0x94, 0x54, 0x10);
+    let image = |paint: &dyn Fn(u32, u32) -> Option<Rgb>| {
+        let mut data = Vec::new();
+        for y in 0..20 {
+            for x in 0..30 {
+                let c = paint(x, y).unwrap_or(BG);
+                data.extend_from_slice(&[c.0, c.1, c.2]);
+            }
+        }
+        Image { width: 30, height: 20, data }
+    };
+    // Two 1px card borders with a 6px gap between them, at columns 5 and 12.
+    let cards = image(&|x, _| [5, 12].contains(&x).then_some(LINE));
+    let got = cards.runs_in_row(3, (0, 30), LINE, 2);
+    ensure!(got == [(5, 6), (12, 13)], "border runs: {got:?}");
+    ensure!(cards.runs_in_row(3, (6, 12), BG, 2) == [(6, 12)], "gap run");
+    ensure!(cards.runs_in_row(3, (0, 99), BG, 2) == [(0, 5), (6, 12), (13, 30)], "background runs, to the edge");
+    ensure!(cards.runs_in_column(5, (0, 20), LINE, 2) == [(0, 20)], "a border down a column");
+    ensure!(cards.runs_in_row(25, (0, 30), LINE, 2).is_empty(), "a row past the bottom");
+    // A tight tolerance tells the border from a near colour.
+    ensure!(cards.runs_in_row(3, (0, 30), Rgb(0x25, 0x29, 0x2c), 2).is_empty(), "near colour matched");
+
+    // A ring 1px wide round columns 3..=8, rows 2..=6, added to `cards`.
+    let ringed = image(&|x, y| {
+        let band = ((3..=8).contains(&x) && [2, 6].contains(&y)) || ((2..=6).contains(&y) && [3, 8].contains(&x));
+        if band { Some(RING) } else { [5, 12].contains(&x).then_some(LINE) }
+    });
+    let all = ringed.all();
+    let got = ringed.changes(&cards, all, 16)?;
+    ensure!(got.bbox == Some(PxRect { x0: 3, y0: 2, x1: 9, y1: 7 }), "ring box: {got:?}");
+    ensure!(got.count == 2 * 6 + 2 * 3, "ring pixels: {got:?}");
+    ensure!(got.color == Some(RING), "ring colour: {got:?}");
+    let none = cards.changes(&cards, all, 16)?;
+    ensure!(none == Changes { count: 0, bbox: None, color: None }, "no change: {none:?}");
+    let outside = ringed.changes(&cards, PxRect { x0: 10, y0: 0, x1: 30, y1: 20 }, 16)?;
+    ensure!(outside.count == 0, "a change outside the region: {outside:?}");
     Ok(())
 }

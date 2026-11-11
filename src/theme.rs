@@ -226,8 +226,10 @@ impl Theme {
         self.background.mix(target, 0.35)
     }
 
-    /// The `border` (and `input`) token.
-    fn chrome_border(&self) -> Color {
+    /// The `border` (and `input`) token, and a zone card's border: the
+    /// terminal's background mixed with 12% of its foreground, so a card's
+    /// line reads like a chrome border in that theme.
+    pub(crate) fn card_border(&self) -> Color {
         self.background.mix(self.foreground, 0.12)
     }
 
@@ -236,11 +238,35 @@ impl Theme {
         self.foreground.mix(self.background, 0.45)
     }
 
+    /// Muted text on the terminal's own background (an inactive zone
+    /// header's title, its buttons): the muted mix, kept at 3:1 against
+    /// the terminal background, as the `muted_foreground` token is against
+    /// the chrome's.
+    pub(crate) fn card_muted_foreground(&self) -> Color {
+        self.muted_foreground().legible_on(self.background, 3.0)
+    }
+
+    /// A card drawn round this theme's terminal (a zone, a tmux window):
+    /// on the terminal's background (the owner sets `surround`, the chrome
+    /// background round the card, itself), with its foreground for an active title, the muted text for
+    /// an inactive one and the buttons, and the `card_border` line.
+    pub(crate) fn card_colors(&self) -> brindle_ui::CardColors {
+        let background = self.background.hsla();
+        brindle_ui::CardColors {
+            surface: Some(background),
+            text: Some(self.foreground.hsla()),
+            muted: Some(self.card_muted_foreground().hsla()),
+            border: Some(self.card_border().hsla()),
+            surround: Some(background),
+        }
+    }
+
     /// The `brindle-ui` token set for this theme: chrome background and
     /// border, the theme's foreground and accent, and its red as destructive.
     /// Every text/background pair is kept legible (4.5:1, muted 3:1). The
-    /// tokens are the window chrome's only colour source; the helpers above
-    /// are private inputs to them.
+    /// tokens are the window chrome's only colour source; the private
+    /// helpers above are inputs to them (`card_border` and
+    /// `card_muted_foreground` also colour the zone cards).
     pub fn ui_tokens(&self) -> brindle_ui::Tokens {
         let bg = self.chrome_background();
         let fg = self.foreground.legible_on(bg, 4.5);
@@ -248,7 +274,7 @@ impl Theme {
         let surface = bg.mix(fg, 0.08);
         let accent = self.accent();
         let destructive = self.ansi[1];
-        let border = self.chrome_border();
+        let border = self.card_border();
         let mut tokens = if self.is_dark() {
             brindle_ui::Tokens::neutral_dark()
         } else {
@@ -455,6 +481,37 @@ mod tests {
         assert_eq!(color_of(t.background), theme.chrome_background());
         assert!(t.dark);
         assert!(!builtin_theme("brindle-light").map_or(false, |l| l.ui_tokens().dark));
+    }
+
+    /// A zone card's border is the `border` token's mix of the terminal's
+    /// own colours, visible against its background; its muted text is the
+    /// muted mix, legible at 3:1 on that background, in every built-in
+    /// theme.
+    #[test]
+    fn card_colours_derive_from_the_terminal_theme() {
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            let border = theme.card_border();
+            assert_eq!(border, theme.background.mix(theme.foreground, 0.12), "{name}");
+            assert_eq!(border.hsla(), theme.ui_tokens().border, "{name}");
+            assert_ne!(border, theme.background, "{name}: the card border vanishes into the background");
+            let muted = theme.card_muted_foreground();
+            let ratio = muted.contrast(theme.background);
+            assert!(ratio >= 3.0, "{name}: card muted foreground contrast {ratio:.2} < 3");
+            assert_ne!(muted, theme.foreground, "{name}: the muted title is the foreground");
+            // A mix that is already legible is kept as it is.
+            let mix = theme.foreground.mix(theme.background, 0.45);
+            if mix.contrast(theme.background) >= 3.0 {
+                assert_eq!(muted, mix, "{name}");
+            }
+            // The card a zone or tmux window is drawn in.
+            let card = theme.card_colors();
+            assert_eq!(card.surface, Some(theme.background.hsla()), "{name}");
+            assert_eq!(card.surround, Some(theme.background.hsla()), "{name}");
+            assert_eq!(card.text, Some(theme.foreground.hsla()), "{name}");
+            assert_eq!(card.muted, Some(muted.hsla()), "{name}");
+            assert_eq!(card.border, Some(border.hsla()), "{name}");
+        }
     }
 
     #[test]

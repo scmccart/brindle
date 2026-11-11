@@ -338,6 +338,7 @@ fn self_test() -> i32 {
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),
         ("divider junctions", capture::self_test_junction),
+        ("pixel scans", capture::self_test_scan),
     ];
     let mut failed = 0;
     for (name, test) in tests {

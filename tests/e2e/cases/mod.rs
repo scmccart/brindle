@@ -5,6 +5,7 @@
 
 #[cfg(windows)]
 mod win;
+mod cards;
 mod colors;
 mod commands;
 mod dividers;
@@ -37,10 +38,12 @@ mod windows;
 mod zone_menu;
 mod zones;
 
-use crate::capture::Cells;
-use crate::brindle::Output;
+use std::sync::{Arc, Mutex};
+
+use crate::brindle::{Output, Run};
+use crate::capture::{self, Cells, Changes, Image};
 use crate::tmux::TmuxServer;
-use crate::{Case, Result};
+use crate::{Case, Ctx, Result, ensure};
 
 pub fn all() -> Vec<Case> {
     #[cfg(windows)]
@@ -184,6 +187,11 @@ fn unix() -> Vec<Case> {
         display("zones-close", zones::close),
         display("zones-restore", zones::restore),
         display("zones-header-colors", zones::header_colors),
+        display("cards-zone-border", cards::zone_border),
+        display("cards-zone-corners", cards::zone_corners),
+        display("cards-zone-gap", cards::zone_gap),
+        display("cards-zone-ring", cards::zone_ring),
+        display("cards-tmux-window", cards::tmux_window),
         display("tabs-strip-colors", tabs::strip_colors),
         display("tabs-strip-keys", tabs::strip_keys),
         display("tabs-actions-keep-focus", tabs::actions_keep_focus),
@@ -236,6 +244,84 @@ fn server() -> Result<TmuxServer> {
 fn cells(server: &TmuxServer, out: &Output, active: &str) -> Result<Cells> {
     let [left, top, _, _] = server.geometry(active)?;
     Ok(Cells::from_pane(out.dump.grid()?, left, top))
+}
+
+/// The gap round a local tab's zone cards and a tmux window's card
+/// (`ZONE_GAP`), and a card's border (`brindle_ui::CARD_BORDER`), in
+/// logical pixels: a card's content starts this far in from the tab's area.
+const ZONE_GAP: f32 = 6.0;
+const CARD_BORDER: f32 = 1.0;
+const CARD_INSET: f32 = ZONE_GAP + CARD_BORDER;
+
+/// When step `step` (counted from 1) runs: Brindle runs its steps one
+/// second apart, the first 1.5 s in.
+fn step_time(step: usize) -> f64 {
+    0.5 + step as f64
+}
+
+/// Window captures taken during a run, by name.
+#[derive(Clone, Default)]
+struct Shots(Arc<Mutex<Vec<(&'static str, Image)>>>);
+
+impl Shots {
+    /// Captures the window as `name` a little after step `step` ran, before
+    /// the next one.
+    fn after<'a>(&self, run: Run<'a>, ctx: &Ctx, step: usize, name: &'static str) -> Run<'a> {
+        let (display, shots) = (ctx.display.clone(), self.0.clone());
+        run.call_at(step_time(step) + 0.55, move |pid| {
+            let image = capture::grab(&display, pid)?;
+            shots.lock().unwrap().push((name, image));
+            Ok(())
+        })
+    }
+
+    /// Runs `check` on captures `a` and `b`, and saves both to the case
+    /// directory when it fails.
+    fn compare<T>(&self, ctx: &Ctx, (a, b): (&str, &str), check: impl FnOnce(&Image, &Image) -> Result<T>) -> Result<T> {
+        let shots = self.0.lock().unwrap();
+        let find = |name: &str| shots.iter().find(|(n, _)| *n == name).map(|(_, i)| i).ok_or(format!("no capture {name:?}"));
+        let (first, second) = (find(a)?, find(b)?);
+        let result = check(first, second);
+        if result.is_err() {
+            first.save_ppm(&ctx.dir.join(format!("{a}.ppm")));
+            second.save_ppm(&ctx.dir.join(format!("{b}.ppm")));
+        }
+        result.map_err(|e| format!("{a} against {b}: {e}"))
+    }
+
+    /// Captures `a` and `b` show the same view except for one focus ring:
+    /// the pixels that differ form a band about 3 px wide around a box
+    /// `width` by `height` logical pixels (ring included) within the given
+    /// ranges. Both captures are saved to the case directory if not.
+    fn expect_ring(
+        &self,
+        ctx: &Ctx,
+        what: &str,
+        pair: (&str, &str),
+        scale: f32,
+        width: (f32, f32),
+        height: (f32, f32),
+    ) -> Result<Changes> {
+        self.compare(ctx, pair, |a, b| ring_between(a, b, scale, width, height)).map_err(|e| format!("{what} ({e})"))
+    }
+}
+
+fn ring_between(a: &Image, b: &Image, scale: f32, width: (f32, f32), height: (f32, f32)) -> Result<Changes> {
+    let changes = a.changes(b, a.all(), 16)?;
+    let (count, bbox) = (changes.count, changes.bbox.ok_or("no pixel differs: no ring")?);
+    let (w, h) = ((bbox.x1 - bbox.x0) as f32 / scale, (bbox.y1 - bbox.y0) as f32 / scale);
+    ensure!(
+        (width.0..=width.1).contains(&w) && (height.0..=height.1).contains(&h),
+        "the change spans {w}x{h} at {bbox:?}, want {width:?} x {height:?}"
+    );
+    // A 3 px ring (and a 1 px border inside it) along the box's edges, not
+    // a filled box.
+    let band = 2.0 * (w + h) * scale * 3.0 * scale;
+    ensure!(
+        (count as f32) >= band * 0.5 && (count as f32) <= band * 2.0,
+        "{count} pixels differ in {w}x{h}, want a ring of about {band}"
+    );
+    Ok(changes)
 }
 
 /// Skips a case when a program it needs isn't installed.

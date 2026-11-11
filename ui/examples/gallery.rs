@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme, Button, ButtonSize, ButtonVariant, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
+    ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
     ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
     MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
@@ -225,6 +225,30 @@ fn demo_tab_width() -> TabWidth {
 }
 
 /// A 6px dot, as a tab's status and bell adornments.
+/// The demo cards' size.
+const CARD_DEMO_WIDTH: f32 = 240.;
+const CARD_DEMO_HEIGHT: f32 = 120.;
+
+/// The headerless card's content: a square background, painted to its
+/// box's corners.
+const CARD_SQUARE: u32 = 0xd946ef;
+
+/// What the owner-coloured cards sit on.
+const OWNER_CARD_SURROUND: u32 = 0x16161e;
+
+/// A terminal's colours, as an app gives them to a card: tokyo-night's
+/// background and foreground, a muted mix and the 12% border mix, on a
+/// darker surround.
+fn owner_card_colors() -> CardColors {
+    CardColors {
+        surface: Some(rgb(0x1a1b26).into()),
+        text: Some(rgb(0xc0caf5).into()),
+        muted: Some(rgb(0x737aa2).into()),
+        border: Some(rgb(0x2e303f).into()),
+        surround: Some(rgb(OWNER_CARD_SURROUND).into()),
+    }
+}
+
 fn dot(color: Hsla) -> Div {
     div().flex_none().size(px(6.)).rounded_full().bg(color)
 }
@@ -1132,6 +1156,90 @@ impl Gallery {
             )
     }
 
+    /// Cards: the default look with a header; the owner's colours (a
+    /// terminal's) on a surround of their own; a headerless card whose
+    /// content paints a square background to its corners; and the same
+    /// card without and with the ring.
+    fn cards_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let records = &self.records;
+        let owner = owner_card_colors();
+        let actions = |card: &'static str, muted: Hsla, header: CardHeader| {
+            [("split-right", Icon::Columns2), ("split-down", Icon::Rows2), ("close", Icon::X)].into_iter().fold(
+                header,
+                |header, (name, icon)| {
+                    let id = SharedString::from(format!("card-{card}-{name}"));
+                    header.action(
+                        Button::icon_only(id, icon).variant(ButtonVariant::Ghost).size(ButtonSize::IconXs).text_color(muted),
+                    )
+                },
+            )
+        };
+        let sized = |card: Card| card.w(px(CARD_DEMO_WIDTH)).h(px(CARD_DEMO_HEIGHT));
+        let header_record = |name: &'static str| {
+            let records = records.clone();
+            move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                records.borrow_mut().insert(name.to_string(), bounds);
+            }
+        };
+        let body = |text: &'static str| div().size_full().px_2().py_1().text_size(px(12.)).child(text);
+
+        let default = sized(Card::new("card-default"))
+            .header(actions(
+                "default",
+                t.muted_foreground,
+                CardHeader::new("card-default-header").leading(dot(rgb(0x22c55e).into())).title("A long card title cut by an ellipsis"),
+            ))
+            .on_header_bounds(header_record("card:default:header"))
+            .child(body("The default tokens"));
+        let owned = sized(Card::new("card-owner"))
+            .colors(owner)
+            .header(actions(
+                "owner",
+                owner.muted.unwrap_or(t.muted_foreground),
+                CardHeader::new("card-owner-header").leading(dot(rgb(0xe0af68).into())).title("nvim"),
+            ))
+            .on_header_bounds(header_record("card:owner:header"))
+            .child(body("~ $ ls").text_color(owner.text.unwrap_or(t.foreground)));
+        let inactive = sized(Card::new("card-owner-inactive"))
+            .colors(owner)
+            .header(actions(
+                "owner-inactive",
+                owner.muted.unwrap_or(t.muted_foreground),
+                CardHeader::new("card-owner-inactive-header").title("bash (muted title)").title_muted(true),
+            ))
+            .child(body("~ $").text_color(owner.text.unwrap_or(t.foreground)));
+        let square = sized(Card::new("card-plain")).child(
+            recorded(div().size_full().bg(rgb(CARD_SQUARE)), "card:plain:content", records).size_full(),
+        );
+        let ring_off = sized(Card::new("card-ring-off")).child(body("Ring off"));
+        let ring_on = sized(Card::new("card-ring-on")).ring(true).child(body("Ring on"));
+        let row = |name: &'static str| div().flex().items_start().gap_4().child(label(name, cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Card", cx))
+            .child(row("Default").child(recorded(default, "card:default", records)))
+            .child(
+                row("Owner colours").child(
+                    div()
+                        .flex()
+                        .gap(px(6.))
+                        .p(px(6.))
+                        .bg(rgb(OWNER_CARD_SURROUND))
+                        .child(recorded(owned, "card:owner", records))
+                        .child(recorded(inactive, "card:owner-inactive", records)),
+                ),
+            )
+            .child(row("No header").child(recorded(square, "card:plain", records)))
+            .child(
+                row("Ring")
+                    .child(recorded(ring_off, "card:ring-off", records))
+                    .child(recorded(ring_on, "card:ring-on", records)),
+            )
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -1245,6 +1353,7 @@ impl Render for Gallery {
             .child(self.toggles_section(cx))
             .child(self.toggle_tooltip_section(cx))
             .child(self.tabs_section(cx))
+            .child(self.cards_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -2387,6 +2496,19 @@ mod check {
         let check = tabs_tooltip(&mut c).await;
         let check = pointer_away_after(&mut c, check).await;
         c.run_check("tabs-trigger-tooltip-shows-on-hover", check).await;
+        // Cards: the layout everywhere, what is drawn on Windows only.
+        let check = card_headerless_fills(&mut c).await;
+        c.run_check("card-without-a-header-content-fills-inside-the-border", check).await;
+        let check = card_header_above_content(&mut c).await;
+        c.run_check("card-header-row-along-the-top-inside-the-border", check).await;
+        let check = card_default_colours(&mut c).await;
+        c.run_check("card-default-colours-are-the-card-foreground-and-border-tokens", check).await;
+        let check = card_owner_colours(&mut c).await;
+        c.run_check("card-owner-colours-draw-card-and-header-whatever-the-tokens", check).await;
+        let check = card_ring(&mut c).await;
+        c.run_check("card-ring-is-a-band-outside-the-border-taking-no-room", check).await;
+        let check = card_corners(&mut c).await;
+        c.run_check("card-corners-show-the-surround-over-square-content", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -4492,6 +4614,203 @@ mod check {
         rest(c, at).await?;
         let shown = c.pixel(sample).await?;
         ensure!(near(shown, tooltip), "resting on a trigger showed {shown:?} at {sample:?}, not the tooltip {tooltip:?}");
+        Ok(())
+    }
+
+    // ---- cards ----
+
+    use brindle_ui::{CARD_BORDER, CARD_HEADER_HEIGHT, CardColors, card_style};
+
+    /// Whether two laid-out boxes match, within a pixel on each edge.
+    fn same_box(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+        close_to(a.left(), b.left()) && close_to(a.top(), b.top()) && close_to(a.right(), b.right()) && close_to(a.bottom(), b.bottom())
+    }
+
+    /// `bounds` less `inset` on every side.
+    fn inset(bounds: Bounds<Pixels>, inset: Pixels) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(bounds.left() + inset, bounds.top() + inset),
+            size: gpui::size(bounds.size.width - inset * 2., bounds.size.height - inset * 2.),
+        }
+    }
+
+    /// Within `tolerance` on every channel.
+    fn within(a: [u8; 3], b: [u8; 3], tolerance: u8) -> bool {
+        a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= tolerance)
+    }
+
+    /// The pixel of `row` that stands out most from `surface`: a glyph's
+    /// core, where its colour is least blended with what is behind it.
+    fn strongest(row: &[[u8; 3]], surface: [u8; 3]) -> [u8; 3] {
+        let distance = |p: &[u8; 3]| p.iter().zip(surface).map(|(a, b)| a.abs_diff(b) as u32).sum::<u32>();
+        row.iter().copied().max_by_key(distance).unwrap_or(surface)
+    }
+
+    /// The points across a header's title, through its middle: from past
+    /// the leading dot to the header's middle.
+    fn title_row(header: Bounds<Pixels>) -> Vec<Point<Pixels>> {
+        let (left, right) = (f32::from(header.left()) + 24., f32::from(header.center().x));
+        (0..((right - left) as usize)).map(|dx| point(px(left + dx as f32), header.center().y)).collect()
+    }
+
+    /// The spec's "Header optional": a card drawn without a header has its
+    /// content fill the whole card inside its border.
+    async fn card_headerless_fills(c: &mut Checker) -> Check {
+        let card = c.reveal("card:plain").await?;
+        let content = c.recorded("card:plain:content")?;
+        let inner = inset(card, CARD_BORDER);
+        ensure!(same_box(content, inner), "the headerless card's content is laid out at {content:?}, not {inner:?} (inside the border)");
+        Ok(())
+    }
+
+    /// The card's header row: inside the border at the card's top, the
+    /// header's height, and the content below it.
+    async fn card_header_above_content(c: &mut Checker) -> Check {
+        let card = c.reveal("card:default").await?;
+        let header = c.recorded("card:default:header")?;
+        let inner = inset(card, CARD_BORDER);
+        ensure!(
+            close_to(header.top(), inner.top()) && close_to(header.left(), inner.left()) && close_to(header.right(), inner.right()),
+            "the header is at {header:?}, not along the top of {inner:?}"
+        );
+        ensure!(
+            close_to(header.size.height, CARD_HEADER_HEIGHT),
+            "the header is {:?} tall, not {CARD_HEADER_HEIGHT:?}",
+            header.size.height
+        );
+        Ok(())
+    }
+
+    /// The spec's "Default colours" (surface, title and border from the
+    /// card, foreground and border tokens, the line under the header in the
+    /// border token), and the corners on the background.
+    async fn card_default_colours(c: &mut Checker) -> Check {
+        let card = c.reveal("card:default").await?;
+        let header = c.recorded("card:default:header")?;
+        let s = c.with(|_, _, cx| card_style(cx.ui_theme()))?;
+        card_colours(c, card, header, s, "default").await
+    }
+
+    /// The spec's "Owner colours": a card given a terminal's colours is
+    /// drawn in them, header included, whichever token set is active; an
+    /// inactive header's title is in the owner's muted colour.
+    async fn card_owner_colours(c: &mut Checker) -> Check {
+        let owner = super::owner_card_colors();
+        let result = card_owner_colours_in_both_sets(c, owner).await;
+        c.with(|gallery, _, cx| gallery.set_dark(false, cx))?;
+        c.tick().await;
+        result
+    }
+
+    async fn card_owner_colours_in_both_sets(c: &mut Checker, owner: CardColors) -> Check {
+        for dark in [false, true] {
+            c.with(move |gallery, _, cx| gallery.set_dark(dark, cx))?;
+            c.tick().await;
+            let card = c.reveal("card:owner").await?;
+            let header = c.recorded("card:owner:header")?;
+            let s = c.with(move |_, _, cx| card_style(cx.ui_theme()).with_colors(owner))?;
+            card_colours(c, card, header, s, if dark { "owner (dark set)" } else { "owner (light set)" }).await?;
+            // The inactive card's title is muted, not in the text colour.
+            let inactive = c.recorded("card:owner-inactive")?;
+            let inactive_header = Bounds {
+                origin: point(inactive.left() + CARD_BORDER, inactive.top() + CARD_BORDER),
+                size: gpui::size(inactive.size.width - CARD_BORDER * 2., CARD_HEADER_HEIGHT),
+            };
+            let (surface, text, muted) = (over(s.surface, s.surface), over(s.text, s.surface), over(s.muted, s.surface));
+            let shown = strongest(&c.pixels(&title_row(inactive_header)).await?, surface);
+            ensure!(
+                within(shown, muted, 32) && !within(shown, text, 32),
+                "the muted title's strongest pixel is {shown:?}, not the muted {muted:?} (text {text:?})"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads one card's surface, title, border, header line and corner.
+    async fn card_colours(
+        c: &mut Checker,
+        card: Bounds<Pixels>,
+        header: Bounds<Pixels>,
+        s: brindle_ui::CardStyle,
+        which: &str,
+    ) -> Check {
+        // The surfaces are opaque, in the tokens and the owner's colours.
+        let surface = over(s.surface, s.surround);
+        let (text, border, surround) = (over(s.text, s.surface), over(s.border, s.surface), over(s.surround, s.surround));
+        let samples = [
+            // The content's empty bottom middle.
+            point(card.center().x, card.bottom() - px(8.)),
+            // The left border, half way down.
+            point(card.left() + px(0.5), card.center().y),
+            // The line under the header.
+            point(card.center().x, header.bottom() - px(0.5)),
+            // Just inside the top left corner's square, outside its arc.
+            point(card.left() + px(1.5), card.top() + px(1.5)),
+        ];
+        let shown = c.pixels(&samples).await?;
+        ensure!(near(shown[0], surface), "the {which} card's surface is {:?}, not {surface:?}", shown[0]);
+        ensure!(near(shown[1], border), "the {which} card's border is {:?}, not {border:?}", shown[1]);
+        ensure!(near(shown[2], border), "the {which} card's header line is {:?}, not {border:?}", shown[2]);
+        ensure!(near(shown[3], surround), "the {which} card's corner is {:?}, not the surround {surround:?}", shown[3]);
+        let title = strongest(&c.pixels(&title_row(header)).await?, surface);
+        ensure!(within(title, text, 32), "the {which} card's title is at most {title:?}, not the text {text:?}");
+        Ok(())
+    }
+
+    /// The spec's "Ring outside the border": the ringed card is laid out as
+    /// the plain one is, and a band in the ring colour shows just above its
+    /// border, where the plain card shows the background.
+    async fn card_ring(c: &mut Checker) -> Check {
+        let off = c.reveal("card:ring-off").await?;
+        let on = c.recorded("card:ring-on")?;
+        ensure!(
+            close_to(on.size.width, off.size.width) && close_to(on.size.height, off.size.height) && close_to(on.top(), off.top()),
+            "the ringed card is laid out at {on:?}, the plain one at {off:?}: the ring took room"
+        );
+        let (background, ring) = c.with(|_, _, cx| {
+            let t = cx.ui_theme();
+            (over(t.background, t.background), over(brindle_ui::focus_ring(t), t.background))
+        })?;
+        let above = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() - px(1.5));
+        let shown = c.pixels(&[above(on), above(off)]).await?;
+        ensure!(near(shown[0], ring), "above the ringed card shows {:?}, not the ring {ring:?}", shown[0]);
+        ensure!(near(shown[1], background), "above the plain card shows {:?}, not the background {background:?}", shown[1]);
+        Ok(())
+    }
+
+    /// The spec's "Content with a square background": each corner of the
+    /// headerless card, whose content paints a square to its box, shows the
+    /// surround outside the rounded border, and the content shows inside.
+    async fn card_corners(c: &mut Checker) -> Check {
+        let card = c.reveal("card:plain").await?;
+        let (surround, border) = c.with(|_, _, cx| {
+            let s = card_style(cx.ui_theme());
+            (over(s.surround, s.surround), over(s.border, s.surround))
+        })?;
+        let square = {
+            let rgb = gpui::rgb(super::CARD_SQUARE);
+            [(rgb.r * 255.).round() as u8, (rgb.g * 255.).round() as u8, (rgb.b * 255.).round() as u8]
+        };
+        let d = px(1.5);
+        let corners = [
+            point(card.left() + d, card.top() + d),
+            point(card.right() - d, card.top() + d),
+            point(card.right() - d, card.bottom() - d),
+            point(card.left() + d, card.bottom() - d),
+        ];
+        let mut samples = corners.to_vec();
+        samples.push(card.center());
+        samples.push(point(card.left() + px(0.5), card.center().y));
+        let shown = c.pixels(&samples).await?;
+        for (ix, at) in corners.iter().enumerate() {
+            ensure!(
+                near(shown[ix], surround),
+                "corner {ix} at {at:?} shows {:?}, not the surround {surround:?} (the content is {square:?})",
+                shown[ix]
+            );
+        }
+        ensure!(near(shown[4], square), "the content shows {:?}, not its square {square:?}", shown[4]);
+        ensure!(near(shown[5], border), "the border over the content is {:?}, not {border:?}", shown[5]);
         Ok(())
     }
 }

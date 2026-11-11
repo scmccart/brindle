@@ -1,7 +1,5 @@
 # Proposal
 
-Status: skeleton. The decisions are made (below, no open questions left); specs, design and tasks are written when the change is picked up, after `ui-chrome` lands.
-
 ## Why
 
 `ui-chrome` moved the strip, the find bar, the menus and the zone headers' buttons and colours onto `brindle-ui`, but the **zone** itself is still hand-built: a 28px header bar made of `div`s (status dot, title, three ghost buttons) and 1px dividers. There is no `brindle-ui` component for "a titled pane with actions", and no shadcn look for the whole zone.
@@ -32,7 +30,7 @@ No existing `brindle-ui` component fits as is:
 
 10. **Unsplit local tabs are a card too**, with no header row, so a tab looks the same before and after a split and the same as a tmux window. The zones spec's "no header bar" rule for one zone is unchanged; only the card frame is new.
 11. **The tmux window card has no header row** either: a border and rounded corners round the whole window.
-12. **The ring shows on keyboard focus only** (shadcn's focus-visible), through the same focus-visible modality `brindle-ui` already tracks. A zone focused with the mouse shows no ring, so the header's title in the foreground (muted when inactive, as today) stays as the cue that works for both.
+12. **The ring shows on keyboard focus only, and only on tabs with two or more zones** (shadcn's focus-visible), through the same focus-visible modality `brindle-ui` already tracks. A zone focused with the mouse shows no ring, so the header's title in the foreground (muted when inactive, as today) stays as the cue that works for both.
 13. **Sizes (chosen here, adjusted by eye in the design):** a 6px gap between cards and as an outer margin round the card (twice the tab pill's 3px padding), the `rounded-lg` radius of the tokens (`radius_lg`), a 1px border, and the terminal's current padding unchanged inside the card. The card costs about 14px in each dimension against an edge-to-edge terminal (6px margin and 1px border on each side); the design verifies that `fit_grid` and the tmux `refresh-client -C` size account for it.
 
 ## Open questions
@@ -55,6 +53,7 @@ None. Narrow-zone overflow is tabled (decision 9).
 - `zones`: header, divider and card requirements.
 - `ui-components`: the `Card` component requirements.
 - `ui-theme-tokens`: zone headers (and their cards) join the tab faces as the exception to "chrome uses the tokens".
+- `tmux-control-mode`: a tmux window is one headerless card.
 
 ## Impact
 

@@ -16,8 +16,10 @@ while sessions stay in tmux, persistent and detachable.
   program's, on Windows the one its shell last reported (see
   [Shell integration](#shell-integration)).
 - **Zones**: split any local tab horizontally (ctrl-shift-e) or vertically (ctrl-shift-o)
-  into a binary tree of zones with native GPUI header bars and controls, move between
-  them with alt-arrows, and close a zone with ctrl-shift-x.
+  into a binary tree of zones, each a card in its terminal's colours with a header bar
+  and controls once the tab has two or more. Move between them with alt-arrows (the
+  active zone gets a focus ring when you move by keyboard), and close a zone with
+  ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
 - **Shell integration** (OSC 133): jump between prompts, select or copy the last
