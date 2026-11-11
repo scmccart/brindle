@@ -38,6 +38,7 @@ None.
 - `scrollback-search`: search scope and purpose no longer cover control-mode panes.
 - `links`: remove the control-mode pane requirement and purpose wording.
 - `shell-integration`: remove the tmux panes requirement and purpose wording.
+- `ui-components`: the menu item description example no longer uses a tmux profile.
 
 ## Impact
 
