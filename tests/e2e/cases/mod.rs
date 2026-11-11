@@ -183,9 +183,9 @@ impl Shots {
     /// Captures the window as `name` a little after step `step` ran, before
     /// the next one.
     fn after<'a>(&self, run: Run<'a>, ctx: &Ctx, step: usize, name: &'static str) -> Run<'a> {
-        let (display, shots) = (ctx.display.clone(), self.0.clone());
+        let (display, shots, slow) = (ctx.display.clone(), self.0.clone(), ctx.secs(1.0));
         run.call_at(step_time(step) + 0.55, move |pid| {
-            let image = capture::grab(&display, pid)?;
+            let image = capture::grab(&display, pid, slow)?;
             shots.lock().unwrap().push((name, image));
             Ok(())
         })

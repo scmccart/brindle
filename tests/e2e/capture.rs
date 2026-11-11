@@ -230,13 +230,54 @@ impl Cells {
 
 /// Window captures are X11-only; cases that need them run on Linux.
 #[cfg(not(target_os = "linux"))]
-pub fn grab(_display: &str, _pid: u32) -> Result<Image> {
+pub fn grab(_display: &str, _pid: u32, _slow: f64) -> Result<Image> {
     Err("window captures need X11".into())
 }
 
-/// Captures the viewable X11 window whose `_NET_WM_PID` is `pid`.
+/// Without X11 no window is ever seen: the receiver reports a closed channel.
+#[cfg(not(target_os = "linux"))]
+pub fn watch_window(_display: &str, _pid: u32, _slow: f64) -> std::sync::mpsc::Receiver<std::time::Instant> {
+    std::sync::mpsc::channel().1
+}
+
+/// Polls every 100 ms, on a thread of its own, for the viewable X11 window
+/// whose `_NET_WM_PID` is `pid`, and sends when it first appeared. Brindle
+/// times its steps and its dump from its window opening, so captures count
+/// from this moment, not from the spawn. It gives up after the window wait
+/// (`WINDOW_WAIT_SECS` scaled by `slow`), and the channel then closes.
 #[cfg(target_os = "linux")]
-pub fn grab(display: &str, pid: u32) -> Result<Image> {
+pub fn watch_window(display: &str, pid: u32, slow: f64) -> std::sync::mpsc::Receiver<Instant> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let display = display.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs_f64(WINDOW_WAIT_SECS * slow);
+        let Ok((conn, screen)) = x11rb::connect(Some(&display)) else { return };
+        let root = conn.setup().roots[screen].root;
+        let Some(atom) = conn.intern_atom(false, b"_NET_WM_PID").ok().and_then(|c| c.reply().ok()).map(|r| r.atom)
+        else {
+            return;
+        };
+        while Instant::now() < deadline {
+            if find_window(&conn, root, atom, pid).is_some() {
+                tx.send(Instant::now()).ok();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    rx
+}
+
+/// How long `grab` waits for the window to be viewable, before `slow`
+/// (`BRINDLE_E2E_SLOW`) scales it. A cold first launch on a loaded runner
+/// (lavapipe, an empty font cache) can take most of it; on a passing run the
+/// wait ends as soon as the window is up.
+pub const WINDOW_WAIT_SECS: f64 = 10.0;
+
+/// Captures the viewable X11 window whose `_NET_WM_PID` is `pid`, waiting
+/// for it up to `WINDOW_WAIT_SECS` scaled by `slow`.
+#[cfg(target_os = "linux")]
+pub fn grab(display: &str, pid: u32, slow: f64) -> Result<Image> {
     let (conn, screen) = x11rb::connect(Some(display)).map_err(|e| format!("X display {display}: {e}"))?;
     let root = conn.setup().roots[screen].root;
     let atom = conn
@@ -245,7 +286,7 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
         .reply()
         .map_err(|e| e.to_string())?
         .atom;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs_f64(WINDOW_WAIT_SECS * slow);
     let window = loop {
         if let Some(w) = find_window(&conn, root, atom, pid) {
             break w;
@@ -279,6 +320,12 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
 /// Asks the window of `pid` to close, as a window manager's close button
 /// does: a `WM_DELETE_WINDOW` client message (a protocol message to that
 /// window, not input).
+///
+/// It returns only once the server has processed the request. The server
+/// drops whatever it hasn't read from a client that hung up (a hang-up is an
+/// error to its poll loop, and it closes the client before reading), so a
+/// send, flush and disconnect could lose the message. A window manager keeps
+/// its connection open, so its close button never races like this.
 #[cfg(target_os = "linux")]
 pub fn request_close(display: &str, pid: u32) -> Result {
     use x11rb::protocol::xproto::{ClientMessageEvent, EventMask};
@@ -290,8 +337,12 @@ pub fn request_close(display: &str, pid: u32) -> Result {
     let (pid_atom, protocols, delete) = (atom(b"_NET_WM_PID")?, atom(b"WM_PROTOCOLS")?, atom(b"WM_DELETE_WINDOW")?);
     let window = find_window(&conn, root, pid_atom, pid).ok_or_else(|| format!("no viewable window for pid {pid}"))?;
     let event = ClientMessageEvent::new(32, window, protocols, [delete, x11rb::CURRENT_TIME, 0, 0, 0]);
-    conn.send_event(false, window, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
-    conn.flush().map_err(|e| e.to_string())?;
+    // `check` adds a round trip and waits for it; requests are handled in
+    // order, so the client message has been delivered when it returns.
+    conn.send_event(false, window, EventMask::NO_EVENT, event)
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| format!("WM_DELETE_WINDOW to {window:#x}: {e}"))?;
     Ok(())
 }
 

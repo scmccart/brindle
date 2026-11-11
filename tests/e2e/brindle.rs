@@ -2,7 +2,7 @@
 //! changes alongside it, and the `--dump-screen-after` output.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::capture::{self, Image};
@@ -413,7 +413,9 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Captures the window `secs` after Brindle starts.
+    /// Captures the window `secs` after it first appears, which is when
+    /// Brindle's steps and dump start counting (other timeline events count
+    /// from the spawn).
     pub fn capture_at(mut self, secs: f64) -> Self {
         self.capture_at = Some(secs);
         self
@@ -457,8 +459,12 @@ impl<'a> Run<'a> {
             .stdout(Stdio::piped())
             .stderr(log)
             .spawn()
+            .map(Reaped)
             .map_err(|e| format!("starting {}: {e}", ctx.bin.display()))?;
         let started = Instant::now();
+        // Captures count from the window's first appearance, as Brindle's
+        // steps and dump do; the rest of the timeline counts from the spawn.
+        let window_seen = self.capture_at.map(|_| capture::watch_window(&ctx.display, child.id(), ctx.secs(1.0)));
 
         // The timeline runs on its own thread, so captures can happen meanwhile.
         self.timeline.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -488,10 +494,18 @@ impl<'a> Run<'a> {
         });
 
         let mut image = None;
-        if let Some(at) = self.capture_at {
-            let due = started + Duration::from_secs_f64(ctx.secs(at));
+        if let (Some(at), Some(window_seen)) = (self.capture_at, window_seen) {
+            let seen = window_seen.recv().map_err(|_| {
+                format!(
+                    "no viewable window for pid {} on {} within {:.1} s",
+                    child.id(),
+                    ctx.display,
+                    ctx.secs(capture::WINDOW_WAIT_SECS)
+                )
+            })?;
+            let due = seen + Duration::from_secs_f64(ctx.secs(at));
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
-            let captured = capture::grab(&ctx.display, child.id())?;
+            let captured = capture::grab(&ctx.display, child.id(), ctx.secs(1.0))?;
             captured.save_ppm(&ctx.dir.join(format!("{}.ppm", self.label)));
             image = Some(captured);
         }
@@ -502,7 +516,6 @@ impl<'a> Run<'a> {
                 break status;
             }
             if Instant::now() > deadline {
-                child.kill().ok();
                 return Err(format!("Brindle didn't exit; see {}.log", self.label));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -531,6 +544,34 @@ impl<'a> Run<'a> {
         }
         ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
+    }
+}
+
+/// Brindle as `Run::run` spawned it. Dropping it kills Brindle if it is
+/// still running and waits for it, so a run that fails early (no window to
+/// capture, no exit by the deadline) never leaves it running into the next
+/// case, where it would later die on a closed stdout.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            self.0.kill().ok();
+        }
+        self.0.wait().ok();
     }
 }
 
