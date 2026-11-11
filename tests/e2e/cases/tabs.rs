@@ -7,7 +7,7 @@
 //! can't be posted on Linux, so a click on a tab or a button, and hovering
 //! for a tooltip, stay manual checks.
 
-use super::{CARD_INSET, server};
+use super::CARD_INSET;
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -235,8 +235,7 @@ fn measure_plus(image: &Image, strip: &Strip, bg: Rgb, face: Rgb) -> Result<Plus
 /// background. The `+` is a 16px icon (its arms lucide's 14 of 24, 9.3px)
 /// with strokes at least two pixels wide.
 pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "active").profile("Alt").config(&alt_profile()).capture_at(3.5).dump_at(4.0).run()?;
+    let out = Run::new(ctx, "active").profile("Alt").config(&alt_profile()).capture_at(3.5).dump_at(4.0).run()?;
     let image = out.image.as_ref().ok_or("no capture")?;
     let strip = Strip::locate(&out, image)?;
     // The empty caption, left of the window controls: the global theme's
@@ -270,7 +269,7 @@ pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
     );
 
     // The Alt tab in the background, a Shell tab (the global theme) active.
-    let out = Run::new(ctx, &server, "background")
+    let out = Run::new(ctx, "background")
         .profile("Alt")
         .default_profile("Shell")
         .config(&alt_profile())
@@ -294,9 +293,7 @@ pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// A run starting in a bash tab whose `new_tab` opens another bash tab (the
-/// test config's default profile is otherwise `tmux`, whose windows arrive
-/// as tabs on their own time).
+/// A run starting in a bash tab whose `new_tab` opens another bash tab.
 fn shell(run: Run) -> Run {
     run.profile("Shell").default_profile("Shell")
 }
@@ -328,12 +325,11 @@ fn expect_focus(out: &Output, place: &str, what: &str) -> Result {
 /// strip; home goes to the first and escape gives focus back to its
 /// terminal; left goes to the previous and enter gives focus back.
 pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = three_tabs(Run::new(ctx, &server, "focus")).action("focus_tab_strip").dump_at(step_time(3) + 1.0).run()?;
+    let out = three_tabs(Run::new(ctx, "focus")).action("focus_tab_strip").dump_at(step_time(3) + 1.0).run()?;
     expect_active(&out, 3, 2, "after focus_tab_strip")?;
     expect_focus(&out, "tabs", "after focus_tab_strip")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "right"))
+    let out = three_tabs(Run::new(ctx, "right"))
         .action("focus_tab_strip")
         .key("right")
         .dump_at(step_time(4) + 1.0)
@@ -341,7 +337,7 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 3, 0, "after right from the last tab")?;
     expect_focus(&out, "tabs", "after right")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "home-escape"))
+    let out = three_tabs(Run::new(ctx, "home-escape"))
         .action("focus_tab_strip")
         .key("home")
         .key("escape")
@@ -350,7 +346,7 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 3, 0, "after home and escape")?;
     expect_focus(&out, "terminal", "after escape")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "left-enter"))
+    let out = three_tabs(Run::new(ctx, "left-enter"))
         .action("focus_tab_strip")
         .key("left")
         .key("enter")
@@ -364,12 +360,11 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
 /// `new_tab` and `close_tab` leave focus in the active tab's terminal, and
 /// a new tab opened while the strip has focus takes focus into its own.
 pub fn actions_keep_focus(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = shell(Run::new(ctx, &server, "new-tab")).action("new_tab").dump_at(step_time(1) + 1.5).run()?;
+    let out = shell(Run::new(ctx, "new-tab")).action("new_tab").dump_at(step_time(1) + 1.5).run()?;
     expect_active(&out, 2, 1, "after new_tab")?;
     expect_focus(&out, "terminal", "after new_tab")?;
 
-    let out = shell(Run::new(ctx, &server, "close-tab"))
+    let out = shell(Run::new(ctx, "close-tab"))
         .action("new_tab")
         .action("close_tab")
         .dump_at(step_time(2) + 1.5)
@@ -377,7 +372,7 @@ pub fn actions_keep_focus(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 1, 0, "after new_tab and close_tab")?;
     expect_focus(&out, "terminal", "after close_tab")?;
 
-    let out = shell(Run::new(ctx, &server, "from-strip"))
+    let out = shell(Run::new(ctx, "from-strip"))
         .action("focus_tab_strip")
         .action("new_tab")
         .dump_at(step_time(2) + 1.5)

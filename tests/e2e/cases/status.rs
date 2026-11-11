@@ -2,7 +2,6 @@
 //! (read from `BRINDLE_NOTIFY_LOG`, as in `notify.rs`), and the feature
 //! query's reply.
 
-use super::server;
 use crate::brindle::Run;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -34,13 +33,12 @@ fn setup(ctx: &Ctx) -> String {
 /// `blocked` root record in the dump, the latter notifying. Second: a
 /// `done` record outlives the program and the prompt that follows it.
 pub fn local(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let log = ctx.dir.join("notify.log");
     // `--send` turns `\n` into a newline, so the reply is printed with echo.
     let query = r#"printf '\033]7501;?\033\\'; read -rs -t 3 -d '\\' r; echo "reply:$r" | tr -d '\033'\r"#;
     let working = r"\033]7501;state=working:id=a:progress=40:app=cargo\033\\";
     let blocked = r"\033]7501;state=blocked:kind=permission:app=claude-code:msg=UnVuIGNhcmdvIHRlc3Q/\033\\";
-    let out = Run::new(ctx, &server, "blocked")
+    let out = Run::new(ctx, "blocked")
         .profile("Shell")
         .config("\n[notifications]\nwhen = \"always\"\n")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
@@ -65,7 +63,7 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
 
     std::fs::remove_file(&log).ok();
     let done = r"\033]7501;state=done:app=brew:msg=VXBncmFkZWQgMTIgcGFja2FnZXM=\033\\";
-    let out = Run::new(ctx, &server, "done")
+    let out = Run::new(ctx, "done")
         .profile("Shell")
         .config("\n[notifications]\nwhen = \"always\"\n")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
@@ -86,28 +84,23 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// A `blocked` report without a message from a pane in a tmux window whose
-/// tab isn't active (the default `when = "unfocused"`): the notification
-/// names the window and says what kind of wait it is.
-pub fn tmux_pane(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    server.run(&["new-window", "-d", "-t", "e2e", "-n", "bg"])?;
+/// A `blocked` report without a message from a tab that isn't active (the
+/// default `when = "unfocused"`): one notification, naming the app and
+/// saying what kind of wait it is. The report waits until a second tab has
+/// opened in front of it.
+pub fn background_tab(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
-    let report = r"printf '\033]7501;state=blocked:kind=auth:app=brew\033\\'; sleep 30";
-    let out = Run::new(ctx, &server, "run")
+    let report = r"sleep 3; printf '\033]7501;state=blocked:kind=auth:app=brew\033\\'; sleep 30\r";
+    let out = Run::new(ctx, "run")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
-        .at(2.5, &["send-keys", "-t", "e2e:bg", "-l", report])
-        .at(2.6, &["send-keys", "-t", "e2e:bg", "Enter"])
-        .dump_at(5.0)
+        .send(report)
+        .action("new_tab")
+        .dump_at(7.0)
         .run()?;
-    ensure!(
-        out.dump.tabs.iter().any(|(t, active)| t == "bg" && !active),
-        "expected an inactive tab \"bg\": {:?}",
-        out.dump.tabs
-    );
-    ensure!(out.dump.status.is_empty(), "the active window has no records: {:?}", out.dump.status);
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "expected the second tab active: {:?}", out.dump.tabs);
+    ensure!(out.dump.status.is_empty(), "the active tab has no records: {:?}", out.dump.status);
     let got = notifications(ctx);
-    let want = ["osc7501\tbrew — bg\tWaiting for a login"];
-    ensure!(got == want, "notifications {got:?}, expected {want:?}");
+    ensure!(got.len() == 1, "one notification expected, got {got:?}");
+    expect_notification(&got, "brew", "Waiting for a login")?;
     Ok(Outcome::Pass)
 }

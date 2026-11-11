@@ -1,12 +1,12 @@
-//! Running Brindle: the test config, a timeline of tmux commands alongside
-//! it, and the `--dump-screen-after` output.
+//! Running Brindle: the test config, a timeline of checks and config
+//! changes alongside it, and the `--dump-screen-after` output.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::capture::{self, Image};
-use crate::tmux::{TmuxServer, trim_screen};
+use crate::common::trim_screen;
 use crate::{Ctx, Result, ensure};
 
 /// The test config's theme. Cases assert against these colors, so they
@@ -36,10 +36,7 @@ pub mod theme {
         Rgb(0xff, 0xff, 0xff),
     ];
     pub const RED: Rgb = ANSI[1];
-    pub const GREEN: Rgb = ANSI[2];
-    pub const YELLOW: Rgb = ANSI[3];
     pub const BLUE: Rgb = ANSI[4];
-    pub const MAGENTA: Rgb = ANSI[5];
 
     /// The window chrome's `background` token for the `e2e` theme: its
     /// background mixed 35% towards black (`Theme::ui_tokens`), which the
@@ -50,12 +47,6 @@ pub mod theme {
     /// terminal theme's colours (`Theme::card_border`), so an `e2e` tab's
     /// cards are drawn in it too.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
-    /// The `secondary` token for the `e2e` theme: `CHROME_BACKGROUND` mixed
-    /// 8% towards the foreground, which tmux's zoomed badge is drawn on.
-    pub const CHROME_SECONDARY: Rgb = Rgb(0x19, 0x1b, 0x1e);
-    /// A tmux divider with no border style: `CHROME_BORDER` mixed 15%
-    /// towards the foreground token.
-    pub const TMUX_DIVIDER: Rgb = Rgb(0x3c, 0x40, 0x42);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
@@ -68,7 +59,7 @@ pub mod theme {
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
     /// The second theme's blue; its other ANSI colors are the first's.
     pub const ALT_BLUE: Rgb = Rgb(0x30, 0x60, 0xc0);
-    /// The border of a card (a zone, a tmux window) in a theme of
+    /// The border of a zone's card in a theme of
     /// `ALT_FOREGROUND` on `ALT_BACKGROUND` (`e2e-alt`, and the cases' own
     /// themes with those colours): the background mixed 12% towards the
     /// foreground (`Theme::card_border`).
@@ -79,13 +70,14 @@ pub mod theme {
     pub const ALT_CARD_MUTED: Rgb = Rgb(0x71, 0x6e, 0x6e);
 }
 
-/// The test config, with `theme_name` as the global theme.
-pub fn config(socket: &str, theme_name: &str) -> String {
-    config_with(socket, theme_name, "tmux", "")
+/// The test config, with `theme_name` as the global theme. Its one profile,
+/// `Shell`, is the default.
+pub fn config(theme_name: &str) -> String {
+    config_with(theme_name, "Shell", "")
 }
 
 /// The test config with another default profile and extra top-level lines.
-pub fn config_with(socket: &str, theme_name: &str, default_profile: &str, top: &str) -> String {
+pub fn config_with(theme_name: &str, default_profile: &str, top: &str) -> String {
     use theme::*;
     let ansi: Vec<String> = ANSI.iter().map(|c| format!("\"{}\"", c.hex())).collect();
     let mut alt_ansi = ansi.clone();
@@ -102,12 +94,6 @@ blink = false
 name = "Shell"
 command = "bash"
 args = ["--norc", "--noprofile"]
-
-[[profiles]]
-name = "tmux"
-tmux = "control"
-tmux_session = "e2e"
-tmux_args = ["-L", "{socket}", "-f", "/dev/null"]
 
 [themes.e2e]
 foreground = "{fg}"
@@ -140,19 +126,15 @@ ansi = [{alt_ansi}]
 }
 
 enum Event {
-    Tmux(Vec<String>),
-    /// Runs a tmux command and saves its output as `<label>-<name>.txt`.
-    Record(Vec<String>, String),
     /// Rewrites the config with another theme (Brindle reloads it).
     Theme(&'static str),
     /// Runs a check or an action, given Brindle's pid; an error fails the run.
     Call(Box<dyn FnOnce(u32) -> Result + Send>),
 }
 
-/// One run of Brindle attached to a test server's session.
+/// One run of Brindle.
 pub struct Run<'a> {
     ctx: &'a Ctx,
-    server: &'a TmuxServer,
     label: &'static str,
     profile: &'static str,
     /// Appended to the test config (after its tables).
@@ -161,8 +143,6 @@ pub struct Run<'a> {
     top: String,
     /// Brindle should quit by itself (its window closed) before the dump.
     expect_exit: bool,
-    /// The window has no tabs at the dump, only a palette.
-    without_tabs: bool,
     /// A timeline call kills Brindle, so it prints no dump.
     expect_killed: bool,
     /// Another Brindle binary than `ctx.bin`.
@@ -240,16 +220,14 @@ pub struct Output {
 
 impl<'a> Run<'a> {
     /// `label` names the run's files in the case directory.
-    pub fn new(ctx: &'a Ctx, server: &'a TmuxServer, label: &'static str) -> Self {
+    pub fn new(ctx: &'a Ctx, label: &'static str) -> Self {
         Run {
             ctx,
-            server,
             label,
-            profile: "tmux",
+            profile: "Shell",
             extra_config: String::new(),
             top: String::new(),
             expect_exit: false,
-            without_tabs: false,
             expect_killed: false,
             bin: None,
             steps: Vec::new(),
@@ -259,7 +237,7 @@ impl<'a> Run<'a> {
             dump_at: 4.0,
             capture_at: None,
             restore: false,
-            default_profile: "tmux",
+            default_profile: "Shell",
             args: Vec::new(),
             command: Vec::new(),
             keep_detached: false,
@@ -319,8 +297,8 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Starts with another profile of the test config (default `tmux`;
-    /// `Shell` is a local bash).
+    /// Starts with another profile (default `Shell`, the test config's local
+    /// bash; others come from [`Run::config`]).
     pub fn profile(mut self, name: &'static str) -> Self {
         self.profile = name;
         self
@@ -352,7 +330,7 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Adds top-level keys to the test config, e.g. `tmux_session_end = "ask"`.
+    /// Adds top-level keys to the test config, e.g. `scrollback = 100`.
     pub fn top(mut self, text: &str) -> Self {
         self.top.push_str(text);
         if !text.ends_with('\n') {
@@ -398,13 +376,6 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Expects the dumped window to have no tabs, only an open palette, so
-    /// the dump has no screen.
-    pub fn without_tabs(mut self) -> Self {
-        self.without_tabs = true;
-        self
-    }
-
     /// Opens the find bar on the active terminal and searches for `text`.
     pub fn find(mut self, text: &str) -> Self {
         self.steps.extend(["--find".to_string(), text.to_string()]);
@@ -431,25 +402,6 @@ impl<'a> Run<'a> {
         self
     }
 
-    /// Runs a tmux command `secs` after Brindle starts.
-    pub fn at(mut self, secs: f64, args: &[&str]) -> Self {
-        self.timeline.push((secs, Event::Tmux(args.iter().map(|a| a.to_string()).collect())));
-        self
-    }
-
-    /// Runs a tmux command `secs` after Brindle starts and keeps its output,
-    /// read back with [`Run::recorded`].
-    pub fn record_at(mut self, secs: f64, name: &str, args: &[&str]) -> Self {
-        self.timeline.push((secs, Event::Record(args.iter().map(|a| a.to_string()).collect(), name.to_string())));
-        self
-    }
-
-    /// The output of a [`Run::record_at`] command of a run labelled `label`.
-    pub fn recorded(ctx: &Ctx, label: &str, name: &str) -> Result<String> {
-        let path = ctx.dir.join(format!("{label}-{name}.txt"));
-        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
-    }
-
     /// Switches the config to another theme `secs` after Brindle starts.
     pub fn theme_at(mut self, secs: f64, theme: &'static str) -> Self {
         self.timeline.push((secs, Event::Theme(theme)));
@@ -470,7 +422,7 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        let mut text = config_with(&self.server.socket, "e2e", self.default_profile, &self.top);
+        let mut text = config_with("e2e", self.default_profile, &self.top);
         if let Some(padding) = self.padding {
             text = text.replacen("\npadding = 6\n", &format!("\npadding = {padding}\n"), 1);
         }
@@ -511,10 +463,8 @@ impl<'a> Run<'a> {
         // The timeline runs on its own thread, so captures can happen meanwhile.
         self.timeline.sort_by(|a, b| a.0.total_cmp(&b.0));
         let timeline: Vec<(f64, Event)> = std::mem::take(&mut self.timeline);
-        let socket = self.server.socket.clone();
         let slow = ctx.secs(1.0);
         let config_for_reload = config_path.clone();
-        let (case_dir, label) = (ctx.dir.clone(), self.label);
         let brindle_pid = child.id();
         let events = std::thread::spawn(move || -> Vec<String> {
             let mut errors = Vec::new();
@@ -522,33 +472,8 @@ impl<'a> Run<'a> {
                 let due = started + Duration::from_secs_f64(secs * slow);
                 std::thread::sleep(due.saturating_duration_since(Instant::now()));
                 match event {
-                    Event::Tmux(args) => {
-                        let out = Command::new("tmux").args(["-L", &socket, "-f", "/dev/null"]).args(&args).output();
-                        match out {
-                            Ok(o) if o.status.success() => {}
-                            Ok(o) => errors.push(format!(
-                                "tmux {}: {}",
-                                args.join(" "),
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            )),
-                            Err(e) => errors.push(format!("tmux: {e}")),
-                        }
-                    }
-                    Event::Record(args, name) => {
-                        let out = Command::new("tmux").args(["-L", &socket, "-f", "/dev/null"]).args(&args).output();
-                        let text = match out {
-                            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-                            Err(e) => {
-                                errors.push(format!("tmux: {e}"));
-                                String::new()
-                            }
-                        };
-                        if let Err(e) = std::fs::write(case_dir.join(format!("{label}-{name}.txt")), text) {
-                            errors.push(format!("saving {name}: {e}"));
-                        }
-                    }
                     Event::Theme(theme) => {
-                        if let Err(e) = std::fs::write(&config_for_reload, config(&socket, theme)) {
+                        if let Err(e) = std::fs::write(&config_for_reload, config(theme)) {
                             errors.push(format!("rewriting config: {e}"));
                         }
                     }
@@ -604,15 +529,7 @@ impl<'a> Run<'a> {
             ensure!(status.success(), "Brindle exited with {status}; see {}.log", self.label);
             return Ok(Output { dump, image });
         }
-        if self.without_tabs {
-            ensure!(
-                dump.tabs.is_empty() && !dump.palette.is_empty(),
-                "expected a palette and no tabs; see {}.dump",
-                self.label
-            );
-        } else {
-            ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
-        }
+        ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
     }
 }
@@ -670,7 +587,7 @@ pub struct Dump {
     /// `settings`, `tabs` (the tab strip), `menu`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
-    /// `list`, `session_end`, `close`, a field's or a button's label.
+    /// `sections`, `list`, `close`, a field's or a button's label.
     pub focus_stop: Option<String>,
     /// The window's focus-visible modality (`modality=`): `keyboard` or
     /// `pointer`.
@@ -807,26 +724,6 @@ fn parse_grid(text: &str) -> Option<Grid> {
     })
 }
 
-/// Checks the active pane's text and size against tmux.
-pub fn matches_tmux(server: &TmuxServer, dump: &Dump, pane: &str) -> Result {
-    let [_, _, width, height] = server.geometry(pane)?;
-    ensure!(
-        dump.size == Some((width, height)),
-        "Brindle's grid is {:?}, tmux's pane {pane} is {width}x{height}",
-        dump.size
-    );
-    let tmux = server.capture(pane)?;
-    if dump.screen != tmux {
-        let first = dump.screen.iter().zip(&tmux).position(|(a, b)| a != b).unwrap_or(dump.screen.len().min(tmux.len()));
-        return Err(format!(
-            "screen differs from capture-pane of {pane} at line {first}: Brindle {:?}, tmux {:?}",
-            dump.screen.get(first),
-            tmux.get(first)
-        ));
-    }
-    Ok(())
-}
-
 pub fn self_test_dump() -> Result {
     let dump = Dump::parse(
         "--- tab 1 \"bash\" (active)\n--- tab 2 \"vi\"\n--- screen 56x32 mode TermMode(SHOW_CURSOR)\n\
@@ -873,14 +770,14 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);
     let dump = Dump::parse(
-        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- palette list query=\"splt\"\ntmux: Split Right  [ctrl-shift-e]\n\
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- palette list query=\"splt\"\nSplit Zone Right  [ctrl-shift-e]\n\
          --- input text=\"split\" cursor=4 selection=1..4\n",
     );
     ensure!(dump.screen == ["hi"], "screen before the palette {:?}", dump.screen);
-    ensure!(dump.palette == ["list query=\"splt\"", "tmux: Split Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
+    ensure!(dump.palette == ["list query=\"splt\"", "Split Zone Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
     let input = Input { text: "split".into(), cursor: 4, selection: (1, 4) };
     ensure!(dump.input == Some(input), "input {:?}", dump.input);
-    let line = "--- settings section=Profiles mode=editor name=\"tmux\" field=\"Theme\" theme=\"e2e-alt\" tmux=\"control\" default=true invalid=[] can_save=true error=None\n";
+    let line = "--- settings section=Profiles mode=editor name=\"Shell\" field=\"Theme\" theme=\"e2e-alt\" default=true invalid=[] can_save=true error=None\n";
     let dump = Dump::parse(line);
     let settings = dump.settings.as_deref().unwrap_or("");
     ensure!(settings.starts_with("section=Profiles mode=editor") && settings.contains("theme=\"e2e-alt\""), "settings {settings:?}");
@@ -909,17 +806,17 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
     ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
     let dump = Dump::parse(
-        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|tmux highlighted=0\n\
-         Shell  bash  [ctrl-alt-1]\nOff\ntmux  tmux control mode · e2e  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|Other highlighted=0\n\
+         Shell  bash  [ctrl-alt-1]\nOff\nOther  sh · /tmp  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",
     );
     ensure!(dump.screen == ["hi"], "screen before the menu {:?}", dump.screen);
     ensure!(
         dump.menu
             == [
-                "items=Shell|[Off]|tmux highlighted=0",
+                "items=Shell|[Off]|Other highlighted=0",
                 "Shell  bash  [ctrl-alt-1]",
                 "Off",
-                "tmux  tmux control mode · e2e  [ctrl-alt-3]"
+                "Other  sh · /tmp  [ctrl-alt-3]"
             ],
         "menu {:?}",
         dump.menu

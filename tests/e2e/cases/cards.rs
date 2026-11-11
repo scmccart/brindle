@@ -1,21 +1,19 @@
-//! Zones and tmux windows drawn as cards (OpenSpec change `zones-shadcn`):
-//! a card's 1px border in its terminal theme's colours, the 6px gap round
-//! and between cards in the chrome's `background` token, the strip's colour
-//! (no dividers), the corners rounded over the terminal in that colour, the
+//! Zones drawn as cards (OpenSpec change `zones-shadcn`): a card's 1px
+//! border in its terminal theme's colours, the 6px gap round and between
+//! cards in the chrome's `background` token, the strip's colour (no
+//! dividers), the corners rounded over the terminal in that colour, and the
 //! focus ring on the active zone of a split tab only while focus came from
-//! the keyboard, in the global theme's ring colour, and one card round a
-//! whole tmux window.
+//! the keyboard, in the global theme's ring colour.
 //!
 //! Every case uses a profile theme of `ALT_FOREGROUND` on `ALT_BACKGROUND`
-//! (`e2e-zone` for local tabs, `e2e-alt` for tmux) while the global theme
-//! stays `e2e`, so a card's border (`ALT_CARD_BORDER`) differs from the
+//! (`e2e-zone`) while the global theme stays `e2e`, so a card's border (`ALT_CARD_BORDER`) differs from the
 //! global border token (`CHROME_BORDER`), which the old dividers were drawn
 //! in, and its terminal's padding (`ALT_BACKGROUND`) from the gap round it
 //! (`CHROME_BACKGROUND`). Borders are matched within 2 per channel: at the
 //! usual 24, the border colours and the backgrounds all match each other.
 
 use super::zones::{ZONE_ACCENT, ZONE_PROFILE};
-use super::{CARD_BORDER, CARD_INSET, Shots, ZONE_GAP, ring_between, server, step_time, styles};
+use super::{CARD_BORDER, Shots, ZONE_GAP, ring_between, step_time};
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Changes, Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -116,10 +114,10 @@ fn expect_gap(image: &Image, what: &str, line: Line, range: (u32, u32)) -> Resul
 /// theme's border token) round its terminal and its padding (in the
 /// terminal's background), and a 6px margin in the chrome's background on
 /// every side: left and right along a row below the prompt, above and
-/// below down a column.
+/// below down a column. The grid fills the card less its padding, in whole
+/// cells.
 pub fn zone_border(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run").profile("Alt").config(ZONE_PROFILE).capture_at(3.0).dump_at(3.5).run()?;
+    let out = Run::new(ctx, "run").profile("Alt").config(ZONE_PROFILE).capture_at(3.0).dump_at(3.5).run()?;
     ensure!(out.dump.zones.is_none(), "one zone, but --- zones {:?}", out.dump.zones);
     let image = image(&out)?;
     let grid = out.dump.grid()?;
@@ -153,6 +151,17 @@ pub fn zone_border(ctx: &Ctx) -> Result<Outcome> {
     expect_all(image, "right padding", row, (dev(grid_right, s), b0), theme::ALT_BACKGROUND)?;
     expect_gap(image, "right margin", row, (b1, image.width))?;
     ensure!(near_px(image.width - b1, gap), "right margin: {} px from the border at {b0} to the window's edge", image.width - b1);
+    // The grid is the card's inner area less the padding, in whole cells
+    // (`fit_grid`): what is left on the right is the padding and less than
+    // another column.
+    let fits = |what: &str, spare: f32, cell: f32| -> Result {
+        ensure!(
+            spare >= PADDING - 1.0 && spare < PADDING + cell + 1.0,
+            "{what}: {spare} px between the grid and the border, want the {PADDING} px padding and less than a cell ({cell})"
+        );
+        Ok(())
+    };
+    fits("right of the grid", b0 as f32 / s - grid_right, grid.cell_width)?;
 
     // Down a column past the prompt: from the margin's top to the grid,
     // and from the grid's last row to the window's bottom edge. The strip,
@@ -162,7 +171,8 @@ pub fn zone_border(ctx: &Ctx) -> Result<Outcome> {
     let (b0, b1) = one_border(image, "top edge", column, (margin_top, dev(grid.y, s)), Some(dev(top, s)), s)?;
     expect_gap(image, "top margin", column, (b0.saturating_sub(gap), b0))?;
     expect_all(image, "top padding", column, (b1, dev(grid.y, s)), theme::ALT_BACKGROUND)?;
-    let (_, b1) = one_border(image, "bottom edge", column, (dev(grid_bottom, s), image.height), None, s)?;
+    let (b0, b1) = one_border(image, "bottom edge", column, (dev(grid_bottom, s), image.height), None, s)?;
+    fits("below the grid", b0 as f32 / s - grid_bottom, grid.line_height)?;
     expect_gap(image, "bottom margin", column, (b1, image.height))?;
     ensure!(near_px(image.height - b1, gap), "bottom margin: {} px under the border", image.height - b1);
     Ok(Outcome::Pass)
@@ -176,8 +186,7 @@ pub fn zone_border(ctx: &Ctx) -> Result<Outcome> {
 /// it are green.
 pub fn zone_corners(ctx: &Ctx) -> Result<Outcome> {
     const GREEN: Rgb = Rgb(0x00, 0xc8, 0x00);
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Alt")
         .config(ZONE_PROFILE)
         .padding(0)
@@ -224,8 +233,7 @@ pub fn zone_corners(ctx: &Ctx) -> Result<Outcome> {
 /// the headers and a row through the terminals. Focus is counted as from
 /// the pointer, so the active zone's ring isn't drawn in the gap.
 pub fn zone_gap(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Alt")
         .config(ZONE_PROFILE)
         .action("split_zone_right")
@@ -282,9 +290,8 @@ fn ring(shots: &Shots, ctx: &Ctx, what: &str, pair: (&str, &str), scale: f32) ->
 /// orange), not the zone
 /// theme's blue accent. A tab of one zone shows no ring either way.
 pub fn zone_ring(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let shots = Shots::default();
-    let run = Run::new(ctx, &server, "split").profile("Alt").config(ZONE_PROFILE).action("split_zone_right");
+    let run = Run::new(ctx, "split").profile("Alt").config(ZONE_PROFILE).action("split_zone_right");
     let run = shots.after(run.modality("keyboard"), ctx, 2, "right-key");
     let run = shots.after(run.modality("pointer"), ctx, 3, "right-pointer");
     let run = shots.after(run.key("alt-left"), ctx, 4, "left-key");
@@ -332,7 +339,7 @@ pub fn zone_ring(ctx: &Ctx) -> Result<Outcome> {
     // One zone: the margin round the card is the same from the keyboard
     // and from the pointer.
     let shots = Shots::default();
-    let run = Run::new(ctx, &server, "one-zone").profile("Alt").config(ZONE_PROFILE);
+    let run = Run::new(ctx, "one-zone").profile("Alt").config(ZONE_PROFILE);
     let run = shots.after(run.modality("keyboard"), ctx, 1, "one-key");
     let run = shots.after(run.modality("pointer"), ctx, 2, "one-pointer");
     let out = run.dump_at(step_time(2) + 0.9).run()?;
@@ -349,70 +356,5 @@ pub fn zone_ring(ctx: &Ctx) -> Result<Outcome> {
         }
         Ok(())
     })?;
-    Ok(Outcome::Pass)
-}
-
-/// The spec's "Window card" and "Size reported to tmux": a tmux window of
-/// two panes side by side, in a profile theme of `ALT_FOREGROUND` on
-/// `ALT_BACKGROUND` (`tmux-alt`), is one card. Along a row through both
-/// panes there are exactly two runs of the card's border colour, its left
-/// and right edges, each with the 6px margin outside it, and none at the
-/// divider between the panes. The size Brindle reports to tmux is the
-/// card's inner area less the padding, in whole cells.
-pub fn tmux_window(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    server.run(&["split-window", "-h", "-t", "e2e"])?;
-    for pane in ["%0", "%1"] {
-        server.type_line(pane, "clear")?;
-    }
-    ctx.sleep(0.5);
-    let out = Run::new(ctx, &server, "run")
-        .profile("tmux-alt")
-        .config(&styles::alt_profile(&server))
-        .record_at(3.0, "size", &["display-message", "-p", "-t", "e2e", "#{window_width} #{window_height}"])
-        .capture_at(3.5)
-        .dump_at(5.0)
-        .run()?;
-    let image = image(&out)?;
-    let grid = out.dump.grid()?;
-    let s = grid.scale;
-    // The window's first cell, from the active pane's.
-    let [left, top, ..] = server.geometry(&server.active_pane()?)?;
-    let (x, y) = (grid.x - grid.cell_width * left as f32, grid.y - grid.line_height * top as f32);
-    let card_left = x - PADDING - CARD_BORDER;
-
-    let row = Line::Row(dev(y + grid.line_height * 5.5, s));
-    let range = (0, image.width);
-    let runs = border_runs(image, "a row through both panes", row, range)?;
-    let found = || format!("{runs:?} along {row:?}; found {}", row.summary(image, range));
-    ensure!(runs.len() == 2, "want the card's two edges and no border per pane, got {}", found());
-    let [(a0, a1), (b0, b1)] = [runs[0], runs[1]];
-    ensure!(
-        near_px(a1 - a0, dev(CARD_BORDER, s)) && near_px(b1 - b0, dev(CARD_BORDER, s)),
-        "borders aren't 1px: {}",
-        found()
-    );
-    ensure!(near_px(a0, dev(card_left, s)), "the card's left edge isn't at {}: {}", dev(card_left, s), found());
-    let gap = dev(ZONE_GAP, s);
-    ensure!(a0 + 1 >= gap && near_px(image.width - b1, gap), "the margins aren't 6px: {}", found());
-    expect_gap(image, "left margin", row, (a0 + 1 - gap.min(a0 + 1), a0))?;
-    expect_gap(image, "right margin", row, (b1, image.width))?;
-
-    // The card's inner area, from the window's first cell less the padding
-    // to the window's edges less the margin and the border; the grid is
-    // that less the padding, in whole cells (`fit_grid`).
-    let (width, height) = (image.width as f32 / s, image.height as f32 / s);
-    let inner = (width - CARD_INSET - (x - PADDING), height - CARD_INSET - (y - PADDING));
-    let want = (
-        ((inner.0 - 2.0 * PADDING) / grid.cell_width).floor() as u16,
-        ((inner.1 - 2.0 * PADDING) / grid.line_height).floor() as u16,
-    );
-    let size = Run::recorded(ctx, "run", "size")?;
-    let got = size
-        .trim()
-        .split_once(' ')
-        .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
-        .ok_or(format!("tmux window size {size:?}"))?;
-    ensure!(got == want, "tmux's window is {got:?} cells, want {want:?} from the card's inner {inner:?} px");
     Ok(Outcome::Pass)
 }
