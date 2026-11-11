@@ -5,9 +5,11 @@
 //! [`crate::access`], re-exported here.
 
 use std::ffi::c_void;
+use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree, WIN32_ERROR};
 use windows::Win32::Security::Authorization::{
@@ -22,7 +24,10 @@ use windows::Win32::Security::{
     SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
     TokenIntegrityLevel, TokenUser,
 };
-use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, GetFileInformationByHandle, MOVE_FILE_FLAGS,
+    MoveFileExW,
+};
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -427,6 +432,129 @@ impl Dacl {
     }
 }
 
+/// What tells one file from another whatever its name: the volume's serial
+/// number and the file's index on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    volume: u32,
+    index: u64,
+}
+
+/// The identity of an open file (`GetFileInformationByHandle`). A file
+/// created under a deleted file's name has another one.
+pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open for the call and `info` is writable.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.map_err(os)?;
+    Ok(FileIdentity {
+        volume: info.dwVolumeSerialNumber,
+        index: u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow),
+    })
+}
+
+/// This process's image path (`GetModuleFileNameW`, through std). A server
+/// role runs from its per-build copy, so this is what it starts roles from.
+pub fn own_image_path() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}
+
+/// The build id of the file at `path`, or `None` when it can't be read.
+fn build_of(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| crate::build_id::of_binary(&bytes))
+}
+
+/// Makes sure the per-build copy of the helper at `installed` exists under
+/// `copies` (see [`crate::server_dir::helper_copies`]) and returns its path.
+/// Server roles run from the copy, never from the installed helper, whose
+/// image a role running for days would keep locked.
+///
+/// The helper is copied to a temporary name beside the copy, keeping its
+/// last-write time, and renamed into place. When another process's rename
+/// got there first, its file is used once its build id checks out.
+pub fn ensure_helper_copy(installed: &Path, copies: &Path) -> io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let build = std::fs::read(installed)
+        .map(|bytes| crate::build_id::of_binary(&bytes))
+        .map_err(|error| context(installed.display(), error))?;
+    let copy = crate::server_dir::helper_copy(copies, &build);
+    if build_of(&copy).as_deref() == Some(&build) {
+        return Ok(copy);
+    }
+    let dir = copy.parent().expect("the copy is in its build's directory");
+    std::fs::create_dir_all(dir).map_err(|error| context(dir.display(), error))?;
+    let temp = dir.join(format!(
+        "brindle-remote.exe.{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let placed = place_copy(installed, &temp, &copy, &build);
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    placed.map(|()| copy)
+}
+
+/// Copies `installed` to `temp` and renames that to `copy`. On an error
+/// `temp` may be left behind.
+fn place_copy(installed: &Path, temp: &Path, copy: &Path, build: &str) -> io::Result<()> {
+    // `CopyFileExW`, which keeps the last-write time as `CopyFileW` does.
+    std::fs::copy(installed, temp).map_err(|error| context(temp.display(), error))?;
+    if build_of(temp).as_deref() != Some(build) {
+        return Err(io::Error::other(format!(
+            "{} changed while it was copied",
+            installed.display()
+        )));
+    }
+    // Without `MOVEFILE_REPLACE_EXISTING`, so a copy that is already there
+    // (and may be running) is never replaced by an equal one.
+    // SAFETY: both names are NUL-terminated strings that outlive the call.
+    let renamed = unsafe {
+        MoveFileExW(
+            &HSTRING::from(temp),
+            &HSTRING::from(copy),
+            MOVE_FILE_FLAGS(0),
+        )
+    };
+    let Err(error) = renamed else {
+        return Ok(());
+    };
+    if build_of(copy).as_deref() == Some(build) {
+        // Another process won the rename with the same build.
+        return std::fs::remove_file(temp);
+    }
+    if copy.exists() {
+        // Something else is under the copy's name: replace it.
+        return std::fs::rename(temp, copy).map_err(|error| context(copy.display(), error));
+    }
+    Err(context(copy.display(), os(error)))
+}
+
+/// Removes every build's directory under `copies` except `keep`'s, where it
+/// can: Windows refuses to delete a running image, so a build that still
+/// has a role running keeps its directory. Nothing here fails; what can't
+/// be removed stays for a later call.
+pub fn prune_helper_copies(copies: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(copies) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == keep || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let dir = entry.path();
+        // The image first: while it runs, the directory is left whole.
+        match std::fs::remove_file(dir.join("brindle-remote.exe")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// SYSTEM's SID, the one entry beside the user's in the server's DACLs.
 pub const SYSTEM_SID: &str = "S-1-5-18";
 
@@ -609,6 +737,199 @@ mod tests {
         protect_dir(&plain).unwrap();
         let dacl = Dacl::of_path(&plain).unwrap();
         assert!(dacl.allows_only(&[&own, SYSTEM_SID]), "{dacl:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("brindle-win-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn cmd_exe() -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe")
+    }
+
+    #[test]
+    fn file_identity_tells_a_recreated_file_from_the_first() {
+        let dir = scratch("identity");
+        let path = dir.join("a");
+        let first = File::create(&path).unwrap();
+        let again = File::open(&path).unwrap();
+        assert_eq!(
+            file_identity(&first).unwrap(),
+            file_identity(&again).unwrap()
+        );
+        std::fs::remove_file(&path).unwrap();
+        let second = File::create(&path).unwrap();
+        assert_ne!(
+            file_identity(&first).unwrap(),
+            file_identity(&second).unwrap()
+        );
+        drop((first, again, second));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn own_image_path_is_this_test_binary() {
+        let path = own_image_path().unwrap();
+        assert!(path.is_absolute() && path.is_file());
+        assert_eq!(path.extension().unwrap(), "exe");
+    }
+
+    #[test]
+    fn the_copy_is_named_by_build_and_keeps_the_last_write_time() {
+        let dir = scratch("copy");
+        let installed = dir.join("installed.exe");
+        std::fs::write(&installed, b"a helper").unwrap();
+        let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        File::options()
+            .write(true)
+            .open(&installed)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        let copies = dir.join("bin");
+
+        let copy = ensure_helper_copy(&installed, &copies).unwrap();
+        let build = crate::build_id::of_binary(b"a helper");
+        assert_eq!(copy, crate::server_dir::helper_copy(&copies, &build));
+        assert_eq!(std::fs::read(&copy).unwrap(), b"a helper");
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().modified().unwrap(),
+            written
+        );
+        assert_eq!(names(copy.parent().unwrap()), ["brindle-remote.exe"]);
+
+        // A second call finds the copy and leaves it alone.
+        let identity = file_identity(&File::open(&copy).unwrap()).unwrap();
+        assert_eq!(ensure_helper_copy(&installed, &copies).unwrap(), copy);
+        assert_eq!(
+            file_identity(&File::open(&copy).unwrap()).unwrap(),
+            identity
+        );
+
+        // Another build gets its own directory.
+        std::fs::write(&installed, b"a newer helper").unwrap();
+        let newer = ensure_helper_copy(&installed, &copies).unwrap();
+        assert_ne!(newer, copy);
+        assert_eq!(std::fs::read(&copy).unwrap(), b"a helper");
+        assert_eq!(std::fs::read(&newer).unwrap(), b"a newer helper");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_file_under_the_copys_name_is_replaced() {
+        let dir = scratch("wrong");
+        let installed = dir.join("installed.exe");
+        std::fs::write(&installed, b"a helper").unwrap();
+        let copies = dir.join("bin");
+        let build = crate::build_id::of_binary(b"a helper");
+        let copy = crate::server_dir::helper_copy(&copies, &build);
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::write(&copy, b"cut short").unwrap();
+
+        assert_eq!(ensure_helper_copy(&installed, &copies).unwrap(), copy);
+        assert_eq!(std::fs::read(&copy).unwrap(), b"a helper");
+        assert_eq!(names(copy.parent().unwrap()), ["brindle-remote.exe"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_helper_is_an_error_naming_it() {
+        let dir = scratch("missing");
+        let error = ensure_helper_copy(&dir.join("nope.exe"), &dir.join("bin")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("nope.exe"), "{error}");
+        assert!(!dir.join("bin").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn racing_copies_end_with_one_valid_copy() {
+        let dir = scratch("race");
+        let installed = dir.join("installed.exe");
+        let bytes: Vec<u8> = (0..4_000_000u32).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&installed, &bytes).unwrap();
+        let copies = dir.join("bin");
+
+        for round in 0..8 {
+            let _ = std::fs::remove_dir_all(&copies);
+            let barrier = std::sync::Barrier::new(2);
+            let race = || {
+                barrier.wait();
+                ensure_helper_copy(&installed, &copies)
+            };
+            let (a, b) = std::thread::scope(|scope| {
+                let a = scope.spawn(race);
+                let b = scope.spawn(race);
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            let (a, b) = (a.unwrap(), b.unwrap());
+            assert_eq!(a, b, "round {round}");
+            assert_eq!(std::fs::read(&a).unwrap(), bytes, "round {round}");
+            assert_eq!(names(&copies).len(), 1, "round {round}");
+            assert_eq!(
+                names(a.parent().unwrap()),
+                ["brindle-remote.exe"],
+                "round {round}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pruning_skips_a_build_whose_helper_is_running() {
+        let dir = scratch("prune");
+        let copies = dir.join("bin");
+        let running = crate::server_dir::helper_copy(&copies, "running");
+        let stale = crate::server_dir::helper_copy(&copies, "stale");
+        let kept = crate::server_dir::helper_copy(&copies, "kept");
+        for copy in [&running, &stale, &kept] {
+            std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+            std::fs::copy(cmd_exe(), copy).unwrap();
+        }
+        std::fs::write(running.with_file_name("extra.txt"), b"").unwrap();
+        std::fs::write(copies.join("a-file"), b"").unwrap();
+        let mut child = std::process::Command::new(&running)
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+
+        prune_helper_copies(&copies, "kept");
+        assert_eq!(names(&copies), ["a-file", "kept", "running"]);
+        assert!(kept.is_file());
+        // The directory in use is left whole, not half emptied.
+        assert_eq!(
+            names(running.parent().unwrap()),
+            ["brindle-remote.exe", "extra.txt"]
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            prune_helper_copies(&copies, "kept");
+            if !running.parent().unwrap().exists() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the copy stayed");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(names(&copies), ["a-file", "kept"]);
+
+        // No directory at all is nothing to prune.
+        prune_helper_copies(&dir.join("absent"), "kept");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
