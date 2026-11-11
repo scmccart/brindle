@@ -1,6 +1,6 @@
 [package]
 name = "brindle"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A GPU-accelerated terminal emulator built on GPUI, with tabs and profiles"
 license = "MIT OR Apache-2.0"
