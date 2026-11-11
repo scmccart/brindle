@@ -27,15 +27,15 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 - [x] 3.2 In `terminal/mod.rs`, delete `PaletteHandler`, tmux pane colour defaults, the tmux-specific `reply()` and `feed()` comments and code, and `fixed_size` if nothing else sets it (check `terminal_element.rs` and `cell_metrics()` callers). Verify `cargo test -p brindle terminal::` and that the message-tab path still builds.
 - [x] 3.3 Remove tmux-only code from `win.rs`, `terminal/cmdline.rs` (the `wsl` detection only, keeping `program_stem`), `ui/src/filter.rs`, `ui/src/components/menu.rs`, `ui/src/text_input.rs` and `ui/examples/gallery.rs`: change tmux-only strings and fixtures in comments and tests to neutral ones, and remove what only tmux used. Verify `cargo test --workspace` and `cargo build -p brindle-ui --example gallery`.
 - [x] 3.4 Remove `BRINDLE_TMUX_STATE` and the e2e passthrough of it, and scan for `BRINDLE_CONTROL_CLIENT` and `tmux` in `src/` with `grep -ri tmux src ui term-core remote-agent remote-protocol`; every remaining hit must be an ordinary program mention in a comment or a test of the scanner. Verify the grep output is reviewed and clean.
-- [ ] 3.5 Commit as `refactor(tmux)!: remove remote tmux and the tmux-only terminal plumbing`, then run `cargo test --workspace` and `cargo build --release --locked` (route the release build to a Haiku chore per CLAUDE.md).
+- [x] 3.5 Commit as `refactor(tmux)!: remove remote tmux and the tmux-only terminal plumbing`, then run `cargo test --workspace` and `cargo build --release --locked` (route the release build to a Haiku chore per CLAUDE.md).
 
 ## 4. Tests, perf and CI
 
 - [x] 4.1 Delete `tests/e2e/tmux.rs`, `tests/e2e/cases/tmux.rs`, `tests/common/tmux.rs` and their registrations; delete the perf `latency-tmux` and `throughput-tmux` cases and `tests/perf/fixtures` tmux entries. Verify `cargo test --test e2e -- --list` and `cargo test --test perf -- --self-test` (with `BRINDLE_E2E=1` / `BRINDLE_PERF=1`) list no tmux case and compile.
 - [x] 4.2 Audit every other file in `tests/` that mentions tmux (`grep -ril tmux tests`): rewrite cases that used tmux as a pane source against a shell or two-zone tab, delete cases that exist only for tmux behaviour (including `session_end`, `multi_window` tmux parts and the WSL and `remote-*` tmux cases), and list in the commit message which cases were deleted and which rewritten. Verify the e2e list under `scripts/with-xvfb` and that no case's expectation in `openspec/specs` loses coverage (the zone and card geometry scenarios in particular).
-- [ ] 4.3 Run the e2e suite under `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (headless, so no desktop windows open). Verify all remaining cases pass; investigate any failure rather than skipping.
+- [x] 4.3 Run the e2e suite under `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (headless, so no desktop windows open). Verify all remaining cases pass; investigate any failure rather than skipping.
 - [x] 4.4 Update `.github/workflows/ci.yml`: remove the tmux matrix, the source build and cache steps, the version check, the `old-tmux` input and the header comment about it; rename artifacts to `e2e-shard-<k>`; keep the `tmux` apt package only if group 4.2 kept a case that runs tmux as a program; reconsider the shard count from the new case total. Verify with `actionlint` if available (else `gh workflow view` after pushing) and that the PR's CI jobs start.
-- [ ] 4.5 Update `tests/fixtures/remote/Dockerfile` to stop installing tmux unless a retained remote case needs it. Verify `docker build` of the fixture where Docker is available (skip otherwise, and say so in the PR).
+- [x] 4.5 Update `tests/fixtures/remote/Dockerfile` to stop installing tmux unless a retained remote case needs it. Verify `docker build` of the fixture where Docker is available (skip otherwise, and say so in the PR).
 - [ ] 4.6 Commit as `test(tmux)!: remove the tmux cases and CI matrix` (and a separate `ci:` commit if the workflow change reads better alone), then push and wait for the `commits`, `test`, `release`, `windows`, `windows-e2e` and `e2e` jobs.
 
 ## 5. Docs and packaging
@@ -43,7 +43,7 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 - [x] 5.1 Update `README.md`: remove the tmux sections, keybinding tables rows, config keys and the tmux profile examples; add a short "Using tmux" note (run it as a profile command, with the two-line example) and a "Upgrading" note for the removed keys. Verify by searching the README for stale tmux features and by running its documented profile snippet in a throwaway config with `--dump-screen-after` under `scripts/with-xvfb`.
 - [x] 5.2 Update `CLAUDE.md`: remove the tmux architecture, tmux-mode e2e and subscription/polling notes, the `BRINDLE_TMUX_STATE` line, the control-mode manual checks (`classic (plain) tmux profiles with the prefix keys`, `ctrl-shift-d does nothing…`) and the Windows WSL tmux case; fix the CI paragraph (matrix, `old-tmux`) and the e2e description. Verify `grep -n -i tmux CLAUDE.md` shows only deliberate mentions.
 - [x] 5.3 Update `Cargo.toml`'s description and `packaging/winget/scmccart.brindle.locale.en-US.yaml`'s short description and tags to drop "first-class tmux support"/`tmux`; check `scripts/run-throwaway*` for tmux text. Verify `scripts/winget-manifest.ps1` output via the `windows` CI job's `winget validate`.
-- [ ] 5.4 Commit as `docs: drop tmux from the README, CLAUDE.md and package descriptions`.
+- [x] 5.4 Commit as `docs: drop tmux from the README, CLAUDE.md and package descriptions`.
 
 ## 6. In-flight changes and the teammate-mode change
 
@@ -53,8 +53,8 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 
 ## 7. Integration checks
 
-- [ ] 7.1 With a config containing the old default `tmux` and `tmux (classic)` profiles, `tmux_session_end = "ask"` and a state file with a `kind = "tmux"` entry, launch Brindle under `scripts/with-xvfb` with `--dump-screen-after 3` and verify: it starts without an error banner, the log shows the warnings, the old tmux tabs are not restored, and the `tmux (classic)` profile opens a shell.
-- [ ] 7.2 Run `scripts/lint-commits` and `scripts/lint-commits --title "feat(tmux)!: drop tmux support"`. Verify both pass.
+- [x] 7.1 With a config containing the old default `tmux` and `tmux (classic)` profiles, `tmux_session_end = "ask"` and a state file with a `kind = "tmux"` entry, launch Brindle under `scripts/with-xvfb` with `--dump-screen-after 3` and verify: it starts without an error banner, the log shows the warnings, the old tmux tabs are not restored, and the `tmux (classic)` profile opens a shell.
+- [x] 7.2 Run `scripts/lint-commits` and `scripts/lint-commits --title "feat(tmux)!: drop tmux support"`. Verify both pass.
 - [ ] 7.3 Ask the user to hand-check, with `scripts/run-throwaway.sh`: a profile with `command = "tmux"` and `args = ["new-session", "-A", "-s", "main"]` opens and works with its prefix keys and mouse; ctrl-shift-d reaches the shell; the settings dialog has Profiles and Theme only; no tmux entry appears in the palette or the profile picker.
 - [ ] 7.4 Open the PR with the title `feat(tmux)!: drop tmux support`, a body stating the breaking change and the migration lines, and the attribution lines; user merges.
 
