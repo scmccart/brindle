@@ -11,8 +11,7 @@ The config SHALL control:
 - `osc52_paste` (whether programs may read the clipboard);
 - `restore_session` (whether a plain launch reopens the last session's windows and tabs, as defined by the `session-restore` capability; default off);
 - `mark_failed_commands` (whether failed commands get a gutter mark; on by default);
-- `blocks` (whether commands are grouped into blocks, as defined by the `blocks` capability; on by default);
-- `tmux_session_end` (what happens when a control-mode session leaves a window that showed only its tabs: `close_window`, `new_tab` or `ask`, as defined by the `tmux-control-mode` capability; default `close_window`).
+- `blocks` (whether commands are grouped into blocks, as defined by the `blocks` capability; on by default).
 
 #### Scenario: Blinking disabled
 - **WHEN** `cursor.blink = false`
@@ -29,7 +28,3 @@ The config SHALL control:
 #### Scenario: Blocks disabled
 - **WHEN** `blocks = false` and the config is reloaded
 - **THEN** no terminal shows blocks
-
-#### Scenario: Unknown session-end value
-- **WHEN** the config contains `tmux_session_end = "shell"`
-- **THEN** Brindle starts with defaults and shows a config error banner naming the problem

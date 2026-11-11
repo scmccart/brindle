@@ -6,7 +6,7 @@ See proposal.md for motivation and specs/ for required behaviour.
 
 `Marks` already keeps each `Command`'s A/B/C/D positions as absolute lines, through scrolling, pruning and reflow, in local tabs and control-mode panes. Everything else assumes a straight viewport: paint walks `renderable_content().display_iter`, and `cell_at`, links, selection, search and prompt jumps convert through `display_offset`. Alacritty comes from crates.io and offers one `display_offset` for one continuous viewport, so it can't express hidden rows or a second scroll position.
 
-GPUI re-renders the whole window on any `cx.notify()`, so `prepaint` has to stay cheap. On Linux and Windows every wheel event arrives as `TouchPhase::Moved`, so there is no gesture boundary. tmux panes have no padding and must stay on their exact cell grid.
+GPUI re-renders the whole window on any `cx.notify()`, so `prepaint` has to stay cheap. On Linux and Windows every wheel event arrives as `TouchPhase::Moved`, so there is no gesture boundary.
 
 ## Goals / Non-Goals
 
@@ -30,7 +30,7 @@ A pure module, `src/terminal/blocks.rs`, builds a `Projection` from the commands
 
 Paint iterates the projection and reads rows with `term.grid()[Line(n)]`, replacing `display_iter`. Selection, match and link checks already work on grid `Point`s, so they carry over once paint hands them the row's real line.
 
-Alternatives: a separate `Term` per command (Warp's approach) would break cursor addressing, the shared scrollback and tmux restore; a fork of alacritty conflicts with using the crates.io release; adding a gutter or real rows changes the PTY size.
+Alternatives: a separate `Term` per command (Warp's approach) would break cursor addressing and the shared scrollback; a fork of alacritty conflicts with using the crates.io release; adding a gutter or real rows changes the PTY size.
 
 ### The identity case keeps alacritty's scrolling
 

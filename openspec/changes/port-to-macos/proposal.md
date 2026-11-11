@@ -9,7 +9,7 @@ The Linux-only spots found in the code:
 - **Title bar:** the tab strip is drawn as a client-side title bar. On macOS GPUI always reports server decorations (`Decorations::Server`) and `start_window_move` does nothing, so today the strip would lose its drag and double-click handling. The strip's left end would also sit under the window's traffic-light buttons.
 - **Keybindings:** the defaults are ctrl-shift-* (GNOME Terminal conventions). Mac users expect cmd-t, cmd-c, cmd-v and so on, and cmd never reaches the shell, so the ctrl-shift workaround isn't needed there.
 - **Config location:** `Config::path` uses `dirs::config_dir()`, which is `~/Library/Application Support` on macOS. The configuration spec says `$XDG_CONFIG_HOME/brindle/config.toml`.
-- **Shell and environment:** Brindle always passes an explicit shell to alacritty (`$SHELL`, then `/bin/sh`), which skips alacritty's macOS login-shell path. Apps opened from Finder or the Dock also get launchd's minimal `PATH`, so `tmux` from Homebrew wouldn't be found.
+- **Shell and environment:** Brindle always passes an explicit shell to alacritty (`$SHELL`, then `/bin/sh`), which skips alacritty's macOS login-shell path. Apps opened from Finder or the Dock also get launchd's minimal `PATH`, so Homebrew-installed commands wouldn't be found.
 - **Fonts:** the default family list and glyph fallbacks name Linux fonts (DejaVu, Noto).
 - **Option key:** on macOS the Option key composes characters (option-2 is `@` on a German layout), so treating Alt as Meta unconditionally would break typing for many layouts.
 
@@ -21,7 +21,7 @@ The Linux-only spots found in the code:
 - **Mac keybindings:** on macOS the default app shortcuts use cmd in place of ctrl-shift (cmd-t, cmd-w, cmd-c, cmd-v, cmd-k, cmd-, …), cmd-1…9 jumps to a tab, and a standard menu bar (Brindle, Shell, Edit, View, Window) exposes the common actions.
 - **Option as Meta is opt-in on macOS:** new config key `macos_option_as_meta` (default `false`). When off, Option produces the layout's character; when on, Option acts as Meta as on Linux.
 - **Config at `~/.config/brindle/config.toml`** on macOS (or `$XDG_CONFIG_HOME/brindle/`), matching Linux and other terminals, so one dotfile works on both.
-- **Login shell and PATH:** with no command configured, macOS tabs start the user's login shell the way Terminal.app does. When Brindle starts outside a terminal, it imports `PATH` from the user's login shell, so profile commands and tmux resolve as they do in a shell.
+- **Login shell and PATH:** with no command configured, macOS tabs start the user's login shell the way Terminal.app does. When Brindle starts outside a terminal, it imports `PATH` from the user's login shell, so profile commands resolve as they do in a shell.
 - **Mac font defaults:** Menlo and SF Mono join the default family list, and the glyph fallbacks gain Apple Color Emoji, Apple Symbols and PingFang.
 - **Packaging:**
   - a `Brindle.app` bundle (`Info.plist`, `brindle.icns` rendered from `assets/brindle.svg`), assembled by `scripts/macos/bundle.sh`;

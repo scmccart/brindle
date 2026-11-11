@@ -47,9 +47,9 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 
 ## 6. In-flight changes and the teammate-mode change
 
-- [ ] 6.1 `git rm -r openspec/changes/test-claude-code-teammate-mode`. Verify `openspec list` no longer shows it.
-- [ ] 6.2 Edit `add-blocks` (proposal scope, design alternatives line, task 7.1's tmux case), `port-to-macos` (proposal PATH wording, design keybinding rows and tmux text, tasks 7.1 and the Homebrew-tmux check, `specs/macos-platform/spec.md` scenario), `session-layout-in-server` (the tmux placeholder bullet and open question), `remote-connections-followups` (tmux bullets and questions) and `terminal-server-remote` (the "remote tmux stays outside the server" line). Verify `grep -n -i tmux` over those changes shows no reference to removed behaviour, and `openspec validate --changes` still passes for each that has specs.
-- [ ] 6.3 Commit as `docs(openspec): drop tmux from the in-flight changes and remove test-claude-code-teammate-mode`.
+- [x] 6.1 `git rm -r openspec/changes/test-claude-code-teammate-mode`. Verify `openspec list` no longer shows it.
+- [x] 6.2 Edit `add-blocks` (proposal scope, design alternatives line, task 7.1's tmux case), `port-to-macos` (proposal PATH wording, design keybinding rows and tmux text, tasks 7.1 and the Homebrew-tmux check, `specs/macos-platform/spec.md` scenario), `session-layout-in-server` (the tmux placeholder bullet and open question), `remote-connections-followups` (tmux bullets and questions) and `terminal-server-remote` (the "remote tmux stays outside the server" line). Verify `grep -n -i tmux` over those changes shows no reference to removed behaviour, and `openspec validate --changes` still passes for each that has specs.
+- [x] 6.3 Commit as `docs(openspec): drop tmux from the in-flight changes and remove test-claude-code-teammate-mode`.
 
 ## 7. Integration checks
 

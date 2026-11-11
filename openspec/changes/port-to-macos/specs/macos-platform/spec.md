@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Make Brindle a native-feeling macOS terminal: the same tabs, profiles and tmux support as on Linux, following Mac conventions for the title bar, shortcuts, menu bar, Option key, shell startup and fonts.
+Make Brindle a native-feeling macOS terminal: the same tabs and profiles as on Linux, following Mac conventions for the title bar, shortcuts, menu bar, Option key, shell startup and fonts.
 
 ## ADDED Requirements
 
@@ -51,7 +51,7 @@ On macOS, each default shortcut that uses ctrl-shift-KEY SHALL use cmd-KEY inste
 - **THEN** the program receives byte 0x03
 
 ### Requirement: Tab shortcuts on macOS
-On macOS, cmd-N SHALL jump to tab N (cmd-9 is the last tab), cmd-alt-N SHALL open a tab with the Nth profile, cmd-shift-[ and cmd-shift-] SHALL switch to the previous and next tab, and in tmux control-mode tabs cmd-alt-arrow SHALL move focus between panes.
+On macOS, cmd-N SHALL jump to tab N (cmd-9 is the last tab), cmd-alt-N SHALL open a tab with the Nth profile, and cmd-shift-[ and cmd-shift-] SHALL switch to the previous and next tab.
 
 #### Scenario: Jump to a tab
 - **WHEN** there are five tabs and the user presses cmd-2
@@ -102,11 +102,11 @@ On macOS, a profile that sets no command SHALL start the user's login shell from
 - **THEN** the variable is set in that tab's shell
 
 ### Requirement: PATH from the login shell on macOS
-When Brindle starts on macOS outside a terminal (from Finder, the Dock, Spotlight or `open`), it SHALL take `PATH` from the user's login shell before starting any program, so profile commands and tmux resolve as they do in a terminal. If that fails or takes more than two seconds, Brindle SHALL keep its own `PATH` with `/opt/homebrew/bin` and `/usr/local/bin` appended, and log a warning.
+When Brindle starts on macOS outside a terminal (from Finder, the Dock, Spotlight or `open`), it SHALL take `PATH` from the user's login shell before starting any program, so profile commands resolve as they do in a terminal. If that fails or takes more than two seconds, Brindle SHALL keep its own `PATH` with `/opt/homebrew/bin` and `/usr/local/bin` appended, and log a warning.
 
-#### Scenario: Homebrew tmux from the Dock
-- **WHEN** tmux is installed with Homebrew, Brindle is opened from the Dock, and the user opens a `tmux = "control"` profile
-- **THEN** Brindle attaches to the session instead of reporting that tmux could not be started
+#### Scenario: Homebrew program from the Dock
+- **WHEN** `example-tool` is installed with Homebrew, Brindle is opened from the Dock, and the user opens a profile whose `command` is `example-tool`
+- **THEN** Brindle starts it instead of reporting that it could not be started
 
 #### Scenario: Started from a terminal
 - **WHEN** Brindle is started from a shell in another terminal
