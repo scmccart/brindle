@@ -1,7 +1,7 @@
 # zones Specification
 
 ## Purpose
-Split local tabs into a binary tree of zones with native controls around each zone, so multiple terminals (and future zone types) can share a tab side by side without tmux.
+Split local tabs into a binary tree of zones with native controls around each zone, so multiple terminals (and future zone types) can share a tab side by side.
 
 ## Requirements
 

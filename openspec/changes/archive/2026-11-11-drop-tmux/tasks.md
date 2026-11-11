@@ -36,7 +36,7 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 - [x] 4.3 Run the e2e suite under `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (headless, so no desktop windows open). Verify all remaining cases pass; investigate any failure rather than skipping.
 - [x] 4.4 Update `.github/workflows/ci.yml`: remove the tmux matrix, the source build and cache steps, the version check, the `old-tmux` input and the header comment about it; rename artifacts to `e2e-shard-<k>`; keep the `tmux` apt package only if group 4.2 kept a case that runs tmux as a program; reconsider the shard count from the new case total. Verify with `actionlint` if available (else `gh workflow view` after pushing) and that the PR's CI jobs start.
 - [x] 4.5 Update `tests/fixtures/remote/Dockerfile` to stop installing tmux unless a retained remote case needs it. Verify `docker build` of the fixture where Docker is available (skip otherwise, and say so in the PR).
-- [ ] 4.6 Commit as `test(tmux)!: remove the tmux cases and CI matrix` (and a separate `ci:` commit if the workflow change reads better alone), then push and wait for the `commits`, `test`, `release`, `windows`, `windows-e2e` and `e2e` jobs.
+- [x] 4.6 Commit as `test(tmux)!: remove the tmux cases and CI matrix` (and a separate `ci:` commit if the workflow change reads better alone), then push and wait for the `commits`, `test`, `release`, `windows`, `windows-e2e` and `e2e` jobs.
 
 ## 5. Docs and packaging
 
@@ -56,7 +56,7 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 - [x] 7.1 With a config containing the old default `tmux` and `tmux (classic)` profiles, `tmux_session_end = "ask"` and a state file with a `kind = "tmux"` entry, launch Brindle under `scripts/with-xvfb` with `--dump-screen-after 3` and verify: it starts without an error banner, the log shows the warnings, the old tmux tabs are not restored, and the `tmux (classic)` profile opens a shell.
 - [x] 7.2 Run `scripts/lint-commits` and `scripts/lint-commits --title "feat(tmux)!: drop tmux support"`. Verify both pass.
 - [ ] 7.3 Ask the user to hand-check, with `scripts/run-throwaway.sh`: a profile with `command = "tmux"` and `args = ["new-session", "-A", "-s", "main"]` opens and works with its prefix keys and mouse; ctrl-shift-d reaches the shell; the settings dialog has Profiles and Theme only; no tmux entry appears in the palette or the profile picker.
-- [ ] 7.4 Open the PR with the title `feat(tmux)!: drop tmux support`, a body stating the breaking change and the migration lines, and the attribution lines; user merges.
+- [x] 7.4 Open the PR with the title `feat(tmux)!: drop tmux support`, a body stating the breaking change and the migration lines, and the attribution lines; user merges.
 
 ## Workflow follow-up
 

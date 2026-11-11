@@ -397,8 +397,8 @@ An owner MAY give any trigger its own surface and text colours (its icons take t
 A menu item MAY carry a description, drawn in the muted foreground on a second line under its label. Typeahead and the item's accessible name SHALL use the label only.
 
 #### Scenario: Description shown
-- **WHEN** a menu item has the label `tmux` and the description `tmux control mode · main`
-- **THEN** the item shows both lines, and typing `t` highlights it
+- **WHEN** a menu item has the label `Shell` and the description `default shell`
+- **THEN** the item shows both lines, and typing `s` highlights it
 
 ### Requirement: Cards
 A card SHALL be a bordered, rounded surface with an optional header row above its content, after shadcn's Card. The header SHALL hold a title, an optional leading adornment (a status dot) and an optional action slot at its end, and be separated from the content by a border line. The content SHALL fill the rest of the card with no padding of its own. A card SHALL NOT know of terminals.

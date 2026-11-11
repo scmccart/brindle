@@ -1,7 +1,7 @@
 # profiles Specification
 
 ## Purpose
-Let users define named launch configurations (command, directory, environment, look and tmux mode) and open a tab from any of them quickly.
+Let users define named launch configurations (command, directory, environment and look) and open a tab from any of them quickly.
 
 ## Requirements
 
@@ -12,10 +12,9 @@ A profile SHALL be able to set:
 - a working directory, with `~` expanded;
 - environment variables;
 - a theme;
-- a font size;
-- a tmux mode (`none`, `plain` or `control`), with a session name (default `main`) and extra tmux arguments.
+- a font size.
 
-There SHALL always be at least one profile; a "Shell" profile is created when the config defines none. Profiles without a name SHALL be named `Profile N`.
+There SHALL always be at least one profile; a "Shell" profile is created when the config defines none. Profiles without a name SHALL be named `Profile N`. A profile that still sets `tmux`, `tmux_session` or `tmux_args` (settings of earlier versions) SHALL load, with those keys ignored and a warning logged for each.
 
 #### Scenario: No profiles configured
 - **WHEN** the config defines no profiles
@@ -33,40 +32,20 @@ There SHALL always be at least one profile; a "Shell" profile is created when th
 - **WHEN** a Windows profile sets `command = "pwsh.exe"` and `args = ["-NoExit", "-Command", "Set-Location 'C:\My Files'"]`
 - **THEN** the program receives exactly three arguments, the last one with its spaces intact
 
+#### Scenario: Old tmux settings are ignored
+- **WHEN** a profile `work` sets `tmux = "plain"`, `tmux_session = "work"` and `tmux_args = ["-L", "w"]`, and no command
+- **THEN** the config loads, the log has a warning for each of the three keys, and a tab of `work` runs the default shell, not tmux
+
+#### Scenario: Running tmux as a command
+- **WHEN** a profile sets `command = "tmux"` and `args = ["new-session", "-A", "-s", "main"]`
+- **THEN** its tabs run that command in an ordinary terminal, as they would any program
+
 ### Requirement: Default profile
-New tabs SHALL use the profile named by `default_profile`, matched case-insensitively. If no profile has that name, the first profile SHALL be used. When that profile is a control-mode profile whose session the window already shows, its tab SHALL become active, as defined by `tabs`.
+New tabs SHALL use the profile named by `default_profile`, matched case-insensitively. If no profile has that name, the first profile SHALL be used.
 
 #### Scenario: Case-insensitive default
 - **WHEN** `default_profile = "work"` and a profile is named `Work`
 - **THEN** ctrl-shift-t opens a `Work` tab
-
-### Requirement: Profile picker
-ctrl-shift-space SHALL open the new-tab palette, a picker listing every profile with a short description of what it runs. For a control-mode profile the description SHALL name its session and, when the window shows that session at the moment the picker opens, add "open in this window". Pressing ctrl-shift-space again while it is open SHALL close it. The list SHALL be filtered by a case-insensitive subsequence match on the typed text. The picker SHALL be operable with:
-- up/down (also ctrl-p / ctrl-n) to move;
-- enter to open the profile;
-- escape or a click outside to dismiss.
-
-Profiles SHALL NOT be listed in the command palette. The `open_profile_picker` action name SHALL keep opening this picker from user keybindings.
-
-#### Scenario: Filter and open
-- **WHEN** the user opens the picker, types `tc` and presses enter
-- **THEN** a tab opens with the first profile whose name contains `t` then `c`, such as `tmux (classic)`
-
-#### Scenario: Existing keybinding keeps working
-- **WHEN** the config binds `ctrl-shift-p` to `open_profile_picker`
-- **THEN** ctrl-shift-p opens the new-tab palette instead of the command palette
-
-#### Scenario: Session shown elsewhere
-- **WHEN** the window shows session `main` of profile `tmux` in a background tab, and the user opens the picker
-- **THEN** the `tmux` row's description reads `tmux control mode · main · open in this window`
-
-#### Scenario: Pick a session shown elsewhere
-- **WHEN** the window shows session `main` of profile `tmux` in a background tab, and the user picks `tmux` in the picker
-- **THEN** no palette asks, a tab of `main` becomes active, and no second tmux client attaches
-
-#### Scenario: Session not open
-- **WHEN** the window doesn't show session `main`, and the user opens the picker
-- **THEN** the `tmux` row's description reads `tmux control mode · main`
 
 ### Requirement: Direct profile shortcuts
 ctrl-alt-N SHALL open a tab with the Nth profile, for N from 1 to 9.
@@ -74,13 +53,6 @@ ctrl-alt-N SHALL open a tab with the Nth profile, for N from 1 to 9.
 #### Scenario: Second profile
 - **WHEN** the user presses ctrl-alt-2
 - **THEN** a tab opens using the second profile
-
-### Requirement: Classic tmux profiles
-A profile with `tmux = "plain"` SHALL run `tmux [tmux_args] new-session -A -s <session>` in an ordinary tab. This attaches to the session if it already exists.
-
-#### Scenario: Reattach classic session
-- **WHEN** the user opens a plain tmux profile while that session already exists
-- **THEN** the tab attaches to the existing session instead of creating a new one
 
 ### Requirement: Per-profile appearance
 A profile's theme and font size SHALL apply to its tabs only, and SHALL update when the config is reloaded.
@@ -97,7 +69,7 @@ When a profile is renamed from the settings dialog, every open tab of that profi
 - **THEN** the tab shows `tokyo-night`
 
 ### Requirement: Remote target
-A profile MAY define one remote Linux endpoint. An SSH endpoint SHALL accept `host` and optional `user`, `port`, `identity_file`, and `ssh_args`. A container endpoint SHALL accept `container`, optional `user`, and `engine` (`docker` by default, or `podman`). The profile's command, arguments, working directory, environment, theme, font size, and tmux settings SHALL otherwise retain their local meanings on that endpoint.
+A profile MAY define one remote Linux endpoint. An SSH endpoint SHALL accept `host` and optional `user`, `port`, `identity_file`, and `ssh_args`. A container endpoint SHALL accept `container`, optional `user`, and `engine` (`docker` by default, or `podman`). The profile's command, arguments, working directory, environment, theme, and font size SHALL otherwise retain their local meanings on that endpoint.
 
 #### Scenario: SSH config alias
 - **WHEN** a profile sets `remote = { type = "ssh", host = "A8" }`
@@ -114,20 +86,28 @@ The strip's `⌄` button SHALL open a dropdown menu listing every profile in con
 - **WHEN** the menu opens with three profiles
 - **THEN** its items show ctrl-alt-1, ctrl-alt-2 and ctrl-alt-3 at their right edge
 
-### Requirement: Choosing from the profile menu
-Choosing an item in the profile menu SHALL open that profile exactly as choosing it in the picker does, including a control-mode session that the window or another Brindle already shows.
+### Requirement: New-tab profile picker
+ctrl-shift-space SHALL open the new-tab palette, a picker listing every profile with a short description of what it runs. Pressing ctrl-shift-space again while it is open SHALL close it. The list SHALL be filtered by a case-insensitive subsequence match on the typed text. The picker SHALL be operable with:
+- up/down (also ctrl-p / ctrl-n) to move;
+- enter to open the profile;
+- escape or a click outside to dismiss.
+
+Profiles SHALL NOT be listed in the command palette. The `open_profile_picker` action name SHALL keep opening this picker from user keybindings.
+
+#### Scenario: Filter and open
+- **WHEN** the user opens the picker, types `wk` and presses enter
+- **THEN** a tab opens with the first profile whose name contains `w` then `k`, such as `Work`
+
+#### Scenario: Existing keybinding keeps working
+- **WHEN** the config binds `ctrl-shift-p` to `open_profile_picker`
+- **THEN** ctrl-shift-p opens the new-tab palette instead of the command palette
+
+### Requirement: Opening a profile from the menu
+Choosing an item in the profile menu SHALL open that profile exactly as choosing it in the picker does.
 
 #### Scenario: Open a profile
 - **WHEN** the user presses `⌄` and chooses the second profile
 - **THEN** a tab opens with the second profile, as ctrl-alt-2 would open it
-
-#### Scenario: Description shown
-- **WHEN** the window shows session `main` of profile `tmux` in a background tab and the user opens the menu
-- **THEN** the `tmux` item's second line reads `tmux control mode · main · open in this window`
-
-#### Scenario: Session shown elsewhere
-- **WHEN** the window shows session `main` of profile `tmux` in a background tab and the user chooses `tmux` in the menu
-- **THEN** a tab of `main` becomes active and no second tmux client attaches
 
 #### Scenario: Toggle
 - **WHEN** the menu is open and the user presses `⌄`
