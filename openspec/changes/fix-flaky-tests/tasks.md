@@ -4,13 +4,13 @@ Root-cause reports, kept for the implementer: /tmp/claude-1000/-home-scmccart-sr
 
 ## 1. Ready-fd handoff (holder tests and `start_core`)
 
-- [ ] 1.1 Add a helper that passes a pipe fd to a child as a given number: `dup2` when the numbers differ, and clear `FD_CLOEXEC` when they match. Use it in `remote-agent/tests/support/mod.rs` `start` and in `src/remote/local.rs` `start_core`. Verify with a unit test that forces the pipe onto the target fd (close fds below it first) and checks that the child sees the fd open.
+- [x] 1.1 Add a helper that passes a pipe fd to a child as a given number: `dup2` when the numbers differ, and clear `FD_CLOEXEC` when they match. Use it in `remote-agent/tests/support/mod.rs` `start` and in `src/remote/local.rs` `start_core`. Verify with a unit test that forces the pipe onto the target fd (close fds below it first) and checks that the child sees the fd open.
 - [ ] 1.2 Verify that `cargo test -p brindle-remote-agent --test holder` passes 600 consecutive runs, with 4 copies at a time, and no `--ready-fd 3 is not an open file descriptor` failure. Before the fix, about 1 in 600 runs failed.
 
 ## 2. `ETXTBSY` on test scripts
 
-- [ ] 2.1 After writing each executable test script in `src/remote/local.rs` tests (`script()`) and `src/terminal/links.rs` tests, wait (bounded at 5 s) until a read lease can be taken, then release it. If leases are unsupported (`EINVAL`), fall back to the bounded wait without one and log it. Verify that `cargo test -p brindle --bin brindle remote::local` and `terminal::links` pass.
-- [ ] 2.2 Verify that `a_core_that_never_listens_is_unreachable` and `a_core_that_fails_to_start_shows_why` pass 3,500 runs of the `brindle` test binary, 4 copies at a time, with no "can't run" failure. Before the fix, 13 of 3,520 runs failed.
+- [x] 2.1 After writing each executable test script in `src/remote/local.rs` tests (`script()`) and `src/terminal/links.rs` tests, wait (bounded at 5 s) until a read lease can be taken, then release it. If leases are unsupported (`EINVAL`), fall back to the bounded wait without one and log it. Verify that `cargo test -p brindle --bin brindle remote::local` and `terminal::links` pass.
+- [x] 2.2 Verify that `a_core_that_never_listens_is_unreachable` and `a_core_that_fails_to_start_shows_why` pass 3,500 runs of the `brindle` test binary, 4 copies at a time, with no "can't run" failure. Before the fix, 13 of 3,520 runs failed.
 
 ## 3. Ownership survives a core killed right after an attach
 
@@ -49,12 +49,22 @@ Root-cause reports, kept for the implementer: /tmp/claude-1000/-home-scmccart-sr
 - [x] 8.2 Add the timed headless Windows PowerShell 5.1 warm-up to `windows-pwsh-integration`, writing `powershell-warmup.txt` to the case directory. Verify on Windows that the case passes and that the file is written.
 - [ ] 8.3 Verify the Windows build and the Windows-only unit tests compile and pass (`cargo test --workspace` on Windows), since groups 1, 2 and 6 touch `cfg(unix)` and shared code.
 
+## 10. Holder and client timing tests
+
+These turned up while verifying groups 1–2: three holder tests failed in 16 of 600 runs at only 4 at a time, also on an idle machine.
+
+- [ ] 10.1 `hangup_kills_a_child_that_outlives_its_exited_leader`: the parent prints the child's pid before the child has run `trap '' HUP`, so the hang-up can kill it first (1,995 of 2,000 in miniature). Have the child print its own pid after the trap (`(trap '' HUP; exec sh -c 'echo "bg=$$."; exec sleep 1000') & wait`). Verify 600 runs of the holder binary, 4 at a time, with no failure of this test.
+- [ ] 10.2 `a_new_core_gets_the_sessions_checkpoints_and_tails` (`holder sockets: []`): find out why the holder is empty when the test expects it, and fix the test's ordering without weakening what it checks. Verify the same way.
+- [ ] 10.3 `a_checkpoint_keeps_the_output_it_doesnt_cover` (`cat` exited 1 instead of dying of SIGHUP): find the cause. If the product is right, make the test accept the outcomes the spec allows; if it isn't, fix the product and say so. Verify the same way.
+- [ ] 10.4 `without_a_core_a_program_blocks_instead_of_losing_output` (a fixed 500 ms sleep) and `a_tail_past_its_limit_is_truncated`, which failed only with 24 binaries at once: replace fixed sleeps with waits for the condition, bounded. Verify 600 runs at 8 at a time with no failure of either.
+- [ ] 10.5 `remote::client::tests::an_idle_writer_sends_heartbeats_and_then_the_goodbye` (6 heartbeats where 2–5 were expected in 900 ms; 1 of 3,500): make the count bound follow the time that actually elapsed. Verify 3,500 runs of the test, 4 at a time with 4 busy loops, with no failure.
+
 ## 9. Integration
 
 - [ ] 9.1 Run `cargo test --workspace --locked` 20 times in a row on Linux. Verify there are no failures, and list any new flake found, with its test name and failure text, in the PR description.
 - [ ] 9.2 Run the full e2e suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2` 3 times. Verify there are no failures.
 - [ ] 9.3 After the PR is pushed, check its CI. Verify that `test`, all e2e shards and `windows-e2e` are green. On a red job, read its log before rerunning anything.
-- [ ] 9.4 Draft follow-up issues for the out-of-scope items in proposal.md (load-only holder failures, `XDG_RUNTIME_DIR` in `instance.rs` tests, ignored SIGHUP under `nohup`, the GPUI blank-window fix). Show the drafts to the user, and file them only with their approval.
+- [ ] 9.4 Draft follow-up issues for the out-of-scope items in proposal.md (`XDG_RUNTIME_DIR` in `instance.rs` tests, ignored SIGHUP under `nohup`, the GPUI blank-window fix). Show the drafts to the user, and file them only with their approval.
 
 ## Workflow follow-up
 

@@ -41,8 +41,8 @@ None.
 - Tests: `tests/e2e/capture.rs`, `tests/e2e/brindle.rs`, `tests/e2e/cases/win.rs`, `remote-agent/tests/{support/mod.rs,core.rs}`, and the unit tests in `src/remote/local.rs`, `src/session.rs`, `src/config_edit.rs`, `src/terminal/cmdline.rs`, `src/terminal/links.rs`.
 - Product: `src/remote/local.rs` (`start_core`'s ready-fd handoff), `remote-agent/src/server/core.rs` (flush order for ownership changes), `src/main.rs` (`--wait-for` limit and dump line).
 - Closes #32 and #36.
+- Added during implementation, once verification loops showed them failing at ordinary parallelism: five holder tests whose timing assumptions fail under load (one, the hang-up test, also on an idle machine), and the client heartbeat-count test (task group 10).
 - Out of scope, to be filed as follow-ups:
-  - four holder tests that fail only with 24 test binaries running at once;
   - `instance.rs` setting `XDG_RUNTIME_DIR` for the whole test process, which makes `remote::local` tests create real systemd scopes on a desktop;
   - session programs inheriting an ignored SIGHUP when the tests run under `nohup`;
   - picking up GPUI's blank-new-window fix (zed-industries/zed#62081) with a future gpui upgrade.
