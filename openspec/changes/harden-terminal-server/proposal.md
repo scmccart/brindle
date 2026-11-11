@@ -1,6 +1,6 @@
 # Proposal
 
-**Status: outline only.** This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests`, which needs to merge first: `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core come from that change.
+**Status: outline only.** This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests` (#47), which added `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core.
 
 ## Why
 
