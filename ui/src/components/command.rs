@@ -991,8 +991,8 @@ mod tests {
     fn items_and_groups_from_labels() {
         let item: CommandItem = "Close Tab".into();
         assert_eq!(item, CommandItem::new("Close Tab"));
-        let item = CommandItem::new("Split Right").detail("tmux").shortcut("ctrl-shift-r");
-        assert_eq!(item.detail.as_ref().map(|s| s.as_ref()), Some("tmux"));
+        let item = CommandItem::new("Split Right").detail("zones").shortcut("ctrl-shift-r");
+        assert_eq!(item.detail.as_ref().map(|s| s.as_ref()), Some("zones"));
         assert_eq!(item.shortcut.as_ref().map(|s| s.as_ref()), Some("ctrl-shift-r"));
         assert!(!item.disabled);
         let group = CommandGroup::new("Panes", [item.clone()]);

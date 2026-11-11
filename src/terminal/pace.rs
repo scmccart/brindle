@@ -1,5 +1,5 @@
 //! Pacing for the event loops that feed the UI thread (terminal output,
-//! remote output, tmux control events).
+//! remote output).
 //!
 //! Each of those loops would otherwise update as fast as its producer
 //! sends, and a flooding program keeps it busy forever. On Windows that
@@ -10,14 +10,14 @@
 //!
 //! So once [`BURST`] updates in a row have each come less than [`PACE`]
 //! after the previous one, a loop waits out the rest of [`PACE`] before the
-//! next. A short run of quick updates, such as a tmux command's response
-//! followed by the echo it caused, is handled at once, and so is output
-//! after a quiet spell.
+//! next. A short run of quick updates, such as a key's echo followed by
+//! the output it caused, is handled at once, and so is output after a
+//! quiet spell.
 //!
 //! Each update then keeps taking ready batches for up to [`BUDGET`]
 //! ([`drain`]), so a flood is handled in long updates with short gaps: the
 //! gap is what Windows needs, and its share of the time is what a flood's
-//! throughput loses (measured on Linux `throughput-tmux`).
+//! throughput loses (measured on Linux with vtebench).
 
 use std::time::{Duration, Instant};
 

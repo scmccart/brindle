@@ -4,8 +4,8 @@
 //! batch is shaped once (GPUI caches shaped lines across frames) and placed
 //! at its exact column, so a glyph with an odd advance can never push the
 //! rest of the row out of alignment. Backgrounds are merged into runs, and
-//! box-drawing / block characters are drawn as rectangles so tmux pane
-//! borders and TUI frames join seamlessly regardless of line height.
+//! box-drawing / block characters are drawn as rectangles so borders and
+//! TUI frames join seamlessly regardless of line height.
 
 use alacritty_terminal::index::Point as GridPoint;
 use alacritty_terminal::term::TermMode;
@@ -33,7 +33,7 @@ pub struct CellMetrics {
 }
 
 /// Font and cell size for a terminal. Everything that positions cells must
-/// use this so tmux panes line up exactly with their grids.
+/// use this so cells line up exactly with the grid.
 pub fn cell_metrics(font_size_override: Option<f32>, window: &Window, cx: &App) -> CellMetrics {
     let settings = Settings::get(cx);
     let font = settings.font();
@@ -177,15 +177,13 @@ impl Element for TerminalElement {
         let view = self.view.read(cx);
         let CellMetrics { font: base_font, font_size, cell_width, line_height } =
             cell_metrics(view.font_size_override, window, cx);
-        // tmux panes are positioned on an exact cell grid by their container.
-        let padding = if view.fixed_size { px(0.0) } else { px(Settings::get(cx).config.padding) };
+        let padding = px(Settings::get(cx).config.padding);
         let text_system = window.text_system().clone();
 
         let origin = bounds.origin + point(padding, padding);
         let (fit_cols, fit_rows) = fit_grid(bounds.size, padding, cell_width, line_height);
 
         let terminal_entity = view.terminal.clone();
-        let fixed = view.fixed_size;
         let focused = view.focus_handle.is_focused(window) && window.is_window_active();
         let blink_visible = view.blink_visible;
         let marked_text = view.marked_text.clone();
@@ -193,16 +191,14 @@ impl Element for TerminalElement {
         let layout_cell = view.layout.clone();
         let hovered_link = view.hovered_link.clone();
 
-        if !fixed {
-            terminal_entity.update(cx, |t, _| {
-                t.resize(GridSize {
-                    cols: fit_cols as u16,
-                    rows: fit_rows as u16,
-                    cell_width: f32::from(cell_width) as u16,
-                    cell_height: f32::from(line_height) as u16,
-                })
-            });
-        }
+        terminal_entity.update(cx, |t, _| {
+            t.resize(GridSize {
+                cols: fit_cols as u16,
+                rows: fit_rows as u16,
+                cell_width: f32::from(cell_width) as u16,
+                cell_height: f32::from(line_height) as u16,
+            })
+        });
 
         let terminal = terminal_entity.read(cx);
         let theme = &terminal.theme;

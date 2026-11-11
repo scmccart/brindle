@@ -23,10 +23,10 @@ Work on a branch off `main`, one commit per group, each building and passing `ca
 
 ## 3. Remove remote tmux and tmux-only terminal plumbing
 
-- [ ] 3.1 In `remote/mod.rs`, delete `tmux_command`, `TmuxProcess`, `detach_command`, the dropped-client detach and their tests; update the module comment. Verify `cargo test -p brindle remote::` passes.
-- [ ] 3.2 In `terminal/mod.rs`, delete `PaletteHandler`, tmux pane colour defaults, the tmux-specific `reply()` and `feed()` comments and code, and `fixed_size` if nothing else sets it (check `terminal_element.rs` and `cell_metrics()` callers). Verify `cargo test -p brindle terminal::` and that the message-tab path still builds.
-- [ ] 3.3 Remove tmux-only code from `win.rs`, `terminal/cmdline.rs` (the `wsl` detection only, keeping `program_stem`), `ui/src/filter.rs`, `ui/src/components/menu.rs`, `ui/src/text_input.rs` and `ui/examples/gallery.rs`: change tmux-only strings and fixtures in comments and tests to neutral ones, and remove what only tmux used. Verify `cargo test --workspace` and `cargo build -p brindle-ui --example gallery`.
-- [ ] 3.4 Remove `BRINDLE_TMUX_STATE` and the e2e passthrough of it, and scan for `BRINDLE_CONTROL_CLIENT` and `tmux` in `src/` with `grep -ri tmux src ui term-core remote-agent remote-protocol`; every remaining hit must be an ordinary program mention in a comment or a test of the scanner. Verify the grep output is reviewed and clean.
+- [x] 3.1 In `remote/mod.rs`, delete `tmux_command`, `TmuxProcess`, `detach_command`, the dropped-client detach and their tests; update the module comment. Verify `cargo test -p brindle remote::` passes.
+- [x] 3.2 In `terminal/mod.rs`, delete `PaletteHandler`, tmux pane colour defaults, the tmux-specific `reply()` and `feed()` comments and code, and `fixed_size` if nothing else sets it (check `terminal_element.rs` and `cell_metrics()` callers). Verify `cargo test -p brindle terminal::` and that the message-tab path still builds.
+- [x] 3.3 Remove tmux-only code from `win.rs`, `terminal/cmdline.rs` (the `wsl` detection only, keeping `program_stem`), `ui/src/filter.rs`, `ui/src/components/menu.rs`, `ui/src/text_input.rs` and `ui/examples/gallery.rs`: change tmux-only strings and fixtures in comments and tests to neutral ones, and remove what only tmux used. Verify `cargo test --workspace` and `cargo build -p brindle-ui --example gallery`.
+- [x] 3.4 Remove `BRINDLE_TMUX_STATE` and the e2e passthrough of it, and scan for `BRINDLE_CONTROL_CLIENT` and `tmux` in `src/` with `grep -ri tmux src ui term-core remote-agent remote-protocol`; every remaining hit must be an ordinary program mention in a comment or a test of the scanner. Verify the grep output is reviewed and clean.
 - [ ] 3.5 Commit as `refactor(tmux)!: remove remote tmux and the tmux-only terminal plumbing`, then run `cargo test --workspace` and `cargo build --release --locked` (route the release build to a Haiku chore per CLAUDE.md).
 
 ## 4. Tests, perf and CI

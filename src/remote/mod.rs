@@ -1,15 +1,14 @@
 //! Remote Linux host and container support.
 //!
 //! Terminal PTYs are served by the `brindle-remote` helper over a framed
-//! stdio connection. tmux control clients use SSH/container-exec pipes
-//! directly because tmux control mode already is a byte-stream protocol.
+//! stdio connection, deployed and reached through SSH or a container's exec
+//! (`remote_command`).
 
 pub mod client;
 #[cfg(target_os = "linux")]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -19,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::config::{Profile, RemoteTarget};
+use crate::config::RemoteTarget;
 
 /// Keeps a process Brindle starts outside a tab from opening a console
 /// window of its own: Brindle has no console to share, so a console program
@@ -132,125 +131,6 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
     Ok(command)
 }
 
-// The remote tmux helpers below lost their last caller with control mode;
-// drop-tmux task 3.1 deletes them (and their tests).
-
-/// How long [`detach_client`] may take, connecting included.
-#[allow(dead_code)]
-const DETACH_LIMIT: Duration = Duration::from_secs(10);
-
-/// The command that detaches the tmux client `client` on the profile's
-/// endpoint: `tmux_program <tmux_options> detach-client -t <client>`.
-#[allow(dead_code)]
-pub fn detach_command(
-    profile: &Profile,
-    tmux_program: &str,
-    tmux_options: &[String],
-    client: &str,
-) -> Result<Command> {
-    let mut target = profile
-        .remote
-        .clone()
-        .context("remote profile has no target")?;
-    if let RemoteTarget::Ssh { ssh_args, .. } = &mut target {
-        // No password prompt on a connection nobody is watching; the first
-        // value of an option wins in ssh.
-        ssh_args.splice(0..0, ["-o".to_string(), "BatchMode=yes".to_string()]);
-    }
-    let mut args = tmux_options.to_vec();
-    args.extend(["detach-client".to_string(), "-t".to_string(), client.to_string()]);
-    remote_command(&target, tmux_program, &args)
-}
-
-/// Runs `command` to completion in at most [`DETACH_LIMIT`], silently. Meant
-/// for a background thread: the connection it needs may be gone.
-#[allow(dead_code)]
-pub fn detach_client(mut command: Command) {
-    use std::process::Stdio;
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    match command.spawn() {
-        Ok(child) => {
-            let never = AtomicBool::new(false);
-            if let Err(error) = wait_process(child, &never, DETACH_LIMIT) {
-                log::debug!("detaching the dropped tmux client: {error:#}");
-            }
-        }
-        Err(error) => log::debug!("detaching the dropped tmux client: {error}"),
-    }
-}
-
-/// A tmux process ready to spawn, and what to write to its stdin first.
-/// The caller sets its stdio.
-#[allow(dead_code)]
-pub struct TmuxProcess {
-    pub command: Command,
-    pub initial_input: Vec<u8>,
-}
-
-/// Builds the remote tmux process used by `TmuxSession`, starting in `cwd`
-/// on the endpoint when given (`~` is expanded there, not here).
-#[allow(dead_code)]
-pub fn tmux_command(
-    profile: &Profile,
-    program: &str,
-    args: &[String],
-    cwd: Option<&str>,
-) -> Result<TmuxProcess> {
-    let target = profile
-        .remote
-        .as_ref()
-        .context("remote profile has no target")?;
-    let mut argv = vec![program.to_string()];
-    argv.extend(args.iter().cloned());
-    let command = shlex::try_join(argv.iter().map(String::as_str))
-        .context("tmux command contains a NUL byte")?;
-    let launch = match cwd {
-        Some("~") => format!("cd \"$HOME\" && exec {command}"),
-        Some(cwd) if cwd.starts_with("~/") => {
-            let rest = shlex::try_quote(&cwd[2..]).context("tmux directory contains a NUL byte")?;
-            format!("cd \"$HOME\"/{rest} && exec {command}")
-        }
-        Some(cwd) => {
-            let cwd = shlex::try_quote(cwd).context("tmux directory contains a NUL byte")?;
-            format!("cd {cwd} && exec {command}")
-        }
-        None => format!("exec {command}"),
-    };
-    let script =
-        format!("IFS= read -r brindle_env || exit 1; eval \"$brindle_env\" || exit 1; {launch}");
-    let command = remote_command(target, "sh", &["-lc".into(), script])?;
-    let environment: BTreeMap<_, _> = crate::terminal::child_env(profile).into_iter().collect();
-    let mut setup = String::new();
-    for (key, value) in environment {
-        if !valid_env_name(&key) {
-            bail!("invalid environment variable name {key:?}");
-        }
-        if value.contains(['\n', '\r']) {
-            bail!("remote tmux environment variable {key:?} contains a newline");
-        }
-        let value = shlex::try_quote(&value).context("environment value contains a NUL byte")?;
-        setup.push_str("export ");
-        setup.push_str(&key);
-        setup.push('=');
-        setup.push_str(&value);
-        setup.push(';');
-    }
-    setup.push('\n');
-    Ok(TmuxProcess {
-        command,
-        initial_input: setup.into_bytes(),
-    })
-}
-
-#[allow(dead_code)]
-fn valid_env_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,8 +146,8 @@ mod tests {
         };
         let command = remote_command(
             &target,
-            "tmux",
-            &["-L".into(), "work socket".into(), "-C".into()],
+            "git",
+            &["-C".into(), "work tree".into(), "status".into()],
         )
         .unwrap();
         let args: Vec<_> = command
@@ -292,7 +172,7 @@ mod tests {
                 "key file",
                 "--",
                 "dev@A8",
-                "tmux -L 'work socket' -C",
+                "git -C 'work tree' status",
             ]
         );
     }
@@ -319,81 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_tmux_applies_profile_environment_without_interpreting_values() {
-        let profile = Profile {
-            remote: Some(RemoteTarget::Container {
-                engine: "docker".into(),
-                container: "devbox".into(),
-                user: None,
-            }),
-            env: [("TOKEN".into(), "a b".into())].into(),
-            ..Profile::default_shell()
-        };
-        let process = tmux_command(&profile, "tmux", &["-C".into()], None).unwrap();
-        let args: Vec<_> = process
-            .command
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(&args[..5], ["exec", "-i", "devbox", "sh", "-lc"]);
-        assert!(
-            args[5].contains("eval \"$brindle_env\" || exit 1; exec tmux -C"),
-            "{}",
-            args[5]
-        );
-        assert!(!args.iter().any(|arg| arg.contains("TOKEN")));
-        let prelude = String::from_utf8(process.initial_input).unwrap();
-        assert!(prelude.contains("export TOKEN='a b';"), "{prelude}");
-        assert!(prelude.contains("export TERM=xterm-256color;"), "{prelude}");
-    }
-
-    #[test]
-    fn remote_tmux_rejects_multiline_environment_values() {
-        let profile = Profile {
-            remote: Some(RemoteTarget::Container {
-                engine: "docker".into(),
-                container: "devbox".into(),
-                user: None,
-            }),
-            env: [("TOKEN".into(), "first\nsecond".into())].into(),
-            ..Profile::default_shell()
-        };
-        assert!(tmux_command(&profile, "tmux", &["-C".into()], None).is_err());
-    }
-
-    #[test]
-    fn remote_tmux_expands_tilde_cwd_on_the_endpoint() {
-        let profile = Profile {
-            remote: Some(RemoteTarget::Ssh {
-                host: "A8".into(),
-                user: None,
-                port: None,
-                identity_file: None,
-                ssh_args: Vec::new(),
-            }),
-            ..Profile::default_shell()
-        };
-        let process = tmux_command(
-            &profile,
-            "tmux",
-            &["-C".into(), "new-session".into()],
-            Some("~/src tree"),
-        )
-        .unwrap();
-        let args: Vec<_> = process
-            .command
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.iter().any(|arg| arg == "A8"));
-        let script = args.last().unwrap();
-        assert!(script.contains("cd \"$HOME\"/"), "{script}");
-        assert!(script.contains("src tree"), "{script}");
-        assert!(script.contains("exec tmux -C new-session"), "{script}");
-        assert!(!script.contains(" -c "));
-    }
-
-    #[test]
     fn the_helper_is_the_variable_or_beside_brindle() {
         let dir = std::env::temp_dir().join(format!("brindle-find-helper-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -410,25 +215,5 @@ mod tests {
         std::fs::write(&named, b"").unwrap();
         assert_eq!(find_helper_in(Some(named.clone().into()), &exe).unwrap(), Some(named));
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn detach_command_names_the_client_and_never_prompts() {
-        let profile = Profile {
-            remote: Some(RemoteTarget::Ssh {
-                host: "A8".into(),
-                user: None,
-                port: None,
-                identity_file: None,
-                ssh_args: vec![],
-            }),
-            ..Profile::default()
-        };
-        let command =
-            detach_command(&profile, "tmux", &["-L".into(), "work".into()], "client-42").unwrap();
-        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]), "{args:?}");
-        assert_eq!(args.last().unwrap(), "tmux -L work detach-client -t client-42");
-        assert!(detach_command(&Profile::default(), "tmux", &[], "c").is_err());
     }
 }
