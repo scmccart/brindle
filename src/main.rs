@@ -20,6 +20,8 @@ mod settings_dialog;
 mod terminal;
 mod terminal_element;
 mod terminal_view;
+#[cfg(all(test, unix))]
+mod test_support;
 mod theme;
 #[cfg(windows)]
 mod win;

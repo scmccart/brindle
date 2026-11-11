@@ -29,6 +29,56 @@ fn holder_exits(dir: &TempDir, pid: u32) -> bool {
     eventually(TIMEOUT, || !alive(pid) && dir.holder_sockets().is_empty())
 }
 
+/// Runs `printf R >&3` with a new pipe's write end passed as fd 3, and checks
+/// that the byte arrives. The pipe is first put on fd 3 itself (`on_target`),
+/// close-on-exec as `pipe2` can return it, or kept off it. That is done in
+/// the forked child, whose fds are its own copy, so no other test's fd 3 is
+/// touched.
+fn assert_passed_as_fd_3(on_target: bool) {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let write_fd = write.as_raw_fd();
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf R >&3"]).stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let fd = match (on_target, write_fd == 3) {
+                (true, false) => libc::dup3(write_fd, 3, libc::O_CLOEXEC),
+                (false, true) => libc::fcntl(write_fd, libc::F_DUPFD_CLOEXEC, 4),
+                _ => write_fd,
+            };
+            if fd == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            pass_fd_as(fd, 3)
+        });
+    }
+    let output = command.output().unwrap();
+    drop(write);
+    let mut got = String::new();
+    fs::File::from(read).read_to_string(&mut got).unwrap();
+    assert_eq!(
+        got,
+        "R",
+        "on_target {on_target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_ready_pipe_is_passed_as_fd_3_whether_or_not_it_is_there_already() {
+    // `dup2(3, 3)` does nothing, so the server's exec would close it and
+    // `--ready-fd 3` would name a closed fd.
+    assert_passed_as_fd_3(true);
+    assert_passed_as_fd_3(false);
+}
+
 #[test]
 fn a_new_holder_is_detached_and_welcomes_its_first_core() {
     let mut dir = TempDir::new("welcome");

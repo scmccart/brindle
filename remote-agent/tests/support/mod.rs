@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -121,6 +121,29 @@ pub fn server_processes(dir: &Path, role: &str) -> Vec<u32> {
     pids
 }
 
+/// For a forked child, before its exec: makes `fd` the child's fd `target`,
+/// open in the program it runs. `dup2` does that when the numbers differ.
+/// When they already match it does nothing, so `fd` would stay close-on-exec:
+/// the flag is cleared instead.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+pub fn pass_fd_as(fd: RawFd, target: RawFd) -> io::Result<()> {
+    let result = unsafe {
+        if fd == target {
+            match libc::fcntl(fd, libc::F_GETFD) {
+                -1 => -1,
+                flags => libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+            }
+        } else {
+            libc::dup2(fd, target)
+        }
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Runs `bin <role> --ready-fd 3` for `dir` and waits for its ready byte.
 /// Fails, with the server's stderr, if it exits before being ready.
 pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
@@ -138,12 +161,7 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_fd, 3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(move || pass_fd_as(write_fd, 3));
     }
     // A freshly written binary can be briefly busy: another test thread's
     // fork may still hold the writer's fd until it execs.
@@ -925,17 +943,7 @@ impl TestClient {
         let mut command = Command::new("sleep");
         command.arg("1000").stdin(Stdio::null());
         unsafe {
-            command.pre_exec(move || {
-                let result = if fd == 3 {
-                    libc::fcntl(fd, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(fd, 3)
-                };
-                if result == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            command.pre_exec(move || pass_fd_as(fd, 3));
         }
         let child = command.spawn().unwrap();
         drop(self);
