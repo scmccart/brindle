@@ -308,6 +308,24 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// Where what is queued for the holder so far ends, as a count of the
+    /// bytes written to its connection ([`Core::holder_has`]). `None`
+    /// without the holder.
+    pub(super) fn holder_queue_end(&self, token: Token) -> Option<u64> {
+        self.holders
+            .get(&token)
+            .map(|holder| holder.conn.queued_end())
+    }
+
+    /// Whether the holder's socket has taken the first `end` bytes of its
+    /// connection, so the holder reads them even if the core is killed
+    /// now. Also true once the holder is gone: nothing can reach it.
+    pub(super) fn holder_has(&self, token: Token, end: u64) -> bool {
+        self.holders
+            .get(&token)
+            .is_none_or(|holder| holder.conn.written() >= end)
+    }
+
     fn handle_holder(&mut self, token: Token, message: ToCore) {
         match message {
             ToCore::Welcome(welcome) => self.adopt(token, welcome),

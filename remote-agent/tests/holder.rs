@@ -448,6 +448,77 @@ fn set_meta_replaces_what_the_next_core_gets() {
 }
 
 #[test]
+fn what_a_core_sent_before_it_went_counts_while_the_holder_had_output_for_it() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let (dir, mut first, holder_pid) = holder("write-fail");
+    // It prints without pause, so the holder always has output to send.
+    first.spawn(shell(1, "stty raw -echo; exec yes"));
+
+    // The next core never reads. Once its socket is full, the holder has
+    // output queued for it, which it tries to send at each turn.
+    let mut silent = UnixStream::connect(&dir.holder_sockets()[0]).unwrap();
+    let send = |stream: &mut UnixStream, message: ToHolder| {
+        message.encode().unwrap().write_to(stream).unwrap()
+    };
+    send(
+        &mut silent,
+        ToHolder::Hello(h1::Hello {
+            min: h1::PROTOCOLS.min,
+            max: h1::PROTOCOLS.max,
+            core_build: "silent".into(),
+            instance: 2,
+        }),
+    );
+    assert!(first.closes(), "the holder kept its first core");
+    let unread = |stream: &UnixStream| {
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, and the fd is open.
+        let result = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+        assert_eq!(result, 0);
+        waiting
+    };
+    let mut before = 0;
+    assert!(
+        eventually(TIMEOUT, || {
+            let now = unread(&silent);
+            let full = now >= 64 * 1024 && now == before;
+            before = now;
+            full
+        }),
+        "the holder's output never backed up"
+    );
+
+    // Its last message, and then it is gone, like a core killed right
+    // after telling a client about an attach. The holder doesn't run in
+    // between (as on a busy machine), so when it does, the write it tries
+    // first fails: the message in its socket must still be read.
+    let signal = |signal| unsafe { libc::kill(holder_pid as libc::pid_t, signal) };
+    assert_eq!(signal(libc::SIGSTOP), 0);
+    assert!(eventually(TIMEOUT, || state(holder_pid) == Some('T')));
+    let updated = h1::SessionMeta {
+        owner: "b".into(),
+        ..h1::SessionMeta::default()
+    }
+    .to_value();
+    send(
+        &mut silent,
+        ToHolder::SetMeta(h1::SetMeta {
+            session: 1,
+            meta: updated.clone(),
+        }),
+    );
+    drop(silent);
+    assert_eq!(signal(libc::SIGCONT), 0);
+
+    let mut last = TestCore::connect_to(&dir);
+    let adopted = last.hello(3);
+    assert_eq!(adopted.welcome().sessions[0].meta, updated);
+    last.hang_up(1);
+}
+
+#[test]
 fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
     let (dir, mut core, _) = holder("covers");
     core.spawn(spawn(1, "cat", &[]));

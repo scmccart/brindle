@@ -19,6 +19,8 @@ pub struct Conn {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
+    /// How many bytes the socket has taken, over the connection's life.
+    written: u64,
     write_shut: bool,
 }
 
@@ -32,6 +34,7 @@ impl Conn {
             input_start: 0,
             output: Vec::new(),
             output_start: 0,
+            written: 0,
             write_shut: false,
         })
     }
@@ -118,12 +121,28 @@ impl Conn {
         self.output.len() - self.output_start
     }
 
+    /// How many bytes the socket has taken so far. The peer reads those
+    /// even if this side ends right after: they are no longer this
+    /// process's to lose.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// What [`Conn::written`] is once everything queued so far is sent:
+    /// where the last queued frame ends.
+    pub fn queued_end(&self) -> u64 {
+        self.written + self.queued() as u64
+    }
+
     /// Sends as much of the queue as the socket takes without blocking.
     pub fn flush(&mut self) -> io::Result<()> {
         while self.output_start < self.output.len() {
             match self.stream.write(&self.output[self.output_start..]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(written) => self.output_start += written,
+                Ok(written) => {
+                    self.output_start += written;
+                    self.written += written as u64;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
@@ -274,6 +293,36 @@ mod tests {
         assert_eq!(sender.queued(), 0);
         drop(sender);
         assert!(receiver.read_available().unwrap(), "EOF");
+    }
+
+    #[test]
+    fn the_written_count_stops_where_the_socket_does() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut sender = Conn::new(a).unwrap();
+        let mut receiver = Conn::new(b).unwrap();
+        assert_eq!((sender.written(), sender.queued_end()), (0, 0));
+        sender.queue(&Frame::new(1, b"first".to_vec()).unwrap());
+        let first_end = sender.queued_end();
+        assert_eq!((sender.written(), first_end), (0, 10));
+        // Far more than a socket holds while its peer doesn't read.
+        let big = Frame::new(2, vec![7; 1024 * 1024]).unwrap();
+        for _ in 0..8 {
+            sender.queue(&big);
+        }
+        let end = sender.queued_end();
+        assert_eq!(end, 10 + 8 * (5 + 1024 * 1024));
+        sender.flush().unwrap();
+        let taken = sender.written();
+        assert!(taken >= first_end && taken < end, "{taken} of {end}");
+        assert_eq!(sender.queued_end(), end, "queued frames end where they did");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sender.written() < end && Instant::now() < deadline {
+            assert!(!receiver.read_available().unwrap());
+            while receiver.next_frame().unwrap().is_some() {}
+            sender.flush().unwrap();
+        }
+        assert_eq!((sender.written(), sender.queued()), (end, 0));
     }
 
     #[test]
