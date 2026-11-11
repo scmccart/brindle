@@ -2,10 +2,10 @@
 
 ## 0. Close the spike's gaps (before anything builds on them)
 
-- [ ] 0.1 On the `spike/windows-conpty` branch, extend `spike reparent` to cover two cases: the current owner HWND destroyed while the session lives (then a dialog opened, then reparenting to a new window), and the owner window in a third process, not the one that created the pseudoconsole. Record in design.md ("REPARENT") whether the console window and dialogs survive, and whether `hwnd: 0` on quit is enough. Verify: the findings are written with the commands that produced them.
-- [ ] 0.2 Run `spike survive` from a Start Menu shortcut, from Explorer, inside Windows Terminal (closing its tab), and on a GitHub `windows-latest` runner, and record which allow breakaway in design.md ("Starting a role detached"). Verify: a table of launch method → survived or not.
-- [ ] 0.3 In the spike, check the access model: a medium-integrity client can't open a pipe labelled `S:(ML;;NW;;;HI)`; `GetNamedPipeClientProcessId` plus `OpenProcessToken` reads `TokenUser` and `TokenIntegrityLevel` of an unelevated client, and fails or reads high integrity for an elevated one; `ImpersonateNamedPipeClient` before any read fails with `ERROR_CANNOT_IMPERSONATE`; and `FILE_FLAG_FIRST_PIPE_INSTANCE` fails when the name exists. Verify: the outcomes are recorded in design.md ("Access").
-- [ ] 0.4 If 0.1–0.3 contradict a spec scenario ("Owner after reattach", "Started from the Start Menu", the access requirements) or design.md, revise the specs and design with `/opsx:update` before group 1 starts. Verify: `openspec validate terminal-server-windows --strict` passes after any revision, and design.md has no "check early" items left.
+- [x] 0.1 On the `spike/windows-conpty` branch, extend `spike reparent` to cover two cases: the current owner HWND destroyed while the session lives (then a dialog opened, then reparenting to a new window), and the owner window in a third process, not the one that created the pseudoconsole. Record in design.md ("REPARENT") whether the console window and dialogs survive, and whether `hwnd: 0` on quit is enough. Verify: the findings are written with the commands that produced them.
+- [x] 0.2 Run `spike survive` from a Start Menu shortcut, from Explorer, inside Windows Terminal (closing its tab), and on a GitHub `windows-latest` runner, and record which allow breakaway in design.md ("Starting a role detached"). Verify: a table of launch method → survived or not.
+- [x] 0.3 In the spike, check the access model: a medium-integrity client can't open a pipe labelled `S:(ML;;NW;;;HI)`; `GetNamedPipeClientProcessId` plus `OpenProcessToken` reads `TokenUser` and `TokenIntegrityLevel` of an unelevated client, and fails or reads high integrity for an elevated one; `ImpersonateNamedPipeClient` before any read fails with `ERROR_CANNOT_IMPERSONATE`; and `FILE_FLAG_FIRST_PIPE_INSTANCE` fails when the name exists. Verify: the outcomes are recorded in design.md ("Access").
+- [x] 0.4 If 0.1–0.3 contradict a spec scenario ("Owner after reattach", "Started from the Start Menu", the access requirements) or design.md, revise the specs and design with `/opsx:update` before group 1 starts. Verify: `openspec validate terminal-server-windows --strict` passes after any revision, and design.md has no "check early" items left.
 
 ## 1. Platform seams in the server (Linux behaviour unchanged)
 
@@ -15,14 +15,14 @@
 
 ## 2. Directory and names
 
-- [ ] 2.1 Extend `remote-protocol`'s `server_dir::resolve` for Windows: `BRINDLE_SERVER_DIR`, else `%LOCALAPPDATA%\brindle\run`, with `run-elevated` for an elevated token. Add pure helpers for the core and holder pipe names (FNV-1a of the canonical directory plus the user SID) and the per-build copy path. Verify: unit tests for each, runnable on Linux with injected inputs, as `cmdline::program_stem` is.
-- [ ] 2.2 Create the directory with a protected DACL for the user and SYSTEM on Windows. Verify: a test reads it back with `GetSecurityInfo` and finds exactly those two entries.
+- [x] 2.1 Extend `remote-protocol`'s `server_dir::resolve` for Windows: `BRINDLE_SERVER_DIR`, else `%LOCALAPPDATA%\brindle\run`, with `run-elevated` for an elevated token. Add pure helpers for the core and holder pipe names (FNV-1a of the canonical directory plus the user SID) and the per-build copy path. Verify: unit tests for each, runnable on Linux with injected inputs, as `cmdline::program_stem` is.
+- [x] 2.2 Create the directory with a protected DACL for the user and SYSTEM on Windows. Verify: a test reads it back with `GetSecurityInfo` and finds exactly those two entries.
 
 ## 3. Windows I/O: IOCP loop, pipes, access
 
 - [ ] 3.1 Implement the IOCP `EventLoop` with the readiness facade from design.md: owned read and write buffers per pipe source, a pending `ConnectNamedPipe` for listeners, a `PostQueuedCompletionStatus` waker, process-exit waits that post packets, and cancel-and-drain on deregister and drop. Add the `windows` 0.61 dependency to the agent for Windows only. Verify: `PollLoop`'s tests (tokens, pausing, writable, waker from a thread) pass against it, plus tests for EOF, closing with a read in flight, and a process exit; `git diff Cargo.lock` shows only the agent's own dependency list changing.
 - [ ] 3.2 Implement the Windows `conn` and `listen`: overlapped named pipe server instances with the user-and-SYSTEM DACL, the integrity mandatory label, `PIPE_REJECT_REMOTE_CLIENTS` and `FILE_FLAG_FIRST_PIPE_INSTANCE`; peer check by `GetNamedPipeClientProcessId` and the client's token (user and integrity, refusing a token that can't be opened); `input_waiting` through the buffer plus `PeekNamedPipe`; the graceful close (send the queue, then wait for the peer, up to 10 s). Verify: unit tests for a same-user client accepted, a mismatched SID and a lower integrity refused (the comparison as a pure function), a name taken by another instance failing the create, and a flood read in order.
-- [ ] 3.3 Implement the client-side server check: `GetNamedPipeServerProcessId`, then the server's token user and integrity, refusing a mismatch before writing. Verify: a unit test of the comparison, and a test that a pipe created without the first-instance owner check is refused.
+- [x] 3.3 Implement the client-side server check: `GetNamedPipeServerProcessId`, then the server's token user and integrity, refusing a mismatch before writing. Verify: a unit test of the comparison, and a test that a pipe created without the first-instance owner check is refused.
 
 ## 4. Locks, starting roles, the per-build copy
 
