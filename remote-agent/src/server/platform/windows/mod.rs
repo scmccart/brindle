@@ -1,15 +1,10 @@
-//! The Windows platform layer. The event loop (`event_loop`, with its pipe
-//! sources in `pipe`), the stream (`conn`), the pipe listener (`listen`) and
-//! the sessions' pseudoconsoles (`pty`) are in place. Until the
-//! `terminal-server-windows` change fills in the rest, the other modules
-//! are stubs with the Linux modules' items: nothing can be created, and
-//! what would create it fails with [`unsupported`], so `serve`, `hold` and
-//! the management commands end with that message.
-//!
-//! The stubs' types that stand for a resource are never constructed (hence
-//! their `dead_code` allowances), so their methods are never called.
-
-use std::io;
+//! The Windows platform layer: the event loop (`event_loop`, with its pipe
+//! sources in `pipe`), the stream (`conn`), the pipe listener (`listen`),
+//! the locks (`lock`), the directory (`dir`), starting roles (`daemon`) and
+//! the sessions' pseudoconsoles (`pty`). The core and the holder still pass
+//! Unix socket paths to the listener, so `serve` and `hold` don't run on
+//! Windows until the `terminal-server-windows` change moves them to pipe
+//! names.
 
 pub mod conn;
 pub mod daemon;
@@ -20,10 +15,3 @@ pub mod lock;
 mod pipe;
 pub mod pty;
 pub mod sys;
-
-fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the terminal server is not implemented on Windows yet",
-    )
-}
