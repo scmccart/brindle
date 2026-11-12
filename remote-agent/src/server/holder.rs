@@ -681,7 +681,15 @@ impl<L: EventLoop> Holder<L> {
                     core.goodbye = true;
                 }
             }
-            ToHolder::Reparent(reparent) => self.send_error(Some(reparent.session), "unsupported"),
+            ToHolder::Reparent(reparent) => {
+                // Advisory where it is supported (Windows): no reply, and a
+                // session that just ended is no error.
+                let session = self.sessions.get(&reparent.session);
+                let program = session.map(|session| &session.program);
+                if let Err(error) = pty::reparent(program, reparent.hwnd) {
+                    self.send_error(Some(reparent.session), error.to_string());
+                }
+            }
             ToHolder::Pause(target) => self.set_paused(target.session, true),
             ToHolder::Resume(target) => self.set_paused(target.session, false),
             // The next core's `WELCOME` carries it. An unknown session may
@@ -991,8 +999,8 @@ impl<L: EventLoop> Holder<L> {
             }
         }
 
-        self.kills.retain(|&(_, group, at)| {
-            if now < at {
+        self.kills.retain(|(_, group, at)| {
+            if now < *at {
                 return true;
             }
             // The reaped leader's children that ignored the hang-up are

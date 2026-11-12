@@ -20,10 +20,20 @@
 //!   reading: the host writes what it still holds and exits, and only then
 //!   does [`Pty::read`] report the end. So the end of output follows the
 //!   last byte, and the holder reports `EXITED` after it.
-//! - **Hangup:** dropping the [`Pty`] closes the pseudoconsole in the same
-//!   way, which ends the programs attached to the console. [`Group`] is a
-//!   minimal stand-in until terminal-server-windows 5.3: its hang-up does
-//!   nothing more, and its kills end only the session's root process.
+//! - **Hangup:** [`Group::hang_up`], like dropping the [`Pty`], closes the
+//!   pseudoconsole in the same way, never waiting for it. The console host
+//!   then ends the programs attached to the console, as closing a console
+//!   window does. After the grace the holder calls
+//!   [`Group::kill_remaining`], which terminates the session's root process
+//!   if it is still running. A program that left the console (a GUI
+//!   program started from the shell) keeps running: no job object holds a
+//!   session's processes.
+//! - **The console window's owner:** [`reparent`] has the packaged host
+//!   make a window the owner of the console window, the one programs get
+//!   from `GetConsoleWindow`, so that their dialogs belong to that window.
+//!   The ConPTY built into Windows can't, which is logged once. The owner
+//!   is never cleared: when its window is destroyed the console window
+//!   stays, with no owner, until the next one is set.
 
 use std::ffi::OsString;
 use std::io;
@@ -63,7 +73,7 @@ const PIPE_BUFFER: u32 = 64 * 1024;
 /// built into Windows.
 const INBOX: &str = "inbox";
 
-/// The exit code of a program the holder ended.
+/// The exit code of a root process the holder terminated.
 const KILLED: u32 = 1;
 
 /// A session's pseudoconsole, shared by its [`Pty`] and its [`Program`]:
@@ -151,6 +161,7 @@ impl Program {
         Group {
             pid: self.process.pid(),
             started: self.started,
+            console: Arc::clone(&self.console),
         }
     }
 
@@ -188,30 +199,40 @@ impl Program {
     }
 }
 
-/// The processes that end with a session's program. It outlives the
-/// program.
+/// The processes that end with a session's program: those attached to its
+/// console, and its root process. It outlives the program.
 ///
-/// A minimal stand-in until terminal-server-windows 5.3: only the root
-/// process, named by its pid and start time, so that a later process with
-/// the same pid is left alone.
-#[derive(Debug, Clone, Copy)]
+/// Windows has no process group to signal. The console's processes are the
+/// console host's to end, which it does when the pseudoconsole closes. The
+/// root process is named by its pid and start time, so that a later process
+/// with the same pid is left alone. Processes that left the console aren't
+/// in the group.
+#[derive(Clone)]
 pub struct Group {
     pid: u32,
     started: u64,
+    console: Console,
 }
 
 impl Group {
-    /// Tells the processes their terminal is gone. Closing the
-    /// pseudoconsole (dropping the session's [`Pty`]) is what does that.
-    pub fn hang_up(self) {}
+    /// Tells the processes their terminal is gone: closes the pseudoconsole
+    /// if it is still open, on a thread of its own
+    /// ([`crate::conpty::Pseudoconsole`]'s drop), so this never waits for
+    /// the console host. The host then ends the console's processes.
+    pub fn hang_up(&self) {
+        console(&self.console).take();
+    }
 
-    /// Ends the root process.
-    pub fn kill(self) {
+    /// Hangs the console's processes up and ends the root process.
+    pub fn kill(&self) {
+        self.hang_up();
         self.kill_remaining();
     }
 
-    /// Ends the root process if it is still running.
-    pub fn kill_remaining(self) {
+    /// Ends what a hang-up left running. That is the root process, if it is
+    /// still the one that was started: the console's other processes are
+    /// ended by the console host.
+    pub fn kill_remaining(&self) {
         let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
         // SAFETY: opens a process by pid; the handle is owned below.
         let Ok(handle) = (unsafe { OpenProcess(access, false, self.pid) }) else {
@@ -226,6 +247,20 @@ impl Group {
             let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
         }
     }
+}
+
+/// Makes the window `hwnd` the owner of the console window of `program`'s
+/// session (`REPARENT`). It is advisory: nothing happens for a session that
+/// is gone (`None`) or whose pseudoconsole has closed, or with the ConPTY
+/// built into Windows, which logs that once. The host applies it a moment
+/// later, and a failure is only logged.
+pub fn reparent(program: Option<&Program>, hwnd: u64) -> io::Result<()> {
+    if let Some(program) = program
+        && let Some(console) = console(&program.console).as_ref()
+    {
+        console.reparent(hwnd);
+    }
+    Ok(())
 }
 
 /// An error of [`crate::conpty`] with its Win32 code. Those carry it as an
@@ -404,6 +439,18 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GW_OWNER, GetWindow, MSG, PM_REMOVE,
+        PeekMessageW, WINDOW_EX_STYLE, WS_OVERLAPPED,
+    };
+    use windows::core::w;
+
     use super::*;
     use crate::server::event_loop::{Event, EventLoop, Interest, Loop};
 
@@ -418,6 +465,144 @@ mod tests {
             .filter(|(name, _)| !set(name))
             .chain(extra.iter().map(|(name, value)| (name.to_string(), value.to_string())))
             .collect()
+    }
+
+    /// Starts `command` on a new pseudoconsole, in the temporary directory.
+    fn run(command: &str, args: &[&str], extra: &[(&str, &str)], cols: u16, rows: u16) -> (Pty, Program) {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let env = env(extra);
+        let temp = std::env::temp_dir();
+        let (pty, program) = spawn(&PtyCommand {
+            command: Some(command),
+            args: &args,
+            cwd: temp.to_str(),
+            env: &env,
+            cols,
+            rows,
+            cell_width: 0,
+            cell_height: 0,
+            exact_env: true,
+        })
+        .unwrap();
+        assert_ne!(program.pid(), 0);
+        (pty, program)
+    }
+
+    /// The processes `parent` started that are still running: each one's
+    /// pid, a handle to wait for it with, and its program's file name.
+    fn children(parent: u32) -> Vec<(u32, OwnedHandle, String)> {
+        // SAFETY: the snapshot handle is new and owned by nothing else.
+        let snapshot = unsafe {
+            OwnedHandle::from_raw_handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).unwrap().0)
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = Vec::new();
+        // SAFETY: the snapshot is open, and `entry` has its size set.
+        let mut more = unsafe { Process32FirstW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
+        while more {
+            if entry.th32ParentProcessID == parent
+                && let Some(process) = open(entry.th32ProcessID)
+            {
+                let name = entry.szExeFile.split(|unit| *unit == 0).next().unwrap();
+                found.push((entry.th32ProcessID, process, String::from_utf16_lossy(name)));
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
+        }
+        found
+    }
+
+    /// The running process `pid`, to wait for.
+    fn open(pid: u32) -> Option<OwnedHandle> {
+        let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        // SAFETY: opens a process by pid; the handle is owned at once.
+        let process = unsafe { OpenProcess(access, false, pid) }.ok()?;
+        // SAFETY: the handle is new and owned by nothing else.
+        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+        (!has_exited(&process)).then_some(process)
+    }
+
+    fn has_exited(process: &OwnedHandle) -> bool {
+        // SAFETY: the handle is open.
+        unsafe { WaitForSingleObject(raw(process.as_handle()), 0) == WAIT_OBJECT_0 }
+    }
+
+    /// A hidden top-level window of this thread's, destroyed on drop.
+    struct Window(HWND);
+
+    impl Window {
+        fn new() -> Self {
+            // SAFETY: a window of a system class, with no parent, menu or
+            // parameter; it is never shown.
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("brindle test owner"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    100,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            Self(window.unwrap())
+        }
+
+        fn id(&self) -> u64 {
+            self.0.0 as usize as u64
+        }
+
+        /// Handles what other threads sent this thread's windows: a host
+        /// that makes one an owner may wait for it to answer.
+        fn pump() {
+            let mut message = MSG::default();
+            // SAFETY: `message` outlives each call.
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                // SAFETY: the message was just read.
+                unsafe { DispatchMessageW(&message) };
+            }
+        }
+    }
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            // SAFETY: the window is this thread's, as `Window` isn't `Send`.
+            unsafe { DestroyWindow(self.0) }.unwrap();
+        }
+    }
+
+    /// The owner of the window `window`, if it has one (0 if not).
+    fn owner(window: u64) -> u64 {
+        let window = HWND(window as usize as *mut std::ffi::c_void);
+        // SAFETY: any window handle may be asked about.
+        let owner = unsafe { GetWindow(window, GW_OWNER) };
+        owner.map_or(0, |owner| owner.0 as usize as u64)
+    }
+
+    /// PowerShell that prints its console window as `hwnd=N;` and waits.
+    const CONSOLE_WINDOW: &str = "$w = (Add-Type -Name Console -Namespace BrindleTest -PassThru \
+        -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr \
+        GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
+        Start-Sleep -Seconds 600";
+
+    /// A session of [`CONSOLE_WINDOW`], and its console window.
+    fn session_with_a_console_window(extra: &[(&str, &str)]) -> (Session, u64) {
+        let args = ["-NoProfile", "-Command", CONSOLE_WINDOW];
+        let mut session = Session::start("powershell.exe", &args, extra);
+        session.until(";");
+        let text = session.text();
+        let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
+        let window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
+        assert_ne!(window, 0, "no console window in {text:?}");
+        (session, window)
     }
 
     /// A session as the holder runs one: its pseudoconsole registered with
@@ -438,22 +623,7 @@ mod tests {
         }
 
         fn sized(command: &str, args: &[&str], extra: &[(&str, &str)], cols: u16, rows: u16) -> Self {
-            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-            let env = env(extra);
-            let temp = std::env::temp_dir();
-            let (pty, mut program) = spawn(&PtyCommand {
-                command: Some(command),
-                args: &args,
-                cwd: temp.to_str(),
-                env: &env,
-                cols,
-                rows,
-                cell_width: 0,
-                cell_height: 0,
-                exact_env: true,
-            })
-            .unwrap();
-            assert_ne!(program.pid(), 0);
+            let (pty, mut program) = run(command, args, extra, cols, rows);
             let mut ev = Loop::new().unwrap();
             ev.register(&pty.source(), TOKEN, Interest::READABLE).unwrap();
             program.watch(&ev.waker()).unwrap();
@@ -689,14 +859,153 @@ mod tests {
         session.until("ready>");
         let group = session.program.group();
         // Another process's start time: this pid isn't the group's.
-        Group { started: group.started + 1, ..group }.kill();
+        let other = Group { started: group.started + 1, ..group.clone() };
+        other.kill_remaining();
         assert!(session.program.try_wait().unwrap().is_none());
-        group.hang_up();
-        assert!(session.program.try_wait().unwrap().is_none());
-        group.kill();
+        group.kill_remaining();
         let (_, code) = session.finish();
         assert_eq!(code, KILLED as i32);
         group.kill_remaining();
+        group.kill();
+    }
+
+    #[test]
+    fn a_hang_up_ends_the_program_and_its_console_children() {
+        let mut session = Session::start("cmd.exe", &["/c", "ping -t localhost"], &[]);
+        session.until("Reply from");
+        let running = children(session.program.pid());
+        let ping = running.iter().find(|(_, _, name)| name.eq_ignore_ascii_case("PING.EXE"));
+        let (_, ping, _) = ping.expect("ping is the shell's child");
+
+        // As the holder's `HANGUP` does: the PTY goes, the group is hung
+        // up, and after the grace what remains is killed.
+        let Session { mut ev, pty, mut program, .. } = session;
+        let group = program.group();
+        let hung_up = Instant::now();
+        ev.deregister(TOKEN).unwrap();
+        drop(pty);
+        group.hang_up();
+        assert!(hung_up.elapsed() < Duration::from_millis(500), "the hang-up waited");
+        let grace = hung_up + crate::pty::GRACEFUL_SHUTDOWN;
+        while !(has_exited(ping) && program.try_wait().unwrap().is_some()) {
+            assert!(Instant::now() < grace, "the console's programs outlived the grace");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Nothing remains, and the pid may be another process's by now.
+        group.kill_remaining();
+        assert_ne!(program.try_wait().unwrap().unwrap().code, Some(KILLED as i32));
+    }
+
+    #[test]
+    fn a_kill_after_the_grace_ends_a_root_that_left_its_console() {
+        // No console close reaches a root whose console is someone else's,
+        // which stands for one that ignores the close.
+        let mut session = Session::start("cmd.exe", &["/D"], &[("PROMPT", "ready$G")]);
+        session.until("ready>");
+        let group = session.program.group();
+        let stale = Group { console: Arc::default(), ..group.clone() };
+        stale.hang_up();
+        assert!(session.program.try_wait().unwrap().is_none());
+        stale.kill_remaining();
+        assert_eq!(session.finish().1, KILLED as i32);
+    }
+
+    #[test]
+    fn the_loop_serves_another_session_while_a_close_is_in_flight() {
+        const OTHER: usize = 8;
+        // A session whose output nobody reads: a host that closes only
+        // once its output is read (older ones) can't finish closing.
+        let flood = ["/c", "for /l %i in () do @echo brindle brindle brindle brindle"];
+        let (stuck, mut stuck_program) = run("cmd.exe", &flood, &[], 80, 24);
+        let mut session = Session::start("cmd.exe", &["/D"], &[("PROMPT", "ready$G")]);
+        session.ev.register(&stuck.source(), OTHER, Interest::NONE).unwrap();
+        session.until("ready>");
+
+        let hung_up = Instant::now();
+        stuck_program.group().hang_up();
+        assert!(hung_up.elapsed() < Duration::from_millis(500), "the hang-up waited");
+        // The close is in flight, or blocked, and the loop goes on.
+        for round in 0..3 {
+            session.send(&format!("echo round^{round}\r"));
+            session.until(&format!("round{round}"));
+        }
+
+        // Once the pipes are gone, the host can't be writing.
+        session.ev.deregister(OTHER).unwrap();
+        drop(stuck);
+        let deadline = Instant::now() + LIMIT;
+        while stuck_program.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the program outlived its console");
+            if Instant::now() > hung_up + crate::pty::GRACEFUL_SHUTDOWN {
+                stuck_program.group().kill_remaining();
+            }
+            session.turn();
+        }
+        session.send("exit\r");
+        session.finish();
+    }
+
+    #[test]
+    fn a_reparent_gives_the_console_window_an_owner() {
+        if !crate::conpty::has_embedded() {
+            eprintln!("skipped: this build has no packaged ConPTY");
+            return;
+        }
+        let (mut session, console_window) = session_with_a_console_window(&[]);
+        assert_eq!(owner(console_window), 0);
+        let first = Window::new();
+        let second = Window::new();
+        for window in [&first, &second] {
+            reparent(Some(&session.program), window.id()).unwrap();
+            // The host does it a moment later.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while owner(console_window) != window.id() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the owner is {:#x}, not {:#x}",
+                    owner(console_window),
+                    window.id()
+                );
+                Window::pump();
+                session.turn();
+            }
+        }
+        // A destroyed owner leaves the console window, with no owner.
+        drop(second);
+        session.turn();
+        assert_eq!(owner(console_window), 0);
+        reparent(Some(&session.program), first.id()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while owner(console_window) != first.id() {
+            assert!(Instant::now() < deadline, "no owner after the first one went");
+            Window::pump();
+            session.turn();
+        }
+
+        // A session that is gone, and one whose console has closed.
+        reparent(None, first.id()).unwrap();
+        session.program.group().kill();
+        reparent(Some(&session.program), first.id()).unwrap();
+        session.finish();
+    }
+
+    #[test]
+    fn the_inbox_host_ignores_a_reparent() {
+        let (mut session, console_window) =
+            session_with_a_console_window(&[("BRINDLE_CONPTY", "inbox")]);
+        assert!(!session.pty.packaged);
+        let window = Window::new();
+        for _ in 0..2 {
+            reparent(Some(&session.program), window.id()).unwrap();
+        }
+        let settled = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < settled {
+            Window::pump();
+            session.turn();
+        }
+        assert_eq!(owner(console_window), 0);
+        session.program.group().kill();
+        session.finish();
     }
 
     #[test]

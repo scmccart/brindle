@@ -104,6 +104,12 @@ impl Program {
     }
 }
 
+/// Refuses to give the console window of `program`'s session an owner
+/// window (`REPARENT`): that is for Windows.
+pub fn reparent(_program: Option<&Program>, _hwnd: u64) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+}
+
 /// The process group a session's program leads. It outlives the program:
 /// children that ignored the hang-up are still in it.
 #[derive(Debug, Clone, Copy)]

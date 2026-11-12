@@ -6,6 +6,7 @@ use std::os::windows::io::{
     AsHandle as _, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle,
 };
 use std::path::Path;
+use std::sync::Once;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::System::Console::{COORD, HPCON};
@@ -84,19 +85,20 @@ impl Pseudoconsole {
         Ok(())
     }
 
-    /// Parents the console window programs can ask for (`GetConsoleWindow`)
-    /// to the window `hwnd`, so their dialogs belong to that window. Only
-    /// the packaged host supports it; with the built-in one this logs and
-    /// does nothing.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "for REPARENT (terminal-server-windows 5.4)")
-    )]
+    /// Makes the window `hwnd` the owner of the console window programs can
+    /// ask for (`GetConsoleWindow`), so their dialogs belong to that window.
+    /// The host does it a moment later. Only the packaged host supports it;
+    /// with the built-in one this does nothing, and says so in the log the
+    /// first time.
     pub fn reparent(&self, hwnd: u64) {
         let Some(reparent) = self.api.reparent else {
-            eprintln!(
-                "conpty: the ConPTY built into Windows can't parent a console to window {hwnd:#x}"
-            );
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| {
+                eprintln!(
+                    "conpty: the ConPTY built into Windows can't give a console window an \
+                     owner; ignoring that for window {hwnd:#x} and from now on"
+                );
+            });
             return;
         };
         let window = HWND(hwnd as usize as *mut c_void);
