@@ -3,6 +3,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The trampoline a role is started through on Windows (`launch`).
+#[cfg(windows)]
+pub use super::platform::daemon::launch;
 pub use super::platform::daemon::{
     ReadyPipe, daemonize, open_log, ready_from_args, role_args, start_role,
 };

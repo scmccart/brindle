@@ -31,11 +31,12 @@ windows = { version = "0.61", features = [
   "Win32_System_Threading",
 ] }
 
-# The tests' real command-line parser, their list of processes, and their
-# owner window for a console window.
+# The tests' real command-line parser, their list of processes, the jobs they
+# start roles in, and their owner window for a console window.
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.61", features = [
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

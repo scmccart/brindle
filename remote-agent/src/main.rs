@@ -50,6 +50,9 @@ fn run() -> Result<(), String> {
         }
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
+        // The trampoline that starts a role detached, for the role's starter.
+        #[cfg(windows)]
+        Some("launch") => server::daemon::launch(&rest),
         Some(command) => manage(command, &rest).unwrap_or_else(|| Err(USAGE.into())),
         None => Err(USAGE.into()),
     }

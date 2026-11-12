@@ -72,8 +72,8 @@ const TICK_SLOW: Duration = Duration::from_millis(500);
 /// The core the holder starts is run from its own binary, with
 /// [`daemon::role_args`]. Tests replace the arguments with
 /// `BRINDLE_TEST_HOLDER_CORE_ARGS` (whitespace-separated), where the
-/// platform's placeholder (`{ready_fd}` on Linux) stands for the ready
-/// pipe.
+/// platform's placeholder (`{ready_fd}` on Linux, `{ready_handle}` on
+/// Windows) stands for the ready pipe.
 const CORE_ARGS_ENV: &str = "BRINDLE_TEST_HOLDER_CORE_ARGS";
 
 macro_rules! log {
@@ -87,8 +87,9 @@ macro_rules! log {
     };
 }
 
-/// Runs `brindle-remote hold [--ready-fd N]`. Without `--ready-fd` it stays
-/// in the foreground and logs to stderr.
+/// Runs `brindle-remote hold [--ready-fd N]` (`--ready-handle N` on
+/// Windows). Without it the holder stays in the foreground and logs to
+/// stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
     let ready = daemon::ready_from_args("hold", args)?;
     let dir = dir::from_env().map_err(|error| error.to_string())?;

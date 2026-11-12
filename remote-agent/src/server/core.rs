@@ -87,8 +87,8 @@ macro_rules! log {
 }
 pub(crate) use log;
 
-/// Runs `brindle-remote serve [--ready-fd N]`. Without `--ready-fd` it stays
-/// in the foreground and logs to stderr.
+/// Runs `brindle-remote serve [--ready-fd N]` (`--ready-handle N` on
+/// Windows). Without it the core stays in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
     let ready = daemon::ready_from_args("serve", args)?;
     let dir = dir::from_env().map_err(|error| error.to_string())?;
