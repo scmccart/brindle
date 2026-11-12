@@ -73,6 +73,7 @@ impl Pseudoconsole {
 
     /// Whether the packaged ConPTY made this pseudoconsole, not the one
     /// built into Windows.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by tests"))]
     pub fn is_packaged(&self) -> bool {
         self.api.packaged
     }
@@ -87,6 +88,10 @@ impl Pseudoconsole {
     /// to the window `hwnd`, so their dialogs belong to that window. Only
     /// the packaged host supports it; with the built-in one this logs and
     /// does nothing.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "for REPARENT (terminal-server-windows 5.4)")
+    )]
     pub fn reparent(&self, hwnd: u64) {
         let Some(reparent) = self.api.reparent else {
             eprintln!(

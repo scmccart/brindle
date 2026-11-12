@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Child;
 
-use super::event_loop::Source;
+use super::event_loop::{Source, Waker};
 use crate::pty::{self, PtyCommand};
 
 /// The master end of a session's PTY, non-blocking.
@@ -82,6 +82,12 @@ impl Program {
     /// The processes to hang up and kill with this program.
     pub fn group(&self) -> Group {
         Group(self.pid)
+    }
+
+    /// Nothing to arrange: `SIGCHLD` wakes the loop when any child exits
+    /// ([`Waker::wake_on_child_exit`]).
+    pub fn watch(&mut self, _waker: &Waker) -> io::Result<()> {
+        Ok(())
     }
 
     /// Reaps the program if it has exited.

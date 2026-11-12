@@ -19,6 +19,10 @@
 //! Reading, writing and waiting for the program are the caller's: the
 //! holder does them on its event loop.
 
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows holder's pty starts programs with it")
+)]
 pub mod cmdline;
 
 #[cfg(windows)]
@@ -29,12 +33,8 @@ mod console;
 #[cfg(windows)]
 pub use console::{Process, Pseudoconsole};
 
-/// Keeps the embedded ConPTY in the binary while nothing creates a
-/// pseudoconsole yet: the linker drops it with the unused code otherwise,
-/// and packaging checks that the helper carries it. To be removed, with its
-/// call in `main`, once the holder's pty uses this module
-/// (terminal-server-windows 5.2).
-#[cfg(windows)]
-pub fn keep_embedded() {
-    std::hint::black_box(api::bundle::FILES);
+/// Whether this build embeds the packaged ConPTY.
+#[cfg(all(windows, test))]
+pub fn has_embedded() -> bool {
+    api::bundle::FILES.is_some()
 }

@@ -753,6 +753,10 @@ impl<L: EventLoop> Holder<L> {
             }));
         }
         self.sources.insert(token, Source::Master(id));
+        if let Err(error) = program.watch(&self.ev.waker()) {
+            // The exit is then seen on a later turn of the loop.
+            log!("session {id}: can't watch its program for its exit: {error}");
+        }
         let pid = program.pid();
         log!(
             "session {id}: started {} as pid {pid}",

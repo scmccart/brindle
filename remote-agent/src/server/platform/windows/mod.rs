@@ -1,6 +1,6 @@
 //! The Windows platform layer. The event loop (`event_loop`, with its pipe
-//! sources in `pipe`), the stream (`conn`) and the pipe listener (`listen`)
-//! are in place. Until the
+//! sources in `pipe`), the stream (`conn`), the pipe listener (`listen`) and
+//! the sessions' pseudoconsoles (`pty`) are in place. Until the
 //! `terminal-server-windows` change fills in the rest, the other modules
 //! are stubs with the Linux modules' items: nothing can be created, and
 //! what would create it fails with [`unsupported`], so `serve`, `hold` and

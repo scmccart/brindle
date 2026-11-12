@@ -23,13 +23,6 @@ pub const OUTPUT_DRAIN_IDLE: Duration = Duration::from_millis(250);
 pub const OUTPUT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 
 /// What to run on a new PTY.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "read by the Windows pty (terminal-server-windows 5.2)"
-    )
-)]
 pub struct PtyCommand<'a> {
     /// `None` runs the user's login shell.
     pub command: Option<&'a str>,
@@ -38,7 +31,9 @@ pub struct PtyCommand<'a> {
     pub env: &'a BTreeMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+    #[cfg_attr(windows, allow(dead_code, reason = "a console has no pixel size"))]
     pub cell_width: u16,
+    #[cfg_attr(windows, allow(dead_code, reason = "a console has no pixel size"))]
     pub cell_height: u16,
     /// `env` is the program's whole environment. Otherwise it is added to
     /// this process's own, with a default `TERM`.

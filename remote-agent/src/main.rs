@@ -1,9 +1,4 @@
 mod agent;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "used by the Windows holder's pty (terminal-server-windows 5.2)"
-)]
 mod conpty;
 #[cfg(any(target_os = "linux", windows))]
 mod pty;
@@ -29,8 +24,6 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    #[cfg(windows)]
-    conpty::keep_embedded();
     let mut args = env::args().skip(1);
     if env::var_os("BRINDLE_REMOTE_UNLINK").is_some()
         && let Ok(exe) = env::current_exe()

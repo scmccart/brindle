@@ -101,8 +101,8 @@ pub fn holder_pipe(dir: &Path, user_sid: &str, build: &str, n: u32) -> String {
     )
 }
 
-/// The pipe a holder gives one session's pseudoconsole host, `n` counting
-/// that holder's sessions.
+/// A pipe a holder gives one session's pseudoconsole host, `n` counting
+/// that holder's pipes: each session has one for input and one for output.
 pub fn pty_pipe(holder_pid: u32, n: u64) -> String {
     format!(r"\\.\pipe\brindle-pty-{holder_pid}-{n}")
 }

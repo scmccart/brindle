@@ -37,8 +37,13 @@ pub(super) struct Api {
     /// Lets the host exit once the client is gone. Not on every build.
     pub release: Option<ReleaseFn>,
     /// Only the packaged host has it.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "for REPARENT (terminal-server-windows 5.4)")
+    )]
     pub reparent: Option<ReparentFn>,
     /// Whether this is the packaged ConPTY.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by tests"))]
     pub packaged: bool,
 }
 

@@ -928,10 +928,6 @@ impl Pipe {
 
     /// A pipe end to read from, one to write to, or one of each: two pipes
     /// that make one source.
-    #[allow(
-        dead_code,
-        reason = "for the PTY's pipes and the ready pipe (tasks 4.2 and 5.2)"
-    )]
     pub(super) fn of(read: Option<OwnedHandle>, write: Option<OwnedHandle>) -> Self {
         Self::with(
             read.map(|handle| Reader::new(Arc::new(handle))),

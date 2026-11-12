@@ -356,7 +356,6 @@ impl Waker {
     /// Wakes the loop when `process` exits, as [`Waker::wake`] does, for
     /// its starter to reap. The watch lasts until the returned value is
     /// dropped, and fires once; `process` may be closed meanwhile.
-    #[allow(dead_code, reason = "for the programs the holder starts (task 5.2)")]
     pub fn wake_on_exit(&self, process: BorrowedHandle<'_>) -> io::Result<ExitWatch> {
         // The wait needs a handle that stays open, whatever the caller does
         // with its own.
@@ -399,7 +398,6 @@ unsafe extern "system" fn process_exited(port: *mut c_void, _timed_out: bool) {
 
 /// A process watched with [`Waker::wake_on_exit`]. Dropping it ends the
 /// watch.
-#[allow(dead_code, reason = "for the programs the holder starts (task 5.2)")]
 pub struct ExitWatch {
     wait: HANDLE,
     /// The reference (`Arc::into_raw`) the callback uses.
