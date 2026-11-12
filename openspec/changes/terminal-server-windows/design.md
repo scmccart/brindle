@@ -113,7 +113,7 @@ An elevated Brindle (Run as administrator, or started from an elevated console a
   - `scripts/package-windows.ps1` checks the embedding in `brindle-remote.exe` instead.
 - **`SPAWN` carries the command and arguments.** On Windows, Brindle always resolves the program (`windows_default_program` for the default profile), so `command` is never empty, and the holder builds the line with `launch_line`. The environment is complete and already merged case-insensitively by Brindle, as Linux sends it. The holder passes it as given.
 - **`BRINDLE_CONPTY` is read from the `SPAWN` environment, not the holder's.** The holder resolves the shipped and the inbox `Api` lazily, and caches each. So the fallback e2e case works when a holder is already running.
-- **Output pipes:** the holder creates an overlapped named pipe pair per session (`\\.\pipe\brindle-pty-<holder pid>-<n>`, first instance, the user DACL). It hands ConPTY the synchronous ends, and keeps the overlapped ends in its loop. The flags (`PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH`) are unchanged.
+- **Output pipes:** the holder creates two overlapped named pipes per session, input then output (`\\.\pipe\brindle-pty-<holder pid>-<n>` with consecutive `n`, first instance, the user DACL). It hands ConPTY the synchronous ends, and keeps the overlapped ends in its loop. The flags (`PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH`) are unchanged.
 - **Exit:** the child's exit wait posts to the loop.
   - The holder then calls `ReleasePseudoConsole` when the export exists, and `ClosePseudoConsole` on a short-lived thread, because it can block until output drains.
   - The loop keeps reading the output pipe to EOF.
