@@ -464,6 +464,21 @@ pub fn core_endpoint(dir: &Path) -> PathBuf {
     Endpoints::of(dir).unwrap().core()
 }
 
+/// Whether a core accepts connections for `dir`.
+pub fn core_listens(dir: &Path) -> bool {
+    connect(&core_endpoint(dir)).is_ok()
+}
+
+/// Whether nothing is left of the core's endpoint for `dir`: no socket
+/// file on Linux, no pipe of that name on Windows.
+pub fn core_endpoint_gone(dir: &Path) -> bool {
+    let endpoint = core_endpoint(dir);
+    #[cfg(unix)]
+    return !endpoint.exists();
+    #[cfg(windows)]
+    return connect(&endpoint).is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+}
+
 /// Runs `brindle-remote args…` (a management command, say) for `dir`.
 pub fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
@@ -844,9 +859,37 @@ impl TestClient {
         }
     }
 
-    /// Hands the connection to a `sleep` process (as its fd 3) and closes
-    /// this side, so killing that process is a client dying.
-    #[cfg(unix)]
+    /// Collects `session`'s output until it contains `needle` and then
+    /// until none came for `quiet`: everything it printed, when the program
+    /// waits after `needle`. Other messages are kept for later.
+    pub fn output_until_quiet(
+        &mut self,
+        session: SessionId,
+        needle: &[u8],
+        quiet: Duration,
+    ) -> Vec<u8> {
+        let mut output = self.output_until(session, needle);
+        let mut kept = Vec::new();
+        loop {
+            match self.next(quiet) {
+                Recv::Message(ToClient::Data(client::Data { session: s, bytes }))
+                    if s == session =>
+                {
+                    output.extend(bytes)
+                }
+                Recv::Message(other) => kept.push(other),
+                Recv::TimedOut => break,
+                Recv::Closed => panic!("the core closed the connection"),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        output
+    }
+
+    /// Hands the connection to another process (a `sleep` on Linux, as its
+    /// fd 3; a `ping` on Windows, as an inherited handle) and closes this
+    /// side, so killing that process is a client dying.
     pub fn into_process(self) -> std::process::Child {
         let child = hand_to_process(&self.stream);
         drop(self);
@@ -876,6 +919,54 @@ pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
 #[cfg(unix)]
 pub fn client_shell(script: &str) -> client::Spawn {
     client_spawn("/bin/sh", &["-c", script])
+}
+
+/// A client `cmd /d /v:on /c script` session (see [`shell`]).
+#[cfg(windows)]
+pub fn client_shell(script: &str) -> client::Spawn {
+    client_spawn("cmd.exe", &["/d", "/v:on", "/c", script])
+}
+
+/// This process's environment with `extra` over it, for programs that need
+/// more than the system's own (PowerShell).
+#[cfg(windows)]
+pub fn inherited_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+    let set = |name: &str| extra.iter().any(|(set, _)| set.eq_ignore_ascii_case(name));
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| !set(name))
+        .chain(extra.iter().map(|(name, value)| (name.to_string(), value.to_string())))
+        .collect()
+}
+
+/// Line `n` of a file of numbered lines, without its line end.
+fn numbered_line(n: usize) -> String {
+    format!("#{n:07}# {}", "x".repeat(60))
+}
+
+/// Writes a file of `lines` numbered lines into `dir`: output that is
+/// recognised in what a pseudoconsole makes of it. `cmd`'s `type` takes
+/// its path unquoted, so it has no space.
+pub fn numbered_lines(dir: &Path, lines: usize) -> PathBuf {
+    let path = dir.join(format!("lines-{lines}.txt"));
+    assert!(!path.to_str().unwrap().contains(' '), "{path:?}");
+    let text: String = (0..lines).map(|n| numbered_line(n) + "\r\n").collect();
+    fs::write(&path, text).unwrap();
+    path
+}
+
+/// Fails unless `output` has every one of `lines` numbered lines, in
+/// order.
+pub fn check_lines(output: &[u8], lines: usize) {
+    let output = String::from_utf8_lossy(output);
+    let mut from = 0;
+    for n in 0..lines {
+        let line = numbered_line(n);
+        match output[from..].find(&line) {
+            Some(at) => from += at + line.len(),
+            None => panic!("line {n} is missing after byte {from} of {}", output.len()),
+        }
+    }
 }
 
 /// A fresh emulator of `cols` × `rows`, fed `bytes` (a replay, say).

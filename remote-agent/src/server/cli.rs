@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use brindle_remote_protocol::client::{
     self, Hello, Kill, KillTarget, Request, ServerStatus, SessionInfo, ToClient, ToCore,
 };
+use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::serde_json::{self, Value};
 use brindle_remote_protocol::{Frame, RequestId};
 
@@ -234,9 +235,14 @@ struct Connection {
 impl Connection {
     /// Connects and says `HELLO`; `None` when no core is listening.
     fn open() -> Result<Option<Self>, String> {
-        let socket = dir::resolve_from_env()
-            .map_err(|error| error.to_string())?
-            .join("core.sock");
+        let dir = dir::resolve_from_env().map_err(|error| error.to_string())?;
+        let socket = match Endpoints::of(&dir) {
+            Ok(endpoints) => endpoints.core(),
+            // Without the directory (which names the pipe on Windows), no
+            // server runs there.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("can't use {}: {error}", dir.display())),
+        };
         let stream = match listen::connect(&socket) {
             Ok(stream) => stream,
             Err(error)

@@ -1,11 +1,13 @@
 //! `brindle-remote serve`: the core, which clients talk to.
 //!
-//! The core owns the client socket and drives the holders, which own the
-//! PTYs. It can restart at any time without ending a session: a new core
+//! The core owns the client endpoint (`core.sock` on Linux, a named pipe on
+//! Windows; see `brindle_remote_protocol::endpoint`) and drives the
+//! holders, which own the PTYs. It can restart at any time without ending a session: a new core
 //! adopts the running holders and their sessions.
 //!
 //! - **Single instance:** `core.lock` is held for the core's whole life,
-//!   and only then is a stale `core.sock` replaced. A second
+//!   and only then is a stale `core.sock` replaced (a pipe leaves nothing
+//!   behind). A second
 //!   `serve` that can't take the lock waits until the winner accepts
 //!   connections, tells its starter it is ready, and exits 0.
 //! - **Clients** ([`clients`]): the peer check before reading anything, the
@@ -13,8 +15,9 @@
 //!   [`CLIENT_QUEUE_HIGH`] queued to a client, its sessions are paused in
 //!   their holders until the queue is under [`CLIENT_QUEUE_LOW`], so a
 //!   stalled client blocks only its own programs.
-//! - **Holders** ([`holders`]): found by their `holder-*.sock` sockets, live
-//!   ones told from stale ones by their lock files, and adopted (`HELLO`,
+//! - **Holders** ([`holders`]): found by their `holder-*.sock` sockets (on
+//!   Windows by their lock files, which name their pipes), live ones told
+//!   from stale ones by their lock files, and adopted (`HELLO`,
 //!   then `WELCOME` with the sessions, checkpoints and tails). Clients are
 //!   accepted once the holders found at startup are adopted, so session ids
 //!   continue from the largest adopted one and returning clients find their
@@ -29,6 +32,9 @@
 //! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, once
 //!   `STOP` has ended every session, or after `STEP_DOWN`. The socket is
 //!   removed first.
+//! - **Windows:** a client's `REPARENT` goes to its session's holder, and
+//!   at its start the core removes the helper copies of other builds that
+//!   nothing runs from any more ([`prune_copies`]).
 
 mod clients;
 mod holders;
@@ -37,13 +43,13 @@ mod screen;
 mod sessions;
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{Request, ToClient};
+use brindle_remote_protocol::endpoint::{self, Endpoints};
 use brindle_remote_protocol::{RequestId, SessionId};
 
 use self::clients::{Client, Pending};
@@ -109,6 +115,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         daemon::daemonize(&log).map_err(|error| error.to_string())?;
     }
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
+    prune_copies(&build);
     let ev = Loop::new().map_err(|error| error.to_string())?;
     let core = Core::new(ev, dir, paths, lock, build, Identity::own()).map_err(|error| {
         log!("can't start: {error}");
@@ -125,24 +132,49 @@ pub fn run(args: &[String]) -> Result<(), String> {
     })
 }
 
-/// The core's files in the server directory.
+/// Where the core listens, and its files in the server directory.
 struct Paths {
+    endpoints: Endpoints,
     lock: PathBuf,
-    socket: PathBuf,
+    /// The socket on Linux, the pipe's name on Windows.
+    endpoint: PathBuf,
     log: PathBuf,
 }
 
 impl Paths {
     fn new(dir: &Path) -> io::Result<Self> {
-        let socket = dir.join("core.sock");
-        listen::check_path(&socket)?;
+        let endpoints = Endpoints::of(dir)?;
+        let endpoint = endpoints.core();
+        listen::check_path(&endpoint)?;
         Ok(Self {
+            endpoints,
             lock: dir.join("core.lock"),
-            socket,
+            endpoint,
             log: dir.join("core.log"),
         })
     }
 }
+
+/// Removes the per-build helper copies of other builds, where nothing runs
+/// from them any more (Windows runs every role from a copy, since a running
+/// image can't be replaced). A copy still in use stays for a later core.
+#[cfg(windows)]
+fn prune_copies(build: &str) {
+    use brindle_remote_protocol::{server_dir, win};
+
+    let server_dir = std::env::var_os("BRINDLE_SERVER_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()) else {
+        return;
+    };
+    let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local));
+    win::prune_helper_copies(&copies, build);
+}
+
+/// Only Windows runs its roles from per-build copies.
+#[cfg(not(windows))]
+fn prune_copies(_build: &str) {}
 
 enum Claim {
     /// This process holds `core.lock` and becomes the core.
@@ -159,7 +191,7 @@ fn claim(paths: &Paths) -> io::Result<Claim> {
         if let Some(lock) = Lock::create(&paths.lock)? {
             return Ok(Claim::Core(lock));
         }
-        if listen::connect(&paths.socket).is_ok() {
+        if listen::connect(&paths.endpoint).is_ok() {
             return Ok(Claim::Running);
         }
         if Instant::now() >= deadline {
@@ -206,7 +238,8 @@ pub(super) struct Core<L: EventLoop> {
     dir: PathBuf,
     paths: Paths,
     _lock: Lock,
-    listener: Listener,
+    /// Closed when the core exits, before its last messages go out.
+    listener: Option<Listener>,
     /// Clients are accepted once the startup adoption is done.
     accepting: bool,
     build: String,
@@ -243,11 +276,11 @@ impl<L: EventLoop> Core<L> {
         identity: Identity,
     ) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
-        let listener = Listener::bind(&paths.socket, identity)?;
+        let listener = Listener::bind(&paths.endpoint, identity)?;
         ev.register(&listener.source(), LISTENER, Interest::NONE)?;
         log!(
             "listening on {} (version {}, build {build})",
-            paths.socket.display(),
+            paths.endpoint.display(),
             env!("CARGO_PKG_VERSION")
         );
         Ok(Self {
@@ -255,7 +288,7 @@ impl<L: EventLoop> Core<L> {
             dir,
             paths,
             _lock: lock,
-            listener,
+            listener: Some(listener),
             accepting: false,
             build,
             instance: random_instance(),
@@ -506,8 +539,12 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn shutdown(mut self) {
-        // Nothing can find this core once the socket is gone.
-        let _ = fs::remove_file(&self.paths.socket);
+        // Nothing can find this core once it stops listening and its socket
+        // is gone. (A pipe's name goes with the listener and the
+        // connections it accepted.)
+        self.drop_source(LISTENER);
+        self.listener = None;
+        let _ = endpoint::remove(&self.paths.endpoint);
         let stepped_down = self.stepping_down.take();
         if stepped_down.is_some() {
             // The checkpoints and GOODBYEs reach the holders before the
@@ -547,11 +584,10 @@ impl<L: EventLoop> Core<L> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::dir::tests::TempDir;
-    use crate::server::platform::listen::tests::TestPeer;
 
     /// A core in a fresh directory that runs, as far as its peer check is
     /// concerned, as `identity`.
@@ -564,12 +600,15 @@ mod tests {
         Core::new(ev, temp.0.clone(), paths, lock, "test".into(), identity).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_foreign_uid_is_closed_without_being_read() {
+        use crate::server::platform::listen::tests::TestPeer;
+
         let temp = TempDir::new("core-peer");
         // As if this core ran as someone else.
         let mut core = core_as(&temp, Identity::own().other());
-        let mut peer = TestPeer::connect(&temp.0.join("core.sock"));
+        let mut peer = TestPeer::connect(&core.paths.endpoint);
         peer.send_hello();
         core.accept();
         assert!(core.pending.is_empty() && core.clients.is_empty());
@@ -579,8 +618,41 @@ mod tests {
         // The same connection from its own user waits for its HELLO.
         let temp = TempDir::new("core-peer-own");
         let mut core = core_as(&temp, Identity::own());
-        let mut peer = TestPeer::connect(&temp.0.join("core.sock"));
+        let mut peer = TestPeer::connect(&core.paths.endpoint);
         peer.send_hello();
+        core.accept();
+        assert_eq!(core.pending.len(), 1);
+    }
+
+    /// The Windows form of the test above. A pipe has no reset, so a client
+    /// can't tell "closed unread" from "closed"; that the listener closes a
+    /// refused peer before reading is its own test's
+    /// (`platform::windows::listen`). Here: the core keeps nothing of a
+    /// peer that runs as another user, and that peer reads the end.
+    #[cfg(windows)]
+    #[test]
+    fn a_foreign_user_is_closed_and_never_becomes_a_client() {
+        use std::io::{Read, Write};
+
+        let hello = [1u8, 0, 0, 0, 2, b'{', b'}'];
+
+        let temp = TempDir::new("core-peer");
+        // As if this core ran as someone else.
+        let mut core = core_as(&temp, Identity::own().other());
+        let mut peer = listen::connect(&core.paths.endpoint).unwrap();
+        peer.write_all(&hello).unwrap();
+        core.accept();
+        assert!(core.pending.is_empty() && core.clients.is_empty());
+        let mut rest = Vec::new();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(peer.read_to_end(&mut rest).unwrap(), 0, "closed, with no answer");
+        drop(core);
+
+        // The same connection from its own user waits for its HELLO.
+        let temp = TempDir::new("core-peer-own");
+        let mut core = core_as(&temp, Identity::own());
+        let mut peer = listen::connect(&core.paths.endpoint).unwrap();
+        peer.write_all(&hello).unwrap();
         core.accept();
         assert_eq!(core.pending.len(), 1);
     }

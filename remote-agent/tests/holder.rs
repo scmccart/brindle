@@ -76,12 +76,13 @@ mod programs {
 /// The sessions' programs, as `cmd.exe` runs them.
 #[cfg(windows)]
 mod programs {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use brindle_remote_protocol::SessionId;
     use brindle_remote_protocol::holder::Spawn;
 
     use super::support::shell;
+    pub use super::support::{check_lines, numbered_lines};
 
     /// What ends a line of input.
     pub const ENTER: &[u8] = b"\r";
@@ -102,35 +103,6 @@ mod programs {
     /// for another line and exits with 0.
     pub fn echoes_a_line(session: SessionId) -> Spawn {
         shell(session, "echo one& set /p x=& echo two:!x!& set /p y=& exit 0")
-    }
-
-    /// Line `n` of a file of numbered lines, without its line end.
-    fn line(n: usize) -> String {
-        format!("#{n:07}# {}", "x".repeat(60))
-    }
-
-    /// Writes a file of `lines` numbered lines into `dir`: output that is
-    /// recognised in what a pseudoconsole makes of it. `cmd`'s `type` takes
-    /// its path unquoted here.
-    pub fn numbered_lines(dir: &Path, lines: usize) -> PathBuf {
-        let path = dir.join(format!("lines-{lines}.txt"));
-        assert!(!path.to_str().unwrap().contains(' '), "{path:?}");
-        let text: String = (0..lines).map(|n| line(n) + "\r\n").collect();
-        std::fs::write(&path, text).unwrap();
-        path
-    }
-
-    /// Fails unless `output` has every one of `lines` numbered lines, in
-    /// order.
-    pub fn check_lines(output: &[u8], lines: usize) {
-        let output = String::from_utf8_lossy(output);
-        let mut from = 0;
-        for n in 0..lines {
-            match output[from..].find(&line(n)) {
-                Some(at) => from += at + line(n).len(),
-                None => panic!("line {n} is missing after byte {from} of {}", output.len()),
-            }
-        }
     }
 
     /// Prints a flood and exits with 0.
@@ -824,16 +796,9 @@ fn a_holder_without_a_core_starts_one_from_its_own_binary_even_after_it_was_repl
 /// shell: the same behaviour, over a pseudoconsole.
 #[cfg(windows)]
 mod on_windows {
-    use std::collections::BTreeMap;
     use std::time::Instant;
 
     use brindle_remote_protocol::holder::Spawn;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, GW_OWNER, GetWindow, MSG, PM_REMOVE,
-        PeekMessageW, WINDOW_EX_STYLE, WS_OVERLAPPED,
-    };
-    use windows::core::w;
 
     use super::*;
 
@@ -842,17 +807,6 @@ mod on_windows {
     const GRACE: Duration = Duration::from_secs(1);
     /// The exit code of a program the holder terminated.
     const TERMINATED: i32 = 1;
-
-    /// This process's environment with `extra` over it, for programs that
-    /// need more than the system's own (PowerShell).
-    fn inherited_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
-        let set = |name: &str| extra.iter().any(|(set, _)| set.eq_ignore_ascii_case(name));
-        std::env::vars_os()
-            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-            .filter(|(name, _)| !set(name))
-            .chain(extra.iter().map(|(name, value)| (name.to_string(), value.to_string())))
-            .collect()
-    }
 
     /// An interactive `cmd` whose prompt is `ready>`.
     fn interactive(session: u32) -> Spawn {
@@ -1101,63 +1055,6 @@ mod on_windows {
         hung_up(&mut core, 1);
     }
 
-    /// A hidden top-level window of this thread's, destroyed on drop.
-    struct Window(HWND);
-
-    impl Window {
-        fn new() -> Self {
-            // SAFETY: a window of a system class, with no parent, menu or
-            // parameter; it is never shown.
-            let window = unsafe {
-                CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    w!("STATIC"),
-                    w!("brindle test owner"),
-                    WS_OVERLAPPED,
-                    0,
-                    0,
-                    100,
-                    100,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            };
-            Self(window.unwrap())
-        }
-
-        fn id(&self) -> u64 {
-            self.0.0 as usize as u64
-        }
-
-        /// Handles what other threads sent this thread's windows: a host
-        /// that makes one an owner may wait for it to answer.
-        fn pump() {
-            let mut message = MSG::default();
-            // SAFETY: `message` outlives each call.
-            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
-                // SAFETY: the message was just read.
-                unsafe { DispatchMessageW(&message) };
-            }
-        }
-    }
-
-    impl Drop for Window {
-        fn drop(&mut self) {
-            // SAFETY: the window is this thread's, as `Window` isn't `Send`.
-            unsafe { DestroyWindow(self.0) }.unwrap();
-        }
-    }
-
-    /// The owner of the window `window`, if it has one (0 if not).
-    fn owner(window: u64) -> u64 {
-        let window = HWND(window as usize as *mut std::ffi::c_void);
-        // SAFETY: any window handle may be asked about.
-        let owner = unsafe { GetWindow(window, GW_OWNER) };
-        owner.map_or(0, |owner| owner.0 as usize as u64)
-    }
-
     #[test]
     fn reparent_makes_a_window_the_owner_of_the_sessions_console_window() {
         // Only the packaged ConPTY can; a build without it uses Windows' own.
@@ -1177,7 +1074,7 @@ mod on_windows {
         let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
         let console_window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
         assert_ne!(console_window, 0, "no console window in {text:?}");
-        assert_eq!(owner(console_window), 0);
+        assert_eq!(window_owner(console_window), 0);
 
         let window = Window::new();
         core.send(ToHolder::Reparent(h1::Reparent {
@@ -1186,11 +1083,11 @@ mod on_windows {
         }));
         // The host applies it a moment later.
         let deadline = Instant::now() + TIMEOUT;
-        while owner(console_window) != window.id() {
+        while window_owner(console_window) != window.id() {
             assert!(
                 Instant::now() < deadline,
                 "the owner is {:#x}, not {:#x}",
-                owner(console_window),
+                window_owner(console_window),
                 window.id()
             );
             Window::pump();

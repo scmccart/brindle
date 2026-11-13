@@ -1,13 +1,15 @@
-//! The core's holders: finding them by their sockets, adopting them and
+//! The core's holders: finding them in the server directory (by their
+//! sockets on Linux, by their lock files on Windows), adopting them and
 //! their sessions, starting one of the core's own build, and H1.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::endpoint::{self, Holder as Place};
 use brindle_remote_protocol::{SessionId, client};
 use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHolder, Welcome};
 
@@ -30,8 +32,9 @@ const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(1);
 pub(super) struct Holder {
     pub(super) conn: Conn,
     pub(super) interest: Interest,
-    socket: PathBuf,
-    /// Its socket names the core's own build.
+    /// Where it listens, and its lock file.
+    place: Place,
+    /// Its files name the core's own build.
     own_build: bool,
     /// Found at startup: clients wait until it is adopted.
     initial: bool,
@@ -89,36 +92,35 @@ pub(super) struct WaitingSpawn {
     pub(super) spawn: client::Spawn,
 }
 
-/// Whether a holder socket belongs to a running holder.
+/// Whether what the directory shows of a holder belongs to a running one.
 enum Liveness {
     Live,
-    /// No holder holds its lock: the socket is a leftover (and is removed).
+    /// No holder holds its lock: its files are leftovers (and are removed).
     Stale,
-    /// It has no lock file; leave it alone.
+    /// It has no lock file (any more); leave it alone.
     Unknown,
 }
 
 /// A running holder holds `holder-<build>-<n>.lock` for its whole life. Its
-/// lock free means the socket beside it is stale; then, still holding the
-/// lock (so no new holder can take that slot meanwhile), the socket and the
-/// lock file are removed.
-fn liveness(socket: &Path) -> io::Result<Liveness> {
-    let lock_path = socket.with_extension("lock");
-    let _lock = match Lock::existing(&lock_path) {
+/// lock free means that its holder is gone (killed, since an exiting one
+/// removes its files); then, still holding the lock (so no new holder can
+/// take that slot meanwhile), the socket and the lock file are removed.
+fn liveness(place: &Place) -> io::Result<Liveness> {
+    let _lock = match Lock::existing(&place.lock) {
         Ok(Some(lock)) => lock,
         Ok(None) => return Ok(Liveness::Live),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Liveness::Unknown),
         Err(error) => return Err(error),
     };
-    let _ = fs::remove_file(socket);
-    let _ = fs::remove_file(&lock_path);
+    let _ = endpoint::remove(&place.endpoint);
+    let _ = fs::remove_file(&place.lock);
     Ok(Liveness::Stale)
 }
 
-fn connect(socket: &Path, retry_for: Duration) -> io::Result<Stream> {
+fn connect(endpoint: &Path, retry_for: Duration) -> io::Result<Stream> {
     let deadline = Instant::now() + retry_for;
     loop {
-        match listen::connect(socket) {
+        match listen::connect(endpoint) {
             Ok(stream) => return Ok(stream),
             Err(error)
                 if Instant::now() < deadline
@@ -138,31 +140,26 @@ impl<L: EventLoop> Core<L> {
     /// Connects to every running holder in the server directory that the
     /// core isn't connected to yet.
     pub(super) fn discover(&mut self, initial: bool) {
-        let mut sockets: Vec<PathBuf> = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    name.starts_with("holder-") && name.ends_with(".sock")
-                })
-                .collect(),
+        let places = match self.paths.endpoints.holders() {
+            Ok(places) => places,
             Err(error) => return log!("can't read {}: {error}", self.dir.display()),
         };
-        sockets.sort();
-        for socket in sockets {
-            if self.holders.values().any(|holder| holder.socket == socket) {
+        for place in places {
+            if self.holders.values().any(|holder| holder.place == place) {
                 continue;
             }
-            match liveness(&socket) {
+            match liveness(&place) {
                 Ok(Liveness::Live) => {}
                 Ok(Liveness::Stale) => {
-                    log!("removed the stale holder socket {}", socket.display());
+                    log!(
+                        "removed what a holder that is gone left behind ({})",
+                        place.lock.display()
+                    );
                     continue;
                 }
                 Ok(Liveness::Unknown) => continue,
                 Err(error) => {
-                    log!("can't check {}: {error}", socket.display());
+                    log!("can't check {}: {error}", place.lock.display());
                     continue;
                 }
             }
@@ -171,19 +168,20 @@ impl<L: EventLoop> Core<L> {
             } else {
                 Duration::ZERO
             };
-            if let Err(error) = self.connect_holder(&socket, retry_for, initial) {
-                log!("can't connect to {}: {error}", socket.display());
+            let endpoint = place.endpoint.clone();
+            if let Err(error) = self.connect_holder(place, retry_for, initial) {
+                log!("can't connect to {}: {error}", endpoint.display());
             }
         }
     }
 
     fn connect_holder(
         &mut self,
-        socket: &Path,
+        place: Place,
         retry_for: Duration,
         initial: bool,
     ) -> io::Result<()> {
-        let mut conn = Conn::new(connect(socket, retry_for)?)?;
+        let mut conn = Conn::new(connect(&place.endpoint, retry_for)?)?;
         queue(
             &mut conn,
             ToHolder::Hello(Hello {
@@ -196,14 +194,14 @@ impl<L: EventLoop> Core<L> {
         let token = self.token();
         self.ev.register(&conn.source(), token, Interest::READABLE)?;
         self.sources.insert(token, Source::Holder);
-        let name = socket.file_name().unwrap_or_default().to_string_lossy();
+        let name = place.lock.file_name().unwrap_or_default().to_string_lossy();
         let own_build = name.starts_with(&format!("holder-{}-", self.build));
         self.holders.insert(
             token,
             Holder {
                 conn,
                 interest: Interest::READABLE,
-                socket: socket.to_path_buf(),
+                place,
                 own_build,
                 initial,
                 welcome: None,
@@ -360,7 +358,7 @@ impl<L: EventLoop> Core<L> {
         }
         log!(
             "adopted holder {} (pid {}, build {}, protocol H{}, previous core {:?}) with {} session(s)",
-            holder.socket.display(),
+            holder.place.endpoint.display(),
             welcome.pid,
             welcome.build,
             welcome.protocol,
@@ -371,14 +369,14 @@ impl<L: EventLoop> Core<L> {
         if welcome.previous == h1::Previous::Handover {
             log!(
                 "upgrade: took holder {} over from a core that stepped down",
-                holder.socket.display()
+                holder.place.endpoint.display()
             );
         }
         let drain = !holder.own_build;
         if drain {
             log!(
                 "drain: holder {} is of build {}, not {}; it takes no new sessions and exits after its last one",
-                holder.socket.display(),
+                holder.place.endpoint.display(),
                 welcome.build,
                 self.build
             );
@@ -469,19 +467,19 @@ impl<L: EventLoop> Core<L> {
         if holder.draining && lost.is_empty() {
             log!(
                 "drain: holder {} (pid {:?}) ended its last session and exited",
-                holder.socket.display(),
+                holder.place.endpoint.display(),
                 holder.welcome.as_ref().map(|welcome| welcome.pid),
             );
         } else if lost.is_empty() {
             log!(
                 "holder {} (pid {:?}) closed its connection with no sessions ({reason})",
-                holder.socket.display(),
+                holder.place.endpoint.display(),
                 holder.welcome.as_ref().map(|welcome| welcome.pid),
             );
         } else {
             log!(
                 "holder {} (pid {:?}) left ({reason}); {} session(s) lost",
-                holder.socket.display(),
+                holder.place.endpoint.display(),
                 holder.welcome.as_ref().map(|welcome| welcome.pid),
                 lost.len()
             );

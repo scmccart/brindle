@@ -1,13 +1,14 @@
 //! The Windows half of the tests' support: pipe connections, starting a
-//! server process through `launch` with `--ready-handle`, and process
-//! checks through Toolhelp and process handles.
+//! server process through `launch` with `--ready-handle`, process checks
+//! through Toolhelp and process handles, and a window to own a session's
+//! console window.
 
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,8 +17,8 @@ use std::time::Duration;
 use brindle_remote_protocol::win;
 use windows::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HWND, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
@@ -29,12 +30,17 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Threading::{
-    CreateEventW, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    CreateEventW, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     QueryFullProcessImageNameW, SetEvent, TerminateProcess, WaitForMultipleObjects,
     WaitForSingleObject,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GW_OWNER, GetWindow, MSG, PM_REMOVE,
+    PeekMessageW, WINDOW_EX_STYLE, WS_OVERLAPPED,
+};
+use windows::core::{PCWSTR, PWSTR, w};
 
 use super::TIMEOUT;
 
@@ -297,11 +303,43 @@ fn is_server(pid: u32) -> bool {
     image_name(pid).is_some_and(|name| name.to_ascii_lowercase().starts_with("brindle-remote"))
 }
 
-/// Kills the server process `pid`, if it still runs.
+/// Kills the server process `pid`, if it still runs, and what it started
+/// that is still running then: a holder's console hosts and programs. They
+/// end with their holder, except one that was only just starting.
 pub fn kill_server(pid: u32) {
-    if is_server(pid) {
-        kill(pid);
+    if !is_server(pid) {
+        return;
     }
+    let processes = processes();
+    let mut started = vec![pid];
+    let mut next = 0;
+    while next < started.len() {
+        // A pid is used again: only a process younger than the one its
+        // parent pid names was started by it.
+        let parent = started[next];
+        let since = created(parent);
+        let children = processes.iter().filter(|(child, of, _)| {
+            *of == parent && since.is_some() && created(*child) >= since
+        });
+        let children = children.map(|(child, ..)| *child);
+        let new: Vec<u32> = children.filter(|child| !started.contains(child)).collect();
+        started.extend(new);
+        next += 1;
+    }
+    for process in started {
+        kill(process);
+    }
+}
+
+/// When the running process `pid` was created, as a `FILETIME`'s count.
+fn created(pid: u32) -> Option<u64> {
+    let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let (mut creation, mut exit) = (FILETIME::default(), FILETIME::default());
+    let (mut kernel, mut user) = (FILETIME::default(), FILETIME::default());
+    // SAFETY: the handle is open and the four times are writable.
+    unsafe { GetProcessTimes(raw(&process), &mut creation, &mut exit, &mut kernel, &mut user) }
+        .ok()?;
+    Some(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
 }
 
 /// Every running process: its pid, its parent's pid and its image's file
@@ -387,14 +425,14 @@ pub fn server_processes(dir: &Path, role: &str) -> Vec<u32> {
     pids
 }
 
+/// Held while a handle of this process can be inherited: one start at a
+/// time, so that no other start's process gets that handle.
+static STARTING: Mutex<()> = Mutex::new(());
+
 /// Runs `bin launch <role> --ready-handle N` for `dir` and waits for the
 /// role's ready byte. Fails, with what the role said before it had its
 /// log, if it ends before being ready.
 pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
-    // One start at a time: while the pipe's write end can be inherited, no
-    // other start's processes should get it.
-    static STARTING: Mutex<()> = Mutex::new(());
-
     let (mut read, write) = io::pipe()?;
     let handle = HANDLE(write.as_raw_handle());
     let child = {
@@ -448,4 +486,93 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         )));
     }
     Ok(())
+}
+
+/// Hands `stream` to a `ping` process, which inherits its handle, so killing
+/// that process closes the connection as a client dying does. The caller
+/// drops its own side.
+pub fn hand_to_process(stream: &Stream) -> Child {
+    let handle = raw(&stream.pipe.handle);
+    let _starting = STARTING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the handle is open; it can be inherited only while the lock
+    // is held.
+    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.unwrap();
+    let child = Command::new("ping.exe")
+        .args(["-n", "1000", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    // SAFETY: as above.
+    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.unwrap();
+    child.unwrap()
+}
+
+/// The working set of `pid`, in KiB.
+pub fn working_set_kib(pid: u32) -> u64 {
+    let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION).expect("the process");
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the handle is open, and `counters` has `size` bytes.
+    unsafe { GetProcessMemoryInfo(raw(&process), &mut counters, size) }.unwrap();
+    counters.WorkingSetSize as u64 / 1024
+}
+
+/// A hidden top-level window of this thread's, destroyed on drop.
+pub struct Window(HWND);
+
+impl Window {
+    pub fn new() -> Self {
+        // SAFETY: a window of a system class, with no parent, menu or
+        // parameter; it is never shown.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("brindle test owner"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        Self(window.unwrap())
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0.0 as usize as u64
+    }
+
+    /// Handles what other threads sent this thread's windows: a host
+    /// that makes one an owner may wait for it to answer.
+    pub fn pump() {
+        let mut message = MSG::default();
+        // SAFETY: `message` outlives each call.
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            // SAFETY: the message was just read.
+            unsafe { DispatchMessageW(&message) };
+        }
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // SAFETY: the window is this thread's, as `Window` isn't `Send`.
+        unsafe { DestroyWindow(self.0) }.unwrap();
+    }
+}
+
+/// The owner of the window `window`, if it has one (0 if not).
+pub fn window_owner(window: u64) -> u64 {
+    let window = HWND(window as usize as *mut std::ffi::c_void);
+    // SAFETY: any window handle may be asked about.
+    let owner = unsafe { GetWindow(window, GW_OWNER) };
+    owner.map_or(0, |owner| owner.0 as usize as u64)
 }

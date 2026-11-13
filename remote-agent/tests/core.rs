@@ -1,17 +1,193 @@
 //! `brindle-remote serve`, driven by test clients over protocol 1, with real
 //! holders under it (task groups 4 and 5).
+//!
+//! Most tests run on both platforms with the platform's own programs
+//! ([`programs`]). Those that need a Unix shell, exact PTY bytes, signals
+//! or `/proc` are Linux's, and Windows has its own beside them
+//! ([`on_windows`]) for the same behaviour over a pseudoconsole. Its output
+//! carries the console host's own escape sequences, so where Linux compares
+//! a replay with the bytes a program printed, Windows compares it with what
+//! an attached client saw.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 
 mod support;
 
+#[cfg(unix)]
 use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, ToClient};
 
 use support::*;
+
+/// The sessions' programs, as a Unix shell runs them.
+#[cfg(unix)]
+mod programs {
+    use std::path::Path;
+
+    use brindle_remote_protocol::SessionId;
+    use brindle_remote_protocol::client::Spawn;
+
+    use super::support::{TestClient, client_shell, client_spawn, reported_pid};
+
+    /// What ends a line of input.
+    pub const ENTER: &[u8] = b"\n";
+    /// A program that doesn't exist, and what the error says of it.
+    pub const MISSING: (&str, &str) = ("/nonexistent/brindle-no-such-program", "No such file");
+    /// How many bytes [`flood`] prints.
+    const FLOOD: usize = 6 * 1024 * 1024;
+
+    /// Exits with `code`.
+    pub fn exits(code: i32) -> Spawn {
+        client_shell(&format!("exit {code}"))
+    }
+
+    /// Waits for a line of input, then exits with `code`.
+    pub fn exits_after_a_line(code: i32) -> Spawn {
+        client_shell(&format!("read x; exit {code}"))
+    }
+
+    /// Waits for a line of input.
+    pub fn waits() -> Spawn {
+        client_shell("read x")
+    }
+
+    /// Runs until it is ended.
+    pub fn sleeps() -> Spawn {
+        client_shell("sleep 1000")
+    }
+
+    /// Answers every line of input with [`echo_of`] it.
+    pub fn echoer() -> Spawn {
+        client_spawn("cat", &[])
+    }
+
+    /// What [`echoer`]'s session prints for the line `word`: the PTY's
+    /// echo, then `cat`'s.
+    pub fn echo_of(word: &str) -> Vec<u8> {
+        format!("{word}\r\n{word}\r\n").into_bytes()
+    }
+
+    /// Prints a flood and exits with 0. No newlines, so the PTY passes the
+    /// bytes through unchanged.
+    pub fn flood(_dir: &Path) -> Spawn {
+        client_shell(&format!(
+            "head -c {FLOOD} /dev/zero | tr '\\0' x; exit 0"
+        ))
+    }
+
+    /// Fails unless `output` is all of [`flood`]'s.
+    pub fn check_flood(output: &[u8]) {
+        assert!(output.iter().all(|&byte| byte == b'x'));
+        assert_eq!(output.len(), FLOOD, "every byte of output");
+    }
+
+    /// Starts a child that runs until it is ended, and waits for it.
+    pub fn with_a_child() -> Spawn {
+        client_shell("sleep 1000 & echo \"bg=$!.\"; wait")
+    }
+
+    /// The child of [`with_a_child`]'s program `pid`, in `session`.
+    pub fn child_of(client: &mut TestClient, session: SessionId, _pid: u32) -> u32 {
+        reported_pid(&client.output_until(session, b"."), "bg")
+    }
+
+    /// Sets the title `build`, prints `ready.` and waits.
+    pub fn titled() -> Spawn {
+        client_shell("printf '\\033]2;build\\007ready.'; exec cat")
+    }
+}
+
+/// The sessions' programs, as `cmd.exe` runs them.
+#[cfg(windows)]
+mod programs {
+    use std::path::Path;
+
+    use brindle_remote_protocol::SessionId;
+    use brindle_remote_protocol::client::Spawn;
+
+    use super::support::{
+        TIMEOUT, TestClient, check_lines, children_named, client_shell, client_spawn, eventually,
+        numbered_lines,
+    };
+
+    /// What ends a line of input.
+    pub const ENTER: &[u8] = b"\r";
+    /// A program that doesn't exist, and what the error says of it.
+    pub const MISSING: (&str, &str) = (r"C:\nonexistent\brindle-no-such-program.exe", "cannot find");
+    /// How many lines [`flood`] prints: about 6 MB.
+    const FLOOD_LINES: usize = 85_000;
+
+    /// Exits with `code`.
+    pub fn exits(code: i32) -> Spawn {
+        client_shell(&format!("exit {code}"))
+    }
+
+    /// Waits for a line of input, then exits with `code`.
+    pub fn exits_after_a_line(code: i32) -> Spawn {
+        client_shell(&format!("set /p x=& exit {code}"))
+    }
+
+    /// Waits for a line of input.
+    pub fn waits() -> Spawn {
+        exits_after_a_line(0)
+    }
+
+    /// Runs until it is ended. It is the session's own program, not a
+    /// shell's child: a program that joins a console while it closes isn't
+    /// told to end, and these sessions are closed as soon as they start.
+    pub fn sleeps() -> Spawn {
+        client_spawn("ping.exe", &["-n", "1000", "127.0.0.1"])
+    }
+
+    /// Answers every line of input with [`echo_of`] it.
+    pub fn echoer() -> Spawn {
+        client_shell("for /l %i in (0,0,1) do @(set /p x=& echo got:!x!)")
+    }
+
+    /// What [`echoer`]'s session prints for the line `word`, after the
+    /// console's echo of it.
+    pub fn echo_of(word: &str) -> Vec<u8> {
+        format!("got:{word}").into_bytes()
+    }
+
+    /// Prints a flood and exits with 0.
+    pub fn flood(dir: &Path) -> Spawn {
+        let file = numbered_lines(dir, FLOOD_LINES);
+        client_shell(&format!("type {}& exit 0", file.display()))
+    }
+
+    /// Fails unless `output` is all of [`flood`]'s.
+    pub fn check_flood(output: &[u8]) {
+        check_lines(output, FLOOD_LINES);
+    }
+
+    /// Starts a child that runs until it is ended, and waits for it.
+    pub fn with_a_child() -> Spawn {
+        client_shell("ping -t 127.0.0.1 >nul")
+    }
+
+    /// The child of [`with_a_child`]'s program `pid`.
+    pub fn child_of(_client: &mut TestClient, _session: SessionId, pid: u32) -> u32 {
+        let mut children = Vec::new();
+        assert!(
+            eventually(TIMEOUT, || {
+                children = children_named(pid, "ping");
+                !children.is_empty()
+            }),
+            "the program started no child"
+        );
+        children[0]
+    }
+
+    /// Sets the title `build`, prints `ready.` and waits.
+    pub fn titled() -> Spawn {
+        client_shell("title build& echo ready.& set /p x=")
+    }
+}
 
 /// A core in a fresh directory, with a connected client.
 fn core(tag: &str) -> (TempDir, TestClient) {
@@ -20,6 +196,24 @@ fn core(tag: &str) -> (TempDir, TestClient) {
     let client = TestClient::hello(&dir.path, &format!("token-{tag}"));
     dir.track(client.core_pid());
     (dir, client)
+}
+
+/// Sends the line `word` to an [`programs::echoer`] session and waits for
+/// its answer.
+fn say(client: &mut TestClient, session: SessionId, word: &str) {
+    client.input(session, &[word.as_bytes(), programs::ENTER].concat());
+    client.output_until(session, &programs::echo_of(word));
+}
+
+/// Waits for the `EXIT` of a session that was hung up. A signal ended its
+/// program on Linux, so it has no exit code; on Windows it has the one the
+/// console's end or the holder ended it with.
+fn hung_up(client: &mut TestClient, session: SessionId) {
+    let code = client.exit_code(session);
+    #[cfg(unix)]
+    assert_eq!(code, None);
+    #[cfg(windows)]
+    assert!(code.is_some());
 }
 
 // 4.1
@@ -59,7 +253,7 @@ fn sessions_share_one_holder_that_is_neither_the_core_nor_the_client() {
     let (mut dir, mut client) = core("share");
     let core_pid = client.core_pid();
     let pids: Vec<u32> = (0..3)
-        .map(|_| client.spawn(client_shell("read x")).1)
+        .map(|_| client.spawn(programs::waits()).1)
         .collect();
     let holder = parent(pids[0]).unwrap();
     dir.track(holder);
@@ -86,37 +280,37 @@ fn an_unused_core_and_its_holder_exit_and_remove_their_sockets() {
     let started = Instant::now();
     assert!(gone(pid));
     assert!(started.elapsed() >= Duration::from_secs(4));
-    assert!(!core_endpoint(&idle.path).exists());
+    assert!(core_endpoint_gone(&idle.path));
 
     // Used, then left.
     let (dir, mut client) = core("unused");
     let core_pid = client.core_pid();
-    let (session, _) = client.spawn(client_shell("read x; exit 0"));
+    let (session, _) = client.spawn(programs::exits_after_a_line(0));
     let holder = server_processes(&dir.path, "hold")[0];
-    client.input(session, b"\n");
+    client.input(session, programs::ENTER);
     assert_eq!(client.exit_code(session), Some(0));
     drop(client);
     assert!(gone(holder) && gone(core_pid));
-    assert!(!core_endpoint(&dir.path).exists());
+    assert!(core_endpoint_gone(&dir.path));
     assert!(dir.holder_endpoints().is_empty());
 }
 
 #[test]
 fn a_new_core_adopts_the_holder_and_continues_the_session_ids() {
     let (mut dir, mut client) = core("adopt");
-    let first = client.spawn(client_shell("read x"));
-    let second = client.spawn(client_shell("read x"));
+    let first = client.spawn(programs::waits());
+    let second = client.spawn(programs::waits());
     assert_eq!((first.0, second.0), (1, 2));
     let holder = parent(first.1).unwrap();
     dir.track(holder);
 
-    unsafe { libc::kill(client.core_pid() as libc::pid_t, libc::SIGKILL) };
+    kill(client.core_pid());
     assert!(client.closes());
     assert!(gone(client.core_pid()));
     start_core(&dir.path, &[]).unwrap();
     let mut client = TestClient::hello(&dir.path, "someone-else");
     dir.track(client.core_pid());
-    let (third, pid) = client.spawn(client_shell("read x"));
+    let (third, pid) = client.spawn(programs::waits());
     assert_eq!(third, 3);
     assert_eq!(parent(pid), Some(holder), "the adopted holder is reused");
     assert!(alive(first.1) && alive(second.1));
@@ -129,6 +323,7 @@ fn a_new_core_adopts_the_holder_and_continues_the_session_ids() {
 
 // 4.2
 
+#[cfg(unix)]
 #[test]
 fn a_session_gets_exactly_the_requests_environment() {
     let mut dir = TempDir::new("env");
@@ -162,15 +357,13 @@ fn a_session_gets_exactly_the_requests_environment() {
 
 #[test]
 fn a_missing_command_is_an_error_naming_it() {
+    let (program, reason) = programs::MISSING;
     let (_dir, mut client) = core("missing");
-    match client.spawn_reply(client_spawn("/nonexistent/brindle-no-such-program", &[])) {
+    match client.spawn_reply(client_spawn(program, &[])) {
         ToClient::Error(error) => {
             assert!(error.session.is_none());
             assert!(
-                error
-                    .message
-                    .contains("/nonexistent/brindle-no-such-program")
-                    && error.message.contains("No such file"),
+                error.message.contains(program) && error.message.contains(reason),
                 "{}",
                 error.message
             );
@@ -178,17 +371,20 @@ fn a_missing_command_is_an_error_naming_it() {
         other => panic!("{other:?}"),
     }
     // The core and its holder still work.
-    let (session, _) = client.spawn(client_shell("exit 0"));
+    let (session, _) = client.spawn(programs::exits(0));
     assert_eq!(client.exit_code(session), Some(0));
 }
 
 #[test]
 fn exit_statuses_reach_the_client() {
     let (_dir, mut client) = core("exit");
-    let (three, _) = client.spawn(client_shell("read x; exit 3"));
-    let (signalled, _) = client.spawn(client_shell("kill -TERM $$"));
-    assert_eq!(client.exit_code(signalled), None, "killed by a signal");
-    client.input(three, b"\n");
+    let (three, _) = client.spawn(programs::exits_after_a_line(3));
+    #[cfg(unix)]
+    {
+        let (signalled, _) = client.spawn(client_shell("kill -TERM $$"));
+        assert_eq!(client.exit_code(signalled), None, "killed by a signal");
+    }
+    client.input(three, programs::ENTER);
     assert_eq!(client.exit_code(three), Some(3));
     // It is gone: input for it is refused.
     client.input(three, b"x");
@@ -208,32 +404,27 @@ fn exit_statuses_reach_the_client() {
 /// lost session.
 #[test]
 fn a_flood_and_its_exit_reach_a_slow_client() {
-    const FLOOD: usize = 6 * 1024 * 1024;
     let (dir, mut client) = core("flood");
-    // No newlines, so the PTY passes the bytes through unchanged.
-    let (session, _) = client.spawn(client_shell(&format!(
-        "head -c {FLOOD} /dev/zero | tr '\\0' x; exit 0"
-    )));
-    let mut output = 0usize;
+    let (session, _) = client.spawn(programs::flood(&dir.path));
+    let mut output = Vec::new();
     let mut since_pause = 0usize;
     let deadline = Instant::now() + Duration::from_secs(60);
     let exit = loop {
-        assert!(Instant::now() < deadline, "only {output} bytes arrived");
+        assert!(Instant::now() < deadline, "only {} bytes arrived", output.len());
         match client.recv() {
             ToClient::Data(data) if data.session == session => {
-                assert!(data.bytes.iter().all(|&byte| byte == b'x'));
-                output += data.bytes.len();
                 since_pause += data.bytes.len();
+                output.extend(data.bytes);
                 if since_pause >= 64 * 1024 {
                     since_pause = 0;
                     thread::sleep(Duration::from_millis(30));
                 }
             }
             ToClient::Exit(exit) if exit.session == session => break exit,
-            other => panic!("after {output} bytes: {other:?}"),
+            other => panic!("after {} bytes: {other:?}", output.len()),
         }
     };
-    assert_eq!(output, FLOOD, "every byte of output");
+    programs::check_flood(&output);
     assert_eq!((exit.code, exit.lost), (Some(0), None), "{}", dir.logs());
     assert!(
         eventually(TIMEOUT, || dir.holder_endpoints().is_empty()),
@@ -249,11 +440,12 @@ fn spawning_as_the_last_session_ends_still_works() {
     // sends it to a new holder.
     let (_dir, mut client) = core("respawn");
     for round in 0..10 {
-        let (session, _) = client.spawn(client_shell(&format!("exit {round}")));
+        let (session, _) = client.spawn(programs::exits(round));
         assert_eq!(client.exit_code(session), Some(round));
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn input_resize_and_close() {
     let (dir, mut client) = core("io");
@@ -298,6 +490,7 @@ fn input_resize_and_close() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_stalled_client_doesnt_delay_another_clients_session() {
     let (dir, mut stalled) = core("stall");
@@ -358,12 +551,8 @@ fn detach(mut spawn: client::Spawn) -> client::Spawn {
     spawn
 }
 
-fn kill(pid: u32) {
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-}
-
-/// SIGKILLs the client's core and waits until another core (the holders'
-/// own) accepts connections.
+/// Kills the client's core (SIGKILL, or `TerminateProcess`) and waits until
+/// another core (the holders' own) accepts connections.
 fn kill_core_and_wait_for_another(dir: &TempDir, client: &mut TestClient) {
     let old = client.core_pid();
     kill(old);
@@ -373,7 +562,7 @@ fn kill_core_and_wait_for_another(dir: &TempDir, client: &mut TestClient) {
             server_processes(&dir.path, "serve")
                 .iter()
                 .any(|&pid| pid != old)
-                && std::os::unix::net::UnixStream::connect(core_endpoint(&dir.path)).is_ok()
+                && core_listens(&dir.path)
         }),
         "no new core: {}",
         dir.logs()
@@ -384,9 +573,15 @@ fn kill_core_and_wait_for_another(dir: &TempDir, client: &mut TestClient) {
 fn a_sigkilled_clients_kill_session_ends_with_its_children_and_detach_survives() {
     let (mut dir, mut client) = core("sigkill");
     let core_pid = client.core_pid();
-    let (with_child, pid) = client.spawn(client_shell("sleep 1000 & echo \"bg=$!.\"; wait"));
-    let background = reported_pid(&client.output_until(with_child, b"."), "bg");
-    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    let (with_child, pid) = client.spawn(programs::with_a_child());
+    let background = programs::child_of(&mut client, with_child, pid);
+    let echoer = programs::echoer();
+    let command = [echoer.command.clone().unwrap_or_default()]
+        .into_iter()
+        .chain(echoer.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (kept, kept_pid) = client.spawn(detach(echoer));
     dir.track(parent(pid).unwrap());
 
     let mut process = client.into_process();
@@ -418,14 +613,14 @@ fn a_sigkilled_clients_kill_session_ends_with_its_children_and_detach_survives()
     );
     assert_eq!(meta["policy"], "detach");
     assert_eq!(meta["owner"], "token-sigkill");
-    assert_eq!(meta["command"], "cat");
+    assert_eq!(meta["command"], command);
     assert_eq!(meta["scrollback"], 1000);
 }
 
 #[test]
 fn a_detach_session_goes_back_to_its_owners_token() {
     let (dir, mut client) = core("detach");
-    let (session, pid) = client.spawn(detach(client_spawn("cat", &[])));
+    let (session, pid) = client.spawn(detach(programs::echoer()));
     drop(client);
     thread::sleep(Duration::from_millis(500));
     assert!(alive(pid));
@@ -437,8 +632,7 @@ fn a_detach_session_goes_back_to_its_owners_token() {
         other => panic!("{other:?}"),
     }
     let mut owner = TestClient::hello(&dir.path, "token-detach");
-    owner.input(session, b"back\n");
-    owner.output_until(session, b"back\r\nback\r\n");
+    say(&mut owner, session, "back");
 }
 
 #[test]
@@ -447,19 +641,17 @@ fn a_client_back_within_the_grace_period_keeps_its_kill_sessions() {
     start_core(&dir.path, &[SUPERVISED]).unwrap();
     let mut client = TestClient::hello(&dir.path, "back");
     let old_core = client.core_pid();
-    let (session, pid) = client.spawn(client_spawn("cat", &[]));
+    let (session, pid) = client.spawn(programs::echoer());
     dir.track(parent(pid).unwrap());
 
     kill_core_and_wait_for_another(&dir, &mut client);
     let mut client = TestClient::hello(&dir.path, "back");
     assert_ne!(client.core_pid(), old_core);
-    client.input(session, b"still here\n");
-    client.output_until(session, b"still here\r\nstill here\r\n");
+    say(&mut client, session, "still here");
 
     thread::sleep(PAST_GRACE);
     assert!(alive(pid));
-    client.input(session, b"later\n");
-    client.output_until(session, b"later\r\nlater\r\n");
+    say(&mut client, session, "later");
 }
 
 #[test]
@@ -467,8 +659,8 @@ fn kill_sessions_whose_owner_doesnt_come_back_end_after_the_grace_period() {
     let mut dir = TempDir::new("grace-gone");
     start_core(&dir.path, &[SUPERVISED]).unwrap();
     let mut client = TestClient::hello(&dir.path, "away");
-    let (_, pid) = client.spawn(client_spawn("cat", &[]));
-    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    let (_, pid) = client.spawn(programs::echoer());
+    let (kept, kept_pid) = client.spawn(detach(programs::echoer()));
     dir.track(parent(pid).unwrap());
 
     kill_core_and_wait_for_another(&dir, &mut client);
@@ -485,21 +677,20 @@ fn kill_sessions_whose_owner_doesnt_come_back_end_after_the_grace_period() {
     assert!(alive(kept_pid), "a detach session waits for its owner");
 
     let mut owner = TestClient::hello(&dir.path, "away");
-    owner.input(kept, b"x\n");
-    owner.output_until(kept, b"x\r\nx\r\n");
+    say(&mut owner, kept, "x");
 }
 
 #[test]
 fn kill_and_stop_end_sessions_whatever_their_policy() {
     let (dir, mut client) = core("stop");
     let core_pid = client.core_pid();
-    let (first, first_pid) = client.spawn(detach(client_spawn("cat", &[])));
+    let (first, first_pid) = client.spawn(detach(programs::echoer()));
     client.send(client::ToCore::Kill(client::Kill {
         req: 100,
         target: client::KillTarget::Session(first),
     }));
     assert!(matches!(client.reply(100), ToClient::Ok(_)));
-    assert_eq!(client.exit_code(first), None);
+    hung_up(&mut client, first);
     assert!(!alive(first_pid));
 
     client.send(client::ToCore::Kill(client::Kill {
@@ -511,22 +702,23 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
         other => panic!("{other:?}"),
     }
 
-    let (kept, kept_pid) = client.spawn(detach(client_spawn("cat", &[])));
-    let (plain, plain_pid) = client.spawn(client_shell("sleep 1000"));
+    let (kept, kept_pid) = client.spawn(detach(programs::echoer()));
+    let (plain, plain_pid) = client.spawn(programs::sleeps());
     let holder = parent(kept_pid).unwrap();
     client.send(client::ToCore::Stop(client::Request { req: 102 }));
     assert!(matches!(client.reply(102), ToClient::Ok(_)));
-    assert_eq!(client.exit_code(kept), None);
-    assert_eq!(client.exit_code(plain), None);
+    hung_up(&mut client, kept);
+    hung_up(&mut client, plain);
     assert!(client.closes());
     assert!(!alive(kept_pid) && !alive(plain_pid));
     assert!(gone(core_pid) && gone(holder));
-    assert!(!core_endpoint(&dir.path).exists());
+    assert!(core_endpoint_gone(&dir.path));
     assert!(dir.holder_endpoints().is_empty());
 }
 
 // 5.1
 
+#[cfg(unix)]
 #[test]
 fn a_cursor_position_query_gets_only_the_clients_reply() {
     let (_dir, mut client) = core("query");
@@ -553,21 +745,18 @@ fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
     start_core(&dir.path, &[("BRINDLE_TEST_FEED_PANIC", PANIC_MARKER)]).unwrap();
     let mut client = TestClient::hello(&dir.path, "t");
     dir.track(client.core_pid());
-    let (broken, _) = client.spawn(client_spawn("cat", &[]));
-    let (other, _) = client.spawn(client_spawn("cat", &[]));
+    let (broken, _) = client.spawn(programs::echoer());
+    let (other, _) = client.spawn(programs::echoer());
 
-    client.input(broken, format!("{PANIC_MARKER}\n").as_bytes());
-    client.output_until(broken, format!("{PANIC_MARKER}\r\n{PANIC_MARKER}\r\n").as_bytes());
+    say(&mut client, broken, PANIC_MARKER);
     assert!(
         eventually(TIMEOUT, || dir.logs().contains("the emulator panicked")),
         "{}",
         dir.logs()
     );
     // Still forwarding, and not breaking again.
-    client.input(broken, format!("after {PANIC_MARKER}\n").as_bytes());
-    client.output_until(broken, format!("after {PANIC_MARKER}\r\n").as_bytes());
-    client.input(other, b"fine\n");
-    client.output_until(other, b"fine\r\nfine\r\n");
+    say(&mut client, broken, &format!("after-{PANIC_MARKER}"));
+    say(&mut client, other, "fine");
     assert_eq!(dir.logs().matches("the emulator panicked").count(), 1);
 
     // Its replay is just a reset; the other's is its screen. (One
@@ -583,17 +772,19 @@ fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
 // 5.3
 
 /// Spawns `bytes` as a detached fixture session and detaches from it.
+#[cfg(unix)]
 fn detached_fixture(
     dir: &TempDir,
     client: &mut TestClient,
     bytes: &[u8],
     scrollback: u32,
-) -> (brindle_remote_protocol::SessionId, u32) {
+) -> (SessionId, u32) {
     let (session, pid) = client.spawn(fixture_spawn(dir, "fixture", bytes, scrollback));
     client.detach(session);
     (session, pid)
 }
 
+#[cfg(unix)]
 #[test]
 fn attaching_to_a_full_screen_session_replays_its_screen() {
     let (dir, mut client) = core("attach-full");
@@ -611,6 +802,7 @@ fn attaching_to_a_full_screen_session_replays_its_screen() {
     assert_eq!(screen.title().as_deref(), Some("htop-like"));
 }
 
+#[cfg(unix)]
 #[test]
 fn attaching_replays_the_scrollback() {
     let (dir, mut client) = core("attach-scroll");
@@ -626,9 +818,9 @@ fn attaching_replays_the_scrollback() {
     assert_eq!(text, want);
 }
 
-#[test]
-fn attaching_replays_status_records_and_prompt_marks() {
-    let (dir, mut client) = core("attach-marks");
+/// Three finished commands with their OSC 133 marks, then a prompt and an
+/// OSC 7501 report of a working program.
+fn marks_fixture() -> Vec<u8> {
     let mut fixture = Vec::new();
     for (n, exit) in [(1, 0), (2, 1), (3, 0)] {
         fixture.extend_from_slice(
@@ -639,6 +831,14 @@ fn attaching_replays_status_records_and_prompt_marks() {
         );
     }
     fixture.extend_from_slice(b"\x1b]133;A\x07$ \x1b]7501;state=working:app=tests\x1b\\");
+    fixture
+}
+
+#[cfg(unix)]
+#[test]
+fn attaching_replays_status_records_and_prompt_marks() {
+    let (dir, mut client) = core("attach-marks");
+    let fixture = marks_fixture();
     let (session, _) = detached_fixture(&dir, &mut client, &fixture, 1000);
     let expected = snapshot(&replayed(&fixture, 80, 24, 1000));
     let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
@@ -652,6 +852,7 @@ fn attaching_replays_status_records_and_prompt_marks() {
     assert_eq!(marks.prompt_lines().collect::<Vec<_>>(), [0, 2, 4, 6]);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
     let (dir, mut owner) = core("attach-refused");
@@ -698,6 +899,7 @@ fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
 
 // 5.4
 
+#[cfg(unix)]
 #[test]
 fn after_a_core_restart_a_full_screen_session_rebuilds_from_checkpoint_and_tail() {
     let mut dir = TempDir::new("rebuild-full");
@@ -735,6 +937,7 @@ fn after_a_core_restart_a_full_screen_session_rebuilds_from_checkpoint_and_tail(
 }
 
 /// Numbered, coloured lines: about `kib` KiB of them.
+#[cfg(unix)]
 fn lines_fixture(kib: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut n = 0;
@@ -753,6 +956,7 @@ fn lines_fixture(kib: usize) -> Vec<u8> {
     out
 }
 
+#[cfg(unix)]
 #[test]
 fn a_session_with_more_output_than_a_tail_holds_rebuilds_exactly() {
     let mut dir = TempDir::new("rebuild-long");
@@ -773,6 +977,7 @@ fn a_session_with_more_output_than_a_tail_holds_rebuilds_exactly() {
     assert!(!logs.contains("truncated"), "{logs}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_truncated_tail_still_gives_a_working_session() {
     let mut dir = TempDir::new("rebuild-truncated");
@@ -809,6 +1014,7 @@ fn a_truncated_tail_still_gives_a_working_session() {
 
 // 5.5
 
+#[cfg(unix)]
 #[test]
 fn a_client_back_after_a_core_restart_gets_its_replay_then_live_output() {
     let mut dir = TempDir::new("reconnect-replay");
@@ -846,6 +1052,7 @@ fn a_client_back_after_a_core_restart_gets_its_replay_then_live_output() {
 }
 
 /// A process's resident set, in KiB.
+#[cfg(unix)]
 fn rss_kib(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     status
@@ -859,7 +1066,7 @@ fn rss_kib(pid: u32) -> u64 {
 
 /// Input to `session` is refused because the session isn't attached to
 /// `client`: the core gave it no replay of it.
-fn not_given_back(client: &mut TestClient, session: brindle_remote_protocol::SessionId) {
+fn not_given_back(client: &mut TestClient, session: SessionId) {
     client.input(session, b"x");
     loop {
         match client.recv() {
@@ -879,7 +1086,7 @@ fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let mut spawn = detach(client_shell("printf '\\033]2;build\\007ready.'; exec cat"));
+    let mut spawn = detach(programs::titled());
     spawn.profile = Some("Shell".into());
     let reply = client.spawn_reply(spawn);
     let ToClient::Spawned(spawned) = reply else { panic!("{reply:?}") };
@@ -898,7 +1105,7 @@ fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
     assert!(client.closes());
     start_core(&dir.path, &[]).unwrap();
     let mut again = TestClient::hello(&dir.path, "token-keys");
-    let reply = again.spawn_reply(detach(client_spawn("cat", &[])));
+    let reply = again.spawn_reply(detach(programs::echoer()));
     let ToClient::Spawned(second) = reply else { panic!("{reply:?}") };
     assert_eq!(second.session, spawned.session);
     assert_ne!(second.key, spawned.key);
@@ -909,7 +1116,7 @@ fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
 #[test]
 fn an_explicit_detach_keeps_a_kill_session_and_clears_its_owner() {
     let (dir, mut client) = core("explicit-detach");
-    let (session, pid) = client.spawn(client_spawn("cat", &[]));
+    let (session, pid) = client.spawn(programs::echoer());
     client.detach(session);
     let listed = client.list();
     let info = listed.iter().find(|s| s.session == session).unwrap();
@@ -930,8 +1137,8 @@ fn owner_and_policy_changes_survive_a_core_restart() {
     let mut dir = TempDir::new("set-meta-restart");
     start_core(&dir.path, &[SUPERVISED]).unwrap();
     let mut a = TestClient::hello(&dir.path, "a");
-    let (left, left_pid) = a.spawn(client_spawn("cat", &[]));
-    let (taken, _) = a.spawn(detach(client_spawn("cat", &[])));
+    let (left, left_pid) = a.spawn(programs::echoer());
+    let (taken, _) = a.spawn(detach(programs::echoer()));
     dir.track(parent(left_pid).unwrap());
     a.detach(left);
     a.detach(taken);
@@ -962,7 +1169,7 @@ fn an_attaching_client_owns_the_session_and_its_policy_applies_when_it_goes() {
     let mut dir = TempDir::new("attach-owner");
     start_core(&dir.path, &[SUPERVISED]).unwrap();
     let mut a = TestClient::hello(&dir.path, "a");
-    let (session, pid) = a.spawn(client_spawn("cat", &[]));
+    let (session, pid) = a.spawn(programs::echoer());
     dir.track(parent(pid).unwrap());
     // After a core restart the kill session waits for its owner; B takes it.
     kill_core_and_wait_for_another(&dir, &mut a);
@@ -975,12 +1182,34 @@ fn an_attaching_client_owns_the_session_and_its_policy_applies_when_it_goes() {
     );
 }
 
+/// `REPARENT` is for Windows: a Linux core refuses it, and goes on.
+#[cfg(unix)]
+#[test]
+fn a_linux_core_refuses_reparent() {
+    let (_dir, mut client) = core("reparent");
+    let (session, _) = client.spawn(programs::echoer());
+    client.send(client::ToCore::Reparent(client::Reparent {
+        session,
+        hwnd: 0x1234,
+    }));
+    match client.recv() {
+        ToClient::Error(error) => {
+            assert_eq!(error.session, Some(session));
+            assert!(error.message.contains("REPARENT is for Windows"), "{}", error.message);
+        }
+        other => panic!("{other:?}"),
+    }
+    say(&mut client, session, "still");
+}
+
 /// The systemd unit a process runs in, from its cgroup path.
+#[cfg(unix)]
 fn unit_of(pid: u32) -> String {
     let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
     cgroup.trim().rsplit('/').next().unwrap_or_default().to_string()
 }
 
+#[cfg(unix)]
 #[test]
 fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
     // `start_core` sets BRINDLE_NO_SCOPE=1 for the starter; "0" overrides it
@@ -1006,4 +1235,569 @@ fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
     dir.track(client.core_pid());
     let unit = unit_of(client.core_pid());
     assert!(unit.starts_with("brindle-serve-") && unit.ends_with(".scope"), "core in {unit}");
+}
+
+/// The Windows tests of what the Linux-only ones above cover with a Unix
+/// shell: the same behaviour, over a pseudoconsole. A replay is compared
+/// with the session's output as an attached client saw it, since the
+/// console host writes its own stream for what a program prints.
+#[cfg(windows)]
+mod on_windows {
+    use std::fs;
+    use std::path::Path;
+
+    use brindle_term_core::alacritty_terminal::term::TermMode;
+
+    use super::*;
+
+    /// How long a session that has printed everything stays quiet before
+    /// its output counts as all there.
+    const QUIET: Duration = Duration::from_secs(1);
+
+    /// An interactive `cmd` whose prompt is `ready>`.
+    fn interactive() -> client::Spawn {
+        let mut request = client_spawn("cmd.exe", &["/d"]);
+        request.env = inherited_env(&[("PROMPT", "ready$G")]);
+        request
+    }
+
+    /// A PowerShell session running `script`.
+    fn powershell(script: &str) -> client::Spawn {
+        let mut request =
+            client_spawn("powershell.exe", &["-NoProfile", "-Command", script]);
+        request.env = inherited_env(&[]);
+        request
+    }
+
+    /// A `detach` PowerShell session that prints each of `parts` as it is
+    /// (the escape sequences too), waiting for a line of input before every
+    /// one but the first, and then runs until it is ended.
+    fn printer(dir: &TempDir, parts: &[&[u8]], scrollback: u32) -> client::Spawn {
+        let mut script = String::new();
+        for (n, part) in parts.iter().enumerate() {
+            let path = dir.path.join(format!("part-{n}"));
+            fs::write(&path, part).unwrap();
+            if n > 0 {
+                script.push_str("[void][Console]::ReadLine(); ");
+            }
+            script.push_str(&format!(
+                "[Console]::Write([IO.File]::ReadAllText('{}')); ",
+                path.display()
+            ));
+        }
+        script.push_str("Start-Sleep -Seconds 1000");
+        let mut request = powershell(&script);
+        request.scrollback = scrollback;
+        request.policy = client::Policy::Detach;
+        request
+    }
+
+    /// The console's size as `size=COLSxROWS;`, asked of an [`interactive`]
+    /// session.
+    const SIZE: &[u8] = b"powershell -NoProfile -Command \"$s = $Host.UI.RawUI.WindowSize; \
+                          Write-Host ('size=' + $s.Width + 'x' + $s.Height + ';')\"\r";
+
+    /// Asks an [`interactive`] session for its size until it is 100x30: the
+    /// console applies a resize a moment later.
+    fn becomes_100x30(client: &mut TestClient, session: SessionId) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            client.input(session, SIZE);
+            let output = client.output_until(session, b"ready>");
+            if contains(&output, b"size=100x30;") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_gets_exactly_the_requests_environment() {
+        let mut dir = TempDir::new("env");
+        // Set on the core (and so its holder): the program must not see it.
+        start_core(&dir.path, &[("FOO", "1")]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "t");
+        dir.track(client.core_pid());
+
+        // Wide enough for every variable to be one line.
+        let mut request = client_spawn("cmd.exe", &["/d", "/c", "set& cd"]);
+        request.cols = 200;
+        request.env.insert("FOO".into(), "2".into());
+        request.env.insert("HOME".into(), r"C:\nonexistent-home".into());
+        let cwd = request.env["SystemRoot"].clone();
+        request.cwd = Some(cwd.clone());
+        let expected: Vec<String> = request
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let (session, _) = client.spawn(request);
+        let (output, code) = client.output_and_exit(session);
+        assert_eq!(code, Some(0));
+        let mut lines = rows(&replayed(&output, 200, 24, 1000));
+        lines.retain(|line| !line.is_empty());
+        // As the disk spells it, which needn't be how the variable does.
+        let shown = lines.pop().unwrap_or_default();
+        assert!(shown.eq_ignore_ascii_case(&cwd), "{shown} isn't {cwd}");
+        // `cmd` gives itself these three when it has none.
+        let own = ["COMSPEC=", "PATHEXT=", "PROMPT="];
+        lines.retain(|line| !own.iter().any(|name| line.starts_with(name)));
+        lines.sort();
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn input_resize_and_close() {
+        let (dir, mut client) = core("io");
+        let (session, _) = client.spawn(interactive());
+        client.output_until(session, b"ready>");
+        client.send(client::ToCore::Resize(client::Resize {
+            session,
+            cols: 100,
+            rows: 30,
+            cell_w: 8,
+            cell_h: 16,
+        }));
+        becomes_100x30(&mut client, session);
+        // The caret goes when `cmd` runs the line, so only the program's
+        // own output matches.
+        client.input(session, b"echo got^ hello\r");
+        client.output_until(session, b"got hello");
+
+        let (closed, pid) = client.spawn(programs::sleeps());
+        client.send(client::ToCore::Close(client::SessionRef {
+            session: closed,
+        }));
+        hung_up(&mut client, closed);
+        assert!(!alive(pid));
+
+        // Another client can't use these sessions.
+        let mut other = TestClient::hello(&dir.path, "other");
+        other.input(session, b"x");
+        match other.recv() {
+            ToClient::Error(error) => {
+                assert_eq!(error.session, Some(session));
+                assert!(
+                    error.message.contains("isn't attached"),
+                    "{}",
+                    error.message
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stalled_client_doesnt_delay_another_clients_session() {
+        let (dir, mut stalled) = core("stall");
+        let core_pid = stalled.core_pid();
+        let file = numbered_lines(&dir.path, 20_000);
+        let (flood, _) = stalled.spawn(client_shell(&format!(
+            "for /l %i in (0,0,1) do @type {}",
+            file.display()
+        )));
+        // From here on it stops reading.
+        let mut reader = TestClient::hello(&dir.path, "reader");
+        let (echo, _) = reader.spawn(programs::echoer());
+
+        // Long enough for the flood to fill every queue on its way. Then
+        // its program is blocked, not the core: the core holds no more of
+        // it, however long the flood goes on.
+        thread::sleep(Duration::from_secs(3));
+        let held = working_set_kib(core_pid);
+        assert!(held < 128 * 1024, "the core holds {held} KiB");
+
+        for round in 0..5 {
+            let sent = Instant::now();
+            say(&mut reader, echo, &format!("ping{round}"));
+            assert!(
+                sent.elapsed() < Duration::from_secs(5),
+                "round {round} took {:?}",
+                sent.elapsed()
+            );
+        }
+        let held = working_set_kib(core_pid);
+        assert!(held < 128 * 1024, "the core holds {held} KiB");
+
+        // Once the stalled client reads again, its session flows again: far
+        // more arrives than was queued when it was paused.
+        let mut received = 0usize;
+        let deadline = Instant::now() + TIMEOUT;
+        while received < 16 * 1024 * 1024 {
+            assert!(Instant::now() < deadline, "only {received} bytes resumed");
+            match stalled.recv() {
+                ToClient::Data(data) if data.session == flood => received += data.bytes.len(),
+                _ => {}
+            }
+        }
+    }
+
+    /// The console host passes a colour query through to the terminal, and
+    /// the program gets one answer: the client's, since the core's emulator
+    /// answers nothing.
+    #[test]
+    fn a_colour_query_gets_only_the_clients_reply() {
+        let (_dir, mut client) = core("query");
+        // Reads, after two seconds, everything that came back to it.
+        let script = "$e = [char]27; $b = [char]7; \
+            [Console]::Write('ask' + $e + ']11;?' + $b); Start-Sleep -Seconds 2; $r = ''; \
+            while ([Console]::KeyAvailable) { $r += [Console]::ReadKey($true).KeyChar }; \
+            [Console]::Write('got=' + ($r -replace $e, 'ESC' -replace $b, 'BEL') + '.')";
+        let (session, _) = client.spawn(powershell(script));
+        client.output_until(session, b"\x1b]11;?");
+        client.input(session, b"\x1b]11;rgb:1010/1414/1818\x07");
+        let mut output = Vec::new();
+        let answered = |output: &[u8]| {
+            let text = String::from_utf8_lossy(output);
+            text.split("got=").nth(1).is_some_and(|rest| rest.contains('.'))
+        };
+        while !answered(&output) {
+            output.extend(client.output_until(session, b"."));
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("got=ESC]11;rgb:1010/1414/1818BEL."), "{text:?}");
+        assert_eq!(client.exit_code(session), Some(0));
+    }
+
+    /// Spawns a [`printer`] of `bytes`, reads everything it prints and
+    /// detaches from it: the session, its program, and what the client saw.
+    fn detached_printer(
+        dir: &TempDir,
+        client: &mut TestClient,
+        bytes: &[u8],
+        printed: &[u8],
+    ) -> (SessionId, u32, Vec<u8>) {
+        let (session, pid) = client.spawn(printer(dir, &[bytes], 1000));
+        let seen = client.output_until_quiet(session, printed, QUIET);
+        client.detach(session);
+        (session, pid, seen)
+    }
+
+    #[test]
+    fn attaching_to_a_full_screen_session_replays_its_screen() {
+        let (dir, mut client) = core("attach-full");
+        let fixture = full_screen_fixture(1);
+        let (session, pid, seen) = detached_printer(&dir, &mut client, &fixture, b"Quit frame 1");
+        let expected = snapshot(&replayed(&seen, 80, 24, 1000));
+
+        let mut other = TestClient::hello(&dir.path, "other");
+        let (start, screen) =
+            other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+        assert_eq!((start.session, start.pid), (session, pid));
+        let mode = *screen.term().mode();
+        assert!(mode.contains(TermMode::ALT_SCREEN | TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE));
+        assert!(!mode.contains(TermMode::SHOW_CURSOR));
+        assert_eq!(screen.title().as_deref(), Some("htop-like"));
+        let text = rows(&screen);
+        assert!(text.iter().any(|row| row.contains("PID USER      CPU%")), "{text:?}");
+        assert!(text.iter().any(|row| row.ends_with("Quit frame 1")), "{text:?}");
+    }
+
+    #[test]
+    fn attaching_replays_the_scrollback() {
+        let (dir, mut client) = core("attach-scroll");
+        let lines: String = (1..=500).map(|n| format!("line {n}\r\n")).collect();
+        let (session, _, seen) =
+            detached_printer(&dir, &mut client, lines.as_bytes(), b"line 500");
+        let expected = snapshot(&replayed(&seen, 80, 24, 1000));
+        let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+        let text: Vec<String> = rows(&screen)
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect();
+        let want: Vec<String> = (1..=500).map(|n| format!("line {n}")).collect();
+        assert_eq!(text, want);
+    }
+
+    #[test]
+    fn attaching_replays_status_records_and_prompt_marks() {
+        let (dir, mut client) = core("attach-marks");
+        let fixture = marks_fixture();
+        let (session, _, seen) = detached_printer(&dir, &mut client, &fixture, b"app=tests");
+        let expected = snapshot(&replayed(&seen, 80, 24, 1000));
+        let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+        use brindle_term_core::status::State;
+        assert_eq!(
+            screen.records().get("").map(|record| record.state),
+            Some(State::Working)
+        );
+        let marks = screen.marks();
+        assert_eq!(marks.commands().len(), 4);
+        assert_eq!(marks.prompt_lines().collect::<Vec<_>>(), [0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
+        let (dir, mut owner) = core("attach-refused");
+        let (session, _) = owner.spawn(detach(interactive()));
+        owner.output_until(session, b"ready>");
+        let mut other = TestClient::hello(&dir.path, "other");
+        let refusal = other.attach(session, 100, 30).unwrap_err();
+        assert_eq!(refusal.session, Some(session));
+        assert!(refusal.message.contains("attached"), "{}", refusal.message);
+        assert!(
+            other
+                .attach(999, 80, 24)
+                .unwrap_err()
+                .message
+                .contains("no session 999")
+        );
+        assert!(
+            owner
+                .attach(session, 80, 24)
+                .unwrap_err()
+                .message
+                .contains("already attached")
+        );
+
+        owner.detach(session);
+        let (start, _) = loop {
+            match other.attach(session, 100, 30) {
+                Ok(replay) => break replay,
+                // The DETACH may not have been read yet.
+                Err(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert_eq!(start.session, session);
+        becomes_100x30(&mut other, session);
+        // The first client no longer has it.
+        owner.input(session, b"x");
+        match owner.recv() {
+            ToClient::Error(error) => assert!(error.message.contains("isn't attached")),
+            message => panic!("{message:?}"),
+        }
+    }
+
+    #[test]
+    fn after_a_core_restart_a_full_screen_session_rebuilds_from_checkpoint_and_tail() {
+        let mut dir = TempDir::new("rebuild-full");
+        start_core(&dir.path, &[SUPERVISED]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "first");
+        let first = full_screen_fixture(1);
+        let second = full_screen_fixture(2);
+        // The second frame comes after a line of input.
+        let (session, pid) = client.spawn(printer(&dir, &[&first, &second], 1000));
+        dir.track(parent(pid).unwrap());
+        let mut seen = client.output_until_quiet(session, b"Quit frame 1", QUIET);
+        // The checkpoint, of the first frame.
+        client.detach(session);
+        client.attach(session, 80, 24).unwrap();
+        // The tail: the second frame.
+        client.input(session, b"\r");
+        seen.extend(client.output_until_quiet(session, b"Quit frame 2", QUIET));
+
+        kill_core_and_wait_for_another(&dir, &mut client);
+        let mut other = TestClient::hello(&dir.path, "other");
+        let expected = snapshot(&replayed(&seen, 80, 24, 1000));
+        let (start, screen) =
+            other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+        assert_eq!(start.pid, pid);
+        assert!(rows(&screen).iter().any(|row| row.ends_with("Quit frame 2")));
+        let logs = dir.logs();
+        assert!(!logs.contains("truncated"), "{logs}");
+    }
+
+    #[test]
+    fn a_session_with_more_output_than_a_tail_holds_rebuilds_exactly() {
+        let mut dir = TempDir::new("rebuild-long");
+        start_core(&dir.path, &[SUPERVISED]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "first");
+        // More than the 1 MiB tail: only checkpoints keep it exact.
+        let file = numbered_lines(&dir.path, 21_000);
+        let script = format!("type {}& echo all-printed& set /p z=", file.display());
+        let (session, pid) = client.spawn(detach(client_shell(&script)));
+        dir.track(parent(pid).unwrap());
+        let seen = client.output_until_quiet(session, b"all-printed", QUIET);
+        assert!(seen.len() > 1024 * 1024 + 256 * 1024, "{} bytes", seen.len());
+
+        kill_core_and_wait_for_another(&dir, &mut client);
+        let mut other = TestClient::hello(&dir.path, "other");
+        let expected = snapshot(&replayed(&seen, 80, 24, 1000));
+        let (_, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+        assert!(rows(&screen).iter().any(|row| row == "all-printed"));
+        let logs = dir.logs();
+        assert!(!logs.contains("truncated"), "{logs}");
+    }
+
+    #[test]
+    fn a_truncated_tail_still_gives_a_working_session() {
+        let mut dir = TempDir::new("rebuild-truncated");
+        start_core(&dir.path, &[]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "first");
+        // Prints more than a tail holds for every line of input.
+        let file = numbered_lines(&dir.path, 21_000);
+        let script = format!(
+            "for /l %i in (0,0,1) do @(set /p x=& type {}& echo END !x!)",
+            file.display()
+        );
+        let (session, pid) = client.spawn(detach(client_shell(&script)));
+        let holder = parent(pid).unwrap();
+        dir.track(holder);
+        kill(client.core_pid());
+        assert!(client.closes());
+
+        // A core that never checkpoints: the tail overflows.
+        let mut test_core = TestCore::connect_to(&dir);
+        test_core.hello(7);
+        test_core.input(session, b"one\r");
+        test_core.output_until(session, b"END one");
+        drop(test_core);
+
+        start_core(&dir.path, &[]).unwrap();
+        let mut other = TestClient::hello(&dir.path, "other");
+        dir.track(other.core_pid());
+        let (start, screen) = other.attach_until(session, 1000, |screen| {
+            rows(screen).iter().any(|row| row == "END one")
+        });
+        assert_eq!(start.pid, pid);
+        assert!(rows(&screen).iter().any(|row| row.starts_with("#00")));
+        assert!(dir.logs().contains("tail was truncated"), "{}", dir.logs());
+        other.input(session, b"two\r");
+        other.output_until(session, b"END two");
+    }
+
+    #[test]
+    fn a_client_back_after_a_core_restart_gets_its_replay_then_live_output() {
+        let mut dir = TempDir::new("reconnect-replay");
+        start_core(&dir.path, &[SUPERVISED]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "back");
+        let first = full_screen_fixture(1);
+        let second = full_screen_fixture(2);
+        // A kill session, attached all along.
+        let mut spawn = printer(&dir, &[&first, &second], 1000);
+        spawn.policy = client::Policy::Kill;
+        let (session, pid) = client.spawn(spawn);
+        dir.track(parent(pid).unwrap());
+        let mut seen = client.output_until_quiet(session, b"Quit frame 1", QUIET);
+
+        kill_core_and_wait_for_another(&dir, &mut client);
+        let mut client = TestClient::hello(&dir.path, "back");
+        let (start, replay) = client.reconnect_replay();
+        assert_eq!((start.session, start.pid, start.req), (session, pid, None));
+        let mut screen = replayed(&replay, 80, 24, 1000);
+        assert_eq!(snapshot(&screen), snapshot(&replayed(&seen, 80, 24, 1000)));
+
+        // Live output follows the replay.
+        client.input(session, b"\r");
+        let live = client.output_until_quiet(session, b"Quit frame 2", QUIET);
+        screen.feed(&live);
+        seen.extend(live);
+        assert_eq!(snapshot(&screen), snapshot(&replayed(&seen, 80, 24, 1000)));
+        assert!(rows(&screen).iter().any(|row| row.ends_with("Quit frame 2")));
+        assert!(alive(pid));
+    }
+
+    /// A client's `REPARENT` reaches the session's holder, which makes the
+    /// window the owner of the session's console window.
+    #[test]
+    fn reparent_reaches_the_sessions_holder() {
+        // Only the packaged ConPTY can; a build without it uses Windows' own.
+        if !Path::new(BIN).with_file_name("conpty.dll").exists() {
+            eprintln!("skipped: no packaged ConPTY beside the helper");
+            return;
+        }
+        let (dir, mut client) = core("reparent");
+        // Prints its console window as `hwnd=N;` and waits.
+        let script = "$w = (Add-Type -Name Console -Namespace BrindleTest -PassThru \
+            -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr \
+            GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
+            Start-Sleep -Seconds 600";
+        let (session, _) = client.spawn(powershell(script));
+        let output = client.output_until(session, b";");
+        let text = String::from_utf8_lossy(&output);
+        let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
+        let console_window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
+        assert_ne!(console_window, 0, "no console window in {text:?}");
+        assert_eq!(window_owner(console_window), 0);
+
+        // Another client's session isn't this one's to reparent.
+        let window = Window::new();
+        let mut other = TestClient::hello(&dir.path, "other");
+        other.send(client::ToCore::Reparent(client::Reparent {
+            session,
+            hwnd: window.id(),
+        }));
+        match other.recv() {
+            ToClient::Error(error) => {
+                assert_eq!(error.session, Some(session));
+                assert!(error.message.contains("isn't attached"), "{}", error.message);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(window_owner(console_window), 0);
+
+        client.send(client::ToCore::Reparent(client::Reparent {
+            session,
+            hwnd: window.id(),
+        }));
+        // The host applies it a moment later.
+        let deadline = Instant::now() + TIMEOUT;
+        while window_owner(console_window) != window.id() {
+            assert!(
+                Instant::now() < deadline,
+                "the owner is {:#x}, not {:#x}",
+                window_owner(console_window),
+                window.id()
+            );
+            Window::pump();
+            thread::sleep(Duration::from_millis(10));
+        }
+        // It has no answer: the next message is the close's.
+        client.send(client::ToCore::Close(client::SessionRef { session }));
+        hung_up(&mut client, session);
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A core removes the helper copies of other builds when it starts,
+    /// except one that something still runs from.
+    #[test]
+    fn a_starting_core_prunes_the_helper_copies_of_other_builds() {
+        let (dir, mut client) = core("prune");
+        let build = client.welcome.as_ref().unwrap().core_build.clone();
+        let core_pid = client.core_pid();
+        client.send(client::ToCore::Stop(client::Request { req: 1 }));
+        assert!(matches!(client.reply(1), ToClient::Ok(_)));
+        assert!(gone(core_pid));
+
+        // With `BRINDLE_SERVER_DIR` set, the copies are in its `bin`.
+        let copies = dir.path.join("bin");
+        let copy = |name: &str| copies.join(name).join("brindle-remote.exe");
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let cmd = Path::new(&system).join("System32").join("cmd.exe");
+        for name in [build.as_str(), "stale", "running"] {
+            fs::create_dir_all(copies.join(name)).unwrap();
+            fs::copy(&cmd, copy(name)).unwrap();
+        }
+        // Waits for input that never comes.
+        let mut running = std::process::Command::new(copy("running"))
+            .arg("/k")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        start_core(&dir.path, &[]).unwrap();
+        let pruned = names(&copies);
+        running.kill().unwrap();
+        running.wait().unwrap();
+        let mut kept = [build.as_str(), "running"];
+        kept.sort_unstable();
+        assert_eq!(pruned, kept);
+        assert!(copy(&build).is_file());
+    }
 }
