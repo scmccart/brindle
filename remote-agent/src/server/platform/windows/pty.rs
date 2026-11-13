@@ -23,9 +23,14 @@
 //! - **Hangup:** [`Group::hang_up`], like dropping the [`Pty`], closes the
 //!   pseudoconsole in the same way, never waiting for it. The console host
 //!   then ends the programs attached to the console, as closing a console
-//!   window does. After the grace the holder calls
-//!   [`Group::kill_remaining`], which terminates the session's root process
-//!   if it is still running. A program that left the console (a GUI
+//!   window does. The close first waits, on its thread, for the program to
+//!   be on the console: one that reaches the host sooner (a session hung
+//!   up as it starts) reaches neither the program nor what it starts. The
+//!   host takes the end of its input as the close too, so a copy of the
+//!   holder's end stays open until then. A program another one starts just
+//!   as the close goes out can still miss it. After the grace the holder
+//!   calls [`Group::kill_remaining`], which terminates the session's root
+//!   process if it is still running. A program that left the console (a GUI
 //!   program started from the shell) keeps running: no job object holds a
 //!   session's processes.
 //! - **The console window's owner:** [`reparent`] has the packaged host
@@ -386,7 +391,7 @@ fn pipe(
 pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
     let (input, host_input) = pipe(PIPE_ACCESS_OUTBOUND, GENERIC_READ.0)?;
     let (output, host_output) = pipe(PIPE_ACCESS_INBOUND, GENERIC_WRITE.0)?;
-    let pseudoconsole = Pseudoconsole::create(
+    let mut pseudoconsole = Pseudoconsole::create(
         wants_inbox(request),
         request.cols,
         request.rows,
@@ -396,6 +401,9 @@ pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
     .map_err(plain)?;
     // The host has its own copies, so the output ends when the host exits.
     drop((host_input, host_output));
+    // The host takes the end of its input as a close too, and the holder's
+    // end goes with the `Pty`: this copy stays until the close goes out.
+    pseudoconsole.hold_input_open(input.try_clone()?);
     #[cfg(test)]
     let packaged = pseudoconsole.is_packaged();
 
@@ -894,6 +902,120 @@ mod tests {
         // Nothing remains, and the pid may be another process's by now.
         group.kill_remaining();
         assert_ne!(program.try_wait().unwrap().unwrap().code, Some(KILLED as i32));
+    }
+
+    /// Learns the console host of `program` while it is on its console, on
+    /// a thread of its own, as it may not be on it for long: a handle to
+    /// the host, to wait for and end, or `None` if the program exited first.
+    fn watch_console_host(program: &Program) -> std::thread::JoinHandle<Option<OwnedHandle>> {
+        let process = program.process.handle().try_clone_to_owned().unwrap();
+        std::thread::spawn(move || {
+            loop {
+                let exited = has_exited(&process);
+                if let Some(host) = crate::conpty::console_host(process.as_handle()) {
+                    return open_to_end(host);
+                }
+                if exited {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+        })
+    }
+
+    /// The running process `pid`, to wait for and terminate.
+    fn open_to_end(pid: u32) -> Option<OwnedHandle> {
+        let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
+        // SAFETY: opens a process by pid; the handle is owned at once.
+        let process = unsafe { OpenProcess(access, false, pid) }.ok()?;
+        // SAFETY: the handle is new and owned by nothing else.
+        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+        (!has_exited(&process)).then_some(process)
+    }
+
+    /// What a session of `cmd /c ping` may leave running: its root, the
+    /// `ping` the root started, and its console host. They are ended on
+    /// drop, also when a test fails.
+    struct Leftovers {
+        group: Group,
+        root: u32,
+        host: Option<OwnedHandle>,
+    }
+
+    impl Leftovers {
+        /// The `ping`s the root started that still run.
+        fn pings(&self) -> Vec<u32> {
+            let running = children(self.root).into_iter();
+            let pings = running.filter(|(_, _, name)| name.eq_ignore_ascii_case("PING.EXE"));
+            pings.map(|(pid, ..)| pid).collect()
+        }
+
+        fn host_runs(&self) -> bool {
+            self.host.as_ref().is_some_and(|host| !has_exited(host))
+        }
+    }
+
+    impl Drop for Leftovers {
+        fn drop(&mut self) {
+            self.group.kill();
+            let pings = self.pings().into_iter().filter_map(open_to_end);
+            for process in pings.chain(self.host.take()) {
+                // SAFETY: the handle is open and may terminate the process.
+                let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
+            }
+        }
+    }
+
+    #[test]
+    fn a_hang_up_as_the_program_starts_ends_it_and_its_console_children() {
+        const ROUNDS: usize = 20;
+        // The close can reach the console host before `cmd` is on the
+        // console, and `ping` starts only once it is. Each host, in turn.
+        for round in 0..ROUNDS {
+            let host: &[(&str, &str)] = match round % 2 {
+                0 => &[],
+                _ => &[("BRINDLE_CONPTY", "inbox")],
+            };
+            let (pty, program) = run("cmd.exe", &["/c", "ping -t localhost"], host, 80, 24);
+            let watcher = watch_console_host(&program);
+            let mut left = Leftovers {
+                group: program.group(),
+                root: program.pid(),
+                host: None,
+            };
+
+            // As the holder's `HANGUP` does, right after the spawn.
+            let hung_up = Instant::now();
+            drop(pty);
+            left.group.hang_up();
+            assert!(hung_up.elapsed() < Duration::from_millis(500), "the hang-up waited");
+            let grace = hung_up + crate::pty::GRACEFUL_SHUTDOWN;
+            let deadline = grace + Duration::from_secs(2);
+            let mut killed = false;
+            while program.process.exit_code().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "round {round}: the program outlived the grace");
+                if !killed && Instant::now() >= grace {
+                    left.group.kill_remaining();
+                    killed = true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            left.host = watcher.join().unwrap();
+            // Nothing on the console outlives it, nor does the host.
+            while !left.pings().is_empty() || left.host_runs() {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: ping {:?} and the console host ({}) outlived the grace; \
+                     the program exited with {:#x?}",
+                    left.pings(),
+                    if left.host_runs() { "running" } else { "gone" },
+                    program.process.exit_code().unwrap(),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let code = program.process.exit_code().unwrap();
+            assert_ne!(code, Some(KILLED), "round {round}: the close never reached the program");
+        }
     }
 
     #[test]

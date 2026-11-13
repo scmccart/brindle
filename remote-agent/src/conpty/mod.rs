@@ -14,7 +14,9 @@
 //!   wcwidth glyph widths (the way the grid counts cells). It starts the
 //!   program ([`Pseudoconsole::start`]), resizes and reparents, and
 //!   dropping it releases and closes it on a short-lived thread, so nothing
-//!   waits on a host that blocks in `ClosePseudoConsole`.
+//!   waits on a host that blocks in `ClosePseudoConsole`. That thread
+//!   first waits for the program to be on the console, which a close that
+//!   comes sooner never reaches, and keeps the input open until then.
 //!
 //! Reading, writing and waiting for the program are the caller's: the
 //! holder does them on its event loop.
@@ -32,6 +34,8 @@ mod console;
 
 #[cfg(windows)]
 pub use console::{Process, Pseudoconsole};
+#[cfg(all(windows, test))]
+pub use console::console_host;
 
 /// Whether this build embeds the packaged ConPTY.
 #[cfg(all(windows, test))]

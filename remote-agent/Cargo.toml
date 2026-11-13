@@ -16,11 +16,13 @@ brindle-term-core = { path = "../term-core" }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# The holder's pseudoconsoles (`conpty`), and the server's event loop and
-# pipes. Brindle already builds this version, so only the features below are
-# the agent's own.
+# The holder's pseudoconsoles (`conpty`, which asks `ntdll` whether a program
+# is on its console yet), and the server's event loop and pipes. Brindle
+# already builds this version, so only the features below are the agent's
+# own.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
+  "Wdk_System_Threading",
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Storage_FileSystem",

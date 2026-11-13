@@ -7,7 +7,9 @@ use std::os::windows::io::{
 };
 use std::path::Path;
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::System::Console::{COORD, HPCON};
 use windows::Win32::System::Threading::{
@@ -25,12 +27,39 @@ use super::cmdline::environment_block;
 /// package's `conpty.h`; the built-in host accepts and ignores it.
 const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH: u32 = 0x10;
 
+/// `NtQueryInformationProcess`'s `ProcessConsoleHostProcess`, which isn't
+/// documented: the console host a process is on, with flags in the low two
+/// bits. Until the process has connected to a console it names the process
+/// that started it.
+const PROCESS_CONSOLE_HOST_PROCESS: PROCESSINFOCLASS = PROCESSINFOCLASS(49);
+
+/// How long closing waits for the program to be on the console: as long as
+/// the holder gives a hung-up program before it terminates it.
+const CONNECT_LIMIT: Duration = crate::pty::GRACEFUL_SHUTDOWN;
+/// How often closing looks.
+const CONNECT_POLL: Duration = Duration::from_millis(1);
+
 /// An open pseudoconsole. Dropping it releases and closes it without
 /// blocking the dropping thread.
+///
+/// Closing has the host send `CTRL_CLOSE_EVENT` to the programs on the
+/// console and then exit once none is left. The host does that once, on
+/// the close or on the end of its input, whichever comes first. A program
+/// still starting isn't on the console yet: the host takes it afterwards,
+/// untold, and stays for it, so it and what it starts outlive the console.
+/// So the close waits for the program started here to be on the console
+/// (or gone) first, for at most [`CONNECT_LIMIT`], and keeps the input open
+/// until then ([`Pseudoconsole::hold_input_open`]). A program that a
+/// program on the console starts as the close goes out can still miss it.
 pub struct Pseudoconsole {
     handle: HPCON,
     /// The ConPTY that made it, which every later call must go to.
     api: &'static Api,
+    /// The program started on it, which the close waits for.
+    program: Option<OwnedHandle>,
+    /// A copy of the caller's end of the input, closed as the close goes
+    /// out.
+    input: Option<OwnedHandle>,
 }
 
 // SAFETY: a pseudoconsole handle may be used from any thread.
@@ -69,7 +98,20 @@ impl Pseudoconsole {
             )
         }
         .ok()?;
-        Ok(Self { handle, api })
+        Ok(Self {
+            handle,
+            api,
+            program: None,
+            input: None,
+        })
+    }
+
+    /// Keeps `input`, a copy of the caller's end of the input pipe, open
+    /// until the close goes out. The host takes the end of its input as a
+    /// close, which mustn't come before the program is on the console
+    /// either, and the caller's own end may go first.
+    pub fn hold_input_open(&mut self, input: OwnedHandle) {
+        self.input = Some(input);
     }
 
     /// Whether the packaged ConPTY made this pseudoconsole, not the one
@@ -110,9 +152,10 @@ impl Pseudoconsole {
 
     /// Starts the program of the command line `line` (see
     /// [`super::cmdline`]) on this pseudoconsole, in `cwd` (this process's
-    /// directory when `None`), with exactly the environment `env`.
+    /// directory when `None`), with exactly the environment `env`. Closing
+    /// the pseudoconsole waits for it to be on the console.
     pub fn start<'a>(
-        &self,
+        &mut self,
         line: &str,
         cwd: Option<&Path>,
         env: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -175,10 +218,14 @@ impl Pseudoconsole {
         }?;
         // SAFETY: the thread handle is ours and unused.
         unsafe { CloseHandle(info.hThread) }.ok();
+        // SAFETY: the process handle is ours.
+        let handle = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
+        // The close waits through a copy. Copying a handle of ours doesn't
+        // fail, and without one the close just wouldn't wait.
+        self.program = handle.try_clone().ok();
         Ok(Process {
             pid: info.dwProcessId,
-            // SAFETY: the process handle is ours.
-            handle: unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) },
+            handle,
         })
     }
 }
@@ -186,12 +233,19 @@ impl Pseudoconsole {
 impl Drop for Pseudoconsole {
     fn drop(&mut self) {
         // Both calls can wait on a busy host (an older one blocks in Close
-        // until its output is read), so they run on a thread of their own.
+        // until its output is read), so they run on a thread of their own,
+        // as does the wait for the program to be on the console.
         let (release, close) = (self.api.release, self.api.close);
         let handle = self.handle.0;
+        let program = self.program.take();
+        let input = self.input.take();
         let closed = std::thread::Builder::new()
             .name("conpty-close".into())
             .spawn(move || {
+                if let Some(program) = program {
+                    wait_until_on_console(program.as_handle(), CONNECT_LIMIT);
+                }
+                drop(input);
                 if let Some(release) = release {
                     // SAFETY: the handle is still open.
                     unsafe { release(HPCON(handle)) }.ok().ok();
@@ -213,6 +267,60 @@ fn coord(cols: u16, rows: u16) -> COORD {
         X: cells(cols),
         Y: cells(rows),
     }
+}
+
+/// Waits until `program` is on its console or has exited, for at most
+/// `limit`. One that never connects (a GUI program) takes all of it.
+fn wait_until_on_console(program: BorrowedHandle<'_>, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    let process = HANDLE(program.as_raw_handle());
+    // SAFETY: the handle is open for the call.
+    while unsafe { WaitForSingleObject(process, 0) } != WAIT_OBJECT_0
+        && Instant::now() < deadline
+    {
+        if on_console(program) {
+            return;
+        }
+        // Not a timed wait on the process: those take the system's timer
+        // tick (often 15.6 ms), and the close should follow the connection
+        // closely, before the program starts others.
+        std::thread::sleep(CONNECT_POLL);
+    }
+}
+
+/// Whether `process`, started by this process, has connected to its
+/// console. Until it has, its console host is said to be this process. When
+/// Windows doesn't say, it counts as connected, so a close isn't held up.
+fn on_console(process: BorrowedHandle<'_>) -> bool {
+    host_process(process).is_none_or(|host| host != std::process::id())
+}
+
+/// The console host `process` is on, once it is on one.
+#[cfg(test)]
+pub fn console_host(process: BorrowedHandle<'_>) -> Option<u32> {
+    host_process(process).filter(|&host| host != 0 && host != std::process::id())
+}
+
+/// What Windows says `process`'s console host is
+/// ([`PROCESS_CONSOLE_HOST_PROCESS`]), or `None` when the query fails.
+fn host_process(process: BorrowedHandle<'_>) -> Option<u32> {
+    let mut host: usize = 0;
+    // SAFETY: the handle is open for the call, and `host` is as large as the
+    // class's answer and outlives the call.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            HANDLE(process.as_raw_handle()),
+            PROCESS_CONSOLE_HOST_PROCESS,
+            (&raw mut host).cast(),
+            std::mem::size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    // The low bits are flags; process ids are multiples of four.
+    u32::try_from(host & !3).ok()
 }
 
 /// A program started on a pseudoconsole.
@@ -287,7 +395,7 @@ mod tests {
     fn run(inbox: bool, args: &[&str], extra: &[(&str, &str)]) -> Ran {
         let (input_read, _input_write) = pipe();
         let (output_read, output_write) = pipe();
-        let console = console(inbox, &input_read, &output_write);
+        let mut console = console(inbox, &input_read, &output_write);
         drop((input_read, output_write));
         let packaged = console.is_packaged();
 

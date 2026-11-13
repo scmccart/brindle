@@ -918,6 +918,10 @@ mod on_windows {
         // Started first, so the holder isn't left empty (and exits) between the two.
         let plain = core.spawn(programs::exits_after_a_line(2, 0));
         let pid = core.spawn(spawn(1, "cmd.exe", &["/d", "/c", "ping -t 127.0.0.1"]));
+        // Once `ping` is on the console: a program another one starts just
+        // as the console closes can miss the close (see
+        // `conpty::Pseudoconsole`).
+        core.output_until(1, b"Reply from");
         let mut ping = Vec::new();
         assert!(eventually(TIMEOUT, || {
             ping = children_named(pid, "ping");
@@ -939,6 +943,31 @@ mod on_windows {
 
         core.hang_up(2);
         hung_up(&mut core, 2);
+        assert!(!alive(plain));
+    }
+
+    #[test]
+    fn a_hangup_as_a_session_starts_reaches_its_program() {
+        let (_dir, mut core, _) = holder("hangup-start");
+        // Started first, so the holder isn't left empty (and exits) between
+        // the rounds.
+        let plain = core.spawn(programs::exits_after_a_line(1, 0));
+        for session in 2..5 {
+            // Right after `SPAWNED`, before `cmd` is on its console.
+            let pid = core.spawn(spawn(session, "cmd.exe", &["/d", "/c", "ping -t 127.0.0.1"]));
+            core.hang_up(session);
+            let code = core.exit_code(session);
+            // The close ends what is on the console at once; anything left
+            // by the grace never got it.
+            let gone = eventually(2 * GRACE, || children_named(pid, "ping").is_empty());
+            for ping in children_named(pid, "ping") {
+                kill(ping);
+            }
+            assert!(gone, "session {session}: ping outlived its console");
+            assert_ne!(code, Some(TERMINATED), "session {session}: the close never reached it");
+        }
+        core.hang_up(1);
+        hung_up(&mut core, 1);
         assert!(!alive(plain));
     }
 
