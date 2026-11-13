@@ -119,8 +119,8 @@ An elevated Brindle (Run as administrator, or started from an elevated console a
   - The loop keeps reading the output pipe to EOF.
   - `EXITED` follows the last output, with `GetExitCodeProcess`'s code.
 - **Hangup (`CLOSE`, `KILL`, `STOP`, a `kill` session's owner gone):**
-  1. The holder closes the pseudoconsole in the same way, which ends the console's attached processes as closing a tab does today.
-  2. After `agent.rs`'s grace, it calls `TerminateProcess` on the session's root process if it is still alive.
+  1. The holder closes the pseudoconsole in the same way, which ends the console's attached processes as closing a tab does today. The host sends `CTRL_CLOSE_EVENT` once, only to the processes connected at that moment, so the close waits (up to the grace) until the root has connected, and the holder keeps its input pipe end open until then, because the input ending is a close too.
+  2. After `agent.rs`'s grace, it calls `TerminateProcess` on the session's root process if it is still alive, and on every process still attached to the session's console host (a child that connected just after the close was broadcast never hears it). A process's host is read with `NtQueryInformationProcess(ProcessConsoleHostProcess)`, which is undocumented; if it fails, only the root is terminated.
   - Programs that left the console (a GUI app started from the shell) keep running, as they do today. This is the Windows meaning of "the processes under it".
 - **No per-session job object.** A kill-on-close job would also end programs the user started to outlive the tab, and nested jobs interact with the starter's job.
 
