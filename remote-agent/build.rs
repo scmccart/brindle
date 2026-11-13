@@ -1,14 +1,37 @@
 //! Windows builds embed the packaged ConPTY that `scripts/fetch-conpty.ps1`
 //! fetches into `.conpty/<version>/`, and copy it next to the built exe so
-//! a helper run from the build directory loads it from there. Other targets
-//! do nothing here.
+//! a helper run from the build directory loads it from there. They also
+//! compile the version resource into the exe. Other targets do nothing here.
 
 use std::path::{Path, PathBuf};
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         conpty();
+        // embed-resource (a Windows-only build dependency) is only there
+        // when building on Windows, the only host Brindle builds Windows on.
+        #[cfg(windows)]
+        resources();
     }
+}
+
+/// Compiles `brindle-remote.rc` into the exe, with the crate's version.
+#[cfg(windows)]
+fn resources() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let rc = manifest.join("brindle-remote.rc");
+    println!("cargo:rerun-if-changed={}", rc.display());
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let number = |name: &str| std::env::var(name).unwrap();
+    let macros = [
+        format!("BRINDLE_VERSION=\"{version}\""),
+        format!("BRINDLE_MAJOR={}", number("CARGO_PKG_VERSION_MAJOR")),
+        format!("BRINDLE_MINOR={}", number("CARGO_PKG_VERSION_MINOR")),
+        format!("BRINDLE_PATCH={}", number("CARGO_PKG_VERSION_PATCH")),
+    ];
+    embed_resource::compile(&rc, &macros)
+        .manifest_optional()
+        .expect("compiling remote-agent/brindle-remote.rc");
 }
 
 /// Writes `$OUT_DIR/conpty.rs`: the pinned version and, when it has been

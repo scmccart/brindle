@@ -1,6 +1,7 @@
 # Packs the release build into the Windows release zip,
-# target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip: brindle.exe,
-# the Linux x86-64 remote helper, Brindle's licences and the notice for the
+# target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip: brindle.exe, the
+# terminal server helper brindle-remote.exe (which must sit beside it), the
+# Linux x86-64 remote helper, Brindle's licences and the notice for the
 # packaged ConPTY.
 #
 #   scripts/fetch-conpty.ps1
@@ -26,7 +27,10 @@ try {
     $fetched = ".conpty\$conpty"
 
     # remote-agent/build.rs embeds both files byte for byte, so look for them
-    # in the helper.
+    # in the helper. brindle.exe embeds none, so passing it as the helper fails.
+    if (-not $Helper -or -not (Test-Path -PathType Leaf $Helper)) {
+        throw "package-windows: no terminal server helper '$Helper'; build brindle-remote.exe (cargo build --release) or pass -Helper"
+    }
     Add-Type -TypeDefinition @'
 public static class Embedded {
     public static bool Contains(byte[] haystack, byte[] needle) {
@@ -61,6 +65,8 @@ public static class Embedded {
     Remove-Item -Recurse -Force $stage, "$stage.zip" -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $stage | Out-Null
     Copy-Item $Exe, $RemoteAgent, LICENSE-MIT, LICENSE-APACHE, packaging\windows\THIRD-PARTY-NOTICES.txt $stage
+    # Brindle looks for the helper by this name beside brindle.exe.
+    Copy-Item $Helper (Join-Path $stage 'brindle-remote.exe')
     Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip"
     Remove-Item -Recurse -Force $stage
     Write-Output (Resolve-Path "$stage.zip").Path

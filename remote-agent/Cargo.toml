@@ -35,6 +35,11 @@ windows = { version = "0.61", features = [
   "Win32_System_Threading",
 ] }
 
+# The version resource in brindle-remote.exe (build.rs); Brindle already
+# builds this version.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
+
 # The tests' real command-line parser, the jobs they start roles in, a
 # process's memory, and their owner window for a console window.
 [target.'cfg(windows)'.dev-dependencies]

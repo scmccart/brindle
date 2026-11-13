@@ -54,6 +54,8 @@ jobs:
       # The packaged ConPTY that remote-agent/build.rs embeds in brindle-remote.exe.
       - run: scripts/fetch-conpty.ps1
         shell: pwsh
+      # Every workspace crate is a default member, so this builds brindle.exe
+      # and the terminal server helper, brindle-remote.exe.
       - run: cargo build --release --locked
       - run: cargo test --locked --workspace
       - name: e2e harness self-test
@@ -90,6 +92,19 @@ jobs:
           $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
           & $mt.FullName -nologo "-inputresource:$exe;#1" "-out:manifest.xml"
           if (-not (Select-String -Path manifest.xml -Pattern 'PerMonitorV2' -Quiet)) { throw 'no PerMonitorV2 in the manifest' }
+      - name: Version resource and --version of brindle-remote.exe
+        shell: pwsh
+        run: |
+          $helper = (Resolve-Path target/release/brindle-remote.exe).Path
+          $info = (Get-Item $helper).VersionInfo
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($info.ProductName -ne 'Brindle' -or $info.ProductVersion -ne $version -or $info.OriginalFilename -ne 'brindle-remote.exe') {
+            throw "version resource: '$($info.ProductName)' '$($info.ProductVersion)' '$($info.OriginalFilename)', expected Brindle $version brindle-remote.exe"
+          }
+          # A console program, so PowerShell waits for it.
+          $out = & $helper --version
+          if ($LASTEXITCODE -ne 0) { throw "brindle-remote.exe --version exited $LASTEXITCODE" }
+          if ("$out".Trim() -ne $version) { throw "brindle-remote.exe --version printed '$out', expected $version" }
       # brindle.exe is a GUI program, so PowerShell waits for it only
       # through Start-Process -Wait.
       - name: Start Menu shortcut (--install-desktop / --uninstall-desktop)
@@ -116,12 +131,13 @@ jobs:
           if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
           if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
           if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
-      # A Windows release is one zip (today brindle.exe alone; the terminal server's brindle-remote.exe joins it in task 9.1 of terminal-server-windows).
+      # A Windows release is one zip: brindle.exe with brindle-remote.exe
+      # beside it, which local tabs need and which carries the packaged ConPTY.
       - name: Release zip
         id: zip
         shell: pwsh
         run: |
-          $zip = scripts/package-windows.ps1
+          $zip = scripts/package-windows.ps1 -Exe target/release/brindle.exe -Helper target/release/brindle-remote.exe
           "path=$zip" >> $env:GITHUB_OUTPUT
       - name: WinGet manifest
         if: inputs.winget-validate

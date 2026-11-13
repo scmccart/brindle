@@ -387,9 +387,12 @@ There's no installer. The terminal server's helper, `brindle-remote.exe`,
 carries the packaged ConPTY and unpacks it to
 `%LOCALAPPDATA%\brindle\conpty\<version>` on first run; it must sit beside
 `brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
-zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with the exe, the Linux
-remote helper and the licences (`SHA256SUMS` beside it lists its hash); unpack it anywhere and run `brindle.exe`. Once
-releases are published to WinGet, it installs as a `brindle` command on `PATH`:
+zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
+`brindle-remote.exe`, the Linux remote helper and the licences (`SHA256SUMS`
+beside it lists its hash); unpack it anywhere, keeping the two exes together,
+and run `brindle.exe`. Once releases are published to WinGet, it installs as
+the `brindle` command on `PATH`, with the terminal server's `brindle-remote`
+(`brindle-remote status`, `list`, `kill`, `stop`) beside it:
 
 ```powershell
 winget install scmccart.brindle

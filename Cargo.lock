@@ -713,6 +713,7 @@ version = "0.3.0"
 dependencies = [
  "brindle-remote-protocol",
  "brindle-term-core",
+ "embed-resource",
  "libc",
  "windows 0.61.3",
 ]
