@@ -17,6 +17,9 @@ alacritty_terminal = "0.26.0"
 anyhow = "1"
 base64 = "0.22"
 dirs = "5"
+# Resolving brindle.exe through a WinGet link without the `\\?\` prefix
+# (`remote::exe_paths`); already in the lockfile through gpui_util.
+dunce = "1"
 getrandom = "0.3"
 env_logger = "0.11"
 futures = "0.3"

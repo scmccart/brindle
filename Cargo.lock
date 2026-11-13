@@ -682,6 +682,7 @@ dependencies = [
  "brindle-term-core",
  "brindle-ui",
  "dirs 5.0.1",
+ "dunce",
  "embed-resource",
  "env_logger",
  "futures",
