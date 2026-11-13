@@ -7,6 +7,7 @@ use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use super::local_server;
 use crate::brindle::Dump;
 use crate::{Case, Ctx, Outcome, Result, ensure, winproc};
 
@@ -24,6 +25,32 @@ pub fn all() -> Vec<Case> {
         display("windows-caption", caption),
         display("windows-wsl-tmux", wsl_tmux),
         display("windows-zones", zones),
+        display("local-server-session", local_server::session),
+        display("local-server-close", local_server::close),
+        display("local-server-quit", local_server::quit),
+        display("local-server-crash", local_server::crash),
+        display("local-server-close-zone", local_server::close_zone),
+        display("local-server-close-window", local_server::close_window),
+        display("local-server-close-command", local_server::close_command),
+        display("local-server-reattach-quit", local_server::reattach_quit),
+        display("local-server-reattach-crash", local_server::reattach_crash),
+        display("local-server-reattach-killed", local_server::reattach_killed),
+        display("local-server-reattach-inactive", local_server::reattach_inactive),
+        display("local-server-reattach-closed-tab", local_server::reattach_closed_tab),
+        display("local-server-reattach-no-restore", local_server::reattach_no_restore),
+        display("local-server-reattach-second", local_server::reattach_second),
+        display("local-server-palette", local_server::palette),
+        display("local-server-attach-flag", local_server::attach_flag),
+        display("local-server-env", local_server::env),
+        display("local-server-core-restart", local_server::core_restart),
+        display("local-server-replay-quiet", local_server::replay_quiet),
+        display("local-server-holder-lost", local_server::holder_lost),
+        display("local-server-no-helper", local_server::no_helper),
+        display("local-server-upgrade", local_server::upgrade),
+        display("local-server-manage", local_server::manage),
+        display("local-server-message-box", local_server::message_box),
+        display("local-server-inbox-host", local_server::inbox_host),
+        display("local-server-elevated", local_server::elevated),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]

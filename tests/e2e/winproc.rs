@@ -118,6 +118,180 @@ pub fn kill(pid: u32) {
     }
 }
 
+/// Whether `pid` is still running.
+pub fn alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::STILL_ACTIVE;
+    use windows::Win32::System::Threading::GetExitCodeProcess;
+    let Some(process) = Opened::new(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
+    let mut code = 0;
+    // SAFETY: an open handle with the right to ask.
+    unsafe { GetExitCodeProcess(process.0, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
+}
+
+/// The pid that started `pid`, as the process list has it.
+pub fn parent(pid: u32) -> Option<u32> {
+    all().into_iter().find(|p| p.pid == pid).map(|p| p.parent)
+}
+
+/// A window handle, as a number (0 for none).
+pub type Window = isize;
+
+/// The visible top-level window of `pid`, if it has one.
+pub fn window_of(pid: u32) -> Option<Window> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::BOOL;
+
+    struct Found {
+        pid: u32,
+        window: Option<Window>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
+        // SAFETY: `found` is the `Found` passed to EnumWindows below.
+        let found = unsafe { &mut *(found.0 as *mut Found) };
+        let mut pid = 0;
+        // SAFETY: plain queries about a window that exists.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == found.pid && IsWindowVisible(hwnd).as_bool() {
+                found.window = Some(hwnd.0 as isize);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut found = Found { pid, window: None };
+    // SAFETY: `found` outlives the enumeration.
+    unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
+    found.window
+}
+
+fn hwnd(window: Window) -> windows::Win32::Foundation::HWND {
+    windows::Win32::Foundation::HWND(window as *mut c_void)
+}
+
+/// The top-level window with the title `title`, if there is one.
+pub fn window_titled(title: &str) -> Option<Window> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::{HSTRING, PCWSTR};
+    let title = HSTRING::from(title);
+    // SAFETY: a plain query with a NUL-terminated title.
+    unsafe { FindWindowW(PCWSTR::null(), &title) }.ok().map(|w| w.0 as isize)
+}
+
+/// `window`'s owner (`GW_OWNER`), if it has one.
+pub fn owner(window: Window) -> Option<Window> {
+    use windows::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow};
+    // SAFETY: any window handle may be asked about.
+    unsafe { GetWindow(hwnd(window), GW_OWNER) }.ok().map(|w| w.0 as isize)
+}
+
+/// Posts `WM_CLOSE` to `window`: a message, not input.
+pub fn post_close(window: Window) -> crate::Result {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    // SAFETY: a message with no pointers in it.
+    unsafe { PostMessageW(Some(hwnd(window)), WM_CLOSE, WPARAM(0), LPARAM(0)) }
+        .map_err(|e| format!("posting WM_CLOSE to {window:#x}: {e}"))
+}
+
+/// Whether this process runs elevated (its token is the full one).
+pub fn elevated() -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    // SAFETY: this process's own token, closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut used = 0;
+    // SAFETY: `elevation` is the size passed.
+    let asked = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut used,
+        )
+    };
+    // SAFETY: the token is ours and open.
+    unsafe { CloseHandle(token) }.ok();
+    asked.is_ok() && elevation.TokenIsElevated != 0
+}
+
+/// Starts `command_line` unelevated, from an elevated process: with the
+/// filtered token linked to this one (what the same user gets without
+/// elevating), through `CreateProcessWithTokenW`, so it needs the Secondary
+/// Logon service. Returns the process's pid; it runs with its user's own
+/// environment, not this process's.
+pub fn start_unelevated(command_line: &str) -> crate::Result<u32> {
+    use windows::Win32::Security::{
+        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS,
+        TOKEN_LINKED_TOKEN, TokenLinkedToken, TokenPrimary,
+    };
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_CONSOLE, CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+
+    let mut own = HANDLE::default();
+    // SAFETY: this process's own token, closed below.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(0x0008), &mut own) }
+        .map_err(|e| format!("opening this process's token: {e}"))?;
+    let mut linked = TOKEN_LINKED_TOKEN::default();
+    let mut used = 0;
+    // SAFETY: `linked` is the size passed; the token is open.
+    let asked = unsafe {
+        GetTokenInformation(
+            own,
+            TokenLinkedToken,
+            Some(&mut linked as *mut TOKEN_LINKED_TOKEN as *mut c_void),
+            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut used,
+        )
+    };
+    // SAFETY: ours and open.
+    unsafe { CloseHandle(own) }.ok();
+    asked.map_err(|e| format!("this token has no linked (unelevated) token: {e}"))?;
+    let mut primary = HANDLE::default();
+    // SAFETY: the linked token is open; the duplicate is closed below.
+    let duplicated =
+        unsafe { DuplicateTokenEx(linked.LinkedToken, TOKEN_ALL_ACCESS, None, SecurityImpersonation, TokenPrimary, &mut primary) };
+    // SAFETY: ours and open.
+    unsafe { CloseHandle(linked.LinkedToken) }.ok();
+    duplicated.map_err(|e| format!("duplicating the unelevated token: {e}"))?;
+    let startup = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut info = PROCESS_INFORMATION::default();
+    let mut line: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: the command line is writable and NUL-terminated, and outlives
+    // the call; the handles returned are closed below.
+    let started = unsafe {
+        CreateProcessWithTokenW(
+            primary,
+            LOGON_WITH_PROFILE,
+            None,
+            Some(PWSTR(line.as_mut_ptr())),
+            CREATE_NEW_CONSOLE,
+            None,
+            None,
+            &startup,
+            &mut info,
+        )
+    };
+    // SAFETY: ours and open.
+    unsafe { CloseHandle(primary) }.ok();
+    started.map_err(|e| format!("starting {command_line:?} unelevated: {e}"))?;
+    // SAFETY: the process's handles are ours.
+    unsafe {
+        CloseHandle(info.hThread).ok();
+        CloseHandle(info.hProcess).ok();
+    }
+    Ok(info.dwProcessId)
+}
+
 pub fn self_test() -> crate::Result {
     use crate::ensure;
     for (line, want) in [
@@ -132,5 +306,15 @@ pub fn self_test() -> crate::Result {
     ensure!(own.contains("--self-test"), "own command line: {own:?}");
     let me = all().into_iter().find(|p| p.pid == std::process::id()).ok_or("this process isn't listed")?;
     ensure!(image(me.pid).is_some_and(|path| path.file_name().is_some_and(|n| *n == *me.name)), "image of {}", me.name);
+    ensure!(alive(me.pid), "this process isn't alive");
+    ensure!(parent(me.pid) == Some(me.parent), "parent of this process: {:?}", parent(me.pid));
+    let mut ended = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "exit"])
+        .spawn()
+        .map_err(|e| format!("starting cmd: {e}"))?;
+    let pid = ended.id();
+    ended.wait().map_err(|e| e.to_string())?;
+    // Its handle is still open here, so the pid isn't reused yet.
+    ensure!(!alive(pid), "cmd {pid} is alive after exiting");
     Ok(())
 }

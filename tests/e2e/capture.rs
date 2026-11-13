@@ -278,7 +278,15 @@ pub fn request_close(display: &str, pid: u32) -> Result {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Asks the window of `pid` to close, as its close button does: a
+/// `WM_CLOSE` message to that window, not input.
+#[cfg(windows)]
+pub fn request_close(_display: &str, pid: u32) -> Result {
+    let window = crate::winproc::window_of(pid).ok_or_else(|| format!("no visible window for pid {pid}"))?;
+    crate::winproc::post_close(window)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn request_close(_display: &str, _pid: u32) -> Result {
     Err("closing a window by WM_DELETE_WINDOW needs X11".into())
 }

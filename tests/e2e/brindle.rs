@@ -92,8 +92,7 @@ blink = false
 
 [[profiles]]
 name = "Shell"
-command = "bash"
-args = ["--norc", "--noprofile"]
+{shell}
 
 [[profiles]]
 name = "tmux"
@@ -128,8 +127,23 @@ ansi = [{alt_ansi}]
         match_fg = SEARCH_MATCH_FG.hex(),
         focused_bg = SEARCH_FOCUSED_BG.hex(),
         focused_fg = SEARCH_FOCUSED_FG.hex(),
+        shell = SHELL_PROFILE,
     )
 }
+
+/// The `Shell` profile's command: bash, or on Windows PowerShell 7 with the
+/// prompt [`PROMPT`].
+const SHELL_PROFILE: &str = if cfg!(windows) {
+    r#"command = "pwsh.exe"
+args = ["-NoLogo", "-NoProfile", "-NoExit", "-Command", "function prompt { 'PS> ' }"]"#
+} else {
+    r#"command = "bash"
+args = ["--norc", "--noprofile"]"#
+};
+
+/// The `Shell` profile's prompt on Windows, as the screen shows it at a
+/// line's end (without its trailing space).
+pub const PROMPT: &str = "PS>";
 
 enum Event {
     Tmux(Vec<String>),
@@ -144,7 +158,8 @@ enum Event {
 /// One run of Brindle attached to a test server's session.
 pub struct Run<'a> {
     ctx: &'a Ctx,
-    server: &'a TmuxServer,
+    /// None for a run of local tabs only ([`Run::local`]).
+    server: Option<&'a TmuxServer>,
     label: &'static str,
     profile: &'static str,
     /// Appended to the test config (after its tables).
@@ -231,6 +246,20 @@ pub struct Output {
 impl<'a> Run<'a> {
     /// `label` names the run's files in the case directory.
     pub fn new(ctx: &'a Ctx, server: &'a TmuxServer, label: &'static str) -> Self {
+        Self::with(ctx, Some(server), label)
+    }
+
+    /// A run with no tmux server, starting with the `Shell` profile (also the
+    /// default one): local tabs only. Its config's tmux profile names no
+    /// server, and tmux timeline events fail.
+    pub fn local(ctx: &'a Ctx, label: &'static str) -> Self {
+        let mut run = Self::with(ctx, None, label);
+        run.profile = "Shell";
+        run.default_profile = "Shell";
+        run
+    }
+
+    fn with(ctx: &'a Ctx, server: Option<&'a TmuxServer>, label: &'static str) -> Self {
         Run {
             ctx,
             server,
@@ -372,6 +401,12 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Waits for the `Shell` profile's prompt on Windows, whose PowerShell
+    /// takes a while to start; bash needs no wait.
+    pub fn prompt(self) -> Self {
+        if cfg!(windows) { self.wait_for(PROMPT) } else { self }
+    }
+
     /// Calls `call` with Brindle's pid `secs` after Brindle starts (stretched
     /// like the other timeline events), on the timeline thread. Its error
     /// fails the run; later events wait for it to return.
@@ -452,7 +487,8 @@ impl<'a> Run<'a> {
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
         let config_path = ctx.dir.join("config.toml");
-        let text = config_with(&self.server.socket, "e2e", self.default_profile, &self.top) + &self.extra_config;
+        let socket = self.server.map_or_else(|| NO_SOCKET.to_string(), |server| server.socket.clone());
+        let text = config_with(&socket, "e2e", self.default_profile, &self.top) + &self.extra_config;
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
@@ -489,7 +525,6 @@ impl<'a> Run<'a> {
         // The timeline runs on its own thread, so captures can happen meanwhile.
         self.timeline.sort_by(|a, b| a.0.total_cmp(&b.0));
         let timeline: Vec<(f64, Event)> = std::mem::take(&mut self.timeline);
-        let socket = self.server.socket.clone();
         let slow = ctx.secs(1.0);
         let config_for_reload = config_path.clone();
         let (case_dir, label) = (ctx.dir.clone(), self.label);
@@ -594,6 +629,9 @@ impl<'a> Run<'a> {
         Ok(Output { dump, image })
     }
 }
+
+/// The tmux socket a [`Run::local`] config names: no server has it.
+const NO_SOCKET: &str = "brindle-e2e-no-server";
 
 /// The session-restore state directory of every run in the case.
 pub fn state_dir(ctx: &Ctx) -> std::path::PathBuf {
