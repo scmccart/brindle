@@ -593,18 +593,21 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         ensure!(text.contains("MYPROMPT> "), "{shell}: the user's prompt is gone:\n{text}");
         ensure!(text.contains("dir=C:\\Windows"), "{shell}: the new tab's directory:\n{text}");
         // Restore: the session written on quit reattaches both tabs, the
-        // active one in C:\Windows.
+        // active one in C:\Windows. Its replay already shows `dir=`, so the
+        // live shell answers with `redir=` (split so the typed line doesn't
+        // match).
         let restored = run_with(
             ctx,
             &config,
             &format!("{label}-restored"),
-            &["--wait-for", "MYPROMPT>", "--send", "\"dir=$PWD\"\r"],
+            &["--wait-for", "MYPROMPT>", "--send", "'re' + \"dir=$PWD\"\r", "--wait-for", "redir="],
             &[],
             8.0,
             None,
         )?;
         let text = screen(&restored.dump);
-        ensure!(text.contains("dir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
+        ensure!(restored.dump.tabs.len() == 2, "{shell}: restored tabs {:?}", restored.dump.tabs);
+        ensure!(text.contains("redir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
         std::fs::remove_dir_all(ctx.dir.join("state")).ok();
     }
     Ok(Outcome::Pass)
