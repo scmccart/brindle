@@ -1,10 +1,11 @@
 //! `brindle-remote hold`: the holder, which owns sessions' PTYs for the
 //! terminal server's core.
 //!
-//! A holder is the programs' parent. It pumps their I/O, resizes, signals
-//! and reaps them, and parses nothing. Per session it keeps the core's
-//! latest checkpoint and the raw output since then (the tail), as bytes it
-//! doesn't interpret, so a new core can rebuild the screens.
+//! A holder is the programs' parent. It pumps their I/O, resizes, hangs up
+//! and reaps them (on Windows over ConPTY: see `platform::pty`), and parses
+//! nothing. Per session it keeps the core's latest checkpoint and the raw
+//! output since then (the tail), as bytes it doesn't interpret, so a new
+//! core can rebuild the screens.
 //!
 //! - **Endpoint:** holder `<n>` of its build listens where
 //!   [`Endpoints::holder`] says: on Linux at the socket

@@ -1,5 +1,6 @@
-//! The server directory: where the core's and holders' sockets, locks and
-//! logs live. The platform says where it is and who may enter it.
+//! The server directory: where the core's and holders' locks and logs live,
+//! and on Linux their sockets (Windows names its pipes from the directory
+//! instead). The platform says where it is and who may enter it.
 
 use std::io;
 use std::path::PathBuf;

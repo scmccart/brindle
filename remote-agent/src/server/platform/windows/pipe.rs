@@ -1,6 +1,6 @@
 //! Pipe sources: overlapped pipe I/O behind the loop's readiness facade.
 //!
-//! A [`Pipe`] is the owner's side (a stream; later a PTY and a ready pipe)
+//! A [`Pipe`] is the owner's side (a stream, a session's PTY or a ready pipe)
 //! of up to two pipe handles opened with `FILE_FLAG_OVERLAPPED`: one to
 //! read from and one to write to, which are the same handle for a duplex
 //! pipe. Its [`Source`] is the loop's side of the same state. Pipes are

@@ -30,8 +30,8 @@
 //!   [`RECONNECT_GRACE`] for their owners to come back. Each has an
 //!   emulator ([`screen`]) fed with all of its output.
 //! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, once
-//!   `STOP` has ended every session, or after `STEP_DOWN`. The socket is
-//!   removed first.
+//!   `STOP` has ended every session, or after `STEP_DOWN`. On Linux the
+//!   socket is removed first.
 //! - **Windows:** a client's `REPARENT` goes to its session's holder, and
 //!   at its start the core removes the helper copies of other builds that
 //!   nothing runs from any more ([`prune_copies`]).

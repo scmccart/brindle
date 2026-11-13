@@ -318,7 +318,7 @@ impl Drop for Loop {
 }
 
 /// Something a loop waits on: the state a pipe or a listener shares with
-/// its owner (a stream, a listener; later a PTY, a ready pipe), which does
+/// its owner (a stream, a listener, a PTY, a ready pipe), which does
 /// the I/O. It stays valid when the owner is gone, and then reports nothing.
 #[derive(Clone)]
 pub struct Source(Arc<dyn Watched>);
