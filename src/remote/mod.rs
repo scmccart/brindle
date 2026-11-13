@@ -5,7 +5,10 @@
 //! directly because tmux control mode already is a byte-stream protocol.
 
 pub mod client;
-#[cfg(target_os = "linux")]
+// Nothing on Windows uses the client until local tabs run in the server
+// there (`Backend::Server`, task 7.3 of `terminal-server-windows`).
+#[cfg(any(target_os = "linux", windows))]
+#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
 

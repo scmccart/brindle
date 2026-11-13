@@ -23,7 +23,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -32,7 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use parking_lot::{Condvar, Mutex};
 
-use super::{Connected, Endpoint, Refused};
+use super::{Connected, Endpoint, Refused, Stream};
 use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, ReplayStart, Request, Resize, SessionInfo, SessionRef,
     Spawned, ToClient, ToCore,
@@ -143,7 +142,7 @@ struct State {
 /// The stream the writer writes to; `None` while reconnecting.
 #[derive(Default)]
 struct Slot {
-    stream: Option<Arc<UnixStream>>,
+    stream: Option<Arc<Stream>>,
     closed: bool,
 }
 
@@ -282,7 +281,7 @@ impl Connection {
     }
 
     /// Reads each connection in turn, reconnecting when one ends.
-    fn run(self: Arc<Self>, mut stream: UnixStream) {
+    fn run(self: Arc<Self>, mut stream: Stream) {
         loop {
             let reason = self.read(stream);
             log::warn!("terminal server connection ended ({reason}); reconnecting");
@@ -298,7 +297,7 @@ impl Connection {
     }
 
     /// Reads one connection until it ends, saying why.
-    fn read(&self, stream: UnixStream) -> String {
+    fn read(&self, stream: Stream) -> String {
         let mut reader = BufReader::with_capacity(READ_BUFFER, stream);
         loop {
             let frame = match Frame::read_from_or_eof(&mut reader) {
@@ -446,7 +445,7 @@ impl Connection {
     /// Connects again with the same token, starting a core if none appears
     /// within [`START_AFTER`], for at most [`RECONNECT_LIMIT`]. Then asks
     /// for the session list and hands the writer the new stream.
-    fn reconnect(&self) -> std::result::Result<UnixStream, String> {
+    fn reconnect(&self) -> std::result::Result<Stream, String> {
         let started = Instant::now();
         let mut next_start = START_AFTER;
         loop {
@@ -474,7 +473,7 @@ impl Connection {
         }
     }
 
-    fn resume(&self, connected: Connected) -> Result<UnixStream> {
+    fn resume(&self, connected: Connected) -> Result<Stream> {
         let Connected { mut stream, welcome } = connected;
         log::info!("reconnected to the terminal server (core pid {})", welcome.pid);
         let req = self.req();

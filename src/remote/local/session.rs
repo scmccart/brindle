@@ -227,13 +227,13 @@ fn run(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::remote::local::{Endpoint, connect};
+    use crate::remote::local::sys::Listener;
+    use crate::remote::local::{Endpoint, Stream, connect};
     use crate::remote::protocol::Frame;
     use crate::remote::protocol::client::{self, Spawned, ToClient, ToCore, Welcome};
 
@@ -284,10 +284,10 @@ mod tests {
     /// A core that waits `delay` before its `WELCOME`, starts one session,
     /// and reports the messages it gets after `SPAWN`.
     fn slow_core(dir: &std::path::Path, delay: Duration) -> mpsc::Receiver<ToCore> {
-        let listener = UnixListener::bind(dir.join("core.sock")).unwrap();
+        let listener = Listener::bind(dir);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = listener.accept();
             let ToCore::Hello(_) = ToCore::decode(&Frame::read_from(&mut stream).unwrap()).unwrap() else {
                 panic!("not HELLO")
             };
@@ -316,7 +316,7 @@ mod tests {
         rx
     }
 
-    fn send(stream: &mut std::os::unix::net::UnixStream, message: ToClient) {
+    fn send(stream: &mut Stream, message: ToClient) {
         message.encode().unwrap().write_to(stream).unwrap();
     }
 
@@ -324,12 +324,12 @@ mod tests {
     /// (which may reply) and reports it.
     fn scripted_core(
         dir: &std::path::Path,
-        mut answer: impl FnMut(&ToCore, &mut std::os::unix::net::UnixStream) + Send + 'static,
+        mut answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
     ) -> mpsc::Receiver<ToCore> {
-        let listener = UnixListener::bind(dir.join("core.sock")).unwrap();
+        let listener = Listener::bind(dir);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = listener.accept();
             let ToCore::Hello(_) = ToCore::decode(&Frame::read_from(&mut stream).unwrap()).unwrap() else {
                 panic!("not HELLO")
             };
@@ -353,7 +353,7 @@ mod tests {
     }
 
     fn connector(dir: &std::path::Path) -> impl FnOnce() -> Result<Arc<Connection>> + Send + 'static {
-        let endpoint = Endpoint { helper: dir.join("unused"), dir: dir.to_path_buf() };
+        let endpoint = Endpoint::at(dir.join("unused"), dir.to_path_buf());
         move || {
             let connected = connect(&endpoint, "tok")?;
             Connection::start(endpoint, "tok", connected)
@@ -365,7 +365,7 @@ mod tests {
     }
 
     /// Answers `ATTACH` of session 5 with a replay, then live output.
-    fn replaying(message: &ToCore, stream: &mut std::os::unix::net::UnixStream) {
+    fn replaying(message: &ToCore, stream: &mut Stream) {
         if let ToCore::Attach(attach) = message {
             let session = attach.session;
             send(stream, ToClient::ReplayStart(client::ReplayStart { req: Some(attach.req), session, pid: 99 }));
@@ -564,7 +564,7 @@ mod tests {
     fn a_slow_core_never_blocks_the_start_and_queued_input_arrives() {
         let dir = temp_dir("slow");
         let core = slow_core(&dir, Duration::from_millis(800));
-        let endpoint = Endpoint { helper: dir.join("unused"), dir: dir.clone() };
+        let endpoint = Endpoint::at(dir.join("unused"), dir.clone());
         let (tx, seen) = mpsc::channel();
         let started = Instant::now();
         let session = Session::start_with(
