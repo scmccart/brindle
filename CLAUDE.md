@@ -31,7 +31,7 @@ The Windows port (OpenSpec change `port-to-windows`) builds on `x86_64-pc-window
 - On Windows `BRINDLE_E2E=1 cargo test --test e2e` lists only the Windows cases (`tests/e2e/cases/win.rs`: the ConPTY host and fallback, passthrough, glyph widths, closing mid-output, titles, PowerShell integration, the caption hit-test, WSL tmux) plus the `local-server-*` cases that apply to Windows and the `remote-*` cases, which skip unless `BRINDLE_REMOTE_AGENT` names a Linux helper, and `tests/perf` runs only its self-test. Each Windows case that opens a window gets a private server directory (`target/tmp/e2e/<case>/server`) and needs `brindle-remote.exe` beside the binary (or `BRINDLE_SERVER_HELPER`), not older than its sources; `windows-e2e` on CI builds the helper first.
 - Pitfalls found on the way:
   - `--send` turns `\t`, `\e`, `\r` and `\n` into controls, so Windows paths in steps use `/`.
-  - `brindle.exe` is a GUI program: PowerShell doesn't wait for it unless its output is piped, or it is run with `Start-Process -Wait`.
+  - `brindle.exe` is a GUI program: PowerShell doesn't wait for it unless its output is piped, or it is run with `Start-Process -Wait` (which waits for the whole process tree, a server Brindle started included; wait on the `-PassThru` process with `WaitForExit()` instead).
   - Elevated PowerShell (as on CI) sets its own console title.
   - GPUI answers `WM_NCHITTEST` for the last mouse position, so probes send a `WM_MOUSEMOVE` to the window first. That is a message, not input.
   - Windows acts on a caption press (drag, double-click, the caption buttons) only when GPUI leaves it unhandled, and GPUI's focus transfer counts as handling it. So the tab strip occludes the focusable workspace, and the caption buttons have no handlers there.

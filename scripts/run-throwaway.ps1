@@ -25,7 +25,7 @@
 #
 # This opens a window on your desktop and takes focus: don't start it while
 # typing elsewhere. brindle.exe is a GUI program, which PowerShell does not
-# wait for by itself, so it is started with Start-Process -Wait.
+# wait for by itself, so it is started with Start-Process and waited on.
 
 param(
     [string]$Config,
@@ -98,11 +98,14 @@ try {
     $env:BRINDLE_STATE_DIR = Join-Path $dir 'state'
     $env:BRINDLE_SERVER_DIR = Join-Path $dir 'server'
     if ($haveHelper) { $env:BRINDLE_SERVER_HELPER = $helper }
-    $start = @{ FilePath = $bin; Wait = $true; PassThru = $true }
+    $start = @{ FilePath = $bin; PassThru = $true }
     if ($passed.Count -gt 0) {
         $start.ArgumentList = ($passed | ForEach-Object { Quote-Argument $_ }) -join ' '
     }
     $process = Start-Process @start
+    # Not -Wait: that waits for the whole process tree, including a terminal
+    # server that outlives Brindle by design.
+    $process.WaitForExit()
     $exit = $process.ExitCode
 } finally {
     $env:BRINDLE_CONFIG = $previous.Config
@@ -119,7 +122,12 @@ try {
     if ($Keep) {
         Write-Host "run-throwaway: kept $dir"
     } else {
-        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        # The server's per-build helper copy stays locked until its processes
+        # have gone, which `stop` doesn't wait for: retry for a few seconds.
+        for ($try = 0; $try -lt 20 -and (Test-Path -LiteralPath $dir); $try++) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $dir) { Start-Sleep -Milliseconds 250 }
+        }
     }
 }
 exit $exit
