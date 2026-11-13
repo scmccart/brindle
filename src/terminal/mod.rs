@@ -437,11 +437,7 @@ impl Terminal {
         // tmux attach) is never restored or reattached, so it ends with its
         // tab and with Brindle. Everything else keeps running when Brindle
         // goes away without closing it.
-        //
-        // Not yet on Windows, where nothing reattaches a session: every
-        // program there ends with Brindle until task 8.1 of
-        // `terminal-server-windows`.
-        let closing = if cfg!(windows) { Closing::Ends } else { Closing::new(command_override.is_some()) };
+        let closing = Closing::new(command_override.is_some());
         // The program is always resolved here (on Windows from `PATH` and
         // `%COMSPEC%`), so `SPAWN` never leaves it to the server.
         let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
@@ -505,9 +501,6 @@ impl Terminal {
     /// quiet (no bell or notification), then its live output. It closes as
     /// a spawned profile terminal does. Returns at once, like a spawn; a
     /// refused attach shows in the terminal.
-    // Unused on Windows until sessions are listed and attached there (task 8.1
-    // of `terminal-server-windows`).
-    #[cfg_attr(windows, allow(dead_code))]
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach(
         request: crate::remote::local::AttachRequest,
@@ -1091,9 +1084,6 @@ impl Terminal {
 
     /// The terminal server session (id and key) this terminal shows, once
     /// it exists and while its program runs.
-    // Unused on Windows until sessions are listed and attached there (task 8.1
-    // of `terminal-server-windows`).
-    #[cfg_attr(windows, allow(dead_code))]
     #[cfg(any(target_os = "linux", windows))]
     pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
         match &self.backend {
@@ -1444,7 +1434,7 @@ mod tests {
         assert_eq!(Closing::new(false), Closing::Keeps);
         // `-e` and classic tmux attaches are never restored.
         assert_eq!(Closing::new(true), Closing::Ends);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             use crate::remote::protocol::client::Policy;
             assert_eq!(Closing::Keeps.policy(), Policy::Detach);

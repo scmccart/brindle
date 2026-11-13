@@ -99,9 +99,6 @@ pub struct AttachRequest {
 type Reply<T> = mpsc::SyncSender<Result<T, String>>;
 
 /// What a request waits for.
-// Unused on Windows until sessions are listed and attached there (task 8.1
-// of `terminal-server-windows`).
-#[cfg_attr(windows, allow(dead_code))]
 enum Waiting {
     /// `SPAWNED`, whose sink then joins the session map.
     Spawn { sink: Sink, reply: Reply<Spawned> },
@@ -272,9 +269,6 @@ impl Connection {
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
-    // Unused on Windows until sessions are listed and attached there (task 8.1
-    // of `terminal-server-windows`).
-    #[cfg_attr(windows, allow(dead_code))]
     pub fn list(&self) -> Result<Vec<SessionInfo>> {
         self.ask("list its sessions", |req, reply| {
             (Waiting::List(reply), ToCore::List(Request { req }))
@@ -282,9 +276,6 @@ impl Connection {
     }
 
     /// Ends a session whatever its policy or client. Blocks.
-    // Unused on Windows until sessions are listed and attached there (task 8.1
-    // of `terminal-server-windows`).
-    #[cfg_attr(windows, allow(dead_code))]
     pub fn kill(&self, session: SessionId) -> Result<()> {
         self.ask("end the session", |req, reply| {
             let target = KillTarget::Session(session);

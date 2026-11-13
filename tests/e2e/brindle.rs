@@ -180,10 +180,9 @@ pub struct Run<'a> {
 /// Hangs up the case server's detached sessions and waits for them to go,
 /// so the case's next Brindle (which attaches detached sessions at launch)
 /// starts with only the tabs it asks for.
-fn hang_up_detached(ctx: &Ctx) -> Result {
-    // Only Linux leaves sessions detached: a Windows tab's ends with its
-    // Brindle.
-    if cfg!(not(target_os = "linux")) {
+pub fn hang_up_detached(ctx: &Ctx) -> Result {
+    // Only the terminal server (Linux and Windows) leaves sessions detached.
+    if cfg!(not(any(target_os = "linux", windows))) {
         return Ok(());
     }
     let list = || -> Result<Vec<String>> {

@@ -237,8 +237,25 @@ fn run(ctx: &Ctx, label: &str, args: &[&str], env: &[(&str, &str)], dump_at: f64
 
 type During<'a> = Option<(f64, &'a dyn Fn(u32) -> String)>;
 
-/// [`run`] with another config.
+/// [`run`] with another config. The sessions the run leaves detached are
+/// hung up, so the case's next run starts with only the tabs it asks for.
 fn run_with(
+    ctx: &Ctx,
+    config_text: &str,
+    label: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    dump_at: f64,
+    during: During,
+) -> Result<Ran> {
+    let ran = run_keeping(ctx, config_text, label, args, env, dump_at, during)?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(ran)
+}
+
+/// [`run_with`], leaving the sessions the run leaves detached (a quit
+/// leaves every profile tab's) for the next run to attach.
+fn run_keeping(
     ctx: &Ctx,
     config_text: &str,
     label: &str,
@@ -548,8 +565,8 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         // prompts they need, since Windows PowerShell can take longer than a
         // step to start and load the script, and the directory is reported
         // with the prompt after `cd` (`cddone` is split so the typed line
-        // doesn't match).
-        let ran = run_with(
+        // doesn't match). Its tabs' sessions stay for the restore.
+        let ran = run_keeping(
             ctx,
             &config,
             label,
@@ -575,7 +592,8 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         ensure!(ran.dump.tabs.len() == 2, "{shell}: tabs {:?}", ran.dump.tabs);
         ensure!(text.contains("MYPROMPT> "), "{shell}: the user's prompt is gone:\n{text}");
         ensure!(text.contains("dir=C:\\Windows"), "{shell}: the new tab's directory:\n{text}");
-        // Restore: the session written on quit reopens both tabs in C:\Windows.
+        // Restore: the session written on quit reattaches both tabs, the
+        // active one in C:\Windows.
         let restored = run_with(
             ctx,
             &config,
@@ -635,7 +653,8 @@ fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
 
 fn zones(ctx: &Ctx) -> Result<Outcome> {
     let restore_config = CONFIG.to_string();
-    let split = run_with(
+    // Its zones' sessions stay for the restore, which reattaches them.
+    let split = run_keeping(
         ctx,
         &restore_config,
         "zones-split",
@@ -693,6 +712,7 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
         "restored zone_list: {:?}",
         restored.dump.zone_list
     );
+    ensure!(screen(&restored.dump).contains("zone1-left"), "restored screen: {}", screen(&restored.dump));
     ensure!(
         restored.dump.palette.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"),
         "palette rows: {:?}",

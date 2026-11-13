@@ -240,8 +240,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
                 }
             }
             "--no-restore" => args.no_restore = true,
-            "--attach" if cfg!(not(target_os = "linux")) => {
-                usage_error("--attach needs the terminal server, which runs only on Linux")
+            "--attach" if cfg!(not(any(target_os = "linux", windows))) => {
+                usage_error("--attach needs the terminal server, which runs only on Linux and Windows")
             }
             "--attach" => match it.next().and_then(|id| id.parse().ok()) {
                 Some(id) => args.attach = Some(id),
@@ -453,7 +453,7 @@ fn forwarded_launch(
 /// The running terminal server's sessions, attached or not: none when no
 /// server runs (none is started), `None` when listing fails (logged).
 fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     match remote::local::running_sessions(Duration::from_secs(2)) {
         Ok(sessions) => Some(sessions),
         Err(why) => {
@@ -461,7 +461,7 @@ fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
             None
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     Some(Vec::new())
 }
 
@@ -923,7 +923,7 @@ mod tests {
         };
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn attach_takes_a_session_id() {
         let args = parse(&["--attach", "7", "--dump-screen-after", "2"]);
