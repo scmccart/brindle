@@ -51,7 +51,7 @@ fn with_no_server_running_nothing_is_printed_and_nothing_starts() {
         assert_eq!(stderr(&output), "no server is running\n");
     }
     assert!(server_processes(&dir.path, "serve").is_empty());
-    assert!(!core_socket(&dir.path).exists());
+    assert!(!core_endpoint(&dir.path).exists());
     // A directory that doesn't exist isn't created.
     let missing = dir.path.join("missing");
     succeeded(cli(&missing, &["list"]));
@@ -178,8 +178,8 @@ fn stop_ends_every_session_the_core_and_the_holders() {
     assert!(client.closes());
     assert!(gone(killed_pid) && gone(kept_pid));
     assert!(gone(core_pid) && gone(holder));
-    assert!(!core_socket(&dir.path).exists());
-    assert!(dir.holder_sockets().is_empty());
+    assert!(!core_endpoint(&dir.path).exists());
+    assert!(dir.holder_endpoints().is_empty());
     // And now there is no server.
     let output = succeeded(cli(&dir.path, &["status"]));
     assert_eq!(stdout(&output), "no server is running\n");

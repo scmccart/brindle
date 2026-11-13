@@ -169,7 +169,7 @@ fn an_old_build_holder_drains_and_new_sessions_go_to_a_new_holder() {
     let (two, two_pid) = client.spawn(client_spawn("cat", &[]));
     let old_holder = parent(one_pid).unwrap();
     dir.track(old_holder);
-    let old_socket = dir.holder_sockets().pop().unwrap();
+    let old_socket = dir.holder_endpoints().pop().unwrap();
     assert!(
         old_socket
             .file_name()
@@ -290,7 +290,7 @@ fn a_next_core_that_wont_start_is_replaced_by_the_holders_own() {
             server_processes(&dir.path, "serve")
                 .iter()
                 .any(|&pid| pid != old_core)
-                && std::os::unix::net::UnixStream::connect(core_socket(&dir.path)).is_ok()
+                && std::os::unix::net::UnixStream::connect(core_endpoint(&dir.path)).is_ok()
         }),
         "no core: {}",
         dir.logs()

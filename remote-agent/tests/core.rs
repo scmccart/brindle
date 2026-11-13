@@ -65,7 +65,7 @@ fn sessions_share_one_holder_that_is_neither_the_core_nor_the_client() {
     dir.track(holder);
     assert!(pids.iter().all(|&pid| parent(pid) == Some(holder)));
     assert_eq!(server_processes(&dir.path, "hold"), [holder]);
-    assert_eq!(dir.holder_sockets().len(), 1);
+    assert_eq!(dir.holder_endpoints().len(), 1);
     for pid in [core_pid, holder] {
         let parent = parent(pid);
         assert_ne!(parent, Some(std::process::id()));
@@ -86,7 +86,7 @@ fn an_unused_core_and_its_holder_exit_and_remove_their_sockets() {
     let started = Instant::now();
     assert!(gone(pid));
     assert!(started.elapsed() >= Duration::from_secs(4));
-    assert!(!core_socket(&idle.path).exists());
+    assert!(!core_endpoint(&idle.path).exists());
 
     // Used, then left.
     let (dir, mut client) = core("unused");
@@ -97,8 +97,8 @@ fn an_unused_core_and_its_holder_exit_and_remove_their_sockets() {
     assert_eq!(client.exit_code(session), Some(0));
     drop(client);
     assert!(gone(holder) && gone(core_pid));
-    assert!(!core_socket(&dir.path).exists());
-    assert!(dir.holder_sockets().is_empty());
+    assert!(!core_endpoint(&dir.path).exists());
+    assert!(dir.holder_endpoints().is_empty());
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn a_flood_and_its_exit_reach_a_slow_client() {
     assert_eq!(output, FLOOD, "every byte of output");
     assert_eq!((exit.code, exit.lost), (Some(0), None), "{}", dir.logs());
     assert!(
-        eventually(TIMEOUT, || dir.holder_sockets().is_empty()),
+        eventually(TIMEOUT, || dir.holder_endpoints().is_empty()),
         "the empty holder didn't exit"
     );
     let logs = dir.logs();
@@ -373,7 +373,7 @@ fn kill_core_and_wait_for_another(dir: &TempDir, client: &mut TestClient) {
             server_processes(&dir.path, "serve")
                 .iter()
                 .any(|&pid| pid != old)
-                && std::os::unix::net::UnixStream::connect(core_socket(&dir.path)).is_ok()
+                && std::os::unix::net::UnixStream::connect(core_endpoint(&dir.path)).is_ok()
         }),
         "no new core: {}",
         dir.logs()
@@ -521,8 +521,8 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
     assert!(client.closes());
     assert!(!alive(kept_pid) && !alive(plain_pid));
     assert!(gone(core_pid) && gone(holder));
-    assert!(!core_socket(&dir.path).exists());
-    assert!(dir.holder_sockets().is_empty());
+    assert!(!core_endpoint(&dir.path).exists());
+    assert!(dir.holder_endpoints().is_empty());
 }
 
 // 5.1

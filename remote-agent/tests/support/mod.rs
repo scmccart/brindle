@@ -1,24 +1,33 @@
 //! Shared pieces for the terminal-server tests: a temp server directory,
-//! starting a server process with `--ready-fd`, a test core speaking H1, a
-//! test client speaking protocol 1, and process checks.
+//! starting a server process with its ready pipe, a test core speaking H1, a
+//! test client speaking protocol 1, and process checks. What differs between
+//! the platforms (connections, starting, processes) is in `unix` and
+//! `windows`, with the same items.
 
 #![allow(dead_code)]
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{self, ToClient};
+use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
 };
@@ -33,7 +42,7 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A fresh user-only directory under the system temp dir (short, so socket
-/// paths fit). Dropping it kills the holders it saw and removes it.
+/// paths fit). Dropping it kills the servers it saw and removes it.
 pub struct TempDir {
     pub path: PathBuf,
     pids: Vec<u32>,
@@ -46,7 +55,7 @@ impl TempDir {
         let path = std::env::temp_dir().join(format!("bt-{tag}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        private_dir(&path);
         Self {
             path,
             pids: Vec::new(),
@@ -69,18 +78,12 @@ impl TempDir {
         text
     }
 
-    pub fn holder_sockets(&self) -> Vec<PathBuf> {
-        let mut sockets: Vec<PathBuf> = fs::read_dir(&self.path)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path.file_name().unwrap().to_string_lossy();
-                name.starts_with("holder-") && name.ends_with(".sock")
-            })
-            .collect();
-        sockets.sort();
-        sockets
+    /// Where the holders the directory shows listen
+    /// ([`Endpoints::holders`]): sockets on Linux, pipe names on Windows.
+    pub fn holder_endpoints(&self) -> Vec<PathBuf> {
+        let endpoints = Endpoints::of(&self.path).unwrap();
+        let holders = endpoints.holders().unwrap();
+        holders.into_iter().map(|holder| holder.endpoint).collect()
     }
 }
 
@@ -90,98 +93,10 @@ impl Drop for TempDir {
         pids.extend(server_processes(&self.path, "serve"));
         pids.extend(server_processes(&self.path, "hold"));
         for pid in pids {
-            if alive(pid) {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            }
+            kill_server(pid);
         }
         let _ = fs::remove_dir_all(&self.path);
     }
-}
-
-/// The running `brindle-remote <role>` processes (`serve` or `hold`) whose
-/// environment names `dir` as their server directory.
-pub fn server_processes(dir: &Path, role: &str) -> Vec<u32> {
-    let wanted = format!("BRINDLE_SERVER_DIR={}", dir.display());
-    let mut pids: Vec<u32> = fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&pid| {
-            let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-                return false;
-            };
-            let is_role = cmdline.split(|&b| b == 0).nth(1) == Some(role.as_bytes());
-            is_role
-                && alive(pid)
-                && fs::read(format!("/proc/{pid}/environ"))
-                    .is_ok_and(|env| env.split(|&b| b == 0).any(|var| var == wanted.as_bytes()))
-        })
-        .collect();
-    pids.sort_unstable();
-    pids
-}
-
-/// Runs `bin <role> --ready-fd 3` for `dir` and waits for its ready byte.
-/// Fails, with the server's stderr, if it exits before being ready.
-pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
-    let mut fds = [-1; 2];
-    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    let write_fd = write.as_raw_fd();
-    let mut command = Command::new(bin);
-    command
-        .args([role, "--ready-fd", "3"])
-        .env("BRINDLE_SERVER_DIR", dir)
-        .env("BRINDLE_NO_SCOPE", "1")
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_fd, 3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    // A freshly written binary can be briefly busy: another test thread's
-    // fork may still hold the writer's fd until it execs.
-    let mut attempts = 0;
-    let child = loop {
-        match command.spawn() {
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 100 => {
-                attempts += 1;
-                thread::sleep(Duration::from_millis(20));
-            }
-            result => break result?,
-        }
-    };
-    drop(write);
-    let mut pollfd = libc::pollfd {
-        fd: read.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, TIMEOUT.as_millis() as libc::c_int) };
-    let mut byte = [0u8; 1];
-    let got =
-        ready == 1 && unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) } == 1;
-    let output = child.wait_with_output()?;
-    if !got {
-        return Err(io::Error::other(format!(
-            "{role} wasn't ready ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "the starter exited with {}",
-            output.status
-        )));
-    }
-    Ok(())
 }
 
 /// Starts a holder from the built binary. A core it starts on its own (once
@@ -210,21 +125,22 @@ impl Adopted {
     }
 }
 
-/// A core for tests: H1 over a holder's socket, read on a thread.
+/// A core for tests: H1 over a holder's endpoint, read on a thread.
 pub struct TestCore {
-    stream: UnixStream,
+    stream: Stream,
+    reader: Option<JoinHandle<()>>,
     incoming: Receiver<io::Result<ToCore>>,
     backlog: VecDeque<ToCore>,
     closed: bool,
 }
 
 impl TestCore {
-    pub fn connect(socket: &Path) -> Self {
-        let stream = UnixStream::connect(socket)
-            .unwrap_or_else(|error| panic!("connect {}: {error}", socket.display()));
+    pub fn connect(endpoint: &Path) -> Self {
+        let stream = connect(endpoint)
+            .unwrap_or_else(|error| panic!("connect {}: {error}", endpoint.display()));
         let mut reader = stream.try_clone().unwrap();
         let (sender, incoming) = mpsc::channel();
-        thread::spawn(move || {
+        let reader = thread::spawn(move || {
             loop {
                 let message = match Frame::read_from_or_eof(&mut reader) {
                     Ok(Some(frame)) => ToCore::decode(&frame),
@@ -239,6 +155,7 @@ impl TestCore {
         });
         Self {
             stream,
+            reader: Some(reader),
             incoming,
             backlog: VecDeque::new(),
             closed: false,
@@ -247,9 +164,9 @@ impl TestCore {
 
     /// Connects to the directory's only holder.
     pub fn connect_to(dir: &TempDir) -> Self {
-        let sockets = dir.holder_sockets();
-        assert_eq!(sockets.len(), 1, "holder sockets: {sockets:?}");
-        Self::connect(&sockets[0])
+        let endpoints = dir.holder_endpoints();
+        assert_eq!(endpoints.len(), 1, "holder endpoints: {endpoints:?}");
+        Self::connect(&endpoints[0])
     }
 
     pub fn send(&mut self, message: ToHolder) {
@@ -283,6 +200,25 @@ impl TestCore {
     pub fn recv(&mut self) -> ToCore {
         self.try_recv(TIMEOUT)
             .expect("the holder closed the connection")
+    }
+
+    /// Whether the holder sends nothing for `duration`. What it does send
+    /// is kept for later.
+    pub fn quiet_for(&mut self, duration: Duration) -> bool {
+        if !self.backlog.is_empty() {
+            return false;
+        }
+        match self.incoming.recv_timeout(duration) {
+            Ok(Ok(message)) => {
+                self.backlog.push_back(message);
+                false
+            }
+            Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                false
+            }
+            Err(RecvTimeoutError::Timeout) => true,
+        }
     }
 
     /// Whether the holder closes the connection within the timeout, skipping
@@ -428,9 +364,14 @@ impl TestCore {
 
 impl Drop for TestCore {
     /// Closes the connection, as a core exiting or being killed would; the
-    /// reader thread's clone would otherwise keep it open.
+    /// reader thread's clone would otherwise keep it open. The thread ends
+    /// with the connection and is waited for, so the holder is told of the
+    /// close before the test goes on.
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        close(&self.stream);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -457,6 +398,7 @@ pub fn spawn(session: SessionId, command: &str, args: &[&str]) -> Spawn {
     }
 }
 
+#[cfg(unix)]
 pub fn base_env() -> BTreeMap<String, String> {
     BTreeMap::from([(
         "PATH".to_string(),
@@ -464,43 +406,28 @@ pub fn base_env() -> BTreeMap<String, String> {
     )])
 }
 
+/// What Windows programs need to start, and a `PATH` short enough for one
+/// line of a terminal: the system's own programs.
+#[cfg(windows)]
+pub fn base_env() -> BTreeMap<String, String> {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    BTreeMap::from([
+        ("PATH".to_string(), format!(r"{root}\System32")),
+        ("SystemRoot".to_string(), root),
+    ])
+}
+
 /// A `sh -c script` session.
+#[cfg(unix)]
 pub fn shell(session: SessionId, script: &str) -> Spawn {
     spawn(session, "/bin/sh", &["-c", script])
 }
 
-/// The state letter in `/proc/<pid>/stat`, `None` once the pid is gone.
-pub fn state(pid: u32) -> Option<char> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat[stat.rfind(')')? + 1..].trim_start().chars().next()
-}
-
-/// Running, and not a zombie.
-pub fn alive(pid: u32) -> bool {
-    state(pid).is_some_and(|state| state != 'Z' && state != 'X')
-}
-
-pub fn parent(pid: u32) -> Option<u32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat[stat.rfind(')')? + 1..]
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
-/// Children of `pid` named `comm`.
-pub fn children_named(pid: u32, comm: &str) -> Vec<u32> {
-    fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&child| {
-            parent(child) == Some(pid)
-                && fs::read_to_string(format!("/proc/{child}/comm"))
-                    .is_ok_and(|name| name.trim_end() == comm)
-        })
-        .collect()
+/// A `cmd /d /v:on /c script` session: no AutoRun commands, and `!name!`
+/// reads a variable when its command runs.
+#[cfg(windows)]
+pub fn shell(session: SessionId, script: &str) -> Spawn {
+    spawn(session, "cmd.exe", &["/d", "/v:on", "/c", script])
 }
 
 /// Polls `condition` every 20 ms until it holds or `timeout` passes.
@@ -531,8 +458,10 @@ pub fn start_core(dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
     start(Path::new(BIN), "serve", dir, &env)
 }
 
-pub fn core_socket(dir: &Path) -> PathBuf {
-    dir.join("core.sock")
+/// Where the core of `dir` listens: a socket on Linux, a pipe name on
+/// Windows.
+pub fn core_endpoint(dir: &Path) -> PathBuf {
+    Endpoints::of(dir).unwrap().core()
 }
 
 /// Runs `brindle-remote args…` (a management command, say) for `dir`.
@@ -546,10 +475,7 @@ pub fn cli(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// Holders start a real core of their own once theirs is gone.
-pub const SUPERVISED: (&str, &str) = (
-    "BRINDLE_TEST_HOLDER_CORE_ARGS",
-    "serve --ready-fd {ready_fd}",
-);
+pub const SUPERVISED: (&str, &str) = ("BRINDLE_TEST_HOLDER_CORE_ARGS", SERVE_ARGS);
 
 /// Waits until `pid` is gone.
 pub fn gone(pid: u32) -> bool {
@@ -564,11 +490,11 @@ pub enum Recv {
     TimedOut,
 }
 
-/// A client for tests: protocol 1 over the core's socket, read on the
+/// A client for tests: protocol 1 over the core's endpoint, read on the
 /// calling thread (so a test can stop reading, or hand the connection to
 /// another process).
 pub struct TestClient {
-    stream: UnixStream,
+    stream: Stream,
     input: Vec<u8>,
     backlog: VecDeque<ToClient>,
     closed: bool,
@@ -578,9 +504,9 @@ pub struct TestClient {
 
 impl TestClient {
     pub fn connect(dir: &Path) -> Self {
-        let socket = core_socket(dir);
-        let stream = UnixStream::connect(&socket)
-            .unwrap_or_else(|error| panic!("connect {}: {error}", socket.display()));
+        let endpoint = core_endpoint(dir);
+        let stream = connect(&endpoint)
+            .unwrap_or_else(|error| panic!("connect {}: {error}", endpoint.display()));
         Self {
             stream,
             input: Vec::new(),
@@ -920,24 +846,9 @@ impl TestClient {
 
     /// Hands the connection to a `sleep` process (as its fd 3) and closes
     /// this side, so killing that process is a client dying.
+    #[cfg(unix)]
     pub fn into_process(self) -> std::process::Child {
-        let fd = self.stream.as_raw_fd();
-        let mut command = Command::new("sleep");
-        command.arg("1000").stdin(Stdio::null());
-        unsafe {
-            command.pre_exec(move || {
-                let result = if fd == 3 {
-                    libc::fcntl(fd, libc::F_SETFD, 0)
-                } else {
-                    libc::dup2(fd, 3)
-                };
-                if result == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = command.spawn().unwrap();
+        let child = hand_to_process(&self.stream);
         drop(self);
         child
     }
@@ -962,6 +873,7 @@ pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
 }
 
 /// A client `sh -c script` session.
+#[cfg(unix)]
 pub fn client_shell(script: &str) -> client::Spawn {
     client_spawn("/bin/sh", &["-c", script])
 }
@@ -1044,6 +956,7 @@ pub fn snapshot(screen: &Emulator) -> String {
 
 /// Writes `bytes` to a file in `dir` and returns a `detach` session spawn
 /// that prints the file unchanged (raw mode: no `\n` → `\r\n`), then waits.
+#[cfg(unix)]
 pub fn fixture_spawn(dir: &TempDir, name: &str, bytes: &[u8], scrollback: u32) -> client::Spawn {
     let path = dir.path.join(name);
     fs::write(&path, bytes).unwrap();

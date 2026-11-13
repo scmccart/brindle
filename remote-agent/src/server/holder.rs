@@ -6,9 +6,11 @@
 //! latest checkpoint and the raw output since then (the tail), as bytes it
 //! doesn't interpret, so a new core can rebuild the screens.
 //!
-//! - **Socket:** `holder-<build>-<n>.sock` in the server directory, beside
-//!   `holder-<build>-<n>.lock`, which it holds for its whole life, and its
-//!   log.
+//! - **Endpoint:** holder `<n>` of its build listens where
+//!   [`Endpoints::holder`] says: on Linux at the socket
+//!   `holder-<build>-<n>.sock` in the server directory, on Windows at a
+//!   named pipe. Beside it in the directory are `holder-<build>-<n>.lock`,
+//!   which it holds for its whole life, and its log.
 //! - **One core at a time:** a newer `HELLO` takes the holder over from the
 //!   connected core. `WELCOME` lists the sessions, then each one's
 //!   checkpoint and tail follow.
@@ -30,6 +32,7 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
+use brindle_remote_protocol::endpoint::{self, Endpoints};
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
     Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
@@ -121,11 +124,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
 }
 
 /// The holder's place in the server directory: index `n`, its held lock
-/// file, socket and log.
+/// file, its log, and where it listens.
 struct Slot {
     _lock: Lock,
     lock_path: PathBuf,
-    socket_path: PathBuf,
+    endpoint: PathBuf,
     log_path: PathBuf,
 }
 
@@ -133,28 +136,27 @@ impl Slot {
     /// Takes the first index whose lock file no live holder of this build
     /// holds.
     fn claim(dir: &Path, build: &str) -> io::Result<Self> {
+        let endpoints = Endpoints::of(dir)?;
         let mut index = 0u32;
         let mut attempts = 0;
         while index < 1024 && attempts < 4096 {
             attempts += 1;
-            let name = format!("holder-{build}-{index}");
-            let lock_path = dir.join(format!("{name}.lock"));
-            let Some(lock) = Lock::create(&lock_path)? else {
+            let place = endpoints.holder(build, index);
+            let Some(lock) = Lock::create(&place.lock)? else {
                 index += 1;
                 continue;
             };
             // An exiting holder removes its lock file; if that happened
             // between the open and the lock, this lock protects nothing.
-            if !lock.is_at(&lock_path)? {
+            if !lock.is_at(&place.lock)? {
                 continue;
             }
-            let socket_path = dir.join(format!("{name}.sock"));
-            listen::check_path(&socket_path)?;
+            listen::check_path(&place.endpoint)?;
             return Ok(Self {
                 _lock: lock,
-                lock_path,
-                socket_path,
-                log_path: dir.join(format!("{name}.log")),
+                lock_path: place.lock,
+                endpoint: place.endpoint,
+                log_path: place.log,
             });
         }
         Err(io::Error::other(
@@ -288,12 +290,12 @@ struct Holder<L: EventLoop> {
 impl<L: EventLoop> Holder<L> {
     fn new(mut ev: L, build: String, slot: Slot, core_args: Vec<String>) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
-        let listener = Listener::bind(&slot.socket_path, Identity::own())?;
+        let listener = Listener::bind(&slot.endpoint, Identity::own())?;
         ev.register(&listener.source(), LISTENER, Interest::READABLE)?;
         ev.waker().wake_on_child_exit()?;
         log!(
             "listening on {} (build {build})",
-            slot.socket_path.display()
+            slot.endpoint.display()
         );
         Ok(Self {
             ev,
@@ -1107,7 +1109,7 @@ impl<L: EventLoop> Holder<L> {
     /// messages in the core's socket buffer.
     fn shutdown(mut self) {
         // Nothing new can find this holder.
-        let _ = fs::remove_file(&self.slot.socket_path);
+        let _ = endpoint::remove(&self.slot.endpoint);
         let _ = fs::remove_file(&self.slot.lock_path);
         if let Some(core) = self.core.as_mut() {
             let queued = core.conn.queued();
@@ -1203,27 +1205,29 @@ mod tests {
         assert_eq!(tail.to_vec().len(), Tail::LIMIT - 5);
     }
 
-    #[cfg(unix)]
     #[test]
     fn slots_take_the_first_free_index() {
         let temp = crate::server::dir::tests::TempDir::new("slots");
+        let endpoints = Endpoints::of(&temp.0).unwrap();
         let a = Slot::claim(&temp.0, "b1").unwrap();
         let b = Slot::claim(&temp.0, "b1").unwrap();
         let other = Slot::claim(&temp.0, "b2").unwrap();
-        assert!(a.socket_path.ends_with("holder-b1-0.sock"));
-        assert!(b.socket_path.ends_with("holder-b1-1.sock"));
+        assert_eq!(a.endpoint, endpoints.holder("b1", 0).endpoint);
+        assert_eq!(b.endpoint, endpoints.holder("b1", 1).endpoint);
         assert!(b.log_path.ends_with("holder-b1-1.log"));
         assert!(other.lock_path.ends_with("holder-b2-0.lock"));
+        assert_eq!(other.endpoint, endpoints.holder("b2", 0).endpoint);
         drop(a);
         let c = Slot::claim(&temp.0, "b1").unwrap();
-        assert!(
-            c.socket_path.ends_with("holder-b1-0.sock"),
+        assert_eq!(
+            c.endpoint,
+            endpoints.holder("b1", 0).endpoint,
             "a released index is reused"
         );
         // A lock file unlinked by an exiting holder doesn't count.
         fs::remove_file(&b.lock_path).unwrap();
         let d = Slot::claim(&temp.0, "b1").unwrap();
-        assert!(d.socket_path.ends_with("holder-b1-1.sock"));
+        assert_eq!(d.endpoint, endpoints.holder("b1", 1).endpoint);
         drop(b);
     }
 }
