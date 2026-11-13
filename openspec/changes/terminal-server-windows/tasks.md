@@ -43,7 +43,7 @@
 - [x] 6.1 Run the core on Windows: the core pipe listener, holder discovery through lock files, the holder connections, supervision restarting a core from the holder's own image, and the unused exit. Forward `REPARENT` to the holder on Windows; Linux keeps refusing it. Verify: `cargo test -p brindle-remote-agent --test core` passes on Windows (roles, start race, peer check, spawn, policies, reconnect, replay, checkpoints, core killed and restarted by its holder) and on Linux.
 - [ ] 6.2 Make the upgrade path work on Windows: `check`, `STEP_DOWN`, adoption and drain, with the core's exe time read through `QueryFullProcessImageNameW`. Verify: `cargo test -p brindle-remote-agent --test upgrade` passes on Windows, including the upgrade to the same binary and a new core that won't start.
 - [ ] 6.3 Run `list`, `kill`, `status` and `stop` on Windows. Verify: `cargo test -p brindle-remote-agent --test manage` passes on Windows, and `brindle-remote status --json` with no server prints `{"running":false}`.
-- [ ] 6.4 Update `remote-agent`'s docs and the server parts of CLAUDE.md's architecture section to cover Windows: the directory, pipe names, access, detached start, the per-build copy and ConPTY in the holder. Verify: the text names each Windows mechanism in design.md.
+- [x] 6.4 Update `remote-agent`'s docs and the server parts of CLAUDE.md's architecture section to cover Windows: the directory, pipe names, access, detached start, the per-build copy and ConPTY in the holder. Verify: the text names each Windows mechanism in design.md.
 
 ## 7. Brindle's client on Windows
 
