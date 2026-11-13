@@ -30,17 +30,16 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, SetEvent, TerminateProcess, WaitForMultipleObjects,
-    WaitForSingleObject,
+    CreateEventW, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, SetEvent,
+    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GW_OWNER, GetWindow, MSG, PM_REMOVE,
     PeekMessageW, WINDOW_EX_STYLE, WS_OVERLAPPED,
 };
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::core::{PCWSTR, w};
 
 use super::TIMEOUT;
 
@@ -278,23 +277,12 @@ pub fn kill(pid: u32) {
     }
 }
 
-/// The file name of `pid`'s image.
+/// The file name of `pid`'s image, while it runs.
 fn image_name(pid: u32) -> Option<String> {
-    let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    let mut buffer = [0u16; 1024];
-    let mut len = buffer.len() as u32;
-    // SAFETY: the buffer has `len` units, and `len` is set to what is used.
-    unsafe {
-        QueryFullProcessImageNameW(
-            raw(&process),
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut len,
-        )
-    }
-    .ok()?;
-    let path = String::from_utf16_lossy(&buffer[..len as usize]);
-    Some(path.rsplit(['\\', '/']).next()?.to_string())
+    // An exited process can still be opened while a handle to it is open.
+    let _running = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let path = win::image_path_of(pid).ok()?;
+    Some(path.file_name()?.to_string_lossy().into_owned())
 }
 
 /// Whether `pid` runs `brindle-remote` (or a test's copy of it): a pid a

@@ -16,6 +16,8 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+pub mod programs;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
@@ -1055,6 +1057,25 @@ pub fn fixture_spawn(dir: &TempDir, name: &str, bytes: &[u8], scrollback: u32) -
         "stty raw -echo; cat '{}'; exec sleep 1000",
         path.display()
     ));
+    spawn.scrollback = scrollback;
+    spawn.policy = client::Policy::Detach;
+    spawn
+}
+
+/// Writes `bytes` to a file in `dir` and returns a `detach` session spawn
+/// whose PowerShell prints the file as it is (the escape sequences too),
+/// then waits. The console host renders what it prints, so a test compares
+/// a replay with what a client saw, not with `bytes`.
+#[cfg(windows)]
+pub fn fixture_spawn(dir: &TempDir, name: &str, bytes: &[u8], scrollback: u32) -> client::Spawn {
+    let path = dir.path.join(name);
+    fs::write(&path, bytes).unwrap();
+    let script = format!(
+        "[Console]::Write([IO.File]::ReadAllText('{}')); Start-Sleep -Seconds 1000",
+        path.display()
+    );
+    let mut spawn = client_spawn("powershell.exe", &["-NoProfile", "-Command", &script]);
+    spawn.env = inherited_env(&[]);
     spawn.scrollback = scrollback;
     spawn.policy = client::Policy::Detach;
     spawn

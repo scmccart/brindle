@@ -25,6 +25,7 @@ use super::{check, dir};
 const REPLY_LIMIT: Duration = Duration::from_secs(60);
 const NO_SERVER: &str = "no server is running";
 
+#[cfg(unix)]
 pub const USAGE: &str = "\
 usage: brindle-remote <command>
   --version                         print the version
@@ -38,6 +39,22 @@ usage: brindle-remote <command>
   stop                              hang up every session and stop the server
 The server directory is $BRINDLE_SERVER_DIR, else $XDG_RUNTIME_DIR/brindle,
 else ~/.cache/brindle/run.";
+
+#[cfg(windows)]
+pub const USAGE: &str = "\
+usage: brindle-remote <command>
+  --version                         print the version
+  --server                          serve one session over stdio (remote tabs)
+  serve [--ready-handle N]          run the terminal server's core
+  hold [--ready-handle N]           run a holder (started by the core)
+  launch <role> [--ready-handle N]  internal: start serve or hold detached
+  check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
+  list [--json]                     the server's sessions: id, pid, state, policy, age, title, command, directory
+  kill ID | kill --all              hang up one session, or all of them
+  status [--json]                   the core and its holders
+  stop                              hang up every session and stop the server
+The server directory is %BRINDLE_SERVER_DIR%, else %LOCALAPPDATA%\\brindle\\run
+(run-elevated for an elevated process).";
 
 /// Runs a management command or `check`; `None` if `command` is neither.
 pub fn run(command: &str, args: &[String]) -> Option<Result<(), String>> {

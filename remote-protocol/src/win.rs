@@ -4,9 +4,10 @@
 //! and the server directory are created with. The rules themselves are in
 //! [`crate::access`], re-exported here.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs::File;
 use std::io;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +31,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::core::{BOOL, HSTRING, PWSTR};
 
@@ -456,6 +458,32 @@ pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
 /// role runs from its per-build copy, so this is what it starts roles from.
 pub fn own_image_path() -> io::Result<PathBuf> {
     std::env::current_exe()
+}
+
+/// The image path of the running process `pid`
+/// (`QueryFullProcessImageNameW`), where Linux reads `/proc/<pid>/exe`:
+/// the upgrade check reads the running core's binary through it.
+pub fn image_path_of(pid: u32) -> io::Result<PathBuf> {
+    let what = || format!("process {pid}");
+    // SAFETY: plain arguments; the handle is owned below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|error| context(what(), context("can't open it", os(error))))?;
+    // SAFETY: a fresh handle nothing else owns.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    // Long paths can exceed MAX_PATH; 32767 units is the most a path has.
+    let mut buffer = vec![0u16; 32 * 1024];
+    let mut len = buffer.len() as u32;
+    // SAFETY: the buffer has `len` units, and `len` is set to what is used.
+    unsafe {
+        QueryFullProcessImageNameW(
+            HANDLE(process.as_raw_handle()),
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .map_err(|error| context(what(), os(error)))?;
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..len as usize])))
 }
 
 /// The build id of the file at `path`, or `None` when it can't be read.
@@ -931,5 +959,19 @@ mod tests {
         // No directory at all is nothing to prune.
         prune_helper_copies(&dir.join("absent"), "kept");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_processs_image_path_is_its_executable() {
+        let path = image_path_of(std::process::id()).unwrap();
+        let own = std::env::current_exe().unwrap();
+        assert!(
+            path.as_os_str().eq_ignore_ascii_case(own.as_os_str()),
+            "{} isn't {}",
+            path.display(),
+            own.display()
+        );
+        // No process has pid 0's image to give.
+        assert!(image_path_of(0).is_err());
     }
 }
