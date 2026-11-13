@@ -461,8 +461,7 @@ fn title_child(ctx: &Ctx) -> Result<Outcome> {
 
 /// Brindle's PowerShell script in PowerShell 7 and 5.1, under a prompt the
 /// user defined: the prompt still draws, and the directory the script
-/// reports is where a new tab, and a restored one, starts. (The marks and
-/// `$LASTEXITCODE` are checked byte for byte by a unit test in conpty.rs.)
+/// reports is where a new tab, and a restored one, starts.
 fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     // The README's line, run by the brindle.exe under test.
     let bin = ctx.bin.display().to_string().replace('\\', "/");

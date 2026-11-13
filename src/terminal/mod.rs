@@ -4,33 +4,16 @@
 //! - `Server` (Linux and Windows): a session of the local terminal server
 //!   ([`crate::remote::local`]), whose output the connection's reader
 //!   thread parses. Every local tab uses it.
-//! - `Pty` (Windows): a local child process on Brindle's own
-//!   pseudoconsole. Nothing starts one any more; it goes with task 7.5 of
-//!   `terminal-server-windows`.
 //! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
 //! - `Agent`: a PTY owned by the remote Linux helper.
 
-// Used on Windows; tested everywhere. There, the command lines are built
-// only for `conpty` until task 7.5 removes them with it.
-#[allow(dead_code)]
 pub mod cmdline;
-// Unused since Windows tabs run in the terminal server; removed by task 7.5
-// of `terminal-server-windows`, as `pty` and `scan`'s reader are.
-#[cfg(windows)]
-#[allow(dead_code)]
-mod conpty;
 pub mod keys;
 pub mod links;
 pub mod mouse;
 pub mod pace;
 pub mod process;
-#[cfg(windows)]
-#[allow(dead_code)]
-mod pty;
-// Read through by the Windows PTY (task 7.5 removes that); tested everywhere.
-#[allow(dead_code)]
-mod scan;
 pub mod search;
 #[cfg(any(target_os = "linux", windows))]
 mod server;
@@ -45,8 +28,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
-#[cfg(windows)]
-use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -70,6 +51,7 @@ use crate::theme::{Color, Theme};
 pub enum ChannelEvent {
     Alac(AlacEvent),
     /// A sequence the scanner found in the output (on the thread reading it).
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Osc(Found),
     /// A replay of a server session starts (`true`) or ends. In between,
     /// the state updates but no attention is raised.
@@ -114,7 +96,7 @@ pub struct Listener(UnboundedSender<ChannelEvent>, Arc<OutputMarker>);
 impl EventListener for Listener {
     fn send_event(&self, event: AlacEvent) {
         if matches!(event, AlacEvent::Wakeup) {
-            // On alacritty's I/O thread, right after it parsed new output.
+            // On the thread that parsed new output, right after it did.
             self.1.advance(Instant::now());
         }
         self.0.unbounded_send(ChannelEvent::Alac(event)).ok();
@@ -206,15 +188,6 @@ pub enum TerminalEvent {
 }
 
 enum Backend {
-    /// A pseudoconsole Brindle owns. Never built since Windows tabs run in
-    /// the terminal server; task 7.5 of `terminal-server-windows` removes it.
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    Pty {
-        sender: EventLoopSender,
-        process: process::PtyProcess,
-        console: Arc<conpty::Pseudoconsole>,
-    },
     /// A session of the local terminal server.
     #[cfg(any(target_os = "linux", windows))]
     Server { session: crate::remote::local::Session, closing: Closing },
@@ -267,8 +240,8 @@ pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     backend: Backend,
     output: Arc<OutputMarker>,
-    /// The vte processor and OSC 133 scanner. Locked before `term`; the PTY
-    /// reader thread uses it too (see `pty.rs`).
+    /// The vte processor and OSC 133 scanner. Locked before `term`; a server
+    /// session's reader thread uses it too (see `server.rs`).
     parser: Arc<Mutex<Parser>>,
     /// Shell-integration marks. Locked after `term`.
     marks: Arc<Mutex<Marks>>,
@@ -622,8 +595,6 @@ impl Terminal {
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let scanner = match &mut self.backend {
             Backend::Remote { scanner, .. } | Backend::Agent { scanner, .. } => scanner,
-            #[cfg(windows)]
-            Backend::Pty { .. } => return,
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { .. } => return,
         };
@@ -859,10 +830,6 @@ impl Terminal {
             return;
         }
         match &self.backend {
-            #[cfg(windows)]
-            Backend::Pty { sender, .. } => {
-                sender.send(Msg::Input(bytes)).ok();
-            }
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => session.input(&bytes),
             Backend::Remote { input, .. } => input(&bytes),
@@ -905,8 +872,6 @@ impl Terminal {
         self.marks.lock().resize(&mut *term, size);
         drop(term);
         match &self.backend {
-            #[cfg(windows)]
-            Backend::Pty { sender, .. } => _ = sender.send(Msg::Resize(size.into())),
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => {
                 session.resize(size.cols, size.rows, size.cell_width, size.cell_height)
@@ -1049,8 +1014,6 @@ impl Terminal {
     /// titles. `snapshot` is the title tick's look at all processes.
     pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
         match &self.backend {
-            #[cfg(windows)]
-            Backend::Pty { process, .. } => process.foreground_name(snapshot),
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => {
                 session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
@@ -1074,7 +1037,6 @@ impl Terminal {
         let Some(hwnd) = crate::win::hwnd(window) else { return };
         match &self.backend {
             Backend::Server { session, .. } => session.reparent(hwnd.0 as usize as u64),
-            Backend::Pty { console, .. } => console.reparent(hwnd),
             Backend::Remote { .. } | Backend::Agent { .. } => {}
         }
     }
@@ -1086,7 +1048,7 @@ impl Terminal {
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         match &self.backend {
             #[cfg(windows)]
-            Backend::Pty { .. } | Backend::Server { .. } => {
+            Backend::Server { .. } => {
                 self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
             }
             #[cfg(target_os = "linux")]
@@ -1116,8 +1078,6 @@ impl Terminal {
     /// [`Closing`] says, and any other terminal's ends.
     fn leave(&mut self, close: bool) {
         match &self.backend {
-            #[cfg(windows)]
-            Backend::Pty { sender, .. } => _ = sender.send(Msg::Shutdown),
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, closing } => match (close, closing) {
                 (false, Closing::Keeps) => session.detach(),
