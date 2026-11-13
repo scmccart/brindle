@@ -877,6 +877,50 @@ mod tests {
         }
     }
 
+    /// Brindle's PowerShell script, in a real PowerShell 7 and Windows
+    /// PowerShell 5.1 on a pseudoconsole: a failing native command gets
+    /// A, B, C and D;3, the directory is reported, and `$LASTEXITCODE`
+    /// survives the prompt.
+    #[test]
+    fn the_powershell_script_marks_commands() {
+        const PROMPT_END: &str = "\x1b]133;B\x07";
+        let script = std::env::temp_dir().join(format!("brindle-si-{}.ps1", std::process::id()));
+        std::fs::write(&script, include_str!("../../../../../shell-integration/brindle.ps1")).unwrap();
+        let on_path = |exe: &str| {
+            std::env::var_os("PATH")
+                .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
+        };
+        let mut ran = 0;
+        for shell in ["pwsh.exe", "powershell.exe"] {
+            if !on_path(shell) {
+                eprintln!("{shell} isn't on PATH; skipped");
+                continue;
+            }
+            ran += 1;
+            let load = format!(". '{}'", script.display());
+            let args = ["-NoLogo", "-NoProfile", "-NoExit", "-Command", &load];
+            let mut session = Session::sized(shell, &args, &[], 120, 30);
+            // Each line is typed at the next prompt.
+            for (prompts, line) in ["cmd /c exit 3\r", "\"code=$LASTEXITCODE\"\r"].iter().enumerate() {
+                let deadline = Instant::now() + LIMIT;
+                while session.text().matches(PROMPT_END).count() <= prompts {
+                    assert!(Instant::now() < deadline, "{shell}: no prompt in {:?}", session.text());
+                    session.turn();
+                }
+                session.send(line);
+            }
+            session.until("code=3");
+            let out = session.text();
+            for mark in ["\x1b]133;A\x07", PROMPT_END, "\x1b]133;C\x07", "\x1b]133;D;3\x07", "\x1b]7;file://"] {
+                assert!(out.contains(mark), "{shell}: no {mark:?} in {out:?}");
+            }
+            session.send("exit\r");
+            session.finish();
+        }
+        std::fs::remove_file(&script).ok();
+        assert!(ran > 0, "no PowerShell on PATH");
+    }
+
     #[test]
     fn the_sessions_environment_picks_the_host() {
         let inbox = Session::start("cmd.exe", &["/c", "echo %BRINDLE_CONPTY%"], &[("BRINDLE_CONPTY", "inbox")]);

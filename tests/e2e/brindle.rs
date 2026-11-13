@@ -181,7 +181,8 @@ pub struct Run<'a> {
 /// so the case's next Brindle (which attaches detached sessions at launch)
 /// starts with only the tabs it asks for.
 fn hang_up_detached(ctx: &Ctx) -> Result {
-    // Only Linux tabs run in the terminal server.
+    // Only Linux leaves sessions detached: a Windows tab's ends with its
+    // Brindle.
     if cfg!(not(target_os = "linux")) {
         return Ok(());
     }
