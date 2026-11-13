@@ -31,6 +31,8 @@ enum Phase {
     Starting {
         input: Vec<Vec<u8>>,
         resize: Option<Size>,
+        /// The window to parent the session's console to (Windows).
+        parent: Option<u64>,
         left: Option<Leaving>,
     },
     Running(Running),
@@ -94,7 +96,7 @@ impl Session {
         start: Start,
         sink: Box<dyn SessionSink>,
     ) -> Self {
-        let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, left: None }));
+        let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
         let sink: Sink = Arc::new(Mutex::new(sink));
         let starting = phase.clone();
         let failing = sink.clone();
@@ -137,6 +139,18 @@ impl Session {
         match &mut *self.phase.lock() {
             Phase::Starting { resize, .. } => *resize = Some(Size { cols, rows, cell_w, cell_h }),
             Phase::Running(running) => running.resize(cols, rows, cell_w, cell_h),
+            Phase::Gone => {}
+        }
+    }
+
+    /// Makes the window `hwnd` the owner of the session's console window
+    /// (`REPARENT`), now or as soon as it starts or attaches, and again
+    /// after each reconnect's replay. Only a Windows core takes it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn reparent(&self, hwnd: u64) {
+        match &mut *self.phase.lock() {
+            Phase::Starting { parent, .. } => *parent = Some(hwnd),
+            Phase::Running(running) => running.reparent(hwnd),
             Phase::Gone => {}
         }
     }
@@ -207,7 +221,7 @@ fn run(
         }
     };
     // Under the lock, so later input waits for what was queued.
-    let Phase::Starting { input, resize, left } = std::mem::replace(&mut *phase, Phase::Gone) else {
+    let Phase::Starting { input, resize, parent, left } = std::mem::replace(&mut *phase, Phase::Gone) else {
         unreachable!("only this thread leaves Starting");
     };
     match left {
@@ -217,6 +231,9 @@ fn run(
     }
     if let Some(size) = resize {
         running.resize(size.cols, size.rows, size.cell_w, size.cell_h);
+    }
+    if let Some(hwnd) = parent {
+        running.reparent(hwnd);
     }
     for bytes in input {
         running.input(&bytes);
@@ -381,6 +398,44 @@ mod tests {
 
     fn seen(rx: &mpsc::Receiver<String>) -> String {
         rx.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    /// `REPARENT` asked for while the session starts goes out once it has,
+    /// and again after a replay (a reconnect's: the core may be a new one),
+    /// but not for a session the tab closed.
+    #[test]
+    fn a_reparent_waits_for_the_session_and_follows_each_replay() {
+        let dir = temp_dir("reparent");
+        let mut replayed = false;
+        let core = scripted_core(&dir, move |message, stream| match message {
+            ToCore::Spawn(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: 7, pid: 4242, key: "k7".into() }));
+            }
+            ToCore::Reparent(_) if !replayed => {
+                replayed = true;
+                send(stream, ToClient::ReplayStart(client::ReplayStart { req: None, session: 7, pid: 4242 }));
+                send(stream, ToClient::ReplayEnd(client::SessionRef { session: 7 }));
+            }
+            ToCore::Close(_) => send(stream, ToClient::ReplayEnd(client::SessionRef { session: 7 })),
+            _ => {}
+        });
+        let (tx, tab) = mpsc::channel();
+        let session = Session::start_with(connector(&dir), request(), Box::new(Recorder(tx)));
+        session.reparent(0x1234);
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        let reparent = client::Reparent { session: 7, hwnd: 0x1234 };
+        assert_eq!(recv(&core), ToCore::Reparent(reparent.clone()));
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "replay false");
+        assert_eq!(recv(&core), ToCore::Reparent(reparent));
+        // Once running it goes straight out.
+        session.reparent(0x5678);
+        assert_eq!(recv(&core), ToCore::Reparent(client::Reparent { session: 7, hwnd: 0x5678 }));
+        session.close();
+        assert!(matches!(recv(&core), ToCore::Close(_)));
+        // The replay end after the close brings nothing more.
+        session.reparent(0x9abc);
+        assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[test]

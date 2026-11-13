@@ -5,10 +5,7 @@
 //! directly because tmux control mode already is a byte-stream protocol.
 
 pub mod client;
-// Nothing on Windows uses the client until local tabs run in the server
-// there (`Backend::Server`, task 7.3 of `terminal-server-windows`).
 #[cfg(any(target_os = "linux", windows))]
-#[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
 
@@ -60,7 +57,7 @@ fn find_helper_in(variable: Option<OsString>, exe: &Path) -> Result<Option<PathB
 /// Linux `BRINDLE_REMOTE_AGENT`, then beside Brindle's executable. On Windows
 /// `BRINDLE_REMOTE_AGENT` names the Linux helper for remote profiles, so it is
 /// ignored and only `brindle-remote.exe` beside `brindle.exe` is looked for.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) fn find_server_helper() -> Result<Option<PathBuf>> {
     let exe = std::env::current_exe().context("locating Brindle executable")?;
     find_server_helper_in(

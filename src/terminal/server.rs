@@ -1,4 +1,4 @@
-//! A local tab's session in the terminal server (Linux): the sink its output
+//! A local tab's session in the terminal server: the sink its output
 //! goes to on the connection's reader thread, and what its `SPAWN` carries.
 //!
 //! The sink does what `pty.rs`'s `ParsingReader` does for a PTY: it scans

@@ -33,8 +33,8 @@ use parking_lot::{Condvar, Mutex};
 
 use super::{Connected, Endpoint, Refused, Stream};
 use crate::remote::protocol::client::{
-    self, Data, Kill, KillTarget, Policy, ReplayStart, Request, Resize, SessionInfo, SessionRef,
-    Spawned, ToClient, ToCore,
+    self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
+    SessionRef, Spawned, ToClient, ToCore,
 };
 use crate::remote::protocol::{Frame, RequestId, SessionId};
 
@@ -99,6 +99,9 @@ pub struct AttachRequest {
 type Reply<T> = mpsc::SyncSender<Result<T, String>>;
 
 /// What a request waits for.
+// Unused on Windows until sessions are listed and attached there (task 8.1
+// of `terminal-server-windows`).
+#[cfg_attr(windows, allow(dead_code))]
 enum Waiting {
     /// `SPAWNED`, whose sink then joins the session map.
     Spawn { sink: Sink, reply: Reply<Spawned> },
@@ -132,6 +135,9 @@ struct Pending {
 #[derive(Default)]
 struct State {
     sessions: HashMap<SessionId, Sink>,
+    /// The window each session's console is parented to (Windows), sent
+    /// again after a reconnect's replay: a core doesn't keep it.
+    parents: HashMap<SessionId, u64>,
     requests: HashMap<RequestId, Pending>,
     /// The `LIST` sent after a reconnect's `WELCOME`.
     list: Option<RequestId>,
@@ -266,6 +272,9 @@ impl Connection {
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
+    // Unused on Windows until sessions are listed and attached there (task 8.1
+    // of `terminal-server-windows`).
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn list(&self) -> Result<Vec<SessionInfo>> {
         self.ask("list its sessions", |req, reply| {
             (Waiting::List(reply), ToCore::List(Request { req }))
@@ -273,6 +282,9 @@ impl Connection {
     }
 
     /// Ends a session whatever its policy or client. Blocks.
+    // Unused on Windows until sessions are listed and attached there (task 8.1
+    // of `terminal-server-windows`).
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn kill(&self, session: SessionId) -> Result<()> {
         self.ask("end the session", |req, reply| {
             let target = KillTarget::Session(session);
@@ -384,7 +396,11 @@ impl Connection {
                 }
             }
             ToClient::Exit(exit) => {
-                let sink = self.state.lock().sessions.remove(&exit.session);
+                let sink = {
+                    let mut state = self.state.lock();
+                    state.parents.remove(&exit.session);
+                    state.sessions.remove(&exit.session)
+                };
                 if let Some(sink) = sink {
                     match exit.lost {
                         Some(reason) => sink.lock().lost(&format!("the terminal server lost it: {reason}")),
@@ -401,6 +417,12 @@ impl Connection {
                 if let Some(sink) = self.sink(end.session) {
                     sink.lock().replay(false);
                 }
+                // The core that replayed may be a new one, which doesn't
+                // know the session's window.
+                let parent = self.state.lock().parents.get(&end.session).copied();
+                if let Some(hwnd) = parent {
+                    self.send(ToCore::Reparent(Reparent { session: end.session, hwnd }));
+                }
             }
             ToClient::Sessions(sessions) => {
                 let lost = {
@@ -411,6 +433,7 @@ impl Connection {
                     state.list = None;
                     let kept: HashSet<SessionId> =
                         sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
+                    state.parents.retain(|session, _| kept.contains(session));
                     missing(&mut state.sessions, &kept)
                 };
                 for sink in lost {
@@ -494,6 +517,7 @@ impl Connection {
         let (sessions, requests) = {
             let mut state = self.state.lock();
             state.dead = true;
+            state.parents.clear();
             (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests))
         };
         self.slot.lock().closed = true;
@@ -604,6 +628,21 @@ impl Running {
         self.conn.send(ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h }));
     }
 
+    /// Makes the window `hwnd` the owner of the session's console window
+    /// (`REPARENT`, which only a Windows core takes), and keeps it to send
+    /// again after each reconnect's replay. A session that exited or was
+    /// lost sends nothing.
+    pub fn reparent(&self, hwnd: u64) {
+        {
+            let mut state = self.conn.state.lock();
+            if !state.sessions.contains_key(&self.id) {
+                return;
+            }
+            state.parents.insert(self.id, hwnd);
+        }
+        self.conn.send(ToCore::Reparent(Reparent { session: self.id, hwnd }));
+    }
+
     /// Ends the session (`CLOSE`). Once is enough; a session that already
     /// exited or was lost isn't closed again.
     pub fn close(&self) {
@@ -622,7 +661,9 @@ impl Running {
 
     /// Stops showing the session; says whether it was still shown.
     fn forget(&self) -> bool {
-        self.conn.state.lock().sessions.remove(&self.id).is_some()
+        let mut state = self.conn.state.lock();
+        state.parents.remove(&self.id);
+        state.sessions.remove(&self.id).is_some()
     }
 }
 

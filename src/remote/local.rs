@@ -113,6 +113,9 @@ pub fn shared() -> Result<Arc<Connection>> {
 /// launch to attach: none when no core is listening (it never starts one).
 /// It blocks, for about `limit` at most past the `HELLO`; it runs once,
 /// before any window opens.
+// Unused on Windows until sessions are listed and attached there (task 8.1
+// of `terminal-server-windows`).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn running_sessions(limit: Duration) -> Result<Vec<client::SessionInfo>> {
     let endpoint = Endpoint::from_env()?;
     let Some(stream) = try_connect_within(&endpoint, limit)? else {

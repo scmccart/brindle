@@ -1,19 +1,24 @@
 //! The terminal model: an alacritty `Term` grid plus the backend feeding it.
 //!
 //! The backends:
-//! - `Server` (Linux): a session of the local terminal server
+//! - `Server` (Linux and Windows): a session of the local terminal server
 //!   ([`crate::remote::local`]), whose output the connection's reader
-//!   thread parses.
-//! - `Pty` (Windows): a local child process on a pseudoconsole, driven by
-//!   alacritty's I/O thread.
+//!   thread parses. Every local tab uses it.
+//! - `Pty` (Windows): a local child process on Brindle's own
+//!   pseudoconsole. Nothing starts one any more; it goes with task 7.5 of
+//!   `terminal-server-windows`.
 //! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
 //!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
 //! - `Agent`: a PTY owned by the remote Linux helper.
 
-// Used by the Windows PTY; tested everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
+// Used on Windows; tested everywhere. There, the command lines are built
+// only for `conpty` until task 7.5 removes them with it.
+#[allow(dead_code)]
 pub mod cmdline;
+// Unused since Windows tabs run in the terminal server; removed by task 7.5
+// of `terminal-server-windows`, as `pty` and `scan`'s reader are.
 #[cfg(windows)]
+#[allow(dead_code)]
 mod conpty;
 pub mod keys;
 pub mod links;
@@ -21,12 +26,13 @@ pub mod mouse;
 pub mod pace;
 pub mod process;
 #[cfg(windows)]
+#[allow(dead_code)]
 mod pty;
-// Read through by the Windows PTY; tested everywhere.
-#[cfg_attr(not(windows), allow(dead_code))]
+// Read through by the Windows PTY (task 7.5 removes that); tested everywhere.
+#[allow(dead_code)]
 mod scan;
 pub mod search;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod server;
 // Moved to `brindle-term-core`, which the server core shares.
 pub use brindle_term_core::{shell_integration, status};
@@ -40,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 #[cfg(windows)]
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -67,10 +73,10 @@ pub enum ChannelEvent {
     Osc(Found),
     /// A replay of a server session starts (`true`) or ends. In between,
     /// the state updates but no attention is raised.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Replay(bool),
     /// The server session can't be got back; the reason is on the screen.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Lost,
 }
 
@@ -200,15 +206,17 @@ pub enum TerminalEvent {
 }
 
 enum Backend {
-    /// A pseudoconsole Brindle owns.
+    /// A pseudoconsole Brindle owns. Never built since Windows tabs run in
+    /// the terminal server; task 7.5 of `terminal-server-windows` removes it.
     #[cfg(windows)]
+    #[allow(dead_code)]
     Pty {
         sender: EventLoopSender,
         process: process::PtyProcess,
         console: Arc<conpty::Pseudoconsole>,
     },
     /// A session of the local terminal server.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     Server { session: crate::remote::local::Session, closing: Closing },
     /// A tmux pane whose stream and input are owned by `TmuxSession`.
     Remote {
@@ -225,7 +233,7 @@ enum Backend {
     },
 }
 
-/// What happens to a local Linux terminal's program when Brindle goes away
+/// What happens to a local terminal's program when Brindle goes away
 /// without closing it (quit, a crash, the desktop stopping Brindle). The
 /// user closing the terminal always ends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,7 +250,7 @@ impl Closing {
         if command_override { Self::Ends } else { Self::Keeps }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn policy(self) -> crate::remote::protocol::client::Policy {
         match self {
             Self::Ends => crate::remote::protocol::client::Policy::Kill,
@@ -442,10 +450,9 @@ impl Terminal {
         }
     }
 
-    /// Spawns `profile`'s program on a new PTY: in a session of the local
-    /// terminal server on Linux, on Brindle's own pseudoconsole on Windows.
-    /// If that fails, the terminal shows the error instead so the tab
-    /// explains what went wrong.
+    /// Spawns `profile`'s program in a new session of the local terminal
+    /// server. If that fails, the terminal shows the error instead so the
+    /// tab explains what went wrong.
     fn spawn_pty(
         profile: &Profile,
         command_override: Option<(String, Vec<String>)>,
@@ -457,8 +464,13 @@ impl Terminal {
         // tmux attach) is never restored or reattached, so it ends with its
         // tab and with Brindle. Everything else keeps running when Brindle
         // goes away without closing it.
-        #[cfg_attr(windows, allow(unused_variables))]
-        let closing = Closing::new(command_override.is_some());
+        //
+        // Not yet on Windows, where nothing reattaches a session: every
+        // program there ends with Brindle until task 8.1 of
+        // `terminal-server-windows`.
+        let closing = if cfg!(windows) { Closing::Ends } else { Closing::new(command_override.is_some()) };
+        // The program is always resolved here (on Windows from `PATH` and
+        // `%COMSPEC%`), so `SPAWN` never leaves it to the server.
         let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
             Some(program) => (program.clone(), profile.args.clone()),
             None => default_program(&profile.args),
@@ -469,7 +481,7 @@ impl Terminal {
             .or_else(dirs::home_dir)
             .filter(|dir| dir.is_dir());
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let request = crate::remote::local::SpawnRequest {
             command: program.clone(),
             args,
@@ -483,23 +495,17 @@ impl Terminal {
             policy: closing.policy(),
             profile: Some(profile.name.clone()),
         };
-        #[cfg(windows)]
-        let command = conpty::Command {
-            line: cmdline::launch_line(&program, &args),
-            cwd: working_directory,
-            env: child_env(profile).into_iter().collect(),
-        };
 
         let (tx, rx) = unbounded();
         let output = Arc::new(OutputMarker::default());
-        let listener = Listener(tx.clone(), output.clone());
+        let listener = Listener(tx, output.clone());
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new()));
         let marks = Arc::new(Mutex::new(Marks::default()));
         // Returns at once: the session starts in the background, and a
         // failure is shown in the terminal then.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let spawned: anyhow::Result<Backend> = {
             let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("start {program:?}"));
             let session = crate::remote::local::Session::start(request, Box::new(sink));
@@ -510,16 +516,6 @@ impl Terminal {
             let _ = (listener, args, working_directory, closing);
             Err(anyhow::anyhow!("local terminals run in the terminal server, which needs Linux"))
         };
-        #[cfg(windows)]
-        let spawned = (|| -> anyhow::Result<Backend> {
-            let spawned = conpty::spawn(&command, size.into())?;
-            let (child_pid, console) = (spawned.pid, spawned.console.clone());
-            let pty = pty::MarkedPty::new(spawned, term.clone(), parser.clone(), marks.clone(), listener.clone(), tx);
-            let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
-            let sender = event_loop.channel();
-            event_loop.spawn();
-            Ok(Backend::Pty { sender, process: process::PtyProcess::new(child_pid), console })
-        })();
 
         let theme = config.profile_theme(profile);
         match spawned {
@@ -536,7 +532,10 @@ impl Terminal {
     /// quiet (no bell or notification), then its live output. It closes as
     /// a spawned profile terminal does. Returns at once, like a spawn; a
     /// refused attach shows in the terminal.
-    #[cfg(target_os = "linux")]
+    // Unused on Windows until sessions are listed and attached there (task 8.1
+    // of `terminal-server-windows`).
+    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(any(target_os = "linux", windows))]
     pub fn attach(
         request: crate::remote::local::AttachRequest,
         what: String,
@@ -625,7 +624,7 @@ impl Terminal {
             Backend::Remote { scanner, .. } | Backend::Agent { scanner, .. } => scanner,
             #[cfg(windows)]
             Backend::Pty { .. } => return,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             Backend::Server { .. } => return,
         };
         let found = scanner.scan(bytes);
@@ -864,7 +863,7 @@ impl Terminal {
             Backend::Pty { sender, .. } => {
                 sender.send(Msg::Input(bytes)).ok();
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => session.input(&bytes),
             Backend::Remote { input, .. } => input(&bytes),
             Backend::Agent { handle, .. } => handle.input(bytes.into_owned()),
@@ -908,7 +907,7 @@ impl Terminal {
         match &self.backend {
             #[cfg(windows)]
             Backend::Pty { sender, .. } => _ = sender.send(Msg::Resize(size.into())),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => {
                 session.resize(size.cols, size.rows, size.cell_width, size.cell_height)
             }
@@ -1052,7 +1051,7 @@ impl Terminal {
         match &self.backend {
             #[cfg(windows)]
             Backend::Pty { process, .. } => process.foreground_name(snapshot),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => {
                 session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
             }
@@ -1066,14 +1065,17 @@ impl Terminal {
 
     /// Parents the tab's console window to `window`, so dialogs that console
     /// programs open (credential prompts, for one) belong to Brindle's
-    /// window. Local tabs never move between windows, so once is enough.
+    /// window. Local tabs never move between windows, so once is enough:
+    /// the session sends `REPARENT` once it has started or attached, and
+    /// again after each reconnect's replay, since a new core doesn't know
+    /// the window.
     #[cfg(windows)]
     pub fn parent_console_to(&self, window: &gpui::Window) {
-        let Backend::Pty { console, .. } = &self.backend else {
-            return;
-        };
-        if let Some(hwnd) = crate::win::hwnd(window) {
-            console.reparent(hwnd);
+        let Some(hwnd) = crate::win::hwnd(window) else { return };
+        match &self.backend {
+            Backend::Server { session, .. } => session.reparent(hwnd.0 as usize as u64),
+            Backend::Pty { console, .. } => console.reparent(hwnd),
+            Backend::Remote { .. } | Backend::Agent { .. } => {}
         }
     }
 
@@ -1084,7 +1086,7 @@ impl Terminal {
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         match &self.backend {
             #[cfg(windows)]
-            Backend::Pty { .. } => {
+            Backend::Pty { .. } | Backend::Server { .. } => {
                 self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
             }
             #[cfg(target_os = "linux")]
@@ -1110,13 +1112,13 @@ impl Terminal {
     }
 
     /// Ends the terminal's connection to its program: `close` ends the
-    /// program; otherwise a local Linux terminal's program is left as its
+    /// program; otherwise a local terminal's program is left as its
     /// [`Closing`] says, and any other terminal's ends.
     fn leave(&mut self, close: bool) {
         match &self.backend {
             #[cfg(windows)]
             Backend::Pty { sender, .. } => _ = sender.send(Msg::Shutdown),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, closing } => match (close, closing) {
                 (false, Closing::Keeps) => session.detach(),
                 _ => session.close(),
@@ -1129,7 +1131,10 @@ impl Terminal {
 
     /// The terminal server session (id and key) this terminal shows, once
     /// it exists and while its program runs.
-    #[cfg(target_os = "linux")]
+    // Unused on Windows until sessions are listed and attached there (task 8.1
+    // of `terminal-server-windows`).
+    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(any(target_os = "linux", windows))]
     pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
         match &self.backend {
             Backend::Server { session, .. } if !self.exited => session.id_and_key(),
@@ -1341,10 +1346,22 @@ pub fn child_env(profile: &Profile) -> HashMap<String, String> {
 /// server adds nothing, so this is what the program sees. Variables that
 /// aren't UTF-8 can't travel in `SPAWN` and are left out, as are the
 /// startup-notification tokens that were for Brindle's own launch.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+///
+/// On Windows names are compared case-insensitively, as Windows does: a
+/// profile's `path` replaces Brindle's `Path`, under the profile's spelling.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub fn server_env(
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     profile: &Profile,
+) -> std::collections::BTreeMap<String, String> {
+    merged_env(vars, child_env(profile), cfg!(windows))
+}
+
+/// `vars` with `set` over them; see [`server_env`].
+fn merged_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    set: HashMap<String, String>,
+    ignore_case: bool,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env: std::collections::BTreeMap<String, String> = vars
         .into_iter()
@@ -1353,7 +1370,10 @@ pub fn server_env(
     for key in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
         env.remove(key);
     }
-    env.extend(child_env(profile));
+    if ignore_case {
+        return cmdline::merge_environment(env.into_iter().collect(), set.into_iter().collect()).into_iter().collect();
+    }
+    env.extend(set);
     env
 }
 
@@ -1514,6 +1534,22 @@ mod tests {
         // Without profile entries, Brindle's own value is what the program sees.
         let env = server_env([(OsString::from("FOO"), OsString::from("2"))], &Profile::default_shell());
         assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
+    }
+
+    /// Windows compares names case-insensitively, so a profile's `path`
+    /// replaces Brindle's `Path` instead of joining it.
+    #[test]
+    fn windows_sessions_get_one_value_per_name_whatever_its_case() {
+        use std::ffi::OsString;
+        let own = [("Path", "C:\\Windows"), ("TEMP", "C:\\t"), ("term", "dumb")]
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+        let set: HashMap<String, String> =
+            [("path".to_string(), "C:\\tools".to_string()), ("TERM".to_string(), "xterm-256color".to_string())].into();
+        let env = merged_env(own.clone(), set.clone(), true);
+        let pairs: Vec<(&str, &str)> = env.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+        assert_eq!(pairs, [("TEMP", "C:\\t"), ("TERM", "xterm-256color"), ("path", "C:\\tools")]);
+        // Elsewhere they are different variables.
+        assert_eq!(merged_env(own, set, false).len(), 5);
     }
 
     #[test]
