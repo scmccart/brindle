@@ -918,10 +918,6 @@ mod on_windows {
         // Started first, so the holder isn't left empty (and exits) between the two.
         let plain = core.spawn(programs::exits_after_a_line(2, 0));
         let pid = core.spawn(spawn(1, "cmd.exe", &["/d", "/c", "ping -t 127.0.0.1"]));
-        // Once `ping` is on the console: a program another one starts just
-        // as the console closes can miss the close (see
-        // `conpty::Pseudoconsole`).
-        core.output_until(1, b"Reply from");
         let mut ping = Vec::new();
         assert!(eventually(TIMEOUT, || {
             ping = children_named(pid, "ping");
@@ -934,7 +930,8 @@ mod on_windows {
         );
 
         // Closing the console ends the programs on it, the shell's child
-        // too, within the grace.
+        // too, and the holder ends any the close missed after the grace
+        // (`ping` started just as it went out).
         let hung_up_at = Instant::now();
         core.hang_up(1);
         assert_ne!(core.exit_code(1), Some(TERMINATED));

@@ -28,11 +28,12 @@
 //!   up as it starts) reaches neither the program nor what it starts. The
 //!   host takes the end of its input as the close too, so a copy of the
 //!   holder's end stays open until then. A program another one starts just
-//!   as the close goes out can still miss it. After the grace the holder
-//!   calls [`Group::kill_remaining`], which terminates the session's root
-//!   process if it is still running. A program that left the console (a GUI
-//!   program started from the shell) keeps running: no job object holds a
-//!   session's processes.
+//!   as the close goes out can still miss it, and the host stays for it.
+//!   So after the grace the holder calls [`Group::kill_remaining`], which
+//!   terminates every process still on the session's console host, and the
+//!   session's root process if it is still running. A program that left the
+//!   console (a GUI program started from the shell) keeps running: no job
+//!   object holds a session's processes.
 //! - **The console window's owner:** [`reparent`] has the packaged host
 //!   make a window the owner of the console window, the one programs get
 //!   from `GetConsoleWindow`, so that their dialogs belong to that window.
@@ -56,12 +57,16 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    TerminateProcess, WaitForSingleObject,
+    GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows::core::PCWSTR;
 
@@ -78,7 +83,7 @@ const PIPE_BUFFER: u32 = 64 * 1024;
 /// built into Windows.
 const INBOX: &str = "inbox";
 
-/// The exit code of a root process the holder terminated.
+/// The exit code of a process the holder terminated.
 const KILLED: u32 = 1;
 
 /// A session's pseudoconsole, shared by its [`Pty`] and its [`Program`]:
@@ -140,9 +145,8 @@ impl Drop for Pty {
 
 /// A session's program: the process started on the pseudoconsole.
 pub struct Program {
-    process: Process,
-    /// When it started, which tells it from a later process with its pid.
-    started: u64,
+    /// Shared with its [`Group`]s, which outlive it.
+    process: Arc<Process>,
     console: Console,
     /// Wakes the loop when the process exits.
     watch: Option<ExitWatch>,
@@ -164,8 +168,7 @@ impl Program {
     /// The processes to hang up and kill with this program.
     pub fn group(&self) -> Group {
         Group {
-            pid: self.process.pid(),
-            started: self.started,
+            root: Arc::clone(&self.process),
             console: Arc::clone(&self.console),
         }
     }
@@ -208,14 +211,14 @@ impl Program {
 /// console, and its root process. It outlives the program.
 ///
 /// Windows has no process group to signal. The console's processes are the
-/// console host's to end, which it does when the pseudoconsole closes. The
-/// root process is named by its pid and start time, so that a later process
-/// with the same pid is left alone. Processes that left the console aren't
-/// in the group.
+/// console host's to end, which it does when the pseudoconsole closes, and
+/// the group ends those the close missed. The group holds the root process
+/// open, so its pid stays its own, and the console host it was on can be
+/// asked for after it exits. Processes that left the console aren't in the
+/// group.
 #[derive(Clone)]
 pub struct Group {
-    pid: u32,
-    started: u64,
+    root: Arc<Process>,
     console: Console,
 }
 
@@ -228,30 +231,121 @@ impl Group {
         console(&self.console).take();
     }
 
-    /// Hangs the console's processes up and ends the root process.
+    /// Hangs the console's processes up, and ends them and the root process
+    /// at once.
     pub fn kill(&self) {
         self.hang_up();
         self.kill_remaining();
     }
 
-    /// Ends what a hang-up left running. That is the root process, if it is
-    /// still the one that was started: the console's other processes are
-    /// ended by the console host.
+    /// Ends what a hang-up left running: every process still on the
+    /// session's console host, and the root process. The close reaches only
+    /// the programs on the console as it goes out, so one that connected
+    /// just after it was never told, and the host stays for it. When Windows
+    /// doesn't say which host the root was on, only the root is ended.
     pub fn kill_remaining(&self) {
-        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-        // SAFETY: opens a process by pid; the handle is owned below.
-        let Ok(handle) = (unsafe { OpenProcess(access, false, self.pid) }) else {
-            // Gone, with every handle to it.
+        if let Some(host) = self.host() {
+            host.end_its_programs();
+        }
+        // Fails for a process that has exited, which is as wanted.
+        // SAFETY: the handle is open and may terminate the process.
+        let _ = unsafe { TerminateProcess(raw(self.root.handle()), KILLED) };
+    }
+
+    /// The session's console host, if it still runs: the one the root
+    /// process is on, or was on when it exited.
+    fn host(&self) -> Option<Host> {
+        let pid = crate::conpty::console_host(self.root.handle())?;
+        let process = open_process(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+        // SAFETY: the handle is open.
+        if unsafe { WaitForSingleObject(raw(process.as_handle()), 0) } == WAIT_OBJECT_0 {
+            // It exits once nothing is on it.
+            return None;
+        }
+        // The host starts before the root does. A process that took its
+        // pid later started after the root had connected to it.
+        let started = start_time(process.as_handle()).ok()?;
+        if started >= start_time(self.root.handle()).ok()? {
+            return None;
+        }
+        Some(Host {
+            pid,
+            started,
+            _process: process,
+        })
+    }
+}
+
+/// A session's console host, held open while its programs are ended, so
+/// that its pid stays its own.
+struct Host {
+    pid: u32,
+    started: u64,
+    _process: OwnedHandle,
+}
+
+impl Host {
+    /// Terminates every process on this console host.
+    fn end_its_programs(&self) {
+        let Ok(processes) = processes() else {
             return;
         };
-        // SAFETY: the handle is new and owned by nothing else.
-        let process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-        if start_time(process.as_handle()).is_ok_and(|started| started == self.started) {
-            // Fails for a process that has exited, which is as wanted.
-            // SAFETY: the handle is open and may terminate the process.
-            let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
+        let own = std::process::id();
+        // Only a host of this process's: a root that moved to another
+        // console names that one's.
+        let ours = |entry: &PROCESSENTRY32W| {
+            entry.th32ProcessID == self.pid && entry.th32ParentProcessID == own
+        };
+        if !processes.iter().any(ours) {
+            return;
+        }
+        let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        let others = processes.iter().map(|entry| entry.th32ProcessID);
+        for pid in others.filter(|&pid| pid != own && pid != self.pid) {
+            // Asked and terminated through one handle, so it is one process.
+            let Some(process) = open_process(pid, access) else {
+                continue;
+            };
+            let on_it = crate::conpty::console_host(process.as_handle()) == Some(self.pid);
+            // A process that was on an earlier host with this pid started
+            // before this one.
+            if on_it && start_time(process.as_handle()).is_ok_and(|started| started >= self.started) {
+                // SAFETY: the handle is open and may terminate the process.
+                let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
+            }
         }
     }
+}
+
+/// The process `pid`, opened with `access`, or `None` when it can't be (it
+/// has gone, with every handle to it, or isn't this user's).
+fn open_process(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Option<OwnedHandle> {
+    // SAFETY: opens a process by pid; the handle is owned at once.
+    let process = unsafe { OpenProcess(access, false, pid) }.ok()?;
+    // SAFETY: the handle is new and owned by nothing else.
+    Some(unsafe { OwnedHandle::from_raw_handle(process.0) })
+}
+
+/// The processes running now, from a Toolhelp snapshot.
+fn processes() -> io::Result<Vec<PROCESSENTRY32W>> {
+    // SAFETY: takes a snapshot of every process; the handle is owned below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|error| os_error(win32(&error)))?;
+    // SAFETY: the handle is new and owned by nothing else.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut found = Vec::new();
+    // SAFETY: the snapshot is open, and `entry` has its size set.
+    let mut more = unsafe { Process32FirstW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
+    while more {
+        found.push(entry);
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
+    }
+    Ok(found)
 }
 
 /// Makes the window `hwnd` the owner of the console window of `program`'s
@@ -416,15 +510,6 @@ pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
         env.iter().map(|(name, value)| (name.as_str(), value.as_str())),
     )
     .map_err(plain)?;
-    let started = match start_time(process.handle()) {
-        Ok(started) => started,
-        Err(error) => {
-            // Without it the program couldn't be ended later.
-            // SAFETY: the handle is open and may terminate the process.
-            let _ = unsafe { TerminateProcess(raw(process.handle()), KILLED) };
-            return Err(error);
-        }
-    };
     let console = Arc::new(Mutex::new(Some(pseudoconsole)));
     Ok((
         Pty {
@@ -434,8 +519,7 @@ pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
             packaged,
         },
         Program {
-            process,
-            started,
+            process: Arc::new(process),
             console,
             watch: None,
         },
@@ -448,11 +532,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows::Win32::System::Threading::PROCESS_SYNCHRONIZE;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, GW_OWNER, GetWindow, MSG, PM_REMOVE,
         PeekMessageW, WINDOW_EX_STYLE, WS_OVERLAPPED,
@@ -497,40 +576,23 @@ mod tests {
     }
 
     /// The processes `parent` started that are still running: each one's
-    /// pid, a handle to wait for it with, and its program's file name.
-    fn children(parent: u32) -> Vec<(u32, OwnedHandle, String)> {
-        // SAFETY: the snapshot handle is new and owned by nothing else.
-        let snapshot = unsafe {
-            OwnedHandle::from_raw_handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).unwrap().0)
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
-        let mut found = Vec::new();
-        // SAFETY: the snapshot is open, and `entry` has its size set.
-        let mut more = unsafe { Process32FirstW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
-        while more {
-            if entry.th32ParentProcessID == parent
-                && let Some(process) = open(entry.th32ProcessID)
-            {
-                let name = entry.szExeFile.split(|unit| *unit == 0).next().unwrap();
-                found.push((entry.th32ProcessID, process, String::from_utf16_lossy(name)));
+    /// pid, a handle to wait for and end it with, and its program's file
+    /// name.
+    fn children(parent: &Process) -> Vec<(u32, OwnedHandle, String)> {
+        // A process names its parent by pid, which may have been another
+        // process's: only one younger than `parent` is its child.
+        let since = start_time(parent.handle()).unwrap();
+        let running = processes().unwrap().into_iter();
+        let children = running.filter(|entry| entry.th32ParentProcessID == parent.pid());
+        let running = |entry: PROCESSENTRY32W| {
+            let process = open_to_end(entry.th32ProcessID)?;
+            if start_time(process.as_handle()).ok()? < since {
+                return None;
             }
-            // SAFETY: as above.
-            more = unsafe { Process32NextW(raw(snapshot.as_handle()), &mut entry) }.is_ok();
-        }
-        found
-    }
-
-    /// The running process `pid`, to wait for.
-    fn open(pid: u32) -> Option<OwnedHandle> {
-        let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-        // SAFETY: opens a process by pid; the handle is owned at once.
-        let process = unsafe { OpenProcess(access, false, pid) }.ok()?;
-        // SAFETY: the handle is new and owned by nothing else.
-        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
-        (!has_exited(&process)).then_some(process)
+            let name = entry.szExeFile.split(|unit| *unit == 0).next().unwrap();
+            Some((entry.th32ProcessID, process, String::from_utf16_lossy(name)))
+        };
+        children.filter_map(running).collect()
     }
 
     fn has_exited(process: &OwnedHandle) -> bool {
@@ -862,26 +924,29 @@ mod tests {
     }
 
     #[test]
-    fn a_kill_ends_the_root_process_and_only_that_one() {
+    fn a_kill_ends_the_sessions_processes_and_no_others() {
         let mut session = Session::start("cmd.exe", &["/D"], &[("PROMPT", "ready$G")]);
+        let mut other = Session::start("cmd.exe", &["/D"], &[("PROMPT", "ready$G")]);
         session.until("ready>");
+        other.until("ready>");
         let group = session.program.group();
-        // Another process's start time: this pid isn't the group's.
-        let other = Group { started: group.started + 1, ..group.clone() };
-        other.kill_remaining();
-        assert!(session.program.try_wait().unwrap().is_none());
         group.kill_remaining();
         let (_, code) = session.finish();
         assert_eq!(code, KILLED as i32);
+        // Again, once its program and host are gone, and with a hang-up.
         group.kill_remaining();
         group.kill();
+        // The other session's console has another host.
+        assert!(other.program.try_wait().unwrap().is_none());
+        other.send("exit 4\r");
+        assert_eq!(other.finish().1, 4);
     }
 
     #[test]
     fn a_hang_up_ends_the_program_and_its_console_children() {
         let mut session = Session::start("cmd.exe", &["/c", "ping -t localhost"], &[]);
         session.until("Reply from");
-        let running = children(session.program.pid());
+        let running = children(&session.program.process);
         let ping = running.iter().find(|(_, _, name)| name.eq_ignore_ascii_case("PING.EXE"));
         let (_, ping, _) = ping.expect("ping is the shell's child");
 
@@ -926,10 +991,7 @@ mod tests {
     /// The running process `pid`, to wait for and terminate.
     fn open_to_end(pid: u32) -> Option<OwnedHandle> {
         let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
-        // SAFETY: opens a process by pid; the handle is owned at once.
-        let process = unsafe { OpenProcess(access, false, pid) }.ok()?;
-        // SAFETY: the handle is new and owned by nothing else.
-        let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+        let process = open_process(pid, access)?;
         (!has_exited(&process)).then_some(process)
     }
 
@@ -938,16 +1000,20 @@ mod tests {
     /// drop, also when a test fails.
     struct Leftovers {
         group: Group,
-        root: u32,
         host: Option<OwnedHandle>,
     }
 
     impl Leftovers {
-        /// The `ping`s the root started that still run.
-        fn pings(&self) -> Vec<u32> {
-            let running = children(self.root).into_iter();
+        /// The `ping`s the root started that still run, and handles that
+        /// may end them.
+        fn ping_processes(&self) -> Vec<(u32, OwnedHandle)> {
+            let running = children(&self.group.root).into_iter();
             let pings = running.filter(|(_, _, name)| name.eq_ignore_ascii_case("PING.EXE"));
-            pings.map(|(pid, ..)| pid).collect()
+            pings.map(|(pid, process, _)| (pid, process)).collect()
+        }
+
+        fn pings(&self) -> Vec<u32> {
+            self.ping_processes().into_iter().map(|(pid, _)| pid).collect()
         }
 
         fn host_runs(&self) -> bool {
@@ -958,7 +1024,7 @@ mod tests {
     impl Drop for Leftovers {
         fn drop(&mut self) {
             self.group.kill();
-            let pings = self.pings().into_iter().filter_map(open_to_end);
+            let pings = self.ping_processes().into_iter().map(|(_, process)| process);
             for process in pings.chain(self.host.take()) {
                 // SAFETY: the handle is open and may terminate the process.
                 let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
@@ -966,55 +1032,95 @@ mod tests {
         }
     }
 
+    /// Starts `cmd /c ping` (round by round on each host), hangs it up as
+    /// the holder's `HANGUP` does once `ready` says, and after the grace
+    /// ends what remains as the holder does. Neither `ping` nor the console
+    /// host outlives that, and the close reached `cmd`: it wasn't
+    /// terminated.
+    fn hang_up_a_ping(round: usize, ready: impl Fn(&Leftovers) -> bool) {
+        let host: &[(&str, &str)] = match round % 2 {
+            0 => &[],
+            _ => &[("BRINDLE_CONPTY", "inbox")],
+        };
+        let (pty, program) = run("cmd.exe", &["/c", "ping -t localhost"], host, 80, 24);
+        let mut watcher = Some(watch_console_host(&program));
+        let mut left = Leftovers {
+            group: program.group(),
+            host: None,
+        };
+        let deadline = Instant::now() + LIMIT;
+        while !ready(&left) {
+            assert!(Instant::now() < deadline, "round {round}: never ready");
+        }
+
+        let hung_up = Instant::now();
+        drop(pty);
+        left.group.hang_up();
+        assert!(hung_up.elapsed() < Duration::from_millis(500), "the hang-up waited");
+        // The holder lets go of a program it has reaped; the group holds it.
+        drop(program);
+        let root = Arc::clone(&left.group.root);
+        let grace = hung_up + crate::pty::GRACEFUL_SHUTDOWN;
+        let deadline = grace + Duration::from_secs(2);
+        let mut killed = false;
+        loop {
+            if !killed && Instant::now() >= grace {
+                left.group.kill_remaining();
+                killed = true;
+            }
+            if root.exit_code().unwrap().is_some() {
+                if let Some(watcher) = watcher.take() {
+                    left.host = watcher.join().unwrap();
+                }
+                // Nothing on the console outlives it, nor does the host.
+                if left.pings().is_empty() && !left.host_runs() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: ping {:?} and the console host ({}) outlived the grace; \
+                 the program's exit: {:#x?}",
+                left.pings(),
+                if left.host_runs() { "running" } else { "gone or unknown" },
+                root.exit_code().unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let code = root.exit_code().unwrap();
+        assert_ne!(code, Some(KILLED), "round {round}: the close never reached the program");
+    }
+
     #[test]
     fn a_hang_up_as_the_program_starts_ends_it_and_its_console_children() {
-        const ROUNDS: usize = 20;
         // The close can reach the console host before `cmd` is on the
-        // console, and `ping` starts only once it is. Each host, in turn.
-        for round in 0..ROUNDS {
-            let host: &[(&str, &str)] = match round % 2 {
-                0 => &[],
-                _ => &[("BRINDLE_CONPTY", "inbox")],
-            };
-            let (pty, program) = run("cmd.exe", &["/c", "ping -t localhost"], host, 80, 24);
-            let watcher = watch_console_host(&program);
-            let mut left = Leftovers {
-                group: program.group(),
-                root: program.pid(),
-                host: None,
-            };
+        // console, and `ping` starts only once it is.
+        for round in 0..20 {
+            hang_up_a_ping(round, |_| true);
+        }
+    }
 
-            // As the holder's `HANGUP` does, right after the spawn.
-            let hung_up = Instant::now();
-            drop(pty);
-            left.group.hang_up();
-            assert!(hung_up.elapsed() < Duration::from_millis(500), "the hang-up waited");
-            let grace = hung_up + crate::pty::GRACEFUL_SHUTDOWN;
-            let deadline = grace + Duration::from_secs(2);
-            let mut killed = false;
-            while program.process.exit_code().unwrap().is_none() {
-                assert!(Instant::now() < deadline, "round {round}: the program outlived the grace");
-                if !killed && Instant::now() >= grace {
-                    left.group.kill_remaining();
-                    killed = true;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            left.host = watcher.join().unwrap();
-            // Nothing on the console outlives it, nor does the host.
-            while !left.pings().is_empty() || left.host_runs() {
-                assert!(
-                    Instant::now() < deadline,
-                    "round {round}: ping {:?} and the console host ({}) outlived the grace; \
-                     the program exited with {:#x?}",
-                    left.pings(),
-                    if left.host_runs() { "running" } else { "gone" },
-                    program.process.exit_code().unwrap(),
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let code = program.process.exit_code().unwrap();
-            assert_ne!(code, Some(KILLED), "round {round}: the close never reached the program");
+    #[test]
+    fn a_hang_up_as_a_program_starts_another_ends_both() {
+        // The close can reach the console host before `ping` is on the
+        // console, as `ping` exists from when `cmd` starts it, which only
+        // the end of the grace catches. That is a round in ten to fifty
+        // here, and rounds run side by side, which makes it likelier.
+        const SIDE_BY_SIDE: usize = 4;
+        const ROUNDS: usize = 75;
+        let workers: Vec<_> = (0..SIDE_BY_SIDE)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    for round in worker * ROUNDS..(worker + 1) * ROUNDS {
+                        hang_up_a_ping(round, |left| !left.pings().is_empty());
+                    }
+                })
+            })
+            .collect();
+        // Every round ends what it started, so all of them finish first.
+        let ended: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        for panic in ended.into_iter().filter_map(Result::err) {
+            std::panic::resume_unwind(panic);
         }
     }
 

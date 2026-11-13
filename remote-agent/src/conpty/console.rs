@@ -30,8 +30,10 @@ const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH: u32 = 0x10;
 /// `NtQueryInformationProcess`'s `ProcessConsoleHostProcess`, which isn't
 /// documented: the console host a process is on, with flags in the low two
 /// bits. Until the process has connected to a console it names the process
-/// that started it.
+/// that started it. It stays once the process has exited.
 const PROCESS_CONSOLE_HOST_PROCESS: PROCESSINFOCLASS = PROCESSINFOCLASS(49);
+/// The flag in its answer that the process has connected to the host.
+const CONNECTED: usize = 1;
 
 /// How long closing waits for the program to be on the console: as long as
 /// the holder gives a hung-up program before it terminates it.
@@ -50,7 +52,8 @@ const CONNECT_POLL: Duration = Duration::from_millis(1);
 /// So the close waits for the program started here to be on the console
 /// (or gone) first, for at most [`CONNECT_LIMIT`], and keeps the input open
 /// until then ([`Pseudoconsole::hold_input_open`]). A program that a
-/// program on the console starts as the close goes out can still miss it.
+/// program on the console starts as the close goes out can still miss it;
+/// [`console_host`] finds those for the caller to end.
 pub struct Pseudoconsole {
     handle: HPCON,
     /// The ConPTY that made it, which every later call must go to.
@@ -292,18 +295,22 @@ fn wait_until_on_console(program: BorrowedHandle<'_>, limit: Duration) {
 /// console. Until it has, its console host is said to be this process. When
 /// Windows doesn't say, it counts as connected, so a close isn't held up.
 fn on_console(process: BorrowedHandle<'_>) -> bool {
-    host_process(process).is_none_or(|host| host != std::process::id())
+    host_process(process).is_none_or(|host| host & !3 != std::process::id() as usize)
 }
 
-/// The console host `process` is on, once it is on one.
-#[cfg(test)]
+/// The pid of the console host `process` is on, or was on when it exited.
+/// `None` before it has connected to one, and when Windows doesn't say.
+/// It needs `PROCESS_QUERY_LIMITED_INFORMATION`.
 pub fn console_host(process: BorrowedHandle<'_>) -> Option<u32> {
-    host_process(process).filter(|&host| host != 0 && host != std::process::id())
+    let host = host_process(process).filter(|host| host & CONNECTED != 0)?;
+    // The low bits are flags; process ids are multiples of four.
+    u32::try_from(host & !3).ok().filter(|&host| host != 0)
 }
 
 /// What Windows says `process`'s console host is
-/// ([`PROCESS_CONSOLE_HOST_PROCESS`]), or `None` when the query fails.
-fn host_process(process: BorrowedHandle<'_>) -> Option<u32> {
+/// ([`PROCESS_CONSOLE_HOST_PROCESS`]), flags included, or `None` when the
+/// query fails.
+fn host_process(process: BorrowedHandle<'_>) -> Option<usize> {
     let mut host: usize = 0;
     // SAFETY: the handle is open for the call, and `host` is as large as the
     // class's answer and outlives the call.
@@ -316,11 +323,7 @@ fn host_process(process: BorrowedHandle<'_>) -> Option<u32> {
             std::ptr::null_mut(),
         )
     };
-    if status.is_err() {
-        return None;
-    }
-    // The low bits are flags; process ids are multiples of four.
-    u32::try_from(host & !3).ok()
+    status.is_ok().then_some(host)
 }
 
 /// A program started on a pseudoconsole.

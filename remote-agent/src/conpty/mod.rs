@@ -17,6 +17,8 @@
 //!   waits on a host that blocks in `ClosePseudoConsole`. That thread
 //!   first waits for the program to be on the console, which a close that
 //!   comes sooner never reaches, and keeps the input open until then.
+//!   [`console_host`] says which console host a process is on, for the
+//!   caller to end the programs that reached it after the close.
 //!
 //! Reading, writing and waiting for the program are the caller's: the
 //! holder does them on its event loop.
@@ -33,9 +35,7 @@ mod api;
 mod console;
 
 #[cfg(windows)]
-pub use console::{Process, Pseudoconsole};
-#[cfg(all(windows, test))]
-pub use console::console_host;
+pub use console::{Process, Pseudoconsole, console_host};
 
 /// Whether this build embeds the packaged ConPTY.
 #[cfg(all(windows, test))]

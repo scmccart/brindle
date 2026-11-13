@@ -367,6 +367,10 @@ pub fn parent(pid: u32) -> Option<u32> {
 
 /// The running children of `pid` whose image is `name` (`ping` or
 /// `PING.EXE`).
+///
+/// A pid is used again, and a process still names a parent that exited
+/// long ago: only a process younger than `pid`, or than this one once `pid`
+/// has exited, counts as its child.
 pub fn children_named(pid: u32, name: &str) -> Vec<u32> {
     let wanted = name.to_ascii_lowercase();
     let wanted = wanted.strip_suffix(".exe").unwrap_or(&wanted);
@@ -374,9 +378,11 @@ pub fn children_named(pid: u32, name: &str) -> Vec<u32> {
         let image = image.to_ascii_lowercase();
         image.strip_suffix(".exe").unwrap_or(&image) == wanted
     };
+    let since = created(pid).or_else(|| created(std::process::id()));
+    let young = |child: u32| since.is_some() && created(child) >= since;
     processes()
         .into_iter()
-        .filter(|(child, parent, image)| *parent == pid && is_named(image) && alive(*child))
+        .filter(|(child, parent, image)| *parent == pid && is_named(image) && young(*child))
         .map(|(child, ..)| child)
         .collect()
 }
