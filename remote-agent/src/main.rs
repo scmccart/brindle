@@ -76,16 +76,16 @@ fn manage(command: &str, args: &[String]) -> Option<Result<(), String>> {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 fn serve(_args: &[String]) -> Result<(), String> {
-    Err("the terminal server runs only on Linux".into())
+    Err("the terminal server runs only on Linux and Windows".into())
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
 fn hold(_args: &[String]) -> Result<(), String> {
-    Err("the terminal server runs only on Linux".into())
+    Err("the terminal server runs only on Linux and Windows".into())
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
 fn manage(command: &str, _args: &[String]) -> Option<Result<(), String>> {
     matches!(command, "check" | "list" | "kill" | "status" | "stop")
-        .then(|| Err("the terminal server runs only on Linux".into()))
+        .then(|| Err("the terminal server runs only on Linux and Windows".into()))
 }

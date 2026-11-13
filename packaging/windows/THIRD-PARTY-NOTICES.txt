@@ -1,4 +1,4 @@
-brindle.exe contains Microsoft's packaged ConPTY (conpty.dll and
+brindle-remote.exe contains Microsoft's packaged ConPTY (conpty.dll and
 OpenConsole.exe, from the NuGet package Microsoft.Windows.Console.ConPTY,
 built from https://github.com/microsoft/terminal), under this licence:
 

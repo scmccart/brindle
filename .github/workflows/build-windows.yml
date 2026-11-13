@@ -116,7 +116,7 @@ jobs:
           if ((Run '--uninstall-desktop') -ne 0 -or (Test-Path $lnk)) { throw 'uninstall failed' }
           if ((Run '--uninstall-desktop') -ne 0) { throw 'uninstalling twice failed' }
           if ((Run '--install-desktop --prefix C:\Tools') -ne 2 -or (Test-Path $lnk)) { throw '--prefix was not rejected' }
-      # A Windows release is one zip (brindle.exe needs nothing beside it).
+      # A Windows release is one zip (today brindle.exe alone; the terminal server's brindle-remote.exe joins it in task 9.1 of terminal-server-windows).
       - name: Release zip
         id: zip
         shell: pwsh
