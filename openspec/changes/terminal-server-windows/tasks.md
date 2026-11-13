@@ -36,7 +36,7 @@
 - [x] 5.2 Implement the Windows `pty` for the holder: an overlapped named pipe pair per session, spawn with the session's complete environment, `PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH` and the host chosen from `BRINDLE_CONPTY` in that environment, resize, the exit wait, then release and close on a short-lived thread while output drains to EOF, and `EXITED` after the last output. Verify: holder tests for spawn and I/O, resize, the exit code, and a flood followed by exit losing no output.
 - [x] 5.3 Implement hangup: close the pseudoconsole, then `TerminateProcess` the root after `agent.rs`'s grace. Verify: a holder test where `HANGUP` ends `cmd /c ping -t localhost` and its console children within the grace, and one where the holder's loop keeps serving another session while a close blocks.
 - [x] 5.4 Apply `REPARENT` in the Windows holder with `ConptyReparentPseudoConsole`, logging and ignoring it on the inbox host. Verify: a holder test that reparents a session's console window to a test window and reads the console window's owner after the settle time.
-- [ ] 5.5 Port `remote-agent/tests/holder.rs` to Windows: kill with `TerminateProcess`, check liveness with `GetExitCodeProcess`, and check parents with Toolhelp. Verify: `cargo test -p brindle-remote-agent --test holder` passes on Windows and on Linux.
+- [x] 5.5 Port `remote-agent/tests/holder.rs` to Windows: kill with `TerminateProcess`, check liveness with `GetExitCodeProcess`, and check parents with Toolhelp. Verify: `cargo test -p brindle-remote-agent --test holder` passes on Windows and on Linux.
 
 ## 6. The core and the management commands on Windows
 
