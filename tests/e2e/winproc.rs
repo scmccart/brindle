@@ -221,48 +221,79 @@ pub fn elevated() -> bool {
     asked.is_ok() && elevation.TokenIsElevated != 0
 }
 
-/// Starts `command_line` unelevated, from an elevated process: with the
-/// filtered token linked to this one (what the same user gets without
-/// elevating), through `CreateProcessWithTokenW`, so it needs the Secondary
-/// Logon service. Returns the process's pid; it runs with its user's own
-/// environment, not this process's.
-pub fn start_unelevated(command_line: &str) -> crate::Result<u32> {
-    use windows::Win32::Security::{
-        DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ACCESS_MASK, TOKEN_ALL_ACCESS,
-        TOKEN_LINKED_TOKEN, TokenLinkedToken, TokenPrimary,
-    };
-    use windows::Win32::System::Threading::{
-        CREATE_NEW_CONSOLE, CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken,
-        PROCESS_INFORMATION, STARTUPINFOW,
-    };
-    use windows::core::PWSTR;
-
-    let mut own = HANDLE::default();
-    // SAFETY: this process's own token, closed below.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(0x0008), &mut own) }
-        .map_err(|e| format!("opening this process's token: {e}"))?;
-    let mut linked = TOKEN_LINKED_TOKEN::default();
+/// Whether `token` is elevated (`TokenElevation`); an unreadable one counts
+/// as elevated.
+fn token_elevated(token: HANDLE) -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation};
+    let mut elevation = TOKEN_ELEVATION::default();
     let mut used = 0;
-    // SAFETY: `linked` is the size passed; the token is open.
+    // SAFETY: `elevation` is the size passed; the token is open.
     let asked = unsafe {
         GetTokenInformation(
-            own,
-            TokenLinkedToken,
-            Some(&mut linked as *mut TOKEN_LINKED_TOKEN as *mut c_void),
-            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut used,
         )
     };
-    // SAFETY: ours and open.
-    unsafe { CloseHandle(own) }.ok();
-    asked.map_err(|e| format!("this token has no linked (unelevated) token: {e}"))?;
+    asked.is_err() || elevation.TokenIsElevated != 0
+}
+
+/// A primary token duplicated from the desktop shell's (Explorer's), which
+/// runs unelevated beside an elevated process when UAC is on. The filtered
+/// token linked to an elevated one can't be used instead: without
+/// `SeTcbPrivilege` it comes back at `SecurityIdentification`, which
+/// `DuplicateTokenEx` won't make a primary token (error 1346).
+fn shell_token() -> crate::Result<HANDLE> {
+    use windows::Win32::Security::{
+        DuplicateTokenEx, SecurityImpersonation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_QUERY, TokenPrimary,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+
+    // SAFETY: no arguments.
+    let shell = unsafe { GetShellWindow() };
+    if shell.is_invalid() {
+        return Err("no desktop shell window".into());
+    }
+    let mut pid = 0;
+    // SAFETY: a window handle and an out pointer to a local.
+    unsafe { GetWindowThreadProcessId(shell, Some(&mut pid)) };
+    let process =
+        Opened::new(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok_or_else(|| format!("can't open the shell, pid {pid}"))?;
+    let mut token = HANDLE::default();
+    // SAFETY: the process handle is open; the token is closed below.
+    unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token) }
+        .map_err(|e| format!("opening the shell's token (pid {pid}): {e}"))?;
     let mut primary = HANDLE::default();
-    // SAFETY: the linked token is open; the duplicate is closed below.
-    let duplicated =
-        unsafe { DuplicateTokenEx(linked.LinkedToken, TOKEN_ALL_ACCESS, None, SecurityImpersonation, TokenPrimary, &mut primary) };
+    let rights = TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID;
+    // SAFETY: the token is open; the duplicate is the caller's to close.
+    let duplicated = unsafe { DuplicateTokenEx(token, rights, None, SecurityImpersonation, TokenPrimary, &mut primary) };
     // SAFETY: ours and open.
-    unsafe { CloseHandle(linked.LinkedToken) }.ok();
-    duplicated.map_err(|e| format!("duplicating the unelevated token: {e}"))?;
+    unsafe { CloseHandle(token) }.ok();
+    duplicated.map_err(|e| format!("duplicating the shell's token (pid {pid}): {e}"))?;
+    if token_elevated(primary) {
+        // SAFETY: ours and open.
+        unsafe { CloseHandle(primary) }.ok();
+        return Err(format!("the shell (pid {pid}) runs elevated too; is UAC off?"));
+    }
+    Ok(primary)
+}
+
+/// Starts `command_line` unelevated, from an elevated process: with the
+/// desktop shell's token ([`shell_token`]), the same user's unelevated one,
+/// through `CreateProcessWithTokenW`, so it needs the Secondary Logon
+/// service. Returns the process's pid; it runs with its user's own
+/// environment, not this process's.
+pub fn start_unelevated(command_line: &str) -> crate::Result<u32> {
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_CONSOLE, CreateProcessWithTokenW, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+
+    let primary = shell_token()?;
     let startup = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
     let mut info = PROCESS_INFORMATION::default();
     let mut line: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();

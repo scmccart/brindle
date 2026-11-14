@@ -1418,8 +1418,9 @@ pub fn inbox_host(ctx: &Ctx) -> Result<Outcome> {
 /// An elevated Brindle and an unelevated one, with no `BRINDLE_SERVER_DIR`,
 /// run separate servers: `run-elevated` and `run` under `%LOCALAPPDATA%\brindle`
 /// (here a private `LOCALAPPDATA` in the case directory), each listing only
-/// its own session. Needs an elevated runner with a linked unelevated token;
-/// skipped otherwise, since elevating would ask through UAC.
+/// its own session. Needs an elevated runner whose desktop shell runs
+/// unelevated (UAC on), whose token starts the unelevated Brindle; skipped
+/// otherwise, since elevating would ask through UAC.
 #[cfg(windows)]
 pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
     use brindle_remote_protocol::server_dir::resolve_windows;
@@ -1455,7 +1456,8 @@ pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
         crate::winproc::all()
             .into_iter()
             .filter(|p| p.name.eq_ignore_ascii_case(&name))
-            .filter(|p| crate::winproc::image(p.pid).is_some_and(|image| image.starts_with(&copies)))
+            // However the image's path is spelled (`\\?\`, case).
+            .filter(|p| crate::winproc::image(p.pid).is_some_and(|image| crate::under(&image, &copies)))
             .map(|p| p.pid)
             .collect()
     };
@@ -1483,7 +1485,14 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
         .run()?;
     screen_has(&out, "elevated-tab")?;
     let high_server = Server { dir: high.to_path_buf(), helper: ctx.helper.clone(), slow: ctx.secs(1.0) };
-    let elevated_sessions = detached_pids(&high_server, 10.0, 1)?;
+    // Not `detached_pids`: with `BRINDLE_SERVER_DIR` unset the copies the
+    // roles run from are in `appdata\brindle\server`, shared by both
+    // servers, not in the server directory's `bin`, so `Server::core` never
+    // finds the core. `list` never starts one, so it is polled as it is.
+    let elevated_sessions = high_server.wait(10.0, "1 detached session in the elevated server", || {
+        let sessions = high_server.list()?;
+        Ok((sessions.len() == 1 && !sessions[0].attached).then(|| vec![sessions[0].pid]))
+    })?;
 
     // The unelevated one, through cmd, which sets its environment.
     let done = ctx.dir.join("unelevated-done");
@@ -1498,9 +1507,13 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
         format!("set \"LOCALAPPDATA={}\"", appdata.display()),
         format!("set \"BRINDLE_CONFIG={}\"", ctx.dir.join("config.toml").display()),
         format!("set \"BRINDLE_STATE_DIR={}\"", state.display()),
+        // The elevated run's helper: this environment is the user's own,
+        // not the test's.
+        format!("set \"BRINDLE_SERVER_HELPER={}\"", ctx.helper.display()),
         format!(
-            "{} -p Shell --no-restore --wait-for \"PS>\" --send \"'unelev' + 'ated-tab'\\r\" --dump-screen-after {} > {} 2> {}",
+            "{} -p Shell --no-restore --wait-for \"PS>\" --send \"'unelev' + 'ated-tab'\\r\" {} --dump-screen-after {} > {} 2> {}",
             quote(&ctx.bin),
+            ctx.step_interval().join(" "),
             ctx.secs(later(4.0)),
             quote(&dump),
             quote(&log)
@@ -1512,12 +1525,35 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
     ];
     std::fs::write(&script, body.join("\r\n") + "\r\n").map_err(|e| e.to_string())?;
     let line = format!("cmd.exe /d /c \"{}\"", script.display());
-    if let Err(why) = crate::winproc::start_unelevated(&line) {
-        return Ok(Outcome::Skip(format!("can't run an unelevated Brindle beside: {why}")));
-    }
+    let cmd = match crate::winproc::start_unelevated(&line) {
+        Ok(pid) => pid,
+        Err(why) => return Ok(Outcome::Skip(format!("can't run an unelevated Brindle beside: {why}"))),
+    };
     let deadline = Instant::now() + Duration::from_secs_f64(ctx.secs(60.0));
     while !done.exists() {
-        ensure!(Instant::now() < deadline, "the unelevated run didn't finish; see unelevated.log");
+        // The script writes `done` last, so a cmd gone without it stopped
+        // early: most likely it couldn't write to the case directory.
+        if !crate::winproc::alive(cmd) && !done.exists() {
+            let present = |path: &Path| if path.exists() { "present" } else { "missing" };
+            return Err(format!(
+                "the unelevated script ended without finishing (unelevated.dump {}, unelevated.log {}, \
+                 unelevated-list.txt {}); can the unelevated user write {}?",
+                present(&dump),
+                present(&log),
+                present(&listed),
+                ctx.dir.display()
+            ));
+        }
+        if Instant::now() >= deadline {
+            // Brindle and the helper commands are cmd's children.
+            let children: Vec<u32> = crate::winproc::all()
+                .into_iter()
+                .filter(|p| p.parent == cmd)
+                .map(|p| p.pid)
+                .collect();
+            children.into_iter().chain([cmd]).for_each(crate::winproc::kill);
+            return Err("the unelevated run didn't finish; see unelevated.log".into());
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     let screen = std::fs::read_to_string(&dump).unwrap_or_default();
