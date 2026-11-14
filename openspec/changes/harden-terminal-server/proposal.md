@@ -1,6 +1,8 @@
 # Proposal
 
-**Status: outline only.** This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests` (#47), which added `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core.
+**Status: outline only.** Items 1, 4 and 5 moved to `terminal-server-remote` (its decision 12), which settles the signal question as "every signal". Items 2 and 3 remain here.
+
+This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests` (#47), which added `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core.
 
 ## Why
 
@@ -57,4 +59,4 @@ Items 2, 4 and 5 are test or internal robustness work with no requirement change
 - `remote-agent/src/server/daemon.rs`, `src/remote/local.rs` (`start_core`, `pass_fd_as`), `remote-agent/tests/support/mod.rs`: the ready-fd handling.
 - `src/instance.rs` tests, and the `remote::local` tests.
 - Tests: `remote-agent/tests/holder.rs` gains an ignored-SIGHUP case. Existing tests that accept either ending of a hung-up `cat` (`TestClient::hung_up`) could tighten if item 3 lands.
-- Issues: closes #43 and #44; #46 when its items are decided.
+- Issues: closes #43, and #46 item 1 when decided. #44 and #46 items 2 and 3 are closed by `terminal-server-remote`.

@@ -1,5 +1,14 @@
 # Proposal
 
+**Superseded by `terminal-server-remote` (2026-11-14).** Every follow-up below is settled there:
+- 1a: pinning is kept and specified ("A tab stays on its host");
+- 1b: the host pushes process info (client protocol 2);
+- 2: the lifecycle polling goes with the stdio agent;
+- 3: `Host` is the endpoint type;
+- 4: one connection per host, one SSH connection on the warm path, and a cached container helper.
+
+Delete this change once that one lands.
+
 Outline only. Each item below still needs its own decision before any design or tasks.
 
 **Status (2026-11-04).** The persistent terminal server that an exploration had added here as section 5 is now its own change, `terminal-server`. That change would absorb or supersede follow-ups 2–4 below, as noted on each, so their decisions should wait on its fate, or be made knowing it. Follow-up 1 is independent of it.
