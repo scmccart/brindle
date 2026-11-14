@@ -99,6 +99,11 @@ mod programs {
     pub fn titled() -> Spawn {
         client_shell("printf '\\033]2;build\\007ready.'; exec cat")
     }
+
+    /// The title [`titled`]'s session gets for `text`.
+    pub fn title(text: &str) -> String {
+        text.to_string()
+    }
 }
 
 /// The sessions' programs, as `cmd.exe` runs them.
@@ -110,8 +115,8 @@ mod programs {
     use brindle_remote_protocol::client::Spawn;
 
     use super::support::{
-        TIMEOUT, TestClient, check_lines, children_named, client_shell, client_spawn, eventually,
-        numbered_lines,
+        TIMEOUT, TestClient, check_lines, children_named, client_shell, client_spawn, cmd_title,
+        eventually, numbered_lines,
     };
 
     /// What ends a line of input.
@@ -186,6 +191,12 @@ mod programs {
     /// Sets the title `build`, prints `ready.` and waits.
     pub fn titled() -> Spawn {
         client_shell("title build& echo ready.& set /p x=")
+    }
+
+    /// The title [`titled`]'s session gets for `text`: cmd's, which is
+    /// prefixed when the tests run elevated.
+    pub fn title(text: &str) -> String {
+        cmd_title(text)
     }
 }
 
@@ -1112,7 +1123,7 @@ fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
     let listed = client.list();
     let info = listed.iter().find(|s| s.session == spawned.session).unwrap();
     assert_eq!(info.key, spawned.key);
-    assert_eq!(info.title, "build");
+    assert_eq!(info.title, programs::title("build"));
     assert_eq!(info.profile.as_deref(), Some("Shell"));
     assert!(info.started >= before && info.started <= before + 60, "{info:?}");
 
@@ -1763,17 +1774,8 @@ mod on_windows {
             return;
         }
         let (dir, mut client) = core("reparent");
-        // Prints its console window as `hwnd=N;` and waits.
-        let script = "$w = (Add-Type -Name Console -Namespace BrindleTest -PassThru \
-            -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr \
-            GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
-            Start-Sleep -Seconds 600";
-        let (session, _) = client.spawn(powershell(script));
-        let output = client.output_until(session, b";");
-        let text = String::from_utf8_lossy(&output);
-        let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
-        let console_window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
-        assert_ne!(console_window, 0, "no console window in {text:?}");
+        let (session, _) = client.spawn(powershell(CONSOLE_WINDOW));
+        let console_window = wait_for_console_window(|| client.output_until(session, b";"));
         assert_eq!(window_owner(console_window), 0);
 
         // Another client's session isn't this one's to reparent.

@@ -1252,17 +1252,8 @@ mod on_windows {
             return;
         }
         let (_dir, mut core, _) = holder("reparent");
-        // Prints its console window as `hwnd=N;` and waits.
-        let script = "$w = (Add-Type -Name Console -Namespace BrindleTest -PassThru \
-            -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr \
-            GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
-            Start-Sleep -Seconds 600";
-        core.spawn(powershell(1, script));
-        let output = core.output_until(1, b";");
-        let text = String::from_utf8_lossy(&output);
-        let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
-        let console_window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
-        assert_ne!(console_window, 0, "no console window in {text:?}");
+        core.spawn(powershell(1, CONSOLE_WINDOW));
+        let console_window = wait_for_console_window(|| core.output_until(1, b";"));
         assert_eq!(window_owner(console_window), 0);
 
         let window = Window::new();

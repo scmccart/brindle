@@ -570,3 +570,45 @@ pub fn window_owner(window: u64) -> u64 {
     let owner = unsafe { GetWindow(window, GW_OWNER) };
     owner.map_or(0, |owner| owner.0 as usize as u64)
 }
+
+/// A PowerShell script that prints its console window as `hwnd=N;` and
+/// waits.
+pub const CONSOLE_WINDOW: &str = "$w = (Add-Type -Name Console -Namespace BrindleTest \
+    -PassThru -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern \
+    System.IntPtr GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
+    Start-Sleep -Seconds 600";
+
+/// Reads output with `more` (which returns what came up to its next `;`)
+/// until the window [`CONSOLE_WINDOW`] printed is all there, and returns it.
+/// Waits for the `hwnd=` line itself: the host's title (`ESC ] 0 ;`) has a
+/// `;` too, and may come in an earlier read.
+pub fn wait_for_console_window(mut more: impl FnMut() -> Vec<u8>) -> u64 {
+    let mut output = Vec::new();
+    loop {
+        output.extend(more());
+        let text = String::from_utf8_lossy(&output);
+        if let Some(window) = printed_window(&text) {
+            assert_ne!(window, 0, "a console window of 0 in {text:?}");
+            return window;
+        }
+    }
+}
+
+/// The window [`CONSOLE_WINDOW`] printed, once the whole `hwnd=N;` is in
+/// `text`.
+fn printed_window(text: &str) -> Option<u64> {
+    let (_, rest) = text.split_once("hwnd=")?;
+    let (digits, _) = rest.split_once(';')?;
+    digits.parse().ok()
+}
+
+/// The title a console program gets from cmd's `title TEXT`: cmd puts
+/// `Administrator: ` (from its own message table) and a space in front of it
+/// when it runs elevated, as on CI.
+pub fn cmd_title(text: &str) -> String {
+    if win::is_elevated().unwrap() {
+        format!("Administrator:  {text}")
+    } else {
+        text.to_string()
+    }
+}
