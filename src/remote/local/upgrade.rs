@@ -6,7 +6,9 @@
 //!   newer when its build id differs and its file is newer than the running
 //!   core's binary. That binary's mtime is read through `/proc/<core
 //!   pid>/exe`, which still reaches the running file after an install
-//!   replaced it, so `WELCOME` needs no extra field.
+//!   replaced it, so `WELCOME` needs no extra field. On Windows the core
+//!   runs from a per-build copy that keeps the helper's file time, found
+//!   with `QueryFullProcessImageNameW`.
 //!
 //! A newer helper must pass `<helper> check --holder-protocols LIST` (the
 //! running holders' H1 versions), else the running core stays and is used.
@@ -17,14 +19,14 @@
 //! asked waits for all of this, with the tab's input queued.
 
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 
-use super::{Connected, Endpoint, connection::RECONNECT_LIMIT, hello, start_core, try_connect};
+use super::{Connected, Endpoint, Stream, connection::RECONNECT_LIMIT, hello, start_core, sys, try_connect};
+use crate::remote::hide_window;
 use crate::remote::protocol::build_id;
 use crate::remote::protocol::client::{Request, ToClient, ToCore, Welcome};
 use crate::remote::protocol::Frame;
@@ -103,7 +105,7 @@ pub fn offer(endpoint: &Endpoint, token: &str, connected: Connected) -> Result<C
 fn helper_build(helper: &Path) -> Result<Build> {
     let bytes = std::fs::read(helper).with_context(|| format!("reading {}", helper.display()))?;
     let mtime = std::fs::metadata(helper).and_then(|metadata| metadata.modified()).ok();
-    let output = run(Command::new(helper).arg("--version"))?;
+    let output = run(hide_window(&mut Command::new(helper)).arg("--version"))?;
     if !output.status.success() {
         bail!("{} --version failed", helper.display());
     }
@@ -115,11 +117,11 @@ fn helper_build(helper: &Path) -> Result<Build> {
 }
 
 fn core_build(welcome: &Welcome) -> Build {
-    let exe = format!("/proc/{}/exe", welcome.pid);
+    let exe = sys::image_of(welcome.pid);
     Build {
         version: welcome.core_version.clone(),
         build: welcome.core_build.clone(),
-        mtime: std::fs::metadata(exe).and_then(|metadata| metadata.modified()).ok(),
+        mtime: exe.and_then(std::fs::metadata).and_then(|metadata| metadata.modified()).ok(),
     }
 }
 
@@ -127,7 +129,7 @@ fn core_build(welcome: &Welcome) -> Build {
 /// `core.log` itself.
 fn check(helper: &Path, protocols: &[u32]) -> Result<()> {
     let list = protocols.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let output = run(Command::new(helper).args(["check", "--holder-protocols", &list]))?;
+    let output = run(hide_window(&mut Command::new(helper)).args(["check", "--holder-protocols", &list]))?;
     if output.status.success() {
         return Ok(());
     }
@@ -148,15 +150,14 @@ fn run(command: &mut Command) -> Result<std::process::Output> {
     match rx.recv_timeout(HELPER_LIMIT) {
         Ok(output) => Ok(output?),
         Err(_) => {
-            // SAFETY: a plain kill of the child this function started.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            sys::kill(pid);
             bail!("the terminal server helper didn't answer within {} s", HELPER_LIMIT.as_secs())
         }
     }
 }
 
 /// Sends `STEP_DOWN` and waits for `OK`, then for the core to close.
-fn step_down(stream: &mut UnixStream) -> Result<()> {
+fn step_down(stream: &mut Stream) -> Result<()> {
     let req = 1;
     stream.set_read_timeout(Some(STEP_DOWN_LIMIT))?;
     ToCore::StepDown(Request { req }).encode()?.write_to(stream)?;

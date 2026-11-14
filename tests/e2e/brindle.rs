@@ -92,8 +92,7 @@ blink = false
 
 [[profiles]]
 name = "Shell"
-command = "bash"
-args = ["--norc", "--noprofile"]
+{shell}
 
 [themes.e2e]
 foreground = "{fg}"
@@ -122,8 +121,23 @@ ansi = [{alt_ansi}]
         match_fg = SEARCH_MATCH_FG.hex(),
         focused_bg = SEARCH_FOCUSED_BG.hex(),
         focused_fg = SEARCH_FOCUSED_FG.hex(),
+        shell = SHELL_PROFILE,
     )
 }
+
+/// The `Shell` profile's command: bash, or on Windows PowerShell 7 with the
+/// prompt [`PROMPT`].
+const SHELL_PROFILE: &str = if cfg!(windows) {
+    r#"command = "pwsh.exe"
+args = ["-NoLogo", "-NoProfile", "-NoExit", "-Command", "function prompt { 'PS> ' }"]"#
+} else {
+    r#"command = "bash"
+args = ["--norc", "--noprofile"]"#
+};
+
+/// The `Shell` profile's prompt on Windows, as the screen shows it at a
+/// line's end (without its trailing space).
+pub const PROMPT: &str = "PS>";
 
 enum Event {
     /// Rewrites the config with another theme (Brindle reloads it).
@@ -172,9 +186,9 @@ pub struct Run<'a> {
 /// Hangs up the case server's detached sessions and waits for them to go,
 /// so the case's next Brindle (which attaches detached sessions at launch)
 /// starts with only the tabs it asks for.
-fn hang_up_detached(ctx: &Ctx) -> Result {
-    // Only Linux tabs run in the terminal server.
-    if cfg!(not(target_os = "linux")) {
+pub fn hang_up_detached(ctx: &Ctx) -> Result {
+    // Only the terminal server (Linux and Windows) leaves sessions detached.
+    if cfg!(not(any(target_os = "linux", windows))) {
         return Ok(());
     }
     let list = || -> Result<Vec<String>> {
@@ -376,6 +390,12 @@ impl<'a> Run<'a> {
     pub fn wait_for(mut self, text: &str) -> Self {
         self.steps.extend(["--wait-for".to_string(), text.to_string()]);
         self
+    }
+
+    /// Waits for the `Shell` profile's prompt on Windows, whose PowerShell
+    /// takes a while to start; bash needs no wait.
+    pub fn prompt(self) -> Self {
+        if cfg!(windows) { self.wait_for(PROMPT) } else { self }
     }
 
     /// Calls `call` with Brindle's pid `secs` after Brindle starts (stretched

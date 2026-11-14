@@ -23,7 +23,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -32,10 +31,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use parking_lot::{Condvar, Mutex};
 
-use super::{Connected, Endpoint, Refused};
+use super::{Connected, Endpoint, Refused, Stream};
 use crate::remote::protocol::client::{
-    self, Data, Kill, KillTarget, Policy, ReplayStart, Request, Resize, SessionInfo, SessionRef,
-    Spawned, ToClient, ToCore,
+    self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
+    SessionRef, Spawned, ToClient, ToCore,
 };
 use crate::remote::protocol::{Frame, RequestId, SessionId};
 
@@ -133,6 +132,9 @@ struct Pending {
 #[derive(Default)]
 struct State {
     sessions: HashMap<SessionId, Sink>,
+    /// The window each session's console is parented to (Windows), sent
+    /// again after a reconnect's replay: a core doesn't keep it.
+    parents: HashMap<SessionId, u64>,
     requests: HashMap<RequestId, Pending>,
     /// The `LIST` sent after a reconnect's `WELCOME`.
     list: Option<RequestId>,
@@ -143,7 +145,7 @@ struct State {
 /// The stream the writer writes to; `None` while reconnecting.
 #[derive(Default)]
 struct Slot {
-    stream: Option<Arc<UnixStream>>,
+    stream: Option<Arc<Stream>>,
     closed: bool,
 }
 
@@ -282,7 +284,7 @@ impl Connection {
     }
 
     /// Reads each connection in turn, reconnecting when one ends.
-    fn run(self: Arc<Self>, mut stream: UnixStream) {
+    fn run(self: Arc<Self>, mut stream: Stream) {
         loop {
             let reason = self.read(stream);
             log::warn!("terminal server connection ended ({reason}); reconnecting");
@@ -298,7 +300,7 @@ impl Connection {
     }
 
     /// Reads one connection until it ends, saying why.
-    fn read(&self, stream: UnixStream) -> String {
+    fn read(&self, stream: Stream) -> String {
         let mut reader = BufReader::with_capacity(READ_BUFFER, stream);
         loop {
             let frame = match Frame::read_from_or_eof(&mut reader) {
@@ -385,7 +387,11 @@ impl Connection {
                 }
             }
             ToClient::Exit(exit) => {
-                let sink = self.state.lock().sessions.remove(&exit.session);
+                let sink = {
+                    let mut state = self.state.lock();
+                    state.parents.remove(&exit.session);
+                    state.sessions.remove(&exit.session)
+                };
                 if let Some(sink) = sink {
                     match exit.lost {
                         Some(reason) => sink.lock().lost(&format!("the terminal server lost it: {reason}")),
@@ -402,6 +408,12 @@ impl Connection {
                 if let Some(sink) = self.sink(end.session) {
                     sink.lock().replay(false);
                 }
+                // The core that replayed may be a new one, which doesn't
+                // know the session's window.
+                let parent = self.state.lock().parents.get(&end.session).copied();
+                if let Some(hwnd) = parent {
+                    self.send(ToCore::Reparent(Reparent { session: end.session, hwnd }));
+                }
             }
             ToClient::Sessions(sessions) => {
                 let lost = {
@@ -412,6 +424,7 @@ impl Connection {
                     state.list = None;
                     let kept: HashSet<SessionId> =
                         sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
+                    state.parents.retain(|session, _| kept.contains(session));
                     missing(&mut state.sessions, &kept)
                 };
                 for sink in lost {
@@ -446,7 +459,7 @@ impl Connection {
     /// Connects again with the same token, starting a core if none appears
     /// within [`START_AFTER`], for at most [`RECONNECT_LIMIT`]. Then asks
     /// for the session list and hands the writer the new stream.
-    fn reconnect(&self) -> std::result::Result<UnixStream, String> {
+    fn reconnect(&self) -> std::result::Result<Stream, String> {
         let started = Instant::now();
         let mut next_start = START_AFTER;
         loop {
@@ -474,7 +487,7 @@ impl Connection {
         }
     }
 
-    fn resume(&self, connected: Connected) -> Result<UnixStream> {
+    fn resume(&self, connected: Connected) -> Result<Stream> {
         let Connected { mut stream, welcome } = connected;
         log::info!("reconnected to the terminal server (core pid {})", welcome.pid);
         let req = self.req();
@@ -495,6 +508,7 @@ impl Connection {
         let (sessions, requests) = {
             let mut state = self.state.lock();
             state.dead = true;
+            state.parents.clear();
             (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests))
         };
         self.slot.lock().closed = true;
@@ -605,6 +619,21 @@ impl Running {
         self.conn.send(ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h }));
     }
 
+    /// Makes the window `hwnd` the owner of the session's console window
+    /// (`REPARENT`, which only a Windows core takes), and keeps it to send
+    /// again after each reconnect's replay. A session that exited or was
+    /// lost sends nothing.
+    pub fn reparent(&self, hwnd: u64) {
+        {
+            let mut state = self.conn.state.lock();
+            if !state.sessions.contains_key(&self.id) {
+                return;
+            }
+            state.parents.insert(self.id, hwnd);
+        }
+        self.conn.send(ToCore::Reparent(Reparent { session: self.id, hwnd }));
+    }
+
     /// Ends the session (`CLOSE`). Once is enough; a session that already
     /// exited or was lost isn't closed again.
     pub fn close(&self) {
@@ -623,7 +652,9 @@ impl Running {
 
     /// Stops showing the session; says whether it was still shown.
     fn forget(&self) -> bool {
-        self.conn.state.lock().sessions.remove(&self.id).is_some()
+        let mut state = self.conn.state.lock();
+        state.parents.remove(&self.id);
+        state.sessions.remove(&self.id).is_some()
     }
 }
 

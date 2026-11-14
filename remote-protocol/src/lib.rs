@@ -9,22 +9,26 @@
 //! message numbers: [`client`] (client ↔ core, protocol 1) and [`holder`]
 //! (core ↔ holder, H1).
 
+pub mod access;
 pub mod build_id;
 pub mod client;
+pub mod endpoint;
 pub mod holder;
 #[cfg(unix)]
 pub mod scope;
 pub mod server_dir;
 pub mod version;
+#[cfg(windows)]
+pub mod win;
 mod wire;
 
 #[cfg(test)]
 mod fuzz;
 
-pub use wire::{RequestId, SessionId};
 /// Re-exported for the helper's `--json` output, so it needs no dependency
 /// of its own.
 pub use serde_json;
+pub use wire::{RequestId, SessionId};
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -122,7 +126,11 @@ pub fn skip_preamble(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 fn preamble_message(problem: &str, seen: &[u8]) -> String {
     let shown = &seen[..seen.len().min(512)];
     let text = String::from_utf8_lossy(shown);
-    let more = if seen.len() > shown.len() { " (truncated)" } else { "" };
+    let more = if seen.len() > shown.len() {
+        " (truncated)"
+    } else {
+        ""
+    };
     format!(
         "{problem}; shell startup output or a failed remote helper is the likely cause. \
          Output received before it: {:?}{more}",
@@ -376,7 +384,10 @@ mod tests {
     fn preamble_eof_and_bound_report_the_discarded_text() {
         let error = skip_preamble(&mut Cursor::new(b"Welcome to host\n".to_vec())).unwrap_err();
         assert!(error.to_string().contains("Welcome to host"), "{error}");
-        assert!(error.to_string().contains("shell startup output"), "{error}");
+        assert!(
+            error.to_string().contains("shell startup output"),
+            "{error}"
+        );
 
         let flood = vec![b'x'; MAX_PREAMBLE_NOISE + 4096];
         let error = skip_preamble(&mut Cursor::new(flood)).unwrap_err();

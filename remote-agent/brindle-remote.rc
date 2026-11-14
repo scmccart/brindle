@@ -1,0 +1,35 @@
+// brindle-remote.exe's version information. build.rs compiles this with the
+// version from Cargo.toml as macros: BRINDLE_VERSION (a quoted string),
+// BRINDLE_MAJOR, BRINDLE_MINOR and BRINDLE_PATCH. No icon: it's a console
+// program that opens no window.
+
+#include <winver.h>
+
+1 VERSIONINFO
+FILEVERSION BRINDLE_MAJOR, BRINDLE_MINOR, BRINDLE_PATCH, 0
+PRODUCTVERSION BRINDLE_MAJOR, BRINDLE_MINOR, BRINDLE_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Brindle"
+            VALUE "FileDescription", "Brindle terminal server"
+            VALUE "FileVersion", BRINDLE_VERSION
+            VALUE "InternalName", "brindle-remote"
+            VALUE "LegalCopyright", "MIT OR Apache-2.0"
+            VALUE "OriginalFilename", "brindle-remote.exe"
+            VALUE "ProductName", "Brindle"
+            VALUE "ProductVersion", BRINDLE_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

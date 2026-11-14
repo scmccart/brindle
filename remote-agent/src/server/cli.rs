@@ -7,15 +7,17 @@
 //! and `stop` say so on stderr; all of them exit 0.
 
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use brindle_remote_protocol::client::{
     self, Hello, Kill, KillTarget, Request, ServerStatus, SessionInfo, ToClient, ToCore,
 };
+use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::serde_json::{self, Value};
 use brindle_remote_protocol::{Frame, RequestId};
 
+use super::platform::conn::Stream;
+use super::platform::listen;
 use super::{check, dir};
 
 /// How long a command waits for the core's answer. `stop` waits for every
@@ -23,6 +25,7 @@ use super::{check, dir};
 const REPLY_LIMIT: Duration = Duration::from_secs(60);
 const NO_SERVER: &str = "no server is running";
 
+#[cfg(unix)]
 pub const USAGE: &str = "\
 usage: brindle-remote <command>
   --version                         print the version
@@ -36,6 +39,22 @@ usage: brindle-remote <command>
   stop                              hang up every session and stop the server
 The server directory is $BRINDLE_SERVER_DIR, else $XDG_RUNTIME_DIR/brindle,
 else ~/.cache/brindle/run.";
+
+#[cfg(windows)]
+pub const USAGE: &str = "\
+usage: brindle-remote <command>
+  --version                         print the version
+  --server                          serve one session over stdio (remote tabs)
+  serve [--ready-handle N]          run the terminal server's core
+  hold [--ready-handle N]           run a holder (started by the core)
+  launch <role> [--ready-handle N]  internal: start serve or hold detached
+  check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
+  list [--json]                     the server's sessions: id, pid, state, policy, age, title, command, directory
+  kill ID | kill --all              hang up one session, or all of them
+  status [--json]                   the core and its holders
+  stop                              hang up every session and stop the server
+The server directory is %BRINDLE_SERVER_DIR%, else %LOCALAPPDATA%\\brindle\\run
+(run-elevated for an elevated process).";
 
 /// Runs a management command or `check`; `None` if `command` is neither.
 pub fn run(command: &str, args: &[String]) -> Option<Result<(), String>> {
@@ -226,17 +245,22 @@ fn unexpected(reply: &ToClient) -> String {
 
 /// A protocol 1 connection to the core, past its `WELCOME`.
 struct Connection {
-    stream: UnixStream,
+    stream: Stream,
     next_req: RequestId,
 }
 
 impl Connection {
     /// Connects and says `HELLO`; `None` when no core is listening.
     fn open() -> Result<Option<Self>, String> {
-        let socket = dir::resolve_from_env()
-            .map_err(|error| error.to_string())?
-            .join("core.sock");
-        let stream = match UnixStream::connect(&socket) {
+        let dir = dir::resolve_from_env().map_err(|error| error.to_string())?;
+        let socket = match Endpoints::of(&dir) {
+            Ok(endpoints) => endpoints.core(),
+            // Without the directory (which names the pipe on Windows), no
+            // server runs there.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("can't use {}: {error}", dir.display())),
+        };
+        let stream = match listen::connect(&socket) {
             Ok(stream) => stream,
             Err(error)
                 if matches!(

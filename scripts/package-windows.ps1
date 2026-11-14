@@ -1,17 +1,20 @@
 # Packs the release build into the Windows release zip,
-# target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip: brindle.exe,
-# the Linux x86-64 remote helper, Brindle's licences and the notice for the
-# ConPTY that brindle.exe embeds.
+# target/dist/brindle-<version>-x86_64-pc-windows-msvc.zip: brindle.exe, the
+# terminal server helper brindle-remote.exe (which must sit beside it), the
+# Linux x86-64 remote helper, Brindle's licences and the notice for the
+# packaged ConPTY.
 #
 #   scripts/fetch-conpty.ps1
 #   cargo build --release --locked
 #   scripts/package-windows.ps1
 #
-# It refuses an exe that doesn't embed the pinned ConPTY, which a build run
-# before scripts/fetch-conpty.ps1 would be.
+# It refuses a build whose terminal server helper, brindle-remote.exe,
+# doesn't embed the pinned ConPTY, which a build run before
+# scripts/fetch-conpty.ps1 would be.
 
 param(
     [string]$Exe = 'target\release\brindle.exe',
+    [string]$Helper = 'target\release\brindle-remote.exe',
     [string]$RemoteAgent = 'target\release\brindle-remote-linux-x86_64'
 )
 
@@ -23,7 +26,11 @@ try {
     $conpty = (Select-String -Path scripts\fetch-conpty.ps1 -Pattern "^\`$Version = '(.+)'").Matches[0].Groups[1].Value
     $fetched = ".conpty\$conpty"
 
-    # build.rs embeds both files byte for byte, so look for them in the exe.
+    # remote-agent/build.rs embeds both files byte for byte, so look for them
+    # in the helper. brindle.exe embeds none, so passing it as the helper fails.
+    if (-not $Helper -or -not (Test-Path -PathType Leaf $Helper)) {
+        throw "package-windows: no terminal server helper '$Helper'; build brindle-remote.exe (cargo build --release) or pass -Helper"
+    }
     Add-Type -TypeDefinition @'
 public static class Embedded {
     public static bool Contains(byte[] haystack, byte[] needle) {
@@ -36,12 +43,12 @@ public static class Embedded {
     }
 }
 '@
-    $exeBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Exe))
+    $helperBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $Helper))
     foreach ($name in 'conpty.dll', 'OpenConsole.exe') {
         $file = Join-Path $fetched $name
         if (-not (Test-Path $file)) { throw "package-windows: no $file; run scripts/fetch-conpty.ps1, then rebuild" }
-        if (-not [Embedded]::Contains($exeBytes, [System.IO.File]::ReadAllBytes((Resolve-Path $file)))) {
-            throw "package-windows: $Exe doesn't embed $file; rebuild it after scripts/fetch-conpty.ps1"
+        if (-not [Embedded]::Contains($helperBytes, [System.IO.File]::ReadAllBytes((Resolve-Path $file)))) {
+            throw "package-windows: $Helper doesn't embed $file; rebuild it after scripts/fetch-conpty.ps1"
         }
     }
 
@@ -58,6 +65,8 @@ public static class Embedded {
     Remove-Item -Recurse -Force $stage, "$stage.zip" -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $stage | Out-Null
     Copy-Item $Exe, $RemoteAgent, LICENSE-MIT, LICENSE-APACHE, packaging\windows\THIRD-PARTY-NOTICES.txt $stage
+    # Brindle looks for the helper by this name beside brindle.exe.
+    Copy-Item $Helper (Join-Path $stage 'brindle-remote.exe')
     Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip"
     Remove-Item -Recurse -Force $stage
     Write-Output (Resolve-Path "$stage.zip").Path
