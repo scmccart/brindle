@@ -61,6 +61,9 @@ pub struct Session {
     phase: Arc<Mutex<Phase>>,
     /// Lets go of the request while it waits.
     abandon: Arc<Abandon>,
+    /// The session an attach asked for, which it stands for until it is
+    /// answered: a tab recorded while its endpoint is offline keeps it.
+    requested: Option<(SessionId, String)>,
 }
 
 impl Session {
@@ -100,6 +103,10 @@ impl Session {
         start: Start,
         sink: Box<dyn SessionSink>,
     ) -> Self {
+        let requested = match &start {
+            Start::Attach(request) => Some((request.session, request.key.clone())),
+            Start::Spawn(_) => None,
+        };
         let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
         let abandon = Arc::new(Abandon::default());
         let sink: Sink = Arc::new(Mutex::new(sink));
@@ -112,7 +119,7 @@ impl Session {
             *phase.lock() = Phase::Gone;
             failing.lock().failed(&anyhow::Error::from(error).context("starting a thread"));
         }
-        Self { phase, abandon }
+        Self { phase, abandon, requested }
     }
 
     /// The program's pid, once the session exists. It is a process of the
@@ -125,11 +132,13 @@ impl Session {
     }
 
     /// The session's id and key, once it exists (the key is empty from a
-    /// core that predates keys).
+    /// core that predates keys). An attach reports the session it asked
+    /// for until it is answered; only a pending spawn reports none.
     pub fn id_and_key(&self) -> Option<(SessionId, String)> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some((running.id(), running.key().to_string())),
-            _ => None,
+            Phase::Starting { .. } => self.requested.clone(),
+            Phase::Gone => None,
         }
     }
 
@@ -401,7 +410,7 @@ mod tests {
     }
 
     fn attach_request(session: SessionId) -> AttachRequest {
-        AttachRequest { session, key: format!("k{session}"), cols: 120, rows: 40 }
+        AttachRequest { session, key: format!("k{session}"), cols: 120, rows: 40, recorded: false }
     }
 
     /// Answers `ATTACH` of session 5 with a replay, then live output.
@@ -778,6 +787,42 @@ mod tests {
         assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
         assert!(tab.recv_timeout(Duration::from_millis(300)).is_err(), "the closed tab says nothing");
         assert_eq!(session.pid(), None);
+    }
+
+    /// 7.1: until its attach is answered, a session reports the one it
+    /// asked for, so a quit while its endpoint is offline records the zone
+    /// again; a pending spawn reports none, and neither does an attach
+    /// that failed.
+    #[test]
+    fn a_pending_attach_reports_the_requested_id_and_key() {
+        let (release, wait) = mpsc::channel::<()>();
+        let (tx, tab) = mpsc::channel();
+        let session = Session::attach_with(
+            move || {
+                wait.recv().ok();
+                anyhow::bail!("can't connect to A8: offline")
+            },
+            AttachRequest { recorded: true, ..attach_request(5) },
+            Box::new(Recorder(tx)),
+        );
+        assert_eq!(session.id_and_key(), Some((5, "k5".to_string())));
+        assert_eq!(session.pid(), None);
+
+        let (spawn_tx, _spawn_tab) = mpsc::channel();
+        let (_hold, held) = mpsc::channel::<()>();
+        let spawning = Session::start_with(
+            move || {
+                held.recv().ok();
+                anyhow::bail!("unused")
+            },
+            request(),
+            Box::new(Recorder(spawn_tx)),
+        );
+        assert_eq!(spawning.id_and_key(), None);
+
+        release.send(()).unwrap();
+        assert_eq!(seen(&tab), "failed can't connect to A8: offline");
+        assert_eq!(session.id_and_key(), None);
     }
 
     #[test]

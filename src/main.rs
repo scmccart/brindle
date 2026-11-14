@@ -529,6 +529,47 @@ fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
     Some(Vec::new())
 }
 
+/// Connects, on background threads, to the remote endpoints of the restored
+/// zones and of the profiles that connect at launch; on each one's first
+/// listing, attaches its detached sessions that nothing restored as tabs at
+/// the end ([`Workspace::attach_swept`], design.md decision 10).
+fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        use futures::StreamExt as _;
+
+        let restored = window.update(cx, |ws, _, _| ws.restored_hosts().to_vec()).unwrap_or_default();
+        let hosts = reattach::launch_hosts(&restored, &Settings::get(cx).config);
+        if hosts.is_empty() {
+            return;
+        }
+        let (listed, mut listings) = futures::channel::mpsc::unbounded();
+        for (host, eager) in hosts {
+            let listed = listed.clone();
+            let spawned = std::thread::Builder::new().name("launch-connect".into()).spawn(move || {
+                let named = host.clone();
+                let hook: remote::local::ListingHook = Box::new(move |sessions| {
+                    listed.unbounded_send((named, sessions)).ok();
+                });
+                remote::local::when_listed(&host, eager, hook);
+            });
+            if let Err(error) = spawned {
+                log::warn!("not connecting at launch: {error}");
+            }
+        }
+        // Ends once every hook has run or was dropped with its connection.
+        drop(listed);
+        cx.spawn(async move |cx| {
+            while let Some((host, sessions)) = listings.next().await {
+                window.update(cx, |ws, window, cx| ws.attach_swept(host, sessions, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = (window, cx);
+}
+
 /// The recorded windows, merged into the one window Brindle has, without
 /// the zones whose sessions are gone (when `listed`: the `Detached` global
 /// holds the launch's listing); `None` when the state file is missing,
@@ -771,6 +812,9 @@ fn main() {
         }
         if let Some(request) = request {
             window.update(cx, |ws, window, cx| ws.open(request, window, cx)).ok();
+        }
+        if restoring {
+            sweep_launch_hosts(window, cx);
         }
         watch_config(cx);
         record_session(cx);

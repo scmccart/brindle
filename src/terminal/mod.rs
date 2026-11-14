@@ -63,6 +63,9 @@ pub enum ChannelEvent {
     /// The server session can't be got back; the reason is on the screen.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Lost,
+    /// The session never started or attached; the reason is on the screen.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Failed,
     /// A remote session's host reported another foreground program, which
     /// a title may show.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -240,6 +243,10 @@ pub struct Terminal {
     size: GridSize,
     title: Option<String>,
     exited: bool,
+    /// It shows a detached session it attached ([`Terminal::attach`]).
+    attaching: bool,
+    /// Its session never started or attached; it shows why.
+    failed: bool,
     /// Between a server replay's start and end: events that would raise
     /// attention are dropped ([`quiet`]).
     replaying: bool,
@@ -297,6 +304,10 @@ impl Terminal {
                                 ChannelEvent::Osc(found) => this.handle_found(found, cx),
                                 ChannelEvent::Replay(active) => this.replaying = active,
                                 ChannelEvent::Lost => this.mark_lost(cx),
+                                ChannelEvent::Failed => {
+                                    this.failed = true;
+                                    this.mark_lost(cx);
+                                }
                                 ChannelEvent::Foreground => cx.emit(TerminalEvent::TitleChanged),
                             }
                         }
@@ -342,6 +353,8 @@ impl Terminal {
             size,
             title: None,
             exited: false,
+            attaching: false,
+            failed: false,
             replaying: false,
             status: status::Records::default(),
             theme,
@@ -413,7 +426,11 @@ impl Terminal {
     /// Attaches a detached session of `host`'s terminal server: its replay,
     /// quiet (no bell or notification), then its live output. It closes as
     /// a spawned profile terminal does. Returns at once, like a spawn; a
-    /// refused attach shows in the terminal.
+    /// refused attach shows in the terminal, which then only shows that
+    /// message ([`Terminal::shows_only_message`]). A session a restored
+    /// zone recorded (`request.recorded`) is attached once its endpoint's
+    /// listing confirms it, at the size listed; meanwhile a remote one says
+    /// it is connecting, until the replay's `ESC c` clears the line.
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach(
         host: &Host,
@@ -427,17 +444,36 @@ impl Terminal {
         let output = Arc::new(OutputMarker::default());
         let listener = Listener(tx, output.clone());
         // The session's size: the replay is rendered at it, and the first
-        // layout resizes the session only if the window's grid differs.
-        let size = GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() };
+        // layout resizes the session only if the window's grid differs. A
+        // recorded session's comes with its listing.
+        let size = if request.recorded {
+            GridSize::default()
+        } else {
+            GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() }
+        };
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("attach session {} ({what})", request.session))
-            .replayed_at(size);
+        if !host.is_local() {
+            // Before the session's thread starts, so before any replay.
+            let line = format!("\x1b[2mconnecting to {}…\x1b[22m\r\n", host.name());
+            parser.lock().advance(&mut *term.lock_unfair(), &marks, line.as_bytes());
+        }
+        let doing = if request.recorded {
+            format!("restore session {} on {}", request.session, host.name())
+        } else {
+            format!("attach session {} ({what})", request.session)
+        };
+        let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, doing);
+        if !request.recorded {
+            sink = sink.replayed_at(size);
+        }
         let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
         let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
         let theme = config.profile_theme(profile);
-        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
+        let mut this = Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx);
+        this.attaching = true;
+        this
     }
 
     /// A read-only terminal showing `text` (used to report errors in a tab).
@@ -912,13 +948,20 @@ impl Terminal {
     }
 
     /// The terminal server session (id and key) this terminal shows, once
-    /// it exists and while its program runs.
+    /// it exists and while its program runs; an attach reports the session
+    /// it asked for until it is answered.
     #[cfg(any(target_os = "linux", windows))]
     pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
         match &self.backend {
             Backend::Server { session, .. } if !self.exited => session.id_and_key(),
             _ => None,
         }
+    }
+
+    /// An attach that failed (refused, or its session gone): the terminal
+    /// only says why, and session restore doesn't record it.
+    pub fn shows_only_message(&self) -> bool {
+        self.attaching && self.failed
     }
 }
 

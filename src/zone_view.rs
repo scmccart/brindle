@@ -578,6 +578,17 @@ impl ZoneTreeView {
         zone.content.as_terminal_view().read(cx).terminal.read(cx).working_directory()
     }
 
+    /// What session restore records for zone `id` (its directory and its
+    /// session), or `None` for a zone that only shows a message: an attach
+    /// that failed.
+    pub fn zone_record(&self, id: ZoneId, cx: &App) -> Option<(Option<PathBuf>, Option<crate::session::ServerSession>)> {
+        let message = self
+            .zones
+            .get(&id)
+            .is_some_and(|zone| zone.content.as_terminal_view().read(cx).terminal.read(cx).shows_only_message());
+        (!message).then(|| (self.zone_working_directory(id, cx), self.zone_server_session(id, cx)))
+    }
+
     /// The terminal server session zone `id` shows, for session restore.
     pub fn zone_server_session(&self, id: ZoneId, cx: &App) -> Option<crate::session::ServerSession> {
         #[cfg(any(target_os = "linux", windows))]

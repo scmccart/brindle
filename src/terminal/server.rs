@@ -129,7 +129,12 @@ impl SessionSink for Sink {
             format!("{error:#}").replace('\n', "\r\n")
         );
         self.output(text.as_bytes());
-        self.send(ChannelEvent::Lost);
+        self.send(ChannelEvent::Failed);
+    }
+
+    /// A recorded session's listed size, which its replay is rendered at.
+    fn replay_size(&mut self, cols: u16, rows: u16) {
+        self.replay_size = Some(GridSize { cols, rows, ..GridSize::default() });
     }
 
     /// A remote host reported another foreground program: the title may
@@ -176,6 +181,7 @@ mod tests {
                 ChannelEvent::Alac(AlacEvent::Exit) => "exit",
                 ChannelEvent::Alac(_) => "alac",
                 ChannelEvent::Lost => "lost",
+                ChannelEvent::Failed => "failed",
                 ChannelEvent::Foreground => "foreground",
             })
 
@@ -223,6 +229,30 @@ mod tests {
         let prompt = text.lines().position(|line| line.starts_with('$')).expect("the prompt is on screen");
         assert_eq!(term.grid().cursor.point.line.0 as usize, prompt, "{text}");
         assert_eq!(term.grid().cursor.point.column.0, 2);
+    }
+
+    /// 7.1: a recorded session's replay is fed at the size its listing
+    /// gave, which the connection tells the sink before the `ATTACH`.
+    #[test]
+    fn a_recorded_sessions_replay_is_fed_at_its_listed_size() {
+        let (mut sink, _rx, _) = sink();
+        sink.replay_size(40, 5);
+        sink.replay(true);
+        sink.output(b"\x1bc1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n$ \x1b[5;3H");
+        sink.replay(false);
+        let term = sink.term.lock();
+        let text = crate::terminal::screen_text(&term);
+        let prompt = text.lines().position(|line| line.starts_with('$')).expect("the prompt is on screen");
+        assert_eq!(term.grid().cursor.point.line.0 as usize, prompt, "{text}");
+    }
+
+    #[test]
+    fn a_failure_says_why_and_marks_the_terminal() {
+        let (mut sink, mut rx, _) = sink();
+        sink.failed(&anyhow::anyhow!("session 3 on A8 has ended"));
+        assert_eq!(kinds(&mut rx), ["wakeup", "failed"]);
+        let text = crate::terminal::screen_text(&sink.term.lock());
+        assert!(text.contains("session 3 on A8 has ended"), "{text}");
     }
 
     #[test]

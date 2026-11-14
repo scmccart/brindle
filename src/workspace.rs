@@ -26,7 +26,7 @@ use brindle_ui::{
 };
 use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
-use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
+use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
@@ -301,6 +301,11 @@ pub struct Workspace {
     /// The window's size as recorded for restore: the size it opened
     /// with, until the user resizes it (see [`recorded_size`]).
     windowed_size: std::cell::Cell<Size<Pixels>>,
+    /// The remote endpoints of the restored tabs, each once, and the
+    /// sessions restored zones recorded there: a launch's sweep of an
+    /// endpoint leaves those to their zones ([`Workspace::attach_swept`]).
+    restored_hosts: Vec<Host>,
+    restored_sessions: Vec<(Host, session::ServerSession)>,
 }
 
 impl Workspace {
@@ -342,6 +347,8 @@ impl Workspace {
             window_id: window.window_handle().window_id().as_u64(),
             order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             windowed_size: std::cell::Cell::new(window.bounds().size),
+            restored_hosts: Vec::new(),
+            restored_sessions: Vec::new(),
         };
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
             // Foreground processes change without any event (e.g. `vim`
@@ -395,7 +402,9 @@ impl Workspace {
     }
 
     /// Opens a recorded window's tabs in order, and activates the recorded
-    /// active tab.
+    /// active tab. Zones that recorded a session get it back: this
+    /// machine's from the launch's listing, a remote endpoint's once that
+    /// endpoint answers (the window never waits for it).
     fn restore(&mut self, state: WindowState, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
@@ -403,21 +412,19 @@ impl Workspace {
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
                 None => {}
-                Some(RestoredTab::Local { profile, cwd, title, zones, session }) => {
-                    let found = match zones {
-                        Some(_) => None,
-                        None => Self::take_detached(session.as_ref(), cx),
-                    };
-                    match (zones, found) {
-                        (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
-                        #[cfg(any(target_os = "linux", windows))]
-                        // This machine's core listed it.
-                        (None, Some(info)) => {
+                Some(RestoredTab::Local { profile, host, cwd, title, zones, session }) => {
+                    if !host.is_local() && !self.restored_hosts.contains(&host) {
+                        self.restored_hosts.push(host.clone());
+                    }
+                    match (zones, session) {
+                        (Some(zones), _) => self.restore_zones(profile, host, zones, window, cx),
+                        (None, Some(recorded)) => {
                             let profile = config.profiles[profile].clone();
-                            let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
-                            self.insert_terminal_tab(profile, Host::Local, terminal, true, window, cx);
+                            let terminal = self.restored_terminal(&profile, &host, cwd, Some(&recorded), &config, cx);
+                            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
                         }
-                        _ => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
+                        // No record: the tab follows its profile.
+                        (None, None) => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
                     }
                     let Some(tab) = self.tabs.get_mut(self.active) else { continue };
                     if let Some(title) = title {
@@ -434,23 +441,23 @@ impl Workspace {
         }
     }
 
-    fn restore_local_zones(
+    /// A restored split tab on `host`: the endpoint its zones recorded
+    /// sessions on, else its profile's (`session::resolve_tab`).
+    fn restore_zones(
         &mut self,
         profile_ix: usize,
+        host: Host,
         zones: RestoredZoneNode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let config = Self::settings(cx).clone();
         let Some(profile) = config.profiles.get(profile_ix).cloned() else { return };
-        // Restored zones are kept only when the profile still targets the
-        // endpoint they were recorded on (`session::resolve_tab`).
-        let host = Host::of(&profile);
         let (tree, leaves, active_id) = zones.into_tree();
         let terminals: Vec<_> = leaves
             .into_iter()
             .map(|(id, cwd, session)| {
-                let terminal = Self::restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
+                let terminal = self.restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
                 (id, terminal)
             })
             .collect();
@@ -478,19 +485,20 @@ impl Workspace {
                 TabOrigin::Message => SnapshotTab::Skip,
                 TabOrigin::Local => {
                     let z = tab.zones.read(cx);
-                    let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
-                        (z.zone_working_directory(id, cx), z.zone_server_session(id, cx))
-                    });
-                    // A single zone's session is the tab's.
-                    let session = zones.is_none().then(|| z.zone_server_session(z.active_id(), cx)).flatten();
-                    SnapshotTab::Local {
-                        profile: tab.profile.name.clone(),
-                        // Where it runs, which its profile may no longer name.
-                        remote: tab.host.target().cloned(),
-                        cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
-                        title: tab.manual_title.clone(),
-                        zones,
-                        session,
+                    // Zones that only show a message (a failed attach) aren't
+                    // recorded, and neither is a tab of nothing else.
+                    match session::record_zones(z.tree(), z.active_id(), &mut |id| z.zone_record(id, cx)) {
+                        None => SnapshotTab::Skip,
+                        Some(recorded) => SnapshotTab::Local {
+                            profile: tab.profile.name.clone(),
+                            // Where it runs, which its profile may no longer name.
+                            remote: tab.host.target().cloned(),
+                            cwd: recorded.cwd,
+                            title: tab.manual_title.clone(),
+                            zones: recorded.zones,
+                            // A single zone's session is the tab's.
+                            session: recorded.session,
+                        },
                     }
                 }
             });
@@ -579,10 +587,9 @@ impl Workspace {
         self.insert_tab(tab, None, window, cx);
     }
 
-    /// A tab on `host` showing `terminal` alone, inserted after the active
-    /// tab, and activated when `activate`. Only attached sessions open this
-    /// way: `host` is the one they were attached on.
-    #[cfg(any(target_os = "linux", windows))]
+    /// A tab on `host` showing `terminal` alone: inserted after the active
+    /// tab and activated when `activate`, else at the end. Attached and
+    /// restored sessions open this way: `host` is the one they run on.
     fn insert_terminal_tab(
         &mut self,
         profile: Profile,
@@ -632,15 +639,19 @@ impl Workspace {
         // that predates sizes in `LIST` reports 0.
         let default = crate::terminal::GridSize::default();
         let (cols, rows) = if info.cols > 0 && info.rows > 0 { (info.cols, info.rows) } else { (default.cols, default.rows) };
-        let request = crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows };
+        let request =
+            crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows, recorded: false };
         let what = crate::reattach::label(info);
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
 
-    /// A restored zone's terminal on `host`: its recorded session attached
-    /// when the launch found it still detached, else `profile` spawned in
-    /// `cwd`. The launch lists only this machine's sessions.
+    /// A restored zone's terminal on `host`. Its recorded session is
+    /// attached: on this machine when the launch's listing found it still
+    /// detached; on a remote endpoint once its listing there confirms it,
+    /// which the zone waits for, saying it is connecting. Otherwise
+    /// `profile` is spawned in `cwd`.
     fn restored_terminal(
+        &mut self,
         profile: &Profile,
         host: &Host,
         cwd: PathBuf,
@@ -648,31 +659,42 @@ impl Workspace {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        let found = recorded.filter(|_| host.is_local()).and_then(|recorded| Self::take_detached(Some(recorded), cx));
         #[cfg(any(target_os = "linux", windows))]
-        if let Some(info) = found {
-            return Self::attached_terminal(host, &info, profile, config, cx);
+        match recorded {
+            Some(recorded) if !host.is_local() => {
+                self.restored_sessions.push((host.clone(), recorded.clone()));
+                let request = crate::remote::local::AttachRequest {
+                    session: recorded.id,
+                    key: recorded.key.clone(),
+                    cols: 0,
+                    rows: 0,
+                    recorded: true,
+                };
+                let what = host.name();
+                return cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx));
+            }
+            Some(recorded) => {
+                if let Some(info) = Self::take_detached(Some(recorded), cx) {
+                    return Self::attached_terminal(host, &info, profile, config, cx);
+                }
+            }
+            None => {}
         }
         #[cfg(not(any(target_os = "linux", windows)))]
-        let _ = found;
+        let _ = recorded;
         cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))
     }
 
-    /// Opens a tab for each of `sessions` (detached sessions nothing
-    /// restored took), after the others and in this order, each with the
-    /// profile its meta names (the default one when it's gone). The active
-    /// tab stays the same.
+    /// Opens a tab for each of `sessions` (detached sessions of this
+    /// machine nothing restored took), after the others and in this order,
+    /// each with the profile it was started with, or the default one when
+    /// that is gone or remote. The active tab stays the same.
     pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
             for info in sessions {
-                let index = info
-                    .profile
-                    .as_deref()
-                    .and_then(|name| config.profile_index(name))
-                    .unwrap_or_else(|| config.default_profile_index());
-                let profile = config.profiles[index].clone();
+                let profile = config.profiles[crate::reattach::local_profile(&info, &config)].clone();
                 // The launch listed this machine's sessions.
                 let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
                 let activate = self.tabs.is_empty();
@@ -681,6 +703,58 @@ impl Workspace {
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (sessions, window, cx);
+    }
+
+    /// The remote endpoints of the restored tabs, each once.
+    pub fn restored_hosts(&self) -> &[Host] {
+        &self.restored_hosts
+    }
+
+    /// Opens a tab at the end for each session `host`'s first listing of the
+    /// launch has that the launch attaches ([`crate::reattach::sweep`]):
+    /// not restored into a zone, not shown here already, and with no owner
+    /// that may come back. Each takes the profile it was started with when
+    /// that targets `host`, else the first that does; when none does, the
+    /// profile of the restored tab that brought the launch to `host` (or
+    /// the default one), on `host` all the same. The active tab stays the
+    /// same, and the replays raise no bells or notifications.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn attach_swept(&mut self, host: Host, listed: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        let mut skip: Vec<session::ServerSession> =
+            self.restored_sessions.iter().filter(|(on, _)| *on == host).map(|(_, s)| s.clone()).collect();
+        skip.extend(self.sessions_on(&host, cx));
+        let sessions = crate::reattach::sweep(listed, &skip);
+        if sessions.is_empty() {
+            return;
+        }
+        log::info!("attaching {} detached session(s) on {}", sessions.len(), host.name());
+        let fallback = self
+            .tabs
+            .iter()
+            .find(|tab| tab.host == host)
+            .and_then(|tab| config.profile_index(&tab.profile.name))
+            .unwrap_or_else(|| config.default_profile_index());
+        for info in sessions {
+            let index = crate::reattach::remote_profile(&info, &host, &config).unwrap_or(fallback);
+            let profile = config.profiles[index].clone();
+            let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
+            let activate = self.tabs.is_empty();
+            self.insert_terminal_tab(profile, host.clone(), terminal, activate, window, cx);
+        }
+    }
+
+    /// The sessions this window's tabs on `host` show (or are attaching).
+    #[cfg(any(target_os = "linux", windows))]
+    fn sessions_on(&self, host: &Host, cx: &App) -> Vec<session::ServerSession> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.host == *host)
+            .flat_map(|tab| {
+                let zones = tab.zones.read(cx);
+                zones.tree().leaves().into_iter().filter_map(|id| zones.zone_server_session(id, cx)).collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
@@ -1284,12 +1358,7 @@ impl Workspace {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            let index = info
-                .profile
-                .as_deref()
-                .and_then(|name| config.profile_index(name))
-                .unwrap_or_else(|| config.default_profile_index());
-            let profile = config.profiles[index].clone();
+            let profile = config.profiles[crate::reattach::local_profile(&info, &config)].clone();
             // The sessions palette and `--attach` list this machine's.
             let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
             self.insert_terminal_tab(profile, Host::Local, terminal, true, window, cx);

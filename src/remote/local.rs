@@ -40,7 +40,7 @@ mod sys;
 mod sys;
 mod upgrade;
 
-pub use connection::{AttachRequest, Connection, Foreground, SessionSink, SpawnRequest};
+pub use connection::{AttachRequest, Connection, Foreground, ListingHook, SessionSink, SpawnRequest};
 pub use super::Host;
 /// What `remote::client`'s tests of the relay's launch against real
 /// endpoints start for themselves.
@@ -126,6 +126,34 @@ pub fn shared(host: &Host) -> Result<Arc<Connection>> {
             Connection::relay(dial, &host_token(host), relay::Timings::default())
         }
     })
+}
+
+/// Hands `hook` the sessions `host`'s core lists once the process's
+/// connection to it is up: at once if it is, else on its first link
+/// (design.md decision 10). Until then the connection keeps trying, and with
+/// `eager` it keeps connecting afterwards too, while nothing else uses it (a
+/// profile that connects at launch). For a remote host: a local one would
+/// block here while connecting. Not on the UI thread.
+pub fn when_listed(host: &Host, eager: bool, hook: ListingHook) {
+    let mut hook = hook;
+    // A connection that ended just now is replaced by the next `shared`.
+    for _ in 0..3 {
+        let connection = match shared(host) {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::warn!("can't connect to {}: {error:#}", host.name());
+                return;
+            }
+        };
+        if eager {
+            connection.set_eager(true);
+        }
+        match connection.on_listing(hook) {
+            Ok(()) => return,
+            Err(back) => hook = back,
+        }
+    }
+    log::warn!("not listing {}'s sessions: its connection keeps ending", host.name());
 }
 
 /// The `client_token` of this process's connection to `host`. Each remote
@@ -841,8 +869,10 @@ mod tests {
 
         eventually("the unused connection ends", &|| connection.is_dead());
         assert!(taken.elapsed() >= idle * 4 / 5, "ended {:?} after it was taken", taken.elapsed());
-        assert!(far.out.is_cut(), "its relay was killed");
-        assert!(!registry.has(&host), "forgotten");
+        // The ending thread cuts the relay and forgets the connection after
+        // marking it ended, so a test thread can look in between.
+        eventually("its relay is killed", &|| far.out.is_cut());
+        eventually("it is forgotten", &|| !registry.has(&host));
         let next = registry.get(&host, make).unwrap();
         assert!(!Arc::ptr_eq(&connection, &next));
         assert_eq!(plans.lock().len(), 2);

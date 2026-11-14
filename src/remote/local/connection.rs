@@ -49,6 +49,13 @@
 //! - **This machine only:** a relay's sessions run on another machine, so
 //!   they are never sent `REPARENT` (a window handle of this one), and
 //!   what is known of their programs comes from `PROCESS` ([`Foreground`]).
+//! - **Listings:** a session a restored zone recorded ([`AttachRequest`]'s
+//!   `recorded`) and a launch's [`Connection::on_listing`] both wait for the
+//!   core's `LIST`, sent on the first link when either waits (and at once
+//!   when the link is up). The listing must have the recorded session with
+//!   its key and no client; then its `ATTACH` goes out at the listed size,
+//!   which its replay is rendered at. Both keep a relay connecting, as an
+//!   attach does.
 //!
 //! The reader holds the state lock only to look a sink up; each sink has
 //! its own lock, taken without the state lock, so parsing never waits on
@@ -102,7 +109,15 @@ pub trait SessionSink: Send {
     /// The core reported another foreground program (`PROCESS`); the
     /// session's [`Foreground`] has it.
     fn foreground(&mut self) {}
+    /// The size the core listed a recorded session at, which its replay is
+    /// rendered at; told before its `ATTACH` goes out.
+    fn replay_size(&mut self, _cols: u16, _rows: u16) {}
 }
+
+/// What a launch does with the first listing of an endpoint's sessions
+/// ([`Connection::on_listing`]). It runs on the connection's reader thread,
+/// so it must not block.
+pub type ListingHook = Box<dyn FnOnce(Vec<SessionInfo>) + Send>;
 
 /// What the core last reported about a session's foreground program
 /// (`PROCESS`, which a relay connection asks for): what a remote tab's
@@ -144,6 +159,10 @@ pub struct AttachRequest {
     pub key: String,
     pub cols: u16,
     pub rows: u16,
+    /// A session a restored zone recorded, not one just listed: the core's
+    /// `LIST` must still have it, with this key and no client, before its
+    /// `ATTACH` goes out, at the size listed instead of `cols` and `rows`.
+    pub recorded: bool,
 }
 
 type Reply<T> = mpsc::SyncSender<Result<T, String>>;
@@ -155,8 +174,10 @@ enum Waiting {
     /// The `REPLAY_START` answering an `ATTACH` (its pid), whose sink joins
     /// the map before the replay's first `DATA` is read. A reconnect's
     /// replay of the session answers it too, and `attach` is sent again
-    /// when the reconnected core didn't give the session back.
-    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach },
+    /// when the reconnected core didn't give the session back. `check` is
+    /// a recorded session's key, until a listing has confirmed it: until
+    /// then nothing is sent.
+    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach, check: Option<String> },
     /// `SESSIONS`.
     List(Reply<Vec<SessionInfo>>),
     /// `OK`.
@@ -182,8 +203,9 @@ struct Pending {
     /// An attach waiting for a relay's first link was told why it can't
     /// connect yet.
     told: bool,
-    /// An attach that went out on a link that ended before its answer.
-    /// The reconnect's `LIST` says what became of it.
+    /// An attach that went out on a link that ended before its answer, or
+    /// a recorded one not sent yet. The next `LIST` says what becomes of
+    /// it.
     carried: bool,
 }
 
@@ -191,6 +213,20 @@ impl Pending {
     fn is_attach(&self) -> bool {
         matches!(self.waiting, Waiting::Attach { .. })
     }
+
+    /// A recorded attach that waits for a listing to confirm its session.
+    fn is_check(&self) -> bool {
+        matches!(self.waiting, Waiting::Attach { check: Some(_), .. })
+    }
+}
+
+/// The `LIST` the reader waits for, outside the requests: after a link
+/// comes up, and for what waits on a listing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Listing {
+    req: RequestId,
+    /// The first after a lost link: the sessions it lacks are lost.
+    after_loss: bool,
 }
 
 #[derive(Default)]
@@ -202,8 +238,11 @@ struct State {
     /// The last `PROCESS` of each session shown.
     foreground: HashMap<SessionId, Foreground>,
     requests: HashMap<RequestId, Pending>,
-    /// The `LIST` sent after a reconnect's `WELCOME`.
-    list: Option<RequestId>,
+    /// The `LIST` sent after a link's `WELCOME`, or for a recorded attach
+    /// or a listing hook.
+    list: Option<Listing>,
+    /// What the next listing goes to ([`Connection::on_listing`]).
+    on_listing: Vec<ListingHook>,
     /// A link has been up.
     connected: bool,
     /// A new tab's request wants a relay attempt now, not after the pause.
@@ -227,9 +266,14 @@ impl State {
     }
 
     /// Something needs the connection: a session it shows, a request
-    /// waiting on it, or a `CLOSE` it hasn't written yet.
+    /// waiting on it, a listing hook, or a `CLOSE` it hasn't written yet.
     fn in_use(&self) -> bool {
-        !self.sessions.is_empty() || !self.requests.is_empty() || self.closing > 0
+        !self.sessions.is_empty() || !self.requests.is_empty() || !self.on_listing.is_empty() || self.closing > 0
+    }
+
+    /// A recorded attach or a listing hook waits for the core's `LIST`.
+    fn waits_for_listing(&self) -> bool {
+        !self.on_listing.is_empty() || self.requests.values().any(Pending::is_check)
     }
 }
 
@@ -475,8 +519,6 @@ impl Connection {
 
     /// Makes the connection keep connecting while nothing waits for it, as
     /// for a profile that connects at launch.
-    // Task 8.2 sets it for eager endpoints.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_eager(&self, eager: bool) {
         self.eager.store(eager, Ordering::Release);
     }
@@ -514,12 +556,13 @@ impl Connection {
 
     /// Sends the request `make` builds and waits for its answer: up to
     /// [`REQUEST_LIMIT`] on the local core, as long as it takes on a relay.
-    /// Not on the UI thread: this blocks.
+    /// A request with no message yet (a recorded attach) waits for the next
+    /// listing, which decides it. Not on the UI thread: this blocks.
     fn ask<T>(
         &self,
         what: &str,
         abandon: Option<(Weak<Self>, &Abandon)>,
-        make: impl FnOnce(RequestId, Reply<T>) -> (Waiting, ToCore),
+        make: impl FnOnce(RequestId, Reply<T>) -> (Waiting, Option<ToCore>),
     ) -> Result<T> {
         let req = self.req();
         let (reply, answer) = mpsc::sync_channel(1);
@@ -534,14 +577,20 @@ impl Connection {
                 state.hurry = true;
                 self.wake.notify_all();
             }
-            state.requests.insert(req, Pending { waiting, written: false, told: false, carried: false });
+            let listed = message.is_none();
+            state.requests.insert(req, Pending { waiting, written: false, told: false, carried: listed });
+            if listed {
+                self.request_list(&mut state);
+            }
         }
         if let Some((connection, abandon)) = abandon
             && !abandon.asked(connection, req)
         {
             self.withdraw(req);
         }
-        self.send(message);
+        if let Some(message) = message {
+            self.send(message);
+        }
         let answer = if self.is_relay() {
             answer.recv().map_err(|_| format!("the terminal server didn't {what}"))
         } else {
@@ -579,7 +628,7 @@ impl Connection {
         let command = Some(request.command).filter(|command| !command.is_empty());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let spawned = self.ask("start the session", abandon, |req, reply| {
-            let message = ToCore::Spawn(client::Spawn {
+            let message = Some(ToCore::Spawn(client::Spawn {
                 req,
                 command,
                 args: request.args,
@@ -592,20 +641,23 @@ impl Connection {
                 scrollback: request.scrollback,
                 policy: request.policy,
                 profile: request.profile,
-            });
+            }));
             (Waiting::Spawn { sink, reply }, message)
         })?;
         Ok(Running { id: spawned.session, pid: spawned.pid, key: spawned.key, conn: self.clone() })
     }
 
     /// Attaches a detached session, whose replay and then live output go to
-    /// `sink`, and waits for its `REPLAY_START`. Not on the UI thread.
+    /// `sink`, and waits for its `REPLAY_START`. A recorded session is
+    /// looked up in the core's listing first. Not on the UI thread.
     pub fn attach(self: &Arc<Self>, request: AttachRequest, sink: Sink, abandon: Option<&Abandon>) -> Result<Running> {
         let session = request.session;
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
+        let check = request.recorded.then(|| request.key.clone());
         let pid = self.ask("attach the session", abandon, |req, reply| {
             let attach = client::Attach { req, session, cols: request.cols, rows: request.rows };
-            (Waiting::Attach { sink, reply, attach: attach.clone() }, ToCore::Attach(attach))
+            let message = check.is_none().then(|| ToCore::Attach(attach.clone()));
+            (Waiting::Attach { sink, reply, attach, check }, message)
         })?;
         Ok(Running { id: session, pid, key: request.key, conn: self.clone() })
     }
@@ -613,7 +665,7 @@ impl Connection {
     /// The core's sessions, this client's and detached ones. Blocks.
     pub fn list(&self) -> Result<Vec<SessionInfo>> {
         self.ask("list its sessions", None, |req, reply| {
-            (Waiting::List(reply), ToCore::List(Request { req }))
+            (Waiting::List(reply), Some(ToCore::List(Request { req })))
         })
     }
 
@@ -621,8 +673,34 @@ impl Connection {
     pub fn kill(&self, session: SessionId) -> Result<()> {
         self.ask("end the session", None, |req, reply| {
             let target = KillTarget::Session(session);
-            (Waiting::Done(reply), ToCore::Kill(Kill { req, target }))
+            (Waiting::Done(reply), Some(ToCore::Kill(Kill { req, target })))
         })
+    }
+
+    /// Hands `hook` the core's next listing: at once once a link is up,
+    /// else on the first link. It keeps a relay connecting until then, as
+    /// an attach does. Gives `hook` back when the connection has ended.
+    pub fn on_listing(&self, hook: ListingHook) -> std::result::Result<(), ListingHook> {
+        let mut state = self.state.lock();
+        if state.ended.is_some() {
+            return Err(hook);
+        }
+        state.on_listing.push(hook);
+        self.request_list(&mut state);
+        Ok(())
+    }
+
+    /// Asks for the core's sessions for what waits on a listing, unless a
+    /// listing is on its way. Before the first link, the link asks
+    /// ([`Connection::up`]); while reconnecting, the writer holds it and the
+    /// next link's own `LIST` replaces it.
+    fn request_list(&self, state: &mut State) {
+        if !state.connected || state.list.is_some() {
+            return;
+        }
+        let req = self.req();
+        state.list = Some(Listing { req, after_loss: false });
+        self.send(ToCore::List(Request { req }));
     }
 
     /// Reads each local link in turn, reconnecting when one ends.
@@ -742,18 +820,29 @@ impl Connection {
     }
 
     /// A link is up. After a loss, `LIST` goes out first, to tell which
-    /// sessions the core no longer has; then the writer gets the link.
+    /// sessions the core no longer has, and so it does on the first link
+    /// when a recorded attach or a listing hook waits for one; then the
+    /// writer gets the link.
     fn up(&self, wire: Arc<dyn Wire>, host: Option<RelayHost>) -> Result<()> {
-        if let Some(reason) = &self.state.lock().ended {
-            // It ended while this link was starting.
-            bail!("{reason}");
+        let list = {
+            let mut state = self.state.lock();
+            if let Some(reason) = &state.ended {
+                // It ended while this link was starting.
+                bail!("{reason}");
+            }
+            let after_loss = state.connected;
+            let wanted = after_loss || state.waits_for_listing();
+            // Under the same lock: what registers after this asks itself.
+            state.connected = true;
+            wanted.then(|| {
+                let listing = Listing { req: self.req(), after_loss };
+                state.list = Some(listing);
+                listing
+            })
+        };
+        if let Some(listing) = list {
+            wire.send(&ToCore::List(Request { req: listing.req }).encode()?)?;
         }
-        if self.state.lock().connected {
-            let req = self.req();
-            self.state.lock().list = Some(req);
-            wire.send(&ToCore::List(Request { req }).encode()?)?;
-        }
-        self.state.lock().connected = true;
         let mut slot = self.slot.lock();
         if slot.closed {
             bail!("the connection ended");
@@ -826,7 +915,7 @@ impl Connection {
                     None => log::debug!("terminal server: {}", error.message),
                 }
             }
-            ToClient::Sessions(sessions) if self.state.lock().list != Some(sessions.req) => {
+            ToClient::Sessions(sessions) if self.state.lock().list.is_none_or(|listing| listing.req != sessions.req) => {
                 let pending = self.state.lock().requests.remove(&sessions.req);
                 match pending.map(|pending| pending.waiting) {
                     Some(Waiting::List(reply)) => {
@@ -901,28 +990,42 @@ impl Connection {
                 }
             }
             ToClient::Sessions(sessions) => {
-                let (lost, (again, gone)) = {
+                let name = self.name();
+                let (lost, decided, hooks) = {
                     let mut state = self.state.lock();
-                    if state.list != Some(sessions.req) {
+                    let Some(listing) = state.list.filter(|listing| listing.req == sessions.req) else {
                         return;
-                    }
+                    };
                     state.list = None;
-                    let kept: HashSet<SessionId> =
-                        sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
-                    state.parents.retain(|session, _| kept.contains(session));
-                    state.foreground.retain(|session, _| kept.contains(session));
-                    let listed: HashMap<SessionId, bool> =
-                        sessions.sessions.iter().map(|s| (s.session, s.attached)).collect();
-                    (missing(&mut state.sessions, &kept), carried_attaches(&mut state.requests, &listed))
+                    // Only a lost link's sessions can be missing: on a link
+                    // that stayed up, every session shown here is listed.
+                    let lost = if listing.after_loss {
+                        let kept: HashSet<SessionId> =
+                            sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
+                        state.parents.retain(|session, _| kept.contains(session));
+                        state.foreground.retain(|session, _| kept.contains(session));
+                        missing(&mut state.sessions, &kept)
+                    } else {
+                        Vec::new()
+                    };
+                    let decided = carried_attaches(&mut state.requests, &sessions.sessions, &name);
+                    (lost, decided, std::mem::take(&mut state.on_listing))
                 };
                 for sink in lost {
                     sink.lock().lost("the terminal server no longer has this session");
                 }
-                for (session, pending) in gone {
-                    pending.waiting.fail(format!("the terminal server no longer has session {session}"));
+                for (pending, reason) in decided.gone {
+                    pending.waiting.fail(reason);
                 }
-                for attach in again {
+                for (attach, recorded) in decided.again {
+                    // Told before the ATTACH goes out, so before its replay.
+                    if let Some(sink) = recorded {
+                        sink.lock().replay_size(attach.cols, attach.rows);
+                    }
                     self.send(ToCore::Attach(attach));
+                }
+                for hook in hooks {
+                    hook(sessions.sessions.clone());
                 }
             }
             ToClient::Process(process) => {
@@ -948,11 +1051,12 @@ impl Connection {
     }
 
     /// A replay without a `req` (a reconnect's) of a session an attach
-    /// waits for answers that attach: its sink joins the map.
+    /// waits for answers that attach: its sink joins the map. A recorded
+    /// attach not sent yet asked the core for nothing, so it isn't one.
     fn attached_by_replay(&self, session: SessionId) -> Option<(Sink, Reply<u32>)> {
         let mut state = self.state.lock();
         let req = state.requests.iter().find_map(|(&req, pending)| match &pending.waiting {
-            Waiting::Attach { attach, .. } if attach.session == session => Some(req),
+            Waiting::Attach { attach, check: None, .. } if attach.session == session => Some(req),
             _ => None,
         })?;
         let Some(Waiting::Attach { sink, reply, .. }) = state.requests.remove(&req).map(|pending| pending.waiting)
@@ -1028,7 +1132,9 @@ impl Connection {
                     _ => None,
                 })
                 .collect();
-            let keep = self.eager.load(Ordering::Acquire) || state.requests.values().any(Pending::is_attach);
+            let keep = self.eager.load(Ordering::Acquire)
+                || state.requests.values().any(Pending::is_attach)
+                || !state.on_listing.is_empty();
             if !keep {
                 // Under the same lock, so no attach slips in to wait on a
                 // connection that has stopped trying.
@@ -1158,6 +1264,8 @@ impl Connection {
             state.ended.get_or_insert_with(|| reason.to_string());
             state.parents.clear();
             state.foreground.clear();
+            // No listing will come.
+            state.on_listing.clear();
             (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests), state.on_end.take())
         };
         self.wake.notify_all();
@@ -1312,9 +1420,14 @@ impl Connection {
         }
     }
 
-    /// Marks a request written or not; false when nobody waits for it.
+    /// Marks a request written or not; false when nobody waits for it. The
+    /// listing the reader waits for isn't a request, and goes out.
     fn mark_written(&self, req: RequestId, written: bool) -> bool {
-        match self.state.lock().requests.get_mut(&req) {
+        let mut state = self.state.lock();
+        if state.list.is_some_and(|listing| listing.req == req) {
+            return true;
+        }
+        match state.requests.get_mut(&req) {
             Some(pending) => {
                 pending.written = written;
                 true
@@ -1359,33 +1472,63 @@ fn retrying_line(message: &str) -> String {
     format!("\r\n\x1b[2m{}; retrying…\x1b[22m\r\n", message.replace('\n', "\r\n"))
 }
 
-/// What becomes of the attaches carried over a lost link, from the
-/// reconnected core's `LIST` (`listed`: each session and whether a client
-/// has it). The core gave this client back the sessions it owns before it
-/// answered, so one listed with a client waits for that replay. One listed
-/// without a client is sent again (returned first, no longer carried), and
-/// one not listed is taken out (returned second, with its session).
-fn carried_attaches(
-    requests: &mut HashMap<RequestId, Pending>,
-    listed: &HashMap<SessionId, bool>,
-) -> (Vec<client::Attach>, Vec<(SessionId, Pending)>) {
-    let (mut again, mut gone) = (Vec::new(), Vec::new());
+/// What a listing decides for the attaches that wait on it.
+#[derive(Default)]
+struct Decided {
+    /// To send (again), with a recorded session's sink, which is told the
+    /// listed size its replay is rendered at.
+    again: Vec<(client::Attach, Option<Sink>)>,
+    /// Taken out, with why.
+    gone: Vec<(Pending, String)>,
+}
+
+/// What becomes of the attaches waiting on the core's `LIST` (`listed`),
+/// at endpoint `name`:
+/// - **Carried over a lost link:** the core gave this client back the
+///   sessions it owns before it answered, so one listed with a client waits
+///   for that replay. One listed without a client is sent again, and one not
+///   listed is taken out.
+/// - **Recorded (not sent yet):** sent at the listed size when the listing
+///   has the session with its key and no client. Taken out when another
+///   client has it, or when it isn't listed with its key (it ended, and the
+///   id may be another session's now).
+fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[SessionInfo], name: &str) -> Decided {
+    let mut decided = Decided::default();
     let carried: Vec<RequestId> =
         requests.iter().filter(|(_, pending)| pending.carried).map(|(&req, _)| req).collect();
     for req in carried {
         let Some(pending) = requests.get_mut(&req) else { continue };
-        let Waiting::Attach { attach, .. } = &pending.waiting else { continue };
+        let Waiting::Attach { attach, check, sink, .. } = &mut pending.waiting else { continue };
         let session = attach.session;
-        match listed.get(&session) {
-            Some(true) => {}
-            Some(false) => {
-                again.push(attach.clone());
-                pending.carried = false;
+        let info = listed.iter().find(|info| info.session == session);
+        let why = match (check.as_deref(), info) {
+            (Some(key), Some(info)) if !key.is_empty() && info.key == key => {
+                if info.attached {
+                    Some(format!("session {session} on {name} is shown by another Brindle"))
+                } else {
+                    if info.cols > 0 && info.rows > 0 {
+                        (attach.cols, attach.rows) = (info.cols, info.rows);
+                    }
+                    *check = None;
+                    pending.carried = false;
+                    decided.again.push((attach.clone(), Some(sink.clone())));
+                    None
+                }
             }
-            None => gone.extend(requests.remove(&req).map(|pending| (session, pending))),
+            (Some(_), _) => Some(format!("session {session} on {name} has ended")),
+            (None, Some(info)) if info.attached => None,
+            (None, Some(_)) => {
+                pending.carried = false;
+                decided.again.push((attach.clone(), None));
+                None
+            }
+            (None, None) => Some(format!("the terminal server no longer has session {session}")),
+        };
+        if let Some(why) = why {
+            decided.gone.extend(requests.remove(&req).map(|pending| (pending, why)));
         }
     }
-    (again, gone)
+    decided
 }
 
 /// Takes the sessions out of `sessions` that the core no longer holds for
@@ -1699,6 +1842,9 @@ pub(super) mod fake {
         fn failed(&mut self, error: &anyhow::Error) {
             self.0.send(format!("failed {error:#}")).ok();
         }
+        fn replay_size(&mut self, cols: u16, rows: u16) {
+            self.0.send(format!("size {cols}x{rows}")).ok();
+        }
     }
 
     pub fn sink() -> (Sink, mpsc::Receiver<String>) {
@@ -1747,7 +1893,12 @@ mod tests {
     }
 
     fn attach_request(session: SessionId) -> AttachRequest {
-        AttachRequest { session, key: format!("k{session}"), cols: 100, rows: 30 }
+        AttachRequest { session, key: format!("k{session}"), cols: 100, rows: 30, recorded: false }
+    }
+
+    /// A session a restored zone recorded, whose size it doesn't know.
+    fn recorded(session: SessionId) -> AttachRequest {
+        AttachRequest { cols: 80, rows: 24, recorded: true, ..attach_request(session) }
     }
 
     /// Waits until `count` requests wait in the connection.
@@ -2356,7 +2507,7 @@ mod tests {
         eventually("the unused connection ends", || connection.is_dead());
         // Not before `idle` (less the idle thread's look, a fifth of it).
         assert!(written.1.elapsed() >= idle * 4 / 5, "{:?}", written.1.elapsed());
-        assert!(second.out.is_cut(), "its relay was ended");
+        eventually("its relay is ended", || second.out.is_cut());
         // It doesn't come back.
         assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err());
     }
@@ -2383,7 +2534,125 @@ mod tests {
         // No longer eager: it ends.
         eager.set_eager(false);
         eventually("the unused connection ends", || eager.is_dead());
-        assert!(far.out.is_cut());
+        eventually("its relay is ended", || far.out.is_cut());
+    }
+
+    /// 7.1: a session a restored zone recorded waits, through failed
+    /// attempts, for the endpoint's first link; a `LIST` goes out first,
+    /// and once it has the session with its key and no client, the `ATTACH`
+    /// goes out at the listed size, which the sink is told before the
+    /// replay.
+    #[test]
+    fn a_recorded_attach_waits_for_a_listing_and_goes_out_at_the_listed_size() {
+        let (connection, plan) = steady_relay("A8");
+        let (sink, tab) = fake::sink();
+        let attaching = connection.clone();
+        let attach = in_background(move || {
+            attaching.attach(recorded(5), sink, None).map(|r| (r.id(), r.pid(), r.key().to_string()))
+        });
+        waiting(&connection, 1);
+        plan.next_dial();
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        assert!(seen(&tab).contains("Connection refused; retrying…"));
+        plan.next_dial();
+        assert!(!connection.is_dead());
+        let (link, far) = fake::link(&[], |message, out| match message {
+            ToCore::List(list) => {
+                let info = SessionInfo { session: 5, key: "k5".into(), cols: 132, rows: 43, owned: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
+            }
+            other => replaying(other, out),
+        });
+        plan.link(link);
+        assert!(matches!(far.next(), ToCore::List(_)));
+        let ToCore::Attach(sent) = far.next() else { panic!("not ATTACH") };
+        assert_eq!((sent.session, sent.cols, sent.rows), (5, 132, 43));
+        assert_eq!(attach.join().unwrap().unwrap(), (5, 99, "k5".to_string()));
+        assert_eq!(seen(&tab), "size 132x43");
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "output screen");
+        assert_eq!(seen(&tab), "replay false");
+        quiet(&tab);
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// 7.1: a recorded session the listing lacks, lists with another key
+    /// (its id was reused), or lists with a client is never attached: each
+    /// attach fails with why. Attaches made while the link is up ask for a
+    /// listing themselves.
+    #[test]
+    fn a_recorded_attach_fails_when_its_session_ended_was_replaced_or_is_shown() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                let sessions = vec![
+                    SessionInfo { session: 6, key: "another".into(), ..Default::default() },
+                    SessionInfo { session: 7, key: "k7".into(), attached: true, ..Default::default() },
+                ];
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions }));
+            }
+        });
+        plan.link(link);
+        far.hello();
+        let failures: Vec<String> = [5, 6, 7]
+            .map(|id| {
+                let attaching = connection.clone();
+                let (sink, _tab) = fake::sink();
+                in_background(move || attaching.attach(recorded(id), sink, None).map(|r| r.pid()))
+            })
+            .into_iter()
+            .map(|attach| attach.join().unwrap().unwrap_err().to_string())
+            .collect();
+        assert_eq!(
+            failures,
+            ["session 5 on A8 has ended", "session 6 on A8 has ended", "session 7 on A8 is shown by another Brindle"]
+        );
+        // Only listings went out.
+        while let Ok(message) = far.got.recv_timeout(Duration::from_millis(300)) {
+            assert!(matches!(message, ToCore::List(_)), "{message:?}");
+        }
+        assert!(connection.state.lock().requests.is_empty());
+    }
+
+    /// 7.2: a launch's listing hook gets the endpoint's first listing,
+    /// keeping a relay that can't connect yet trying, as an attach does.
+    /// Once a link is up, a hook asks for a listing of its own. A connection
+    /// that ended gives the hook back.
+    #[test]
+    fn a_listing_hook_gets_the_first_listing_and_keeps_the_relay_connecting() {
+        let (got, hooked) = mpsc::channel();
+        let hook = |got: &mpsc::Sender<Vec<SessionId>>| -> ListingHook {
+            let got = got.clone();
+            Box::new(move |sessions: Vec<SessionInfo>| {
+                got.send(sessions.iter().map(|s| s.session).collect()).ok();
+            })
+        };
+        let (connection, plan) = steady_relay("A8");
+        assert!(connection.on_listing(hook(&got)).is_ok());
+        plan.next_dial();
+        plan.fail("offline");
+        plan.next_dial();
+        assert!(!connection.is_dead(), "the hook keeps it trying");
+        let (link, far) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                let sessions = vec![SessionInfo { session: 3, ..Default::default() }];
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions }));
+            }
+        });
+        plan.link(link);
+        assert!(matches!(far.next(), ToCore::List(_)));
+        assert_eq!(hooked.recv_timeout(Duration::from_secs(10)).unwrap(), [3]);
+        assert!(connection.on_listing(hook(&got)).is_ok());
+        assert!(matches!(far.next(), ToCore::List(_)));
+        assert_eq!(hooked.recv_timeout(Duration::from_secs(10)).unwrap(), [3]);
+        assert!(hooked.recv_timeout(Duration::from_millis(300)).is_err(), "each runs once");
+        assert!(!connection.state.lock().in_use(), "nothing waits any more");
+
+        let (ended, plan) = relay("B9");
+        plan.next_dial();
+        plan.fail("offline");
+        eventually("the connection ends", || ended.is_dead());
+        assert!(ended.on_listing(hook(&got)).is_err());
     }
 
     #[test]

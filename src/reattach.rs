@@ -1,11 +1,87 @@
 //! The detached terminal server sessions a launch attaches (Linux and
-//! Windows): listed
-//! once before any window opens, then taken by the restored zones whose
-//! recorded session they are, and the rest opened as tabs of the first
-//! window, oldest first.
+//! Windows): this machine's, listed once before any window opens, then
+//! taken by the restored zones whose recorded session they are, and the rest
+//! opened as tabs of the first window, oldest first. Each remote endpoint
+//! the launch connects to does the same once it first answers, with the
+//! tabs at the end ([`sweep`], design.md decision 10). Either way a session
+//! whose owner may still come back is left alone ([`sweepable`], decision
+//! 13).
 
+use crate::config::{Config, Profile};
+use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::ServerSession;
+
+/// How long a session's owner may still come back for it: until then a
+/// launch doesn't attach it unless a restored zone recorded it.
+pub const OWNER_GRACE_SECS: u64 = 5 * 60;
+
+/// Whether a launch attaches `info` as a tab of its own: detached, and with
+/// no owner, or one gone for more than [`OWNER_GRACE_SECS`]. The rest stay
+/// in the sessions palette.
+pub fn sweepable(info: &SessionInfo) -> bool {
+    !info.attached && (!info.owned || info.detached_secs > OWNER_GRACE_SECS)
+}
+
+/// The profile a session of this machine's server opens with: the one it
+/// was started with, unless that is gone or a remote one; then the default.
+pub fn local_profile(info: &SessionInfo, config: &Config) -> usize {
+    info.profile
+        .as_deref()
+        .and_then(|name| config.profile_index(name))
+        .filter(|&index| config.profiles[index].remote.is_none())
+        .unwrap_or_else(|| config.default_profile_index())
+}
+
+/// The profile a session of `host`'s server opens with: the one it was
+/// started with when that targets `host`, else the first profile that
+/// does. `None` when none does.
+pub fn remote_profile(info: &SessionInfo, host: &Host, config: &Config) -> Option<usize> {
+    let on_host = |index: &usize| Host::of(&config.profiles[*index]) == *host;
+    info.profile
+        .as_deref()
+        .and_then(|name| config.profile_index(name))
+        .filter(on_host)
+        .or_else(|| (0..config.profiles.len()).find(on_host))
+}
+
+/// What a remote endpoint's first listing of the launch attaches as tabs:
+/// the [`sweepable`] sessions not in `skip` (those restored into a zone, or
+/// shown already), in start order.
+pub fn sweep(listed: Vec<SessionInfo>, skip: &[ServerSession]) -> Vec<SessionInfo> {
+    let mut sessions: Vec<SessionInfo> = listed
+        .into_iter()
+        .filter(sweepable)
+        .filter(|info| !skip.iter().any(|s| s.id == info.session && s.key == info.key))
+        .collect();
+    sessions.sort_by_key(|s| (s.started, s.session));
+    sessions
+}
+
+/// Whether `profile` connects at launch. Its `connect_at_launch` setting
+/// comes with task 8.1; until then no profile does.
+pub fn connects_at_launch(_profile: &Profile) -> bool {
+    false
+}
+
+/// The remote endpoints a restoring launch connects to: those of its
+/// restored remote zones (`restored`), then those of the profiles that
+/// connect at launch, each once. The flag marks the latter, whose
+/// connections stay eager.
+pub fn launch_hosts(restored: &[Host], config: &Config) -> Vec<(Host, bool)> {
+    let mut hosts: Vec<(Host, bool)> = Vec::new();
+    let eager = config.profiles.iter().filter(|p| connects_at_launch(p)).map(|p| (Host::of(p), true));
+    for (host, eager) in restored.iter().map(|host| (host.clone(), false)).chain(eager) {
+        if host.is_local() {
+            continue;
+        }
+        match hosts.iter_mut().find(|(known, _)| *known == host) {
+            Some((_, known_eager)) => *known_eager |= eager,
+            None => hosts.push((host, eager)),
+        }
+    }
+    hosts
+}
 
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
 /// launches, for a Brindle that doesn't own the session state, and where
@@ -38,9 +114,11 @@ impl Detached {
         self.sessions.iter().position(|s| s.session == recorded.id && !s.key.is_empty() && s.key == recorded.key)
     }
 
-    /// Everything not taken, in start order.
+    /// Everything not taken that a launch attaches ([`sweepable`]), in
+    /// start order. A restored zone takes its own session whatever its
+    /// owner, so the owner rule applies only here.
     pub fn take_rest(&mut self) -> Vec<SessionInfo> {
-        let mut rest = std::mem::take(&mut self.sessions);
+        let mut rest: Vec<SessionInfo> = std::mem::take(&mut self.sessions).into_iter().filter(sweepable).collect();
         rest.sort_by_key(|s| (s.started, s.session));
         rest
     }
@@ -115,6 +193,110 @@ mod tests {
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [2, 1, 4]);
         assert!(detached.take_rest().is_empty());
+    }
+
+    fn owned(session: u32, key: &str, started: u64, detached_secs: u64) -> SessionInfo {
+        SessionInfo { owned: true, detached_secs, ..info(session, key, started) }
+    }
+
+    /// 7.3: a session whose owner left it less than 5 minutes ago may be
+    /// about to come back for it: the launch leaves it in the palette,
+    /// though a restored zone still takes its own.
+    #[test]
+    fn the_rest_leaves_a_recent_owners_sessions_alone() {
+        let mut detached = Detached::new(vec![
+            owned(1, "a", 10, 60),
+            owned(2, "b", 20, OWNER_GRACE_SECS + 1),
+            info(3, "c", 5),
+            owned(4, "d", 1, OWNER_GRACE_SECS),
+            owned(5, "e", 2, 30),
+        ]);
+        assert_eq!(detached.take(&ServerSession { id: 5, key: "e".into() }).map(|s| s.session), Some(5));
+        let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
+        assert_eq!(rest, [3, 2]);
+    }
+
+    /// 7.2: a remote endpoint's first listing attaches its detached
+    /// sessions in start order, except those restored into zones (by id and
+    /// key: a reused id is another session), those another client shows, and
+    /// those a recent owner may come back for.
+    #[test]
+    fn a_sweep_takes_what_no_zone_restored_oldest_first_by_the_owner_rule() {
+        let mut shown = info(6, "f", 1);
+        shown.attached = true;
+        let listed = vec![
+            info(4, "d", 40),
+            info(1, "a", 10),
+            owned(2, "b", 20, 59),
+            owned(3, "c", 30, 301),
+            shown,
+            info(5, "new", 5),
+            info(7, "g", 10),
+        ];
+        let restored = [ServerSession { id: 1, key: "a".into() }, ServerSession { id: 5, key: "old".into() }];
+        let swept: Vec<u32> = sweep(listed, &restored).iter().map(|s| s.session).collect();
+        assert_eq!(swept, [5, 7, 3, 4]);
+        assert!(sweep(Vec::new(), &restored).is_empty());
+    }
+
+    fn profiles() -> Config {
+        Config::parse(
+            "default_profile = \"Shell\"\n\
+             [[profiles]]\nname = \"Shell\"\n\
+             [[profiles]]\nname = \"htop on A8\"\ncommand = \"htop\"\nremote = { type = \"ssh\", host = \"A8\" }\n\
+             [[profiles]]\nname = \"A8\"\nremote = { type = \"ssh\", host = \"A8\" }\n\
+             [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n\
+             [[profiles]]\nname = \"Work\"\n",
+        )
+        .unwrap()
+    }
+
+    fn started_with(profile: Option<&str>) -> SessionInfo {
+        SessionInfo { profile: profile.map(Into::into), ..info(1, "k", 0) }
+    }
+
+    /// 7.2: a remote session opens with the profile it was started with
+    /// when that targets its endpoint, else the first profile that does.
+    #[test]
+    fn a_remote_session_opens_with_a_profile_on_its_endpoint() {
+        let config = profiles();
+        let a8 = Host::of(&config.profiles[2]);
+        assert_eq!(remote_profile(&started_with(Some("A8")), &a8, &config), Some(2));
+        assert_eq!(remote_profile(&started_with(Some("a8")), &a8, &config), Some(2));
+        // Started from another machine with a profile this one lacks, with
+        // a local profile, with one on another host, or with none.
+        for other in [Some("Laptop A8"), Some("Work"), Some("B9"), None] {
+            assert_eq!(remote_profile(&started_with(other), &a8, &config), Some(1), "{other:?}");
+        }
+        // No profile targets the endpoint.
+        let c3 = Host::Remote(crate::config::RemoteTarget::Ssh {
+            host: "C3".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        });
+        assert_eq!(remote_profile(&started_with(Some("A8")), &c3, &config), None);
+    }
+
+    /// 7.3: a session of this machine's server opens with the profile it
+    /// was started with, or the default one when that is gone or remote.
+    #[test]
+    fn a_local_session_opens_with_its_local_profile_or_the_default() {
+        let config = profiles();
+        assert_eq!(local_profile(&started_with(Some("Work")), &config), 4);
+        assert_eq!(local_profile(&started_with(Some("A8")), &config), 0);
+        assert_eq!(local_profile(&started_with(Some("Gone")), &config), 0);
+        assert_eq!(local_profile(&started_with(None), &config), 0);
+    }
+
+    #[test]
+    fn a_launch_connects_to_each_restored_remote_endpoint_once() {
+        let config = profiles();
+        let (a8, b9) = (Host::of(&config.profiles[1]), Host::of(&config.profiles[3]));
+        let hosts = launch_hosts(&[a8.clone(), Host::Local, b9.clone(), Host::of(&config.profiles[2])], &config);
+        assert_eq!(hosts, [(a8, false), (b9, false)]);
+        assert!(launch_hosts(&[], &config).is_empty(), "no profile connects at launch yet");
     }
 
     #[test]
