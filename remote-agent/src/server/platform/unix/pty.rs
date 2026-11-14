@@ -136,6 +136,14 @@ impl Group {
     }
 }
 
+/// The foreground program of the terminal that a session's program `pid`
+/// controls, for the core's `PROCESS` reports: from `/proc`, so it costs
+/// a few file reads.
+pub fn foreground(pid: u32) -> Option<pty::Foreground> {
+    let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    Some(pty::foreground_process(pid))
+}
+
 /// The program `request` runs: its command, or the login shell.
 pub fn program_name(request: &PtyCommand) -> OsString {
     request.program()

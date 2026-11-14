@@ -362,6 +362,13 @@ pub fn reparent(program: Option<&Program>, hwnd: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// A session's foreground program, for the core's `PROCESS` reports: none
+/// on Windows, whose clients find it themselves (a console has no
+/// foreground process group to read).
+pub fn foreground(_pid: u32) -> Option<crate::pty::Foreground> {
+    None
+}
+
 /// An error of [`crate::conpty`] with its Win32 code. Those carry it as an
 /// `HRESULT`, which `io::Error` can't tell the kind of.
 fn plain(error: io::Error) -> io::Error {

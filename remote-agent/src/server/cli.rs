@@ -33,7 +33,7 @@ usage: brindle-remote <command>
   serve [--ready-fd N]              run the terminal server's core
   hold [--ready-fd N]               run a holder (started by the core)
   check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
-  list [--json]                     the server's sessions: id, pid, state, policy, age, title, command, directory
+  list [--json]                     the server's sessions: id, pid, state, owner, time detached, policy, age, title, command, directory
   kill ID | kill --all              hang up one session, or all of them
   status [--json]                   the core and its holders
   stop                              hang up every session and stop the server
@@ -49,7 +49,7 @@ usage: brindle-remote <command>
   hold [--ready-handle N]           run a holder (started by the core)
   launch <role> [--ready-handle N]  internal: start serve or hold detached
   check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
-  list [--json]                     the server's sessions: id, pid, state, policy, age, title, command, directory
+  list [--json]                     the server's sessions: id, pid, state, owner, time detached, policy, age, title, command, directory
   kill ID | kill --all              hang up one session, or all of them
   status [--json]                   the core and its holders
   stop                              hang up every session and stop the server
@@ -106,13 +106,17 @@ fn list(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// One `list` line: id, pid, attached or detached, policy, age (`-` from a
-/// core that doesn't report it), title (`-` when none), command, directory.
+/// One `list` line: id, pid, attached or detached; for a detached session,
+/// whether it is `owned` (its last client left without detaching it, and
+/// may come back for it) or `unowned`, and how long it has been detached
+/// (both `-` when attached); policy, age (`-` from a core that doesn't
+/// report it), title (`-` when none), command, directory.
 fn list_line(session: &SessionInfo, now: u64) -> String {
-    let state = if session.attached {
-        "attached"
+    let (state, owner, detached) = if session.attached {
+        ("attached", "-", "-".to_string())
     } else {
-        "detached"
+        let owner = if session.owned { "owned" } else { "unowned" };
+        ("detached", owner, uptime(session.detached_secs))
     };
     let command = if session.command.is_empty() {
         "(login shell)"
@@ -129,7 +133,7 @@ fn list_line(session: &SessionInfo, now: u64) -> String {
     };
     let title = if session.title.is_empty() { "-" } else { &session.title };
     format!(
-        "{}\t{}\t{state}\t{policy}\t{age}\t{title}\t{command}\t{}",
+        "{}\t{}\t{state}\t{owner}\t{detached}\t{policy}\t{age}\t{title}\t{command}\t{}",
         session.session,
         session.pid,
         session.cwd.as_deref().unwrap_or("-")
@@ -358,9 +362,17 @@ mod tests {
         };
         assert_eq!(
             list_line(&session, 1065),
-            "3\t4242\tattached\tkill\t1m05s\thtop\thtop -d 5\t/home/u"
+            "3\t4242\tattached\t-\t-\tkill\t1m05s\thtop\thtop -d 5\t/home/u"
         );
         session.attached = false;
+        session.owned = true;
+        session.detached_secs = 30;
+        assert_eq!(
+            list_line(&session, 1065),
+            "3\t4242\tdetached\towned\t30s\tkill\t1m05s\thtop\thtop -d 5\t/home/u"
+        );
+        session.owned = false;
+        session.detached_secs = 0;
         session.policy = client::Policy::Detach;
         session.command.clear();
         session.cwd = None;
@@ -368,7 +380,7 @@ mod tests {
         session.started = 0;
         assert_eq!(
             list_line(&session, 1065),
-            "3\t4242\tdetached\tdetach\t-\t-\t(login shell)\t-"
+            "3\t4242\tdetached\tunowned\t0s\tdetach\t-\t-\t(login shell)\t-"
         );
     }
 

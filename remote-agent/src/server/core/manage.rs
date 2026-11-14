@@ -2,7 +2,11 @@
 //!
 //! - **`LIST`** answers `SESSIONS`: every running session with its pid,
 //!   whether a client has it, its command and directory (from the meta the
-//!   core keeps), its policy and size.
+//!   core keeps), its policy and size. A session with no client says
+//!   whether it still has an owner (`owned`: its last client left without
+//!   detaching it, so it may come back for it) and for how long it has had
+//!   no client (`detached_secs`, counted from its adoption when this core
+//!   adopted it without one).
 //! - **`STATUS`** answers `SERVER_STATUS`: the core's version, build,
 //!   protocol ranges, pid, uptime and client count, and each adopted
 //!   holder's pid, build, H1 version, session count and draining flag.
@@ -11,6 +15,8 @@
 //!   holders. Only then does the asking client get its `OK`, so the core it
 //!   starts next finds the checkpoints. The other clients' connections
 //!   close, and they reconnect to the next core.
+
+use std::time::Instant;
 
 use brindle_remote_protocol::RequestId;
 use brindle_remote_protocol::client::{
@@ -26,25 +32,32 @@ impl<L: EventLoop> Core<L> {
     /// `LIST`: the running sessions. Ones still starting, or whose program
     /// exited while their owner was away, aren't listed.
     pub(super) fn client_list(&mut self, client: Token, req: RequestId) {
+        let now = Instant::now();
         let sessions = self
             .sessions
             .iter()
             .filter(|(_, session)| session.is_running())
-            .map(|(&id, session)| SessionInfo {
-                session: id,
-                pid: session.pid,
-                attached: session.attached.is_some(),
-                command: session.meta.command.clone(),
-                cwd: session.meta.cwd.clone(),
-                policy: session.meta.policy,
-                cols: session.cols,
-                rows: session.rows,
-                key: session.meta.key.clone(),
-                title: session.screen.title(),
-                started: session.meta.started,
-                profile: session.meta.profile.clone(),
-                // Task 3.4 fills these in.
-                ..Default::default()
+            .map(|(&id, session)| {
+                let detached = session.attached.is_none();
+                SessionInfo {
+                    session: id,
+                    pid: session.pid,
+                    attached: !detached,
+                    command: session.meta.command.clone(),
+                    cwd: session.meta.cwd.clone(),
+                    policy: session.meta.policy,
+                    cols: session.cols,
+                    rows: session.rows,
+                    key: session.meta.key.clone(),
+                    title: session.screen.title(),
+                    started: session.meta.started,
+                    profile: session.meta.profile.clone(),
+                    owned: detached && !session.meta.owner.is_empty(),
+                    detached_secs: session
+                        .detached_since
+                        .filter(|_| detached)
+                        .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
+                }
             })
             .collect();
         self.send_client(client, ToClient::Sessions(Sessions { req, sessions }));

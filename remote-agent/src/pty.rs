@@ -1,7 +1,7 @@
 //! PTY sessions shared by the stdio agent (`--server`) and the terminal
-//! server's holder: what to run on a new PTY and the shutdown timings here,
-//! and the Linux PTY itself (spawning, resizing, signalling, `/proc`
-//! queries) in [`unix`].
+//! server's holder and core: what to run on a new PTY, the shutdown timings
+//! and a session's foreground program here, and the Linux PTY itself
+//! (spawning, resizing, signalling, `/proc` queries) in `unix`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -38,4 +38,18 @@ pub struct PtyCommand<'a> {
     /// `env` is the program's whole environment. Otherwise it is added to
     /// this process's own, with a default `TERM`.
     pub exact_env: bool,
+}
+
+/// A session's foreground program, as the core reports it to clients that
+/// ask (client protocol 2's `PROCESS`).
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "a Windows core reports no process info")
+)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Foreground {
+    /// Its name (`comm`); `None` when unknown.
+    pub name: Option<String>,
+    /// Its working directory; `None` when unknown.
+    pub cwd: Option<String>,
 }

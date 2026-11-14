@@ -1,5 +1,6 @@
-//! `brindle-remote serve`, driven by test clients over protocol 1, with real
-//! holders under it (task groups 4 and 5).
+//! `brindle-remote serve`, driven by test clients over the client protocol,
+//! with real holders under it (task groups 4 and 5, and the takeover, linger,
+//! owner and process info of `terminal-server-remote`).
 //!
 //! Most tests run on both platforms with the platform's own programs
 //! ([`programs`]). Those that need a Unix shell, exact PTY bytes, signals
@@ -1253,6 +1254,233 @@ fn an_attaching_client_owns_the_session_and_its_policy_applies_when_it_goes() {
         eventually(Duration::from_secs(5), || !alive(pid)),
         "the kill session outlived the client that attached it"
     );
+}
+
+// terminal-server-remote 3.1–3.4
+
+#[test]
+fn a_connection_with_a_connected_clients_token_takes_its_sessions_over() {
+    let (dir, mut first) = core("takeover");
+    let (killed, killed_pid) = first.spawn(programs::echoer());
+    let (kept, kept_pid) = first.spawn(detach(programs::echoer()));
+    say(&mut first, killed, "first");
+    say(&mut first, kept, "first");
+
+    // The first connection stays open, as a link that died silently
+    // leaves it, when the client connects again.
+    let mut second = TestClient::hello(&dir.path, "token-takeover");
+    let mut replayed: Vec<(SessionId, u32)> = (0..2)
+        .map(|_| {
+            let (start, _) = second.reconnect_replay();
+            (start.session, start.pid)
+        })
+        .collect();
+    replayed.sort_unstable();
+    assert_eq!(replayed, [(killed, killed_pid), (kept, kept_pid)]);
+    assert!(first.closes(), "the replaced connection stayed open");
+
+    // No close policy applied: the kill session runs on, as the second's.
+    thread::sleep(Duration::from_millis(500));
+    assert!(alive(killed_pid) && alive(kept_pid));
+    say(&mut second, killed, "second");
+    say(&mut second, kept, "second");
+    let logs = dir.logs();
+    assert!(logs.contains("which it replaces"), "{logs}");
+}
+
+/// A client whose `kill` sessions wait `secs` for it to come back.
+fn lingering(dir: &TempDir, token: &str, secs: u32) -> TestClient {
+    TestClient::hello_with(&dir.path, token, |hello| hello.linger_secs = secs)
+}
+
+#[test]
+fn a_lingering_clients_kill_session_is_given_back_when_it_returns_in_time() {
+    let mut dir = TempDir::new("linger-back");
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = lingering(&dir, "back", 3);
+    dir.track(client.core_pid());
+    let (session, pid) = client.spawn(programs::echoer());
+    say(&mut client, session, "before");
+    drop(client);
+    thread::sleep(Duration::from_secs(1));
+    assert!(alive(pid), "the kill session ended with its connection");
+
+    let mut client = lingering(&dir, "back", 3);
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (session, pid));
+    // Back in time, so the linger no longer counts.
+    thread::sleep(Duration::from_secs(4));
+    assert!(alive(pid), "hung up although its client came back");
+    say(&mut client, session, "after");
+}
+
+#[test]
+fn a_kill_session_ends_when_its_lingering_client_doesnt_return_and_at_once_without_a_linger() {
+    let mut dir = TempDir::new("linger-gone");
+    start_core(&dir.path, &[]).unwrap();
+    let mut away = lingering(&dir, "away", 4);
+    dir.track(away.core_pid());
+    let mut plain = TestClient::hello(&dir.path, "plain");
+    let (waits, waits_pid) = away.spawn(programs::echoer());
+    let (ends, ends_pid) = plain.spawn(programs::echoer());
+    say(&mut away, waits, "up");
+    say(&mut plain, ends, "up");
+
+    let left = Instant::now();
+    drop(away);
+    drop(plain);
+    assert!(
+        eventually(Duration::from_secs(3), || !alive(ends_pid)),
+        "a kill session without a linger outlived its client"
+    );
+    assert!(alive(waits_pid), "the lingering session ended after {:?}", left.elapsed());
+    assert!(gone(waits_pid), "the lingering session never ended");
+    assert!(
+        left.elapsed() >= Duration::from_secs(3),
+        "hung up after {:?}",
+        left.elapsed()
+    );
+}
+
+#[test]
+fn the_session_list_tells_a_dropped_owner_from_an_explicit_detach() {
+    let (dir, mut owner) = core("owned");
+    let (dropped, _) = owner.spawn(detach(programs::echoer()));
+    let (released, _) = owner.spawn(detach(programs::echoer()));
+    owner.detach(released);
+    let mut observer = TestClient::hello(&dir.path, "observer");
+    let listed = |observer: &mut TestClient, session: SessionId| {
+        let sessions = observer.list();
+        sessions.into_iter().find(|info| info.session == session).unwrap()
+    };
+    // A client has it: neither owned for a return nor detached.
+    let info = listed(&mut observer, dropped);
+    assert!(info.attached && !info.owned && info.detached_secs == 0, "{info:?}");
+
+    drop(owner);
+    assert!(
+        eventually(TIMEOUT, || !listed(&mut observer, dropped).attached),
+        "the session kept its client"
+    );
+    thread::sleep(Duration::from_millis(2100));
+    let info = listed(&mut observer, dropped);
+    assert!(!info.attached && info.owned, "{info:?}");
+    assert!((2..60).contains(&info.detached_secs), "{info:?}");
+    let info = listed(&mut observer, released);
+    assert!(!info.attached && !info.owned, "{info:?}");
+    assert!((2..60).contains(&info.detached_secs), "{info:?}");
+}
+
+/// A client that negotiated protocol 2 and asked for process info.
+#[cfg(unix)]
+fn asking_for_processes(dir: &TempDir, token: &str) -> TestClient {
+    let client = TestClient::hello_with(&dir.path, token, |hello| hello.process_info = true);
+    assert_eq!(client.welcome.as_ref().unwrap().protocol, 2);
+    client
+}
+
+/// An interactive shell, so with job control: what it runs becomes the
+/// terminal's foreground process group. Its prompt is `ready> `.
+#[cfg(unix)]
+fn interactive_shell() -> client::Spawn {
+    let mut spawn = client_spawn("/bin/sh", &["-i"]);
+    spawn.env.insert("PS1".into(), "ready> ".into());
+    spawn.cwd = Some("/".into());
+    spawn
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_asks_is_told_of_the_foreground_program_when_it_changes() {
+    let mut dir = TempDir::new("process");
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = asking_for_processes(&dir, "asks");
+    dir.track(client.core_pid());
+    let (session, _) = client.spawn(interactive_shell());
+    client.output_until(session, b"ready> ");
+    // Once after the start: the shell, in its directory.
+    let first = client
+        .process_within(session, TIMEOUT)
+        .expect("no PROCESS after the start");
+    assert_ne!(first.name.as_deref(), Some("sleep"), "{first:?}");
+    assert_eq!(first.cwd.as_deref(), Some("/"), "{first:?}");
+
+    // A program started in the shell, which prints nothing.
+    let typed = Instant::now();
+    client.input(session, b"cd /tmp && sleep 1000\n");
+    let sleep = loop {
+        let process = client
+            .process_within(session, (typed + TIMEOUT).saturating_duration_since(Instant::now()))
+            .expect("never told of sleep");
+        if process.name.as_deref() == Some("sleep") {
+            break process;
+        }
+    };
+    assert!(typed.elapsed() < Duration::from_secs(3), "told after {:?}", typed.elapsed());
+    assert_eq!(sleep.cwd.as_deref(), Some("/tmp"), "{sleep:?}");
+
+    // An attach tells the client once, though nothing changed.
+    client.detach(session);
+    client.attach(session, 80, 24).unwrap();
+    let again = client
+        .process_within(session, Duration::from_secs(5))
+        .expect("no PROCESS after the attach");
+    assert_eq!(again, sleep);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_idle_session_is_not_looked_at() {
+    let mut dir = TempDir::new("process-idle");
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = asking_for_processes(&dir, "asks");
+    dir.track(client.core_pid());
+    // Its foreground program changes 3 s in, with no output or input.
+    let started = Instant::now();
+    let (session, pid) = client.spawn(client_shell("printf 'ready.'; sleep 3; exec sleep 1000"));
+    client.output_until(session, b"ready.");
+    let first = client
+        .process_within(session, TIMEOUT)
+        .expect("no PROCESS after the start");
+    assert_eq!(first.name.as_deref(), Some("sh"), "{first:?}");
+
+    // A core that looked at idle sessions would report `sleep` by now.
+    let late = client.process_within(
+        session,
+        (started + Duration::from_secs(7)).saturating_duration_since(Instant::now()),
+    );
+    assert!(late.is_none(), "told of an idle session: {late:?}");
+    assert_eq!(program_of(pid).as_deref(), Some("sleep"));
+
+    // Input makes it look again.
+    client.input(session, b"x");
+    let woken = client
+        .process_within(session, Duration::from_secs(5))
+        .expect("input made the core look at nothing");
+    assert_eq!(woken.name.as_deref(), Some("sleep"), "{woken:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn only_a_protocol_2_client_that_asks_is_told() {
+    let mut dir = TempDir::new("process-p1");
+    start_core(&dir.path, &[]).unwrap();
+    // It asks, but speaks only protocol 1.
+    let mut old = TestClient::hello_with(&dir.path, "old", |hello| {
+        hello.max = 1;
+        hello.process_info = true;
+    });
+    dir.track(old.core_pid());
+    assert_eq!(old.welcome.as_ref().unwrap().protocol, 1);
+    // It speaks protocol 2, but doesn't ask.
+    let mut quiet = TestClient::hello(&dir.path, "quiet");
+    for client in [&mut old, &mut quiet] {
+        let (session, _) = client.spawn(client_shell("printf 'ready.'; read x; exec sleep 1000"));
+        client.output_until(session, b"ready.");
+        client.input(session, b"\n");
+        let told = client.process_within(session, Duration::from_secs(3));
+        assert!(told.is_none(), "{told:?}");
+    }
 }
 
 /// `REPARENT` is for Windows: a Linux core refuses it, and goes on.

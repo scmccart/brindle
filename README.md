@@ -139,7 +139,7 @@ shows the old holders draining until their sessions end.
 These commands manage the server of that directory, and never start one:
 
 ```sh
-brindle-remote list [--json]     # id, pid, attached/detached, policy, age, title, command, directory
+brindle-remote list [--json]     # id, pid, attached/detached, owned/unowned, time detached, policy, age, title, command, directory
 brindle-remote kill ID           # hang one session up (kill --all for every one)
 brindle-remote status [--json]   # the core's version, pid and uptime, and its holders
 brindle-remote stop              # hang every session up; the core and holders exit

@@ -15,6 +15,10 @@
 //!   [`CLIENT_QUEUE_HIGH`] queued to a client, its sessions are paused in
 //!   their holders until the queue is under [`CLIENT_QUEUE_LOW`], so a
 //!   stalled client blocks only its own programs.
+//! - **Takeover:** a client that connects with the token of one still
+//!   connected replaces it: the old connection, which stopped delivering
+//!   without closing (a dropped network link), is closed, and its sessions
+//!   go to the new one with their replays, with no close policy applied.
 //! - **Holders** ([`holders`]): found by their `holder-*.sock` sockets (on
 //!   Windows by their lock files, which name their pipes), live ones told
 //!   from stale ones by their lock files, and adopted (`HELLO`,
@@ -23,12 +27,21 @@
 //!   continue from the largest adopted one and returning clients find their
 //!   sessions. A holder of the core's own build is started when a session
 //!   needs one, and holders of other builds are told to `DRAIN`.
-//! - **Management and upgrades** ([`manage`]): `LIST`, `STATUS`, and
-//!   `STEP_DOWN`, after which the core exits for the next one.
+//! - **Management and upgrades** ([`manage`]): `LIST` (whose detached
+//!   sessions say whether their owner may come back, and since when they
+//!   have had no client), `STATUS`, and `STEP_DOWN`, after which the core
+//!   exits for the next one.
 //! - **Sessions** ([`sessions`]): spawned through a holder, with their I/O,
 //!   the close policies and, after adopting sessions, the
-//!   [`RECONNECT_GRACE`] for their owners to come back. Each has an
-//!   emulator ([`screen`]) fed with all of its output.
+//!   [`RECONNECT_GRACE`] for their owners to come back. A client may ask
+//!   for a linger of its own (`HELLO`'s `linger_secs`, at most
+//!   [`MAX_LINGER`]): its `kill` sessions then wait that long for it after
+//!   its connection ends. Each session has an emulator ([`screen`]) fed with
+//!   all of its output.
+//! - **Process info** ([`process`]): clients that negotiated protocol 2 and
+//!   asked are told of their sessions' foreground programs (`PROCESS`),
+//!   looked at once a second in sessions that had output or input. A
+//!   Windows core reports none.
 //! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, once
 //!   `STOP` has ended every session, or after `STEP_DOWN`. On Linux the
 //!   socket is removed first.
@@ -39,6 +52,7 @@
 mod clients;
 mod holders;
 mod manage;
+mod process;
 mod screen;
 mod sessions;
 
@@ -66,6 +80,9 @@ pub const UNUSED_LIMIT: Duration = Duration::from_secs(5);
 /// After a core starts with adopted sessions, their owners have this long to
 /// come back before their `kill` sessions are hung up.
 pub const RECONNECT_GRACE: Duration = Duration::from_secs(10);
+/// The longest a client may ask its `kill` sessions to wait for it
+/// (`HELLO`'s `linger_secs`).
+pub const MAX_LINGER: Duration = Duration::from_secs(600);
 /// Past this much queued to a client, its sessions are paused...
 pub const CLIENT_QUEUE_HIGH: usize = 1024 * 1024;
 /// ...until its queue is back under this.
@@ -259,6 +276,8 @@ pub(super) struct Core<L: EventLoop> {
     next_session: SessionId,
     /// While the owners of adopted sessions may still come back.
     grace_until: Option<Instant>,
+    /// When the core next looks at the sessions' foreground programs.
+    next_look: Instant,
     idle_since: Option<Instant>,
     /// Answered once every session has ended.
     stopping: Option<Answer>,
@@ -304,6 +323,7 @@ impl<L: EventLoop> Core<L> {
             sessions: BTreeMap::new(),
             next_session: 1,
             grace_until: None,
+            next_look: Instant::now() + process::PROCESS_LOOK,
             idle_since: None,
             stopping: None,
             stepping_down: None,
@@ -437,6 +457,11 @@ impl<L: EventLoop> Core<L> {
         if self.grace_until.is_some_and(|until| now >= until) {
             self.grace_until = None;
             self.end_grace();
+        }
+        self.end_lingering(now);
+        if now >= self.next_look {
+            self.next_look = now + process::PROCESS_LOOK;
+            self.look_at_processes(now);
         }
         self.check_holder_start(now);
         let idle = self.sessions.is_empty()

@@ -554,14 +554,22 @@ impl TestClient {
 
     /// Connects and says `HELLO` with `token`, expecting `WELCOME`.
     pub fn hello(dir: &Path, token: &str) -> Self {
-        let mut client = Self::connect(dir);
-        client.send(client::ToCore::Hello(client::Hello {
+        Self::hello_with(dir, token, |_| {})
+    }
+
+    /// Connects and says `HELLO` with `token`, as `edit` changes it (a
+    /// linger, process info, another protocol range), expecting `WELCOME`.
+    pub fn hello_with(dir: &Path, token: &str, edit: impl FnOnce(&mut client::Hello)) -> Self {
+        let mut hello = client::Hello {
             min: client::PROTOCOLS.min,
             max: client::PROTOCOLS.max,
             client_version: "test".into(),
             client_token: token.into(),
             ..Default::default()
-        }));
+        };
+        edit(&mut hello);
+        let mut client = Self::connect(dir);
+        client.send(client::ToCore::Hello(hello));
         match client.recv() {
             ToClient::Welcome(welcome) => client.welcome = Some(welcome),
             other => panic!("expected WELCOME, got {other:?}"),
@@ -827,6 +835,40 @@ impl TestClient {
 
     pub fn detach(&mut self, session: SessionId) {
         self.send(client::ToCore::Detach(client::SessionRef { session }));
+    }
+
+    /// The next `PROCESS` for `session` within `timeout`, if one comes.
+    /// Other messages are kept for later.
+    pub fn process_within(
+        &mut self,
+        session: SessionId,
+        timeout: Duration,
+    ) -> Option<client::Process> {
+        let deadline = Instant::now() + timeout;
+        let mut kept: Vec<ToClient> = self.backlog.drain(..).collect();
+        // One already received comes first.
+        let found = match kept
+            .iter()
+            .position(|message| matches!(message, ToClient::Process(p) if p.session == session))
+        {
+            Some(at) => match kept.remove(at) {
+                ToClient::Process(process) => Some(process),
+                _ => unreachable!(),
+            },
+            None => loop {
+                match self.next(deadline.saturating_duration_since(Instant::now())) {
+                    Recv::Message(ToClient::Process(process)) if process.session == session => {
+                        break Some(process);
+                    }
+                    Recv::Message(other) => kept.push(other),
+                    Recv::TimedOut => break None,
+                    Recv::Closed => panic!("the core closed the connection"),
+                }
+            },
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        found
     }
 
     /// Sends a request built with a fresh `req` and returns its reply.

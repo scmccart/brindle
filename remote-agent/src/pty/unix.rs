@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use super::PtyCommand;
+use super::{Foreground, PtyCommand};
 
 /// How long to wait for a session to go after `SIGKILL`.
 pub const FORCED_SHUTDOWN: Duration = Duration::from_secs(1);
@@ -319,8 +319,32 @@ pub fn inspect_process(
     let pid = foreground_group
         .and_then(find_process_in_group)
         .unwrap_or(child_pid);
+    let Foreground { name, cwd } = describe(pid, child_pid);
+    brindle_remote_protocol::ProcessInfo {
+        pid: pid.max(0) as u32,
+        foreground_name: name,
+        cwd,
+    }
+}
+
+/// The foreground process of the terminal that `pid` (a session's
+/// program) controls, else `pid` itself: its name and working directory.
+/// For the terminal server's core, which knows a session's program but not
+/// its PTY, so it reads the terminal's foreground group (`tpgid`) from
+/// `/proc/<pid>/stat` instead of asking the PTY.
+pub fn foreground_process(pid: libc::pid_t) -> Foreground {
+    let foreground = stat_field(pid, STAT_TPGID)
+        .filter(|group| *group > 0)
+        .and_then(find_process_in_group)
+        .unwrap_or(pid);
+    describe(foreground, pid)
+}
+
+/// The name and working directory of `pid`; the directory of `fallback`
+/// (the session's program) when `pid`'s can't be read.
+fn describe(pid: libc::pid_t, fallback: libc::pid_t) -> Foreground {
     let proc_dir = format!("/proc/{pid}");
-    let foreground_name = fs::read_to_string(format!("{proc_dir}/comm"))
+    let name = fs::read_to_string(format!("{proc_dir}/comm"))
         .ok()
         .map(|name| {
             name.trim_end_matches(|character| character == '\r' || character == '\n')
@@ -328,14 +352,27 @@ pub fn inspect_process(
         })
         .filter(|name| !name.is_empty());
     let cwd = fs::read_link(format!("{proc_dir}/cwd"))
-        .or_else(|_| fs::read_link(format!("/proc/{child_pid}/cwd")))
+        .or_else(|_| fs::read_link(format!("/proc/{fallback}/cwd")))
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
-    brindle_remote_protocol::ProcessInfo {
-        pid: pid.max(0) as u32,
-        foreground_name,
-        cwd,
-    }
+    Foreground { name, cwd }
+}
+
+/// `/proc/<pid>/stat`'s fields after the command, counted from 0: state,
+/// ppid, pgrp, session, tty_nr, tpgid (fields 3 to 8 in proc(5)).
+const STAT_PGRP: usize = 2;
+const STAT_TPGID: usize = 5;
+
+fn stat_field(pid: libc::pid_t, field: usize) -> Option<libc::pid_t> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_field(&stat, field)
+}
+
+/// A numeric field of a `/proc/<pid>/stat` line, counted from the one
+/// after the command, which may itself hold spaces and parentheses.
+fn parse_stat_field(stat: &str, field: usize) -> Option<libc::pid_t> {
+    let fields = stat.get(stat.rfind(')')? + 1..)?;
+    fields.split_whitespace().nth(field)?.parse().ok()
 }
 
 fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
@@ -359,10 +396,7 @@ fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
 }
 
 fn process_group(pid: libc::pid_t) -> Option<libc::pid_t> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields = stat.get(stat.rfind(')')? + 1..)?;
-    // Fields after the command are: state (3), ppid (4), pgrp (5).
-    fields.split_whitespace().nth(2)?.parse().ok()
+    stat_field(pid, STAT_PGRP)
 }
 
 /// Sends `signal` to the process group led by `pid` (a session's program,
@@ -378,6 +412,32 @@ pub fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_fields_count_from_after_the_command() {
+        // A command with spaces and parentheses of its own.
+        let stat = "4242 (my (odd) cmd) S 1 4240 4240 34816 4250 4194560 101 0 0 0";
+        assert_eq!(parse_stat_field(stat, STAT_PGRP), Some(4240));
+        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(4250));
+        // No controlling terminal.
+        let stat = "7 (kthreadd) S 2 0 0 0 -1 2129984 0 0";
+        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(-1));
+        assert_eq!(parse_stat_field("garbage", STAT_TPGID), None);
+    }
+
+    #[test]
+    fn a_process_without_a_terminal_is_its_own_foreground() {
+        let pid = std::process::id() as libc::pid_t;
+        let own = foreground_process(pid);
+        // On a terminal or not, the answer is a process that runs.
+        assert!(own.name.is_some_and(|name| !name.is_empty()));
+        assert!(own.cwd.is_some());
+        // Without one, it is this process.
+        if stat_field(pid, STAT_TPGID).is_none_or(|group| group <= 0) {
+            let cwd = std::env::current_dir().unwrap();
+            assert_eq!(foreground_process(pid).cwd.map(PathBuf::from), Some(cwd));
+        }
+    }
 
     #[test]
     fn cwd_tilde_uses_remote_environment_home() {

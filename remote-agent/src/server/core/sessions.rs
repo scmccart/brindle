@@ -4,6 +4,12 @@
 //! - **`kill`** sessions end on `CLOSE`, `KILL` and `STOP`, and when their
 //!   owner is gone: its connection ended, or, for sessions a new core
 //!   adopted, it didn't come back within [`super::RECONNECT_GRACE`].
+//! - **Linger:** a client whose `HELLO` asked for `linger_secs` (at most
+//!   [`super::MAX_LINGER`]) gets that long to come back: its `kill`
+//!   sessions keep running when its connection ends, and are hung up only
+//!   once the time passes without it (an exit meanwhile is kept for it, as
+//!   for an adopted session). The linger lives only in this core: a new
+//!   core gives adopted sessions [`super::RECONNECT_GRACE`].
 //! - **`detach`** sessions end only on `CLOSE`, `KILL`, `STOP` or their
 //!   program's exit. Without a client they keep running.
 //! - **Owners** are `client_token`s. A client whose `HELLO` carries a
@@ -12,6 +18,9 @@
 //!   so no reconnect gives the session back, and makes a `kill` session
 //!   `detach`. Both changes go to the holder with `SET_META` (H1 version
 //!   2), so a later core sees them; a version 1 holder keeps the spawn's.
+//! - **Takeover:** a `HELLO` with the token of a client that is still
+//!   connected replaces that connection ([`Core::client_replaced`]): its
+//!   sessions go to the new one, with no close policy applied.
 //! - **Attach:** `ATTACH` gives a session with no client to the client,
 //!   after a replay of its screen (`REPLAY_START`, `DATA`…, `REPLAY_END`),
 //!   then applies the client's size. `DETACH` leaves it running with no
@@ -31,6 +40,8 @@
 //!   session's emulator is rebuilt from the holder's checkpoint and tail
 //!   (the tail alone, after `ESC c`, when it was truncated).
 
+use std::time::{Duration, Instant};
+
 use brindle_remote_protocol::client::{
     self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
 };
@@ -41,6 +52,7 @@ use super::clients::error;
 use super::holders::WaitingSpawn;
 use super::screen::Screen;
 use super::{Core, log};
+use crate::pty::Foreground;
 use crate::server::event_loop::{EventLoop, Token};
 
 /// How much of a replay each `DATA` carries.
@@ -102,6 +114,21 @@ pub(super) struct Session {
     pending_replay: Option<PendingReplay>,
     /// Its emulator, fed with all of its output.
     pub(super) screen: Screen,
+    /// A `kill` session whose client's connection ended, and which waits
+    /// until then for the client to come back (its `HELLO`'s
+    /// `linger_secs`).
+    linger_until: Option<Instant>,
+    /// Since when it has had no client: since its last client left, or
+    /// since it was adopted (when its client left before that, no core
+    /// knows). `None` while a client has it.
+    pub(super) detached_since: Option<Instant>,
+    /// It had output or input since the core last looked at its foreground
+    /// program, or was just started or attached ([`super::process`]).
+    pub(super) active: bool,
+    /// When its last output or input was.
+    pub(super) active_at: Instant,
+    /// The foreground program its client was last told of.
+    pub(super) foreground: Option<Foreground>,
 }
 
 struct PendingReplay {
@@ -115,6 +142,27 @@ impl Session {
     /// was away.
     pub(super) fn is_running(&self) -> bool {
         self.spawning.is_none() && self.exited.is_none()
+    }
+
+    /// Whether its client may be told of its foreground program now: its
+    /// program runs and isn't being hung up, and the client has its
+    /// `SPAWNED` or its replay already.
+    pub(super) fn reportable(&self) -> bool {
+        self.is_running() && !self.hung_up && self.pending_replay.is_none()
+    }
+
+    /// Output or input: the next look at its foreground program includes
+    /// it.
+    fn mark_active(&mut self) {
+        self.active = true;
+        self.active_at = Instant::now();
+    }
+
+    /// Started or attached: its client is told of its foreground program
+    /// at the next look, changed or not.
+    fn tell_foreground(&mut self) {
+        self.mark_active();
+        self.foreground = None;
     }
 
     /// A session reported in a holder's `WELCOME`. It has no client until
@@ -138,6 +186,11 @@ impl Session {
             rebuilding: Some(held.truncated),
             storing: None,
             pending_replay: None,
+            linger_until: None,
+            detached_since: Some(Instant::now()),
+            active: false,
+            active_at: Instant::now(),
+            foreground: None,
         }
     }
 }
@@ -263,6 +316,11 @@ impl<L: EventLoop> Core<L> {
                 storing: None,
                 pending_replay: None,
                 screen,
+                linger_until: None,
+                detached_since: None,
+                active: false,
+                active_at: Instant::now(),
+                foreground: None,
             },
         );
     }
@@ -286,6 +344,7 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.pid = pid;
+        session.tell_foreground();
         let req = session.spawning.take().map(|spawn| spawn.req);
         let client = session.attached;
         let key = session.meta.key.clone();
@@ -361,6 +420,7 @@ impl<L: EventLoop> Core<L> {
         // Attached or not, so a detached session's screen stays current.
         // Checkpoints wait for the end of the read (`checkpoint_due`).
         session.screen.feed(id, &bytes);
+        session.mark_active();
         // A client still waiting for its replay gets this output in it.
         if let Some(client) = session.attached
             && session.pending_replay.is_none()
@@ -454,14 +514,16 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// The program exited (`code` is `None` for a signal, or a lost holder):
-    /// the client gets `EXIT` and the session is gone. An adopted session
-    /// whose owner may still come back keeps its exit for the owner.
+    /// the client gets `EXIT` and the session is gone. An adopted or
+    /// lingering session whose owner may still come back keeps its exit for
+    /// the owner.
     pub(super) fn session_exited(&mut self, holder: Token, id: SessionId, code: Option<i32>) {
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
         log!("session {id}: exited ({code:?})");
-        if session.awaiting_owner && session.attached.is_none() && !session.hung_up {
+        let owner_may_return = session.awaiting_owner || session.linger_until.is_some();
+        if owner_may_return && session.attached.is_none() && !session.hung_up {
             session.exited = Some(code);
             return;
         }
@@ -480,7 +542,9 @@ impl<L: EventLoop> Core<L> {
     /// A returning owner (`HELLO` with the session's `client_token`) gets
     /// back every session of its own that has no client, each after its
     /// replay (`REPLAY_START` without a `req`). One that exited meanwhile
-    /// gets just its `EXIT`.
+    /// gets just its `EXIT`. A session still starting isn't given back:
+    /// its `SPAWN`'s answer went to a connection that is gone, so the
+    /// client doesn't know it.
     pub(super) fn reattach(&mut self, client: Token) {
         let Some(token) = self.client_token(client).map(str::to_string) else {
             return;
@@ -490,6 +554,7 @@ impl<L: EventLoop> Core<L> {
             .iter()
             .filter(|(_, session)| {
                 session.attached.is_none()
+                    && session.spawning.is_none()
                     && !session.hung_up
                     && !session.meta.owner.is_empty()
                     && session.meta.owner == token
@@ -537,17 +602,68 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// The client's connection ended: its `kill` sessions are hung up, and
-    /// its `detach` sessions keep running without a client.
-    pub(super) fn client_gone(&mut self, client: Token) {
+    /// The client's connection ended: its `detach` sessions keep running
+    /// without a client, and its `kill` sessions are hung up, or, when it
+    /// asked for a `linger` (`HELLO`'s `linger_secs`), wait that long for it
+    /// to come back. A `kill` session still starting is hung up even then:
+    /// its client never learns of it.
+    pub(super) fn client_gone(&mut self, client: Token, linger: Duration) {
         for id in self.sessions_of(client) {
             self.detach_session(id);
-            match self.sessions[&id].meta.policy {
-                Policy::Kill => self.hang_up(id),
+            let session = &self.sessions[&id];
+            let (policy, starting) = (session.meta.policy, session.spawning.is_some());
+            match policy {
+                Policy::Kill if linger.is_zero() || starting => self.hang_up(id),
+                Policy::Kill => {
+                    log!(
+                        "session {id}: its client left; it waits {}s for it",
+                        linger.as_secs()
+                    );
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.linger_until = Some(Instant::now() + linger);
+                    }
+                    self.checkpoint(id);
+                }
                 Policy::Detach => {
                     log!("session {id}: detached");
                     self.checkpoint(id);
                 }
+            }
+        }
+    }
+
+    /// The client was replaced by a newer connection with its token
+    /// ([`Core::take_over`]): its sessions lose their client but keep their
+    /// owner, whatever their policy, so [`Core::reattach`] gives them to the
+    /// new connection. A session still starting is hung up, as its `SPAWN`
+    /// failed with the old connection.
+    pub(super) fn client_replaced(&mut self, client: Token) {
+        for id in self.sessions_of(client) {
+            self.detach_session(id);
+            if self.sessions[&id].spawning.is_some() {
+                log!("session {id}: its client was replaced before it started; hanging up");
+                self.hang_up(id);
+            }
+        }
+    }
+
+    /// Lingering `kill` sessions whose client didn't come back in time are
+    /// hung up; one whose program exited meanwhile is forgotten.
+    pub(super) fn end_lingering(&mut self, now: Instant) {
+        let expired: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.linger_until.is_some_and(|until| now >= until))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            let session = self.sessions.get_mut(&id).expect("the session");
+            session.linger_until = None;
+            if session.exited.is_some() {
+                self.sessions.remove(&id);
+            } else {
+                log!("session {id}: its client didn't come back in time; hanging up");
+                self.hang_up(id);
             }
         }
     }
@@ -620,6 +736,7 @@ impl<L: EventLoop> Core<L> {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.attached = None;
             session.pending_replay = None;
+            session.detached_since = Some(Instant::now());
         }
         self.set_paused(id, false);
     }
@@ -683,6 +800,7 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.screen.input_seen(data.session);
+        session.mark_active();
         let holder = session.holder;
         self.send_holder(
             holder,
@@ -885,7 +1003,10 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.awaiting_owner = false;
+        session.linger_until = None;
         session.attached = Some(client);
+        session.detached_since = None;
+        session.tell_foreground();
         if session.rebuilding.is_some() || session.storing.is_some() {
             session.pending_replay = Some(PendingReplay { req, size });
             return;
