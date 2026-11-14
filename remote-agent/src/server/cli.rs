@@ -284,6 +284,7 @@ impl Connection {
             max: client::PROTOCOLS.max,
             client_version: format!("brindle-remote {}", env!("CARGO_PKG_VERSION")),
             client_token: cli_token(),
+            ..Default::default()
         }))?;
         match connection.recv()? {
             ToClient::Welcome(_) => Ok(Some(connection)),

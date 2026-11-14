@@ -431,7 +431,8 @@ impl Connection {
                     sink.lock().lost("the terminal server no longer has this session");
                 }
             }
-            ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
+            // `PROCESS` is for remote sessions, and only when `HELLO` asks.
+            ToClient::Welcome(_) | ToClient::ServerStatus(_) | ToClient::Process(_) => {}
         }
     }
 

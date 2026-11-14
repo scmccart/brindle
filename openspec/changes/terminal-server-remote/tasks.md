@@ -2,12 +2,12 @@
 
 ## 1. Protocol
 
-- [ ] 1.1 Add `remote-protocol/src/relay.rs`: `RELAY_HOST` (version, build, env, shell, home, server dir, core pid), `RELAY_HEARTBEAT` and `RELAY_ERROR`, on message numbers protocol 1 never uses, with encode/decode and transcript tests; verify with `cargo test -p brindle-remote-protocol relay`
-- [ ] 1.2 Add `linger_secs` (default 0, capped at 600 by the core) and `process_info` (default false) to `Hello` as additive JSON fields. Verify that old `HELLO` frames still decode, in the protocol-1 transcript tests (`cargo test -p brindle-remote-protocol client`)
-- [ ] 1.3 Raise `PROTOCOLS` to 1–2 and add `ToClient::Process { session, name, cwd }` (protocol 2 only), with a transcript test and an `answer_hello` test showing that a 1–2 client and a 1-only core agree on 1; verify with `cargo test -p brindle-remote-protocol`
-- [ ] 1.4 Move `Build`, `is_newer` and `semver` from `src/remote/local/upgrade.rs` to `remote-protocol/src/upgrade.rs`, with their unit tests, and use them from `upgrade.rs`; verify with `cargo test -p brindle-remote-protocol upgrade` and `cargo test -p brindle remote::local`
-- [ ] 1.5 Add `owned` and `detached_secs` to `SessionInfo` as additive JSON fields, and verify that old `SESSIONS` frames still decode (`cargo test -p brindle-remote-protocol client`)
-- [ ] 1.6 Extend `remote-protocol/src/fuzz.rs` to the relay frames, `PROCESS`, and the new `HELLO` and `SessionInfo` fields; verify it passes
+- [x] 1.1 Add `remote-protocol/src/relay.rs`: `RELAY_HOST` (version, build, env, shell, home, server dir, core pid), `RELAY_HEARTBEAT` and `RELAY_ERROR`, on message numbers protocol 1 never uses, with encode/decode and transcript tests; verify with `cargo test -p brindle-remote-protocol relay`
+- [x] 1.2 Add `linger_secs` (default 0, capped at 600 by the core) and `process_info` (default false) to `Hello` as additive JSON fields. Verify that old `HELLO` frames still decode, in the protocol-1 transcript tests (`cargo test -p brindle-remote-protocol client`)
+- [x] 1.3 Raise `PROTOCOLS` to 1–2 and add `ToClient::Process { session, name, cwd }` (protocol 2 only), with a transcript test and an `answer_hello` test showing that a 1–2 client and a 1-only core agree on 1; verify with `cargo test -p brindle-remote-protocol`
+- [x] 1.4 Move `Build`, `is_newer` and `semver` from `src/remote/local/upgrade.rs` to `remote-protocol/src/upgrade.rs`, with their unit tests, and use them from `upgrade.rs`; verify with `cargo test -p brindle-remote-protocol upgrade` and `cargo test -p brindle remote::local`
+- [x] 1.5 Add `owned` and `detached_secs` to `SessionInfo` as additive JSON fields, and verify that old `SESSIONS` frames still decode (`cargo test -p brindle-remote-protocol client`)
+- [x] 1.6 Extend `remote-protocol/src/fuzz.rs` to the relay frames, `PROCESS`, and the new `HELLO` and `SessionInfo` fields; verify it passes
 
 ## 2. Holder hardening (from `harden-terminal-server`)
 

@@ -816,6 +816,7 @@ mod tests {
                         max: c1::PROTOCOLS.max,
                         client_version: "test".into(),
                         client_token: "b".into(),
+                        ..Default::default()
                     })
                     .encode(),
                 );

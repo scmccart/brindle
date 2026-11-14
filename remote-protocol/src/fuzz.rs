@@ -4,7 +4,7 @@
 
 use std::io;
 
-use crate::{Frame, client, holder};
+use crate::{Frame, client, holder, relay};
 
 pub(crate) struct XorShift(u64);
 
@@ -43,6 +43,9 @@ fn decoders() -> Vec<Decoder> {
             holder::ToHolder::decode(f).map(drop)
         }),
         ("holder::ToCore", |f| holder::ToCore::decode(f).map(drop)),
+        ("relay::RelayMessage", |f| {
+            relay::RelayMessage::decode(f).map(drop)
+        }),
     ]
 }
 
@@ -55,6 +58,11 @@ fn seeds() -> Vec<Frame> {
     );
     frames.extend(
         client::samples::to_client()
+            .iter()
+            .map(|m| m.encode().unwrap()),
+    );
+    frames.extend(
+        relay::samples::messages()
             .iter()
             .map(|m| m.encode().unwrap()),
     );
@@ -193,4 +201,64 @@ fn the_assembler_never_panics_on_random_sequences() {
             };
         }
     }
+}
+
+/// The fields added in protocol 2 (`HELLO`'s `linger_secs` and
+/// `process_info`, `SessionInfo`'s `owned` and `detached_secs`, `PROCESS`)
+/// and the relay's frames, with every value of the wrong type, out of range
+/// or hostile: each is `Ok` or an `InvalidData` error.
+#[test]
+fn the_protocol_2_fields_and_relay_frames_reject_bad_values_without_panicking() {
+    let bad = [
+        "null",
+        "true",
+        "-1",
+        "4294967296",
+        "18446744073709551616",
+        "1.5",
+        "\"7\"",
+        "[]",
+        "{}",
+        "[1,[2,[3]]]",
+        "\"\\ud800\"",
+    ];
+    let mut cases: Vec<(u8, String)> = Vec::new();
+    for value in bad {
+        cases.push((
+            client::MSG_HELLO,
+            format!(r#"{{"min":1,"max":2,"client_token":"t","linger_secs":{value},"process_info":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_SESSIONS,
+            format!(r#"{{"req":1,"sessions":[{{"session":1,"pid":2,"owned":{value},"detached_secs":{value}}}]}}"#),
+        ));
+        cases.push((
+            client::MSG_PROCESS,
+            format!(r#"{{"session":{value},"name":{value},"cwd":{value}}}"#),
+        ));
+        cases.push((
+            relay::MSG_RELAY_HOST,
+            format!(r#"{{"version":{value},"env":{value},"shell":{value},"core_pid":{value}}}"#),
+        ));
+        cases.push((relay::MSG_RELAY_ERROR, format!(r#"{{"message":{value}}}"#)));
+    }
+    cases.push((relay::MSG_RELAY_HEARTBEAT, "{}".into()));
+    let decoders = decoders();
+    for (msg_type, payload) in cases {
+        let frame = Frame {
+            msg_type,
+            payload: payload.into_bytes(),
+        };
+        for (_, decode) in &decoders {
+            if let Err(error) = decode(&frame) {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            }
+        }
+    }
+    // The largest accepted values are accepted.
+    let frame = Frame {
+        msg_type: client::MSG_HELLO,
+        payload: br#"{"min":1,"max":2,"client_token":"t","linger_secs":4294967295,"process_info":true}"#.to_vec(),
+    };
+    assert!(client::ToCore::decode(&frame).is_ok());
 }

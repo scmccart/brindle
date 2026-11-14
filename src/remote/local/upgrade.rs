@@ -21,13 +21,14 @@
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
 use super::{Connected, Endpoint, Stream, connection::RECONNECT_LIMIT, hello, start_core, sys, try_connect};
 use crate::remote::hide_window;
 use crate::remote::protocol::build_id;
+use crate::remote::protocol::upgrade::{Build, is_newer};
 use crate::remote::protocol::client::{Request, ToClient, ToCore, Welcome};
 use crate::remote::protocol::Frame;
 
@@ -36,34 +37,6 @@ use crate::remote::protocol::Frame;
 const STEP_DOWN_LIMIT: Duration = Duration::from_secs(60);
 /// How long `--version` and `check` may take.
 const HELPER_LIMIT: Duration = Duration::from_secs(5);
-
-/// A server binary's release, build id and file time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Build {
-    pub version: String,
-    pub build: String,
-    pub mtime: Option<SystemTime>,
-}
-
-/// Whether `helper` should replace `core`.
-pub fn is_newer(helper: &Build, core: &Build) -> bool {
-    match (semver(&helper.version), semver(&core.version)) {
-        (Some(offered), Some(running)) if offered != running => offered > running,
-        (Some(_), Some(_)) => {
-            helper.build != core.build
-                && matches!((helper.mtime, core.mtime), (Some(offered), Some(running)) if offered > running)
-        }
-        _ => false,
-    }
-}
-
-/// `MAJOR.MINOR.PATCH`, ignoring any pre-release or build suffix.
-fn semver(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version.trim().split(['-', '+']).next()?;
-    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
-    let triple = (parts.next()??, parts.next()??, parts.next()??);
-    parts.next().is_none().then_some(triple)
-}
 
 /// Upgrades the core behind `connected` when the helper is newer, and
 /// returns the connection to use: the new core's, or the running one's
@@ -209,54 +182,5 @@ fn connect_new(endpoint: &Endpoint, token: &str) -> Result<Connected> {
             );
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build(version: &str, build: &str, secs: Option<u64>) -> Build {
-        Build {
-            version: version.into(),
-            build: build.into(),
-            mtime: secs.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
-        }
-    }
-
-    #[test]
-    fn a_higher_version_is_newer_and_a_lower_one_older() {
-        let core = build("0.3.0", "aaa", Some(100));
-        assert!(is_newer(&build("0.4.0", "bbb", Some(50)), &core));
-        assert!(is_newer(&build("0.3.1", "aaa", None), &core));
-        assert!(is_newer(&build("1.0.0", "bbb", Some(100)), &build("0.10.9", "aaa", Some(100))));
-        assert!(!is_newer(&build("0.2.9", "bbb", Some(200)), &core));
-        assert!(!is_newer(&build("0.3.0", "bbb", Some(200)), &build("0.3.1", "aaa", Some(100))));
-    }
-
-    #[test]
-    fn an_equal_version_needs_another_build_and_a_later_file() {
-        let core = build("0.3.0", "aaa", Some(100));
-        assert!(is_newer(&build("0.3.0", "bbb", Some(101)), &core));
-        // The same build, however new its file.
-        assert!(!is_newer(&build("0.3.0", "aaa", Some(500)), &core));
-        // Another build, but an older file.
-        assert!(!is_newer(&build("0.3.0", "bbb", Some(99)), &core));
-        assert!(!is_newer(&build("0.3.0", "bbb", Some(100)), &core));
-        // Either time unknown.
-        assert!(!is_newer(&build("0.3.0", "bbb", None), &core));
-        assert!(!is_newer(&build("0.3.0", "bbb", Some(101)), &build("0.3.0", "aaa", None)));
-        // Pre-release suffixes compare by their numbers.
-        assert!(is_newer(&build("0.3.0-rc.1", "bbb", Some(101)), &core));
-    }
-
-    #[test]
-    fn unparsable_versions_are_never_newer() {
-        let core = build("0.3.0", "aaa", Some(100));
-        assert!(!is_newer(&build("dev", "bbb", Some(200)), &core));
-        assert!(!is_newer(&build("0.4", "bbb", Some(200)), &core));
-        assert!(!is_newer(&build("0.4.0", "bbb", Some(200)), &build("", "aaa", Some(1))));
-        assert_eq!(semver(" 1.2.3\n"), Some((1, 2, 3)));
-        assert_eq!(semver("1.2.3.4"), None);
     }
 }

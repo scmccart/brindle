@@ -1,5 +1,6 @@
 //! The terminal server's client protocol, between a client (Brindle, or the
-//! `brindle-remote` management commands) and the core. This is protocol 1.
+//! `brindle-remote` management commands) and the core. This is protocols 1
+//! and 2.
 //!
 //! Frames use the crate's header (`type: u8`, `len: u32 BE`). `DATA` is
 //! binary: a `u32` BE session id, then the bytes (input from the client,
@@ -11,7 +12,7 @@
 //! | type | name            | direction     | payload                                                        |
 //! |-----:|-----------------|---------------|----------------------------------------------------------------|
 //! |    1 | `DATA`          | both          | session, bytes                                                 |
-//! |    2 | `HELLO`         | client → core | `min, max, client_version, client_token`                       |
+//! |    2 | `HELLO`         | client → core | `min, max, client_version, client_token, linger_secs?, process_info?` |
 //! |    3 | `SPAWN`         | client → core | `req, command, args, cwd, env, cols, rows, cell_w, cell_h, scrollback, policy, profile?` |
 //! |    4 | `RESIZE`        | client → core | `session, cols, rows, cell_w, cell_h`                          |
 //! |    5 | `CLOSE`         | client → core | `session`                                                      |
@@ -29,9 +30,10 @@
 //! |   35 | `EXIT`          | core → client | `session, code?`                                               |
 //! |   36 | `REPLAY_START`  | core → client | `req?, session, pid`                                           |
 //! |   37 | `REPLAY_END`    | core → client | `session`                                                      |
-//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?}]` |
+//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?}]` |
 //! |   39 | `SERVER_STATUS` | core → client | `req, core_version, core_build, protocols, holder_protocols, pid, uptime_secs, clients, holders` |
 //! |   40 | `OK`            | core → client | `req`                                                          |
+//! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
 //!
 //! Exchanges:
 //! - `HELLO` → `WELCOME`, or `ERROR` naming both ranges ([`negotiate`]).
@@ -52,6 +54,18 @@
 //! - `title` is the session's title as its emulator keeps it, `started` its
 //!   start time in unix seconds, and `profile` the client's name for what
 //!   started it, kept for clients that attach it later.
+//! - `linger_secs` (a `HELLO` field, capped by the core) asks the core to keep
+//!   the client's `kill` sessions that long after its connection ends, and
+//!   `process_info` asks for `PROCESS`.
+//! - `owned` (a session has an owner) and `detached_secs` (seconds since a
+//!   client was last attached) tell a client whether a detached session's
+//!   owner may still come back.
+//!
+//! Protocol 2 adds `PROCESS`, sent only on connections that negotiated 2 and
+//! set `process_info`: the session's foreground program name and working
+//! directory when either changed (a field is `null` when unknown). Nothing
+//! else differs from protocol 1, so a core that speaks both and a client that
+//! speaks only 1 agree on 1.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -64,7 +78,7 @@ use crate::wire::{self, RequestId, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The client protocol versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 1);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 2);
 
 pub const MSG_DATA: u8 = 1;
 pub const MSG_HELLO: u8 = 2;
@@ -88,6 +102,8 @@ pub const MSG_REPLAY_END: u8 = 37;
 pub const MSG_SESSIONS: u8 = 38;
 pub const MSG_SERVER_STATUS: u8 = 39;
 pub const MSG_OK: u8 = 40;
+/// Protocol 2.
+pub const MSG_PROCESS: u8 = 41;
 
 /// Bytes for one session: input from the client, output from the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +112,7 @@ pub struct Data {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub min: u32,
     pub max: u32,
@@ -106,6 +122,14 @@ pub struct Hello {
     /// Random per Brindle process; a reconnecting client gets back the
     /// sessions it owns under this token.
     pub client_token: String,
+    /// How long the core keeps this client's `kill` sessions running after
+    /// its connection ends, so a reconnect gets them back; 0 hangs them up
+    /// at once. The core caps it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub linger_secs: u32,
+    /// Asks for `PROCESS` messages (protocol 2).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub process_info: bool,
 }
 
 impl Hello {
@@ -284,10 +308,36 @@ pub struct SessionInfo {
     pub started: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// An owner is set: its client may still come back for the session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owned: bool,
+    /// Seconds since a client was last attached; 0 when attached or unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub detached_secs: u64,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The foreground program of a session and its working directory (protocol 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Process {
+    pub session: SessionId,
+    /// The foreground process's name (`comm`); `None` when unknown.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The foreground process's working directory; `None` when unknown.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +452,8 @@ pub enum ToClient {
     Sessions(Sessions),
     ServerStatus(ServerStatus),
     Ok(Request),
+    /// Protocol 2, and only when the client's `HELLO` asked for it.
+    Process(Process),
 }
 
 impl ToClient {
@@ -417,6 +469,7 @@ impl ToClient {
             Self::Sessions(m) => wire::json(MSG_SESSIONS, m),
             Self::ServerStatus(m) => wire::json(MSG_SERVER_STATUS, m),
             Self::Ok(m) => wire::json(MSG_OK, m),
+            Self::Process(m) => wire::json(MSG_PROCESS, m),
         }
     }
 
@@ -432,6 +485,7 @@ impl ToClient {
             MSG_SESSIONS => Self::Sessions(wire::from_json("SESSIONS", frame)?),
             MSG_SERVER_STATUS => Self::ServerStatus(wire::from_json("SERVER_STATUS", frame)?),
             MSG_OK => Self::Ok(wire::from_json("OK", frame)?),
+            MSG_PROCESS => Self::Process(wire::from_json("PROCESS", frame)?),
             other => return Err(wire::unknown_type("core-to-client", other)),
         })
     }
@@ -466,6 +520,15 @@ pub(crate) mod samples {
                 max: 1,
                 client_version: "0.3.0".into(),
                 client_token: "4f1c9a".into(),
+                ..Default::default()
+            }),
+            ToCore::Hello(Hello {
+                min: 1,
+                max: 2,
+                client_version: "0.4.0".into(),
+                client_token: "4f1c9b".into(),
+                linger_secs: 300,
+                process_info: true,
             }),
             ToCore::Spawn(Spawn {
                 req: 1,
@@ -588,6 +651,8 @@ pub(crate) mod samples {
                     title: "htop".into(),
                     started: 1_794_000_000,
                     profile: Some("Shell".into()),
+                    owned: true,
+                    detached_secs: 42,
                 }],
             }),
             ToClient::ServerStatus(ServerStatus {
@@ -608,6 +673,16 @@ pub(crate) mod samples {
                 }],
             }),
             ToClient::Ok(Request { req: 7 }),
+            ToClient::Process(Process {
+                session: 7,
+                name: Some("vim".into()),
+                cwd: Some("/home/u/src".into()),
+            }),
+            ToClient::Process(Process {
+                session: 8,
+                name: None,
+                cwd: None,
+            }),
         ]
     }
 }
@@ -647,7 +722,7 @@ mod tests {
             assert_eq!(&ToClient::decode(&frame).unwrap(), message);
         }
         assert!(types.contains(&MSG_DATA));
-        for expected in MSG_WELCOME..=MSG_OK {
+        for expected in MSG_WELCOME..=MSG_PROCESS {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -704,6 +779,7 @@ mod tests {
                 max: 2,
                 client_version: "9".into(),
                 client_token: "t".into(),
+                ..Default::default()
             })
         );
         let frame = Frame::new(MSG_OK, br#"{"req":9,"note":"later"}"#.to_vec()).unwrap();
@@ -773,12 +849,12 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, 14, 31, MSG_WELCOME, MSG_OK, 41, 255] {
+        for msg_type in [0, 14, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, 42, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_REPARENT, 31, 41, 255] {
+        for msg_type in [0, MSG_HELLO, MSG_REPARENT, 31, 42, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             assert!(ToClient::decode(&frame).is_err());
         }
@@ -789,14 +865,132 @@ mod tests {
         let hello = |min, max| Hello {
             min,
             max,
-            client_version: String::new(),
             client_token: "t".into(),
+            ..Default::default()
         };
         assert_eq!(answer_hello(&hello(1, 1), PROTOCOLS), Ok(1));
+        assert_eq!(answer_hello(&hello(1, 2), PROTOCOLS), Ok(2));
         assert_eq!(answer_hello(&hello(1, 4), VersionRange::new(1, 3)), Ok(3));
-        let error = answer_hello(&hello(2, 3), PROTOCOLS).unwrap_err();
-        assert!(error.message.contains("2–3"), "{}", error.message);
-        assert!(error.message.contains("supported 1"), "{}", error.message);
+        let error = answer_hello(&hello(3, 4), PROTOCOLS).unwrap_err();
+        assert!(error.message.contains("3–4"), "{}", error.message);
+        assert!(error.message.contains("supported 1–2"), "{}", error.message);
         assert_eq!(error.req, None);
+        // A core that still speaks only protocol 1 refuses a client that
+        // speaks only 2.
+        let error = answer_hello(&hello(2, 2), VersionRange::new(1, 1)).unwrap_err();
+        assert!(error.message.contains("supported 1"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_protocol_1_and_2_client_and_a_protocol_1_core_agree_on_1() {
+        let client = Hello {
+            min: PROTOCOLS.min,
+            max: PROTOCOLS.max,
+            client_token: "t".into(),
+            linger_secs: 300,
+            process_info: true,
+            ..Default::default()
+        };
+        assert_eq!(answer_hello(&client, VersionRange::new(1, 1)), Ok(1));
+        // And the reverse: a client that speaks only 1 gets 1 from this core.
+        let old_client = Hello {
+            min: 1,
+            max: 1,
+            client_token: "t".into(),
+            ..Default::default()
+        };
+        assert_eq!(answer_hello(&old_client, PROTOCOLS), Ok(1));
+    }
+
+    #[test]
+    fn old_hello_frames_decode_with_the_new_fields_defaulted() {
+        // What a protocol-1 client sent before `linger_secs` and `process_info`.
+        let frame = Frame::new(
+            MSG_HELLO,
+            br#"{"min":1,"max":1,"client_version":"0.3.0","client_token":"t"}"#.to_vec(),
+        )
+        .unwrap();
+        let ToCore::Hello(hello) = ToCore::decode(&frame).unwrap() else {
+            panic!("not a HELLO");
+        };
+        assert_eq!((hello.linger_secs, hello.process_info), (0, false));
+        // And a HELLO that sets neither encodes exactly as before.
+        let plain = ToCore::Hello(Hello {
+            min: 1,
+            max: 1,
+            client_version: "0.3.0".into(),
+            client_token: "t".into(),
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(plain.payload, frame.payload);
+        let asking = ToCore::Hello(Hello {
+            min: 1,
+            max: 2,
+            client_token: "t".into(),
+            linger_secs: 300,
+            process_info: true,
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            asking.payload,
+            br#"{"min":1,"max":2,"client_version":"","client_token":"t","linger_secs":300,"process_info":true}"#
+        );
+    }
+
+    #[test]
+    fn old_sessions_frames_decode_with_the_new_fields_defaulted() {
+        let frame = Frame::new(
+            MSG_SESSIONS,
+            br#"{"req":3,"sessions":[{"session":3,"pid":5001,"attached":false,"command":"htop","cwd":"/tmp","policy":"detach","cols":100,"rows":30,"key":"k","title":"htop","started":5,"profile":"Shell"}]}"#
+                .to_vec(),
+        )
+        .unwrap();
+        let ToClient::Sessions(sessions) = ToClient::decode(&frame).unwrap() else {
+            panic!("not SESSIONS");
+        };
+        let info = &sessions.sessions[0];
+        assert_eq!((info.owned, info.detached_secs), (false, 0));
+        // An unowned, never-detached session encodes without the new fields.
+        let encoded = ToClient::Sessions(sessions).encode().unwrap();
+        assert_eq!(encoded.payload, frame.payload);
+        let info = SessionInfo {
+            session: 1,
+            owned: true,
+            detached_secs: 7,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.ends_with(r#""owned":true,"detached_secs":7}"#), "{json}");
+    }
+
+    #[test]
+    fn process_names_and_directories_are_optional() {
+        let frame = Frame::new(MSG_PROCESS, br#"{"session":4}"#.to_vec()).unwrap();
+        assert_eq!(
+            ToClient::decode(&frame).unwrap(),
+            ToClient::Process(Process {
+                session: 4,
+                name: None,
+                cwd: None,
+            })
+        );
+        let frame = ToClient::Process(Process {
+            session: 4,
+            name: Some("sleep".into()),
+            cwd: Some("/tmp".into()),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.msg_type, 41);
+        assert_eq!(frame.payload, br#"{"session":4,"name":"sleep","cwd":"/tmp"}"#);
+        // The core-bound decoder doesn't know it.
+        assert!(ToCore::decode(&frame).is_err());
+        // A session id is required.
+        let frame = Frame::new(MSG_PROCESS, br#"{"name":"x"}"#.to_vec()).unwrap();
+        assert!(ToClient::decode(&frame).is_err());
     }
 }

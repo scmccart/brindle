@@ -255,7 +255,7 @@ fn racing_starts_leave_one_detached_core() {
     assert_ne!(parent(pid), Some(std::process::id()));
 
     let welcome = client.welcome.as_ref().unwrap();
-    assert_eq!(welcome.protocol, 1);
+    assert_eq!(welcome.protocol, brindle_remote_protocol::client::PROTOCOLS.max);
     assert_eq!(welcome.core_version, env!("CARGO_PKG_VERSION"));
     assert!(!welcome.core_build.is_empty());
     assert!(welcome.holder_protocols.is_empty(), "no holder yet");

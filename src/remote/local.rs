@@ -304,6 +304,7 @@ pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
         max: client::PROTOCOLS.max,
         client_version: format!("brindle {}", env!("CARGO_PKG_VERSION")),
         client_token: token.to_string(),
+        ..Default::default()
     });
     let talk = |error: io::Error| anyhow!("terminal server unreachable: {error}");
     stream.set_read_timeout(Some(HELLO_LIMIT)).map_err(talk)?;
@@ -532,7 +533,7 @@ mod tests {
         assert!(try_connect(&endpoint).unwrap().is_none(), "no core yet");
 
         let connected = connect(&endpoint, "real-1").unwrap();
-        assert_eq!(connected.welcome.protocol, 1);
+        assert_eq!(connected.welcome.protocol, client::PROTOCOLS.max);
         let core = connected.welcome.pid;
         assert_ne!(core, std::process::id());
         // The core runs from its per-build copy, not from the helper.
@@ -600,14 +601,14 @@ mod tests {
             let frame = Frame::read_from(&mut stream).unwrap();
             let ToCore::Hello(hello) = ToCore::decode(&frame).unwrap() else { panic!("not HELLO") };
             assert_eq!(hello.client_token, "tok");
-            let refusal = client::answer_hello(&hello, client::VersionRange::new(2, 3)).unwrap_err();
+            let refusal = client::answer_hello(&hello, client::VersionRange::new(3, 4)).unwrap_err();
             ToClient::Error(refusal).encode().unwrap().write_to(&mut stream).unwrap();
         });
         let endpoint = Endpoint::at(temp.0.join("unused"), dir);
         let error = connect(&endpoint, "tok").unwrap_err().to_string();
         core.join().unwrap();
         assert!(error.contains("refused Brindle"), "{error}");
-        assert!(error.contains("offered 1, supported 2–3"), "{error}");
+        assert!(error.contains("offered 1–2, supported 3–4"), "{error}");
         assert!(error.contains("brindle-remote stop"), "{error}");
     }
 

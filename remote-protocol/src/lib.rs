@@ -6,17 +6,20 @@
 //! session id.
 //!
 //! The terminal server's protocols use the same header with their own
-//! message numbers: [`client`] (client ↔ core, protocol 1) and [`holder`]
-//! (core ↔ holder, H1).
+//! message numbers: [`client`] (client ↔ core, protocols 1 and 2) and [`holder`]
+//! (core ↔ holder, H1). [`relay`] adds the frames of the link between Brindle
+//! and a `brindle-remote relay`, which pipes the client protocol.
 
 pub mod access;
 pub mod build_id;
 pub mod client;
 pub mod endpoint;
 pub mod holder;
+pub mod relay;
 #[cfg(unix)]
 pub mod scope;
 pub mod server_dir;
+pub mod upgrade;
 pub mod version;
 #[cfg(windows)]
 pub mod win;

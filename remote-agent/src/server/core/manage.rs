@@ -43,6 +43,8 @@ impl<L: EventLoop> Core<L> {
                 title: session.screen.title(),
                 started: session.meta.started,
                 profile: session.meta.profile.clone(),
+                // Task 3.4 fills these in.
+                ..Default::default()
             })
             .collect();
         self.send_client(client, ToClient::Sessions(Sessions { req, sessions }));

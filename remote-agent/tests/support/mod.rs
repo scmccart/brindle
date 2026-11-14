@@ -560,6 +560,7 @@ impl TestClient {
             max: client::PROTOCOLS.max,
             client_version: "test".into(),
             client_token: token.into(),
+            ..Default::default()
         }));
         match client.recv() {
             ToClient::Welcome(welcome) => client.welcome = Some(welcome),
