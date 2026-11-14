@@ -10,8 +10,6 @@
 //!   host reports.
 //! - `Remote`: a read-only message (an error shown in a tab), fed in with
 //!   [`Terminal::feed`]; it has no program, so input goes nowhere.
-//! - `Agent`: a PTY owned by the remote Linux helper, over its stdio
-//!   protocol. Nothing opens one any more; task 6.4 removes it.
 
 pub mod cmdline;
 pub mod keys;
@@ -48,7 +46,7 @@ use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
-use crate::notify::osc::{Found, Notice, Scanner};
+use crate::notify::osc::{Found, Notice};
 use crate::remote::Host;
 use crate::theme::{Color, Theme};
 
@@ -202,13 +200,6 @@ enum Backend {
     Server { session: crate::remote::local::Session, closing: Closing, host: Host },
     /// A read-only message with no program behind it.
     Remote,
-    /// A PTY owned by the remote Linux helper.
-    Agent {
-        scanner: Scanner,
-        handle: crate::remote::client::Handle,
-        foreground_name: Option<String>,
-        cwd: Option<std::path::PathBuf>,
-    },
 }
 
 /// What happens to a terminal's program, local or remote, when Brindle
@@ -261,7 +252,6 @@ pub struct Terminal {
     /// Pending flush of a synchronized update (mode 2026).
     sync_flush: Option<Task<()>>,
     _events: Task<()>,
-    _remote_events: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for Terminal {}
@@ -329,51 +319,6 @@ impl Terminal {
         })
     }
 
-    fn spawn_remote_events(
-        rx: futures::channel::mpsc::Receiver<crate::remote::client::Event>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            let mut rx = rx.ready_chunks(64);
-            let mut pace = Pace::default();
-            while let Some(events) = rx.next().await {
-                pace.wait(cx).await;
-                let alive = this.update(cx, |this, cx| {
-                    pace::drain(&mut rx, events, |events| {
-                        // Consecutive output goes through one `feed`, in order
-                        // relative to the other events.
-                        let mut output: Vec<u8> = Vec::new();
-                        for event in events {
-                            match event {
-                                crate::remote::client::Event::Output(bytes) => {
-                                    if output.is_empty() {
-                                        output = bytes;
-                                    } else {
-                                        output.extend_from_slice(&bytes);
-                                    }
-                                }
-                                other => {
-                                    if !output.is_empty() {
-                                        this.feed(&std::mem::take(&mut output), cx);
-                                    }
-                                    this.handle_remote_event(other, cx);
-                                }
-                            }
-                        }
-                        if !output.is_empty() {
-                            this.feed(&output, cx);
-                        }
-                    });
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    break;
-                }
-                pace.updated();
-            }
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
@@ -389,7 +334,6 @@ impl Terminal {
     ) -> Self {
         Self {
             _events: Self::spawn_events(rx, cx),
-            _remote_events: None,
             term,
             backend,
             output,
@@ -496,39 +440,6 @@ impl Terminal {
         Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
     }
 
-    /// A terminal on the remote Linux helper's stdio protocol, one
-    /// connection per tab.
-    // Remote profiles run in their host's terminal server since task 6.1;
-    // task 6.4 removes this with `Backend::Agent`.
-    #[allow(dead_code)]
-    fn spawn_agent(
-        profile: &Profile,
-        command_override: Option<(String, Vec<String>)>,
-        cwd_override: Option<std::path::PathBuf>,
-        config: &Config,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let (tx, rx) = unbounded();
-        let (remote_tx, remote_rx) = futures::channel::mpsc::channel(64);
-        let output = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, output.clone());
-        let size = GridSize::default();
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener)));
-        let parser = Arc::new(Mutex::new(Parser::posix()));
-        let marks = Arc::new(Mutex::new(Marks::default()));
-        let handle = crate::remote::client::connect(profile.clone(), command_override, cwd_override, size, remote_tx);
-        let backend = Backend::Agent {
-            scanner: Scanner::new(),
-            handle,
-            foreground_name: None,
-            cwd: None,
-        };
-        let theme = config.profile_theme(profile);
-        let mut this = Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx);
-        this._remote_events = Some(Self::spawn_remote_events(remote_rx, cx));
-        this
-    }
-
     /// A read-only terminal showing `text` (used to report errors in a tab).
     pub fn message(text: &str, theme: Theme, config: &Config, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = unbounded();
@@ -542,50 +453,24 @@ impl Terminal {
         this
     }
 
-    /// Feeds output into a remote-agent or message terminal.
+    /// Feeds a message terminal its text. A server session's output is
+    /// parsed on its connection's reader thread instead, so it is ignored
+    /// here.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let found = match &mut self.backend {
-            Backend::Agent { scanner, .. } => scanner.scan(bytes),
-            Backend::Remote => Vec::new(),
-            #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { .. } => return,
-        };
+        #[cfg(any(target_os = "linux", windows))]
+        if let Backend::Server { .. } = self.backend {
+            return;
+        }
         {
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
             parser.advance(&mut *term, &self.marks, bytes);
             self.output.advance(Instant::now());
         }
-        for item in found {
-            self.handle_found(item, cx);
-        }
         self.last_activity = Instant::now();
         Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
         self.schedule_sync_flush(cx);
         cx.notify();
-    }
-
-    fn handle_remote_event(&mut self, event: crate::remote::client::Event, cx: &mut Context<Self>) {
-        match event {
-            crate::remote::client::Event::Output(bytes) => self.feed(&bytes, cx),
-            crate::remote::client::Event::ProcessInfo(info) => {
-                if let Backend::Agent { foreground_name, cwd, .. } = &mut self.backend {
-                    let title_changed = *foreground_name != info.foreground_name;
-                    *foreground_name = info.foreground_name;
-                    *cwd = info.cwd.map(Into::into);
-                    if title_changed {
-                        cx.emit(TerminalEvent::TitleChanged);
-                    }
-                }
-            }
-            crate::remote::client::Event::Exited => self.mark_exited(cx),
-            crate::remote::client::Event::Failed => {
-                self.exited = true;
-                if self.status.end_activity() {
-                    cx.emit(TerminalEvent::Status(None));
-                }
-            }
-        }
     }
 
     /// A synchronized update (mode 2026) may be buffering output; make sure
@@ -766,7 +651,6 @@ impl Terminal {
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => session.input(&bytes),
             Backend::Remote => {}
-            Backend::Agent { handle, .. } => handle.input(bytes.into_owned()),
         }
     }
 
@@ -809,7 +693,6 @@ impl Terminal {
             Backend::Server { session, .. } => {
                 session.resize(size.cols, size.rows, size.cell_width, size.cell_height)
             }
-            Backend::Agent { handle, .. } => handle.resize(size),
             Backend::Remote => {}
         }
     }
@@ -957,10 +840,6 @@ impl Terminal {
             }
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => session.foreground().and_then(|foreground| foreground.name),
-            Backend::Agent { handle, foreground_name, .. } => {
-                handle.query_process();
-                foreground_name.clone()
-            }
             Backend::Remote => None,
         }
     }
@@ -1002,9 +881,6 @@ impl Terminal {
                 .reported_dir()
                 .map(Into::into)
                 .or_else(|| session.foreground()?.cwd.map(Into::into)),
-            Backend::Agent { cwd, .. } => {
-                self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
-            }
             Backend::Remote => None,
         }
     }
@@ -1022,7 +898,7 @@ impl Terminal {
 
     /// Ends the terminal's connection to its program: `close` ends the
     /// program; otherwise a server session's program is left as its
-    /// [`Closing`] says, and any other terminal's ends.
+    /// [`Closing`] says. A message terminal has no program.
     fn leave(&mut self, close: bool) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
@@ -1030,7 +906,6 @@ impl Terminal {
                 (false, Closing::Keeps) => session.detach(),
                 _ => session.close(),
             },
-            Backend::Agent { handle, .. } => handle.close(),
             Backend::Remote => {}
         }
         let _ = close;

@@ -1,14 +1,12 @@
-//! Framing and control messages shared by Brindle and its remote agent.
+//! Framing shared by Brindle and its `brindle-remote` helper.
 //!
 //! Each frame has a five-byte header followed by an opaque payload:
-//! `message_type: u8` and `payload_length: u32` (big endian). One agent
-//! process serves one session, so the stdio frames in this module carry no
-//! session id.
-//!
-//! The terminal server's protocols use the same header with their own
-//! message numbers: [`client`] (client ↔ core, protocols 1 and 2) and [`holder`]
-//! (core ↔ holder, H1). [`relay`] adds the frames of the link between Brindle
-//! and a `brindle-remote relay`, which pipes the client protocol.
+//! `message_type: u8` and `payload_length: u32` (big endian). The terminal
+//! server's protocols carry their own message numbers in it: [`client`]
+//! (client ↔ core, protocols 1 and 2) and [`holder`] (core ↔ holder, H1).
+//! [`relay`] adds the frames of the link between Brindle and a
+//! `brindle-remote relay`, which pipes the client protocol, after the
+//! [`FRAME_STREAM_MARKER`].
 
 pub mod access;
 pub mod build_id;
@@ -34,12 +32,10 @@ mod fuzz;
 pub use serde_json;
 pub use wire::{RequestId, SessionId};
 
-use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub const FRAME_HEADER_LEN: usize = 5;
 /// The largest payload accepted from the wire or written to it.
@@ -49,39 +45,12 @@ pub const FRAME_HEADER_LEN: usize = 5;
 /// an untrusted peer from causing an unbounded allocation.
 pub const MAX_FRAME_PAYLOAD_SIZE: usize = 1024 * 1024;
 
-pub const MSG_DATA: u8 = 1;
-pub const MSG_RESIZE: u8 = 2;
-pub const MSG_EXIT: u8 = 3;
-pub const MSG_QUERY_PROCESS: u8 = 4;
-pub const MSG_PROCESS_INFO: u8 = 5;
-pub const MSG_SPAWN: u8 = 6;
-pub const MSG_SPAWN_RESPONSE: u8 = 7;
-pub const MSG_ERROR: u8 = 8;
-/// Sent by the client while it is alive and idle, with an empty payload. The
-/// agent ends the session when it hears nothing at all for the idle limit.
-pub const MSG_HEARTBEAT: u8 = 9;
-
-/// How often the client sends a [`MSG_HEARTBEAT`] when it has nothing else to say.
+/// How long either side of a relay link goes without writing before it
+/// sends a `RELAY_HEARTBEAT` ([`relay`]), so the other can tell a quiet
+/// link from a dead one.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-/// How long the agent waits without any frame from the client before it ends
-/// the session. Several heartbeats may be lost or late before it expires.
-pub const DEFAULT_IDLE_LIMIT_SECS: u32 = 60;
-/// The largest idle limit a spawn request may ask for (one day).
-pub const MAX_IDLE_LIMIT_SECS: u32 = 24 * 60 * 60;
 
-/// Checks a spawn request's `idle_limit_secs`: non-zero and at most
-/// [`MAX_IDLE_LIMIT_SECS`].
-pub fn validate_idle_limit(secs: u32) -> io::Result<Duration> {
-    if secs == 0 || secs > MAX_IDLE_LIMIT_SECS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("idle limit must be between 1 and {MAX_IDLE_LIMIT_SECS} seconds, not {secs}"),
-        ));
-    }
-    Ok(Duration::from_secs(u64::from(secs)))
-}
-
-/// Written by the agent in `--server` mode before its first frame. Over SSH
+/// Written by `brindle-remote relay` before its first frame. Over SSH
 /// the remote command runs through the user's shell, whose startup files may
 /// print to stdout first; the client discards everything up to this marker.
 pub const FRAME_STREAM_MARKER: &[u8] = b"\0BRINDLE-FRAMES1\n";
@@ -154,67 +123,10 @@ impl Frame {
         Ok(Self { msg_type, payload })
     }
 
-    pub fn data(bytes: Vec<u8>) -> io::Result<Self> {
-        Self::new(MSG_DATA, bytes)
-    }
-
     pub fn json<T: Serialize>(msg_type: u8, value: &T) -> io::Result<Self> {
         let payload = serde_json::to_vec(value)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Self::new(msg_type, payload)
-    }
-
-    pub fn decode_json<T: DeserializeOwned>(&self) -> io::Result<T> {
-        serde_json::from_slice(&self.payload)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    }
-
-    pub fn resize(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> io::Result<Self> {
-        Self::json(
-            MSG_RESIZE,
-            &ResizeRequest {
-                cols,
-                rows,
-                cell_width,
-                cell_height,
-            },
-        )
-    }
-
-    pub fn exit(code: Option<i32>) -> io::Result<Self> {
-        Self::json(MSG_EXIT, &ExitMessage { code })
-    }
-
-    pub fn query_process() -> io::Result<Self> {
-        Self::new(MSG_QUERY_PROCESS, Vec::new())
-    }
-
-    pub fn heartbeat() -> Self {
-        Self {
-            msg_type: MSG_HEARTBEAT,
-            payload: Vec::new(),
-        }
-    }
-
-    pub fn spawn(request: &SpawnRequest) -> io::Result<Self> {
-        Self::json(MSG_SPAWN, request)
-    }
-
-    pub fn spawn_response(response: &SpawnResponse) -> io::Result<Self> {
-        Self::json(MSG_SPAWN_RESPONSE, response)
-    }
-
-    pub fn process_info(info: &ProcessInfo) -> io::Result<Self> {
-        Self::json(MSG_PROCESS_INFO, info)
-    }
-
-    pub fn error(message: impl Into<String>) -> io::Result<Self> {
-        Self::json(
-            MSG_ERROR,
-            &ErrorMessage {
-                message: message.into(),
-            },
-        )
     }
 
     /// Writes exactly one frame, header and payload in a single write, and
@@ -282,57 +194,14 @@ fn validate_outgoing_length(length: usize) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResizeRequest {
-    pub cols: u16,
-    pub rows: u16,
-    pub cell_width: u16,
-    pub cell_height: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExitMessage {
-    pub code: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SpawnRequest {
-    pub command: Option<String>,
-    pub args: Vec<String>,
-    pub cwd: Option<String>,
-    pub env: BTreeMap<String, String>,
-    pub cols: u16,
-    pub rows: u16,
-    pub cell_width: u16,
-    pub cell_height: u16,
-    /// The agent ends the session when no frame arrives for this long.
-    pub idle_limit_secs: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SpawnResponse {
-    pub success: bool,
-    pub error: Option<String>,
-    pub pid: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub foreground_name: Option<String>,
-    pub cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ErrorMessage {
-    pub message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    /// A message type: framing is the same whatever the protocol.
+    const ANY: u8 = 1;
 
     struct ShortIo {
         input: Cursor<Vec<u8>>,
@@ -361,7 +230,7 @@ mod tests {
 
     #[test]
     fn preamble_skips_noise_and_leaves_the_frame_stream_untouched() {
-        let frame = Frame::data(b"payload".to_vec()).unwrap();
+        let frame = Frame::new(ANY, b"payload".to_vec()).unwrap();
         let mut bytes = b"motd\n\0BRINDLE-almost\n".to_vec();
         bytes.extend_from_slice(FRAME_STREAM_MARKER);
         frame.write_to(&mut bytes).unwrap();
@@ -400,7 +269,7 @@ mod tests {
 
     #[test]
     fn frame_roundtrip_survives_short_reads_and_writes() {
-        let original = Frame::data(b"hello\0remote\xffterminal".to_vec()).unwrap();
+        let original = Frame::new(ANY, b"hello\0remote\xffterminal".to_vec()).unwrap();
         let mut writer = ShortIo {
             input: Cursor::new(Vec::new()),
             output: Vec::new(),
@@ -426,7 +295,7 @@ mod tests {
         let error = Frame::read_from_or_eof(&mut Cursor::new(vec![0; 4])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 
-        let truncated_payload = vec![MSG_DATA, 0, 0, 0, 2, b'x'];
+        let truncated_payload = vec![ANY, 0, 0, 0, 2, b'x'];
         let error = Frame::read_from(&mut truncated_payload.as_slice()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
@@ -434,128 +303,22 @@ mod tests {
     #[test]
     fn oversized_payloads_are_rejected_before_reading_or_writing_them() {
         let oversized = (MAX_FRAME_PAYLOAD_SIZE as u32 + 1).to_be_bytes();
-        let mut encoded = vec![MSG_DATA];
+        let mut encoded = vec![ANY];
         encoded.extend_from_slice(&oversized);
         let error = Frame::read_from(&mut encoded.as_slice()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let error =
-            Frame::new(MSG_DATA, vec![0; MAX_FRAME_PAYLOAD_SIZE.saturating_add(1)]).unwrap_err();
+            Frame::new(ANY, vec![0; MAX_FRAME_PAYLOAD_SIZE.saturating_add(1)]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         let oversized_frame = Frame {
-            msg_type: MSG_DATA,
+            msg_type: ANY,
             payload: vec![0; MAX_FRAME_PAYLOAD_SIZE.saturating_add(1)],
         };
         let mut output = Vec::new();
         let error = oversized_frame.write_to(&mut output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(output.is_empty());
-    }
-
-    #[test]
-    fn heartbeat_is_an_empty_frame_of_its_own_type() {
-        let frame = Frame::heartbeat();
-        assert_eq!(frame.msg_type, MSG_HEARTBEAT);
-        assert!(frame.payload.is_empty());
-        for known in [
-            MSG_DATA,
-            MSG_RESIZE,
-            MSG_EXIT,
-            MSG_QUERY_PROCESS,
-            MSG_PROCESS_INFO,
-            MSG_SPAWN,
-            MSG_SPAWN_RESPONSE,
-            MSG_ERROR,
-        ] {
-            assert_ne!(MSG_HEARTBEAT, known);
-        }
-        let mut wire = Vec::new();
-        frame.write_to(&mut wire).unwrap();
-        assert_eq!(wire, [MSG_HEARTBEAT, 0, 0, 0, 0]);
-        assert_eq!(Frame::read_from(&mut wire.as_slice()).unwrap(), frame);
-    }
-
-    #[test]
-    fn idle_limit_must_be_non_zero_and_bounded() {
-        assert_eq!(
-            validate_idle_limit(DEFAULT_IDLE_LIMIT_SECS).unwrap(),
-            Duration::from_secs(60)
-        );
-        assert_eq!(validate_idle_limit(1).unwrap(), Duration::from_secs(1));
-        assert_eq!(
-            validate_idle_limit(MAX_IDLE_LIMIT_SECS).unwrap(),
-            Duration::from_secs(u64::from(MAX_IDLE_LIMIT_SECS))
-        );
-        for bad in [0, MAX_IDLE_LIMIT_SECS + 1, u32::MAX] {
-            let error = validate_idle_limit(bad).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad}");
-        }
-    }
-
-    #[test]
-    fn the_default_idle_limit_leaves_room_for_missed_heartbeats() {
-        assert!(DEFAULT_IDLE_LIMIT_SECS >= 3 * HEARTBEAT_INTERVAL.as_secs() as u32);
-    }
-
-    #[test]
-    fn control_payloads_roundtrip() {
-        let spawn = SpawnRequest {
-            command: Some("/bin/bash".into()),
-            args: vec!["-l".into()],
-            cwd: Some("/home/user".into()),
-            env: BTreeMap::from([("TERM".into(), "xterm-256color".into())]),
-            cols: 80,
-            rows: 24,
-            cell_width: 9,
-            cell_height: 18,
-            idle_limit_secs: 45,
-        };
-        let spawn_frame = Frame::spawn(&spawn).unwrap();
-        assert_eq!(spawn_frame.msg_type, MSG_SPAWN);
-        assert_eq!(spawn_frame.decode_json::<SpawnRequest>().unwrap(), spawn);
-
-        let response = SpawnResponse {
-            success: true,
-            error: None,
-            pid: Some(1234),
-        };
-        let response_frame = Frame::spawn_response(&response).unwrap();
-        assert_eq!(response_frame.msg_type, MSG_SPAWN_RESPONSE);
-        assert_eq!(
-            response_frame.decode_json::<SpawnResponse>().unwrap(),
-            response
-        );
-
-        let resize = ResizeRequest {
-            cols: 120,
-            rows: 40,
-            cell_width: 10,
-            cell_height: 20,
-        };
-        let resize_frame = Frame::json(MSG_RESIZE, &resize).unwrap();
-        assert_eq!(resize_frame.decode_json::<ResizeRequest>().unwrap(), resize);
-
-        let info = ProcessInfo {
-            pid: 1234,
-            foreground_name: Some("vim".into()),
-            cwd: Some("/work".into()),
-        };
-        let info_frame = Frame::process_info(&info).unwrap();
-        assert_eq!(info_frame.decode_json::<ProcessInfo>().unwrap(), info);
-
-        let exit_frame = Frame::exit(Some(17)).unwrap();
-        assert_eq!(
-            exit_frame.decode_json::<ExitMessage>().unwrap(),
-            ExitMessage { code: Some(17) }
-        );
-
-        let error_frame = Frame::error("bad request").unwrap();
-        assert_eq!(
-            error_frame.decode_json::<ErrorMessage>().unwrap(),
-            ErrorMessage {
-                message: "bad request".into()
-            }
-        );
     }
 }

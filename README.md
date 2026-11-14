@@ -28,11 +28,12 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 ## Remote hosts and containers
 
 Profiles can run on a Linux host over SSH or inside an existing Docker/Podman
-container. Brindle keeps drawing the terminal locally; a small headless
-`brindle-remote` helper owns the remote PTY, resize and `/proc` process queries.
-It is copied to a versioned cache on first connection (user-only on an SSH
-host) and reused while its build matches. Output remains the terminal's
-original byte stream,
+container. Brindle keeps drawing the terminal locally, and the programs run in
+the endpoint's own terminal server (see [Terminal server](#terminal-server)),
+which Brindle reaches through `brindle-remote relay`, one connection per
+endpoint for all its tabs. The `brindle-remote` helper is copied to a
+versioned cache on first connection (user-only on an SSH host) and reused
+while its build matches. Output remains the terminal's original byte stream,
 so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status,
 clipboard/color replies and shell-integration marks work as in a local tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
@@ -71,7 +72,8 @@ the profile user. The helper stays there for later connections of the same
 build, and other builds' directories are removed. If something that isn't
 root's already has that name, Brindle runs nothing from it, leaves it alone and
 says so in the tab. It does not create or start containers.
-If the connection drops, the tab shows a "connection lost" message.
+If the connection drops, the endpoint's tabs say so and Brindle reconnects,
+getting their screens back; typing meanwhile is sent once it is back.
 Official Windows archives include the static x86-64 Linux helper beside
 `brindle.exe`. For a Windows source build, build that helper in Docker and
 point Brindle at it:

@@ -2,7 +2,7 @@
 name = "brindle-remote-protocol"
 version = "0.3.0"
 edition = "2024"
-description = "Framed stdio protocol between Brindle and its brindle-remote helper"
+description = "Framed protocols between Brindle, its terminal server and the brindle-remote relay"
 license = "MIT OR Apache-2.0"
 publish = false
 

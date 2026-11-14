@@ -9,12 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 use super::{Foreground, PtyCommand};
-
-/// How long to wait for a session to go after `SIGKILL`.
-pub const FORCED_SHUTDOWN: Duration = Duration::from_secs(1);
 
 pub struct SpawnedPty {
     pub pid: libc::pid_t,
@@ -324,24 +320,6 @@ pub fn resize(
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// The foreground process of the PTY (else the session's own program), its
-/// name and its working directory.
-pub fn inspect_process(
-    pty_fd: RawFd,
-    child_pid: libc::pid_t,
-) -> brindle_remote_protocol::ProcessInfo {
-    let foreground_group = Some(unsafe { libc::tcgetpgrp(pty_fd) }).filter(|pid| *pid > 0);
-    let pid = foreground_group
-        .and_then(find_process_in_group)
-        .unwrap_or(child_pid);
-    let Foreground { name, cwd } = describe(pid, child_pid);
-    brindle_remote_protocol::ProcessInfo {
-        pid: pid.max(0) as u32,
-        foreground_name: name,
-        cwd,
-    }
 }
 
 /// The foreground process of the terminal that `pid` (a session's

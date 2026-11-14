@@ -1,9 +1,13 @@
 //! Remote Linux host and container support.
 //!
-//! Terminal PTYs are served by the `brindle-remote` helper over a framed
-//! stdio connection, deployed and reached through SSH or a container's exec
-//! (`remote_command`).
+//! A remote endpoint's sessions run in its own terminal server, which
+//! Brindle reaches through a `brindle-remote relay` started over SSH or a
+//! container's exec (`remote_command`): `client` deploys the helper and
+//! launches the relay, and `local` keeps one connection per endpoint
+//! ([`Host`]) through it.
 
+// Only `local`, built on Linux and Windows, launches relays.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub mod client;
 mod host;
 #[cfg(any(target_os = "linux", windows))]

@@ -156,21 +156,10 @@ mod tests {
     #[test]
     fn relay_numbers_collide_with_no_other_protocol() {
         let relay = [MSG_RELAY_HOST, MSG_RELAY_HEARTBEAT, MSG_RELAY_ERROR];
-        let stdio = [
-            crate::MSG_DATA,
-            crate::MSG_RESIZE,
-            crate::MSG_EXIT,
-            crate::MSG_QUERY_PROCESS,
-            crate::MSG_PROCESS_INFO,
-            crate::MSG_SPAWN,
-            crate::MSG_SPAWN_RESPONSE,
-            crate::MSG_ERROR,
-            crate::MSG_HEARTBEAT,
-        ];
         // Everything the client protocol uses: 1-13 and 32-41 (`PROCESS`).
         let client_numbers =
             (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
-        for number in client_numbers.chain(stdio) {
+        for number in client_numbers {
             assert!(!relay.contains(&number), "type {number:#x} is used twice");
             assert!(!is_relay_type(number));
         }

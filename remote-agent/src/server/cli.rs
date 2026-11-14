@@ -29,7 +29,6 @@ const NO_SERVER: &str = "no server is running";
 pub const USAGE: &str = "\
 usage: brindle-remote <command>
   --version                         print the version
-  --server                          serve one session over stdio (remote tabs)
   serve [--ready-fd N]              run the terminal server's core
   hold [--ready-fd N]               run a holder (started by the core)
   relay                             connect stdio to the core, starting it if needed (remote tabs)
@@ -45,7 +44,6 @@ else ~/.cache/brindle/run.";
 pub const USAGE: &str = "\
 usage: brindle-remote <command>
   --version                         print the version
-  --server                          serve one session over stdio (remote tabs)
   serve [--ready-handle N]          run the terminal server's core
   hold [--ready-handle N]           run a holder (started by the core)
   launch <role> [--ready-handle N]  internal: start serve or hold detached

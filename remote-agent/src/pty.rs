@@ -1,5 +1,5 @@
-//! PTY sessions shared by the stdio agent (`--server`) and the terminal
-//! server's holder and core: what to run on a new PTY, the shutdown timings
+//! PTY sessions of the terminal server's holder and core: what to run on a
+//! new PTY, the shutdown timings
 //! and a session's foreground program here, and the Linux PTY itself
 //! (spawning, resizing, signalling, `/proc` queries) in `unix`.
 

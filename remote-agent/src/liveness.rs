@@ -1,11 +1,11 @@
-//! When a client last sent a frame, as measured by the thread that reads its
-//! frames, shared by the stdio agent and the relay.
+//! When a relay's client last sent a frame, as measured by the relay's
+//! thread that reads its frames.
 //!
-//! Whatever else a process does with the client can block for a long time on
-//! a slow client's output, so only the reader, which keeps taking frames off
-//! the input, can tell silence from a backlog. The reader stamps every frame
-//! it reads, heartbeats included, which it then drops. A real frame is handed
-//! on (to an event queue, or to the core), which can block; while the reader
+//! Copying the core's output to a slow client can block for a long time, so
+//! only the reader, which keeps taking frames off the input, can tell
+//! silence from a backlog. The reader stamps every frame it reads,
+//! heartbeats included, which it then drops. A real frame is handed on to
+//! the core, which can block; while the reader
 //! waits for that, `busy` says the client has just sent something, and
 //! finishing the hand-over stamps again. A watcher reads `busy` before the
 //! stamp (both Acquire, paired with Release stores in the reader's order

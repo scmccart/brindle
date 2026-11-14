@@ -1,4 +1,3 @@
-mod agent;
 mod conpty;
 #[cfg(target_os = "linux")]
 mod liveness;
@@ -13,7 +12,7 @@ use std::process::ExitCode;
 #[cfg(any(target_os = "linux", windows))]
 const USAGE: &str = server::cli::USAGE;
 #[cfg(not(any(target_os = "linux", windows)))]
-const USAGE: &str = "usage: brindle-remote --version | --server";
+const USAGE: &str = "usage: brindle-remote --version";
 
 fn main() -> ExitCode {
     match run() {
@@ -38,12 +37,6 @@ fn run() -> Result<(), String> {
             }
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
-        }
-        Some("--server") => {
-            if has_extra {
-                return Err("--server does not accept arguments".into());
-            }
-            agent::serve_stdio().map_err(|error| error.to_string())
         }
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
