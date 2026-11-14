@@ -66,7 +66,7 @@
 - [x] 9.2 Check an upgrade while sessions run: install the zip build with a running detached session, replace it with a newer local build (or run WinGet's upgrade from a local manifest), and relaunch. Verify: the replacement succeeds, the session reattaches through the new core, and the old holder drains (`brindle-remote status`).
 - [x] 9.3 Compare `--latency-bench` and a flood's responsiveness on Windows between `main` and the branch. Verify: the numbers are recorded in the PR description; a noticeable regression gets a follow-up issue before merge.
 - [x] 9.4 Run the Linux checks on the Linux machine through Remote Control: `cargo test --locked`, `cargo build --release --locked`, and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e`. Verify: all pass, with the seams from group 1 changing no Linux behaviour.
-- [ ] 9.5 Hand the user the manual checks from CLAUDE.md that touch Windows tabs (wheel scrolling, right-click menus, IME in a terminal), plus a Start Menu launch, a quit and a relaunch, and a dialog from a program in a tab, through `scripts/run-throwaway.ps1`. Verify: the user confirms each one.
+- [x] 9.5 Hand the user the manual checks from CLAUDE.md that touch Windows tabs (wheel scrolling, right-click menus, IME in a terminal), plus a Start Menu launch, a quit and a relaunch, and a dialog from a program in a tab, through `scripts/run-throwaway.ps1`. Verify: the user confirms each one.
 
 ## Workflow follow-up
 
