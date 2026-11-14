@@ -158,15 +158,15 @@ A terminal's grid SHALL be resized to the number of whole cells that fit in its 
 - **THEN** `tput cols` reports the larger column count
 
 ### Requirement: Pseudoconsole host on Windows
-On Windows, Brindle SHALL host each local tab with the ConPTY build that ships with Brindle (`conpty.dll` and `OpenConsole.exe`). It SHALL load only that exact build, never a different `conpty.dll` found beside the executable, on `PATH` or in the current directory. When it can't, it SHALL use the ConPTY built into Windows and log a warning naming what was missing. `BRINDLE_CONPTY=inbox` SHALL force the built-in ConPTY, for tests.
+On Windows, each local tab's program SHALL run on the ConPTY build that ships with Brindle (`conpty.dll` and `OpenConsole.exe`), hosted by the terminal server. Only that exact build SHALL be loaded, never a different `conpty.dll` found beside an executable, on `PATH` or in the current directory. When it can't be, the built-in ConPTY SHALL be used, and the server's log SHALL say what was missing. `BRINDLE_CONPTY=inbox` in Brindle's environment SHALL force the built-in ConPTY for the tabs that Brindle opens, for tests.
 
 #### Scenario: Shipped host
 - **WHEN** a tab opens in Brindle run from the release zip or installed with WinGet
 - **THEN** the tab's console host process is the shipped `OpenConsole.exe`, not `conhost.exe`
 
 #### Scenario: Planted DLL is ignored
-- **WHEN** a directory on `PATH`, the directory Brindle was started from, or the directory of a `cargo install`ed `brindle.exe` contains a `conpty.dll` that differs from the shipped one
-- **THEN** Brindle doesn't load it
+- **WHEN** a directory on `PATH`, the directory Brindle was started from, or the directory of a `cargo install`ed `brindle.exe` or `brindle-remote.exe` contains a `conpty.dll` that differs from the shipped one
+- **THEN** it isn't loaded
 
 #### Scenario: Fallback
 - **WHEN** the shipped ConPTY can't be loaded, or `BRINDLE_CONPTY=inbox` is set
@@ -206,11 +206,15 @@ On Windows, with the shipped ConPTY host, the console SHALL measure characters t
 - **THEN** the console reports column 1
 
 ### Requirement: Closing a tab never blocks on Windows
-Closing a Windows tab, or its program exiting, SHALL release its pseudoconsole without blocking Brindle's window. That holds even while the program is still writing output.
+Closing a Windows tab, or its program exiting, SHALL release its pseudoconsole without blocking Brindle's window or the terminal server's other sessions. That holds even while the program is still writing output.
 
 #### Scenario: Close during output
 - **WHEN** a Windows tab is running a command that prints continuously and the user closes the tab
 - **THEN** the tab closes at once and the window stays responsive
+
+#### Scenario: Other sessions keep streaming
+- **WHEN** two Windows tabs print continuously and the user closes one of them
+- **THEN** the other tab keeps receiving output without a pause
 
 ### Requirement: The window stays responsive during continuous output
 While any terminal in a window (a local tab or zone, or a remote terminal) receives output continuously, the window SHALL keep repainting that terminal's latest output, SHALL keep handling input and actions, and Brindle SHALL still quit when asked. Updates during continuous output MAY be grouped, but output that arrives after a quiet spell SHALL be shown without added delay.
@@ -227,35 +231,16 @@ While any terminal in a window (a local tab or zone, or a remote terminal) recei
 - **WHEN** a tab has had no output for a while and the user types a character that the shell echoes
 - **THEN** the echo is painted on the next frame, with no pacing delay added
 
-### Requirement: Local Linux terminals run in the terminal server
-On Linux, each local tab and zone SHALL run its program in a session of the terminal server, as defined by the `terminal-server` capability, with the `kill` close policy. Brindle SHALL start the server when none is running. Every other requirement of this capability, and titles, directories, shell integration, program status and notifications, SHALL behave as they do with a PTY owned by Brindle.
-
-#### Scenario: Tab program runs under the server
-- **WHEN** a local Linux tab starts the user's shell
-- **THEN** the shell's parent process is the terminal server, not Brindle, and `brindle-remote list` lists its session as attached
-
-#### Scenario: Closing a tab ends its program
-- **WHEN** the user closes a local tab that is running `sleep 1000`
-- **THEN** `sleep` is gone and the session is no longer listed
-
-#### Scenario: Quitting ends every program
-- **WHEN** the user quits Brindle with local tabs open
-- **THEN** their programs are gone and their sessions are no longer listed
-
-#### Scenario: A crash ends every program
-- **WHEN** Brindle is killed with SIGKILL while local tabs are open
-- **THEN** their programs are gone within a few seconds
-
-#### Scenario: Titles and directories
-- **WHEN** the user runs `cd /var/log` and then `htop` in a local tab, and splits the zone while `htop` runs
-- **THEN** the tab title shows `htop`, and the new zone starts in `/var/log`
-
 ### Requirement: Sessions get the launching Brindle's environment
-A local Linux tab's program SHALL see the environment of the Brindle process that opened it, with the defaults and profile entries of "Program launch environment" applied, never the environment of the Brindle that started the server.
+A local tab's program SHALL see the environment of the Brindle process that opened it, with the defaults and profile entries of "Program launch environment" applied, never the environment of the Brindle that started the server.
 
 #### Scenario: Second Brindle with a different environment
 - **WHEN** a Brindle started with `FOO=1` is running, and a second Brindle started with `FOO=2` opens a tab
 - **THEN** `echo $FOO` in the second Brindle's tab prints `2`
+
+#### Scenario: Case-insensitive override through the server
+- **WHEN** on Windows a profile sets `env = { path = "C:\\tools" }` and the server was started by another Brindle
+- **THEN** programs in that profile's tabs see a single `Path` variable whose value is `C:\tools`
 
 ### Requirement: Brindle reconnects when the core restarts
 When Brindle's connection to the terminal server's core ends, Brindle SHALL reconnect, starting a core if none is running, and get its sessions back. Each tab's screen SHALL then match its session's. The replay SHALL NOT ring the bell, raise notifications or change status dots beyond what the session's current state shows. Input typed while reconnecting SHALL be sent once reconnected.
@@ -276,10 +261,10 @@ When Brindle can't get a session back, because its holder ended, the core no lon
 - **THEN** the tab stays open with its last screen and a line saying the session was lost
 
 ### Requirement: An unusable terminal server is reported in the tab
-Local Linux tabs SHALL always run in the terminal server; Brindle SHALL NOT run their programs on PTYs of its own. When Brindle can't find the `brindle-remote` binary, can't start or reach the server, or shares no protocol version with the running server, each local tab it opens SHALL show an error naming the reason, as for a program that can't start. Brindle SHALL try the server again for the next tab.
+Local tabs SHALL always run in the terminal server; Brindle SHALL NOT run their programs on PTYs or pseudoconsoles of its own. When Brindle can't find the `brindle-remote` binary, can't start or reach the server, or shares no protocol version with the running server, each local tab it opens SHALL show an error naming the reason, as for a program that can't start. Brindle SHALL try the server again for the next tab.
 
 #### Scenario: Missing helper
-- **WHEN** no `brindle-remote` is found beside Brindle and `BRINDLE_REMOTE_AGENT` is unset, and the user opens a local tab
+- **WHEN** no `brindle-remote` is found beside Brindle, `BRINDLE_SERVER_HELPER` is unset (and on Linux `BRINDLE_REMOTE_AGENT` too), and the user opens a local tab
 - **THEN** the tab shows an error saying the terminal server helper was not found, with how to point Brindle at it
 
 #### Scenario: No common protocol version
@@ -289,3 +274,34 @@ Local Linux tabs SHALL always run in the terminal server; Brindle SHALL NOT run 
 #### Scenario: Recovery
 - **WHEN** a tab showed a missing-helper error, the helper is then installed, and the user opens another local tab
 - **THEN** the new tab runs in the server
+
+### Requirement: Local terminals run in the terminal server
+On Linux and Windows, each local tab and zone SHALL run its program in a session of the terminal server (`terminal-server`), with the close rule of `tabs`: closing it ends the program, quitting or a crash leaves it detached, and `-e` command terminals end with Brindle. Brindle SHALL start the server when none is running. Every other requirement here, and titles, directories, shell integration, status and notifications, SHALL behave as with a PTY owned by Brindle.
+
+#### Scenario: Tab program runs under the server
+- **WHEN** a local Linux tab starts the user's shell
+- **THEN** the shell's parent process is the terminal server, not Brindle, and `brindle-remote list` lists its session as attached
+
+#### Scenario: Windows tab program runs under the server
+- **WHEN** a local Windows tab starts PowerShell
+- **THEN** PowerShell's parent process is a terminal server holder, not Brindle, and `brindle-remote list` lists its session as attached
+
+#### Scenario: Closing a tab ends its program
+- **WHEN** the user closes a local tab that is running `sleep 1000`
+- **THEN** `sleep` is gone and the session is no longer listed
+
+#### Scenario: Quitting keeps every program
+- **WHEN** the user quits Brindle with local tabs open
+- **THEN** their programs keep running and their sessions are listed as detached
+
+#### Scenario: Command tab ends with Brindle
+- **WHEN** Brindle is killed while a `brindle -e sleep 1000` tab is open
+- **THEN** that `sleep` is gone within a few seconds
+
+#### Scenario: Titles and directories
+- **WHEN** the user runs `cd /var/log` and then `htop` in a local tab, and splits the zone while `htop` runs
+- **THEN** the tab title shows `htop`, and the new zone starts in `/var/log`
+
+#### Scenario: Titles and directories on Windows
+- **WHEN** the user runs `cd C:\Windows` in a local PowerShell tab with Brindle's integration script loaded, then `python`, and splits the zone while Python runs
+- **THEN** the tab title shows `python`, and the new zone starts in `C:\Windows`

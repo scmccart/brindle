@@ -80,7 +80,7 @@ While a local tab contains two or more zones, Brindle SHALL draw a native header
 - **THEN** the zone's header bar is drawn on `gruvbox-dark`'s background with its foreground and muted foreground for the title and buttons
 
 ### Requirement: Closing a zone
-Closing a zone (with `Close Zone`, ctrl-shift-x, its header `×` button, or when its terminal's program exits) SHALL shut down that zone's terminal and replace its parent split with the sibling subtree. Shutting down a local Linux terminal SHALL end its program (see "Closing ends the program"). Focus SHALL move to the most recently focused zone in that sibling subtree. Closing or exiting the only zone in a tab SHALL close the tab. `Close Tab` (ctrl-shift-w) SHALL close the entire tab and all of its zones.
+Closing a zone (with `Close Zone`, ctrl-shift-x, its header `×` button, or when its terminal's program exits) SHALL shut down that zone's terminal and replace its parent split with the sibling subtree. Shutting down a local terminal SHALL end its program (see "Closing ends the program"). Focus SHALL move to the most recently focused zone in that sibling subtree. Closing or exiting the only zone in a tab SHALL close the tab. `Close Tab` (ctrl-shift-w) SHALL close the entire tab and all of its zones.
 
 #### Scenario: Shell exit in one of two zones
 - **WHEN** a local tab has two zones and the user runs `exit` in the focused right zone
@@ -121,7 +121,7 @@ Splitting a zone whose profile has a remote target SHALL create the new PTY on t
 - **THEN** Brindle does not send `C:\src` as the remote working directory
 
 ### Requirement: Closing ends the program
-When the user closes a local Linux terminal (its zone or its tab), Brindle SHALL end its program in the terminal server, without asking, including a terminal attached to a session that an earlier Brindle left. Quitting Brindle SHALL NOT end it (see "Quitting keeps programs running" in `tabs`).
+When the user closes a local terminal (its zone or its tab), on Linux or on Windows, Brindle SHALL end its program in the terminal server, without asking, including a terminal attached to a session that an earlier Brindle left. Quitting Brindle SHALL NOT end it (see "Quitting keeps programs running" in `tabs`).
 
 #### Scenario: Close a zone
 - **WHEN** a zone runs `sleep 1000` and the user closes it
@@ -130,6 +130,10 @@ When the user closes a local Linux terminal (its zone or its tab), Brindle SHALL
 #### Scenario: Close a reattached tab
 - **WHEN** a tab reattached at launch runs `sleep 1000` and the user closes it with ctrl-shift-w
 - **THEN** the `sleep` process is gone within a few seconds
+
+#### Scenario: Close a Windows zone
+- **WHEN** a Windows zone runs `ping -t localhost` and the user closes it
+- **THEN** the zone closes, the `ping` process is gone within a few seconds, and no session is listed for it
 
 ### Requirement: Zone header menu
 Right-clicking a zone's header bar SHALL focus that zone and open a menu beside the pointer listing Split Zone Right, Split Zone Down and Close Zone, each running the action of the same name on that zone and showing its shortcut when it has one. Split items SHALL be disabled where the zone is too small to split.

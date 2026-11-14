@@ -12,7 +12,7 @@ Brindle SHALL accept:
 - `--config <FILE>`;
 - `-e/--command <CMD> [ARGS]...`, which runs CMD instead of the profile's program and must come last;
 - `--no-restore`, which skips session restore for this launch;
-- `--attach <ID>` (Linux), which opens a tab attached to the detached terminal server session `ID`.
+- `--attach <ID>` (Linux and Windows), which opens a tab attached to the detached terminal server session `ID`.
 
 An unknown argument SHALL print usage and exit with status 2.
 
@@ -174,11 +174,15 @@ When Brindle is started from a console on Windows, its informational output, usa
 - **THEN** `dump.txt` contains the screen dump
 
 ### Requirement: Terminal server directory for tests
-When the environment variable `BRINDLE_SERVER_DIR` is set and not empty, Brindle and `brindle-remote` SHALL use it as the terminal server's directory, as defined by the `terminal-server` capability. Programs in tabs inherit it, so `brindle-remote` commands run in a tab manage that same server.
+When the environment variable `BRINDLE_SERVER_DIR` is set and not empty, Brindle and `brindle-remote` SHALL use it as the terminal server's directory, as defined by the `terminal-server` capability, on Linux and on Windows. Programs in tabs inherit it, so `brindle-remote` commands run in a tab manage that same server.
 
 #### Scenario: Isolated server
 - **WHEN** a test runs Brindle with `BRINDLE_SERVER_DIR=/tmp/case-1`
 - **THEN** its local tabs run in a server whose socket is in `/tmp/case-1`, and the user's own server is not touched
+
+#### Scenario: Isolated server on Windows
+- **WHEN** a test runs Brindle on Windows with `BRINDLE_SERVER_DIR=C:\Temp\case-1`
+- **THEN** its local tabs run in a server whose lock and log files are in `C:\Temp\case-1`, and the user's own server is not touched
 
 #### Scenario: Managing from a tab
 - **WHEN** the user runs `brindle-remote list` in a local tab
@@ -227,3 +231,14 @@ On Windows, starting Brindle from the Start Menu, Explorer or a shortcut SHALL N
 #### Scenario: Start Menu launch
 - **WHEN** the user starts Brindle from the Start Menu
 - **THEN** only Brindle's window opens, with no console window beside it
+
+### Requirement: Terminal server helper override
+When `BRINDLE_SERVER_HELPER` is set and not empty, Brindle SHALL use the file it names as the local terminal server's `brindle-remote`, on Linux and on Windows. Without it, Brindle SHALL look beside its own executable, and on Linux SHALL first honour `BRINDLE_REMOTE_AGENT`. On Windows, `BRINDLE_REMOTE_AGENT` SHALL keep naming only the Linux helper that remote profiles deploy.
+
+#### Scenario: Override on Windows
+- **WHEN** Brindle runs on Windows with `BRINDLE_SERVER_HELPER=C:\build\brindle-remote.exe` and `BRINDLE_REMOTE_AGENT` naming a Linux helper
+- **THEN** local tabs run in a server started from a copy of `C:\build\brindle-remote.exe`, and remote profiles deploy the Linux helper
+
+#### Scenario: Override names nothing
+- **WHEN** `BRINDLE_SERVER_HELPER` names a file that doesn't exist and the user opens a local tab
+- **THEN** the tab shows an error naming `BRINDLE_SERVER_HELPER` and the path
