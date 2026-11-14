@@ -3,10 +3,10 @@
 //! `exec` process (design decision 2).
 //!
 //! - **[`Dial`]** starts a relay and reads up to its frame marker. The
-//!   production one ([`CommandDial`]) runs a [`Command`] it is given; task
-//!   5.3's deployment supplies that command (the launch script that execs a
-//!   cached helper or exits 97) and, on [`Unstarted`] with code 97, uploads
-//!   the helper and launches again.
+//!   production one ([`dial`]) runs the endpoint's launch command, which is
+//!   the cached helper's `relay` or an exit with 97; on that [`Unstarted`]
+//!   the helper is deployed and the launch run again
+//!   ([`client::launch`](crate::remote::client::launch)).
 //! - **The process** ([`start`]): its stdin and stdout are the link, and its
 //!   stderr is kept for errors. A thread waits for it with a blocking
 //!   `wait()`, and ending the link kills it by its pid only until that
@@ -33,6 +33,8 @@ use parking_lot::{Condvar, Mutex};
 use super::link::{Link, Wire};
 use super::{SpawnRequest, sys};
 use crate::config::{Profile, RemoteTarget};
+use crate::remote::client;
+pub use crate::remote::client::Unstarted;
 use crate::remote::protocol::client::Policy;
 use crate::remote::protocol::{Frame, HEARTBEAT_INTERVAL, skip_preamble};
 use crate::terminal::GridSize;
@@ -97,65 +99,37 @@ pub trait Dial: Send + Sync {
     fn launch(&self) -> Result<Link>;
 }
 
-/// A relay started by running a command ([`start`]).
-pub struct CommandDial {
+/// The relay at one SSH host or in one container, started by the endpoint's
+/// launch command with the helper deployed when the endpoint has none
+/// ([`client::launch`]).
+struct Deployed {
     name: String,
-    command: Box<dyn Fn() -> Result<Command> + Send + Sync>,
+    target: RemoteTarget,
 }
 
-impl CommandDial {
-    pub fn new(name: String, command: impl Fn() -> Result<Command> + Send + Sync + 'static) -> Self {
-        Self { name, command: Box::new(command) }
-    }
-}
-
-impl Dial for CommandDial {
+impl Dial for Deployed {
     fn name(&self) -> String {
         self.name.clone()
     }
 
     fn launch(&self) -> Result<Link> {
-        let command = (self.command)()?;
-        Ok(start(command, MARKER_LIMIT)?)
+        client::launch(&self.target, |command| start(command, MARKER_LIMIT))
     }
 }
 
-/// The relay at `target`: `brindle-remote relay` as the endpoint's `PATH`
-/// finds it. Task 5.3 replaces the command with the deploying launch.
-// Task 6.1 opens remote terminals on it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The relay at `target`: this build's `brindle-remote relay` from the
+/// endpoint's cache, deployed there first when it is missing.
 pub fn dial(name: String, target: &RemoteTarget) -> Arc<dyn Dial> {
-    let target = target.clone();
-    Arc::new(CommandDial::new(name, move || {
-        crate::remote::remote_command(&target, "brindle-remote", &["relay".into()])
-    }))
+    Arc::new(Deployed { name, target: target.clone() })
 }
-
-/// A relay's process ended, or was ended, before its frame marker. 5.3's
-/// launch script exits 97 when the helper isn't cached.
-#[derive(Debug)]
-pub struct Unstarted {
-    /// Its exit code; `None` when it was killed or didn't exit in time.
-    // Task 5.3's launch reads it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub code: Option<i32>,
-    pub message: String,
-}
-
-impl std::fmt::Display for Unstarted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Unstarted {}
 
 /// Runs `command` as a relay's process and reads its stdout up to the frame
 /// marker, for at most `limit` (then the process is killed). Its stdin and
-/// stdout are the link.
+/// stdout are the link. A process whose stdout ends before the marker is
+/// [`Unstarted`], with the code it exited with.
 pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let unstarted = |message: String| Unstarted { code: None, message };
+    let unstarted = |message: String| Unstarted { code: None, said: String::new(), message };
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -189,14 +163,17 @@ pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
     let preamble = skip_preamble(&mut stdout);
     drop(marked);
     if let Err(error) = preamble {
-        // Too much noise leaves it running.
-        process.kill();
-        let status = process.wait_for(EXIT_WAIT);
-        let problem = if late.load(Ordering::Acquire) {
-            format!("no frame marker within {} s", limit.as_secs())
-        } else {
-            error.to_string()
-        };
+        let late = late.load(Ordering::Acquire);
+        // A process whose output ended is on its way out, and its exit code
+        // says why (a launch script's 97), so it gets a moment to exit by
+        // itself. Too much noise leaves it running, and a late one has been
+        // killed already.
+        let ending = error.kind() == io::ErrorKind::UnexpectedEof && !late;
+        let status = ending.then(|| process.wait_for(EXIT_WAIT)).flatten().or_else(|| {
+            process.kill();
+            process.wait_for(EXIT_WAIT)
+        });
+        let problem = if late { format!("no frame marker within {} s", limit.as_secs()) } else { error.to_string() };
         let mut message = format!("the relay didn't start: {problem}");
         if let Some(status) = status {
             message.push_str(&format!(" ({program} {})", exit_text(status)));
@@ -205,7 +182,7 @@ pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
         if !said.is_empty() {
             message.push_str(&format!("\n{said}"));
         }
-        return Err(Unstarted { code: status.and_then(|status| status.code()), message });
+        return Err(Unstarted { code: status.and_then(|status| status.code()), said, message });
     }
     let wire = Arc::new(ChildWire { stdin: Mutex::new(Some(stdin)), process, stderr: kept, program });
     Ok(Link { reader: Box::new(stdout), wire })
@@ -594,6 +571,21 @@ mod tests {
         assert_eq!(error.downcast_ref::<Unstarted>().and_then(|e| e.code), Some(97));
         let missing = start(Command::new("brindle-no-such-program"), Duration::from_secs(5)).err().expect("an error");
         assert!(missing.message.starts_with("can't run brindle-no-such-program"), "{}", missing.message);
+    }
+
+    /// A launch whose output ends before it has exited isn't killed for it:
+    /// its code is what tells a missing helper (97) from a failure.
+    #[test]
+    fn a_relay_that_ends_its_output_before_exiting_still_says_its_code() {
+        if !cfg!(unix) {
+            // No shell here that can close its own stdout.
+            return;
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec >&-; sleep 0.3; echo not cached >&2; exit 97"]);
+        let error = start(command, Duration::from_secs(20)).err().expect("an error");
+        assert_eq!(error.code, Some(97), "{}", error.message);
+        assert_eq!(error.said, "not cached");
     }
 
     #[test]

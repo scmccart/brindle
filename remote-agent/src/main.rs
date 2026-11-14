@@ -27,11 +27,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    if env::var_os("BRINDLE_REMOTE_UNLINK").is_some()
-        && let Ok(exe) = env::current_exe()
-    {
-        std::fs::remove_file(exe).ok();
-    }
     let mode = args.next();
     let rest: Vec<String> = args.collect();
     let has_extra = !rest.is_empty();

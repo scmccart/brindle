@@ -43,6 +43,13 @@ mod upgrade;
 
 pub use connection::{AttachRequest, Connection, SessionSink, SpawnRequest};
 pub use host::Host;
+/// What `remote::client`'s tests of the relay's launch against real
+/// endpoints start for themselves.
+#[cfg(test)]
+pub(super) use {
+    link::Link,
+    relay::{dial as dial_relay, start as start_relay},
+};
 pub use session::Session;
 
 use std::collections::HashMap;

@@ -51,7 +51,7 @@
   - after a failed first connect, a new tab's `SPAWN` fails, while attaches and eager connections keep waiting through the retries.
 
   Verify with unit tests on an in-memory transport for the dead-link timeout, backoff, queued requests and that first-connect split
-- [ ] 5.3 Deployment:
+- [x] 5.3 Deployment:
   - the SSH launch script that execs a cached `relay` or exits 97, then upload and relaunch;
   - the container cache in `/tmp/brindle-helper-<version>-<digest>`, with the ownership check in the launch exec, a root deploy on 97, refusal of a non-root-owned directory, and pruning of other builds.
 

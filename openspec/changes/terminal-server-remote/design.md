@@ -134,15 +134,18 @@ The other fields:
 - **SSH:** one connection on the warm path. The launch script is roughly:
 
   ```sh
-  h="$HOME/.cache/brindle/V-D/brindle-remote"
-  if test -x "$h" && test "$("$h" --version)" = V; then exec "$h" relay; fi
+  set -- "$HOME/.cache/brindle/V-D/brindle-remote"
+  if test -x "$1" && test "$("$1" --version)" = V; then exec "$1" relay; fi
   exit 97
   ```
 
-  On 97, Brindle uploads as today (a second connection), then launches again. That removes follow-up 4's extra connection from every connect.
+  The path is a positional parameter, not a variable. The relay's environment becomes its sessions' (decision 7), and assigning a variable that the user's environment already has would change it there.
+
+  On 97, Brindle uploads as today (a second connection), then launches again. That removes follow-up 4's extra connection from every connect. A relay never exits 97, and ssh's own failure (255) is a connection error, not a missing helper.
 - **Containers:** the cache is `/tmp/brindle-helper-<version>-<digest>/brindle-remote`.
   - The launch exec runs as the profile's user. It checks that the directory and file are root-owned and not symbolic links, then `exec`s `relay`; otherwise it exits 97.
   - On 97, a root exec creates the directory with mode 755, copies the helper in and makes it root-owned (the current `chown`/`chmod`/`stat` check), and removes other builds' root-owned `brindle-helper-*` directories.
+  - The copy goes in under a temporary name and is renamed into place once it is root's. Connections share the path now, so it must never hold a partial file, and a helper that is running must never be written to.
   - An existing directory that isn't root-owned is an error naming it. Brindle never deletes or reuses it.
   - Nothing is removed at session end. A running core or holder keeps working if its file is pruned, because Linux runs deleted images.
 
