@@ -570,6 +570,53 @@ mod tests {
         .is_err());
     }
 
+    /// 8.5: the config examples in the README's remote section, together,
+    /// load as the profiles they describe.
+    #[test]
+    fn the_readme_remote_examples_parse() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("\n## Remote hosts and containers\n").expect("the remote section");
+        let section = &readme[start + 1..];
+        let section = &section[..section.find("\n### Terminal server\n").expect("the section's end")];
+        let mut toml = String::new();
+        let mut in_block = false;
+        for line in section.lines() {
+            match (in_block, line) {
+                (false, "```toml") => in_block = true,
+                (true, "```") => in_block = false,
+                (true, line) => {
+                    toml.push_str(line);
+                    toml.push('\n');
+                }
+                _ => {}
+            }
+        }
+        let config = Config::parse(&toml).unwrap();
+        let remotes: Vec<(&str, &str, bool)> = config
+            .profiles
+            .iter()
+            .map(|p| {
+                let target = p.remote.as_ref().unwrap_or_else(|| panic!("{} has no remote", p.name));
+                let kind = match target {
+                    RemoteTarget::Ssh { .. } => "ssh",
+                    RemoteTarget::Container { .. } => "container",
+                };
+                (p.name.as_str(), kind, target.connects_at_launch())
+            })
+            .collect();
+        assert_eq!(
+            remotes,
+            [
+                ("A8", "ssh", false),
+                ("A8 dev", "ssh", false),
+                ("dev container", "container", false),
+                ("dev container (podman)", "container", false),
+                ("build host", "ssh", true),
+                ("dev container (eager)", "container", true),
+            ]
+        );
+    }
+
     #[test]
     fn the_removed_restore_session_key_still_loads() {
         assert!(!Config::parse("").unwrap().has_removed_restore_session());

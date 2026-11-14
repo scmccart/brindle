@@ -40,9 +40,10 @@ pub enum Field {
     Engine,
     Container,
     ContainerUser,
+    ConnectAtLaunch,
 }
 
-pub const FIELDS: [Field; 17] = [
+pub const FIELDS: [Field; 18] = [
     Field::Name,
     Field::Remote,
     Field::SshHost,
@@ -53,6 +54,7 @@ pub const FIELDS: [Field; 17] = [
     Field::Engine,
     Field::Container,
     Field::ContainerUser,
+    Field::ConnectAtLaunch,
     Field::Command,
     Field::Args,
     Field::Cwd,
@@ -119,6 +121,7 @@ impl Field {
             Field::Engine => "Engine",
             Field::Container => "Container",
             Field::ContainerUser => "User",
+            Field::ConnectAtLaunch => "Connect at launch",
         }
     }
 
@@ -146,6 +149,11 @@ impl Field {
 
     fn container_only(self) -> bool {
         matches!(self, Field::Engine | Field::Container | Field::ContainerUser)
+    }
+
+    /// Shown for both kinds of remote target, hidden for a local profile.
+    fn remote_only(self) -> bool {
+        matches!(self, Field::ConnectAtLaunch)
     }
 
     pub fn text_index(self) -> Option<usize> {
@@ -311,6 +319,7 @@ impl ProfileEditor {
             .into_iter()
             .filter(|f| !f.ssh_only() || self.values.remote == RemoteKind::Ssh)
             .filter(|f| !f.container_only() || self.values.remote == RemoteKind::Container)
+            .filter(|f| !f.remote_only() || self.values.remote != RemoteKind::Local)
             .collect()
     }
 
@@ -371,6 +380,16 @@ impl ProfileEditor {
             }
             _ => {}
         }
+    }
+
+    /// The "Connect at launch" switch. It is kept, not shown, while the
+    /// profile is local, so choosing a remote kind again finds it as it was.
+    pub fn connect_at_launch(&self) -> bool {
+        self.values.connect_at_launch
+    }
+
+    pub fn toggle_connect_at_launch(&mut self) {
+        self.values.connect_at_launch = !self.values.connect_at_launch;
     }
 
     pub fn toggle_default(&mut self) {
@@ -794,11 +813,14 @@ impl ProfilesState {
                     _ => Vec::new(),
                 };
                 format!(
-                    "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} default={} invalid={:?} can_save={} error={:?}\n",
+                    "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} default={} remote={} connect_at_launch={} invalid={:?} can_save={} error={:?}\n",
                     editor.text(Field::Name),
                     field,
                     editor.theme().unwrap_or("follow global"),
                     editor.is_default(),
+                    remote_label(editor.values.remote),
+                    // Not shown for a local profile.
+                    if editor.values.remote == RemoteKind::Local { "-".to_string() } else { editor.connect_at_launch().to_string() },
                     invalid,
                     invalid.is_empty(),
                     error
@@ -825,7 +847,9 @@ use crate::actions::{
     SettingsDuplicate, SettingsMoveDown, SettingsMoveUp, SettingsSectionFirst, SettingsSectionLast, SettingsSectionNext,
     SettingsSectionPrev,
 };
-use brindle_ui::{ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, TextInput, TextInputEvent};
+use brindle_ui::{
+    ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, Switch, TextInput, TextInputEvent,
+};
 
 /// The fields shown as a select rather than text.
 const SELECT_FIELDS: [Field; 3] = [Field::Theme, Field::Remote, Field::Engine];
@@ -910,6 +934,7 @@ impl SettingsDialog {
     fn profile_field_handle(&self, editor: &ProfileEditor, field: Field, cx: &App) -> Option<FocusHandle> {
         match field {
             Field::Default => (!editor.default_locked()).then(|| self.default_handle.clone()),
+            Field::ConnectAtLaunch => Some(self.connect_handle.clone()),
             f if SELECT_FIELDS.contains(&f) => self.profile_select(f).map(|s| s.focus_handle(cx)),
             f => self.profile_input(f).map(|i| i.focus_handle(cx)),
         }
@@ -1145,6 +1170,7 @@ impl SettingsDialog {
                     this.choice_slot(Choice::Profile(f)).flex_1().min_w_0().into_any_element()
                 }
                 Field::Default => this.render_default_toggle(editor, cx),
+                Field::ConnectAtLaunch => this.render_connect_toggle(editor, cx),
                 _ => div()
                     .flex_1()
                     .min_w_0()
@@ -1199,6 +1225,39 @@ impl SettingsDialog {
                         "Theme and font size show on this profile's tabs now; command, arguments, directory and environment apply to new tabs only.",
                     ))
                     .child(self.editor_buttons(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The "Connect at launch" switch and its note.
+    fn render_connect_toggle(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.ui_theme().muted_foreground;
+        let toggle = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.edit_profile(window, cx, |e| e.toggle_connect_at_launch());
+        };
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .child(
+                Switch::new("profile-connect-at-launch", editor.connect_at_launch())
+                    .focus(&self.connect_handle)
+                    .on_click(cx.listener(move |this, _: &bool, window, cx| toggle(this, window, cx))),
+            )
+            .child(
+                div()
+                    .id("profile-connect-at-launch-note")
+                    .text_xs()
+                    .text_color(muted)
+                    // The note is the switch's label: a click on it toggles too.
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.connect_handle);
+                        toggle(this, window, cx)
+                    }))
+                    .child("Connect when Brindle starts, not on first use"),
             )
             .into_any_element()
     }
@@ -1455,8 +1514,8 @@ theme = "gone"
     }
 
     /// 8.1: editing a profile that connects at launch, through either kind
-    /// of target, keeps `connect_at_launch` (the dialog has no control for
-    /// it yet), and one that doesn't still doesn't.
+    /// of target, keeps `connect_at_launch` when its switch isn't touched,
+    /// and one that doesn't still doesn't.
     #[test]
     fn saving_an_edit_keeps_connect_at_launch() {
         let text = "[[profiles]]\nname = \"Shell\"\n\
@@ -1483,6 +1542,92 @@ theme = "gone"
         assert!(matches!(config.profiles[1].remote, Some(RemoteTarget::Container { .. })));
         assert_eq!(f.text().matches("connect_at_launch = true").count(), 2, "{}", f.text());
         assert!(!f.text().contains("connect_at_launch = false"), "{}", f.text());
+    }
+
+    /// 8.4: the "Connect at launch" switch is shown for `ssh` and
+    /// `container`, hidden for `none`, and is a stop (the editor's stops are
+    /// its visible fields in order) after the kind's own fields.
+    #[test]
+    fn connect_at_launch_switch_shows_per_kind() {
+        let f = Fixture::new("connect-shows", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        assert_eq!(editor.remote_kind(), RemoteKind::Local);
+        assert!(!editor.visible_fields().contains(&Field::ConnectAtLaunch));
+        editor.choose_remote(RemoteKind::Ssh);
+        let visible = editor.visible_fields();
+        let at = visible.iter().position(|f| *f == Field::ConnectAtLaunch).expect("shown for ssh");
+        assert_eq!(visible[at - 1], Field::SshArgs, "after the last ssh field");
+        assert_eq!(visible[at + 1], Field::Command, "before the profile's own fields");
+        editor.choose_remote(RemoteKind::Container);
+        let visible = editor.visible_fields();
+        let at = visible.iter().position(|f| *f == Field::ConnectAtLaunch).expect("shown for container");
+        assert_eq!(visible[at - 1], Field::ContainerUser, "after the last container field");
+        assert_eq!(visible.iter().filter(|f| **f == Field::ConnectAtLaunch).count(), 1);
+        editor.choose_remote(RemoteKind::Local);
+        assert!(!editor.visible_fields().contains(&Field::ConnectAtLaunch));
+    }
+
+    /// 8.4, the spec's scenario: an SSH host `A8` with the switch on saves
+    /// `connect_at_launch = true`; off writes no key; a toggle makes the
+    /// editor dirty and survives a trip through `none`.
+    #[test]
+    fn connect_at_launch_switch_is_written_only_when_on() {
+        let f = Fixture::new("connect-writes", CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        editor.choose_remote(RemoteKind::Ssh);
+        editor.set_text(Field::SshHost, "A8");
+        assert!(!editor.connect_at_launch());
+        state.save(&f.path, &[]).unwrap();
+        assert!(!f.text().contains("connect_at_launch"), "{}", f.text());
+
+        let editor = edit(&mut state, "Work");
+        assert!(!editor.dirty());
+        editor.toggle_connect_at_launch();
+        assert!(editor.connect_at_launch() && editor.dirty());
+        // Through none and back, the switch is as it was left.
+        editor.choose_remote(RemoteKind::Local);
+        editor.choose_remote(RemoteKind::Ssh);
+        assert!(editor.connect_at_launch());
+        state.save(&f.path, &[]).unwrap();
+        assert!(f.text().contains(r#"remote = { type = "ssh", host = "A8", connect_at_launch = true }"#), "{}", f.text());
+        assert_eq!(f.config().profiles[2].remote.as_ref().map(RemoteTarget::connects_at_launch), Some(true));
+
+        // Opened again it shows on, and turning it off removes the key.
+        let editor = edit(&mut state, "Work");
+        assert!(editor.connect_at_launch() && !editor.dirty());
+        editor.toggle_connect_at_launch();
+        state.save(&f.path, &[]).unwrap();
+        assert!(!f.text().contains("connect_at_launch"), "{}", f.text());
+        assert!(f.text().contains(r#"remote = { type = "ssh", host = "A8" }"#), "{}", f.text());
+
+        // The container kind writes it the same way, and `none` drops it
+        // with the rest of the target.
+        let editor = edit(&mut state, "Work");
+        editor.choose_remote(RemoteKind::Container);
+        editor.set_text(Field::Container, "box");
+        editor.toggle_connect_at_launch();
+        state.save(&f.path, &[]).unwrap();
+        assert!(f.text().contains("connect_at_launch = true"), "{}", f.text());
+        let editor = edit(&mut state, "Work");
+        editor.choose_remote(RemoteKind::Local);
+        state.save(&f.path, &[]).unwrap();
+        assert!(!f.text().contains("remote") && !f.text().contains("connect_at_launch"), "{}", f.text());
+    }
+
+    #[test]
+    fn connect_at_launch_shows_in_the_dump() {
+        let f = Fixture::new("connect-dump", CONFIG);
+        let mut state = f.state();
+        edit(&mut state, "Work");
+        let line = state.describe(&None, "Connect at launch");
+        assert!(line.contains("remote=none connect_at_launch=-"), "{line}");
+        let editor = state.editor_mut().unwrap();
+        editor.choose_remote(RemoteKind::Ssh);
+        editor.toggle_connect_at_launch();
+        let line = state.describe(&None, "Connect at launch");
+        assert!(line.contains("remote=ssh connect_at_launch=true"), "{line}");
     }
 
     #[test]

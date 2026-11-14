@@ -72,8 +72,7 @@ the profile user. The helper stays there for later connections of the same
 build, and other builds' directories are removed. If something that isn't
 root's already has that name, Brindle runs nothing from it, leaves it alone and
 says so in the tab. It does not create or start containers.
-If the connection drops, the endpoint's tabs say so and Brindle reconnects,
-getting their screens back; typing meanwhile is sent once it is back.
+
 Official Windows archives include the static x86-64 Linux helper beside
 `brindle.exe`. For a Windows source build, build that helper in Docker and
 point Brindle at it:
@@ -83,6 +82,61 @@ docker run --rm -v "${PWD}:/src" -w /src rust:1.99.1 sh -c `
   "apt-get update -qq && apt-get install -y -qq musl-tools && rustup target add x86_64-unknown-linux-musl && cargo build --locked --release -p brindle-remote-agent --target x86_64-unknown-linux-musl"
 $env:BRINDLE_REMOTE_AGENT = "$PWD/target/x86_64-unknown-linux-musl/release/brindle-remote"
 ```
+
+### Remote tabs persist
+
+Remote tabs follow the same rules as local ones. Closing a zone or a tab ends
+its program on the host. Quitting Brindle, a crash or a dropped network leaves
+it running in the host's terminal server, detached, and the next launch
+attaches it again with its screen: a restored remote zone takes back its own
+session, once Brindle has connected to its host. A tab opened with
+`brindle -e` ends at quit, as a local one does. `brindle-remote list` on the host shows
+the sessions.
+
+Brindle notices a connection that has gone silent within about half a minute.
+The host's tabs then say it was lost, and Brindle reconnects, pausing up to
+30 s between tries for as long as a tab uses the host. Each tab gets its screen
+back with its program still running (the same pid), and what you typed
+meanwhile is sent once it is back. A session the host no longer has (ended
+there with `brindle-remote kill`, say) shows the red "session lost" line, and
+its tab stays open.
+
+A host is normally connected when its first tab opens, and the connection
+ends a few seconds after its last tab closes. To connect at every launch
+instead, set `connect_at_launch = true` in the profile's `remote` table (it
+is the "Connect at launch" switch in the settings dialog's profile editor, for
+SSH and container targets alike):
+
+```toml
+[[profiles]]
+name = "build host"
+remote = { type = "ssh", host = "builder", connect_at_launch = true }
+
+[[profiles]]
+name = "dev container (eager)"
+remote = { type = "container", container = "my-devbox", connect_at_launch = true }
+```
+
+Brindle then connects in the background and keeps the connection while it
+runs, so the host's detached sessions open as tabs soon after the window
+does, without opening a tab of the profile first. The window doesn't wait for
+it. A host that can't be reached counts as offline and is retried, at most 60 s
+apart. A stopped container is never started: it is offline too.
+
+On a host that runs systemd, the server outlives the SSH login that started it
+only when the user has lingering enabled (`loginctl enable-linger`, run once on
+the host). Without it, the server is not started in a systemd scope of its
+own, and where systemd ends a user's processes with their last login
+(`KillUserProcesses=yes`) it ends then, and the sessions with it. A container's
+server ends with the container.
+
+"Attach Session…" in the command palette lists the detached sessions of every
+host Brindle is connected to, under a heading for each: this machine first,
+then the remote hosts in profile order, newest first within each. A host that
+is still connecting, or offline, has a row that says so and does nothing when
+chosen. Enter attaches a remote session in a new tab with the profile it was
+started with (else the first profile of that host), and ctrl-shift-delete ends
+it on its host.
 
 ### Terminal server
 
@@ -128,7 +182,8 @@ their own sessions ([session restore](#session-restore)), and any others
 (sessions a `--no-restore` launch left, say) open as tabs after them, oldest
 first. To pick one by hand, "Attach Session…" in the command palette lists
 the detached sessions, newest first, with their directory and age: enter
-attaches one into a new tab, ctrl-shift-delete ends the selected one.
+attaches one into a new tab, ctrl-shift-delete ends the selected one. It lists
+remote hosts' sessions too, in groups ([Remote tabs persist](#remote-tabs-persist)).
 `brindle --attach ID` opens session `ID` (from `brindle-remote list`) as a
 tab, or a tab saying why it can't.
 
@@ -550,9 +605,11 @@ program, still running, with its screen and scrollback. A zone whose session
 has ended since (after a reboot or `brindle-remote stop`, say) isn't restored:
 the other side of its split takes its place, and a tab with nothing left is
 dropped. When nothing at all is left, Brindle opens one tab with the default
-profile. On Windows, and for remote profiles, shells start fresh in the
-recorded directory. A state file written by more than one window (before
-Brindle had one) comes back as one window, with the first window's size.
+profile. On Windows, shells start fresh in the recorded directory. A remote
+zone gets its session back from its host once Brindle has connected to it, and
+the host's other detached sessions open as tabs after the local ones. A state
+file written by more than one window (before Brindle had one) comes back as one
+window, with the first window's size.
 `brindle --no-restore` skips restoring once, and leaves the detached
 sessions alone.
 

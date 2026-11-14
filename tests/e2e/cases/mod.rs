@@ -69,6 +69,7 @@ fn unix() -> Vec<Case> {
         display("settings-focus-rings", settings::focus_rings),
         display("settings-editor-select-ring", settings::editor_select_ring),
         display("settings-list-stop", settings::list_stop),
+        display("settings-editor-connect-at-launch", settings::editor_connect_at_launch),
         display("settings-enter-on-button", settings::enter_on_button),
         display("settings-section-shortcuts", settings::section_shortcuts),
         display("settings-section-list", settings::section_list),
