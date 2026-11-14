@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use super::server;
 use crate::brindle::{Run, state_dir};
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -67,12 +66,11 @@ impl Launcher {
 /// `-e` launch from a shell in another directory exits, and its command
 /// runs there, in a new active tab of the running Brindle.
 pub fn second_launch(ctx: &Ctx) -> Result<Outcome> {
-    let tmux = server()?;
     let launcher = Launcher::of(ctx);
     let elsewhere = ctx.dir.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).map_err(|e| e.to_string())?;
     let cwd = elsewhere.clone();
-    let out = Run::new(ctx, &tmux, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .default_profile("Shell")
         .send("echo first-tab\r")
@@ -92,8 +90,7 @@ pub fn second_launch(ctx: &Ctx) -> Result<Outcome> {
 /// `brindle --attach ID` beside the running Brindle opens that detached
 /// session there.
 pub fn attach(ctx: &Ctx) -> Result<Outcome> {
-    let tmux = server()?;
-    Run::new(ctx, &tmux, "first").keep_detached().profile("Shell").send("echo attach-$((1+1))\r").wait_for("attach-2").dump_at(4.0).run()?;
+    Run::new(ctx, "first").keep_detached().profile("Shell").send("echo attach-$((1+1))\r").wait_for("attach-2").dump_at(4.0).run()?;
     let helper = ctx.helper.clone();
     let server_dir = ctx.server_dir.clone();
     let listed = Command::new(&helper)
@@ -110,7 +107,7 @@ pub fn attach(ctx: &Ctx) -> Result<Outcome> {
         .to_string();
     let launcher = Launcher::of(ctx);
     let cwd = ctx.dir.clone();
-    let out = Run::new(ctx, &tmux, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .profile("Shell")
         .default_profile("Shell")

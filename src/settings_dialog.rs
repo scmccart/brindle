@@ -1,7 +1,8 @@
 //! The settings dialog: an overlay over the window with a list of sections.
-//! The only section so far is "Theme": pick a theme with a live preview on
-//! the tabs behind the dialog, and create, edit, rename or delete custom
-//! themes. Changes are written to the config file with `config_edit`.
+//! Its sections are "Profiles" (list, edit, reorder and delete profiles) and
+//! "Theme" (pick a theme with a live preview on the tabs behind the dialog,
+//! and create, edit, rename or delete custom themes). Changes are written to
+//! the config file with `config_edit`.
 //!
 //! [`Model`] holds the state and all the logic and has no GPUI dependency,
 //! so it is unit-tested; [`SettingsDialog`] is the view around it.
@@ -18,7 +19,7 @@ use gpui::{
 
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, Dialog, Dismiss, FocusRing as _, FocusStops, Input, Select,
-    SelectEvent, TextInput, TextInputEvent, Tokens,
+    TextInput, TextInputEvent, Tokens,
 };
 
 use crate::actions::{
@@ -29,34 +30,24 @@ use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
 mod profiles;
 
-use crate::config::{Profile, TmuxSessionEnd};
+use crate::config::Profile;
 use profiles::ProfilesState;
 
 /// The dialog's sections, in the order they are listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
-    General,
     Profiles,
     Theme,
 }
 
-const SECTIONS: [Section; 3] = [Section::General, Section::Profiles, Section::Theme];
+const SECTIONS: [Section; 2] = [Section::Profiles, Section::Theme];
 
 impl Section {
     fn label(self) -> &'static str {
         match self {
-            Section::General => "General",
             Section::Profiles => "Profiles",
             Section::Theme => "Theme",
         }
-    }
-}
-
-fn session_end_label(value: TmuxSessionEnd) -> &'static str {
-    match value {
-        TmuxSessionEnd::CloseWindow => "Close window",
-        TmuxSessionEnd::NewTab => "Open a new tab",
-        TmuxSessionEnd::Ask => "Ask",
     }
 }
 
@@ -286,8 +277,7 @@ fn selection_foreground_field() -> usize {
     SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1
 }
 
-/// What kind of view a section shows: its list (General counts as one), an
-/// editor, or the delete confirmation. A change of section or kind moves
+/// What kind of view a section shows: its list, an editor, or the delete confirmation. A change of section or kind moves
 /// focus to the new view's first control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeKind {
@@ -312,8 +302,6 @@ pub enum Outcome {
     Written,
     /// The config file changed and the dialog is done.
     Applied,
-    /// The dialog is done; nothing to write.
-    Close,
 }
 
 pub struct Model {
@@ -331,8 +319,6 @@ pub struct Model {
     profiles: ProfilesState,
     /// Profiles to list (read-only) when the file can't be parsed.
     fallback_profiles: Vec<Profile>,
-    /// The General section's `tmux_session_end`, as last written.
-    session_end: TmuxSessionEnd,
 }
 
 impl Model {
@@ -342,7 +328,6 @@ impl Model {
         fallback: BTreeMap<String, Theme>,
         fallback_profiles: Vec<Profile>,
         fallback_default: Option<String>,
-        session_end: TmuxSessionEnd,
     ) -> Self {
         let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
         let mut model = Self {
@@ -353,10 +338,9 @@ impl Model {
             mode: Mode::List,
             error: None,
             fallback,
-            section: Section::General,
+            section: Section::Profiles,
             profiles,
             fallback_profiles,
-            session_end,
         };
         model.reload_entries();
         let active = model.active.clone();
@@ -401,9 +385,6 @@ impl Model {
     }
 
     pub fn move_selection(&mut self, forward: bool) {
-        if self.section == Section::General {
-            return;
-        }
         if self.section == Section::Profiles {
             self.profiles.move_selection(forward);
             self.error = None;
@@ -431,7 +412,6 @@ impl Model {
     /// (themes skip the unreadable ones, as up and down do).
     pub fn select_edge(&mut self, last: bool) {
         match self.section {
-            Section::General => {}
             Section::Profiles => {
                 if let Some(ix) = if last { self.profiles.entries.len().checked_sub(1) } else { Some(0) } {
                     self.profiles.select(ix);
@@ -450,9 +430,6 @@ impl Model {
     }
 
     pub fn select(&mut self, ix: usize) {
-        if self.section == Section::General {
-            return;
-        }
         if self.section == Section::Profiles {
             self.profiles.select(ix);
             self.error = None;
@@ -479,9 +456,6 @@ impl Model {
 
     /// Enter: apply in the list, save in the editor, delete when confirming.
     pub fn confirm(&mut self) -> Outcome {
-        if self.section == Section::General {
-            return Outcome::Close;
-        }
         if self.section == Section::Profiles {
             let result = match &self.profiles.mode {
                 profiles::Mode::List => {
@@ -502,9 +476,6 @@ impl Model {
 
     /// Escape: `true` when the whole dialog should close (cancel).
     pub fn cancel(&mut self) -> bool {
-        if self.section == Section::General {
-            return true;
-        }
         if self.section == Section::Profiles {
             self.error = None;
             return match self.profiles.mode {
@@ -544,9 +515,6 @@ impl Model {
 
     /// New: a copy of the selected theme under an unused name.
     pub fn start_new(&mut self) {
-        if self.section == Section::General {
-            return;
-        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -566,9 +534,6 @@ impl Model {
 
     /// Edit: a custom theme in place; a built-in is copied first.
     pub fn start_edit(&mut self) {
-        if self.section == Section::General {
-            return;
-        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -636,9 +601,6 @@ impl Model {
 
     /// Delete: asks for confirmation, or explains why the theme can't go.
     pub fn request_delete(&mut self) {
-        if self.section == Section::General {
-            return;
-        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let result = self.profiles.request_delete().map(|()| profiles::Done::Nothing);
@@ -688,9 +650,6 @@ impl Model {
 
     /// List shortcuts. In the editor, keys belong to the text inputs.
     pub fn key(&mut self, ks: &Keystroke) -> bool {
-        if self.section == Section::General {
-            return false;
-        }
         if self.section == Section::Profiles {
             let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
             if !plain || !matches!(self.profiles.mode, profiles::Mode::List) {
@@ -760,7 +719,6 @@ impl Model {
     /// What the current section shows.
     pub fn mode_kind(&self) -> ModeKind {
         match self.section {
-            Section::General => ModeKind::List,
             Section::Theme => match self.mode {
                 Mode::List => ModeKind::List,
                 Mode::Editor(_) => ModeKind::Editor,
@@ -786,7 +744,6 @@ impl Model {
             return true;
         }
         let dirty = match self.section {
-            Section::General => false,
             Section::Theme => matches!(&self.mode, Mode::Editor(e) if e.dirty()),
             Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
         };
@@ -795,7 +752,6 @@ impl Model {
             return false;
         }
         match self.section {
-            Section::General => {}
             Section::Theme => {
                 self.mode = Mode::List;
                 let active = self.active.clone();
@@ -887,34 +843,9 @@ impl Model {
         self.profiles.take_renames()
     }
 
-    pub fn session_end(&self) -> TmuxSessionEnd {
-        self.session_end
-    }
-
-    /// Writes `tmux_session_end`; the value changes only if the write did.
-    pub fn set_session_end(&mut self, value: TmuxSessionEnd) -> Outcome {
-        if self.section != Section::General || value == self.session_end {
-            return Outcome::Nothing;
-        }
-        match self.save(|doc| Ok(config_edit::set_tmux_session_end(doc, value))) {
-            Ok(()) => {
-                self.session_end = value;
-                Outcome::Written
-            }
-            Err(()) => Outcome::Nothing,
-        }
-    }
-
     /// Debug description for `--dump-screen-after`. `field` names the
     /// focused control, which an editor reports as its `field=`.
     pub fn describe(&self, field: &str) -> String {
-        if self.section == Section::General {
-            return format!(
-                "--- settings section=General tmux_session_end={:?} error={:?}\n",
-                self.session_end.as_str(),
-                self.error
-            );
-        }
         if self.section == Section::Profiles {
             return self.profiles.describe(&self.error, field);
         }
@@ -1038,7 +969,6 @@ impl Btn {
 /// The footer buttons of each view, in Tab order (left to right).
 fn footer_buttons(section: Section, kind: ModeKind) -> &'static [Btn] {
     match (section, kind) {
-        (Section::General, _) => &[Btn::Close],
         (_, ModeKind::ConfirmDelete) => &[Btn::Keep, Btn::ConfirmDelete],
         (_, ModeKind::Editor) => &[Btn::Discard, Btn::Save],
         (Section::Theme, ModeKind::List) => &[Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply],
@@ -1057,11 +987,9 @@ fn enter_confirms(on_button: bool) -> bool {
     !on_button
 }
 
-/// A choice field: the General section's session-end setting, or one of the
-/// profile editor's selects.
+/// A choice field: one of the profile editor's selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Choice {
-    SessionEnd,
     Profile(profiles::Field),
 }
 
@@ -1094,9 +1022,6 @@ pub struct SettingsDialog {
     default_handle: FocusHandle,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
-    /// The General section's choice field.
-    session_end: Entity<Select>,
-    _session_end_changed: Subscription,
     /// The section and kind of view focus was last placed for.
     placed_for: (Section, ModeKind),
     /// The focused handle an editor last scrolled into view.
@@ -1119,7 +1044,6 @@ impl FocusStops for SettingsDialog {
         let mut stops = vec![self.sections_handle.clone()];
         let (section, kind) = (self.model.section(), self.model.mode_kind());
         match (section, kind) {
-            (Section::General, _) => stops.push(self.session_end.focus_handle(cx)),
             (Section::Theme | Section::Profiles, ModeKind::List) => stops.push(self.list_handle.clone()),
             (Section::Theme, ModeKind::Editor) => {
                 for (field, input) in self.fields.iter().enumerate() {
@@ -1139,25 +1063,19 @@ impl FocusStops for SettingsDialog {
         stops
     }
 
-    /// The General section opens with its choice focused, so enter, space,
-    /// up and down open its menu at once.
+    /// The dialog opens with its section's first stop focused (the profile
+    /// list), not the section list, as a list or an editor that opens later
+    /// takes focus on its first stop.
     fn initial_focus(&self, cx: &App) -> Option<FocusHandle> {
-        (self.model.section() == Section::General).then(|| self.session_end.focus_handle(cx))
+        Some(self.default_focus(cx))
     }
 }
 
 impl SettingsDialog {
-    pub fn new(model: Model, theme: Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Model, theme: Theme, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = model.preview().unwrap_or(theme);
         let list_scroll = ScrollHandle::new();
         list_scroll.scroll_to_item(model.selected);
-        let labels = TmuxSessionEnd::ALL.map(session_end_label);
-        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == model.session_end());
-        let session_end = cx.new(|cx| Select::new(labels, current, cx));
-        let session_end_changed = cx.subscribe_in(&session_end, window, |this, _, event: &SelectEvent, window, cx| {
-            let SelectEvent::Changed(ix) = *event;
-            this.apply_choice(Choice::SessionEnd, ix, window, cx);
-        });
         let placed_for = (model.section(), model.mode_kind());
         Self {
             focus_handle: cx.focus_handle(),
@@ -1178,8 +1096,6 @@ impl SettingsDialog {
             default_handle: cx.focus_handle(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
-            session_end,
-            _session_end_changed: session_end_changed,
             placed_for,
             scrolled_to: None,
         }
@@ -1198,18 +1114,13 @@ impl SettingsDialog {
     }
 
     /// The name of the focused control: an editor field's label, a
-    /// button's, `list` for a list, `close` for the `X`, `session_end` for
-    /// General's choice, or empty.
+    /// button's, `list` for a list, `close` for the `X`, or empty.
     pub fn focused_label(&self, window: &Window, cx: &App) -> &'static str {
         if self.sections_handle.is_focused(window) {
             return "sections";
         }
         if self.list_handle.is_focused(window) {
             return "list";
-        }
-        let session_end = self.session_end.read(cx);
-        if session_end.is_open() || session_end.focus_handle(cx).is_focused(window) {
-            return "session_end";
         }
         if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
             return field_label(field);
@@ -1276,19 +1187,18 @@ impl SettingsDialog {
         }
     }
 
-    /// Where focus goes when a view opens: General's choice, a list, an
-    /// editor's name, or (asking to confirm a delete) the dialog itself.
+    /// Where focus goes when a view opens: a list, an editor's name, or
+    /// (asking to confirm a delete) the dialog itself.
     fn default_focus(&self, cx: &App) -> FocusHandle {
-        match (self.model.section(), self.model.mode_kind()) {
-            (Section::General, _) => self.session_end.focus_handle(cx),
-            (_, ModeKind::List) => self.list_handle.clone(),
+        match self.model.mode_kind() {
+            ModeKind::List => self.list_handle.clone(),
             _ => self.field_stops(cx).into_iter().next().unwrap_or_else(|| self.focus_handle.clone()),
         }
     }
 
     /// Whether a select's menu is open; it holds focus while it is.
     fn menu_open(&self, cx: &App) -> bool {
-        self.session_end.read(cx).is_open() || self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
+        self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
     }
 
     /// Moves focus to the new view's first control when the section or the
@@ -1297,13 +1207,16 @@ impl SettingsDialog {
     fn place_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = (self.model.section(), self.model.mode_kind());
         let moved = view != self.placed_for;
+        let section_changed = view.0 != self.placed_for.0;
         self.placed_for = view;
         if !moved && self.menu_open(cx) {
             return;
         }
         // On the section list, focus stays while the sections change under
-        // it, by key or click: the user is still choosing a section.
-        if self.sections_handle.is_focused(window) {
+        // it, by key or click: the user is still choosing a section. A view
+        // that opens in the same section (an editor, by a list key) takes
+        // focus as usual.
+        if self.sections_handle.is_focused(window) && (section_changed || !moved) {
             return;
         }
         let stops = self.stops(cx);
@@ -1322,7 +1235,6 @@ impl SettingsDialog {
         self.sync_selects(cx);
         self.place_focus(window, cx);
         match self.model.section() {
-            Section::General => {}
             Section::Theme => {
                 if matches!(self.model.mode, Mode::List) {
                     self.list_scroll.scroll_to_item(self.model.selected);
@@ -1340,10 +1252,6 @@ impl SettingsDialog {
     /// Shows the model's values in the selects: a refused write leaves the
     /// model as it was, and a reload or a newly opened editor sets them.
     fn sync_selects(&mut self, cx: &mut Context<Self>) {
-        let current = TmuxSessionEnd::ALL.iter().position(|v| *v == self.model.session_end());
-        if self.session_end.read(cx).selected() != current {
-            self.session_end.update(cx, |s, cx| s.set_selected(current, cx));
-        }
         let Some(editor) = self.model.profiles.editor() else { return };
         for (field, select) in &self.profile_selects {
             let current = editor.choice_index(*field);
@@ -1356,20 +1264,13 @@ impl SettingsDialog {
     /// The select behind a choice field.
     fn choice_select(&self, choice: Choice) -> Option<Entity<Select>> {
         match choice {
-            Choice::SessionEnd => Some(self.session_end.clone()),
             Choice::Profile(field) => self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s.clone()),
         }
     }
 
-    /// Option `ix` of a choice field was chosen: write the setting, or
-    /// change the edited profile.
+    /// Option `ix` of a choice field was chosen: change the edited profile.
     fn apply_choice(&mut self, choice: Choice, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         match choice {
-            Choice::SessionEnd => {
-                let Some(&value) = TmuxSessionEnd::ALL.get(ix) else { return };
-                let outcome = self.model.set_session_end(value);
-                self.outcome(outcome, window, cx);
-            }
             Choice::Profile(field) => self.edit_profile(window, cx, |e| e.choose(field, ix)),
         }
     }
@@ -1448,7 +1349,6 @@ impl SettingsDialog {
                 cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
                 cx.emit(DismissEvent);
             }
-            Outcome::Close => cx.emit(DismissEvent),
         }
     }
 
@@ -1484,7 +1384,7 @@ impl SettingsDialog {
         self.changed(window, cx);
     }
 
-    /// Enter: the section's confirm (apply, edit, save, delete, close), but
+    /// Enter: the section's confirm (apply, edit, save, delete), but
     /// not on a focused button, which takes the key itself.
     fn confirm(&mut self, _: &SettingsConfirm, window: &mut Window, cx: &mut Context<Self>) {
         // On the section list, the focused section is already the shown
@@ -1502,15 +1402,14 @@ impl SettingsDialog {
     }
 
     /// Escape (through the overlay's `Dismiss`, after an open select menu
-    /// took its own) or the close `X`: closes in a list and in General,
-    /// discards in an editor. Handling `Dismiss` here keeps the dialog open
+    /// took its own) or the close `X`: closes in a list, discards in an
+    /// editor. Handling `Dismiss` here keeps the dialog open
     /// unless the model says it is done.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         self.request_cancel(window, cx);
     }
 
-    /// Escape or the close `X`: closes in a list and in General, discards in
-    /// an editor.
+    /// Escape or the close `X`: closes in a list, discards in an editor.
     fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.cancel() {
             cx.emit(DismissEvent);
@@ -1542,32 +1441,6 @@ impl SettingsDialog {
     }
 
     // ---- rendering ----
-
-    fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
-        // Wide enough for the longest option, "Open a new tab".
-        let choice = self.choice_slot(Choice::SessionEnd).w(px(280.0));
-        let body = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap_2()
-            .child(div().text_color(t.foreground).child("When a tmux session ends and its tabs were the window's only tabs"))
-            .child(div().flex().child(choice))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(t.muted_foreground)
-                    .child("Applies to detaching (ctrl-shift-d), closing the last tab, and the last shell exiting. Saved at once."),
-            );
-        // Changes are already saved, so Close is all the footer needs.
-        let footer = div()
-            .flex()
-            .items_center()
-            .child(div().flex_1())
-            .child(self.button(Btn::Close, "Close", ButtonVariant::Default, cx, |_, _, cx| cx.emit(DismissEvent)));
-        div().flex().flex_col().flex_1().min_h_0().gap_2().child(body).child(footer).into_any_element()
-    }
 
     /// The frame around the theme or profile list: one Tab stop
     /// (`list_handle`) in the `SettingsList` key context, whose keys move
@@ -1861,7 +1734,6 @@ impl Render for SettingsDialog {
         self.follow_focus(window, cx);
         let t = *cx.ui_theme();
         let content = match (self.model.section(), &self.model.mode) {
-            (Section::General, _) => self.render_general(cx),
             (Section::Profiles, _) => self.render_profiles(window, cx),
             (Section::Theme, Mode::Editor(editor)) => {
                 let editor = editor.clone();
@@ -2015,14 +1887,14 @@ background = "nope"
 
         /// A model on the Theme section, where most tests start.
         fn model(&self, active: &str) -> Model {
-            let mut model = self.general(active);
+            let mut model = self.opened(active);
             model.select_section(Section::Theme);
             model
         }
 
-        /// A model as the dialog opens: on the General section.
-        fn general(&self, active: &str) -> Model {
-            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None, TmuxSessionEnd::default())
+        /// A model as the dialog opens: on the Profiles section.
+        fn opened(&self, active: &str) -> Model {
+            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None)
         }
 
         fn text(&self) -> String {
@@ -2091,17 +1963,18 @@ background = "nope"
     #[test]
     fn section_keys_step_wrap_and_reach_the_ends() {
         let f = Fixture::new("section-keys", CONFIG);
-        let mut model = f.general("mine");
-        assert!(model.next_section(true));
+        let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
         assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Theme);
         assert!(model.next_section(true));
-        assert_eq!(model.section(), Section::General);
-        assert!(model.edge_section(true));
+        assert_eq!(model.section(), Section::Profiles);
+        assert!(model.next_section(false));
         assert_eq!(model.section(), Section::Theme);
         assert!(model.edge_section(false));
-        assert_eq!(model.section(), Section::General);
+        assert_eq!(model.section(), Section::Profiles);
+        assert!(model.edge_section(true));
+        assert_eq!(model.section(), Section::Theme);
     }
 
     #[test]
@@ -2112,10 +1985,6 @@ background = "nope"
         assert_eq!(model.selected_entry().unwrap().name, "spare");
         model.select_edge(false);
         assert_eq!(model.selected_entry().unwrap().name, "brindle-dark");
-        // In General there is no list: nothing changes.
-        let mut general = f.general("mine");
-        general.select_edge(true);
-        assert_eq!(general.section(), Section::General);
     }
 
     #[test]
@@ -2136,7 +2005,6 @@ background = "nope"
             BTreeMap::from([("mine".into(), Theme::default())]),
             Vec::new(),
             None,
-            TmuxSessionEnd::default(),
         );
         model.select_section(Section::Theme);
         // The fallback themes are still listed.
@@ -2297,16 +2165,15 @@ background = "nope"
     }
 
     /// Escape (the overlay's dismiss request) per section and mode: it
-    /// closes the dialog from a list and from General, and otherwise leaves
-    /// the editor or the confirmation for the list, keeping the dialog.
+    /// closes the dialog from a list, and otherwise leaves the editor or the
+    /// confirmation for the list, keeping the dialog.
     #[test]
     fn escape_outcome_per_mode() {
         // A second profile, so one can be asked about deleting.
         let config = CONFIG.replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"Work\"\n");
         let f = Fixture::new("escape", &config);
-        let mut model = f.general("mine");
+        let mut model = f.opened("mine");
         assert_eq!(model.mode_kind(), ModeKind::List);
-        assert!(model.cancel(), "General closes");
 
         model.select_section(Section::Theme);
         assert!(model.cancel(), "the theme list closes");
@@ -2346,7 +2213,6 @@ background = "nope"
     /// Each view's buttons, in Tab order, and the dump label of each.
     #[test]
     fn footer_buttons_per_view() {
-        assert_eq!(footer_buttons(Section::General, ModeKind::List), [Btn::Close]);
         assert_eq!(
             footer_buttons(Section::Theme, ModeKind::List),
             [Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply]
@@ -2397,65 +2263,21 @@ background = "nope"
     }
 
     #[test]
-    fn opens_on_general_and_sections_wrap() {
-        let f = Fixture::new("general-order", CONFIG);
-        let mut model = f.general("mine");
-        assert_eq!(model.section(), Section::General);
-        assert_eq!(SECTIONS.map(Section::label), ["General", "Profiles", "Theme"]);
-        assert!(model.in_list());
-        assert!(model.next_section(true));
+    fn opens_on_profiles_and_sections_wrap() {
+        let f = Fixture::new("section-order", CONFIG);
+        let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
+        assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme"]);
+        assert!(model.in_list());
         assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Theme);
         // The theme list shows the active theme.
         assert_eq!(model.selected_entry().unwrap().name, "mine");
         assert!(model.next_section(true));
-        assert_eq!(model.section(), Section::General);
+        assert_eq!(model.section(), Section::Profiles);
         assert!(model.next_section(false));
         assert_eq!(model.section(), Section::Theme);
-        // In General, up/down and list keys do nothing; enter and escape close.
-        model.select_section(Section::General);
-        model.move_selection(true);
-        assert!(!model.key(&Keystroke::parse("n").unwrap()));
-        assert_eq!(model.confirm(), Outcome::Close);
-        assert!(model.cancel());
         assert_eq!(f.text(), CONFIG);
-    }
-
-    #[test]
-    fn general_choices_write_tmux_session_end() {
-        let f = Fixture::new("general-write", CONFIG);
-        let mut model = f.general("mine");
-        assert_eq!(
-            model.describe(""),
-            "--- settings section=General tmux_session_end=\"close_window\" error=None\n"
-        );
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::NewTab);
-        assert!(f.text().starts_with("# test config\ntheme = \"mine\"\ntmux_session_end = \"new_tab\"\n"), "{}", f.text());
-        assert_eq!(model.set_session_end(TmuxSessionEnd::CloseWindow), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
-        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Written);
-        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
-        assert!(f.text().contains("tmux_session_end = \"ask\""));
-        // Choosing the current value writes nothing.
-        assert_eq!(model.set_session_end(TmuxSessionEnd::Ask), Outcome::Nothing);
-        // Only from the General section.
-        model.select_section(Section::Theme);
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
-        assert_eq!(model.session_end(), TmuxSessionEnd::Ask);
-    }
-
-    #[test]
-    fn general_on_a_malformed_file_keeps_the_value() {
-        let text = "theme = \"mine\"\n[oops\n";
-        let f = Fixture::new("general-malformed", text);
-        let mut model = f.general("mine");
-        assert_eq!(model.set_session_end(TmuxSessionEnd::NewTab), Outcome::Nothing);
-        assert_eq!(model.session_end(), TmuxSessionEnd::CloseWindow);
-        assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
-        assert!(model.describe("").contains("error=Some("));
-        assert_eq!(f.text(), text);
     }
 
     #[test]

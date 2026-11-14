@@ -48,9 +48,33 @@ mod programs {
     }
 
     /// Prints `one`, then `two:<line>` for the line it reads, then waits
-    /// for another line and exits with 0.
-    pub fn echoes_a_line(session: SessionId) -> Spawn {
-        shell(session, "echo one; read x; echo \"two:$x\"; read y")
+    /// until [`release`] lets it go through `go` (a FIFO, made here) and
+    /// exits with 0. Releasing it needs no core.
+    pub fn echoes_a_line(session: SessionId, go: &Path) -> Spawn {
+        make_fifo(go);
+        let script = format!("echo one; read x; echo \"two:$x\"; read y <'{}'", go.display());
+        shell(session, &script)
+    }
+
+    /// Lets an [`echoes_a_line`] program waiting on `go` go.
+    pub fn release(go: &Path) {
+        use std::io::Write as _;
+
+        // Opened for reading too, so the open doesn't wait for the program's.
+        let mut fifo = std::fs::OpenOptions::new().read(true).write(true).open(go).unwrap();
+        fifo.write_all(b"
+").unwrap();
+    }
+
+    /// Makes a FIFO at `path`. A session's program that reads it waits until
+    /// the test writes to it.
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "mkfifo: {}", std::io::Error::last_os_error());
     }
 
     /// Prints a flood and exits with 0. No newlines, so the PTY passes the
@@ -100,9 +124,21 @@ mod programs {
     }
 
     /// Prints `one`, then `two:<line>` for the line it reads, then waits
-    /// for another line and exits with 0.
-    pub fn echoes_a_line(session: SessionId) -> Spawn {
-        shell(session, "echo one& set /p x=& echo two:!x!& set /p y=& exit 0")
+    /// until [`release`] creates `go` and exits with 0. Releasing it needs
+    /// no core. The path goes unquoted (the launch line would escape the
+    /// quotes, which `cmd` doesn't undo), so it has no space.
+    pub fn echoes_a_line(session: SessionId, go: &Path) -> Spawn {
+        assert!(!go.to_str().unwrap().contains(' '), "{go:?}");
+        let wait = format!(
+            "for /l %i in (1,1,600) do @(if exist {} (exit 0) else ping -n 2 127.0.0.1 >nul)",
+            go.display()
+        );
+        shell(session, &format!("echo one& set /p x=& echo two:!x!& {wait}"))
+    }
+
+    /// Lets an [`echoes_a_line`] program waiting on `go` go.
+    pub fn release(go: &Path) {
+        std::fs::write(go, b"").unwrap();
     }
 
     /// Prints a flood and exits with 0.
@@ -138,15 +174,69 @@ fn holder_exits(dir: &TempDir, pid: u32) -> bool {
     eventually(TIMEOUT, || !alive(pid) && dir.holder_endpoints().is_empty())
 }
 
-/// Waits for the `EXITED` of a session that was hung up. A signal ended its
-/// program on Linux, so it has no exit code; on Windows it has the one the
-/// console's end or the holder ended it with.
+/// Waits for the `EXITED` of a session that was hung up. On Linux its
+/// status isn't the server's to decide: the signal nearly always ends the
+/// program (no exit code), but one blocked reading the terminal now and then
+/// gets through "the read failed, exit 1" first. On Windows it has the code
+/// the console's end or the holder ended it with.
 fn hung_up(core: &mut TestCore, session: u32) {
     let code = core.exit_code(session);
-    #[cfg(unix)]
-    assert_eq!(code, None);
     #[cfg(windows)]
     assert!(code.is_some());
+    #[cfg(unix)]
+    let _ = code;
+}
+
+#[cfg(unix)]
+/// Runs `printf R >&3` with a new pipe's write end passed as fd 3, and checks
+/// that the byte arrives. The pipe is first put on fd 3 itself (`on_target`),
+/// close-on-exec as `pipe2` can return it, or kept off it. That is done in
+/// the forked child, whose fds are its own copy, so no other test's fd 3 is
+/// touched.
+fn assert_passed_as_fd_3(on_target: bool) {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let write_fd = write.as_raw_fd();
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf R >&3"]).stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let fd = match (on_target, write_fd == 3) {
+                (true, false) => libc::dup3(write_fd, 3, libc::O_CLOEXEC),
+                (false, true) => libc::fcntl(write_fd, libc::F_DUPFD_CLOEXEC, 4),
+                _ => write_fd,
+            };
+            if fd == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            pass_fd_as(fd, 3)
+        });
+    }
+    let output = command.output().unwrap();
+    drop(write);
+    let mut got = String::new();
+    fs::File::from(read).read_to_string(&mut got).unwrap();
+    assert_eq!(
+        got,
+        "R",
+        "on_target {on_target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_ready_pipe_is_passed_as_fd_3_whether_or_not_it_is_there_already() {
+    // `dup2(3, 3)` does nothing, so the server's exec would close it and
+    // `--ready-fd 3` would name a closed fd.
+    assert_passed_as_fd_3(true);
+    assert_passed_as_fd_3(false);
 }
 
 #[test]
@@ -458,9 +548,11 @@ fn hangup_kills_the_process_group() {
 fn hangup_kills_a_child_that_outlives_its_exited_leader() {
     let (_dir, mut core, _) = holder("hangup-orphan");
     // The leader goes on SIGHUP; its child ignores it and stays in the group.
+    // The child reports its own pid, and only once it ignores the signal: a
+    // pid the leader printed could be hung up before the child's trap ran.
     let pid = core.spawn(shell(
         1,
-        "(trap '' HUP; exec sleep 1000) & echo \"bg=$!.\"; wait",
+        "(trap '' HUP; exec sh -c 'echo \"bg=$$.\"; exec sleep 1000') & wait",
     ));
     let background = reported_pid(&core.output_until(1, b"."), "bg");
     assert!(alive(background));
@@ -491,7 +583,8 @@ fn meta() -> h1::Spawn {
 #[test]
 fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
     let (dir, mut first, holder_pid) = holder("adopt");
-    let mut request = programs::echoes_a_line(1);
+    let go = dir.path.join("go");
+    let mut request = programs::echoes_a_line(1, &go);
     request.meta = meta().meta;
     let pid = first.spawn(request.clone());
     first.output_until(1, b"one\r\n");
@@ -542,20 +635,21 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
     );
 
     // An exit while no core is connected is reported in the next WELCOME.
+    // The program is let go (`programs::release`) once the core has gone. Input
+    // would need a core to carry it, and the exit it causes can reach the
+    // holder before that core's disconnect does: the holder then reports
+    // the exit to that core and, left without sessions, exits.
     drop(third);
-    let mut fourth = TestCore::connect_to(&dir);
-    fourth.hello(4);
-    fourth.input(1, programs::ENTER);
-    drop(fourth);
+    programs::release(&go);
     assert!(eventually(TIMEOUT, || !alive(pid)));
-    let mut fifth = TestCore::connect_to(&dir);
-    let adopted = fifth.hello(5);
+    let mut fourth = TestCore::connect_to(&dir);
+    let adopted = fourth.hello(4);
     match adopted.welcome().sessions[0].exit {
         Some(exit) => assert_eq!(exit.code, Some(0)),
         // Reaped, but its output was still being drained.
-        None => assert_eq!(fifth.exit_code(1), Some(0)),
+        None => assert_eq!(fourth.exit_code(1), Some(0)),
     }
-    assert!(fifth.closes(), "the holder had nothing left");
+    assert!(fourth.closes(), "the holder had nothing left");
     assert!(holder_exits(&dir, holder_pid));
 }
 
@@ -593,6 +687,78 @@ fn set_meta_replaces_what_the_next_core_gets() {
 
 #[cfg(unix)]
 #[test]
+fn what_a_core_sent_before_it_went_counts_while_the_holder_had_output_for_it() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let (dir, mut first, holder_pid) = holder("write-fail");
+    // It prints without pause, so the holder always has output to send.
+    first.spawn(shell(1, "stty raw -echo; exec yes"));
+
+    // The next core never reads. Once its socket is full, the holder has
+    // output queued for it, which it tries to send at each turn.
+    let mut silent = UnixStream::connect(&dir.holder_endpoints()[0]).unwrap();
+    let send = |stream: &mut UnixStream, message: ToHolder| {
+        message.encode().unwrap().write_to(stream).unwrap()
+    };
+    send(
+        &mut silent,
+        ToHolder::Hello(h1::Hello {
+            min: h1::PROTOCOLS.min,
+            max: h1::PROTOCOLS.max,
+            core_build: "silent".into(),
+            instance: 2,
+        }),
+    );
+    assert!(first.closes(), "the holder kept its first core");
+    let unread = |stream: &UnixStream| {
+        let mut waiting: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int, and the fd is open.
+        let result = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+        assert_eq!(result, 0);
+        waiting
+    };
+    let mut before = 0;
+    assert!(
+        eventually(TIMEOUT, || {
+            let now = unread(&silent);
+            let full = now >= 64 * 1024 && now == before;
+            before = now;
+            full
+        }),
+        "the holder's output never backed up"
+    );
+
+    // Its last message, and then it is gone, like a core killed right
+    // after telling a client about an attach. The holder doesn't run in
+    // between (as on a busy machine), so when it does, the write it tries
+    // first fails: the message in its socket must still be read.
+    let signal = |signal| unsafe { libc::kill(holder_pid as libc::pid_t, signal) };
+    assert_eq!(signal(libc::SIGSTOP), 0);
+    assert!(eventually(TIMEOUT, || state(holder_pid) == Some('T')));
+    let updated = h1::SessionMeta {
+        owner: "b".into(),
+        ..h1::SessionMeta::default()
+    }
+    .to_value();
+    send(
+        &mut silent,
+        ToHolder::SetMeta(h1::SetMeta {
+            session: 1,
+            meta: updated.clone(),
+        }),
+    );
+    drop(silent);
+    assert_eq!(signal(libc::SIGCONT), 0);
+
+    let mut last = TestCore::connect_to(&dir);
+    let adopted = last.hello(3);
+    assert_eq!(adopted.welcome().sessions[0].meta, updated);
+    last.hang_up(1);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
     let (dir, mut core, _) = holder("covers");
     core.spawn(spawn(1, "cat", &[]));
@@ -610,8 +776,7 @@ fn a_checkpoint_keeps_the_output_it_doesnt_cover() {
     assert_eq!(adopted.checkpoints[&1], b"CP");
     assert_eq!(adopted.tails[&1], b"a\r\nb\r\nb\r\n");
     assert!(!adopted.welcome().sessions[0].truncated);
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
 }
 
 #[test]
@@ -665,9 +830,9 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
         seq = children_named(pid, "seq");
         !seq.is_empty()
     }));
-    std::thread::sleep(Duration::from_millis(500));
+    let blocked = stays_blocked(seq[0], holder_pid);
     assert!(alive(seq[0]), "seq finished, so output went somewhere");
-    assert_eq!(state(seq[0]), Some('S'));
+    assert!(blocked, "seq never stopped: the holder kept reading");
 
     let mut core = TestCore::connect_to(&dir);
     let adopted = core.hello(2);
@@ -687,15 +852,14 @@ fn without_a_core_a_program_blocks_instead_of_losing_output() {
         stream[..expected.len()] == expected[..],
         "the output has a gap or is out of order"
     );
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
     assert!(holder_exits(&dir, holder_pid));
 }
 
 #[cfg(unix)]
 #[test]
 fn a_paused_session_blocks_until_resumed() {
-    let (_dir, mut core, _) = holder("pause");
+    let (_dir, mut core, holder_pid) = holder("pause");
     let pid = core.spawn(shell(1, "read go; seq 1 300000; echo DONE; read z"));
     core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
     core.input(1, b"go\n");
@@ -704,15 +868,14 @@ fn a_paused_session_blocks_until_resumed() {
         seq = children_named(pid, "seq");
         !seq.is_empty()
     }));
-    std::thread::sleep(Duration::from_millis(500));
+    let blocked = stays_blocked(seq[0], holder_pid);
     assert!(alive(seq[0]), "seq finished, so the PTY was read");
-    assert_eq!(state(seq[0]), Some('S'));
+    assert!(blocked, "seq never stopped: the PTY was read");
 
     core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
     let output = core.output_until(1, b"DONE\r\n");
     assert!(contains(&output, b"\r\n300000\r\n"));
-    core.hang_up(1);
-    assert_eq!(core.exit_code(1), None);
+    core.hang_up_and_wait(1);
 }
 
 #[test]

@@ -4,8 +4,8 @@
 //! - `Server` (Linux and Windows): a session of the local terminal server
 //!   ([`crate::remote::local`]), whose output the connection's reader
 //!   thread parses. Every local tab uses it.
-//! - `Remote`: bytes delivered by someone else (a tmux control-mode pane).
-//!   Output is fed in with [`Terminal::feed`] and input goes to a callback.
+//! - `Remote`: a read-only message (an error shown in a tab), fed in with
+//!   [`Terminal::feed`]; it has no program, so input goes nowhere.
 //! - `Agent`: a PTY owned by the remote Linux helper.
 
 pub mod cmdline;
@@ -22,7 +22,6 @@ pub use brindle_term_core::{shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -191,12 +190,8 @@ enum Backend {
     /// A session of the local terminal server.
     #[cfg(any(target_os = "linux", windows))]
     Server { session: crate::remote::local::Session, closing: Closing },
-    /// A tmux pane whose stream and input are owned by `TmuxSession`.
-    Remote {
-        scanner: Scanner,
-        input: Rc<dyn Fn(&[u8])>,
-        palette: Option<PaletteHandler>,
-    },
+    /// A read-only message with no program behind it.
+    Remote,
     /// A PTY owned by the remote Linux helper.
     Agent {
         scanner: Scanner,
@@ -213,8 +208,8 @@ enum Backend {
 pub enum Closing {
     /// It keeps running, detached, and the next launch attaches it.
     Keeps,
-    /// It ends: a command given instead of the profile's program (`-e`, a
-    /// classic tmux attach), which is never restored or reattached.
+    /// It ends: a command given instead of the profile's program (`-e`),
+    /// which is never restored or reattached.
     Ends,
 }
 
@@ -231,10 +226,6 @@ impl Closing {
         }
     }
 }
-
-/// Answers a remote terminal's palette query (OSC 4): given the index and
-/// the formatted reply, it decides whether to send it.
-pub type PaletteHandler = Rc<dyn Fn(usize, Vec<u8>)>;
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
@@ -254,8 +245,6 @@ pub struct Terminal {
     /// Program status records (OSC 7501).
     status: status::Records,
     pub theme: Theme,
-    /// Replace the theme's default colors (set from tmux pane styles).
-    pub default_colors: DefaultColors,
     copy_on_select: bool,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
@@ -401,7 +390,6 @@ impl Terminal {
             replaying: false,
             status: status::Records::default(),
             theme,
-            default_colors: DefaultColors::default(),
             copy_on_select: config.copy_on_select,
             last_activity: Instant::now(),
             sync_flush: None,
@@ -433,9 +421,8 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        // A command given instead of the profile's program (`-e`, or a classic
-        // tmux attach) is never restored or reattached, so it ends with its
-        // tab and with Brindle. Everything else keeps running when Brindle
+        // A command given instead of the profile's program (`-e`) is never
+        // restored or reattached, so it ends with its tab and with Brindle. Everything else keeps running when Brindle
         // goes away without closing it.
         let closing = Closing::new(command_override.is_some());
         // The program is always resolved here (on Windows from `PATH` and
@@ -554,44 +541,27 @@ impl Terminal {
         this
     }
 
-    /// A terminal whose output is supplied via [`Terminal::feed`] and whose
-    /// input is handed to `input`. Palette queries go to `palette`, if any.
-    pub fn remote(
-        size: GridSize,
-        theme: Theme,
-        config: &Config,
-        input: Rc<dyn Fn(&[u8])>,
-        palette: Option<PaletteHandler>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let (tx, rx) = unbounded();
-        let output = Arc::new(OutputMarker::default());
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
-        let backend = Backend::Remote { scanner: Scanner::new(), input, palette };
-        let parser = Arc::new(Mutex::new(Parser::new()));
-        let marks = Arc::new(Mutex::new(Marks::default()));
-        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
-    }
-
     /// A read-only terminal showing `text` (used to report errors in a tab).
     pub fn message(text: &str, theme: Theme, config: &Config, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::remote(GridSize::default(), theme, config, Rc::new(|_| {}), None, cx);
+        let (tx, rx) = unbounded();
+        let output = Arc::new(OutputMarker::default());
+        let size = GridSize::default();
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
+        let parser = Arc::new(Mutex::new(Parser::new()));
+        let marks = Arc::new(Mutex::new(Marks::default()));
+        let mut this = Self::new(term, output, rx, Backend::Remote, parser, marks, size, theme, config, cx);
         this.feed(text.as_bytes(), cx);
         this
     }
 
-    pub fn is_remote(&self) -> bool {
-        matches!(self.backend, Backend::Remote { .. })
-    }
-
-    /// Feeds output into a remote terminal.
+    /// Feeds output into a remote-agent or message terminal.
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let scanner = match &mut self.backend {
-            Backend::Remote { scanner, .. } | Backend::Agent { scanner, .. } => scanner,
+        let found = match &mut self.backend {
+            Backend::Agent { scanner, .. } => scanner.scan(bytes),
+            Backend::Remote => Vec::new(),
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { .. } => return,
         };
-        let found = scanner.scan(bytes);
         {
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
@@ -735,8 +705,6 @@ impl Terminal {
                 return;
             }
             Found::Status(status::Message::Query) => {
-                // tmux doesn't answer this one, so a pane's reply goes
-                // through its input like the palette replies.
                 self.write(status::QUERY_REPLY);
                 return;
             }
@@ -778,22 +746,14 @@ impl Terminal {
                     ClipboardType::Selection => crate::primary::read_primary(cx),
                 };
                 let text = item.and_then(|i| i.text()).unwrap_or_default();
-                self.reply(format(&text).into_bytes());
+                self.write(format(&text).into_bytes());
             }
             AlacEvent::ColorRequest(index, format) => {
                 let set = self.term.lock().colors()[index];
-                let reply = format(set.unwrap_or_else(|| self.default_color(index))).into_bytes();
-                // A palette index the program set is in tmux's pane palette
-                // too, and tmux answers it.
-                match &self.backend {
-                    Backend::Remote { palette: Some(palette), .. } if index < 256 && set.is_none() => {
-                        palette(index, reply)
-                    }
-                    _ => self.reply(reply),
-                }
+                self.write(format(set.unwrap_or_else(|| self.default_color(index))).into_bytes());
             }
-            AlacEvent::PtyWrite(text) => self.reply(text.into_bytes()),
-            AlacEvent::TextAreaSizeRequest(format) => self.reply(format(self.size.into()).into_bytes()),
+            AlacEvent::PtyWrite(text) => self.write(text.into_bytes()),
+            AlacEvent::TextAreaSizeRequest(format) => self.write(format(self.size.into()).into_bytes()),
             AlacEvent::Bell => self.emit_from_output(TerminalEvent::Bell, cx),
             AlacEvent::Exit | AlacEvent::ChildExit(_) => self.mark_exited(cx),
             _ => {}
@@ -803,20 +763,12 @@ impl Terminal {
     /// Theme color for an xterm color index (0-255 palette, then the named
     /// colors alacritty uses for foreground/background/cursor).
     pub fn default_color(&self, index: usize) -> Rgb {
-        palette_color(&self.theme, self.default_colors, index).into()
+        palette_color(&self.theme, index).into()
     }
 
-    /// Sends a reply the emulator generated (device/color/size reports).
-    /// Remote panes drop these: tmux answers such queries itself, and
-    /// forwarding them would inject garbage into the pane's input. Palette
-    /// queries, which tmux leaves to us, go to the pane's `PaletteHandler`.
-    fn reply(&self, bytes: Vec<u8>) {
-        if !self.is_remote() {
-            self.write(bytes);
-        }
-    }
-
-    /// Writes raw bytes to the program.
+    /// Writes raw bytes to the program: input, and the replies the emulator
+    /// generates (device, color and size reports). A message terminal has
+    /// no program, so they go nowhere.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let bytes = bytes.into();
         if bytes.is_empty() {
@@ -825,7 +777,7 @@ impl Terminal {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, .. } => session.input(&bytes),
-            Backend::Remote { input, .. } => input(&bytes),
+            Backend::Remote => {}
             Backend::Agent { handle, .. } => handle.input(bytes.into_owned()),
         }
     }
@@ -870,7 +822,7 @@ impl Terminal {
                 session.resize(size.cols, size.rows, size.cell_width, size.cell_height)
             }
             Backend::Agent { handle, .. } => handle.resize(size),
-            Backend::Remote { .. } => {}
+            Backend::Remote => {}
         }
     }
 
@@ -1015,7 +967,7 @@ impl Terminal {
                 handle.query_process();
                 foreground_name.clone()
             }
-            Backend::Remote { .. } => None,
+            Backend::Remote => None,
         }
     }
 
@@ -1051,7 +1003,7 @@ impl Terminal {
             Backend::Agent { cwd, .. } => {
                 self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
             }
-            Backend::Remote { .. } => None,
+            Backend::Remote => None,
         }
     }
 
@@ -1077,7 +1029,7 @@ impl Terminal {
                 _ => session.close(),
             },
             Backend::Agent { handle, .. } => handle.close(),
-            Backend::Remote { .. } => {}
+            Backend::Remote => {}
         }
         let _ = close;
     }
@@ -1216,19 +1168,10 @@ pub fn link_at<T>(term: &Term<T>, point: GridPoint) -> Option<Link> {
     Some(Link { uri, spans })
 }
 
-/// Default foreground and background that replace the theme's for one
-/// terminal; `None` keeps the theme's.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DefaultColors {
-    pub foreground: Option<Color>,
-    pub background: Option<Color>,
-}
-
 /// The color for an xterm palette index or one of the named colors
 /// alacritty uses after it (foreground, background, cursor, dim colors).
-fn palette_color(t: &Theme, defaults: DefaultColors, index: usize) -> Color {
-    let fg = defaults.foreground.unwrap_or(t.foreground);
-    let bg = defaults.background.unwrap_or(t.background);
+fn palette_color(t: &Theme, index: usize) -> Color {
+    let (fg, bg) = (t.foreground, t.background);
     match index {
         0..=255 => t.indexed(index as u8),
         i if i == NamedColor::Foreground as usize => fg,
@@ -1276,7 +1219,7 @@ fn default_program(args: &[String]) -> (String, Vec<String>) {
     (program, own)
 }
 
-/// Environment for programs started by Brindle (shells and tmux alike).
+/// Environment for programs started by Brindle.
 pub fn child_env(profile: &Profile) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = [
         ("TERM", "xterm-256color"),
@@ -1354,8 +1297,7 @@ pub fn resolve_color(color: ansi::Color, colors: &term::color::Colors, terminal:
     }
 }
 
-/// Sends focus in/out reports when the app asked for them (tmux uses this
-/// for `focus-events on`).
+/// Sends focus in/out reports when the app asked for them (mode 1004).
 pub fn report_focus(terminal: &Terminal, focused: bool) {
     if let Some(seq) = mouse::focus_report(focused, terminal.mode()) {
         terminal.write(seq);
@@ -1397,21 +1339,16 @@ mod tests {
     }
 
     #[test]
-    fn default_colors_replace_the_theme() {
+    fn palette_colors_come_from_the_theme() {
         let t = Theme::default();
-        let none = DefaultColors::default();
-        let fg = NamedColor::Foreground as usize;
-        let bg = NamedColor::Background as usize;
-        assert_eq!(palette_color(&t, none, fg), t.foreground);
-        assert_eq!(palette_color(&t, none, bg), t.background);
-        let blue = Color::hex(0x0000ff);
-        let tinted = DefaultColors { foreground: Some(blue), background: None };
-        assert_eq!(palette_color(&t, tinted, fg), blue);
-        assert_eq!(palette_color(&t, tinted, bg), t.background);
-        assert_eq!(palette_color(&t, tinted, NamedColor::DimForeground as usize), blue.mix(t.background, DIM_FACTOR));
-        // Palette entries and the cursor keep the theme's colors.
-        assert_eq!(palette_color(&t, tinted, 1), t.ansi[1]);
-        assert_eq!(palette_color(&t, tinted, NamedColor::Cursor as usize), t.cursor);
+        assert_eq!(palette_color(&t, NamedColor::Foreground as usize), t.foreground);
+        assert_eq!(palette_color(&t, NamedColor::Background as usize), t.background);
+        assert_eq!(
+            palette_color(&t, NamedColor::DimForeground as usize),
+            t.foreground.mix(t.background, DIM_FACTOR)
+        );
+        assert_eq!(palette_color(&t, 1), t.ansi[1]);
+        assert_eq!(palette_color(&t, NamedColor::Cursor as usize), t.cursor);
     }
 
     #[test]
@@ -1432,7 +1369,7 @@ mod tests {
     #[test]
     fn profile_terminals_outlive_brindle_and_commands_end_with_it() {
         assert_eq!(Closing::new(false), Closing::Keeps);
-        // `-e` and classic tmux attaches are never restored.
+        // `-e` commands are never restored.
         assert_eq!(Closing::new(true), Closing::Ends);
         #[cfg(any(target_os = "linux", windows))]
         {

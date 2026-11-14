@@ -1,6 +1,6 @@
 //! Opt-in performance suite: keystroke latency (`--latency-bench`) and
-//! vtebench throughput, each in a local shell tab and a tmux tab. It
-//! reports numbers and never fails on them.
+//! vtebench throughput, in a local shell tab. It reports numbers and never
+//! fails on them.
 //!
 //! ```sh
 //! cargo build --release
@@ -74,9 +74,7 @@ impl Ctx {
 fn cases() -> Vec<Case> {
     vec![
         Case { name: "latency-shell", run: cases::latency_shell },
-        Case { name: "latency-tmux", run: cases::latency_tmux },
         Case { name: "throughput-brindle", run: cases::throughput_brindle },
-        Case { name: "throughput-tmux", run: cases::throughput_tmux },
     ]
 }
 
@@ -133,7 +131,7 @@ fn main() {
         std::process::exit(1);
     }
     if cfg!(not(target_os = "linux")) {
-        println!("perf: the cases need X11 and tmux, so they run on Linux only");
+        println!("perf: the cases need X11, so they run on Linux only");
         return;
     }
     let display = std::env::var("BRINDLE_PERF_DISPLAY").unwrap_or_else(|_| ":0".into());

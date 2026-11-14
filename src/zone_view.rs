@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenuTarget as _, Icon, Tokens, Tooltip, TooltipFor as _,
-    trigger_label,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, Icon, Modality,
+    Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -19,7 +19,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
-use crate::config::{Config, Profile, TmuxMode};
+use crate::config::{Config, Profile};
 use crate::settings::Settings;
 use crate::terminal::process::Snapshot;
 use crate::terminal::status::State;
@@ -27,16 +27,26 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
-use crate::tmux::Direction;
 use crate::workspace::{shortcut, terminal_automatic_title};
 
-/// Height of the native zone header bar shown when a tab has 2+ zones.
+/// Height of a zone card's header bar, shown when a tab has 2+ zones, its
+/// bottom line included (`brindle_ui::CARD_HEADER_HEIGHT`).
 pub const ZONE_HEADER_HEIGHT: f32 = 28.0;
-/// Thickness of the split divider between zones.
-pub const ZONE_DIVIDER_SIZE: f32 = 1.0;
+/// The gap between a tab's zone cards, and the margin round them; it
+/// replaces the dividers, and the focus ring is drawn in it.
+pub const ZONE_GAP: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ZoneId(pub u64);
+
+/// Which way `FocusZone*` moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -239,10 +249,11 @@ impl ZoneTree {
     }
 }
 
-/// Whether a zone of outer pixel size `zone_size` (including its header bar
-/// when `has_header` is true) can be split in half along `axis` while fitting
-/// two minimum 2x2 terminal grids, the 1px divider, and a header bar on each
-/// resulting zone.
+/// Whether a zone card of outer pixel size `zone_size` (its border, and its
+/// header bar when `has_header` is true, included) can be split in half
+/// along `axis` while fitting, in each resulting card, a minimum 2x2
+/// terminal grid with its padding, the card's border and a header bar, with
+/// the [`ZONE_GAP`] between the two cards.
 pub fn can_split_zone(
     zone_size: Size<Pixels>,
     has_header: bool,
@@ -251,10 +262,13 @@ pub fn can_split_zone(
     cell_width: Pixels,
     line_height: Pixels,
 ) -> bool {
+    let border = f32::from(brindle_ui::CARD_BORDER) * 2.0;
     let min_term_w = f32::from(cell_width) * 2.0 + f32::from(padding) * 2.0;
     let min_term_h = f32::from(line_height) * 2.0 + f32::from(padding) * 2.0;
-    let min_zone_w = min_term_w;
-    let min_zone_h = ZONE_HEADER_HEIGHT + min_term_h;
+    let min_zone_w = min_term_w + border;
+    // Every card of a split tab has a header, whether or not this one has
+    // yet: its height is the card's either way.
+    let min_zone_h = min_term_h + border + ZONE_HEADER_HEIGHT;
 
     let w = f32::from(zone_size.width);
     let h = f32::from(zone_size.height);
@@ -262,11 +276,11 @@ pub fn can_split_zone(
 
     match axis {
         SplitAxis::Horizontal => {
-            let child_w = (w - ZONE_DIVIDER_SIZE) * 0.5;
+            let child_w = (w - ZONE_GAP) * 0.5;
             child_w >= min_zone_w && h >= min_zone_h
         }
         SplitAxis::Vertical => {
-            let child_h = (h - ZONE_DIVIDER_SIZE) * 0.5;
+            let child_h = (h - ZONE_GAP) * 0.5;
             w >= min_zone_w && child_h >= min_zone_h
         }
     }
@@ -349,8 +363,9 @@ pub struct Zone {
 
 pub struct ZoneTreeView {
     pub profile: Profile,
-    /// The tab's theme, for its terminals. The headers and dividers are
-    /// chrome, drawn in the window's tokens (`cx.ui_theme()`) instead.
+    /// The tab's theme, for its terminals and the cards round them (their
+    /// headers, borders and the gaps between them). The focus ring and the
+    /// status dots stay on the window's tokens and global theme.
     pub theme: Theme,
     pub font_size_override: Option<f32>,
     tree: ZoneTree,
@@ -641,23 +656,27 @@ impl ZoneTreeView {
         describe_zone_tree(&self.tree, self.active)
     }
 
-    /// Outer pixel size of `id` for the minimum-split-size check.
+    /// Outer pixel size of `id`'s card (its border and header included) for
+    /// the minimum-split-size check.
     fn zone_outer_size(&self, id: ZoneId, window: &Window, cx: &App) -> Option<Size<Pixels>> {
         let padding = px(Settings::get(cx).config.padding);
+        let border = brindle_ui::CARD_BORDER * 2.0;
         let has_header = self.zones.len() >= 2;
         if let Some(grid) = self.zones.get(&id).and_then(|z| z.content.as_terminal_view().read(cx).layout.get()) {
-            let w = grid.cell_width * grid.cols as f32 + padding * 2.0;
+            let w = grid.cell_width * grid.cols as f32 + padding * 2.0 + border;
             let h = grid.line_height * grid.rows as f32
                 + padding * 2.0
+                + border
                 + if has_header { px(ZONE_HEADER_HEIGHT) } else { px(0.0) };
             return Some(size(w, h));
         }
-        // Fallback before the first paint: estimate from the window's inner bounds
-        // and the zone's normalized rectangle.
+        // Fallback before the first paint: estimate from the window's inner
+        // bounds, less the cards' margin, and the zone's normalized rectangle.
         let (_, rect) = self.tree.rects().into_iter().find(|(zid, _)| *zid == id)?;
         let win_size = window.inner_window_bounds().get_bounds().size;
-        let content_h = (f32::from(win_size.height) - crate::workspace::TAB_BAR_HEIGHT).max(0.0);
-        Some(size(px(f32::from(win_size.width) * rect.w as f32), px(content_h * rect.h as f32)))
+        let content_w = (f32::from(win_size.width) - ZONE_GAP * 2.0).max(0.0);
+        let content_h = (f32::from(win_size.height) - crate::workspace::TAB_BAR_HEIGHT - ZONE_GAP * 2.0).max(0.0);
+        Some(size(px(content_w * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
     /// Whether zone `id` is big enough, at its current size, to split along
@@ -714,19 +733,6 @@ impl ZoneTreeView {
         // A split inherits the target zone's current working directory; if
         // unavailable, `Terminal::spawn` falls back to the profile's cwd or home.
         let cwd = self.zone_working_directory(target, cx);
-        let command = match self.profile.tmux {
-            TmuxMode::Plain => {
-                let mut args = self.profile.tmux_args.clone();
-                args.extend([
-                    "new-session".into(),
-                    "-A".into(),
-                    "-s".into(),
-                    self.profile.tmux_session_name().to_string(),
-                ]);
-                Some(("tmux".into(), args))
-            }
-            _ => None,
-        };
 
         let new_id = ZoneId(self.next_id);
         self.next_id += 1;
@@ -734,7 +740,7 @@ impl ZoneTreeView {
             return;
         }
 
-        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, command, cwd, &config, cx));
+        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, None, cwd, &config, cx));
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         let mut snapshot = None;
         self.refresh_zone_title(target, &mut snapshot, cx);
@@ -848,65 +854,72 @@ impl ZoneTreeView {
 
     // ---- rendering --------------------------------------------------------------
 
-    /// The split tree under `node`, its chrome (dividers and headers) in the
-    /// window's tokens, which come from the global theme: a tab's own theme
-    /// colours only its terminals.
-    fn render_tree(&self, node: &ZoneTree, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The split tree under `node`: a card per zone, the [`ZONE_GAP`]
+    /// between them (no dividers), on the chrome's background token, which the
+    /// root paints.
+    fn render_tree(&self, node: &ZoneTree, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match node {
-            ZoneTree::Leaf(id) => self.render_leaf(*id, tokens, cx),
+            ZoneTree::Leaf(id) => self.render_leaf(*id, tokens, window, cx),
             ZoneTree::Split { axis, first, second } => {
-                let border = tokens.border;
-                let first_el = self.render_tree(first, tokens, cx);
-                let second_el = self.render_tree(second, tokens, cx);
-                let divider = match axis {
-                    SplitAxis::Horizontal => div().flex_none().w(px(ZONE_DIVIDER_SIZE)).h_full().bg(border),
-                    SplitAxis::Vertical => div().flex_none().h(px(ZONE_DIVIDER_SIZE)).w_full().bg(border),
-                };
+                let first_el = self.render_tree(first, tokens, window, cx);
+                let second_el = self.render_tree(second, tokens, window, cx);
+                // Nothing here clips: the focus ring is drawn in the gap.
                 div()
                     .flex()
                     .when(*axis == SplitAxis::Horizontal, |d| d.flex_row())
                     .when(*axis == SplitAxis::Vertical, |d| d.flex_col())
+                    .gap(px(ZONE_GAP))
                     .size_full()
                     .min_w_0()
                     .min_h_0()
                     .child(div().flex_1().min_w_0().min_h_0().size_full().child(first_el))
-                    .child(divider)
                     .child(div().flex_1().min_w_0().min_h_0().size_full().child(second_el))
                     .into_any_element()
             }
         }
     }
 
-    /// Zone `id`: its terminal, under a header when the tab has 2+ zones.
-    /// The header is the zone's first child (see `menu_anchor`).
-    fn render_leaf(&self, id: ZoneId, tokens: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// Zone `id`: a card in its terminal's colours round the terminal, with
+    /// a header when the tab has 2+ zones (recorded for `menu_anchor`), and
+    /// the focus ring when it is the active zone of such a tab and focus
+    /// came there from the keyboard.
+    fn render_leaf(&self, id: ZoneId, tokens: &Tokens, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(zone) = self.zones.get(&id) else {
             return div().size_full().into_any_element();
         };
         let view = zone.content.as_terminal_view().clone();
+        // The gap round the cards is the strip's colour (the chrome
+        // background), so the corner cutouts match it.
+        let mut colors = self.theme.card_colors();
+        colors.surround = Some(tokens.background);
+        let card =Card::new(("zone", id.0 as usize)).colors(colors).size_full().min_w_0().min_h_0();
         if self.zones.len() <= 1 {
-            return view.into_any_element();
+            return card.child(view).into_any_element();
         }
 
         let active = id == self.active;
+        let focus = view.read(cx).focus_handle.clone();
+        let ring = active && shows_ring(focus.contains_focused(window, cx), modality(window, cx), false);
         // Status dots in the chrome theme's colours, like the strip's.
         let status_color =
             zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
         let title = zone.title.clone();
+        let muted = colors.muted.unwrap_or(tokens.muted_foreground);
 
         // A tooltip naming a button and the key bound to its action, looked
         // up when it is shown. The zone actions are bound in `ZoneTree`, so
         // the lookup starts at this zone's terminal, which is inside it.
-        let focus = view.read(cx).focus_handle.clone();
         let tip = |label: &'static str, action: Box<dyn Action>| {
             let (focus, action): (FocusHandle, Rc<dyn Action>) = (focus.clone(), Rc::from(action));
             move |window: &mut Window, _: &mut App| Tooltip::new(label).shortcut_opt(shortcut(&*action, &focus, window))
         };
+        // In the terminal's muted colour: a `Button` sets its own text
+        // colour, so the header's action slot can't give it one.
         let button = |name: &'static str, icon: Icon| {
             Button::icon_only((name, id.0 as usize), icon)
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::IconXs)
-                .text_color(tokens.muted_foreground)
+                .text_color(muted)
         };
         // A press on a header button stops at its wrapper: the header's own
         // press focuses the zone, and a `Button` without a focus handle
@@ -932,21 +945,15 @@ impl ZoneTreeView {
             .tooltip_with(tip("Close zone", Box::new(CloseZone)))
             .on_click(cx.listener(move |this, _, window, cx| this.close_zone_by_id(id, window, cx)));
 
-        let header = div()
-            .id(("zone-header", id.0 as usize))
-            .relative()
-            .flex()
-            .flex_none()
-            .items_center()
-            .h(px(ZONE_HEADER_HEIGHT))
-            .pl_2p5()
-            .pr_0p5()
-            .gap_1p5()
-            .bg(tokens.background)
-            .border_b_1()
-            .border_color(tokens.border)
-            .text_xs()
-            .text_color(if active { tokens.foreground } else { tokens.muted_foreground })
+        // The title in the terminal's foreground on the active zone, muted
+        // on the others (`trigger_label` cuts it, as `truncate` can't).
+        let mut header = CardHeader::new(("zone-header", id.0 as usize));
+        if let Some(color) = status_color {
+            header = header.leading(div().flex_none().size(px(6.0)).rounded_full().bg(color));
+        }
+        let header = header
+            .title(title)
+            .title_muted(!active)
             .cursor(CursorStyle::Arrow)
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                 this.focus_zone(id, window, cx);
@@ -957,53 +964,28 @@ impl ZoneTreeView {
             .on_context_menu(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 this.open_menu(id, event.position, Some(event.clone()), window, cx);
             }))
-            .when(active, |d| {
-                d.child(div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(tokens.primary))
-            })
-            .when_some(status_color, |d, color| {
-                d.child(div().flex_none().size(px(6.0)).rounded_full().bg(color))
-            })
-            // gpui 0.2.2's `text_ellipsis` on a flex item cuts nothing; the
-            // tab strip's label helper does.
-            .child(trigger_label(title))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_0p5()
-                    .child(inert("zone-split-right-press", split_right))
-                    .child(inert("zone-split-down-press", split_down))
-                    .child(inert("zone-close-press", close)),
-            );
+            .action(inert("zone-split-right-press", split_right))
+            .action(inert("zone-split-down-press", split_down))
+            .action(inert("zone-close-press", close));
 
         let laid_out = self.laid_out.clone();
-        div()
-            .on_children_prepainted(move |bounds, _, _| {
-                if let Some(header) = bounds.first() {
-                    laid_out.borrow_mut().headers.insert(id, *header);
-                }
+        card.header(header)
+            .ring(ring)
+            .on_header_bounds(move |bounds, _, _| {
+                laid_out.borrow_mut().headers.insert(id, bounds);
             })
-            .id(("zone", id.0 as usize))
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .child(header)
-            .child(div().flex_1().min_w_0().min_h_0().size_full().child(view))
+            .child(view)
             .into_any_element()
     }
 }
 
 impl Render for ZoneTreeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tree = self.tree.clone();
         // Headers are recorded again as this frame lays them out.
         self.laid_out.borrow_mut().headers.clear();
         let tokens = *cx.ui_theme();
-        let content = self.render_tree(&tree, &tokens, cx);
+        let content = self.render_tree(&tree, &tokens, window, cx);
         let laid_out = self.laid_out.clone();
         div()
             .on_children_prepainted(move |bounds, _, _| laid_out.borrow_mut().tree = bounds.first().copied())
@@ -1026,9 +1008,13 @@ impl Render for ZoneTreeView {
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::focus_up))
             .on_action(cx.listener(Self::focus_down))
+            // A press anywhere in the tab is pointer input: the zone it
+            // focuses shows no ring. It goes on to whatever was pressed.
+            .capture_any_mouse_down(|_, window, cx| brindle_ui::set_modality(window, Modality::Pointer, cx))
             .relative()
             .size_full()
-            .bg(self.theme.background.hsla())
+            .p(px(ZONE_GAP))
+            .bg(tokens.background)
             .child(content)
     }
 }
@@ -1157,16 +1143,27 @@ mod tests {
         let cw = px(8.0);
         let lh = px(16.0);
         let pad = px(4.0);
+        // The split math counts the card's real border and header.
+        assert_eq!(px(ZONE_HEADER_HEIGHT), brindle_ui::CARD_HEADER_HEIGHT);
+        assert_eq!(brindle_ui::CARD_BORDER, px(1.0));
         // Min terminal is 2*8 + 2*4 = 24px wide, 2*16 + 2*4 = 40px high.
-        // With header (28px), each zone needs >= 24px wide and >= 68px high.
-        // Horizontal split needs width >= 2 * 24 + 1 = 49px, height >= 68px.
-        // Vertical split needs width >= 24px, height >= 2 * 68 + 1 = 137px.
-        assert!(can_split_zone(size(px(49.0), px(68.0)), false, SplitAxis::Horizontal, pad, cw, lh));
-        assert!(!can_split_zone(size(px(48.0), px(68.0)), false, SplitAxis::Horizontal, pad, cw, lh));
-        assert!(!can_split_zone(size(px(100.0), px(67.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        // With the card's 1px border and its header (28px), each zone card
+        // needs >= 26px wide and >= 70px high.
+        // Horizontal split needs width >= 2 * 26 + 6 (gap) = 58px, height >= 70px.
+        // Vertical split needs width >= 26px, height >= 2 * 70 + 6 = 146px.
+        assert!(can_split_zone(size(px(58.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(57.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(100.0), px(69.0)), false, SplitAxis::Horizontal, pad, cw, lh));
 
-        assert!(can_split_zone(size(px(24.0), px(137.0)), true, SplitAxis::Vertical, pad, cw, lh));
-        assert!(!can_split_zone(size(px(24.0), px(136.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(can_split_zone(size(px(26.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(!can_split_zone(size(px(26.0), px(145.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(!can_split_zone(size(px(25.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
+
+        // The spec's "Card chrome counts": a zone exactly as wide as two
+        // minimum grids plus their padding (2 * 24), but not the gap and the
+        // borders, can't split right; the same tall enough can't split down.
+        assert!(!can_split_zone(size(px(48.0), px(500.0)), true, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(500.0), px(2.0 * (40.0 + 28.0))), true, SplitAxis::Vertical, pad, cw, lh));
 
         // describe_zone_tree is empty for 1 zone and prints normalized rects for 2+ zones.
         let z1 = ZoneId(1);

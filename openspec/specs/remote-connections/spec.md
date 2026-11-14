@@ -1,7 +1,7 @@
 # remote-connections Specification
 
 ## Purpose
-Run profiles on a remote Linux host over SSH or inside an existing Docker or Podman container, with the same tabs, zones, titles, directories, notifications and tmux control mode as a local profile.
+Run profiles on a remote Linux host over SSH or inside an existing Docker or Podman container, with the same tabs, zones, titles, directories, and notifications as a local profile.
 
 ## Requirements
 
@@ -77,10 +77,3 @@ Remote sessions SHALL pass through OSC 9, OSC 777, and OSC 7501 sequences intact
 #### Scenario: Remote desktop notification
 - **WHEN** a remote command prints `ESC ] 9 ; build complete BEL`
 - **THEN** Brindle triggers a desktop notification for that tab
-
-### Requirement: Remote tmux control mode
-When a remote profile specifies `tmux = "control"`, Brindle SHALL run `tmux -u -C` on the remote endpoint and show its windows and panes natively, as it does for a local control-mode session.
-
-#### Scenario: Native tabs for remote tmux windows
-- **WHEN** a remote profile with `tmux = "control"` attaches to a remote tmux session
-- **THEN** each remote tmux window is rendered as a native tab in Brindle

@@ -317,7 +317,7 @@ pub fn session(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let found = ctx.dir.join("session-pid");
     let save = found.clone();
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&sh("echo shell=$$\r", "\"shell=$PID\"\r"))
@@ -342,7 +342,7 @@ pub fn close(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let file = ctx.dir.join("sleep-pid");
     let watched = file.clone();
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .action("new_tab")
         .prompt()
@@ -366,7 +366,7 @@ pub fn close(ctx: &Ctx) -> Result<Outcome> {
 /// Starts `sleep 1000` in two tabs, recording their pids.
 fn two_sleeps(ctx: &Ctx) -> Result<(Run<'_>, [PathBuf; 2])> {
     let files = [ctx.dir.join("sleep-1"), ctx.dir.join("sleep-2")];
-    let run = Run::local(ctx, "run")
+    let run = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&sleeper(ctx, &files[0], None)?)
@@ -430,7 +430,7 @@ pub fn crash(ctx: &Ctx) -> Result<Outcome> {
 pub fn close_zone(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let file = ctx.dir.join("sleep-pid");
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&format!("{}\r", echo("left-zone")))
@@ -457,7 +457,7 @@ pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
     let file = ctx.dir.join("sleep-pid");
     let watched = file.clone();
     let display = ctx.display.clone();
-    Run::local(ctx, "run")
+    Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&sleeper(ctx, &file, Some("windowed"))?)
@@ -489,7 +489,7 @@ pub fn close_command(ctx: &Ctx) -> Result<Outcome> {
     } else {
         vec!["sh", "-c", &script]
     };
-    Run::local(ctx, "run")
+    Run::new(ctx, "run")
         .keep_detached()
         .wait_for("commanded-42")
         .action("close_window")
@@ -517,7 +517,7 @@ fn shown_pid(out: &crate::brindle::Output, prefix: &str) -> Result<u32> {
 pub fn reattach_quit(ctx: &Ctx) -> Result<Outcome> {
     let notify = "\n[notifications]\nwhen = \"always\"\n";
     let (live_log, replay_log) = (ctx.dir.join("notify-first.log"), ctx.dir.join("notify-second.log"));
-    let first = Run::local(ctx, "first")
+    let first = Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .config(notify)
@@ -533,7 +533,7 @@ pub fn reattach_quit(ctx: &Ctx) -> Result<Outcome> {
     let pid = shown_pid(&first, "first=")?;
     detached_pids(&Server::of(ctx), 10.0, 1)?;
     let again = ctx.dir.join("again-pid");
-    let second = Run::local(ctx, "second")
+    let second = Run::new(ctx, "second")
         .keep_detached()
         .restore()
         .config(notify)
@@ -559,7 +559,7 @@ pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
     let saved = ctx.dir.join("pids");
     let save = saved.clone();
     let checked = srv.clone();
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .prompt()
@@ -588,7 +588,7 @@ pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
     let checked = srv.clone();
     let after = ctx.dir.join("pids-after");
     let save = after.clone();
-    let out = Run::local(ctx, "second")
+    let out = Run::new(ctx, "second")
         .keep_detached()
         .restore()
         .call_at(2.0, move |_| {
@@ -616,7 +616,7 @@ pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
 /// launch opens one fresh tab.
 pub fn reattach_killed(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
-    let first = Run::local(ctx, "first")
+    let first = Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .prompt()
@@ -633,7 +633,7 @@ pub fn reattach_killed(ctx: &Ctx) -> Result<Outcome> {
     let killed = sessions.iter().find(|s| s.pid == right).ok_or("the right zone's session isn't listed")?.id;
     srv.command(&["kill", &killed.to_string()])?;
     gone(&srv, 5.0, &[right])?;
-    let second = Run::local(ctx, "second")
+    let second = Run::new(ctx, "second")
         .keep_detached()
         .restore()
         .send(&format!("{}\r", echo_pid("again")))
@@ -649,7 +649,7 @@ pub fn reattach_killed(ctx: &Ctx) -> Result<Outcome> {
     let id = listed_when(&srv, 10.0, "the left session detached", |s| s.len() == 1 && !s[0].attached)?[0].id;
     srv.command(&["kill", &id.to_string()])?;
     gone(&srv, 5.0, &[left])?;
-    let third = Run::local(ctx, "third")
+    let third = Run::new(ctx, "third")
         .restore()
         .prompt()
         .send(&format!("{}\r", echo_pid("third")))
@@ -667,7 +667,7 @@ pub fn reattach_killed(ctx: &Ctx) -> Result<Outcome> {
 /// than an unlaid-out terminal's 24 rows, so fed at the wrong size its rows
 /// scroll away and the cursor ends up far below the prompt.
 pub fn reattach_inactive(ctx: &Ctx) -> Result<Outcome> {
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .prompt()
@@ -679,7 +679,7 @@ pub fn reattach_inactive(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(5.0))
         .run()?;
     detached_pids(&Server::of(ctx), 10.0, 2)?;
-    let out = Run::local(ctx, "second").keep_detached().restore().action("prev_tab").dump_at(later(5.0)).run()?;
+    let out = Run::new(ctx, "second").keep_detached().restore().action("prev_tab").dump_at(later(5.0)).run()?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[0].1, "tabs: {:?}", out.dump.tabs);
     let screen = &out.dump.screen;
     let output = screen.iter().rposition(|l| l == "hidden-2").ok_or_else(|| format!("no output: {screen:?}"))?;
@@ -693,7 +693,7 @@ pub fn reattach_inactive(ctx: &Ctx) -> Result<Outcome> {
 
 /// A tab closed before quitting doesn't come back: its program ended.
 pub fn reattach_closed_tab(ctx: &Ctx) -> Result<Outcome> {
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .prompt()
@@ -705,7 +705,7 @@ pub fn reattach_closed_tab(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(6.0))
         .run()?;
     detached_pids(&Server::of(ctx), 10.0, 1)?;
-    let out = Run::local(ctx, "second").keep_detached().restore().dump_at(later(5.0)).run()?;
+    let out = Run::new(ctx, "second").keep_detached().restore().dump_at(later(5.0)).run()?;
     ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
     screen_has(&out, "restored-tab")?;
     Ok(Outcome::Pass)
@@ -715,7 +715,7 @@ pub fn reattach_closed_tab(ctx: &Ctx) -> Result<Outcome> {
 /// attaches them after the tabs it restores.
 pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .restore()
         .prompt()
@@ -725,7 +725,7 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     let before = detached_pids(&srv, 10.0, 1)?;
     let checked = srv.clone();
-    let out = Run::local(ctx, "second")
+    let out = Run::new(ctx, "second")
         .keep_detached()
         .prompt()
         .send(&format!("{}\r", echo("own-tab")))
@@ -738,7 +738,7 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(5.0))
         .run()?;
     ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
-    let third = Run::local(ctx, "third").keep_detached().restore().action("next_tab").dump_at(later(5.0)).run()?;
+    let third = Run::new(ctx, "third").keep_detached().restore().action("next_tab").dump_at(later(5.0)).run()?;
     ensure!(third.dump.tabs.len() == 2 && third.dump.tabs[1].1, "tabs: {:?}", third.dump.tabs);
     screen_has(&third, "left-2")?;
     Ok(Outcome::Pass)
@@ -748,12 +748,12 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
 /// of the detached sessions.
 pub fn reattach_second(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
-    Run::local(ctx, "quit").keep_detached().restore().prompt().dump_at(later(4.0)).run()?;
+    Run::new(ctx, "quit").keep_detached().restore().prompt().dump_at(later(4.0)).run()?;
     let before = detached_pids(&srv, 10.0, 1)?;
     // The instance leaves them alone too (`--no-restore`).
-    let first = Run::local(ctx, "first").keep_detached().dump_at(later(9.0));
+    let first = Run::new(ctx, "first").keep_detached().dump_at(later(9.0));
     let checked = srv.clone();
-    let second = Run::local(ctx, "second")
+    let second = Run::new(ctx, "second")
         .keep_detached()
         .restore()
         .call_at(2.0, move |_| {
@@ -775,7 +775,7 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let [older, newer] = [ctx.dir.join("older-pid"), ctx.dir.join("newer-pid")];
     // Quitting leaves both tabs' shells detached.
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .prompt()
         .send(&format!("{}; {}\r", save_pid(&older), echo_sum("older", 1, 1)))
@@ -786,7 +786,7 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(5.0))
         .run()?;
     detached_pids(&srv, 10.0, 2)?;
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .action("attach_session")
@@ -813,7 +813,7 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
 /// `brindle --attach ID` opens that session as the active tab; an id the
 /// server doesn't have gives a tab saying so.
 pub fn attach_flag(ctx: &Ctx) -> Result<Outcome> {
-    Run::local(ctx, "first")
+    Run::new(ctx, "first")
         .keep_detached()
         .prompt()
         .send(&format!("{}\r", echo("unflagged")))
@@ -827,9 +827,9 @@ pub fn attach_flag(ctx: &Ctx) -> Result<Outcome> {
     let sessions = listed_when(&srv, 10.0, "two detached sessions", |s| s.len() == 2 && s.iter().all(|s| !s.attached))?;
     // The new tab spawned after the first, so its session has the higher id.
     let id = sessions.iter().map(|s| s.id).max().ok_or("no sessions")?;
-    let out = Run::local(ctx, "second").keep_detached().arg("--attach").arg(&id.to_string()).dump_at(later(5.0)).run()?;
+    let out = Run::new(ctx, "second").keep_detached().arg("--attach").arg(&id.to_string()).dump_at(later(5.0)).run()?;
     screen_has(&out, "flagged-2")?;
-    let missing = Run::local(ctx, "missing")
+    let missing = Run::new(ctx, "missing")
         .keep_detached()
         .arg("--no-restore")
         .arg("--attach")
@@ -845,8 +845,8 @@ pub fn attach_flag(ctx: &Ctx) -> Result<Outcome> {
 /// Brindle (`FOO=1`) started the server.
 pub fn env(ctx: &Ctx) -> Result<Outcome> {
     let shown = sh("echo foo-$FOO-x\r", "\"foo-$env:FOO-x\"\r");
-    let first = Run::local(ctx, "first").keep_detached().env("FOO", "1").prompt().send(&shown).dump_at(later(8.0));
-    let second = Run::local(ctx, "second").keep_detached().env("FOO", "2").prompt().send(&shown).dump_at(later(4.0));
+    let first = Run::new(ctx, "first").keep_detached().env("FOO", "1").prompt().send(&shown).dump_at(later(8.0));
+    let second = Run::new(ctx, "second").keep_detached().env("FOO", "2").prompt().send(&shown).dump_at(later(4.0));
     let (first, second) = two_processes(ctx, 3.0, first, second)?;
     screen_has(&first, "foo-1-x")?;
     screen_has(&second, "foo-2-x")?;
@@ -880,7 +880,7 @@ fn core_restart_less(ctx: &Ctx) -> Result<Outcome> {
     std::fs::write(&lines, text).map_err(|e| e.to_string())?;
     let file = ctx.dir.join("less-pid");
     let watched = file.clone();
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .send(&recorded(&file, &format!("less \"{}\"", lines.display())))
         .wait_for("line-01")
@@ -932,7 +932,7 @@ Start-Sleep 600
         ),
     )?;
     let watched = file.clone();
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&script)
@@ -966,7 +966,7 @@ pub fn replay_quiet(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
     let watched = log.clone();
     let blocked = r"\033]7501;state=blocked:kind=permission:app=e2e:msg=T2s/\033\\";
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .config("\n[notifications]\nwhen = \"always\"\n")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
@@ -1007,7 +1007,7 @@ pub fn replay_quiet(ctx: &Ctx) -> Result<Outcome> {
 /// "session lost" line.
 pub fn holder_lost(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&format!("{}\r", echo_sum("before", 1, 1)))
@@ -1039,7 +1039,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
         let missing = dir.join(ctx.helper.file_name().ok_or("the helper has no file name")?);
         let helper = ctx.helper.clone();
         let installed = missing.clone();
-        Run::local(ctx, "run")
+        Run::new(ctx, "run")
             .keep_detached()
             .env("BRINDLE_SERVER_HELPER", missing.to_str().unwrap())
             .wait_for("does not name a file")
@@ -1053,7 +1053,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
         link_or_copy(&ctx.bin, &bin)?;
         let installed = bin_dir.join("brindle-remote");
         let helper = ctx.helper.clone();
-        Run::local(ctx, "run")
+        Run::new(ctx, "run")
             .keep_detached()
             .bin(&bin)
             .env_remove("BRINDLE_REMOTE_AGENT")
@@ -1178,7 +1178,7 @@ fn upgrade_windows(ctx: &Ctx) -> Result<Outcome> {
             go.display()
         ),
     )?;
-    let first = Run::local(ctx, "first")
+    let first = Run::new(ctx, "first")
         .keep_detached()
         .prompt()
         .send(&format!("{}\r", echo_pid("first")))
@@ -1194,7 +1194,7 @@ fn upgrade_windows(ctx: &Ctx) -> Result<Outcome> {
         .send("'after-' + (3+4) + \"=$PID\"\r")
         .wait_for("after-7")
         .dump_at(30.0);
-    let second = Run::local(ctx, "second")
+    let second = Run::new(ctx, "second")
         .keep_detached()
         .env("BRINDLE_SERVER_HELPER", newer.to_str().unwrap())
         .prompt()
@@ -1219,7 +1219,7 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
     let (newer, old_build, new_build) = other_build_elf(ctx)?;
     let report = ctx.dir.join("status.json");
     let saved = report.clone();
-    let first = Run::local(ctx, "first")
+    let first = Run::new(ctx, "first")
         .keep_detached()
         .send("echo first=$$\r")
         .call_at(2.0, move |_| {
@@ -1233,7 +1233,7 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
         .send("echo after-$((3+4))=$$\r")
         .wait_for("after-7")
         .dump_at(20.0);
-    let second = Run::local(ctx, "second")
+    let second = Run::new(ctx, "second")
         .keep_detached()
         .env("BRINDLE_REMOTE_AGENT", newer.to_str().unwrap())
         .send("echo second-$((1+1))\r")
@@ -1254,7 +1254,7 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
 
 /// `brindle-remote list` in a tab lists that tab's own session.
 pub fn manage(ctx: &Ctx) -> Result<Outcome> {
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .keep_detached()
         .prompt()
         .send(&sh(
@@ -1305,7 +1305,7 @@ $answer = [BrindleE2e.Box]::MessageBoxW([BrindleE2e.Box]::GetConsoleWindow(), 'O
         let chain = ctx.dir.join(format!("{label}-owners.txt"));
         let saved = chain.clone();
         let slow = ctx.secs(1.0);
-        let out = Run::local(ctx, label)
+        let out = Run::new(ctx, label)
             .keep_detached()
             .restore()
             .prompt()
@@ -1377,12 +1377,12 @@ pub fn inbox_host(ctx: &Ctx) -> Result<Outcome> {
     let inbox = "\n[[profiles]]\nname = \"Inbox\"\ncommand = \"pwsh.exe\"\n\
                  args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt { 'PS> ' }\"]\n\
                  env = { BRINDLE_CONPTY = \"inbox\" }\n";
-    let out = Run::local(ctx, "run")
+    let out = Run::new(ctx, "run")
         .config(inbox)
         .prompt()
         .send(&format!("{}\r", echo("packaged-host")))
-        // The test config's profiles are Shell, tmux, then this one.
-        .action("new_tab_with_profile_3")
+        // The test config's profiles are Shell, then this one.
+        .action("new_tab_with_profile_2")
         .prompt()
         .send(&format!("{}\r", echo("inbox-host")))
         .call_at(later(4.0), move |_| {
@@ -1473,7 +1473,7 @@ pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
 #[cfg(windows)]
 fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Result<Outcome> {
     // The elevated Brindle: an empty BRINDLE_SERVER_DIR counts as unset.
-    let out = Run::local(ctx, "elevated")
+    let out = Run::new(ctx, "elevated")
         .keep_detached()
         .env("BRINDLE_SERVER_DIR", "")
         .env("LOCALAPPDATA", appdata.to_str().unwrap())

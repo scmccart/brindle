@@ -1,7 +1,7 @@
 # shell-integration Specification
 
 ## Purpose
-Understand the OSC 133 semantic prompt marks that shells emit, so users can jump between prompts, select or copy a command's output, and see at a glance which commands failed, in local tabs and tmux control-mode panes alike.
+Understand the OSC 133 semantic prompt marks that shells emit, so users can jump between prompts, select or copy a command's output, and see at a glance which commands failed.
 
 ## Requirements
 
@@ -101,17 +101,6 @@ Brindle SHALL ship integration scripts for bash, zsh, fish and PowerShell that e
 #### Scenario: PowerShell exit status
 - **WHEN** a PowerShell user with the script loaded runs `cmd /c exit 3`
 - **THEN** the command's mark records exit status 3, and `$LASTEXITCODE` is still 3 at the next prompt
-
-### Requirement: tmux panes
-In tmux control-mode panes, marks the pane's shell emits SHALL work like they do in local tabs, because tmux passes pane output through to control clients unchanged. Marks are only recorded from the time Brindle receives output, so restoring a pane on attach SHALL NOT recreate marks for earlier output. In classic tmux, which does not pass OSC 133 to the outer terminal, Brindle SHALL see no marks.
-
-#### Scenario: Control-mode pane
-- **WHEN** a shell with the bash script loaded runs in a control-mode pane and prints several screens of output
-- **THEN** ctrl-shift-up scrolls that pane to the command's prompt
-
-#### Scenario: Reattach
-- **WHEN** Brindle reattaches to a session whose panes had marked prompts
-- **THEN** the restored text has no marks until the shells print new prompts
 
 ### Requirement: Working directory reports
 In local tabs, Brindle SHALL record the working directory a program reports with OSC 7 (`file://<host>/<path>`, percent-decoded) or with ConEmu's OSC 9;9 (`ESC ] 9 ; 9 ; <path> ST`, the path optionally in double quotes). The latest report wins. A report whose path is not absolute for the platform SHALL be ignored. On Windows, `file://host/C:/src` SHALL mean `C:\src`.

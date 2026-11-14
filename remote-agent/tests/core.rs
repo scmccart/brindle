@@ -205,15 +205,17 @@ fn say(client: &mut TestClient, session: SessionId, word: &str) {
     client.output_until(session, &programs::echo_of(word));
 }
 
-/// Waits for the `EXIT` of a session that was hung up. A signal ended its
-/// program on Linux, so it has no exit code; on Windows it has the one the
-/// console's end or the holder ended it with.
+/// Waits for the `EXIT` of a session that was hung up. On Linux its
+/// status isn't the server's to decide: the signal nearly always ends the
+/// program (no exit code), but one blocked reading the terminal now and then
+/// gets through "the read failed, exit 1" first. On Windows it has the code
+/// the console's end or the holder ended it with.
 fn hung_up(client: &mut TestClient, session: SessionId) {
     let code = client.exit_code(session);
-    #[cfg(unix)]
-    assert_eq!(code, None);
     #[cfg(windows)]
     assert!(code.is_some());
+    #[cfg(unix)]
+    let _ = code;
 }
 
 // 4.1
@@ -708,6 +710,10 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
     client.send(client::ToCore::Stop(client::Request { req: 102 }));
     assert!(matches!(client.reply(102), ToClient::Ok(_)));
     hung_up(&mut client, kept);
+    // It doesn't read the terminal, so on Linux only the signal ends it.
+    #[cfg(unix)]
+    assert_eq!(client.exit_code(plain), None);
+    #[cfg(windows)]
     hung_up(&mut client, plain);
     assert!(client.closes());
     assert!(!alive(kept_pid) && !alive(plain_pid));
@@ -964,13 +970,24 @@ fn a_session_with_more_output_than_a_tail_holds_rebuilds_exactly() {
     let mut client = TestClient::hello(&dir.path, "first");
     // More than the 1 MiB tail: only checkpoints keep it exact.
     let fixture = lines_fixture(1536);
-    let (session, pid) = client.spawn(fixture_spawn(&dir, "lines", &fixture, 1000));
+    let mut spawn = fixture_spawn(&dir, "lines", &fixture, 1000);
+    spawn.args[1] = format!(
+        "stty raw -echo; cat '{}'; read x; printf 'ack\\r\\n'; exec sleep 1000",
+        dir.path.join("lines").display()
+    );
+    let (session, pid) = client.spawn(spawn);
     dir.track(parent(pid).unwrap());
     client.output_until(session, b"all printed\r\n");
+    // The core takes no checkpoint while it is behind its holder, so its
+    // first one comes with the end of the flood, and is only queued for
+    // the holder when the client has `all printed`. This line of input is
+    // queued behind it, so its answer means the holder has the checkpoint.
+    client.input(session, b"\n");
+    client.output_until(session, b"ack\r\n");
 
     kill_core_and_wait_for_another(&dir, &mut client);
     let mut other = TestClient::hello(&dir.path, "other");
-    let expected = snapshot(&replayed(&fixture, 80, 24, 1000));
+    let expected = snapshot(&replayed(&[&fixture[..], b"ack\r\n"].concat(), 80, 24, 1000));
     let (_, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
     assert_eq!(snapshot(&screen), expected);
     let logs = dir.logs();
@@ -1162,6 +1179,51 @@ fn owner_and_policy_changes_survive_a_core_restart() {
     let mut b = TestClient::hello(&dir.path, "b");
     let (start, _) = b.reconnect_replay();
     assert_eq!(start.session, taken);
+}
+
+#[test]
+fn an_attach_holds_when_the_core_is_killed_as_its_replay_starts() {
+    let mut dir = TempDir::new("attach-kill");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (session, pid) = a.spawn(detach(programs::echoer()));
+    dir.track(parent(pid).unwrap());
+    // A goes without detaching, so the session is still A's, in the holder
+    // too: a core that forgot B's attach would give it back to A.
+    drop(a);
+    let mut b = TestClient::hello(&dir.path, "b");
+    assert!(
+        eventually(TIMEOUT, || {
+            b.list().iter().any(|s| s.session == session && !s.attached)
+        }),
+        "A's session never lost its client"
+    );
+
+    // Killed on REPLAY_START, without reading any further.
+    const REQ: brindle_remote_protocol::RequestId = 1 << 32;
+    b.send(client::ToCore::Attach(client::Attach {
+        req: REQ,
+        session,
+        cols: 80,
+        rows: 24,
+    }));
+    loop {
+        match b.recv() {
+            ToClient::ReplayStart(start) if start.req == Some(REQ) => break,
+            ToClient::Error(error) => panic!("attach refused: {}", error.message),
+            _ => {}
+        }
+    }
+    kill_core_and_wait_for_another(&dir, &mut b);
+
+    let mut a = TestClient::hello(&dir.path, "a");
+    not_given_back(&mut a, session);
+    let mut b = TestClient::hello(&dir.path, "b");
+    let (start, _) = b.reconnect_replay();
+    assert_eq!((start.session, start.pid), (session, pid));
+    // A still doesn't have it, now that B does.
+    not_given_back(&mut a, session);
+    say(&mut b, session, "mine");
 }
 
 #[test]

@@ -1,12 +1,13 @@
-//! The tab strip: its colours (the window's chrome tokens, the faces in a
-//! muted pill, each in its own terminal's colours with no line), its `+`
+//! The tab strip: its colours (the window's chrome tokens, the faces apart
+//! with no pill behind them, each in its own terminal's colours with no
+//! line), its `+`
 //! drawn legibly, the strip as a keyboard stop (`focus_tab_strip`, then the
 //! tab list's arrows, home and end, and enter or escape back to the
 //! terminal), and tab actions leaving focus where it was. Pointer presses
 //! can't be posted on Linux, so a click on a tab or a button, and hovering
 //! for a tooltip, stay manual checks.
 
-use super::server;
+use super::CARD_INSET;
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Image, PxRect, Rgb};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -31,21 +32,27 @@ fn alt_profile() -> String {
     )
 }
 
-/// The strip's height (`TAB_BAR_HEIGHT`: the 36px pill tab list and the
-/// 1px border under it) and the test config's terminal padding, in
-/// logical pixels.
-const STRIP_HEIGHT: f32 = 37.0;
+/// The strip's height (`TAB_BAR_HEIGHT`: the 36px tab list under the
+/// strip's 6px (`ZONE_GAP`) top padding, with no border under it; its
+/// background runs on into the cards' margin) and the test config's
+/// terminal padding, in logical pixels.
+const STRIP_HEIGHT: f32 = 42.0;
 const PADDING: f32 = 6.0;
 
-/// Where a tab's face is, from the strip's top-left: the pill's 3px of
-/// padding all round puts the faces 3px down and 30px high; they start
-/// 11px in (the strip's and the list's padding), are at least 80px wide
-/// (a `bash` tab is exactly that) and side by side. The samples keep clear
-/// of the rounded corners.
-const FACE_TOP: f32 = 3.0;
+/// The strip's padding above and left of the tab list (`ZONE_GAP`).
+const STRIP_PADDING: f32 = 6.0;
+
+/// Where a tab's face is, from the strip's top-left: the strip's padding
+/// and the list's 3px of padding above put the faces 9px down and 30px
+/// high; they start 6px in (the strip's padding: the list has none at its
+/// left), are at least 80px wide (a `bash` tab is exactly that) and 4px
+/// apart (`TAB_FACE_GAP`). The samples keep clear of the rounded corners.
+const FACE_TOP: f32 = STRIP_PADDING + 3.0;
 const FACE_HEIGHT: f32 = 30.0;
-const FACE_LEFT: f32 = 11.0;
-const FACE_STEP: f32 = 80.0;
+const FACE_LEFT: f32 = STRIP_PADDING;
+const FACE_WIDTH: f32 = 80.0;
+const FACE_GAP: f32 = 4.0;
+const FACE_STEP: f32 = FACE_WIDTH + FACE_GAP;
 
 /// The right end of the strip: the window controls when the window draws
 /// them (8px of padding and three 32px `IconSm` buttons 4px apart; under
@@ -54,8 +61,9 @@ const FACE_STEP: f32 = 80.0;
 const RIGHT_BUTTONS: f32 = 8.0 + 3.0 * 32.0 + 2.0 * 4.0;
 
 /// The middle of the strip's buttons, from its top: `IconSm` buttons
-/// centred in the 36px above the border, their 16px icons too.
-const BUTTON_MIDDLE: f32 = 18.0;
+/// centred in the tab list's 36px under the strip's top padding, their
+/// 16px icons too.
+const BUTTON_MIDDLE: f32 = STRIP_PADDING + 18.0;
 
 /// When step `step` (counted from 1) runs: Brindle runs its steps one
 /// second apart, the first 1.5 s in.
@@ -64,8 +72,9 @@ fn step_time(step: usize) -> f64 {
 }
 
 /// Where the strip is in a capture. The dump's grid origin is the active
-/// terminal's top-left plus the padding, and the terminal sits right under
-/// the strip, so the strip's bottom-left is the origin less the padding.
+/// terminal's top-left plus the padding, and the terminal sits in its card
+/// right under the strip, inside the card's margin and border, so the
+/// strip's bottom-left is the origin less the padding and those.
 struct Strip {
     left: f32,
     top: f32,
@@ -78,8 +87,8 @@ impl Strip {
     fn locate(out: &Output, image: &Image) -> Result<Strip> {
         let grid = out.dump.grid()?;
         Ok(Strip {
-            left: grid.x - PADDING,
-            top: grid.y - PADDING - STRIP_HEIGHT,
+            left: grid.x - PADDING - CARD_INSET,
+            top: grid.y - PADDING - CARD_INSET - STRIP_HEIGHT,
             scale: grid.scale,
             window_width: image.width as f32 / grid.scale,
         })
@@ -125,17 +134,38 @@ impl Strip {
     /// face's top edge: which device row the edge falls on varied by one
     /// between runs (the strip's origin is derived from the dump's logical
     /// pixels; the exact cause was not chased), and a band that began on
-    /// the edge read the pill's muted background in two of seven runs.
+    /// the edge read what lies round the face in two of seven runs.
     fn face_top(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
         self.rect(left + 8.0, FACE_TOP + 1.0, 56.0, 2.0)
     }
 
-    /// The pill's bottom padding under tab `ix`'s face.
+    /// The list's bottom padding under tab `ix`'s face.
     fn under_face(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
         self.rect(left + 8.0, FACE_TOP + FACE_HEIGHT + 0.5, 56.0, 2.0)
     }
+
+    /// The 4px between tab `ix`'s face and the next, less a pixel at each
+    /// side, clear of the rounded corners.
+    fn after_face(&self, ix: usize) -> PxRect {
+        let right = FACE_LEFT + FACE_STEP * ix as f32 + FACE_WIDTH;
+        self.rect(right + 1.0, FACE_TOP + 8.0, FACE_GAP - 2.0, FACE_HEIGHT - 16.0)
+    }
+}
+
+/// The window's background (the chrome's `background` token) is the most
+/// common colour in `r`, within 6: a face's shadow may darken it a little.
+fn expect_window_background(image: &Image, what: &str, r: PxRect) -> Result {
+    let got = image.dominant(r);
+    ensure!(
+        got.is_some_and(|c| c.near(theme::CHROME_BACKGROUND, 6)),
+        "{what}: dominant {:?} in {r:?}, want the window's {}, no pill; found {}",
+        got.map(Rgb::hex),
+        theme::CHROME_BACKGROUND.hex(),
+        image.summary(r)
+    );
+    Ok(())
 }
 
 /// How far `p` is from `from`: the channels' differences added up.
@@ -153,23 +183,26 @@ struct PlusGlyph {
     horizontal: f32,
 }
 
-/// Finds the `+` right of the tab list (whose pill is the last run of
-/// `muted` along the buttons' middle row) and measures it. A stroke's
-/// thickness is its pixels' coverage added up across it, each pixel's
-/// coverage its distance from `bg` against the glyph's inkiest pixel, so
-/// anti-aliased edges count for what they cover.
-fn measure_plus(image: &Image, strip: &Strip, bg: Rgb, muted: Rgb) -> Result<PlusGlyph> {
+/// Finds the `+` right of the tab list (whose last face is the last run of
+/// the face colour `face` along the buttons' middle row) and measures it. A
+/// stroke's thickness is its pixels' coverage added up across it, each
+/// pixel's coverage its distance from `bg` against the glyph's inkiest
+/// pixel, so anti-aliased edges count for what they cover.
+fn measure_plus(image: &Image, strip: &Strip, bg: Rgb, face: Rgb) -> Result<PlusGlyph> {
     let s = strip.scale;
     let dev = |v: f32| (v * s).round() as u32;
     let row = dev(strip.top + BUTTON_MIDDLE);
     let (from, to) = (dev(strip.left + FACE_LEFT), dev(strip.left + FACE_LEFT + 400.0).min(image.width));
     let list_end = (from..to)
-        .filter(|&x| image.pixel(x, row).near(muted, 2))
+        .filter(|&x| image.pixel(x, row).near(face, 2))
         .last()
-        .ok_or_else(|| format!("no tab list pill along y={row}: {}", image.summary(PxRect { x0: from, y0: row, x1: to, y1: row + 1 })))?;
-    // The horizontal arm: the first run of ink past the list.
+        .ok_or_else(|| format!("no tab face along y={row}: {}", image.summary(PxRect { x0: from, y0: row, x1: to, y1: row + 1 })))?;
+    // The horizontal arm: the first run of ink past the list. The face's
+    // anti-aliased right edge (a blend of the face and the strip's
+    // background) counts as ink, so it is skipped first.
     let inked = |x: u32, y: u32| distance(image.pixel(x, y), bg) > 24;
-    let start = (list_end + 1..to).find(|&x| inked(x, row)).ok_or("no + right of the tab list")?;
+    let past_face = (list_end + 1..to).find(|&x| !inked(x, row)).ok_or("no strip background right of the tab list")?;
+    let start = (past_face..to).find(|&x| inked(x, row)).ok_or("no + right of the tab list")?;
     let end = (start..to).find(|&x| !inked(x, row)).unwrap_or(to);
     let center_x = (start + end) as f32 / 2.0;
     // The inkiest pixel in the glyph's box, where the arms cross.
@@ -192,16 +225,17 @@ fn measure_plus(image: &Image, strip: &Strip, bg: Rgb, muted: Rgb) -> Result<Plu
 
 /// The spec's "Mixed themes", "Active tab marker" and "New-tab icon": with
 /// a profile theme (`e2e-tab`) differing from the global one (`e2e`), the
-/// strip's empty space is the global chrome background token and the tab
-/// list's pill the muted token round the faces; the Alt tab's face is its
+/// strip's empty space is the global chrome background token, which also
+/// shows round the faces (no pill behind them, "Faces are apart"), the
+/// first face 6px from the window's left ("Strip margins"); the Alt tab's
+/// face is its
 /// own theme's background whether it is active or not, and no face has a
 /// line along its top (neither the tab theme's accent nor the global
 /// one's). A Shell tab beside it is in the global theme's terminal
 /// background. The `+` is a 16px icon (its arms lucide's 14 of 24, 9.3px)
 /// with strokes at least two pixels wide.
 pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "active").profile("Alt").config(&alt_profile()).capture_at(3.5).dump_at(4.0).run()?;
+    let out = Run::new(ctx, "active").profile("Alt").config(&alt_profile()).capture_at(3.5).dump_at(4.0).run()?;
     let image = out.image.as_ref().ok_or("no capture")?;
     let strip = Strip::locate(&out, image)?;
     // The empty caption, left of the window controls: the global theme's
@@ -212,11 +246,20 @@ pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
     image.expect_none("a line on the active Alt face", strip.face_top(0), TAB_ACCENT)?;
     image.expect_none("a primary line on the active Alt face", strip.face_top(0), theme::ACCENT)?;
     expect_dominant(image, "top of the active Alt face", strip.face_top(0), TAB_BACKGROUND)?;
-    // Right of the face: the pill's padding, then the strip's background.
-    let pill = strip.rect(FACE_LEFT + FACE_STEP + 0.5, FACE_TOP + 8.0, 2.0, FACE_HEIGHT - 16.0);
-    expect_dominant(image, "the pill right of the face", pill, theme::CHROME_MUTED)?;
+    // Left of the face, the strip's 6px margin, and right of it, the list's
+    // padding: the window's background, no pill.
+    let margin = strip.rect(1.0, FACE_TOP + 8.0, FACE_LEFT - 2.0, FACE_HEIGHT - 16.0);
+    expect_window_background(image, "the margin left of the face", margin)?;
+    expect_dominant(
+        image,
+        "the face's left edge",
+        strip.rect(FACE_LEFT + 1.0, FACE_TOP + 8.0, 3.0, FACE_HEIGHT - 16.0),
+        TAB_BACKGROUND,
+    )?;
+    let right = strip.rect(FACE_LEFT + FACE_WIDTH + 0.5, FACE_TOP + 8.0, 2.0, FACE_HEIGHT - 16.0);
+    expect_window_background(image, "right of the face", right)?;
 
-    let plus = measure_plus(image, &strip, theme::CHROME_BACKGROUND, theme::CHROME_MUTED)?;
+    let plus = measure_plus(image, &strip, theme::CHROME_BACKGROUND, TAB_BACKGROUND)?;
     ensure!(plus.across >= 9.0, "the + is {:.1}px across, under a 16px icon's 9.3: {plus:?}", plus.across);
     ensure!(
         plus.vertical >= 1.8 && plus.horizontal >= 1.8,
@@ -226,7 +269,7 @@ pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
     );
 
     // The Alt tab in the background, a Shell tab (the global theme) active.
-    let out = Run::new(ctx, &server, "background")
+    let out = Run::new(ctx, "background")
         .profile("Alt")
         .default_profile("Shell")
         .config(&alt_profile())
@@ -240,17 +283,17 @@ pub fn strip_colors(ctx: &Ctx) -> Result<Outcome> {
     expect_dominant(image, "background Alt face", strip.face(0), TAB_BACKGROUND)?;
     image.expect_none("a line on the background Alt face", strip.face_top(0), TAB_ACCENT)?;
     // Under the inactive face (the active one's shadow is clear of it): the
-    // pill's padding, in the muted token.
-    expect_dominant(image, "under the background face", strip.under_face(0), theme::CHROME_MUTED)?;
+    // list's padding, the window's background with no pill. Between the
+    // faces, 4px of it.
+    expect_window_background(image, "under the background face", strip.under_face(0))?;
+    expect_window_background(image, "between the faces", strip.after_face(0))?;
     expect_dominant(image, "active Shell face", strip.face(1), theme::BACKGROUND)?;
     image.expect_none("a line on the active Shell face", strip.face_top(1), theme::ACCENT)?;
     expect_dominant(image, "top of the active Shell face", strip.face_top(1), theme::BACKGROUND)?;
     Ok(Outcome::Pass)
 }
 
-/// A run starting in a bash tab whose `new_tab` opens another bash tab (the
-/// test config's default profile is otherwise `tmux`, whose windows arrive
-/// as tabs on their own time).
+/// A run starting in a bash tab whose `new_tab` opens another bash tab.
 fn shell(run: Run) -> Run {
     run.profile("Shell").default_profile("Shell")
 }
@@ -282,12 +325,11 @@ fn expect_focus(out: &Output, place: &str, what: &str) -> Result {
 /// strip; home goes to the first and escape gives focus back to its
 /// terminal; left goes to the previous and enter gives focus back.
 pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = three_tabs(Run::new(ctx, &server, "focus")).action("focus_tab_strip").dump_at(step_time(3) + 1.0).run()?;
+    let out = three_tabs(Run::new(ctx, "focus")).action("focus_tab_strip").dump_at(step_time(3) + 1.0).run()?;
     expect_active(&out, 3, 2, "after focus_tab_strip")?;
     expect_focus(&out, "tabs", "after focus_tab_strip")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "right"))
+    let out = three_tabs(Run::new(ctx, "right"))
         .action("focus_tab_strip")
         .key("right")
         .dump_at(step_time(4) + 1.0)
@@ -295,7 +337,7 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 3, 0, "after right from the last tab")?;
     expect_focus(&out, "tabs", "after right")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "home-escape"))
+    let out = three_tabs(Run::new(ctx, "home-escape"))
         .action("focus_tab_strip")
         .key("home")
         .key("escape")
@@ -304,7 +346,7 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 3, 0, "after home and escape")?;
     expect_focus(&out, "terminal", "after escape")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "left-enter"))
+    let out = three_tabs(Run::new(ctx, "left-enter"))
         .action("focus_tab_strip")
         .key("left")
         .key("enter")
@@ -318,12 +360,11 @@ pub fn strip_keys(ctx: &Ctx) -> Result<Outcome> {
 /// `new_tab` and `close_tab` leave focus in the active tab's terminal, and
 /// a new tab opened while the strip has focus takes focus into its own.
 pub fn actions_keep_focus(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = shell(Run::new(ctx, &server, "new-tab")).action("new_tab").dump_at(step_time(1) + 1.5).run()?;
+    let out = shell(Run::new(ctx, "new-tab")).action("new_tab").dump_at(step_time(1) + 1.5).run()?;
     expect_active(&out, 2, 1, "after new_tab")?;
     expect_focus(&out, "terminal", "after new_tab")?;
 
-    let out = shell(Run::new(ctx, &server, "close-tab"))
+    let out = shell(Run::new(ctx, "close-tab"))
         .action("new_tab")
         .action("close_tab")
         .dump_at(step_time(2) + 1.5)
@@ -331,7 +372,7 @@ pub fn actions_keep_focus(ctx: &Ctx) -> Result<Outcome> {
     expect_active(&out, 1, 0, "after new_tab and close_tab")?;
     expect_focus(&out, "terminal", "after close_tab")?;
 
-    let out = shell(Run::new(ctx, &server, "from-strip"))
+    let out = shell(Run::new(ctx, "from-strip"))
         .action("focus_tab_strip")
         .action("new_tab")
         .dump_at(step_time(2) + 1.5)

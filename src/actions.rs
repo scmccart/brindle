@@ -52,32 +52,8 @@ actions!(
         FocusZoneRight,
         FocusZoneUp,
         FocusZoneDown,
-        TmuxDetach,
-        TmuxSplitRight,
-        TmuxSplitDown,
-        TmuxClosePane,
-        TmuxZoomPane,
-        TmuxFocusLeft,
-        TmuxFocusRight,
-        TmuxFocusUp,
-        TmuxFocusDown,
-        TmuxNewWindow,
-        TmuxLayoutEvenHorizontal,
-        TmuxLayoutEvenVertical,
-        TmuxLayoutMainVertical,
-        TmuxLayoutTiled,
-        TmuxNextLayout,
-        TmuxRotatePanes,
-        TmuxSwapPanePrev,
-        TmuxSwapPaneNext,
-        TmuxBreakPane,
-        TmuxRenameWindow,
-        TmuxCommand,
-        TmuxNewSession,
         Quit,
         AttachSession,
-        /// Consumes a key without doing anything (see the ctrl-shift-d guard).
-        Swallow,
         /// Puts keyboard focus on the tab strip, a tab list: arrows, home and
         /// end then switch tabs, and enter or escape return focus to the
         /// terminal. Hidden (no label, no default key).
@@ -175,28 +151,6 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
     ("focus_zone_right", Some("Focus Zone Right"), || Box::new(FocusZoneRight)),
     ("focus_zone_up", Some("Focus Zone Up"), || Box::new(FocusZoneUp)),
     ("focus_zone_down", Some("Focus Zone Down"), || Box::new(FocusZoneDown)),
-    ("tmux_detach", Some("tmux: Detach"), || Box::new(TmuxDetach)),
-    ("tmux_split_right", Some("tmux: Split Right"), || Box::new(TmuxSplitRight)),
-    ("tmux_split_down", Some("tmux: Split Down"), || Box::new(TmuxSplitDown)),
-    ("tmux_close_pane", Some("tmux: Close Pane"), || Box::new(TmuxClosePane)),
-    ("tmux_zoom_pane", Some("tmux: Toggle Zoom"), || Box::new(TmuxZoomPane)),
-    ("tmux_focus_left", Some("tmux: Focus Pane Left"), || Box::new(TmuxFocusLeft)),
-    ("tmux_focus_right", Some("tmux: Focus Pane Right"), || Box::new(TmuxFocusRight)),
-    ("tmux_focus_up", Some("tmux: Focus Pane Up"), || Box::new(TmuxFocusUp)),
-    ("tmux_focus_down", Some("tmux: Focus Pane Down"), || Box::new(TmuxFocusDown)),
-    ("tmux_new_window", Some("tmux: New Window"), || Box::new(TmuxNewWindow)),
-    ("tmux_layout_even_horizontal", Some("tmux: Layout Even Horizontal"), || Box::new(TmuxLayoutEvenHorizontal)),
-    ("tmux_layout_even_vertical", Some("tmux: Layout Even Vertical"), || Box::new(TmuxLayoutEvenVertical)),
-    ("tmux_layout_main_vertical", Some("tmux: Layout Main Vertical"), || Box::new(TmuxLayoutMainVertical)),
-    ("tmux_layout_tiled", Some("tmux: Layout Tiled"), || Box::new(TmuxLayoutTiled)),
-    ("tmux_next_layout", Some("tmux: Next Layout"), || Box::new(TmuxNextLayout)),
-    ("tmux_rotate_panes", Some("tmux: Rotate Panes"), || Box::new(TmuxRotatePanes)),
-    ("tmux_swap_pane_prev", Some("tmux: Swap Pane with Previous"), || Box::new(TmuxSwapPanePrev)),
-    ("tmux_swap_pane_next", Some("tmux: Swap Pane with Next"), || Box::new(TmuxSwapPaneNext)),
-    ("tmux_break_pane", Some("tmux: Break Pane to New Tab"), || Box::new(TmuxBreakPane)),
-    ("tmux_rename_window", Some("tmux: Rename Window"), || Box::new(TmuxRenameWindow)),
-    ("tmux_command", Some("tmux: Run Command"), || Box::new(TmuxCommand)),
-    ("tmux_new_session", Some("tmux: New Session"), || Box::new(TmuxNewSession)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
@@ -302,12 +256,10 @@ pub fn palette_commands(mut available: impl FnMut(&dyn Action) -> bool) -> Vec<(
         .collect()
 }
 
-/// An action's label as a menu item shows it: its command palette label,
-/// without the `tmux: ` prefix (a tmux tab's menu already says where it
-/// acts). `None` for an action without a label.
+/// An action's label as a menu item shows it: its command palette label.
+/// `None` for an action without a label.
 pub fn menu_label(action: &dyn Action) -> Option<&'static str> {
-    let label = ACTIONS.iter().find(|(_, _, build)| build().partial_eq(action)).and_then(|(_, label, _)| *label)?;
-    Some(label.strip_prefix("tmux: ").unwrap_or(label))
+    ACTIONS.iter().find(|(_, _, build)| build().partial_eq(action)).and_then(|(_, label, _)| *label)
 }
 
 /// A row of a menu whose items run actions, such as a tab's or a zone
@@ -371,12 +323,11 @@ impl ActionMenu {
 }
 
 /// Default bindings follow GNOME Terminal / kitty conventions so plain
-/// ctrl-<letter> always reaches the shell (and tmux's prefix).
+/// ctrl-<letter> always reaches the shell (and the programs in it).
 pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let w = Some("Workspace");
     let t = Some("Terminal");
     let p = Some("Palette");
-    let x = Some("TmuxWindow");
     let z = Some("ZoneTree");
     let s = Some("SettingsDialog");
     let l = Some("SettingsList");
@@ -402,10 +353,6 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         // the readable spelling comes last so the palette shows it.
         KeyBinding::new("ctrl-<", OpenSettings, w),
         KeyBinding::new("ctrl-shift-,", OpenSettings, w),
-        // Detach only means something in a control-mode tab; elsewhere the
-        // key is swallowed so habit never sends ^D to a shell.
-        KeyBinding::new("ctrl-shift-d", Swallow, w),
-        KeyBinding::new("ctrl-shift-d", TmuxDetach, x),
         KeyBinding::new("ctrl-+", IncreaseFontSize, w),
         KeyBinding::new("ctrl-shift-=", IncreaseFontSize, w),
         KeyBinding::new("ctrl-=", IncreaseFontSize, w),
@@ -438,14 +385,6 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-right", FocusZoneRight, z),
         KeyBinding::new("alt-up", FocusZoneUp, z),
         KeyBinding::new("alt-down", FocusZoneDown, z),
-        KeyBinding::new("ctrl-shift-e", TmuxSplitRight, x),
-        KeyBinding::new("ctrl-shift-o", TmuxSplitDown, x),
-        KeyBinding::new("ctrl-shift-x", TmuxClosePane, x),
-        KeyBinding::new("ctrl-shift-z", TmuxZoomPane, x),
-        KeyBinding::new("alt-left", TmuxFocusLeft, x),
-        KeyBinding::new("alt-right", TmuxFocusRight, x),
-        KeyBinding::new("alt-up", TmuxFocusUp, x),
-        KeyBinding::new("alt-down", TmuxFocusDown, x),
         // A palette's list keys and escape come from its command list
         // (`UiList`, `UiCommand`) and overlay (`UiLayer`). The host adds
         // the sessions palette's kill, and enter for a prompt, which submits
@@ -531,7 +470,12 @@ mod tests {
         }
         assert!(action_by_name("activate_tab_0").is_none());
         assert!(action_by_name("bogus").is_none());
-        assert!(action_by_name("swallow").is_none());
+        // Removed actions are unknown names now (user bindings to them are
+        // logged and ignored).
+        for removed in ["swallow", "tmux_detach", "tmux_new_session"] {
+            assert!(action_by_name(removed).is_none(), "{removed}");
+        }
+        assert!(action_names().all(|n| !n.starts_with("tmux_")));
         assert_eq!(
             action_by_name("activate_tab_2").unwrap().as_any().downcast_ref::<ActivateTab>(),
             Some(&ActivateTab(1))
@@ -561,7 +505,6 @@ mod tests {
             assert_eq!(menu_label(action), None, "{name}");
         }
         assert_eq!(menu_label(&RenameTab), Some("Rename Tab"));
-        assert_eq!(menu_label(&TmuxRenameWindow), Some("Rename Window"));
         assert_eq!(menu_label(&SplitZoneDown), Some("Split Zone Down"));
 
         let menu = ActionMenu::new(
@@ -611,10 +554,10 @@ mod tests {
     }
 
     /// Real ctrl-shift-up/down presses (as GPUI reports them on Linux)
-    /// resolve to the prompt jumps in a local tab and in a tmux pane alike;
+    /// resolve to the prompt jumps in a terminal, alone or in a zone tree;
     /// `--action` in the e2e cases skips the keymap, so this covers it.
     #[test]
-    fn prompt_jump_keys_resolve_in_local_and_tmux_terminals() {
+    fn prompt_jump_keys_resolve_in_terminals() {
         use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
         let keymap = Keymap::new(default_bindings());
         let press = |key: &str| Keystroke {
@@ -622,7 +565,7 @@ mod tests {
             key: key.into(),
             key_char: None,
         };
-        let stacks = [vec!["Workspace", "Terminal"], vec!["Workspace", "TmuxWindow", "Terminal"]];
+        let stacks = [vec!["Workspace", "Terminal"], vec!["Workspace", "ZoneTree", "Terminal"]];
         for stack in stacks {
             let contexts: Vec<KeyContext> = stack.iter().map(|c| KeyContext::parse(c).unwrap()).collect();
             for (key, expected) in
@@ -637,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn zone_keys_resolve_in_zone_tree_and_tmux_keys_in_tmux_window() {
+    fn zone_keys_resolve_in_zone_tree() {
         use gpui::{KeyContext, Keymap, Keystroke, Modifiers};
         let keymap = Keymap::new(default_bindings());
         let ctrl_shift = |key: &str| Keystroke {
@@ -682,7 +625,16 @@ mod tests {
         let labels: Vec<&str> =
             palette_commands(|a| available.contains(&a.as_any().type_id())).into_iter().map(|(l, _)| l).collect();
         assert_eq!(labels, ["Go to Last Tab", "Clear Scrollback", "Reload Config"]);
-        assert!(palette_commands(|_| true).iter().any(|(l, _)| *l == "tmux: Split Right"));
+        assert!(palette_commands(|_| true).iter().any(|(l, _)| *l == "Split Zone Right"));
+        assert!(palette_commands(|_| true).iter().all(|(l, _)| !l.starts_with("tmux")));
+    }
+
+    /// ctrl-shift-d has no default binding anywhere, so it reaches the
+    /// program in the terminal like any other unbound chord.
+    #[test]
+    fn ctrl_shift_d_is_unbound() {
+        let d = gpui::Keystroke::parse("ctrl-shift-d").unwrap();
+        assert!(default_bindings().iter().all(|b| b.match_keystrokes(std::slice::from_ref(&d)) != Some(false)));
     }
 
     /// On a select in the settings dialog the select's own keys win over

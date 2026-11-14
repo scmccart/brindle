@@ -49,9 +49,9 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - `--action` runs a named action;
 - `--hover` moves the mouse over a cell of the active terminal, and `--click` presses and releases the left button there. `POS` is `COL,ROW` (zero-based cells), optionally prefixed with modifiers such as `ctrl-` or `ctrl-shift-`, which are held for the step;
 - `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it;
-- `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 seconds without it, Brindle SHALL log a warning and run the remaining steps.
+- `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 step intervals without it (30 seconds at the default interval), Brindle SHALL log a warning, record the wait as timed out, and run the remaining steps.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. For each `--wait-for` step that timed out, the dump SHALL print a `--- wait-for timeout "TEXT"` line (TEXT escaped onto one line), and for a `--wait-for` step still waiting when the dump is taken, a `--- wait-for pending "TEXT"` line, so a dump that shows an unexpected screen says which wait failed. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -97,6 +97,18 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - **WHEN** a slow shell shows its first prompt `MYPROMPT>` four seconds after launch, and Brindle runs with `--wait-for 'MYPROMPT>' --send 'cd /tmp\r' --dump-screen-after 8`
 - **THEN** `cd /tmp` is typed at that prompt, about a second after it appears, rather than before the shell is ready
 
+#### Scenario: The wait scales with the interval
+- **WHEN** Brindle runs with `--step-interval 2 --wait-for 'NEVER' --send 'x'`, and `NEVER` never appears
+- **THEN** `x` is typed about 61 seconds after launch (one second before the first step, then 60 seconds of waiting), not about 31
+
+#### Scenario: A timed-out wait in the dump
+- **WHEN** Brindle runs with `--step-interval 0.1 --wait-for 'NEVER' --dump-screen-after 6`, and `NEVER` never appears
+- **THEN** the dump contains the line `--- wait-for timeout "NEVER"`
+
+#### Scenario: A pending wait in the dump
+- **WHEN** Brindle runs with `--wait-for 'NEVER' --dump-screen-after 3`, and `NEVER` never appears
+- **THEN** the dump contains the line `--- wait-for pending "NEVER"`, and a dump with no `--wait-for` step prints neither line
+
 #### Scenario: Invalid interval
 - **WHEN** Brindle runs with `--step-interval 0`
 - **THEN** it prints a usage error and exits without opening a window
@@ -124,21 +136,6 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - **WHEN** Brindle runs without `--latency-log` or `--latency-bench`
 - **THEN** no latency file is written and nothing about latency is printed
 
-### Requirement: Latency benchmark
-`--latency-bench <N>` SHALL type N keystrokes into the active tab after all `--send`/`--action` steps, alternating `x` and Backspace. Each keystroke SHALL go through the same key handling as a real key press, without synthetic OS-level input, and SHALL wait until its output is painted or one second passes, plus a randomized gap, before the next. Brindle SHALL then print a summary to stdout and quit.
-
-#### Scenario: Benchmark in a shell
-- **WHEN** Brindle runs with `--latency-bench 200` in a shell tab
-- **THEN** stdout contains a `--- latency samples=200 timeouts=T` line followed by one line each for `output`, `paint` and `frame`, giving min, p50, p95, p99 and max in milliseconds, and the process exits
-
-#### Scenario: Benchmark in a tmux tab
-- **WHEN** Brindle runs with `-p tmux --latency-bench 200` against a tmux server
-- **THEN** the keystrokes go to the active pane through tmux, and the summary measures the tmux round trip
-
-#### Scenario: Combined with the screen dump
-- **WHEN** Brindle runs with both `--latency-bench` and `--dump-screen-after`
-- **THEN** whichever finishes first prints its output and the process quits
-
 ### Requirement: Desktop install options
 Brindle SHALL accept `--install-desktop` and `--uninstall-desktop`, with an optional `--prefix <DIR>`, as defined by the `desktop-integration` capability. Like the informational options, they SHALL do their work and exit without opening a window or connecting to a display. They SHALL exit with status 0 on success. A file that cannot be written or removed SHALL produce an error naming the path and a non-zero exit. `--prefix` without one of these options SHALL be rejected as a usage error.
 
@@ -160,17 +157,6 @@ When the environment variable `BRINDLE_NOTIFY_LOG` names a file, Brindle SHALL a
 #### Scenario: Logged notification
 - **WHEN** Brindle runs with `BRINDLE_NOTIFY_LOG=/tmp/n.log`, `notifications.when = "always"`, and `--send 'printf "\033]9;hi\a"\r'`
 - **THEN** `/tmp/n.log` contains a line `osc9<TAB><tab title><TAB>hi` and no desktop notification appears
-
-### Requirement: No console window on Windows
-On Windows, starting Brindle from the Start Menu, Explorer or a shortcut SHALL NOT open a console window. Programs Brindle starts outside a tab, such as tmux through WSL, the link opener and tmux session checks, SHALL NOT open console windows either.
-
-#### Scenario: Start Menu launch
-- **WHEN** the user starts Brindle from the Start Menu
-- **THEN** only Brindle's window opens, with no console window beside it
-
-#### Scenario: WSL attach opens no console
-- **WHEN** the user opens a control-mode profile whose command is `wsl`
-- **THEN** no console window appears while the session is attached
 
 ### Requirement: Console output on Windows
 When Brindle is started from a console on Windows, its informational output, usage errors and `--dump-screen-after` output SHALL appear in that console, or in the file or pipe its output is redirected to. Closing that console, or pressing ctrl-c in it, SHALL NOT close Brindle's windows.
@@ -202,8 +188,8 @@ When the environment variable `BRINDLE_SERVER_DIR` is set and not empty, Brindle
 A launch that becomes the instance (see `session-restore`'s "One process owns the state") SHALL restore the recorded session and reattach detached sessions, as defined by `session-restore`, unless it has `--no-restore`. It SHALL then open what it asks for as the active tab: `-p` and `-d` a new tab with that profile or directory, `-e` a tab running the command, `--attach` a tab attached to that session. A launch with none of them SHALL open no further tab, or one default-profile tab when nothing was restored. The debug options (`--send`, `--action`, `--dump-screen-after`) act on the active tab after this.
 
 #### Scenario: Profile launch
-- **WHEN** Brindle quit with two tabs, and the user runs `brindle -p tmux`
-- **THEN** the window shows the two restored tabs and an active tab with the tmux profile
+- **WHEN** Brindle quit with two tabs, and the user runs `brindle -p Work`
+- **THEN** the window shows the two restored tabs and an active tab with the `Work` profile
 
 #### Scenario: Skip once
 - **WHEN** the user runs `brindle --no-restore`
@@ -223,3 +209,21 @@ A launch without debug options while an instance runs (one with the same state d
 #### Scenario: Attach from a shell
 - **WHEN** Brindle runs, session 7 is detached, and the user runs `brindle --attach 7`
 - **THEN** Brindle's window gains an active tab showing session 7
+
+### Requirement: Latency benchmark samples
+`--latency-bench <N>` SHALL type N keystrokes into the active tab after all `--send`/`--action` steps, alternating `x` and Backspace. Each keystroke SHALL go through the same key handling as a real key press, without synthetic OS-level input, and SHALL wait until its output is painted or one second passes, plus a randomized gap, before the next. Brindle SHALL then print a summary to stdout and quit.
+
+#### Scenario: Benchmark in a shell
+- **WHEN** Brindle runs with `--latency-bench 200` in a shell tab
+- **THEN** stdout contains a `--- latency samples=200 timeouts=T` line followed by one line each for `output`, `paint` and `frame`, giving min, p50, p95, p99 and max in milliseconds, and the process exits
+
+#### Scenario: Combined with the screen dump
+- **WHEN** Brindle runs with both `--latency-bench` and `--dump-screen-after`
+- **THEN** whichever finishes first prints its output and the process quits
+
+### Requirement: No console window for Windows launches
+On Windows, starting Brindle from the Start Menu, Explorer or a shortcut SHALL NOT open a console window. Programs Brindle starts outside a tab, such as the link opener, SHALL NOT open console windows either.
+
+#### Scenario: Start Menu launch
+- **WHEN** the user starts Brindle from the Start Menu
+- **THEN** only Brindle's window opens, with no console window beside it

@@ -2018,16 +2018,22 @@ mod tests {
     fn an_idle_writer_sends_heartbeats_and_then_the_goodbye() {
         let (_tx, rx) = mpsc::sync_channel::<Outgoing>(8);
         let mut wire = Vec::new();
-        run_write_loop(
-            &rx,
-            Duration::from_millis(200),
-            Duration::from_millis(900),
-            &mut wire,
-        )
-        .unwrap();
+        let heartbeat = Duration::from_millis(200);
+        let started = Instant::now();
+        run_write_loop(&rx, heartbeat, Duration::from_millis(900), &mut wire).unwrap();
+        let elapsed = started.elapsed();
         let frames = frames_in(&wire);
         let beats = frames.iter().filter(|f| f.msg_type == MSG_HEARTBEAT).count();
-        assert!((2..=5).contains(&beats), "{beats} heartbeats in {frames:?}");
+        // Each heartbeat needs a full `heartbeat` of silence since the
+        // previous write (or the start), so the run, however long the stop
+        // timer actually slept, holds at most `elapsed / heartbeat` of them;
+        // a writer beating on every 100 ms poll exceeds that. A stall can
+        // delay any beat, so the floor is only that the idle writer sent one.
+        let most = (elapsed.as_millis() / heartbeat.as_millis()) as usize;
+        assert!(
+            (1..=most).contains(&beats),
+            "{beats} heartbeats in {elapsed:?} (at most {most}): {frames:?}"
+        );
         assert_eq!(frames.last().unwrap().msg_type, MSG_EXIT);
         assert_eq!(
             frames.iter().filter(|f| f.msg_type == MSG_EXIT).count(),

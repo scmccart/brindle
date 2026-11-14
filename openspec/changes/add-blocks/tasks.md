@@ -42,7 +42,7 @@
 
 ## 7. Integration
 
-- [ ] 7.1 Add a `tests/e2e/cases/blocks.rs` suite for full-screen programs (collapse state surviving `vim`, nothing covered), inline programs (an OSC 133 fixture moving the cursor to a covered row), tmux control-mode panes (independent panes, reattach with plain rows), and a Windows case in `tests/e2e/cases/win.rs`; verify under `scripts/with-xvfb` and through the Windows CI job.
+- [ ] 7.1 Add a `tests/e2e/cases/blocks.rs` suite for full-screen programs (collapse state surviving `vim`, nothing covered), inline programs (an OSC 133 fixture moving the cursor to a covered row), and a Windows case in `tests/e2e/cases/win.rs`; verify under `scripts/with-xvfb` and through the Windows CI job.
 - [ ] 7.2 Run `tests/perf` with blocks on and off against a saved baseline; verify `latency-shell` and `throughput-brindle` show no regression with no marks and record any change with marks in the PR.
 - [ ] 7.3 Document blocks in README.md (behaviour, actions, `blocks` setting) and add the architecture note to CLAUDE.md and the wheel-latching check to its manual checks; verify the listed actions match `--list-actions`.
 

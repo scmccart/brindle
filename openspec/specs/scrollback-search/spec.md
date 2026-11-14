@@ -1,7 +1,7 @@
 # scrollback-search Specification
 
 ## Purpose
-Let users find text in a terminal's scrollback and screen from a find bar, in local tabs and in tmux control-mode panes alike, with matches highlighted and the view following the current match.
+Let users find text in a terminal's scrollback and screen from a find bar, with matches highlighted and the view following the current match.
 
 ## Requirements
 
@@ -15,13 +15,6 @@ ctrl-shift-f, and "Find" in the command palette, SHALL open a find bar over the 
 #### Scenario: Open from the palette
 - **WHEN** the user runs "Find" from the command palette
 - **THEN** the find bar opens on the tab's focused terminal, as with ctrl-shift-f
-
-### Requirement: Search scope
-The find bar SHALL search one terminal: its scrollback and its screen. In a tmux control-mode tab, the bar SHALL belong to the focused pane and search only the output Brindle has received for that pane. Other panes, tabs and tmux's own history SHALL NOT be searched or highlighted.
-
-#### Scenario: Control-mode pane
-- **WHEN** two panes of a control-mode tab both show `needle`, and the user searches for `needle` in the left pane
-- **THEN** only the left pane's `needle` is highlighted
 
 ### Requirement: Incremental search
 The search SHALL rerun on every edit of the query. The first match SHALL be the nearest one at or above the bottom of the view when the bar opened. An empty query SHALL match nothing. Matches SHALL NOT span a line break unless the line was wrapped.
@@ -128,3 +121,10 @@ The find bar's match-case and regular-expression options SHALL be toggles that s
 #### Scenario: Invalid expression
 - **WHEN** regex is on and the query is not a valid expression
 - **THEN** the query field is framed in the destructive colour and the bar says the expression is invalid
+
+### Requirement: Search covers one terminal
+The find bar SHALL search one terminal: its scrollback and its screen. In a tab with several zones, the bar SHALL belong to the focused zone. Other zones and tabs SHALL NOT be searched or highlighted.
+
+#### Scenario: Two zones
+- **WHEN** two zones of a tab both show `needle`, and the user searches for `needle` in the left zone
+- **THEN** only the left zone's `needle` is highlighted

@@ -367,11 +367,8 @@ mod tests {
         /// An executable shell script standing in for the helper.
         #[cfg(unix)]
         fn script(&self, body: &str) -> PathBuf {
-            use std::os::unix::fs::PermissionsExt as _;
-
             let path = self.0.join("brindle-remote");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
             path
         }
 

@@ -1,32 +1,32 @@
-//! The command palette in control-mode tabs: a tmux command run from it
-//! acts like its shortcut, and tmux commands are listed only where they
-//! apply. (Running a general command is `input-palette-run`.) The `--key`
-//! cases press real keys through gpui's keymap: dismissal and focus
-//! return, the one-overlay rule with the settings dialog, Tab staying in
-//! the palette, wrapping, home and end in the filter, and a prompt reached
-//! from the list. `palette-fits-window` checks the panel's size in window
-//! captures.
+//! The command palette: a zone command run from it acts like its shortcut,
+//! and a tab lists the commands that apply to it. (Running a general
+//! command is `input-palette-run`.) The `--key` cases press real keys
+//! through gpui's keymap: dismissal and focus return, the one-overlay rule
+//! with the settings dialog, Tab staying in the palette, wrapping, home and
+//! end in the filter, and a prompt reached from the list.
+//! `palette-fits-window` checks the panel's size in window captures.
 
-use super::server;
-use crate::brindle::{Input, Output, Run, matches_tmux, state_dir, theme};
+use crate::brindle::{Input, Output, Run, state_dir, theme};
 use crate::capture::Image;
 use crate::{Ctx, Outcome, Result, ensure};
 
-/// "tmux: Split Right" from the palette splits the active pane, and focus
-/// moves to the new pane.
-pub fn tmux_action(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+/// "Split Zone Right" from the palette splits the tab as its shortcut
+/// does: two zones side by side, with focus in the new, right one.
+pub fn zone_action(ctx: &Ctx) -> Result<Outcome> {
+    let out = Run::new(ctx, "run")
         .action("open_command_palette")
-        .send("tmux: split right")
+        .send("split zone right")
         .action("picker_confirm")
         .dump_at(5.0)
         .run()?;
     ensure!(out.dump.palette.is_empty(), "the palette is still open: {:?}", out.dump.palette);
-    let panes = server.run(&["list-panes", "-t", "e2e", "-F", "#{pane_id}"])?;
-    ensure!(panes.lines().collect::<Vec<_>>() == ["%0", "%1"], "panes after the split: {panes:?}");
-    ensure!(server.active_pane()? == "%1", "the new pane isn't active in tmux");
-    matches_tmux(&server, &out.dump, "%1")?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones after the split: {:?}", out.dump.zones);
+    ensure!(
+        out.dump.zone_list.iter().any(|z| z.starts_with("id=2 rect=0.5,0,0.5,1") && z.ends_with(" active")),
+        "the new zone isn't the active right half: {:?}",
+        out.dump.zone_list
+    );
+    ensure!(out.dump.focus.as_deref() == Some("terminal"), "focus after the split: {:?}", out.dump.focus);
     Ok(Outcome::Pass)
 }
 
@@ -55,16 +55,15 @@ fn expect_closed(out: &Output, what: &str) -> Result {
 /// dialog the palette, and closing what replaced the other still gives
 /// focus back to the tab.
 pub fn escape(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "open").key("ctrl-shift-p").dump_at(step_time(1) + 1.0).run()?;
+    let out = Run::new(ctx, "open").key("ctrl-shift-p").dump_at(step_time(1) + 1.0).run()?;
     ensure!(out.dump.palette.first().is_some_and(|l| l == "list query=\"\""), "palette {:?}", out.dump.palette);
     expect_focus(&out, "palette", "with the palette open")?;
 
-    let out = Run::new(ctx, &server, "escape").key("ctrl-shift-p").key("escape").dump_at(step_time(2) + 1.0).run()?;
+    let out = Run::new(ctx, "escape").key("ctrl-shift-p").key("escape").dump_at(step_time(2) + 1.0).run()?;
     expect_closed(&out, "escape")?;
     expect_focus(&out, "terminal", "after escape")?;
 
-    let out = Run::new(ctx, &server, "over-settings")
+    let out = Run::new(ctx, "over-settings")
         .action("open_settings")
         .key("ctrl-shift-p")
         .dump_at(step_time(2) + 1.0)
@@ -72,7 +71,7 @@ pub fn escape(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.settings.is_none(), "the dialog stayed open under the palette: {:?}", out.dump.settings);
     ensure!(!out.dump.palette.is_empty(), "the palette didn't open over the dialog");
     expect_focus(&out, "palette", "the palette over the dialog")?;
-    let out = Run::new(ctx, &server, "over-settings-escape")
+    let out = Run::new(ctx, "over-settings-escape")
         .action("open_settings")
         .key("ctrl-shift-p")
         .key("escape")
@@ -81,7 +80,7 @@ pub fn escape(ctx: &Ctx) -> Result<Outcome> {
     expect_closed(&out, "escape from the palette that replaced the dialog")?;
     expect_focus(&out, "terminal", "after the palette that replaced the dialog")?;
 
-    let out = Run::new(ctx, &server, "settings-over")
+    let out = Run::new(ctx, "settings-over")
         .key("ctrl-shift-p")
         .key("ctrl-shift-,")
         .key("escape")
@@ -94,8 +93,7 @@ pub fn escape(ctx: &Ctx) -> Result<Outcome> {
 
 /// Tab and shift-tab keep focus in the palette's filter, with its text.
 pub fn tab_stays(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .key("ctrl-shift-p")
         .send("split")
         .key("tab")
@@ -121,13 +119,12 @@ const FONT_SIZE: [&str; 3] = ["Increase Font Size", "Decrease Font Size", "Reset
 /// it would stay on Increase), and down three times is Increase again
 /// (without wrapping it would stop on Reset, which changes nothing).
 pub fn wrap(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let listed = Run::new(ctx, &server, "listed").key("ctrl-shift-p").send("font size").dump_at(step_time(2) + 1.0).run()?;
+    let listed = Run::new(ctx, "listed").key("ctrl-shift-p").send("font size").dump_at(step_time(2) + 1.0).run()?;
     let labels: Vec<&str> = listed.dump.palette.iter().skip(1).map(|r| label(r)).collect();
     ensure!(labels == FONT_SIZE, "rows for \"font size\": {:?}", listed.dump.palette);
     let before = listed.dump.grid()?.cell_width;
 
-    let up = Run::new(ctx, &server, "up")
+    let up = Run::new(ctx, "up")
         .key("ctrl-shift-p")
         .send("font size")
         .key("up")
@@ -140,7 +137,7 @@ pub fn wrap(ctx: &Ctx) -> Result<Outcome> {
     let after = up.dump.grid()?.cell_width;
     ensure!(after < before, "up, up from the first row didn't run Decrease Font Size: cell width {before} then {after}");
 
-    let down = Run::new(ctx, &server, "down")
+    let down = Run::new(ctx, "down")
         .key("ctrl-shift-p")
         .send("font size")
         .key("down")
@@ -154,7 +151,7 @@ pub fn wrap(ctx: &Ctx) -> Result<Outcome> {
 
     // Home and end leave the highlight alone: Increase, the first row, still
     // runs (had end gone to the list, Reset would run and change nothing).
-    let edges = Run::new(ctx, &server, "home-end")
+    let edges = Run::new(ctx, "home-end")
         .key("ctrl-shift-p")
         .send("font size")
         .key("home")
@@ -169,8 +166,7 @@ pub fn wrap(ctx: &Ctx) -> Result<Outcome> {
 
 /// Home and end move the filter's caret, not the highlight.
 pub fn home_end(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "home")
+    let out = Run::new(ctx, "home")
         .key("ctrl-shift-p")
         .send("split")
         .key("home")
@@ -181,7 +177,7 @@ pub fn home_end(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.input.as_ref() == Some(&want), "after home: input {:?}, want {want:?}", out.dump.input);
     expect_focus(&out, "palette", "after home")?;
 
-    let out = Run::new(ctx, &server, "end")
+    let out = Run::new(ctx, "end")
         .key("ctrl-shift-p")
         .send("split")
         .key("home")
@@ -196,21 +192,20 @@ pub fn home_end(ctx: &Ctx) -> Result<Outcome> {
 /// A command that asks for text, run from the palette: the prompt has
 /// focus, enter submits it, and focus is back on the tab after.
 pub fn prompt_focus(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let pick = |label: &'static str| {
-        Run::new(ctx, &server, label).key("ctrl-shift-p").send("tmux: rename window").key("enter")
-    };
+    let pick =
+        |label: &'static str| Run::new(ctx, label).key("ctrl-shift-p").send("rename tab").key("enter");
     let out = pick("asks").dump_at(step_time(3) + 1.0).run()?;
     let prompt = out.dump.palette.first().map(String::as_str).unwrap_or("");
-    ensure!(prompt.starts_with("prompt \"Rename tmux window\""), "palette {:?}", out.dump.palette);
+    ensure!(prompt.starts_with("prompt \"Rename tab\""), "palette {:?}", out.dump.palette);
     expect_focus(&out, "palette", "in the prompt")?;
     ensure!(out.dump.input.is_some(), "the prompt's input has no focus");
 
+    // The prompt opens with the current title selected, so typing replaces it.
     let out = pick("submits").send("renamed").key("enter").dump_at(step_time(5) + 1.0).run()?;
     expect_closed(&out, "after submitting")?;
     expect_focus(&out, "terminal", "after submitting")?;
-    let name = server.run(&["display-message", "-p", "-t", "e2e", "#{window_name}"])?;
-    ensure!(name.trim() == "renamed", "window name {name:?}");
+    let title = out.dump.tabs.first().map(|(t, _)| t.as_str()).unwrap_or("");
+    ensure!(title == "renamed", "tab titles after submitting: {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }
 
@@ -223,7 +218,8 @@ const PANEL_MAX_HEIGHT: f32 = 345.0;
 /// The rows of `image` that hold a horizontal run of the `border` token at
 /// least `min_run` pixels long: the panel's top and bottom edges and the
 /// line under its filter. Nothing else in the window is drawn in that
-/// colour at that length; the tab strip's border is dimmed by the backdrop.
+/// colour at that length: the top and bottom edges of an `e2e` tab's card
+/// lie under the backdrop, which dims them.
 fn border_rows(image: &Image, min_run: u32) -> Vec<u32> {
     (0..image.height)
         .filter(|&y| {
@@ -275,11 +271,10 @@ fn expect_panel_fits(out: &Output, size: Option<(f32, f32)>) -> Result {
 /// list, centred, not stretched past the window's top and bottom by every
 /// row's height.
 pub fn fits_window(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     fn open(run: Run<'_>) -> Run<'_> {
         run.action("open_command_palette").capture_at(step_time(1) + 1.5).dump_at(step_time(1) + 2.0)
     }
-    let normal = open(Run::new(ctx, &server, "normal").profile("Shell")).run()?;
+    let normal = open(Run::new(ctx, "normal").profile("Shell")).run()?;
     expect_panel_fits(&normal, None)?;
 
     let dir = state_dir(ctx);
@@ -289,7 +284,7 @@ pub fn fits_window(ctx: &Ctx) -> Result<Outcome> {
         ctx.dir.display()
     );
     std::fs::write(dir.join("session.toml"), state).map_err(|e| e.to_string())?;
-    let small = open(Run::new(ctx, &server, "small").restore().default_profile("Shell")).run()?;
+    let small = open(Run::new(ctx, "small").restore().default_profile("Shell")).run()?;
     expect_panel_fits(&small, Some((560.0, 440.0)))?;
     Ok(Outcome::Pass)
 }
@@ -305,23 +300,13 @@ fn label(row: &str) -> &str {
     row.split("  ").next().unwrap_or(row)
 }
 
-/// tmux commands are listed for a control-mode tab, with their shortcuts;
-/// a local tab lists zone commands and only "tmux: New Session" of the tmux
-/// commands.
+/// A local tab lists the zone commands with their shortcuts and the tab's
+/// own commands, and no tmux commands at all.
 pub fn lists_for_tab(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "tmux").action("open_command_palette").dump_at(3.5).run()?;
-    let tmux = rows(&out)?;
-    ensure!(tmux.iter().any(|r| label(r) == "tmux: Split Right"), "tmux tab rows: {tmux:?}");
-    ensure!(tmux.iter().any(|r| r == "tmux: Detach  [ctrl-shift-d]"), "tmux tab rows: {tmux:?}");
-    ensure!(!tmux.iter().any(|r| label(r).contains("Zone")), "zone commands in a tmux tab: {tmux:?}");
-    ensure!(tmux.iter().any(|r| label(r) == "Clear Scrollback"), "tmux tab rows: {tmux:?}");
-    ensure!(tmux.iter().any(|r| label(r) == "Rename Tab"), "tmux tab rows: {tmux:?}");
-
-    let out = Run::new(ctx, &server, "local").profile("Shell").action("open_command_palette").dump_at(3.5).run()?;
+    let out = Run::new(ctx, "local").action("open_command_palette").dump_at(3.5).run()?;
     let local = rows(&out)?;
     let listed: Vec<&str> = local.iter().map(|r| label(r)).filter(|l| l.starts_with("tmux: ")).collect();
-    ensure!(listed == ["tmux: New Session"], "tmux commands in a local tab: {listed:?}");
+    ensure!(listed.is_empty(), "tmux commands in a local tab: {listed:?}");
     ensure!(local.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| r == "Split Zone Down  [ctrl-shift-o]"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| r == "Close Zone  [ctrl-shift-x]"), "local tab rows: {local:?}");

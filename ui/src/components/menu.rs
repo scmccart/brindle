@@ -680,7 +680,7 @@ mod tests {
         vec![
             MenuItem::new("bash").description("the default shell").into(),
             MenuItem::new("fish").description("a friendly shell").into(),
-            MenuItem::new("tmux").description("tmux control mode · main").into(),
+            MenuItem::new("toolbox").description("toolbox container · dev").into(),
             MenuItem::new("zsh").description("not installed").disabled(true).into(),
             MenuEntry::Separator,
             MenuItem::new("Settings…").into(),
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(empty.down(&[]), None);
     }
 
-    /// The spec's scenario: `t` highlights `tmux`, whose label starts with
+    /// The spec's scenario: `t` highlights `toolbox`, whose label starts with
     /// it, not `bash`, whose description does. A disabled match is passed,
     /// and a repeated letter cycles.
     #[test]
@@ -806,8 +806,8 @@ mod tests {
         assert!(!MenuEntry::Separator.is_enabled());
         assert_eq!(MenuEntry::Separator.label(), "");
         assert_eq!(MenuEntry::Separator.item(), None);
-        let item = MenuItem::new("tmux").description("tmux control mode · main").shortcut("ctrl-alt-3");
-        assert_eq!(item.description.as_ref().map(|s| s.as_ref()), Some("tmux control mode · main"));
+        let item = MenuItem::new("toolbox").description("toolbox container · dev").shortcut("ctrl-alt-3");
+        assert_eq!(item.description.as_ref().map(|s| s.as_ref()), Some("toolbox container · dev"));
         assert_eq!(item.shortcut.as_ref().map(|s| s.as_ref()), Some("ctrl-alt-3"));
         let entry: MenuEntry = item.disabled(true).into();
         assert!(!entry.is_enabled());

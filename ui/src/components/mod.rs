@@ -31,6 +31,7 @@
 //! ring-ring/50`) that takes no room, so focusing moves no layout.
 
 pub mod button;
+pub mod card;
 pub mod checkbox;
 pub mod command;
 pub mod context_menu;
@@ -58,6 +59,7 @@ use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::style::ring_geometry;
 
 pub use button::Button;
+pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
 pub use context_menu::{ContextMenu, ContextMenuTarget};

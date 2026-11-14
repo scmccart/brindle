@@ -16,6 +16,12 @@
 //!   after a replay of its screen (`REPLAY_START`, `DATA`…, `REPLAY_END`),
 //!   then applies the client's size. `DETACH` leaves it running with no
 //!   client.
+//! - **Stored before told:** a replay waits until the session's last
+//!   `SET_META` is in its holder's socket (`Session::storing`, released
+//!   by [`Core::send_stored_replays`] after the holders' flush). A client
+//!   that has its `REPLAY_START` therefore gets the session back from the
+//!   next core, however soon this one is killed: the holder reads what
+//!   its socket holds before it sees the connection end.
 //! - **Checkpoints:** the session's replay goes to its holder past
 //!   [`CHECKPOINT_AFTER`] of output since the last one (checked after each
 //!   read of the holder's output, and deferred while more is waiting: see
@@ -87,7 +93,12 @@ pub(super) struct Session {
     /// Adopted, and its emulator isn't rebuilt from the holder's checkpoint
     /// and tail yet: whether the tail was truncated.
     rebuilding: Option<bool>,
-    /// A replay for its client, waiting for the rebuild.
+    /// Where its last `SET_META` ends in its holder's connection (a count
+    /// of bytes written: [`Core::holder_has`]), until the holder's socket
+    /// has taken that much.
+    storing: Option<u64>,
+    /// A replay for its client, waiting for the rebuild or for `storing`.
+    /// Its output meanwhile isn't forwarded: the replay has it.
     pending_replay: Option<PendingReplay>,
     /// Its emulator, fed with all of its output.
     pub(super) screen: Screen,
@@ -125,6 +136,7 @@ impl Session {
             awaiting_owner: true,
             exited: held.exit.map(|exit| exit.code),
             rebuilding: Some(held.truncated),
+            storing: None,
             pending_replay: None,
         }
     }
@@ -248,6 +260,7 @@ impl<L: EventLoop> Core<L> {
                 awaiting_owner: false,
                 exited: None,
                 rebuilding: None,
+                storing: None,
                 pending_replay: None,
                 screen,
             },
@@ -320,10 +333,15 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         // A client attached now is told the session was lost, not that its
-        // program exited, so it can keep the tab open and say why.
+        // program exited, so it can keep the tab open and say why. One
+        // still waiting for its replay gets that first (it answers its
+        // `ATTACH`), and an `EXIT` kept for it ends the session there.
         if let Some(client) = session.attached {
             log!("session {id}: lost with its holder");
-            self.sessions.remove(&id);
+            self.send_waiting_replay(id);
+            if self.sessions.remove(&id).is_none() {
+                return;
+            }
             return self.send_client(
                 client,
                 ToClient::Exit(Exit {
@@ -343,7 +361,10 @@ impl<L: EventLoop> Core<L> {
         // Attached or not, so a detached session's screen stays current.
         // Checkpoints wait for the end of the read (`checkpoint_due`).
         session.screen.feed(id, &bytes);
-        if let Some(client) = session.attached {
+        // A client still waiting for its replay gets this output in it.
+        if let Some(client) = session.attached
+            && session.pending_replay.is_none()
+        {
             self.send_client(client, ToClient::Data(Data { session: id, bytes }));
         }
     }
@@ -443,6 +464,12 @@ impl<L: EventLoop> Core<L> {
         if session.awaiting_owner && session.attached.is_none() && !session.hung_up {
             session.exited = Some(code);
             return;
+        }
+        // A client still waiting for its replay gets it now, then the
+        // `EXIT`: the replay answers its `ATTACH`.
+        if session.pending_replay.is_some() {
+            session.exited = Some(code);
+            return self.send_waiting_replay(id);
         }
         let session = self.sessions.remove(&id).expect("the session");
         if let Some(client) = session.attached {
@@ -587,10 +614,12 @@ impl<L: EventLoop> Core<L> {
         self.send_holder(holder, ToHolder::Hangup(h1::SessionRef { session: id }));
     }
 
-    /// The session loses its client, and isn't paused for it any more.
+    /// The session loses its client, and isn't paused for it any more. A
+    /// replay still waiting for that client is dropped.
     pub(super) fn detach_session(&mut self, id: SessionId) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.attached = None;
+            session.pending_replay = None;
         }
         self.set_paused(id, false);
     }
@@ -665,8 +694,13 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn client_resize(&mut self, client: Token, resize: Resize) {
-        if self.client_session(client, resize.session).is_none() {
+        let Some(session) = self.client_session(client, resize.session) else {
             return;
+        };
+        // It came after the `ATTACH` whose replay still waits, so that
+        // one's size, which applies after the replay, must not undo it.
+        if let Some(pending) = &mut session.pending_replay {
+            pending.size = None;
         }
         self.resize_session(
             resize.session,
@@ -710,7 +744,8 @@ impl<L: EventLoop> Core<L> {
 
     /// `ATTACH`: a session with no client gets this one, after a replay of
     /// its screen; then the client's size applies. A session that has a
-    /// client is refused.
+    /// client is refused. When the attach changes the owner, the replay
+    /// waits until the holder's socket has the change (`store_meta`).
     pub(super) fn client_attach(&mut self, client: Token, attach: client::Attach) {
         let id = attach.session;
         let refusal = match self.sessions.get(&id) {
@@ -747,10 +782,16 @@ impl<L: EventLoop> Core<L> {
     /// policy: a `kill` session becomes `detach`. It also loses its owner,
     /// so no reconnect gives it back to a client that let it go.
     pub(super) fn client_detach(&mut self, client: Token, id: SessionId) {
-        let Some(session) = self.client_session(client, id) else {
+        if self.client_session(client, id).is_none() {
+            return;
+        }
+        log!("session {id}: detached by client {client}");
+        // A replay it still waited for answers its `ATTACH` first (and, for
+        // a session whose program had exited, ends it with its `EXIT`).
+        self.send_waiting_replay(id);
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        log!("session {id}: detached by client {client}");
         session.meta.owner.clear();
         session.meta.policy = Policy::Detach;
         self.store_meta(id);
@@ -761,6 +802,11 @@ impl<L: EventLoop> Core<L> {
     /// Sends the session's meta to its holder (`SET_META`), so a later core
     /// that adopts it knows its owner and policy. A holder driven in H1
     /// version 1 can't take it: the change holds only in this core.
+    ///
+    /// The message is only queued here. Until the holder's socket has taken
+    /// it (`Session::storing`), a core killed now would leave the holder
+    /// with the old meta, so the session's replays wait for that: a client
+    /// is told it has a session only once the next core would agree.
     fn store_meta(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get(&id) else {
             return;
@@ -770,8 +816,54 @@ impl<L: EventLoop> Core<L> {
         match self.holders.get(&holder).and_then(|holder| holder.protocol()) {
             Some(protocol) if protocol >= 2 => {
                 self.send_holder(holder, ToHolder::SetMeta(h1::SetMeta { session: id, meta }));
+                let end = self.holder_queue_end(holder);
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.storing = end;
+                }
             }
             _ => log!("session {id}: its holder speaks H1 version 1; its owner and policy last only in this core"),
+        }
+    }
+
+    /// After the holders' flush: sessions whose `SET_META` their holder's
+    /// socket has now taken (or whose holder is gone) stop holding their
+    /// replays back.
+    pub(super) fn send_stored_replays(&mut self) {
+        let stored: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .storing
+                    .is_some_and(|end| self.holder_has(session.holder, end))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in stored {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            session.storing = None;
+            // One that also waits for the rebuild goes out after its tail.
+            if session.rebuilding.is_none()
+                && let (Some(client), Some(pending)) =
+                    (session.attached, session.pending_replay.take())
+            {
+                self.replay(client, id, pending.req, pending.size);
+            }
+        }
+    }
+
+    /// Sends the replay the session's client still waits for without
+    /// waiting for its meta to be stored: the session is ending, or the
+    /// client is letting it go. A rebuild is still waited for.
+    fn send_waiting_replay(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        session.storing = None;
+        if let (Some(client), Some(pending)) = (session.attached, session.pending_replay.take()) {
+            self.replay(client, id, pending.req, pending.size);
         }
     }
 
@@ -779,7 +871,9 @@ impl<L: EventLoop> Core<L> {
     /// replay as `DATA`, `REPLAY_END`; then `size` applies, and its live
     /// output follows. A session whose program exited meanwhile gets its
     /// `EXIT` after the replay. One still being rebuilt from its holder
-    /// gets its replay once the rebuild is done (no output comes before).
+    /// gets its replay once the rebuild is done (no output comes before),
+    /// and one whose meta isn't in its holder's socket yet once it is
+    /// (output read meanwhile is in the replay, not sent before it).
     pub(super) fn replay(
         &mut self,
         client: Token,
@@ -792,7 +886,7 @@ impl<L: EventLoop> Core<L> {
         };
         session.awaiting_owner = false;
         session.attached = Some(client);
-        if session.rebuilding.is_some() {
+        if session.rebuilding.is_some() || session.storing.is_some() {
             session.pending_replay = Some(PendingReplay { req, size });
             return;
         }

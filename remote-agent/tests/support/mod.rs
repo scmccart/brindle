@@ -167,7 +167,12 @@ impl TestCore {
     /// Connects to the directory's only holder.
     pub fn connect_to(dir: &TempDir) -> Self {
         let endpoints = dir.holder_endpoints();
-        assert_eq!(endpoints.len(), 1, "holder endpoints: {endpoints:?}");
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "holder endpoints: {endpoints:?}; logs:\n{}",
+            dir.logs()
+        );
         Self::connect(&endpoints[0])
     }
 
@@ -361,6 +366,19 @@ impl TestCore {
 
     pub fn hang_up(&mut self, session: SessionId) {
         self.send(ToHolder::Hangup(SessionRef { session }));
+    }
+
+    /// Hangs `session` up and waits for its `EXITED`, whatever the status.
+    ///
+    /// For a program blocked reading the terminal, the status isn't the
+    /// holder's to decide. Closing the PTY makes the kernel fail that read
+    /// (EIO) and then send `SIGHUP`. Nearly always the signal kills the
+    /// program (no status), but now and then it gets through "the read
+    /// failed, exit 1" first, as `cat` and `sh`'s `read` do. Either way the
+    /// session ended, which is what a hang-up is for.
+    pub fn hang_up_and_wait(&mut self, session: SessionId) {
+        self.hang_up(session);
+        self.exit_code(session);
     }
 }
 
@@ -713,6 +731,14 @@ impl TestClient {
     /// Waits for `session`'s `EXIT`, skipping output, and returns its code.
     pub fn exit_code(&mut self, session: SessionId) -> Option<i32> {
         self.output_and_exit(session).1
+    }
+
+    /// Waits for the `EXIT` of a session that was hung up (`CLOSE`, `KILL`
+    /// or `STOP`), whatever its status. A program blocked reading the
+    /// terminal, such as `cat`, may exit by itself before the signal kills
+    /// it: see [`TestCore::hang_up_and_wait`].
+    pub fn hung_up(&mut self, session: SessionId) {
+        self.exit_code(session);
     }
 
     /// `session`'s output up to its `EXIT`, and its code. Other messages are

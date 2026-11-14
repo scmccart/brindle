@@ -1,4 +1,4 @@
-//! Asking a pane's program side for the terminal's default colors (OSC
+//! Asking from a program in a terminal for its default colors (OSC
 //! 10/11) or palette colors (OSC 4) and reading the replies back from the
 //! screen.
 
@@ -28,7 +28,7 @@ for i in "$@"; do
 done
 "#;
 
-/// Writes the query script into the case directory; type its path into a pane.
+/// Writes the query script into the case directory; type its path into a tab.
 /// Its reply timeouts (`{T}`, and `{E}` for a second reply) are 1 s and
 /// 0.5 s, stretched by `BRINDLE_E2E_SLOW`.
 pub fn script(ctx: &Ctx) -> Result<PathBuf> {

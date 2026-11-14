@@ -3,7 +3,7 @@
 //! and a process's image and end.
 
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -55,12 +55,7 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         .stderr(Stdio::piped());
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_fd, 3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(move || pass_fd_as(write_fd, 3));
     }
     let child = command.spawn().with_context(|| {
         format!("terminal server didn't start: can't run {}", endpoint.helper.display())
@@ -77,6 +72,30 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         status: output.status.to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// For a forked child, before its exec: makes `fd` the child's fd `target`,
+/// open in the program it runs. `dup2` does that when the numbers differ.
+/// When they already match it does nothing, so `fd` would stay close-on-exec:
+/// the flag is cleared instead.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+fn pass_fd_as(fd: RawFd, target: RawFd) -> io::Result<()> {
+    // SAFETY: syscalls on fd numbers; a bad one is an error, not undefined.
+    let result = unsafe {
+        if fd == target {
+            match libc::fcntl(fd, libc::F_GETFD) {
+                -1 => -1,
+                flags => libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+            }
+        } else {
+            libc::dup2(fd, target)
+        }
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Whether `fd` has data (or EOF) within `limit`.
@@ -120,5 +139,54 @@ impl Listener {
     /// The next client's connection.
     pub fn accept(&self) -> Stream {
         self.0.accept().unwrap().0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+
+    use super::*;
+
+    /// Runs `printf R >&3` with a new pipe's write end passed as fd 3, and
+    /// checks that the byte arrives. The pipe is first put on fd 3 itself
+    /// (`on_target`), close-on-exec as `pipe2` can return it, or kept off
+    /// it. That is done in the forked child, whose fds are its own copy, so
+    /// no other test's fd 3 is touched.
+    fn assert_passed_as_fd_3(on_target: bool) {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let write_fd = write.as_raw_fd();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf R >&3"]).stdin(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                let fd = match (on_target, write_fd == 3) {
+                    (true, false) => libc::dup3(write_fd, 3, libc::O_CLOEXEC),
+                    (false, true) => libc::fcntl(write_fd, libc::F_DUPFD_CLOEXEC, 4),
+                    _ => write_fd,
+                };
+                if fd == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                pass_fd_as(fd, 3)
+            });
+        }
+        let output = command.output().unwrap();
+        drop(write);
+        let mut got = String::new();
+        std::fs::File::from(read).read_to_string(&mut got).unwrap();
+        assert_eq!(got, "R", "on_target {on_target}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn a_pipe_is_passed_as_fd_3_whether_or_not_it_is_there_already() {
+        // `dup2(3, 3)` does nothing, so the child's exec would close it.
+        assert_passed_as_fd_3(true);
+        assert_passed_as_fd_3(false);
     }
 }

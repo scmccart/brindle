@@ -3,14 +3,14 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::TIMEOUT;
 
@@ -72,6 +72,29 @@ pub fn server_processes(dir: &Path, role: &str) -> Vec<u32> {
     pids
 }
 
+/// For a forked child, before its exec: makes `fd` the child's fd `target`,
+/// open in the program it runs. `dup2` does that when the numbers differ.
+/// When they already match it does nothing, so `fd` would stay close-on-exec:
+/// the flag is cleared instead.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+pub fn pass_fd_as(fd: RawFd, target: RawFd) -> io::Result<()> {
+    let result = unsafe {
+        if fd == target {
+            match libc::fcntl(fd, libc::F_GETFD) {
+                -1 => -1,
+                flags => libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+            }
+        } else {
+            libc::dup2(fd, target)
+        }
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Runs `bin <role> --ready-fd 3` for `dir` and waits for its ready byte.
 /// Fails, with the server's stderr, if it exits before being ready.
 pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
@@ -89,12 +112,7 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_fd, 3) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(move || pass_fd_as(write_fd, 3));
     }
     // A freshly written binary can be briefly busy: another test thread's
     // fork may still hold the writer's fd until it execs.
@@ -169,6 +187,52 @@ pub fn children_named(pid: u32, comm: &str) -> Vec<u32> {
         .collect()
 }
 
+/// How often `pid` has been switched off a CPU, `None` once it is gone. The
+/// count stands still while a process stays blocked.
+pub fn context_switches(pid: u32) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let count = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    Some(count("voluntary_ctxt_switches:")? + count("nonvoluntary_ctxt_switches:")?)
+}
+
+/// How long [`stays_blocked`] watches a writer do nothing.
+const BLOCKED_FOR: Duration = Duration::from_millis(250);
+
+/// Waits until `writer` is blocked for good on output that `reader` no
+/// longer takes. Returns `false` if `writer` ends instead, or isn't blocked
+/// within [`TIMEOUT`].
+///
+/// A writer faster than its reader sleeps too, but only until the reader
+/// takes some more. So it counts as blocked once, for [`BLOCKED_FOR`], it
+/// never ran and both were asleep at every look: nobody was about to move
+/// the output on. How long the output took to get that far doesn't matter,
+/// as it would with a fixed sleep.
+pub fn stays_blocked(writer: u32, reader: u32) -> bool {
+    let asleep = |pid| state(pid) == Some('S');
+    let deadline = Instant::now() + TIMEOUT;
+    // Since when it has been quiet, and the writer's switch count then.
+    let mut quiet: Option<(Instant, u64)> = None;
+    while alive(writer) && Instant::now() < deadline {
+        let switches = context_switches(writer).filter(|_| asleep(writer) && asleep(reader));
+        quiet = match (switches, quiet) {
+            (Some(now), Some((since, before))) if now == before => {
+                if since.elapsed() >= BLOCKED_FOR {
+                    return true;
+                }
+                quiet
+            }
+            (Some(now), _) => Some((Instant::now(), now)),
+            (None, _) => None,
+        };
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 /// Hands `stream` to a `sleep` process (as its fd 3), so killing that
 /// process closes the connection as a client dying does. The caller drops
 /// its own side.
@@ -177,17 +241,7 @@ pub fn hand_to_process(stream: &Stream) -> Child {
     let mut command = Command::new("sleep");
     command.arg("1000").stdin(Stdio::null());
     unsafe {
-        command.pre_exec(move || {
-            let result = if fd == 3 {
-                libc::fcntl(fd, libc::F_SETFD, 0)
-            } else {
-                libc::dup2(fd, 3)
-            };
-            if result == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(move || pass_fd_as(fd, 3));
     }
     command.spawn().unwrap()
 }

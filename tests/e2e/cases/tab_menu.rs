@@ -1,10 +1,9 @@
 //! A tab's menu, opened with the hidden `open_tab_menu` action and driven
 //! with `--key` (a right-click on a tab can't be posted on Linux, so that
 //! stays a manual check): its items and their ends, Move Tab Left, Rename
-//! Tab's prompt, escape, a bound key, the one-overlay rule with the profile
-//! menu, and a tmux tab's Rename Window and Close Tab.
+//! Tab's prompt, Close Tab, escape, a bound key, and the one-overlay rule
+//! with the profile menu.
 
-use super::server;
 use crate::brindle::{Output, Run};
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -14,10 +13,9 @@ fn step_time(step: usize) -> f64 {
     0.5 + step as f64
 }
 
-/// A run starting in a bash tab titled `first` whose `new_tab` opens
-/// another bash tab (the test config's default profile is `tmux`).
+/// A run starting in a bash tab titled `first`.
 fn shell(run: Run) -> Run {
-    run.profile("Shell").default_profile("Shell").send("printf '\\033]2;first\\007'\r")
+    run.send("printf '\\033]2;first\\007'\r")
 }
 
 /// Three bash tabs titled first, second and third, the third active.
@@ -57,8 +55,7 @@ fn titles(out: &Output) -> Vec<(&str, bool)> {
 /// disabled, and a lone tab's both. Escape closes it and gives focus back
 /// to the terminal, and a key the config binds to `open_tab_menu` opens it.
 pub fn items(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = three_tabs(Run::new(ctx, &server, "last")).action("open_tab_menu").dump_at(step_time(THREE_TABS + 1) + 1.0).run()?;
+    let out = three_tabs(Run::new(ctx, "last")).action("open_tab_menu").dump_at(step_time(THREE_TABS + 1) + 1.0).run()?;
     expect_items(&out, "Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab", "the last tab")?;
     let rows = &out.dump.menu[1..];
     ensure!(
@@ -68,17 +65,17 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
     ensure!(titles(&out) == [("first", false), ("second", false), ("third", true)], "tabs {:?}", out.dump.tabs);
     expect_focus(&out, "menu", "after open_tab_menu")?;
 
-    let out = three_tabs(Run::new(ctx, &server, "first"))
+    let out = three_tabs(Run::new(ctx, "first"))
         .action("activate_tab_1")
         .action("open_tab_menu")
         .dump_at(step_time(THREE_TABS + 2) + 1.0)
         .run()?;
     expect_items(&out, "Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab", "the first tab")?;
 
-    let out = shell(Run::new(ctx, &server, "lone")).action("open_tab_menu").dump_at(step_time(2) + 1.0).run()?;
+    let out = shell(Run::new(ctx, "lone")).action("open_tab_menu").dump_at(step_time(2) + 1.0).run()?;
     expect_items(&out, "Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab", "a lone tab")?;
 
-    let out = shell(Run::new(ctx, &server, "escape"))
+    let out = shell(Run::new(ctx, "escape"))
         .action("open_tab_menu")
         .key("down")
         .key("escape")
@@ -88,7 +85,7 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.palette.is_empty(), "a palette is open after escape: {:?}", out.dump.palette);
     expect_focus(&out, "terminal", "after escape")?;
 
-    let out = shell(Run::new(ctx, &server, "bound-key"))
+    let out = shell(Run::new(ctx, "bound-key"))
         .config("\n[keybindings]\n\"ctrl-shift-m\" = \"open_tab_menu\"\n")
         .key("ctrl-shift-m")
         .dump_at(step_time(2) + 1.0)
@@ -102,8 +99,7 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
 /// of three tabs makes it the first, and it stays active with focus in its
 /// terminal. Rename Tab (down, enter) opens the rename prompt.
 pub fn choose(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = three_tabs(Run::new(ctx, &server, "move-left"))
+    let out = three_tabs(Run::new(ctx, "move-left"))
         .action("activate_tab_2")
         .action("open_tab_menu")
         .key("down")
@@ -115,7 +111,7 @@ pub fn choose(ctx: &Ctx) -> Result<Outcome> {
     ensure!(titles(&out) == [("second", true), ("first", false), ("third", false)], "tabs {:?}", out.dump.tabs);
     expect_focus(&out, "terminal", "after Move Tab Left")?;
 
-    let out = shell(Run::new(ctx, &server, "rename"))
+    let out = shell(Run::new(ctx, "rename"))
         .action("open_tab_menu")
         .key("down")
         .key("enter")
@@ -125,22 +121,32 @@ pub fn choose(ctx: &Ctx) -> Result<Outcome> {
     let header = out.dump.palette.first().map(String::as_str).unwrap_or("");
     ensure!(header.starts_with("prompt \"Rename tab\" text=\"first\""), "palette after Rename Tab: {:?}", out.dump.palette);
     expect_focus(&out, "palette", "after Rename Tab")?;
+
+    // Close Tab (end, enter) on the last of three tabs closes it, and the
+    // tab before it becomes active.
+    let out = three_tabs(Run::new(ctx, "close"))
+        .action("open_tab_menu")
+        .key("end")
+        .key("enter")
+        .dump_at(step_time(THREE_TABS + 3) + 1.5)
+        .run()?;
+    expect_closed(&out, "after Close Tab")?;
+    ensure!(titles(&out) == [("first", false), ("second", true)], "tabs after Close Tab: {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }
 
 /// The tab menu and the profile menu are never open together: either one
 /// opened over the other replaces it.
 pub fn exclusive(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = shell(Run::new(ctx, &server, "tab-then-profile"))
+    let out = shell(Run::new(ctx, "tab-then-profile"))
         .action("open_tab_menu")
         .action("open_profile_menu")
         .dump_at(step_time(3) + 1.0)
         .run()?;
-    ensure!(out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell|tmux ")), "menu {:?}", out.dump.menu);
+    ensure!(out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell ")), "menu {:?}", out.dump.menu);
     expect_focus(&out, "menu", "tab menu, then the profile menu")?;
 
-    let out = shell(Run::new(ctx, &server, "profile-then-tab"))
+    let out = shell(Run::new(ctx, "profile-then-tab"))
         .action("open_profile_menu")
         .action("open_tab_menu")
         .dump_at(step_time(3) + 1.0)
@@ -148,7 +154,7 @@ pub fn exclusive(ctx: &Ctx) -> Result<Outcome> {
     expect_items(&out, "Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab", "profile menu, then the tab menu")?;
     expect_focus(&out, "menu", "profile menu, then the tab menu")?;
 
-    let out = shell(Run::new(ctx, &server, "palette-then-tab"))
+    let out = shell(Run::new(ctx, "palette-then-tab"))
         .action("open_command_palette")
         .action("open_tab_menu")
         .key("escape")
@@ -157,41 +163,5 @@ pub fn exclusive(ctx: &Ctx) -> Result<Outcome> {
     expect_closed(&out, "command palette, tab menu, escape")?;
     ensure!(out.dump.palette.is_empty(), "palette still open: {:?}", out.dump.palette);
     expect_focus(&out, "terminal", "command palette, tab menu, escape")?;
-    Ok(Outcome::Pass)
-}
-
-/// A tmux window's tab: the menu offers Rename Window in place of Rename
-/// Tab, which opens the tmux rename prompt, and Close Tab (end, enter)
-/// closes that tmux window.
-pub fn tmux(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let out = Run::new(ctx, &server, "items").send("").action("open_tab_menu").dump_at(step_time(2) + 1.0).run()?;
-    ensure!(out.dump.tabs.len() == 1, "tabs {:?}", out.dump.tabs);
-    expect_items(&out, "Rename Window|[Move Tab Left]|[Move Tab Right]|-|Close Tab", "a tmux tab")?;
-    expect_focus(&out, "menu", "a tmux tab's menu")?;
-
-    let out = Run::new(ctx, &server, "rename")
-        .send("")
-        .action("open_tab_menu")
-        .key("down")
-        .key("enter")
-        .dump_at(step_time(4) + 1.0)
-        .run()?;
-    expect_closed(&out, "after Rename Window")?;
-    let header = out.dump.palette.first().map(String::as_str).unwrap_or("");
-    ensure!(header.starts_with("prompt \"Rename tmux window\""), "palette after Rename Window: {:?}", out.dump.palette);
-
-    let windows = || -> Result<usize> { Ok(server.run(&["list-windows", "-t", "e2e"])?.lines().count()) };
-    let out = Run::new(ctx, &server, "close")
-        .action("tmux_new_window")
-        .send("")
-        .action("open_tab_menu")
-        .key("end")
-        .key("enter")
-        .dump_at(step_time(5) + 2.0)
-        .run()?;
-    ensure!(windows()? == 1, "tmux windows after Close Tab: {:?}", server.run(&["list-windows", "-t", "e2e"])?);
-    ensure!(out.dump.tabs.len() == 1, "tabs after Close Tab: {:?}", out.dump.tabs);
-    expect_closed(&out, "after Close Tab")?;
     Ok(Outcome::Pass)
 }

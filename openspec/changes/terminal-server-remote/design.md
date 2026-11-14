@@ -16,4 +16,4 @@
 - **Version skew:** the helper is cached by Brindle's version and digest, so an older Brindle meets a newer remote core, or the reverse. Phase 1's rules apply: the core speaks every older protocol, and the client offers an upgrade. Confirm that the deploy cache and the upgrade's `check` work together on remote hosts.
 - **The upgrade decision on a remote host** compares the core binary's mtime through `/proc/<pid>/exe` locally. Remotely it has to go through the relay, or through `WELCOME` fields.
 - **Eager connect** has to stay off the UI thread and must not slow startup. Unreachable hosts back off.
-- **Remote tmux control mode** (`tmux -C` over pipes) stays as it is, outside the server.
+- **Remote tmux control mode** (`tmux -C` over pipes) was removed by `drop-tmux`, so it no longer sits outside the server.

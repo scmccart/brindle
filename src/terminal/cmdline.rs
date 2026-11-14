@@ -16,17 +16,6 @@ pub fn windows_editor_command(visual: Option<&str>, editor: Option<&str>, path: 
     ("cmd.exe".into(), vec!["/D".into(), "/S".into(), "/C".into(), tail])
 }
 
-/// A Windows program's name without its directory or extension:
-/// `C:\Windows\System32\CMD.EXE` is `CMD`. Both `\` and `/` separate
-/// directories, on any platform.
-pub fn program_stem(program: &str) -> &str {
-    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
-    match name.rfind('.') {
-        Some(dot) if dot > 0 => &name[..dot],
-        _ => name,
-    }
-}
-
 /// Whether a Windows title is the console's rather than the program's: the
 /// console host starts every program with the program's full path as its
 /// title, and cmd, while it runs a command, appends ` - <command>` to the
@@ -100,14 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn program_stems() {
-        assert_eq!(program_stem(r"C:\Windows\System32\CMD.EXE"), "CMD");
-        assert_eq!(program_stem("C:/tools/wsl.exe"), "wsl");
-        assert_eq!(program_stem("wsl"), "wsl");
-        assert_eq!(program_stem(".hidden"), ".hidden");
-    }
-
-    #[test]
     fn console_default_titles() {
         // The console host's default, the program's path, and cmd's title
         // while it runs a command, built on whatever title it started with.
@@ -134,10 +115,21 @@ mod tests {
         }
     }
 
-    fn bin_dirs(name: &str, exes: &[&[&str]]) -> Vec<std::path::PathBuf> {
+    /// Removes a test's directory tree when dropped, so a failing assertion still cleans up.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn bin_dirs(name: &str, exes: &[&[&str]]) -> (Vec<std::path::PathBuf>, RemoveOnDrop) {
         let root = std::env::temp_dir().join(format!("brindle-default-{}-{name}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
-        exes.iter()
+        let guard = RemoveOnDrop(root.clone());
+        let dirs = exes
+            .iter()
             .enumerate()
             .map(|(i, files)| {
                 let dir = root.join(i.to_string());
@@ -147,17 +139,18 @@ mod tests {
                 }
                 dir
             })
-            .collect()
+            .collect();
+        (dirs, guard)
     }
 
     #[test]
     fn default_program_prefers_pwsh_then_powershell() {
-        let dirs = bin_dirs("both", &[&["powershell.exe"], &["pwsh.exe"]]);
+        let (dirs, _both) = bin_dirs("both",&[&["powershell.exe"], &["pwsh.exe"]]);
         let (program, args) = windows_default_program(dirs.clone(), Some("C:\\Windows\\system32\\cmd.exe"));
         assert_eq!(program, dirs[1].join("pwsh.exe").display().to_string());
         assert_eq!(args, ["-NoLogo"]);
 
-        let dirs = bin_dirs("ps51", &[&["notepad.exe"], &["powershell.exe"]]);
+        let (dirs, _ps51) = bin_dirs("ps51",&[&["notepad.exe"], &["powershell.exe"]]);
         let (program, args) = windows_default_program(dirs.clone(), None);
         assert_eq!(program, dirs[1].join("powershell.exe").display().to_string());
         assert_eq!(args, ["-NoLogo"]);
@@ -165,12 +158,12 @@ mod tests {
 
     #[test]
     fn default_program_falls_back_to_comspec_then_cmd() {
-        let dirs = bin_dirs("none", &[&["notepad.exe"]]);
+        let (dirs, _none) = bin_dirs("none",&[&["notepad.exe"]]);
         assert_eq!(windows_default_program(dirs.clone(), Some("C:\\tcc\\tcc.exe")), ("C:\\tcc\\tcc.exe".to_string(), vec![]));
         assert_eq!(windows_default_program(dirs.clone(), Some(" ")), ("cmd.exe".to_string(), vec![]));
         assert_eq!(windows_default_program(dirs, None), ("cmd.exe".to_string(), vec![]));
         // A directory named like the program doesn't count.
-        let dirs = bin_dirs("dir-named", &[&[]]);
+        let (dirs, _dir_named) = bin_dirs("dir-named",&[&[]]);
         std::fs::create_dir_all(dirs[0].join("pwsh.exe")).unwrap();
         assert_eq!(windows_default_program(dirs, None).0, "cmd.exe");
     }

@@ -1,7 +1,7 @@
 //! Windows cases: local tabs in the case's own terminal server, on its
-//! holder's pseudoconsoles. They run PowerShell or cmd instead of a tmux
-//! server, and check the screen dump, Brindle's and the holder's logs, the
-//! notification log and the console host process.
+//! holder's pseudoconsoles. They run PowerShell or cmd, and check the
+//! screen dump, Brindle's and the holder's logs, the notification log and
+//! the console host process.
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
@@ -23,7 +23,6 @@ pub fn all() -> Vec<Case> {
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
-        display("windows-wsl-tmux", wsl_tmux),
         display("windows-zones", zones),
         display("local-server-session", local_server::session),
         display("local-server-close", local_server::close),
@@ -56,53 +55,16 @@ pub fn all() -> Vec<Case> {
     ]
 }
 
-/// A control-mode profile through WSL attaches a throwaway tmux server
-/// inside it, with each tmux window a tab. Skipped without tmux in WSL.
-fn wsl_tmux(ctx: &Ctx) -> Result<Outcome> {
-    let wsl = |args: &[&str]| Command::new("wsl").args(args).stdin(Stdio::null()).output();
-    match wsl(&["--exec", "tmux", "-V"]) {
-        Ok(out) if out.status.success() => {}
-        _ => return Ok(Outcome::Skip("no tmux in WSL (`wsl --exec tmux -V` failed)".into())),
-    }
-    let socket = format!("brindle-e2e-{}", std::process::id());
-    let tmux = |args: &[&str]| {
-        let mut all = vec!["--exec", "tmux", "-L", socket.as_str(), "-f", "/dev/null"];
-        all.extend_from_slice(args);
-        wsl(&all)
-    };
-    tmux(&["new-session", "-d", "-s", "main", "-n", "first"]).map_err(|e| e.to_string())?;
-    tmux(&["new-window", "-d", "-t", "main", "-n", "second"]).map_err(|e| e.to_string())?;
-    let config = format!(
-        "default_profile = \"wsl\"\n\n[[profiles]]\nname = \"wsl\"\ntmux = \"control\"\ncommand = \"wsl\"\n\
-         tmux_args = [\"tmux\", \"-L\", \"{socket}\", \"-f\", \"/dev/null\"]\n"
-    );
-    let ran = run_with(
-        ctx,
-        &config,
-        "attach",
-        &["-p", "wsl", "--action", "rename_tab", "--send", "  review  ", "--action", "picker_confirm"],
-        &[],
-        8.0,
-        None,
-    );
-    let windows = tmux(&["list-windows", "-t", "main", "-F", "#{window_name}"]);
-    tmux(&["kill-server"]).ok();
-    let ran = ran?;
-    let titles: Vec<&str> = ran.dump.tabs.iter().map(|(t, _)| t.as_str()).collect();
-    ensure!(titles == ["review", "second"], "tabs: {titles:?}; see attach.log");
-    let windows = String::from_utf8_lossy(&windows.map_err(|e| e.to_string())?.stdout).into_owned();
-    ensure!(windows.lines().collect::<Vec<_>>() == ["first", "second"], "tmux windows: {windows:?}");
-    Ok(Outcome::Pass)
-}
-
 /// What Windows' hit test (`WM_NCHITTEST`) reports at points of the tab
 /// strip, given in logical pixels from the client area's top-left (negative
 /// x from its right) and the window's `scale`, then what Windows does with a
 /// double-click on the `strip` point and a press on the `max` point. GPUI
 /// answers for the last mouse position, so each point is first sent to the
 /// window as a `WM_MOUSEMOVE`. These are messages to Brindle's own window,
-/// not input, so the cursor and other windows are untouched.
-fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
+/// not input, so the cursor and other windows are untouched. Until the hit
+/// tests read `hits` (the window may not be laid out yet), it stops before
+/// the double-click and press, so a probe that is polled changes nothing.
+fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str) -> String {
     use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -166,6 +128,9 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
             format!("{name}={}", send(WM_NCHITTEST, 0, screen).0)
         })
         .collect();
+    if out.join(" ") != hits {
+        return out.join(" ");
+    }
     // The caption buttons act through ShowWindowAsync, so wait a little.
     let zoomed = |want: bool| {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -196,29 +161,34 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)]) -> String {
 /// (maximizing) and a press on maximize (restoring), which it does only when
 /// Brindle leaves the press unhandled.
 fn caption(ctx: &Ctx) -> Result<Outcome> {
-    // Logical pixels: the strip is 37 high (the 36px pill tab list and a
-    // 1px border); the caption buttons are 32 wide (the `IconSm` button
-    // size), 4 apart, 8 from the right edge, and centered in the list's
-    // 36px, so empty space ends 112 from the right. Tabs are 3 below the
-    // top, 30 high, 11 in (the strip's and the pill's padding), at least 80
-    // wide (a `cmd` tab is exactly that), with the pill's 3px after the
-    // last; the new-tab button is 4 past the pill, 32 wide.
+    // Logical pixels: the strip is 42 high (6px of padding above the 36px
+    // tab list, no border under it); the caption buttons are 32 wide
+    // (the `IconSm` button size), 4 apart, 8 from the right edge, and
+    // centered in the list's 36px (24 down), so empty space ends 112 from
+    // the right. Tabs are 9 below the top, 30 high, 6 in (the strip's
+    // padding; the list has none at its left and no pill), at least 80 wide
+    // (a `cmd` tab is exactly that), with the list's 3px after the last; the
+    // new-tab button is 4 past the list, 32 wide.
+    let middle = 6.0 + 18.0;
     let points = [
-        ("close", -(8.0 + 16.0), 18.0),
-        ("max", -(8.0 + 32.0 + 4.0 + 16.0), 18.0),
-        ("min", -(8.0 + 2.0 * (32.0 + 4.0) + 16.0), 18.0),
-        ("strip", -(8.0 + 3.0 * 32.0 + 2.0 * 4.0 + 60.0), 18.0),
-        ("tab", 48.0, 18.0),
+        ("close", -(8.0 + 16.0), middle),
+        ("max", -(8.0 + 32.0 + 4.0 + 16.0), middle),
+        ("min", -(8.0 + 2.0 * (32.0 + 4.0) + 16.0), middle),
+        ("strip", -(8.0 + 3.0 * 32.0 + 2.0 * 4.0 + 60.0), middle),
+        ("tab", 48.0, middle),
         // The new-tab button: client area, a press on it is Brindle's.
-        ("new-tab", 8.0 + 3.0 + 80.0 + 3.0 + 4.0 + 16.0, 18.0),
+        ("new-tab", 6.0 + 80.0 + 3.0 + 4.0 + 16.0, middle),
     ];
     // The scale comes from a first run's dump.
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
-    let probe = move |pid| caption_probe(pid, scale, &points);
-    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some((2.5, &probe)))?;
     // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT, HTCLIENT.
-    let expected = "close=20 max=9 min=8 strip=2 tab=1 new-tab=1 double-click=maximized maximize=windowed";
+    let hits = "close=20 max=9 min=8 strip=2 tab=1 new-tab=1";
+    let expected = format!("{hits} double-click=maximized maximize=windowed");
+    let probe = move |pid| caption_probe(pid, scale, &points, hits);
+    // Done once it has clicked: that happens once only.
+    let clicked = |seen: &str| seen.contains("double-click=");
+    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
     ensure!(ran.during == expected, "caption at scale {scale}: {} (want {expected})", ran.during);
     Ok(Outcome::Pass)
 }
@@ -252,17 +222,28 @@ background = "#101418"
 struct Ran {
     dump: Dump,
     log: String,
-    /// What `during` returned.
+    /// What the `during` probe returned last.
     during: String,
 }
 
-/// Runs Brindle with `args` (and `--dump-screen-after dump_at`), calling
-/// `during` with its pid after `during_at` seconds.
+/// Runs Brindle with `args` (and `--dump-screen-after dump_at`), polling
+/// `during` with its pid while it runs.
 fn run(ctx: &Ctx, label: &str, args: &[&str], env: &[(&str, &str)], dump_at: f64, during: During) -> Result<Ran> {
     run_with(ctx, CONFIG, label, args, env, dump_at, during)
 }
 
-type During<'a> = Option<(f64, &'a dyn Fn(u32) -> String)>;
+/// A probe of a running Brindle, called with its pid every 100 ms from its
+/// start until `done` accepts what it returned or Brindle exits (after its
+/// dump), within the run's deadline. The harness's clock starts at the spawn
+/// and Brindle's at its `main`, which a cold first start of the binary can
+/// put seconds apart, so neither a probe at a fixed time nor one that stops
+/// at the dump time by the harness's clock can rely on Brindle being up.
+struct Probe<'a> {
+    run: &'a dyn Fn(u32) -> String,
+    done: &'a dyn Fn(&str) -> bool,
+}
+
+type During<'a> = Option<Probe<'a>>;
 
 /// [`run`] with another config. The sessions the run leaves detached are
 /// hung up, so the case's next run starts with only the tabs it asks for.
@@ -312,13 +293,17 @@ fn run_keeping(
         .spawn()
         .map_err(|e| format!("starting {}: {e}", ctx.bin.display()))?;
     let started = Instant::now();
-    let mut seen = String::new();
-    if let Some((at, during)) = during {
-        let due = started + Duration::from_secs_f64(ctx.secs(at));
-        std::thread::sleep(due.saturating_duration_since(Instant::now()));
-        seen = during(child.id());
-    }
     let deadline = started + Duration::from_secs_f64(ctx.secs(dump_at) + 30.0);
+    let mut seen = String::new();
+    if let Some(probe) = during {
+        loop {
+            seen = (probe.run)(child.id());
+            if (probe.done)(&seen) || Instant::now() >= deadline || child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     while child.try_wait().map_err(|e| e.to_string())?.is_none() {
         if Instant::now() > deadline {
             child.kill().ok();
@@ -367,6 +352,11 @@ fn on_path(exe: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
 }
 
+/// How many of a `host_children` list are named `name`.
+fn count(list: &str, name: &str) -> usize {
+    list.split(',').filter(|n| *n == name).count()
+}
+
 fn screen(dump: &Dump) -> String {
     dump.screen.join("\n")
 }
@@ -383,12 +373,18 @@ fn script(ctx: &Ctx, name: &str, body: &str) -> Result<String> {
 /// holder that owns the session, never by Brindle.
 fn conpty_host(ctx: &Ctx) -> Result<Outcome> {
     let hosts = |brindle: u32| format!("{};{}", holder_children(ctx), brindle_hosts(brindle));
-    let ran = run(ctx, "host", &["-p", "cmd", "--send", "echo hello-host\r"], &[], 4.0, Some((2.5, &hosts)))?;
+    // Done once the holder has started the tab's console host and program.
+    let started = |seen: &str| {
+        let holder = seen.split_once(';').map_or("", |(holder, _)| holder);
+        count(holder, "OpenConsole.exe") > 0 && count(holder, "cmd.exe") > 0
+    };
+    let probe = Probe { run: &hosts, done: &started };
+    let ran = run(ctx, "host", &["-p", "cmd", "--send", "echo hello-host\r"], &[], 4.0, Some(probe))?;
     let logs = holder_logs(ctx);
     let (holder, brindle) = ran.during.split_once(';').unwrap_or_default();
-    ensure!(holder.split(',').any(|n| n == "OpenConsole.exe"), "under the holder: {holder}");
-    ensure!(!holder.split(',').any(|n| n == "conhost.exe"), "a conhost under the holder: {holder}");
-    ensure!(holder.split(',').any(|n| n == "cmd.exe"), "the tab's program isn't the holder's: {holder}");
+    ensure!(count(holder, "OpenConsole.exe") > 0, "under the holder: {holder}");
+    ensure!(count(holder, "conhost.exe") == 0, "a conhost under the holder: {holder}");
+    ensure!(count(holder, "cmd.exe") > 0, "the tab's program isn't the holder's: {holder}");
     ensure!(brindle.is_empty(), "console hosts under Brindle: {brindle}");
     ensure!(logs.contains("conpty: sessions use ConPTY "), "no packaged-ConPTY line in holders.log");
     ensure!(screen(&ran.dump).contains("hello-host"), "screen:\n{}", screen(&ran.dump));
@@ -405,21 +401,20 @@ fn brindle_hosts(pid: u32) -> String {
 /// each session's environment: both tabs get the `conhost.exe` built into
 /// Windows, and the holder says so once.
 fn conpty_fallback(ctx: &Ctx) -> Result<Outcome> {
-    let hosts = |_| holder_children(ctx);
+    let hosts = |_: u32| holder_children(ctx);
     let ran = run(
         ctx,
         "fallback",
         &["-p", "cmd", "--send", "echo hello-inbox\r", "--action", "new_tab"],
         &[("BRINDLE_CONPTY", "inbox")],
-        // The steps count from when the window is up, the probe from when
-        // Brindle starts, so it leaves the second tab's session time.
         6.5,
-        Some((5.0, &hosts)),
+        // One host per tab: done once the second tab's is there.
+        Some(Probe { run: &hosts, done: &|seen| count(seen, "conhost.exe") >= 2 }),
     )?;
     let logs = holder_logs(ctx);
-    let conhosts = ran.during.split(',').filter(|n| *n == "conhost.exe").count();
+    let conhosts = count(&ran.during, "conhost.exe");
     ensure!(conhosts == 2, "{conhosts} conhosts under the holder for two tabs: {}", ran.during);
-    ensure!(!ran.during.split(',').any(|n| n == "OpenConsole.exe"), "OpenConsole under the holder: {}", ran.during);
+    ensure!(count(&ran.during, "OpenConsole.exe") == 0, "OpenConsole under the holder: {}", ran.during);
     let lines = logs.matches("BRINDLE_CONPTY=inbox").count();
     ensure!(lines == 1, "{lines} inbox lines for two tabs; see holders.log");
     ensure!(!logs.contains("conpty: sessions use ConPTY "), "the packaged ConPTY was loaded; see holders.log");
@@ -551,6 +546,9 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
         );
         let label = shell.trim_end_matches(".exe");
+        if shell == "powershell.exe" {
+            powershell_warmup(ctx, &bin);
+        }
         // Marks: OSC 133 A puts the jump at the first prompt, C and D (or
         // the next A) bound the output that gets selected, and the exit
         // code of the command before is still there for the next line.
@@ -638,6 +636,42 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         std::fs::remove_dir_all(ctx.dir.join("state")).ok();
     }
     Ok(Outcome::Pass)
+}
+
+/// Starts Windows PowerShell 5.1 once, headless, doing what the case's tabs
+/// do before their first prompt, and writes how long it took to
+/// `powershell-warmup.txt`. On CI the case's tab is the job's first 5.1
+/// start, and twice it printed nothing for the whole dump time: the warm-up
+/// takes that cold start out of the GUI run, and its time shows whether the
+/// runner was cold. A failed or slow warm-up is recorded, not a failure.
+fn powershell_warmup(ctx: &Ctx, bin: &str) {
+    const LIMIT: Duration = Duration::from_secs(120);
+    let command = format!(
+        "Get-Command PSConsoleHostReadLine -ErrorAction Ignore | Out-Null; \
+         & '{bin}' --shell-integration pwsh | Out-String | Out-Null"
+    );
+    let started = Instant::now();
+    let outcome = match Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Err(e) => format!("not started: {e}"),
+        Ok(mut child) => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break format!("exited with {status}"),
+                Ok(None) if started.elapsed() > LIMIT => {
+                    child.kill().ok();
+                    break format!("killed after {} s", LIMIT.as_secs());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => break format!("wait failed: {e}"),
+            }
+        },
+    };
+    ctx.save("powershell-warmup.txt", &format!("{:.1} s, {outcome}\n", started.elapsed().as_secs_f64()));
 }
 
 fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {

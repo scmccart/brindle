@@ -51,21 +51,21 @@ The user SHALL be able to:
 - **THEN** the tab order changes and the same tab stays active
 
 ### Requirement: Tab titles
-A tab's title SHALL be the manual title the user set for that tab, when one is set. Otherwise a local tab's title SHALL follow its active zone's terminal:
+A tab's title SHALL be the manual title the user set for that tab, when one is set. Otherwise a tab's title SHALL follow its active zone's terminal:
 1. the title the program set (OSC 0/2), when there is one. On Windows the console host starts every program with the program's full path as its title, and cmd builds its title while running a command from that path plus ` - <command>`. A title that is such a path, alone or followed by ` - `, counts as no title;
 2. otherwise the name of the terminal's foreground process. Windows has no foreground process group, so there this is the most recently started descendant of the terminal's program, or the program itself when it has none, without the `.exe` suffix;
 3. otherwise the profile name.
 
-Changing the focused zone in a local tab SHALL update the tab's automatic title immediately. The window title SHALL match the active tab's title.
+Changing the focused zone in a tab SHALL update the tab's automatic title immediately. The window title SHALL match the active tab's title.
 
-A manual title SHALL stay in effect until the user changes or clears it. Program title changes, foreground process changes, zone focus changes, profile name changes, and tmux window name changes SHALL NOT replace a manual title.
+A manual title SHALL stay in effect until the user changes or clears it. Program title changes, foreground process changes, zone focus changes and profile name changes SHALL NOT replace a manual title.
 
 #### Scenario: Foreground process
 - **WHEN** the user starts `htop` in a tab whose program sets no title
 - **THEN** within about a second the tab is titled `htop`
 
 #### Scenario: Switching zones updates the tab title
-- **WHEN** a local tab has no manual title, one zone's program has set the title `server` and the other zone's program has set the title `logs`, and the user moves focus from `server` to `logs`
+- **WHEN** a tab has no manual title, one zone's program has set the title `server` and the other zone's program has set the title `logs`, and the user moves focus from `server` to `logs`
 - **THEN** the tab and window title change to `logs`
 
 #### Scenario: Console's default title on Windows
@@ -88,25 +88,6 @@ A manual title SHALL stay in effect until the user changes or clears it. Program
 - **WHEN** the user clears a manual title from a tab whose active zone's foreground process is `bash`
 - **THEN** the tab is titled `bash` by the automatic title rules
 
-### Requirement: Manual tab title command
-The user SHALL be able to set a manual title for the active tab with a `Rename Tab` command. The command SHALL prompt for one line of text, pre-filled with the tab's current displayed title and selected for replacement.
-
-Brindle SHALL trim the submitted text before applying it. A non-empty trimmed value SHALL become the tab's manual title. An empty trimmed value SHALL clear the tab's manual title and restore automatic title updates.
-
-The command SHALL be Brindle-local for tmux control-mode tabs and SHALL NOT rename the tmux window. Users who want a tmux-owned durable window name SHALL use `tmux: Rename Window`.
-
-#### Scenario: Rename active tab
-- **WHEN** the active tab is titled `bash`, the user runs `Rename Tab`, enters `  server  `, and submits it
-- **THEN** the active tab is titled `server`
-
-#### Scenario: Whitespace clears manual title
-- **WHEN** a tab has the manual title `server`, the user runs `Rename Tab`, enters only whitespace, and submits it
-- **THEN** the manual title is cleared and the tab follows the automatic title rules
-
-#### Scenario: Rename tmux tab locally
-- **WHEN** the active tab shows tmux window `editor`, the user runs `Rename Tab`, enters `review`, and submits it
-- **THEN** Brindle shows that tab as `review` and the tmux window remains named `editor`
-
 ### Requirement: Working directory inheritance
 A new tab whose profile sets no working directory SHALL start in the working directory of the active tab's active terminal's foreground process. On Windows, where another process's working directory can't be read, it SHALL start in the directory the active tab's active terminal last reported, as defined under "Working directory reports" in `shell-integration`, if that directory exists. Otherwise it SHALL start in the home directory.
 
@@ -125,21 +106,6 @@ A new tab whose profile sets no working directory SHALL start in the working dir
 #### Scenario: Nothing reported on Windows
 - **WHEN** the active tab runs `cmd.exe`, which reports no directory, and the user opens a new tab with a profile that sets no directory
 - **THEN** the new shell starts in the user's home directory
-
-### Requirement: Bell indicator
-A bell from a tab that is not active, or from any tab while the window is inactive, SHALL mark that tab until the user activates it. This SHALL include bells from any zone of a local tab and from any pane of a tmux control-mode tab, including tabs for tmux windows that are not current.
-
-#### Scenario: Background bell
-- **WHEN** a background tab rings the bell
-- **THEN** a dot appears on that tab and disappears when the tab is activated
-
-#### Scenario: Bell in a background local zone
-- **WHEN** an unfocused zone in a background local tab rings the bell
-- **THEN** a dot appears on that tab and disappears when the tab is activated
-
-#### Scenario: Bell in a background tmux window
-- **WHEN** a pane in a tmux window whose tab is not active rings the bell
-- **THEN** a dot appears on that window's tab and disappears when the tab is activated
 
 ### Requirement: Title bar behaviour
 When the window draws its own decorations, as it always does on Windows:
@@ -175,21 +141,6 @@ On Windows these areas SHALL behave like a native caption. This includes Snap wh
 - **WHEN** the window draws its own decorations and the user right-clicks empty space in the strip
 - **THEN** the window menu opens
 
-### Requirement: Program status indicator
-A tab SHALL show a status dot while any zone of its local tab, or any pane of its tmux control-mode window, holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit beside the bell dot when both apply.
-
-#### Scenario: Blocked in a background tab
-- **WHEN** a program in a background tab reports `state=blocked:kind=permission`
-- **THEN** that tab shows a yellow dot
-
-#### Scenario: Zones in a local tab
-- **WHEN** a program in one zone of a local tab reports `state=error`, and another zone in the same tab reports `state=working`
-- **THEN** that tab shows a red dot
-
-#### Scenario: Pane in a tmux window
-- **WHEN** a program in one pane of a tmux window reports `state=error`, and another pane reports `state=working`
-- **THEN** that window's tab shows a red dot
-
 ### Requirement: Status indicator lifetime
 The status dot SHALL stay until the terminal's records change (a report, a clear, a new prompt, the process exiting, or the user typing into the terminal), whether or not the tab is active. Activating the tab SHALL NOT clear it.
 
@@ -201,15 +152,8 @@ The status dot SHALL stay until the terminal's records change (a report, a clear
 - **WHEN** a background tab shows the yellow dot and the user activates it
 - **THEN** the dot remains until the program reports again
 
-### Requirement: New tab with the default profile
-ctrl-shift-t (or the `+` button) in a tab that is not a control-mode tab SHALL open the default profile. When the default profile is a control-mode profile whose session the window shows, its tab SHALL become active instead.
-
-#### Scenario: Session in the window
-- **WHEN** the window shows session `main` and a local tab is active, and the user presses ctrl-shift-t
-- **THEN** a tab of `main` becomes active and no tab is added
-
 ### Requirement: One window
-Brindle SHALL show a single window. No command SHALL open another window; opening a profile, a tmux session or an attached session SHALL add a tab to that window.
+Brindle SHALL show a single window. No command SHALL open another window; opening a profile or an attached session SHALL add a tab to that window.
 
 #### Scenario: No new window
 - **WHEN** the user presses ctrl-shift-n
@@ -234,25 +178,6 @@ Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every op
 - **WHEN** a tab runs `brindle -e sleep 1000`'s command and the user quits
 - **THEN** that `sleep` is gone within a few seconds and no session is listed for it
 
-### Requirement: Tab menu
-Right-clicking a tab SHALL activate that tab and open a menu beside the pointer listing: Rename Tab (Rename Window on a tmux tab), Move Tab Left, Move Tab Right, and Close Tab. Move Tab Left SHALL be disabled on the first tab and Move Tab Right on the last. Each item SHALL run the action of the same name on that tab, and show that action's shortcut when it has one.
-
-#### Scenario: Menu on a background tab
-- **WHEN** the user right-clicks the third of four tabs while the first is active
-- **THEN** the third tab becomes active and the menu opens with Move Tab Right enabled
-
-#### Scenario: Move left
-- **WHEN** the menu of the second tab is open and the user selects Move Tab Left
-- **THEN** that tab becomes the first and stays active
-
-#### Scenario: Tmux tab
-- **WHEN** the user right-clicks a tmux window's tab
-- **THEN** the menu offers Rename Window in place of Rename Tab, and Close Tab closes that tmux window
-
-#### Scenario: Keyboard path
-- **WHEN** the config binds a key to `open_tab_menu`
-- **THEN** the key opens the active tab's menu beside the tab
-
 ### Requirement: Tab strip keyboard navigation
 The `focus_tab_strip` action SHALL move focus to the active tab in the strip. With the strip focused, left, right, home and end SHALL change the active tab as a tab list does and the terminal below SHALL show the new tab, without taking focus. Enter and escape SHALL return focus to the active tab's terminal. A pointer press on a tab SHALL activate it and leave focus in its terminal, not in the strip.
 
@@ -276,11 +201,19 @@ The new-tab button, the profile chevron and each tab's close button SHALL show a
 - **THEN** a tooltip reads "New tab" followed by its shortcut
 
 ### Requirement: Tab faces
-The strip's tab faces SHALL sit inside one rounded rectangle on the muted token background (shadcn's default tab list), and each face SHALL be drawn on its terminal's background in its terminal's foreground, with its icons and close button in that foreground. The strip's own background and its buttons SHALL use the global tokens.
+The strip's tab faces SHALL each be drawn on its terminal's background in its terminal's foreground, with its icons and close button in that foreground, with 4 pixels between neighbouring faces and no background behind them. The strip SHALL have no background of its own beyond the window's, no border under it, and a 6-pixel margin above and at the left of the faces, matching the margin round the zone cards below. The strip's buttons SHALL use the global tokens.
 
 #### Scenario: Mixed themes
 - **WHEN** one tab's profile sets a theme other than the global one
 - **THEN** that tab's face is drawn on its own theme's background and foreground, whether active or not, and the other faces are drawn in the global theme's
+
+#### Scenario: Faces are apart
+- **WHEN** a window has two tabs
+- **THEN** 4 pixels of the window background show between their faces, and none shows a shared pill behind them
+
+#### Scenario: Strip margins
+- **WHEN** a window is drawn
+- **THEN** the first face starts 6 pixels from the window's left edge, and 6 pixels of window background are above the faces and between them and the zone cards
 
 #### Scenario: Active tab marker
 - **WHEN** a tab is active
@@ -296,3 +229,64 @@ The icons of the strip's buttons (new tab, the profile chevron, the window contr
 #### Scenario: New-tab icon
 - **WHEN** the strip is drawn at the default scale
 - **THEN** the `+` is at least 16px across with strokes at least two pixels wide
+
+### Requirement: Rename Tab command
+The user SHALL be able to set a manual title for the active tab with a `Rename Tab` command. The command SHALL prompt for one line of text, pre-filled with the tab's current displayed title and selected for replacement.
+
+Brindle SHALL trim the submitted text before applying it. A non-empty trimmed value SHALL become the tab's manual title. An empty trimmed value SHALL clear the tab's manual title and restore automatic title updates.
+
+#### Scenario: Rename active tab
+- **WHEN** the active tab is titled `bash`, the user runs `Rename Tab`, enters `  server  `, and submits it
+- **THEN** the active tab is titled `server`
+
+#### Scenario: Whitespace clears manual title
+- **WHEN** a tab has the manual title `server`, the user runs `Rename Tab`, enters only whitespace, and submits it
+- **THEN** the manual title is cleared and the tab follows the automatic title rules
+
+### Requirement: Bell dot
+A bell from a tab that is not active, or from any tab while the window is inactive, SHALL mark that tab until the user activates it. This SHALL include bells from any zone of a tab.
+
+#### Scenario: Background bell
+- **WHEN** a background tab rings the bell
+- **THEN** a dot appears on that tab and disappears when the tab is activated
+
+#### Scenario: Bell in a background zone
+- **WHEN** an unfocused zone in a background tab rings the bell
+- **THEN** a dot appears on that tab and disappears when the tab is activated
+
+### Requirement: Program status dot
+A tab SHALL show a status dot while any of its zones holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit beside the bell dot when both apply.
+
+#### Scenario: Blocked in a background tab
+- **WHEN** a program in a background tab reports `state=blocked:kind=permission`
+- **THEN** that tab shows a yellow dot
+
+#### Scenario: Zones in a tab
+- **WHEN** a program in one zone of a tab reports `state=error`, and another zone in the same tab reports `state=working`
+- **THEN** that tab shows a red dot
+
+### Requirement: Tab context menu
+Right-clicking a tab SHALL activate that tab and open a menu beside the pointer listing: Rename Tab, Move Tab Left, Move Tab Right, and Close Tab. Move Tab Left SHALL be disabled on the first tab and Move Tab Right on the last. Each item SHALL run the action of the same name on that tab, and show that action's shortcut when it has one.
+
+#### Scenario: Menu on a background tab
+- **WHEN** the user right-clicks the third of four tabs while the first is active
+- **THEN** the third tab becomes active and the menu opens with Move Tab Right enabled
+
+#### Scenario: Move left
+- **WHEN** the menu of the second tab is open and the user selects Move Tab Left
+- **THEN** that tab becomes the first and stays active
+
+#### Scenario: Keyboard path
+- **WHEN** the config binds a key to `open_tab_menu`
+- **THEN** the key opens the active tab's menu beside the tab
+
+#### Scenario: Activated while blocked
+- **WHEN** a background tab shows the yellow dot and the user activates it
+- **THEN** the dot remains until the program reports again
+
+### Requirement: New tab shortcut
+ctrl-shift-t (or the `+` button) SHALL open a tab with the default profile.
+
+#### Scenario: Default profile
+- **WHEN** a tab is active and the user presses ctrl-shift-t
+- **THEN** a tab with the default profile opens and becomes active

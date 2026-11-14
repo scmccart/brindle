@@ -835,17 +835,17 @@ mod tests {
 
     #[test]
     fn word_movement() {
-        let mut s = at("tmux -L work|");
+        let mut s = at("git -C work|");
         s.motion(Motion::WordLeft, false);
-        assert_eq!(show(&s), "tmux -L |work");
+        assert_eq!(show(&s), "git -C |work");
         s.motion(Motion::WordLeft, false);
-        assert_eq!(show(&s), "tmux -|L work");
+        assert_eq!(show(&s), "git -|C work");
         s.motion(Motion::WordRight, false);
-        assert_eq!(show(&s), "tmux -L| work");
+        assert_eq!(show(&s), "git -C| work");
         s.motion(Motion::WordRight, false);
-        assert_eq!(show(&s), "tmux -L work|");
+        assert_eq!(show(&s), "git -C work|");
         s.motion(Motion::WordRight, false);
-        assert_eq!(show(&s), "tmux -L work|");
+        assert_eq!(show(&s), "git -C work|");
         let mut s = at("|  ab_c9 x");
         s.motion(Motion::WordRight, false);
         assert_eq!(show(&s), "  ab_c9| x");
@@ -949,13 +949,13 @@ mod tests {
 
     #[test]
     fn double_click_selects_a_word() {
-        let mut s = EditState::new("tmux -L work_1");
-        s.select_word_at(10);
-        assert_eq!(show(&s), "tmux -L [work_1]");
-        s.select_word_at(14);
-        assert_eq!(show(&s), "tmux -L [work_1]");
-        s.select_word_at(4);
-        assert_eq!(show(&s), "tmux[ -]L work_1");
+        let mut s = EditState::new("git -C work_1");
+        s.select_word_at(9);
+        assert_eq!(show(&s), "git -C [work_1]");
+        s.select_word_at(13);
+        assert_eq!(show(&s), "git -C [work_1]");
+        s.select_word_at(3);
+        assert_eq!(show(&s), "git[ -]C work_1");
         let mut empty = EditState::new("");
         empty.select_word_at(0);
         assert_eq!(show(&empty), "|");

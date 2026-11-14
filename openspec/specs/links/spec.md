@@ -1,7 +1,7 @@
 # links Specification
 
 ## Purpose
-Make links in terminal output usable: find URLs and OSC 8 hyperlinks under the mouse, show them while ctrl is held, and open or copy them, in local tabs and tmux control-mode panes alike.
+Make links in terminal output usable: find URLs and OSC 8 hyperlinks under the mouse, show them while ctrl is held, and open or copy them.
 
 ## Requirements
 
@@ -112,18 +112,3 @@ A `copy_link` action, listed in the command palette as "Copy Link Under Mouse" a
 #### Scenario: Copy from a keybinding
 - **WHEN** the user binds a key to `copy_link`, points at a URL and presses the key
 - **THEN** the clipboard contains the URL
-
-### Requirement: Links in tmux control-mode panes
-Detection, OSC 8 hyperlinks, hover feedback, opening and copying SHALL work in tmux control-mode panes as in local tabs. OSC 8 hyperlinks in a pane's existing content SHALL be kept when Brindle attaches and restores the pane. A ctrl-click on a link in an inactive pane SHALL select that pane and open the link.
-
-#### Scenario: OSC 8 in a pane
-- **WHEN** a program in a control-mode pane prints an OSC 8 hyperlink and the user ctrl-clicks it
-- **THEN** the hyperlink's URI opens
-
-#### Scenario: Link survives attach
-- **WHEN** a pane already shows an OSC 8 hyperlink and Brindle attaches to the session
-- **THEN** ctrl-clicking that text opens the hyperlink's URI
-
-#### Scenario: Inactive pane
-- **WHEN** a window has two panes and the user ctrl-clicks a URL in the inactive one
-- **THEN** that pane becomes active and the URL opens

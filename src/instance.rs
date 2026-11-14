@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn requests_round_trip_as_one_line() {
         let request = Request {
-            profile: Some("tmux".into()),
+            profile: Some("work".into()),
             cwd: Some("/srv".into()),
             command: Some(vec!["htop".into(), "-d".into(), "10".into()]),
             attach: Some(7),

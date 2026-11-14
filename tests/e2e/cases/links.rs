@@ -5,7 +5,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::server;
 use crate::brindle::{Run, theme};
 use crate::capture::Cells;
 use crate::{Ctx, Outcome, Result, ensure};
@@ -43,7 +42,6 @@ fn long_url() -> String {
 /// and a URL long enough to wrap open on ctrl-click; a click without ctrl
 /// opens nothing; ctrl-hover reports the link and underlines its cells.
 pub fn local_click(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let (opener, log) = recorder(ctx)?;
     let show = script(
         ctx,
@@ -57,7 +55,7 @@ pub fn local_click(ctx: &Ctx) -> Result<Outcome> {
             long_url()
         ),
     )?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .env("BRINDLE_LINK_OPENER", &opener.display().to_string())
         .send(&format!("sh {}\r", show.display()))
@@ -97,7 +95,6 @@ pub fn local_click(ctx: &Ctx) -> Result<Outcome> {
 /// With mouse reporting on, a ctrl-click on a link opens it and reports
 /// nothing, while clicks elsewhere (with or without ctrl) are reported.
 pub fn mouse_mode(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
     let (opener, log) = recorder(ctx)?;
     // `cat -v` shows the reports the terminal sends as they are echoed.
     let show = script(
@@ -108,7 +105,7 @@ pub fn mouse_mode(ctx: &Ctx) -> Result<Outcome> {
          printf '\\033[?1000h\\033[?1006h'\n\
          exec cat -v\n",
     )?;
-    let out = Run::new(ctx, &server, "run")
+    let out = Run::new(ctx, "run")
         .profile("Shell")
         .env("BRINDLE_LINK_OPENER", &opener.display().to_string())
         .send(&format!("sh {}\r", show.display()))
@@ -124,37 +121,5 @@ pub fn mouse_mode(ctx: &Ctx) -> Result<Outcome> {
     ensure!(text.contains("[<0;6;2M"), "the plain click wasn't reported: {text:?}");
     ensure!(text.contains("[<16;6;3M"), "the ctrl-click off the link wasn't reported: {text:?}");
     ensure!(!text.contains(";6;1M") && !text.contains(";6;1m"), "the link click was reported: {text:?}");
-    Ok(Outcome::Pass)
-}
-
-/// In a control-mode pane, an OSC 8 link printed before Brindle attached
-/// (restored from `capture-pane -e`) and one printed afterwards (live
-/// `%output`) both open, as does a detected URL.
-pub fn tmux(ctx: &Ctx) -> Result<Outcome> {
-    let server = server()?;
-    let (opener, log) = recorder(ctx)?;
-    let before = script(ctx, "before", "printf '\\033]8;;https://example.com/before\\033\\\\restored\\033]8;;\\033\\\\\\n'\n")?;
-    let after = script(
-        ctx,
-        "after",
-        "printf '\\033]8;;https://example.com/after\\033\\\\live\\033]8;;\\033\\\\ https://example.com/plain\\n'\n",
-    )?;
-    // Short relative paths keep the command line from wrapping.
-    let dir = ctx.dir.display();
-    server.type_line("%0", &format!("cd '{dir}'; clear; sh ./{}", before.file_name().unwrap().to_string_lossy()))?;
-    ctx.sleep(0.5);
-    // Rows: 0 "restored", 1 prompt + "sh after", 2 "live https://…".
-    let out = Run::new(ctx, &server, "run")
-        .env("BRINDLE_LINK_OPENER", &opener.display().to_string())
-        .send(&format!("sh ./{}\r", after.file_name().unwrap().to_string_lossy()))
-        .click("ctrl-2,0")
-        .click("ctrl-1,2")
-        .click("ctrl-12,2")
-        .hover("ctrl-2,0")
-        .dump_at(6.0)
-        .run()?;
-    let want = ["https://example.com/before", "https://example.com/after", "https://example.com/plain"];
-    ensure!(opened(&log) == want, "opened {:?}, want {want:?}; screen {:?}", opened(&log), out.dump.screen);
-    ensure!(out.dump.link.as_deref() == Some("https://example.com/before"), "hovered link {:?}", out.dump.link);
     Ok(Outcome::Pass)
 }

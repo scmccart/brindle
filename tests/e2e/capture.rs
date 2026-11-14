@@ -108,75 +108,92 @@ impl Image {
         out.extend_from_slice(&self.data);
         std::fs::write(path, out).ok();
     }
-}
 
-/// One arm of a divider junction: the line running from the crossing point
-/// to the edge of the sampled rectangle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arm {
-    /// No line pixels at all.
-    None,
-    /// Line pixels that don't run unbroken from the crossing to the edge.
-    Gap,
-    /// An unbroken line that changes color along the way.
-    Mixed,
-    Color(Rgb),
-}
+    /// The whole image, as a rectangle.
+    pub fn all(&self) -> PxRect {
+        PxRect { x0: 0, y0: 0, x1: self.width, y1: self.height }
+    }
 
-/// The four arms of a junction, from the crossing point outwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Junction {
-    pub up: Arm,
-    pub down: Arm,
-    pub left: Arm,
-    pub right: Arm,
-}
-
-impl Image {
-    /// Reads the divider junction in `r`. Line pixels are those near one of
-    /// `colors`. The crossing is where the row and the column with the most
-    /// line pixels meet; lines several pixels thick (scaled windows) count
-    /// as one band each.
-    pub fn junction(&self, r: PxRect, colors: &[Rgb]) -> Result<Junction> {
+    /// Where `self` and `other`, two captures of the same window, differ
+    /// within `r`: the pixels more than `tolerance` apart on some channel.
+    pub fn changes(&self, other: &Image, r: PxRect, tolerance: u8) -> Result<Changes> {
+        ensure!((self.width, self.height) == (other.width, other.height), "the window changed size");
         let (x1, y1) = (r.x1.min(self.width), r.y1.min(self.height));
-        ensure!(r.x0 < x1 && r.y0 < y1, "empty junction rectangle {r:?}");
-        let line = |x: u32, y: u32| colors.iter().position(|&c| self.pixel(x, y).near(c, 24));
-        // The band of rows (or columns) around the busiest one.
-        let band = |counts: Vec<usize>, start: u32| -> Result<(u32, u32)> {
-            let max = counts.iter().copied().max().unwrap_or(0);
-            ensure!(max > 0, "no line pixels in {r:?}");
-            let peak = counts.iter().position(|&n| n == max).unwrap();
-            let thick = |i: usize| counts[i] * 2 >= max;
-            let lo = (0..=peak).rev().take_while(|&i| thick(i)).last().unwrap_or(peak);
-            let hi = (peak..counts.len()).take_while(|&i| thick(i)).last().unwrap_or(peak);
-            Ok((start + lo as u32, start + hi as u32))
-        };
-        let rows = (r.y0..y1).map(|y| (r.x0..x1).filter(|&x| line(x, y).is_some()).count()).collect();
-        let cols = (r.x0..x1).map(|x| (r.y0..y1).filter(|&y| line(x, y).is_some()).count()).collect();
-        let (top, bottom) = band(rows, r.y0)?;
-        let (left, right) = band(cols, r.x0)?;
-        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
-        // An arm's pixels, from the crossing band outwards.
-        let arm = |pixels: Vec<Option<usize>>| -> Arm {
-            if pixels.iter().all(Option::is_none) {
-                return Arm::None;
+        let mut changes = Changes { count: 0, bbox: None, color: None };
+        let mut colors: HashMap<Rgb, usize> = HashMap::new();
+        for y in r.y0..y1 {
+            for x in r.x0..x1 {
+                let p = self.pixel(x, y);
+                if p.near(other.pixel(x, y), tolerance) {
+                    continue;
+                }
+                changes.count += 1;
+                *colors.entry(p).or_default() += 1;
+                changes.bbox = Some(match changes.bbox {
+                    None => PxRect { x0: x, y0: y, x1: x + 1, y1: y + 1 },
+                    Some(b) => PxRect { x0: b.x0.min(x), y0: b.y0.min(y), x1: b.x1.max(x + 1), y1: b.y1.max(y + 1) },
+                });
             }
-            if pixels.iter().any(Option::is_none) {
-                return Arm::Gap;
-            }
-            let first = pixels[0].unwrap();
-            if pixels.iter().all(|&p| p == Some(first)) { Arm::Color(colors[first]) } else { Arm::Mixed }
-        };
-        Ok(Junction {
-            up: arm((r.y0..top).rev().map(|y| line(cx, y)).collect()),
-            down: arm((bottom + 1..y1).map(|y| line(cx, y)).collect()),
-            left: arm((r.x0..left).rev().map(|x| line(x, cy)).collect()),
-            right: arm((right + 1..x1).map(|x| line(x, cy)).collect()),
-        })
+        }
+        changes.color = colors.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c);
+        Ok(changes)
+    }
+
+    /// The runs of pixels within `tolerance` of `color` along row `y`, from
+    /// column `x0` up to `x1`: each run's first column and the one after its
+    /// last.
+    pub fn runs_in_row(&self, y: u32, (x0, x1): (u32, u32), color: Rgb, tolerance: u8) -> Vec<(u32, u32)> {
+        if y >= self.height {
+            return Vec::new();
+        }
+        runs((x0..x1.min(self.width)).map(|x| (x, self.pixel(x, y).near(color, tolerance))))
+    }
+
+    /// As [`Image::runs_in_row`], down column `x` from row `y0` up to `y1`.
+    pub fn runs_in_column(&self, x: u32, (y0, y1): (u32, u32), color: Rgb, tolerance: u8) -> Vec<(u32, u32)> {
+        if x >= self.width {
+            return Vec::new();
+        }
+        runs((y0..y1.min(self.height)).map(|y| (y, self.pixel(x, y).near(color, tolerance))))
     }
 }
 
-/// The cell grid of a whole tab, in device pixels.
+/// Where two captures differ ([`Image::changes`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Changes {
+    /// How many pixels differ.
+    pub count: usize,
+    /// The rectangle round them, when any do.
+    pub bbox: Option<PxRect>,
+    /// The most common colour the differing pixels have in the first
+    /// capture.
+    pub color: Option<Rgb>,
+}
+
+/// The runs of `true` in a line of `(position, matches)`, as the first
+/// position and the one after the last.
+fn runs(line: impl Iterator<Item = (u32, bool)>) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut open: Option<u32> = None;
+    let mut end = 0;
+    for (at, matches) in line {
+        end = at + 1;
+        match (matches, open) {
+            (true, None) => open = Some(at),
+            (false, Some(start)) => {
+                runs.push((start, at));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        runs.push((start, end));
+    }
+    runs
+}
+
+/// The cell grid of a terminal, in device pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct Cells {
     x: f32,
@@ -187,8 +204,8 @@ pub struct Cells {
 }
 
 impl Cells {
-    /// From the dumped grid of the active pane, which sits at `left`,`top`
-    /// in tmux's window.
+    /// From the dumped grid of the active terminal, counting cells from
+    /// `left`,`top` cells to its left and above it (`0, 0` for its own).
     pub fn from_pane(grid: Grid, left: u16, top: u16) -> Cells {
         Cells {
             x: grid.x - grid.cell_width * left as f32,
@@ -213,13 +230,54 @@ impl Cells {
 
 /// Window captures are X11-only; cases that need them run on Linux.
 #[cfg(not(target_os = "linux"))]
-pub fn grab(_display: &str, _pid: u32) -> Result<Image> {
+pub fn grab(_display: &str, _pid: u32, _slow: f64) -> Result<Image> {
     Err("window captures need X11".into())
 }
 
-/// Captures the viewable X11 window whose `_NET_WM_PID` is `pid`.
+/// Without X11 no window is ever seen: the receiver reports a closed channel.
+#[cfg(not(target_os = "linux"))]
+pub fn watch_window(_display: &str, _pid: u32, _slow: f64) -> std::sync::mpsc::Receiver<std::time::Instant> {
+    std::sync::mpsc::channel().1
+}
+
+/// Polls every 100 ms, on a thread of its own, for the viewable X11 window
+/// whose `_NET_WM_PID` is `pid`, and sends when it first appeared. Brindle
+/// times its steps and its dump from its window opening, so captures count
+/// from this moment, not from the spawn. It gives up after the window wait
+/// (`WINDOW_WAIT_SECS` scaled by `slow`), and the channel then closes.
 #[cfg(target_os = "linux")]
-pub fn grab(display: &str, pid: u32) -> Result<Image> {
+pub fn watch_window(display: &str, pid: u32, slow: f64) -> std::sync::mpsc::Receiver<Instant> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let display = display.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs_f64(WINDOW_WAIT_SECS * slow);
+        let Ok((conn, screen)) = x11rb::connect(Some(&display)) else { return };
+        let root = conn.setup().roots[screen].root;
+        let Some(atom) = conn.intern_atom(false, b"_NET_WM_PID").ok().and_then(|c| c.reply().ok()).map(|r| r.atom)
+        else {
+            return;
+        };
+        while Instant::now() < deadline {
+            if find_window(&conn, root, atom, pid).is_some() {
+                tx.send(Instant::now()).ok();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    rx
+}
+
+/// How long `grab` waits for the window to be viewable, before `slow`
+/// (`BRINDLE_E2E_SLOW`) scales it. A cold first launch on a loaded runner
+/// (lavapipe, an empty font cache) can take most of it; on a passing run the
+/// wait ends as soon as the window is up.
+pub const WINDOW_WAIT_SECS: f64 = 10.0;
+
+/// Captures the viewable X11 window whose `_NET_WM_PID` is `pid`, waiting
+/// for it up to `WINDOW_WAIT_SECS` scaled by `slow`.
+#[cfg(target_os = "linux")]
+pub fn grab(display: &str, pid: u32, slow: f64) -> Result<Image> {
     let (conn, screen) = x11rb::connect(Some(display)).map_err(|e| format!("X display {display}: {e}"))?;
     let root = conn.setup().roots[screen].root;
     let atom = conn
@@ -228,7 +286,7 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
         .reply()
         .map_err(|e| e.to_string())?
         .atom;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs_f64(WINDOW_WAIT_SECS * slow);
     let window = loop {
         if let Some(w) = find_window(&conn, root, atom, pid) {
             break w;
@@ -262,6 +320,12 @@ pub fn grab(display: &str, pid: u32) -> Result<Image> {
 /// Asks the window of `pid` to close, as a window manager's close button
 /// does: a `WM_DELETE_WINDOW` client message (a protocol message to that
 /// window, not input).
+///
+/// It returns only once the server has processed the request. The server
+/// drops whatever it hasn't read from a client that hung up (a hang-up is an
+/// error to its poll loop, and it closes the client before reading), so a
+/// send, flush and disconnect could lose the message. A window manager keeps
+/// its connection open, so its close button never races like this.
 #[cfg(target_os = "linux")]
 pub fn request_close(display: &str, pid: u32) -> Result {
     use x11rb::protocol::xproto::{ClientMessageEvent, EventMask};
@@ -273,8 +337,12 @@ pub fn request_close(display: &str, pid: u32) -> Result {
     let (pid_atom, protocols, delete) = (atom(b"_NET_WM_PID")?, atom(b"WM_PROTOCOLS")?, atom(b"WM_DELETE_WINDOW")?);
     let window = find_window(&conn, root, pid_atom, pid).ok_or_else(|| format!("no viewable window for pid {pid}"))?;
     let event = ClientMessageEvent::new(32, window, protocols, [delete, x11rb::CURRENT_TIME, 0, 0, 0]);
-    conn.send_event(false, window, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
-    conn.flush().map_err(|e| e.to_string())?;
+    // `check` adds a round trip and waits for it; requests are handled in
+    // order, so the client message has been delivered when it returns.
+    conn.send_event(false, window, EventMask::NO_EVENT, event)
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| format!("WM_DELETE_WINDOW to {window:#x}: {e}"))?;
     Ok(())
 }
 
@@ -320,51 +388,45 @@ pub fn self_test() -> Result {
     Ok(())
 }
 
-pub fn self_test_junction() -> Result {
-    const BG: Rgb = Rgb(0x10, 0x14, 0x18);
-    const A: Rgb = Rgb(0xff, 0xff, 0x00);
-    const B: Rgb = Rgb(0xff, 0x00, 0xff);
-    let colors = [A, B];
-    // A 20x20 image, lines 2 pixels thick at rows/columns 9-10.
+/// Runs along a row or a column, and the changes between two captures.
+pub fn self_test_scan() -> Result {
+    const BG: Rgb = Rgb(0x28, 0x20, 0x20);
+    const LINE: Rgb = Rgb(0x36, 0x2f, 0x2f);
+    const RING: Rgb = Rgb(0x94, 0x54, 0x10);
     let image = |paint: &dyn Fn(u32, u32) -> Option<Rgb>| {
         let mut data = Vec::new();
         for y in 0..20 {
-            for x in 0..20 {
+            for x in 0..30 {
                 let c = paint(x, y).unwrap_or(BG);
                 data.extend_from_slice(&[c.0, c.1, c.2]);
             }
         }
-        Image { width: 20, height: 20, data }
+        Image { width: 30, height: 20, data }
     };
-    let on = |v: u32| (9..=10).contains(&v);
-    let all = PxRect { x0: 0, y0: 0, x1: 20, y1: 20 };
+    // Two 1px card borders with a 6px gap between them, at columns 5 and 12.
+    let cards = image(&|x, _| [5, 12].contains(&x).then_some(LINE));
+    let got = cards.runs_in_row(3, (0, 30), LINE, 2);
+    ensure!(got == [(5, 6), (12, 13)], "border runs: {got:?}");
+    ensure!(cards.runs_in_row(3, (6, 12), BG, 2) == [(6, 12)], "gap run");
+    ensure!(cards.runs_in_row(3, (0, 99), BG, 2) == [(0, 5), (6, 12), (13, 30)], "background runs, to the edge");
+    ensure!(cards.runs_in_column(5, (0, 20), LINE, 2) == [(0, 20)], "a border down a column");
+    ensure!(cards.runs_in_row(25, (0, 30), LINE, 2).is_empty(), "a row past the bottom");
+    // A tight tolerance tells the border from a near colour.
+    ensure!(cards.runs_in_row(3, (0, 30), Rgb(0x25, 0x29, 0x2c), 2).is_empty(), "near colour matched");
 
-    // A cross whose highlight (A) turns from up to left on the lines.
-    let cross = image(&|x, y| match (on(x), on(y)) {
-        (true, _) if y <= 10 => Some(A),
-        (true, _) => Some(B),
-        (_, true) if x <= 10 => Some(A),
-        (_, true) => Some(B),
-        _ => None,
+    // A ring 1px wide round columns 3..=8, rows 2..=6, added to `cards`.
+    let ringed = image(&|x, y| {
+        let band = ((3..=8).contains(&x) && [2, 6].contains(&y)) || ((2..=6).contains(&y) && [3, 8].contains(&x));
+        if band { Some(RING) } else { [5, 12].contains(&x).then_some(LINE) }
     });
-    let got = cross.junction(all, &colors)?;
-    let want = Junction { up: Arm::Color(A), down: Arm::Color(B), left: Arm::Color(A), right: Arm::Color(B) };
-    ensure!(got == want, "cross: {got:?}");
-
-    // A T: the vertical line, and a horizontal one going right only.
-    let tee = image(&|x, y| (on(x) || (on(y) && x > 10)).then_some(A));
-    let got = tee.junction(all, &colors)?;
-    let want = Junction { up: Arm::Color(A), down: Arm::Color(A), left: Arm::None, right: Arm::Color(A) };
-    ensure!(got == want, "tee: {got:?}");
-
-    // The horizontal line stops a pixel short of the vertical one.
-    let gap = image(&|x, y| (on(x) || (on(y) && x != 11)).then_some(A));
-    let got = gap.junction(all, &colors)?;
-    ensure!(got.right == Arm::Gap && got.left == Arm::Color(A), "gap: {got:?}");
-
-    // The color changes partway along an arm.
-    let mixed = image(&|x, y| (on(x) || on(y)).then_some(if y < 4 { B } else { A }));
-    let got = mixed.junction(all, &colors)?;
-    ensure!(got.up == Arm::Mixed && got.down == Arm::Color(A), "mixed: {got:?}");
+    let all = ringed.all();
+    let got = ringed.changes(&cards, all, 16)?;
+    ensure!(got.bbox == Some(PxRect { x0: 3, y0: 2, x1: 9, y1: 7 }), "ring box: {got:?}");
+    ensure!(got.count == 2 * 6 + 2 * 3, "ring pixels: {got:?}");
+    ensure!(got.color == Some(RING), "ring colour: {got:?}");
+    let none = cards.changes(&cards, all, 16)?;
+    ensure!(none == Changes { count: 0, bbox: None, color: None }, "no change: {none:?}");
+    let outside = ringed.changes(&cards, PxRect { x0: 10, y0: 0, x1: 30, y1: 20 }, 16)?;
+    ensure!(outside.count == 0, "a change outside the region: {outside:?}");
     Ok(())
 }

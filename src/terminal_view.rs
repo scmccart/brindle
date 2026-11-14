@@ -146,8 +146,6 @@ pub struct TerminalView {
     pub terminal: Entity<Terminal>,
     pub focus_handle: FocusHandle,
     pub font_size_override: Option<f32>,
-    /// Grid size is dictated by someone else (tmux panes); don't resize to fit.
-    pub fixed_size: bool,
     pub layout: Rc<Cell<Option<GridLayout>>>,
     pub blink_visible: bool,
     pub marked_text: Option<String>,
@@ -219,7 +217,6 @@ impl TerminalView {
             terminal,
             focus_handle,
             font_size_override,
-            fixed_size: false,
             layout: Rc::new(Cell::new(None)),
             blink_visible: true,
             marked_text: None,
