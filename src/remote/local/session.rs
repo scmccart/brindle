@@ -1,4 +1,5 @@
-//! A local tab's session, as its terminal holds it from the moment the tab
+//! A tab's session in a terminal server, this machine's or a remote
+//! endpoint's ([`Host`]), as its terminal holds it from the moment the tab
 //! opens.
 //!
 //! [`Session::start`] and [`Session::attach`] return at once: connecting
@@ -15,7 +16,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 
 use super::connection::{Abandon, Running, Sink};
-use super::{AttachRequest, Connection, Host, SessionSink, SpawnRequest};
+use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
 use crate::remote::protocol::SessionId;
 
 /// How a tab let its session go.
@@ -55,7 +56,7 @@ struct Size {
     cell_h: u16,
 }
 
-/// A local tab's session in the terminal server.
+/// A tab's session in a terminal server.
 pub struct Session {
     phase: Arc<Mutex<Phase>>,
     /// Lets go of the request while it waits.
@@ -63,9 +64,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts a session in the process's shared connection.
-    pub fn start(request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::start_with(|| super::shared(&Host::Local), request, sink)
+    /// Starts a session on `host`, through the process's connection to it.
+    pub fn start(host: Host, request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
+        Self::start_with(move || super::shared(&host), request, sink)
     }
 
     /// Starts a session in the connection `connect` gives, on a thread of
@@ -78,10 +79,10 @@ impl Session {
         Self::begin(connect, Start::Spawn(request), sink)
     }
 
-    /// Attaches a detached session in the process's shared connection; its
-    /// replay and then its live output go to `sink`.
-    pub fn attach(request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::attach_with(|| super::shared(&Host::Local), request, sink)
+    /// Attaches a detached session on `host`, through the process's
+    /// connection to it; its replay and then its live output go to `sink`.
+    pub fn attach(host: Host, request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
+        Self::attach_with(move || super::shared(&host), request, sink)
     }
 
     /// Attaches a session in the connection `connect` gives, on a thread of
@@ -114,7 +115,8 @@ impl Session {
         Self { phase, abandon }
     }
 
-    /// The program's pid, once the session exists.
+    /// The program's pid, once the session exists. It is a process of the
+    /// session's host, which may not be this machine.
     pub fn pid(&self) -> Option<u32> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some(running.pid()),
@@ -127,6 +129,15 @@ impl Session {
     pub fn id_and_key(&self) -> Option<(SessionId, String)> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some((running.id(), running.key().to_string())),
+            _ => None,
+        }
+    }
+
+    /// What the core last reported of the session's foreground program
+    /// (`PROCESS`, which only a relay connection asks for), while it runs.
+    pub fn foreground(&self) -> Option<Foreground> {
+        match &*self.phase.lock() {
+            Phase::Running(running) => running.foreground(),
             _ => None,
         }
     }
@@ -149,7 +160,9 @@ impl Session {
 
     /// Makes the window `hwnd` the owner of the session's console window
     /// (`REPARENT`), now or as soon as it starts or attaches, and again
-    /// after each reconnect's replay. Only a Windows core takes it.
+    /// after each reconnect's replay. Only a Windows core takes it, so a
+    /// remote session (on a relay connection) never sends it.
+
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn reparent(&self, hwnd: u64) {
         match &mut *self.phase.lock() {
@@ -279,6 +292,9 @@ mod tests {
         }
         fn failed(&mut self, error: &anyhow::Error) {
             self.0.send(format!("failed {error:#}")).ok();
+        }
+        fn foreground(&mut self) {
+            self.0.send("foreground".into()).ok();
         }
     }
 
@@ -663,6 +679,60 @@ mod tests {
         session.close();
         assert!(matches!(next(), ToCore::Close(close) if close.session == 7));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 6.1: a session keeps the last `PROCESS` for it, from the one the
+    /// core sends right behind `SPAWNED`; only a new name tells the tab.
+    /// `PROCESS` for another session is no one's, and an exit clears it.
+    #[test]
+    fn a_session_keeps_the_last_process_its_core_reported() {
+        let dir = temp_dir("process");
+        let process = |session: SessionId, name: &str, cwd: &str| {
+            ToClient::Process(client::Process { session, name: Some(name.into()), cwd: Some(cwd.into()) })
+        };
+        let core = scripted_core(&dir, move |message, stream| match message {
+            ToCore::Spawn(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: 7, pid: 4242, key: "k7".into() }));
+                send(stream, process(7, "bash", "/home/u"));
+                send(stream, process(8, "other", "/elsewhere"));
+            }
+            ToCore::Data(data) if data.bytes == b"cd /tmp\r" => send(stream, process(7, "bash", "/tmp")),
+            ToCore::Data(data) if data.bytes == b"htop\r" => send(stream, process(7, "htop", "/tmp")),
+            ToCore::Data(data) if data.bytes == b"exit\r" => {
+                send(stream, ToClient::Exit(client::Exit { session: 7, code: Some(0), lost: None }))
+            }
+            _ => {}
+        });
+        let (tx, tab) = mpsc::channel();
+        let session = Session::start_with(connector(&dir), request(), Box::new(Recorder(tx)));
+        assert_eq!(session.foreground(), None, "nothing before the session runs");
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        assert_eq!(seen(&tab), "foreground");
+        let reported = |name: &str, cwd: &str| Some(Foreground { name: Some(name.into()), cwd: Some(cwd.into()) });
+        eventually(|| session.foreground() == reported("bash", "/home/u"));
+
+        // A new directory with the same program changes no title.
+        session.input(b"cd /tmp\r");
+        recv(&core);
+        eventually(|| session.foreground() == reported("bash", "/tmp"));
+        session.input(b"htop\r");
+        recv(&core);
+        assert_eq!(seen(&tab), "foreground");
+        assert_eq!(session.foreground(), reported("htop", "/tmp"));
+
+        session.input(b"exit\r");
+        recv(&core);
+        assert_eq!(seen(&tab), "exited Some(0)");
+        assert_eq!(session.foreground(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn eventually(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

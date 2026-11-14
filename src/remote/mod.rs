@@ -5,9 +5,11 @@
 //! (`remote_command`).
 
 pub mod client;
+mod host;
 #[cfg(any(target_os = "linux", windows))]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
+pub use host::Host;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

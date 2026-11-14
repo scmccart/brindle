@@ -11,8 +11,9 @@
 //!   stderr is kept for errors. A thread waits for it with a blocking
 //!   `wait()`, and ending the link kills it by its pid only until that
 //!   `wait()` has returned.
-//! - **[`Timings`]:** heartbeats, the dead-link limit, the bootstrap limit
-//!   and the reconnect backoff, which tests shorten.
+//! - **[`Timings`]:** heartbeats, the dead-link limit, the bootstrap limit,
+//!   the reconnect backoff and how long an unused connection is kept, which
+//!   tests shorten.
 //! - **The program's environment** ([`relay_env`], [`SpawnRequest::remote`]):
 //!   a remote `SPAWN` carries the relay's environment (`RELAY_HOST`, a fresh
 //!   login's) with the profile's ([`child_env`]) over it.
@@ -66,6 +67,9 @@ pub struct Timings {
     pub retry_cap: Duration,
     /// The cap for an eager connection with no terminals.
     pub eager_cap: Duration,
+    /// How long a connection that isn't eager is kept once nothing uses it,
+    /// so closing a tab and opening another reuses it.
+    pub idle: Duration,
 }
 
 impl Default for Timings {
@@ -77,6 +81,7 @@ impl Default for Timings {
             first_retry: Duration::from_secs(1),
             retry_cap: Duration::from_secs(30),
             eager_cap: Duration::from_secs(60),
+            idle: Duration::from_secs(5),
         }
     }
 }
@@ -377,8 +382,6 @@ impl SpawnRequest {
     /// environment, which the connection puts over the endpoint's.
     ///
     /// [`child_env`]: crate::terminal::child_env
-    // Task 6.1 builds remote terminals' requests with it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remote(
         profile: &Profile,
         command: Option<(String, Vec<String>)>,

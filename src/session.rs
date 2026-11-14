@@ -454,15 +454,17 @@ pub fn merge_windows(windows: Vec<WindowState>) -> Option<WindowState> {
 }
 
 /// `window` without the local zones whose recorded terminal server session
-/// is gone (`alive` says which are left): a split's other side takes a
-/// dropped zone's place, and a tab with no zone left is dropped. Zones with
-/// no record stay. `None` when no tab is left.
+/// is gone (`alive` says which are left, from this machine's server): a
+/// split's other side takes a dropped zone's place, and a tab with no zone
+/// left is dropped. Zones with no record stay, and so do a remote tab's,
+/// whose sessions are its endpoint's. `None` when no tab is left.
 pub fn drop_lost_zones(mut window: WindowState, alive: impl Fn(&ServerSession) -> bool) -> Option<WindowState> {
     let lost = |session: &Option<ServerSession>| session.as_ref().is_some_and(|s| !alive(s));
     let mut active = None;
     let mut tabs = Vec::new();
     for (ix, tab) in std::mem::take(&mut window.tabs).into_iter().enumerate() {
         let tab = match tab {
+            tab @ TabState::Local { remote: Some(_), .. } => tab,
             TabState::Local { profile, remote, cwd, title, zones: Some(zones), session } => {
                 match prune_zones(zones, &lost) {
                     None => continue,
@@ -955,6 +957,16 @@ mod tests {
         assert_eq!(drop_lost_zones(window(1, vec![single(2), single(1), single(3)]), alive).unwrap().active, 0);
         // Nothing left.
         assert_eq!(drop_lost_zones(window(0, vec![single(1), split(ZoneNodeState::split(SplitAxis::Vertical, leaf(4, true), leaf(6, false)))]), alive), None);
+
+        // A remote tab's sessions are its endpoint's, which this machine's
+        // listing doesn't have: its zones stay, recorded or not.
+        let remote = Some(crate::config::RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new() });
+        let on_a8 = |tab: TabState| match tab {
+            TabState::Local { profile, cwd, title, zones, session, .. } => TabState::Local { profile, remote: remote.clone(), cwd, title, zones, session },
+            other => other,
+        };
+        let tabs = vec![on_a8(single(1)), on_a8(split(ZoneNodeState::split(SplitAxis::Vertical, leaf(4, true), leaf(7, false))))];
+        assert_eq!(drop_lost_zones(window(1, tabs.clone()), alive), Some(window(1, tabs)));
     }
 
     #[test]

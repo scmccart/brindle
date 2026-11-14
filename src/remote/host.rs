@@ -1,11 +1,12 @@
 //! Which terminal server a session runs in: this machine's, or a remote
-//! endpoint's (an SSH host or a container), reached through a relay.
+//! endpoint's (an SSH host or a container), reached through a relay. Tabs
+//! and zones keep the one they opened on, so it is built on every platform.
 
 use std::hash::{Hash, Hasher};
 
 use crate::config::{Profile, RemoteTarget};
 
-/// An endpoint the process keeps one connection to ([`super::shared`]).
+/// An endpoint the process keeps one connection to (`remote::local::shared`).
 ///
 /// Remote endpoints are equal when their targets name the same endpoint:
 /// an SSH target's host, user, port, identity file and SSH arguments, or a
@@ -37,10 +38,20 @@ enum Identity<'a> {
 
 impl Host {
     /// The endpoint a profile's sessions run on.
-    // Task 6.1 routes remote profiles through it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn of(profile: &Profile) -> Self {
         profile.remote.clone().map_or(Self::Local, Self::Remote)
+    }
+
+    /// The remote target, for a remote endpoint.
+    pub fn target(&self) -> Option<&RemoteTarget> {
+        match self {
+            Self::Local => None,
+            Self::Remote(target) => Some(target),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
     }
 
     fn identity(&self) -> Identity<'_> {

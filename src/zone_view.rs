@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
 use crate::config::{Config, Profile};
+use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::process::Snapshot;
 use crate::terminal::status::State;
@@ -362,7 +363,11 @@ pub struct Zone {
 }
 
 pub struct ZoneTreeView {
+    /// The tab's profile, as the config has it now: what a split runs.
     pub profile: Profile,
+    /// The endpoint the tab opened on, where its splits start too, whatever
+    /// the profile targets now. It never changes.
+    host: Host,
     /// The tab's theme, for its terminals and the cards round them (their
     /// headers, borders and the gaps between them). The focus ring and the
     /// status dots stay on the window's tokens and global theme.
@@ -392,9 +397,11 @@ impl EventEmitter<TerminalEvent> for ZoneTreeView {}
 impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
 
 impl ZoneTreeView {
-    /// Creates a `ZoneTreeView` with a single initial terminal zone.
+    /// Creates a `ZoneTreeView` with a single initial terminal zone, which
+    /// runs on `host`.
     pub fn new(
         profile: Profile,
+        host: Host,
         theme: Theme,
         font_size_override: Option<f32>,
         terminal: Entity<Terminal>,
@@ -404,6 +411,7 @@ impl ZoneTreeView {
         let id = ZoneId(1);
         let mut this = Self {
             profile,
+            host,
             theme,
             font_size_override,
             tree: ZoneTree::new(id),
@@ -420,9 +428,11 @@ impl ZoneTreeView {
     }
 
     /// Creates a `ZoneTreeView` from a restored split tree and pre-spawned
-    /// terminals for each leaf.
+    /// terminals for each leaf, which run on `host`.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_restored(
         profile: Profile,
+        host: Host,
         theme: Theme,
         font_size_override: Option<f32>,
         tree: ZoneTree,
@@ -434,6 +444,7 @@ impl ZoneTreeView {
         let max_id = terminals.iter().map(|(id, _)| id.0).max().unwrap_or(1);
         let mut this = Self {
             profile,
+            host,
             theme,
             font_size_override,
             tree,
@@ -588,9 +599,7 @@ impl ZoneTreeView {
             return self.profile.name.clone();
         };
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        terminal_automatic_title(terminal.title(), &self.profile.name, || {
-            terminal.foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
-        })
+        terminal_automatic_title(terminal.title(), &self.profile.name, || terminal.foreground_process_name(snapshot))
     }
 
     /// Refreshes cached zone header titles for all zones in this tab.
@@ -607,10 +616,8 @@ impl ZoneTreeView {
         let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        let title: SharedString = terminal_automatic_title(terminal.title(), &profile_name, || {
-            terminal.foreground_process_name(snapshot.get_or_insert_with(Snapshot::take))
-        })
-        .into();
+        let title: SharedString =
+            terminal_automatic_title(terminal.title(), &profile_name, || terminal.foreground_process_name(snapshot)).into();
         let changed = zone.title != title;
         zone.title = title;
         changed
@@ -624,6 +631,8 @@ impl ZoneTreeView {
             .max()
     }
 
+    /// Takes the tab's profile as the config now has it (or the settings
+    /// dialog previews it), with its theme and font size. The host stays.
     pub fn set_profile(&mut self, profile: Profile, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
         self.profile = profile;
         self.theme = theme.clone();
@@ -730,8 +739,9 @@ impl ZoneTreeView {
         }
 
         let config: Config = Settings::get(cx).config.clone();
-        // A split inherits the target zone's current working directory; if
-        // unavailable, `Terminal::spawn` falls back to the profile's cwd or home.
+        // A split runs on the tab's host and inherits the target zone's
+        // current working directory there; if unavailable, `Terminal::spawn`
+        // falls back to the profile's cwd or home.
         let cwd = self.zone_working_directory(target, cx);
 
         let new_id = ZoneId(self.next_id);
@@ -740,7 +750,9 @@ impl ZoneTreeView {
             return;
         }
 
-        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, None, cwd, &config, cx));
+        let host = self.host.clone();
+        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx));
+
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         let mut snapshot = None;
         self.refresh_zone_title(target, &mut snapshot, cx);

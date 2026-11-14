@@ -27,7 +27,6 @@
 //! relay (`relay.rs`) instead of the local socket or pipe.
 
 mod connection;
-mod host;
 mod link;
 #[cfg(windows)]
 mod pipe;
@@ -41,8 +40,8 @@ mod sys;
 mod sys;
 mod upgrade;
 
-pub use connection::{AttachRequest, Connection, SessionSink, SpawnRequest};
-pub use host::Host;
+pub use connection::{AttachRequest, Connection, Foreground, SessionSink, SpawnRequest};
+pub use super::Host;
 /// What `remote::client`'s tests of the relay's launch against real
 /// endpoints start for themselves.
 #[cfg(test)]
@@ -146,22 +145,58 @@ fn host_token(host: &Host) -> String {
     }
 }
 
+/// A host's connection, behind a lock of its own.
+type Slot = Arc<Mutex<Option<Arc<Connection>>>>;
+
 /// One connection per host, each made under a lock of its own, so a local
-/// connect that blocks holds up no remote endpoint's.
+/// connect that blocks holds up no remote endpoint's. A connection that
+/// ends (a relay no terminal used any more, or one that never connected)
+/// is forgotten.
 #[derive(Default)]
-struct Registry(Mutex<HashMap<Host, Arc<Mutex<Option<Arc<Connection>>>>>>);
+struct Registry(Arc<Mutex<HashMap<Host, Slot>>>);
 
 impl Registry {
     /// `host`'s connection, made by `make` when there is none or it ended.
     fn get(&self, host: &Host, make: impl FnOnce() -> Result<Arc<Connection>>) -> Result<Arc<Connection>> {
         let slot = self.0.lock().entry(host.clone()).or_default().clone();
         let mut current = slot.lock();
-        if let Some(connection) = current.as_ref().filter(|connection| !connection.is_dead()) {
+        if let Some(connection) = current.as_ref().filter(|connection| connection.reuse()) {
             return Ok(connection.clone());
         }
         let connection = make()?;
+        let (map, host, made) = (Arc::downgrade(&self.0), host.clone(), Arc::as_ptr(&connection) as usize);
+        // Runs on the thread ending it, which is alive until then, so no
+        // other connection has its address meanwhile.
+        connection.on_end(Box::new(move || {
+            if let Some(map) = map.upgrade() {
+                forget(&map, &host, made);
+            }
+        }));
         *current = Some(connection.clone());
         Ok(connection)
+    }
+
+    #[cfg(test)]
+    fn has(&self, host: &Host) -> bool {
+        self.0.lock().contains_key(host)
+    }
+}
+
+/// Takes the connection at address `ended` out of `host`'s slot, and the
+/// slot out of `map`, unless a newer connection has replaced it. Locks the
+/// map, then the slot, as [`Registry::get`] does (it never holds both).
+fn forget(map: &Mutex<HashMap<Host, Slot>>, host: &Host, ended: usize) {
+    let Some(slot) = map.lock().get(host).cloned() else { return };
+    {
+        let mut current = slot.lock();
+        if !current.as_ref().is_some_and(|connection| Arc::as_ptr(connection) as usize == ended) {
+            return;
+        }
+        *current = None;
+    }
+    let mut map = map.lock();
+    if map.get(host).is_some_and(|kept| Arc::ptr_eq(kept, &slot) && kept.lock().is_none()) {
+        map.remove(host);
     }
 }
 
@@ -736,6 +771,81 @@ mod tests {
         let again = registry.get(&Host::Remote(target("dev", 22)), make).unwrap();
         assert!(!Arc::ptr_eq(&shell, &again));
         assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// 6.3: a relay connection ends `idle` after its last session went (its
+    /// `CLOSE` written): its relay is killed and the registry forgets it, so
+    /// the next tab gets a new one. A tab taking it within that time keeps
+    /// it, and starts the time over.
+    #[test]
+    fn a_relay_closes_after_its_last_session_goes() {
+        use crate::config::RemoteTarget;
+        use connection::fake;
+
+        let host = Host::Remote(RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        });
+        let idle = Duration::from_secs(1);
+        let registry = Registry::default();
+        let plans = Mutex::new(Vec::new());
+        let make = || {
+            let (dial, plan) = fake::dialer("A8");
+            plans.lock().push(plan);
+            let timings = relay::Timings { dead: Duration::from_secs(30), idle, ..fake::quick() };
+            Connection::relay(dial, "tok", timings)
+        };
+        let request = || SpawnRequest {
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 16,
+            scrollback: 1000,
+            policy: client::Policy::Detach,
+            profile: Some("A8".into()),
+        };
+        let eventually = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        let connection = registry.get(&host, make).unwrap();
+        let (link, far) = fake::link(&[], fake::spawning);
+        plans.lock()[0].link(link);
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(request(), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        // A session keeps it.
+        std::thread::sleep(idle * 2);
+        assert!(!connection.is_dead());
+
+        running.close();
+        assert!(matches!(far.next(), ToCore::Close(_)));
+        // Taken again within `idle`: the same connection, its time started
+        // over.
+        std::thread::sleep(idle / 5);
+        let taken = Instant::now();
+        let again = registry.get(&host, make).unwrap();
+        assert!(Arc::ptr_eq(&connection, &again));
+        assert_eq!(plans.lock().len(), 1);
+
+        eventually("the unused connection ends", &|| connection.is_dead());
+        assert!(taken.elapsed() >= idle * 4 / 5, "ended {:?} after it was taken", taken.elapsed());
+        assert!(far.out.is_cut(), "its relay was killed");
+        assert!(!registry.has(&host), "forgotten");
+        let next = registry.get(&host, make).unwrap();
+        assert!(!Arc::ptr_eq(&connection, &next));
+        assert_eq!(plans.lock().len(), 2);
     }
 
     #[test]

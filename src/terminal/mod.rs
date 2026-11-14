@@ -1,12 +1,17 @@
 //! The terminal model: an alacritty `Term` grid plus the backend feeding it.
 //!
 //! The backends:
-//! - `Server` (Linux and Windows): a session of the local terminal server
-//!   ([`crate::remote::local`]), whose output the connection's reader
-//!   thread parses. Every local tab uses it.
+//! - `Server` (Linux and Windows): a session of a terminal server, on this
+//!   machine or at a remote endpoint (its [`Host`], through
+//!   [`crate::remote::local`]), whose output the connection's reader thread
+//!   parses. Every tab with a program uses it. What assumes the program
+//!   runs here (its pid, its directory checked on disk, its console window)
+//!   is for [`Host::Local`] only; a remote session's program is what its
+//!   host reports.
 //! - `Remote`: a read-only message (an error shown in a tab), fed in with
 //!   [`Terminal::feed`]; it has no program, so input goes nowhere.
-//! - `Agent`: a PTY owned by the remote Linux helper.
+//! - `Agent`: a PTY owned by the remote Linux helper, over its stdio
+//!   protocol. Nothing opens one any more; task 6.4 removes it.
 
 pub mod cmdline;
 pub mod keys;
@@ -44,6 +49,7 @@ use self::shell_integration::{Marks, Parser};
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
 use crate::notify::osc::{Found, Notice, Scanner};
+use crate::remote::Host;
 use crate::theme::{Color, Theme};
 
 /// What reaches the UI thread from the emulator and output scanner.
@@ -59,6 +65,10 @@ pub enum ChannelEvent {
     /// The server session can't be got back; the reason is on the screen.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Lost,
+    /// A remote session's host reported another foreground program, which
+    /// a title may show.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Foreground,
 }
 
 /// One update's worth of [`ChannelEvent`]s, with its `Wakeup`s and title
@@ -187,9 +197,9 @@ pub enum TerminalEvent {
 }
 
 enum Backend {
-    /// A session of the local terminal server.
+    /// A session of `host`'s terminal server.
     #[cfg(any(target_os = "linux", windows))]
-    Server { session: crate::remote::local::Session, closing: Closing },
+    Server { session: crate::remote::local::Session, closing: Closing, host: Host },
     /// A read-only message with no program behind it.
     Remote,
     /// A PTY owned by the remote Linux helper.
@@ -201,9 +211,9 @@ enum Backend {
     },
 }
 
-/// What happens to a local terminal's program when Brindle goes away
-/// without closing it (quit, a crash, the desktop stopping Brindle). The
-/// user closing the terminal always ends it.
+/// What happens to a terminal's program, local or remote, when Brindle
+/// goes away without closing it (quit, a crash, the desktop stopping
+/// Brindle). The user closing the terminal always ends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closing {
     /// It keeps running, detached, and the next launch attaches it.
@@ -297,6 +307,7 @@ impl Terminal {
                                 ChannelEvent::Osc(found) => this.handle_found(found, cx),
                                 ChannelEvent::Replay(active) => this.replaying = active,
                                 ChannelEvent::Lost => this.mark_lost(cx),
+                                ChannelEvent::Foreground => cx.emit(TerminalEvent::TitleChanged),
                             }
                         }
                         title = batch.title.or(title.take());
@@ -396,100 +407,72 @@ impl Terminal {
         }
     }
 
-    /// Spawns either a local PTY or a remote-agent PTY according to the profile.
+    /// Starts `profile`'s program (or `command_override`) in a new session
+    /// of `host`'s terminal server: the host of the tab it opens in, which
+    /// stays its own whatever the profile targets later. It returns at
+    /// once; if the session can't start, the terminal shows why.
     pub fn spawn(
         profile: &Profile,
+        host: &Host,
         command_override: Option<(String, Vec<String>)>,
         cwd_override: Option<std::path::PathBuf>,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        if profile.remote.is_some() {
-            Self::spawn_remote(profile, command_override, cwd_override, config, cx)
-        } else {
-            Self::spawn_pty(profile, command_override, cwd_override, config, cx)
+        let theme = config.profile_theme(profile);
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            // A command given instead of the profile's program (`-e`) is
+            // never restored or reattached, so it ends with its tab and with
+            // Brindle. Everything else keeps running when Brindle goes away
+            // without closing it.
+            let closing = Closing::new(command_override.is_some());
+            let (request, doing) = spawn_request(profile, host, command_override, cwd_override, config);
+            Self::start_session(host, request, doing, closing, theme, config, cx)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = (host, command_override, cwd_override);
+            log::error!("failed to start a terminal: terminals run in the terminal server, which needs Linux or Windows");
+            let text = "\x1b[31mBrindle could not start a terminal:\x1b[0m\r\n\
+                        terminals run in the terminal server, which needs Linux or Windows\r\n";
+            Self::message(text, theme, config, cx)
         }
     }
 
-    /// Spawns `profile`'s program in a new session of the local terminal
-    /// server. If that fails, the terminal shows the error instead so the
-    /// tab explains what went wrong.
-    fn spawn_pty(
-        profile: &Profile,
-        command_override: Option<(String, Vec<String>)>,
-        cwd_override: Option<std::path::PathBuf>,
+    /// A terminal whose session `request` starts on `host`, in the
+    /// background ([`crate::remote::local::Session::start`]).
+    #[cfg(any(target_os = "linux", windows))]
+    #[allow(clippy::too_many_arguments)]
+    fn start_session(
+        host: &Host,
+        request: crate::remote::local::SpawnRequest,
+        doing: String,
+        closing: Closing,
+        theme: Theme,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        // A command given instead of the profile's program (`-e`) is never
-        // restored or reattached, so it ends with its tab and with Brindle. Everything else keeps running when Brindle
-        // goes away without closing it.
-        let closing = Closing::new(command_override.is_some());
-        // The program is always resolved here (on Windows from `PATH` and
-        // `%COMSPEC%`), so `SPAWN` never leaves it to the server.
-        let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
-            Some(program) => (program.clone(), profile.args.clone()),
-            None => default_program(&profile.args),
-        });
-
-        let working_directory = cwd_override
-            .or_else(|| profile.working_directory())
-            .or_else(dirs::home_dir)
-            .filter(|dir| dir.is_dir());
-
-        #[cfg(any(target_os = "linux", windows))]
-        let request = crate::remote::local::SpawnRequest {
-            command: program.clone(),
-            args,
-            cwd: working_directory.map(|dir| dir.to_string_lossy().into_owned()),
-            env: server_env(std::env::vars_os(), profile),
-            cols: GridSize::default().cols,
-            rows: GridSize::default().rows,
-            cell_w: GridSize::default().cell_width,
-            cell_h: GridSize::default().cell_height,
-            scrollback: u32::try_from(config.scrollback_lines).unwrap_or(u32::MAX),
-            policy: closing.policy(),
-            profile: Some(profile.name.clone()),
-        };
-
         let (tx, rx) = unbounded();
         let output = Arc::new(OutputMarker::default());
         let listener = Listener(tx, output.clone());
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
-        let parser = Arc::new(Mutex::new(Parser::new()));
+        let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        // Returns at once: the session starts in the background, and a
-        // failure is shown in the terminal then.
-        #[cfg(any(target_os = "linux", windows))]
-        let spawned: anyhow::Result<Backend> = {
-            let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("start {program:?}"));
-            let session = crate::remote::local::Session::start(request, Box::new(sink));
-            Ok(Backend::Server { session, closing })
-        };
-        #[cfg(all(unix, not(target_os = "linux")))]
-        let spawned: anyhow::Result<Backend> = {
-            let _ = (listener, args, working_directory, closing);
-            Err(anyhow::anyhow!("local terminals run in the terminal server, which needs Linux"))
-        };
-
-        let theme = config.profile_theme(profile);
-        match spawned {
-            Ok(backend) => Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx),
-            Err(err) => {
-                log::error!("failed to launch {program:?}: {err:#}");
-                let text = format!("\x1b[31mBrindle could not start {program:?}:\x1b[0m\r\n{err:#}\r\n");
-                Self::message(&text, theme, config, cx)
-            }
-        }
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, doing);
+        let session = crate::remote::local::Session::start(host.clone(), request, Box::new(sink));
+        let backend = Backend::Server { session, closing, host: host.clone() };
+        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
     }
 
-    /// Attaches a detached session of the local terminal server: its replay,
+    /// Attaches a detached session of `host`'s terminal server: its replay,
     /// quiet (no bell or notification), then its live output. It closes as
     /// a spawned profile terminal does. Returns at once, like a spawn; a
     /// refused attach shows in the terminal.
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach(
+        host: &Host,
         request: crate::remote::local::AttachRequest,
         what: String,
         profile: &Profile,
@@ -503,17 +486,22 @@ impl Terminal {
         // layout resizes the session only if the window's grid differs.
         let size = GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() };
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
-        let parser = Arc::new(Mutex::new(Parser::new()));
+        let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
         let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, format!("attach session {} ({what})", request.session))
             .replayed_at(size);
-        let session = crate::remote::local::Session::attach(request, Box::new(sink));
-        let backend = Backend::Server { session, closing: Closing::Keeps };
+        let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
+        let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
         let theme = config.profile_theme(profile);
         Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
     }
 
-    fn spawn_remote(
+    /// A terminal on the remote Linux helper's stdio protocol, one
+    /// connection per tab.
+    // Remote profiles run in their host's terminal server since task 6.1;
+    // task 6.4 removes this with `Backend::Agent`.
+    #[allow(dead_code)]
+    fn spawn_agent(
         profile: &Profile,
         command_override: Option<(String, Vec<String>)>,
         cwd_override: Option<std::path::PathBuf>,
@@ -956,13 +944,19 @@ impl Terminal {
     // ---- process info -------------------------------------------------------
 
     /// Name of the foreground process on the PTY (e.g. `vim`), for tab
-    /// titles. `snapshot` is the title tick's look at all processes.
-    pub fn foreground_process_name(&self, snapshot: &process::Snapshot) -> Option<String> {
+    /// titles. A session on this machine is looked up by its pid, in
+    /// `snapshot` (the title tick's look at all processes, taken the first
+    /// time a terminal needs it); a remote one's is what its host last
+    /// reported, since its pid is another machine's.
+    pub fn foreground_process_name(&self, snapshot: &mut Option<process::Snapshot>) -> Option<String> {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, .. } => {
-                session.pid().and_then(|pid| process::PtyProcess::new(pid).foreground_name(snapshot))
+            Backend::Server { session, host: Host::Local, .. } => {
+                let pid = session.pid()?;
+                process::PtyProcess::new(pid).foreground_name(snapshot.get_or_insert_with(process::Snapshot::take))
             }
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { session, .. } => session.foreground().and_then(|foreground| foreground.name),
             Backend::Agent { handle, foreground_name, .. } => {
                 handle.query_process();
                 foreground_name.clone()
@@ -973,33 +967,41 @@ impl Terminal {
 
     /// Parents the tab's console window to `window`, so dialogs that console
     /// programs open (credential prompts, for one) belong to Brindle's
-    /// window. Local tabs never move between windows, so once is enough:
-    /// the session sends `REPARENT` once it has started or attached, and
-    /// again after each reconnect's replay, since a new core doesn't know
-    /// the window.
+    /// window. Tabs never move between windows, so once is enough: the
+    /// session sends `REPARENT` once it has started or attached, and again
+    /// after each reconnect's replay, since a new core doesn't know the
+    /// window. Only a session on this machine has a console here: a remote
+    /// one's host is Linux, whose core refuses `REPARENT`.
     #[cfg(windows)]
     pub fn parent_console_to(&self, window: &gpui::Window) {
+        let Backend::Server { session, host: Host::Local, .. } = &self.backend else { return };
         let Some(hwnd) = crate::win::hwnd(window) else { return };
-        match &self.backend {
-            Backend::Server { session, .. } => session.reparent(hwnd.0 as usize as u64),
-            Backend::Remote { .. } | Backend::Agent { .. } => {}
-        }
+        session.reparent(hwnd.0 as usize as u64);
     }
 
     /// Current working directory of the foreground process (falls back to
     /// the shell). On Windows, where no other process's directory can be
     /// read, it is the directory the program last reported (OSC 7 or 9;9),
-    /// if it still exists.
+    /// if it still exists. A remote session's is a path on its host, never
+    /// checked here: the directory the program reported (OSC 7), else the
+    /// one its host last reported.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         match &self.backend {
             #[cfg(windows)]
-            Backend::Server { .. } => {
+            Backend::Server { host: Host::Local, .. } => {
                 self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
             }
             #[cfg(target_os = "linux")]
-            Backend::Server { session, .. } => {
+            Backend::Server { session, host: Host::Local, .. } => {
                 session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
             }
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { session, .. } => self
+                .marks
+                .lock()
+                .reported_dir()
+                .map(Into::into)
+                .or_else(|| session.foreground()?.cwd.map(Into::into)),
             Backend::Agent { cwd, .. } => {
                 self.marks.lock().reported_dir().map(Into::into).or_else(|| cwd.clone())
             }
@@ -1019,12 +1021,12 @@ impl Terminal {
     }
 
     /// Ends the terminal's connection to its program: `close` ends the
-    /// program; otherwise a local terminal's program is left as its
+    /// program; otherwise a server session's program is left as its
     /// [`Closing`] says, and any other terminal's ends.
     fn leave(&mut self, close: bool) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, closing } => match (close, closing) {
+            Backend::Server { session, closing, .. } => match (close, closing) {
                 (false, Closing::Keeps) => session.detach(),
                 _ => session.close(),
             },
@@ -1200,9 +1202,73 @@ fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
 
+/// What a new terminal of `profile` on `host` asks that host's server to
+/// run, and what starting it is called in an error. A remote host's
+/// session is left to it: its login shell when the profile names no
+/// command, a directory as given (its holder expands `~` and falls back to
+/// home), and its own environment under the profile's
+/// ([`SpawnRequest::remote`](crate::remote::local::SpawnRequest::remote)).
+/// This machine's is resolved here: the program, a directory that exists,
+/// and Brindle's own environment under the profile's. Which one depends on
+/// `host` alone, not on what the profile targets.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn spawn_request(
+    profile: &Profile,
+    host: &Host,
+    command_override: Option<(String, Vec<String>)>,
+    cwd_override: Option<std::path::PathBuf>,
+    config: &Config,
+) -> (crate::remote::local::SpawnRequest, String) {
+    let policy = Closing::new(command_override.is_some()).policy();
+    let size = GridSize::default();
+    let scrollback = u32::try_from(config.scrollback_lines).unwrap_or(u32::MAX);
+    if !host.is_local() {
+        let request =
+            crate::remote::local::SpawnRequest::remote(profile, command_override, cwd_override, size, scrollback, policy);
+        let doing = match request.command.as_str() {
+            "" => format!("open a shell on {}", host.name()),
+            command => format!("start {command:?} on {}", host.name()),
+        };
+        return (request, doing);
+    }
+    // The program is always resolved here (on Windows from `PATH` and
+    // `%COMSPEC%`), so `SPAWN` never leaves it to the server.
+    let (program, args) = command_override.unwrap_or_else(|| match &profile.command {
+        Some(program) => (program.clone(), profile.args.clone()),
+        None => default_program(&profile.args),
+    });
+    let working_directory = cwd_override
+        .or_else(|| profile.working_directory())
+        .or_else(dirs::home_dir)
+        .filter(|dir| dir.is_dir());
+    let doing = format!("start {program:?}");
+    let request = crate::remote::local::SpawnRequest {
+        command: program,
+        args,
+        cwd: working_directory.map(|dir| dir.to_string_lossy().into_owned()),
+        env: server_env(std::env::vars_os(), profile),
+        cols: size.cols,
+        rows: size.rows,
+        cell_w: size.cell_width,
+        cell_h: size.cell_height,
+        scrollback,
+        policy,
+        profile: Some(profile.name.clone()),
+    };
+    (request, doing)
+}
+
+/// The parser for a terminal on `host`: a remote endpoint is Linux, so its
+/// OSC 7 paths are POSIX ones whatever this machine is.
+#[cfg(any(target_os = "linux", windows))]
+fn parser_for(host: &Host) -> Parser {
+    if host.is_local() { Parser::new() } else { Parser::posix() }
+}
+
 /// The program a profile with no `command` runs, with the profile's `args`:
 /// `$SHELL`, then `/bin/sh`.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn default_program(args: &[String]) -> (String, Vec<String>) {
     let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     (program, args.to_vec())
@@ -1308,6 +1374,45 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    /// 6.1/6.2: what a new terminal runs follows the host it opens on, not
+    /// what its profile targets. A remote host's session is left to it (the
+    /// directory unchecked here); this machine's is resolved here, a
+    /// directory that isn't here dropped. A profile tab detaches, `-e` kills.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_spawn_request_follows_its_host() {
+        use crate::config::RemoteTarget;
+        use crate::remote::protocol::client::Policy;
+
+        let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new() };
+        let profile = Profile {
+            name: "htop".into(),
+            command: Some("htop".into()),
+            cwd: Some("/var/log/brindle-nowhere".into()),
+            remote: Some(a8.clone()),
+            ..Default::default()
+        };
+        let config = Config::default();
+
+        let (remote, doing) = spawn_request(&profile, &Host::Remote(a8.clone()), None, None, &config);
+        assert_eq!((remote.command.as_str(), doing.as_str()), ("htop", "start \"htop\" on A8"));
+        assert_eq!(remote.cwd.as_deref(), Some("/var/log/brindle-nowhere"));
+        assert_eq!(remote.policy, Policy::Detach);
+
+        let (local, doing) = spawn_request(&profile, &Host::Local, None, None, &config);
+        assert_eq!((local.command.as_str(), doing.as_str()), ("htop", "start \"htop\""));
+        assert_eq!(local.cwd, None);
+        assert_eq!(local.policy, Policy::Detach);
+
+        let shell = Profile { command: None, ..profile.clone() };
+        let (_, doing) = spawn_request(&shell, &Host::Remote(a8.clone()), None, None, &config);
+        assert_eq!(doing, "open a shell on A8");
+
+        let (command, _) = spawn_request(&profile, &Host::Remote(a8), Some(("top".into(), vec!["-b".into()])), None, &config);
+        assert_eq!((command.command.as_str(), command.args.as_slice()), ("top", ["-b".to_string()].as_slice()));
+        assert_eq!(command.policy, Policy::Kill);
+    }
 
     #[test]
     fn batch_counts_wakeups_and_titles_once() {

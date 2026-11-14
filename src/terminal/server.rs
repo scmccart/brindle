@@ -1,5 +1,5 @@
-//! A local tab's session in the terminal server: the sink its output
-//! goes to on the connection's reader thread, and what its `SPAWN` carries.
+//! A tab's session in a terminal server, local or remote: the sink its
+//! output goes to on the connection's reader thread.
 //!
 //! The sink scans the bytes for the OSCs Brindle handles beside the parser
 //! and sends what it finds, parses them under the terminal's locks (parser,
@@ -131,6 +131,12 @@ impl SessionSink for Sink {
         self.output(text.as_bytes());
         self.send(ChannelEvent::Lost);
     }
+
+    /// A remote host reported another foreground program: the title may
+    /// show it.
+    fn foreground(&mut self) {
+        self.send(ChannelEvent::Foreground);
+    }
 }
 
 #[cfg(test)]
@@ -170,7 +176,9 @@ mod tests {
                 ChannelEvent::Alac(AlacEvent::Exit) => "exit",
                 ChannelEvent::Alac(_) => "alac",
                 ChannelEvent::Lost => "lost",
+                ChannelEvent::Foreground => "foreground",
             })
+
             .collect()
     }
 

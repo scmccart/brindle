@@ -24,6 +24,7 @@ use brindle_ui::{
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
 };
+use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
 use crate::settings::Settings;
@@ -57,7 +58,11 @@ pub enum TabOrigin {
 
 pub struct Tab {
     pub id: u64,
+    /// The tab's profile, as the config has it now.
     pub profile: Profile,
+    /// The endpoint the tab opened on: where its zones run, and where new
+    /// ones start, whatever its profile targets now. It never changes.
+    pub host: Host,
     /// The tab's zones: one terminal, or a split tree of them.
     pub zones: Entity<ZoneTreeView>,
     pub origin: TabOrigin,
@@ -76,6 +81,7 @@ pub struct Tab {
 impl Tab {
     fn new(
         profile: Profile,
+        host: Host,
         zones: Entity<ZoneTreeView>,
         origin: TabOrigin,
         subscriptions: Vec<Subscription>,
@@ -85,6 +91,7 @@ impl Tab {
         let mut tab = Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             profile,
+            host,
             zones,
             origin,
             bell: false,
@@ -198,7 +205,7 @@ enum PaletteKind {
 fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
     #[cfg(any(target_os = "linux", windows))]
     {
-        let connection = crate::remote::local::shared(&crate::remote::local::Host::Local)?;
+        let connection = crate::remote::local::shared(&Host::Local)?;
         if let Some(id) = kill
             && let Err(why) = connection.kill(id)
         {
@@ -404,10 +411,11 @@ impl Workspace {
                     match (zones, found) {
                         (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
                         #[cfg(any(target_os = "linux", windows))]
+                        // This machine's core listed it.
                         (None, Some(info)) => {
                             let profile = config.profiles[profile].clone();
-                            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
-                            self.insert_terminal_tab(profile, terminal, true, window, cx);
+                            let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
+                            self.insert_terminal_tab(profile, Host::Local, terminal, true, window, cx);
                         }
                         _ => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
                     }
@@ -435,22 +443,26 @@ impl Workspace {
     ) {
         let config = Self::settings(cx).clone();
         let Some(profile) = config.profiles.get(profile_ix).cloned() else { return };
+        // Restored zones are kept only when the profile still targets the
+        // endpoint they were recorded on (`session::resolve_tab`).
+        let host = Host::of(&profile);
         let (tree, leaves, active_id) = zones.into_tree();
         let terminals: Vec<_> = leaves
             .into_iter()
             .map(|(id, cwd, session)| {
-                let terminal = Self::restored_terminal(&profile, cwd, session.as_ref(), &config, cx);
+                let terminal = Self::restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
                 (id, terminal)
             })
             .collect();
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
+        let tree_host = host.clone();
         let view = cx.new(|cx| {
-            ZoneTreeView::from_restored(p_clone, theme, font_size, tree, terminals, active_id, window, cx)
+            ZoneTreeView::from_restored(p_clone, tree_host, theme, font_size, tree, terminals, active_id, window, cx)
         });
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -473,7 +485,8 @@ impl Workspace {
                     let session = zones.is_none().then(|| z.zone_server_session(z.active_id(), cx)).flatten();
                     SnapshotTab::Local {
                         profile: tab.profile.name.clone(),
-                        remote: tab.profile.remote.clone(),
+                        // Where it runs, which its profile may no longer name.
+                        remote: tab.host.target().cloned(),
                         cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
                         title: tab.manual_title.clone(),
                         zones,
@@ -522,10 +535,10 @@ impl Workspace {
     }
 
     /// The active directory only has meaning to a profile on the same host
-    /// or container.
+    /// or container as the active tab ([`same_endpoint`]).
     fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
-        if tab.profile.remote != profile.remote {
+        if !same_endpoint(&tab.host, profile) {
             return None;
         }
         tab.active_terminal(cx)?.read(cx).working_directory()
@@ -553,22 +566,27 @@ impl Workspace {
             if profile.cwd.is_none() { self.active_cwd_for(&profile, cx) } else { None }
         });
 
-        let terminal = cx.new(|cx| Terminal::spawn(&profile, command, cwd, &config, cx));
+        // The tab is on the profile's endpoint from now on.
+        let host = Host::of(&profile);
+        let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
-    /// A local tab showing `terminal` alone, inserted after the active tab,
-    /// and activated when `activate`. Only attached sessions open this way.
+    /// A tab on `host` showing `terminal` alone, inserted after the active
+    /// tab, and activated when `activate`. Only attached sessions open this
+    /// way: `host` is the one they were attached on.
     #[cfg(any(target_os = "linux", windows))]
     fn insert_terminal_tab(
         &mut self,
         profile: Profile,
+        host: Host,
         terminal: Entity<Terminal>,
         activate: bool,
         window: &mut Window,
@@ -578,9 +596,10 @@ impl Workspace {
         let theme = self.tab_theme(&profile, &config);
         let font_size = profile.font_size;
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
         if activate {
             self.insert_tab(tab, None, window, cx);
@@ -599,36 +618,44 @@ impl Workspace {
         cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take(recorded))
     }
 
-    /// A terminal attached to the detached session `info`, closing as
-    /// `profile` says.
+    /// A terminal attached to the detached session `info` of `host`'s
+    /// server, closing as `profile` says.
     #[cfg(any(target_os = "linux", windows))]
-    fn attached_terminal(info: &SessionInfo, profile: &Profile, config: &Config, cx: &mut Context<Self>) -> Entity<Terminal> {
+    fn attached_terminal(
+        host: &Host,
+        info: &SessionInfo,
+        profile: &Profile,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
         // At the session's own size, so attaching resizes nothing; a core
         // that predates sizes in `LIST` reports 0.
         let default = crate::terminal::GridSize::default();
         let (cols, rows) = if info.cols > 0 && info.rows > 0 { (info.cols, info.rows) } else { (default.cols, default.rows) };
         let request = crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows };
         let what = crate::reattach::label(info);
-        cx.new(|cx| Terminal::attach(request, what, profile, config, cx))
+        cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
 
-    /// A restored zone's terminal: its recorded session attached when the
-    /// launch found it still detached, else `profile` spawned in `cwd`.
+    /// A restored zone's terminal on `host`: its recorded session attached
+    /// when the launch found it still detached, else `profile` spawned in
+    /// `cwd`. The launch lists only this machine's sessions.
     fn restored_terminal(
         profile: &Profile,
+        host: &Host,
         cwd: PathBuf,
         recorded: Option<&session::ServerSession>,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        let found = Self::take_detached(recorded, cx);
+        let found = recorded.filter(|_| host.is_local()).and_then(|recorded| Self::take_detached(Some(recorded), cx));
         #[cfg(any(target_os = "linux", windows))]
         if let Some(info) = found {
-            return Self::attached_terminal(&info, profile, config, cx);
+            return Self::attached_terminal(host, &info, profile, config, cx);
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = found;
-        cx.new(|cx| Terminal::spawn(profile, None, Some(cwd), config, cx))
+        cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))
     }
 
     /// Opens a tab for each of `sessions` (detached sessions nothing
@@ -646,9 +673,10 @@ impl Workspace {
                     .and_then(|name| config.profile_index(name))
                     .unwrap_or_else(|| config.default_profile_index());
                 let profile = config.profiles[index].clone();
-                let terminal = Self::attached_terminal(&info, &profile, &config, cx);
+                // The launch listed this machine's sessions.
+                let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
                 let activate = self.tabs.is_empty();
-                self.insert_terminal_tab(profile, terminal, activate, window, cx);
+                self.insert_terminal_tab(profile, Host::Local, terminal, activate, window, cx);
             }
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -882,8 +910,10 @@ impl Workspace {
         let theme = config.profile_theme(&profile);
         let terminal = cx.new(|cx| Terminal::message(text, theme.clone(), &config, cx));
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, profile.font_size, terminal, window, cx));
-        let tab = Tab::new(profile, view, TabOrigin::Message, Vec::new(), cx);
+        let host = Host::of(&profile);
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, terminal, window, cx));
+        let tab = Tab::new(profile, host, view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -1260,8 +1290,9 @@ impl Workspace {
                 .and_then(|name| config.profile_index(name))
                 .unwrap_or_else(|| config.default_profile_index());
             let profile = config.profiles[index].clone();
-            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
-            self.insert_terminal_tab(profile, terminal, true, window, cx);
+            // The sessions palette and `--attach` list this machine's.
+            let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
+            self.insert_terminal_tab(profile, Host::Local, terminal, true, window, cx);
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (info, window, cx);
@@ -1435,11 +1466,11 @@ impl Workspace {
                 tab.profile.name = new.to_string();
             }
         }
+        // A tab whose profile now targets another endpoint stays on its
+        // own host (`Tab::host`): its splits start there.
         for tab in &mut self.tabs {
-            if let Some(p) = config.profile(&tab.profile.name) {
-                let remote = tab.profile.remote.clone();
-                tab.profile = p.clone();
-                tab.profile.remote = remote;
+            if let Some(profile) = reloaded_profile(&tab.profile, &config) {
+                tab.profile = profile;
             }
         }
         let mut snapshot = None;
@@ -1899,6 +1930,19 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
     renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
 }
 
+/// Whether a directory from a terminal on `host` means anything to a new
+/// tab of `profile`: only on the same endpoint.
+fn same_endpoint(host: &Host, profile: &Profile) -> bool {
+    *host == Host::of(profile)
+}
+
+/// A tab's profile once the config is reloaded: the config's profile of
+/// that name, whatever it targets now; `None` when the config has none,
+/// and the tab keeps its own.
+fn reloaded_profile(current: &Profile, config: &Config) -> Option<Profile> {
+    config.profile(&current.name).cloned()
+}
+
 /// Gives a tab's terminals `theme`, keeping its font size.
 fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
     let profile = tab.profile.clone();
@@ -2251,6 +2295,54 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::size;
+
+    /// 6.2: a tab stays on the host it was made on. Once its profile moves
+    /// to another endpoint, a reload gives the tab the moved profile, but a
+    /// split (the profile on the tab's host) still starts on the old host,
+    /// and the tab's directories mean nothing to a new tab of the profile.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_tab_keeps_its_host_when_its_profile_moves() {
+        use crate::config::RemoteTarget;
+
+        let ssh = |host: &str| RemoteTarget::Ssh {
+            host: host.into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+        };
+        let before = Profile {
+            name: "logs".into(),
+            command: Some("htop".into()),
+            remote: Some(ssh("old-host")),
+            ..Default::default()
+        };
+        let tab_host = Host::of(&before);
+        let moved = Profile { remote: Some(ssh("new-host")), ..before.clone() };
+        let mut config = Config::default();
+        config.profiles = vec![moved.clone()];
+
+        let reloaded = reloaded_profile(&before, &config).expect("the profile is still there");
+        assert_eq!(reloaded.remote, moved.remote);
+        let split = |profile: &Profile, host: &Host| {
+            crate::terminal::spawn_request(profile, host, None, Some("/var/log/brindle-nowhere".into()), &config)
+        };
+        let (request, doing) = split(&reloaded, &tab_host);
+        assert_eq!(doing, "start \"htop\" on old-host");
+        assert_eq!(request.cwd.as_deref(), Some("/var/log/brindle-nowhere"), "the old host's directory, unchecked");
+        assert!(same_endpoint(&tab_host, &before));
+        assert!(!same_endpoint(&tab_host, &reloaded));
+
+        // A local tab whose profile now names a remote still splits here.
+        let (request, doing) = split(&reloaded, &Host::Local);
+        assert_eq!(doing, "start \"htop\"");
+        assert_eq!(request.cwd, None, "no such directory on this machine");
+        assert!(!same_endpoint(&Host::Local, &reloaded));
+
+        // A profile the config dropped leaves the tab its own.
+        assert!(reloaded_profile(&before, &Config::default()).is_none());
+    }
 
     /// The spec's drag scenario: the first tab dropped on the third lands in
     /// the third place; one dropped from the right lands before its target;

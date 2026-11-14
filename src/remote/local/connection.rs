@@ -41,6 +41,14 @@
 //!   the error once. With no attach waiting, the connection ends, unless it
 //!   is eager (connects at launch). A new tab's request made while it
 //!   retries asks for an attempt at once.
+//! - **A relay's lifetime:** it is in use while it shows a session, a
+//!   request waits on it or a `CLOSE` is still to be written (one queued
+//!   while the link is down keeps it reconnecting). Unless it is eager, it
+//!   ends [`Timings::idle`] after it was last in use: its process is killed
+//!   and [`super::shared`] forgets it.
+//! - **This machine only:** a relay's sessions run on another machine, so
+//!   they are never sent `REPARENT` (a window handle of this one), and
+//!   what is known of their programs comes from `PROCESS` ([`Foreground`]).
 //!
 //! The reader holds the state lock only to look a sink up; each sink has
 //! its own lock, taken without the state lock, so parsing never waits on
@@ -91,6 +99,20 @@ pub trait SessionSink: Send {
     fn lost(&mut self, reason: &str);
     /// The session never started: no server, or the core refused it.
     fn failed(&mut self, error: &anyhow::Error);
+    /// The core reported another foreground program (`PROCESS`); the
+    /// session's [`Foreground`] has it.
+    fn foreground(&mut self) {}
+}
+
+/// What the core last reported about a session's foreground program
+/// (`PROCESS`, which a relay connection asks for): what a remote tab's
+/// title and directory come from, since this machine can't look.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Foreground {
+    /// Its name (`comm`).
+    pub name: Option<String>,
+    /// Its working directory, a path on the session's host.
+    pub cwd: Option<String>,
 }
 
 pub type Sink = Arc<Mutex<Box<dyn SessionSink>>>;
@@ -177,6 +199,8 @@ struct State {
     /// The window each session's console is parented to (Windows), sent
     /// again after a reconnect's replay: a core doesn't keep it.
     parents: HashMap<SessionId, u64>,
+    /// The last `PROCESS` of each session shown.
+    foreground: HashMap<SessionId, Foreground>,
     requests: HashMap<RequestId, Pending>,
     /// The `LIST` sent after a reconnect's `WELCOME`.
     list: Option<RequestId>,
@@ -184,8 +208,29 @@ struct State {
     connected: bool,
     /// A new tab's request wants a relay attempt now, not after the pause.
     hurry: bool,
+    /// `CLOSE`s sent to the writer and not yet written.
+    closing: usize,
+    /// Since when a relay connection has been out of use ([`State::in_use`]).
+    idle_since: Option<Instant>,
     /// The connection ended for good, and why; the next tab makes a new one.
     ended: Option<String>,
+    /// Run once when it ends ([`Connection::on_end`]).
+    on_end: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl State {
+    /// Stops showing `session`: its sink, window and foreground program go.
+    fn remove(&mut self, session: SessionId) -> Option<Sink> {
+        self.parents.remove(&session);
+        self.foreground.remove(&session);
+        self.sessions.remove(&session)
+    }
+
+    /// Something needs the connection: a session it shows, a request
+    /// waiting on it, or a `CLOSE` it hasn't written yet.
+    fn in_use(&self) -> bool {
+        !self.sessions.is_empty() || !self.requests.is_empty() || self.closing > 0
+    }
 }
 
 /// The link the writer writes to.
@@ -356,6 +401,10 @@ impl Connection {
         std::thread::Builder::new()
             .name("relay-watch".into())
             .spawn(move || watching.watchdog(&name, timings.dead))?;
+        let idling = this.clone();
+        std::thread::Builder::new()
+            .name("relay-idle".into())
+            .spawn(move || idling.end_when_unused(timings.idle))?;
         let reading = this.clone();
         std::thread::Builder::new()
             .name("relay-reader".into())
@@ -365,6 +414,63 @@ impl Connection {
 
     pub fn is_dead(&self) -> bool {
         self.state.lock().ended.is_some()
+    }
+
+    /// Takes the connection for another terminal; false once it has ended.
+    /// A relay out of use starts its idle time over, so it can't end
+    /// between this and the terminal's request.
+    pub(super) fn reuse(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.ended.is_some() {
+            return false;
+        }
+        if state.idle_since.is_some() {
+            state.idle_since = Some(Instant::now());
+        }
+        true
+    }
+
+    /// Runs `hook` once the connection ends, on the thread that ends it.
+    /// False (and `hook` dropped) when it has ended already.
+    pub(super) fn on_end(&self, hook: Box<dyn FnOnce() + Send>) -> bool {
+        let mut state = self.state.lock();
+        if state.ended.is_some() {
+            return false;
+        }
+        state.on_end = Some(hook);
+        true
+    }
+
+    /// Ends a relay connection [`Timings::idle`] after it was last in use
+    /// ([`State::in_use`]), unless it is eager. It looks five times per
+    /// `limit`, so it ends at most a fifth of `limit` late.
+    fn end_when_unused(&self, limit: Duration) {
+        let look = (limit / 5).max(Duration::from_millis(1));
+        let mut state = self.state.lock();
+        loop {
+            if state.ended.is_some() {
+                return;
+            }
+            if self.eager.load(Ordering::Acquire) || state.in_use() {
+                state.idle_since = None;
+            } else if state.idle_since.get_or_insert_with(Instant::now).elapsed() >= limit {
+                // Under the lock, so no request slips in to wait on it.
+                let reason = "the connection was no longer used".to_string();
+                state.ended = Some(reason.clone());
+                drop(state);
+                log::info!("closing the unused connection to {}", self.name());
+                return self.ended(&reason);
+            }
+            self.wake.wait_for(&mut state, look);
+        }
+    }
+
+    /// The endpoint, for log lines.
+    fn name(&self) -> String {
+        match &self.transport {
+            Transport::Local(_) => "this machine".to_string(),
+            Transport::Relay { dial, .. } => dial.name(),
+        }
     }
 
     /// Makes the connection keep connecting while nothing waits for it, as
@@ -381,6 +487,25 @@ impl Connection {
 
     fn send(&self, message: ToCore) {
         self.outgoing.send(message).ok();
+    }
+
+    /// Sends `CLOSE` for `session`, which keeps the connection in use until
+    /// it is written.
+    fn send_close(&self, session: SessionId) {
+        self.state.lock().closing += 1;
+        self.send(ToCore::Close(SessionRef { session }));
+    }
+
+    /// Stops showing `session`; says whether it was shown. With `closing`,
+    /// the `CLOSE` the caller sends next is counted under the same lock,
+    /// so the connection is never out of use in between.
+    fn forget(&self, session: SessionId, closing: bool) -> bool {
+        let mut state = self.state.lock();
+        let shown = state.remove(session).is_some();
+        if shown && closing {
+            state.closing += 1;
+        }
+        shown
     }
 
     fn req(&self) -> RequestId {
@@ -527,10 +652,14 @@ impl Connection {
                 Ok((mut reader, stamp)) => {
                     failures = 0;
                     let reason = self.read(&mut reader, Some((&stamp, timings.dead)));
+                    if self.is_dead() {
+                        return;
+                    }
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
                     self.lost_link(&name);
                 }
+                Err(_) if self.is_dead() => return,
                 Err(error) => {
                     let message = format!("can't connect to {name}: {error:#}");
                     log::warn!("{message}");
@@ -615,13 +744,22 @@ impl Connection {
     /// A link is up. After a loss, `LIST` goes out first, to tell which
     /// sessions the core no longer has; then the writer gets the link.
     fn up(&self, wire: Arc<dyn Wire>, host: Option<RelayHost>) -> Result<()> {
+        if let Some(reason) = &self.state.lock().ended {
+            // It ended while this link was starting.
+            bail!("{reason}");
+        }
         if self.state.lock().connected {
             let req = self.req();
             self.state.lock().list = Some(req);
             wire.send(&ToCore::List(Request { req }).encode()?)?;
         }
         self.state.lock().connected = true;
-        self.slot.lock().link = Some(Current { wire, host: host.map(Arc::new) });
+        let mut slot = self.slot.lock();
+        if slot.closed {
+            bail!("the connection ended");
+        }
+        slot.link = Some(Current { wire, host: host.map(Arc::new) });
+        drop(slot);
         self.slot_ready.notify_all();
         Ok(())
     }
@@ -677,7 +815,7 @@ impl Connection {
                         if let Some(other) = other {
                             other.fail("answered with SPAWNED".into());
                         }
-                        self.send(ToCore::Close(SessionRef { session: spawned.session }));
+                        self.send_close(spawned.session);
                     }
                 }
             }
@@ -729,11 +867,7 @@ impl Connection {
                 }
             }
             ToClient::Exit(exit) => {
-                let sink = {
-                    let mut state = self.state.lock();
-                    state.parents.remove(&exit.session);
-                    state.sessions.remove(&exit.session)
-                };
+                let sink = self.state.lock().remove(exit.session);
                 if let Some(sink) = sink {
                     match exit.lost {
                         Some(reason) => sink.lock().lost(&format!("the terminal server lost it: {reason}")),
@@ -776,6 +910,7 @@ impl Connection {
                     let kept: HashSet<SessionId> =
                         sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
                     state.parents.retain(|session, _| kept.contains(session));
+                    state.foreground.retain(|session, _| kept.contains(session));
                     let listed: HashMap<SessionId, bool> =
                         sessions.sessions.iter().map(|s| (s.session, s.attached)).collect();
                     (missing(&mut state.sessions, &kept), carried_attaches(&mut state.requests, &listed))
@@ -790,8 +925,21 @@ impl Connection {
                     self.send(ToCore::Attach(attach));
                 }
             }
-            // Task 6.1 keeps `PROCESS` for remote sessions' titles.
-            ToClient::Welcome(_) | ToClient::ServerStatus(_) | ToClient::Process(_) => {}
+            ToClient::Process(process) => {
+                let renamed = {
+                    let mut state = self.state.lock();
+                    // Only for a session shown here: SPAWNED or REPLAY_START
+                    // put its sink in the map before this was read.
+                    let Some(sink) = state.sessions.get(&process.session).cloned() else { return };
+                    let foreground = Foreground { name: process.name, cwd: process.cwd };
+                    let previous = state.foreground.insert(process.session, foreground.clone());
+                    (previous.map(|previous| previous.name) != Some(foreground.name)).then_some(sink)
+                };
+                if let Some(sink) = renamed {
+                    sink.lock().foreground();
+                }
+            }
+            ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
         }
     }
 
@@ -1002,13 +1150,15 @@ impl Connection {
     }
 
     /// The connection is gone for good: every session is lost and every
-    /// request fails.
+    /// request fails. Its link ends (a relay's process is killed), even one
+    /// still starting. Never called with the state or watch lock held.
     fn ended(&self, reason: &str) {
-        let (sessions, requests) = {
+        let (sessions, requests, hook) = {
             let mut state = self.state.lock();
             state.ended.get_or_insert_with(|| reason.to_string());
             state.parents.clear();
-            (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests))
+            state.foreground.clear();
+            (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests), state.on_end.take())
         };
         self.wake.notify_all();
         {
@@ -1019,10 +1169,14 @@ impl Connection {
             }
         }
         self.slot_ready.notify_all();
-        {
+        let watched = {
             let mut watch = self.watch.lock();
             watch.closed = true;
-            watch.link = None;
+            watch.link.take()
+        };
+        // A relay still greeting the core isn't the writer's yet.
+        if let Some((wire, _)) = watched {
+            wire.end();
         }
         self.watch_changed.notify_all();
         for pending in requests.into_values() {
@@ -1030,6 +1184,9 @@ impl Connection {
         }
         for sink in sessions.into_values() {
             sink.lock().lost(reason);
+        }
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -1129,7 +1286,13 @@ impl Connection {
                 }
             };
             match current.wire.send(&frame) {
-                Ok(()) => return true,
+                Ok(()) => {
+                    if matches!(message, ToCore::Close(_)) {
+                        let mut state = self.state.lock();
+                        state.closing = state.closing.saturating_sub(1);
+                    }
+                    return true;
+                }
                 Err(error) => {
                     log::debug!("writing to the terminal server failed: {error}");
                     if let Some(req) = request {
@@ -1265,11 +1428,21 @@ impl Running {
         self.conn.send(ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h }));
     }
 
+    /// What the core last reported of the session's foreground program,
+    /// once it has.
+    pub fn foreground(&self) -> Option<Foreground> {
+        self.conn.state.lock().foreground.get(&self.id).cloned()
+    }
+
     /// Makes the window `hwnd` the owner of the session's console window
     /// (`REPARENT`, which only a Windows core takes), and keeps it to send
     /// again after each reconnect's replay. A session that exited or was
-    /// lost sends nothing.
+    /// lost sends nothing, and neither does a relay's: its session runs on
+    /// another machine.
     pub fn reparent(&self, hwnd: u64) {
+        if self.conn.is_relay() {
+            return;
+        }
         {
             let mut state = self.conn.state.lock();
             if !state.sessions.contains_key(&self.id) {
@@ -1283,7 +1456,7 @@ impl Running {
     /// Ends the session (`CLOSE`). Once is enough; a session that already
     /// exited or was lost isn't closed again.
     pub fn close(&self) {
-        if self.forget() {
+        if self.conn.forget(self.id, true) {
             self.conn.send(ToCore::Close(SessionRef { session: self.id }));
         }
     }
@@ -1291,16 +1464,9 @@ impl Running {
     /// Leaves the session running with no client (`DETACH`), unless it
     /// already exited or was lost.
     pub fn detach(&self) {
-        if self.forget() {
+        if self.conn.forget(self.id, false) {
             self.conn.send(ToCore::Detach(SessionRef { session: self.id }));
         }
-    }
-
-    /// Stops showing the session; says whether it was still shown.
-    fn forget(&self) -> bool {
-        let mut state = self.conn.state.lock();
-        state.parents.remove(&self.id);
-        state.sessions.remove(&self.id).is_some()
     }
 }
 
@@ -1323,6 +1489,9 @@ pub(super) mod fake {
             first_retry: ms(40),
             retry_cap: ms(160),
             eager_cap: ms(320),
+            // Long: most tests leave a connection unused for a while and
+            // then use it again. The idle tests shorten it.
+            idle: Duration::from_secs(60),
         }
     }
 
@@ -2088,6 +2257,133 @@ mod tests {
         drop(far_writer);
         plan.link(Link { reader: Box::new(client_reader), wire: Arc::new(Plain(Mutex::new(client_writer))) });
         assert_eq!(spawn.join().unwrap().unwrap_err().to_string(), format!("can't connect to A8: {message}"));
+    }
+
+    /// 6.1: a relay's session runs on another machine, so asking to parent
+    /// its console to a window sends nothing, before or after a
+    /// reconnect's replay.
+    #[test]
+    fn a_remote_session_never_sends_reparent() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        running.reparent(0x1234);
+        first.out.cut();
+        assert!(seen(&tab).contains("connection to A8 lost"));
+
+        let id = running.id();
+        let (link, second) = fake::link(&[], move |message, out| {
+            if let ToCore::List(list) = message {
+                replay(out, id, None);
+                let info = SessionInfo { session: id, attached: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
+            }
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "output screen");
+        assert_eq!(seen(&tab), "replay false");
+        running.reparent(0x5678);
+        // Input still goes out: the link is up, and REPARENT never went.
+        running.input(b"x");
+        assert!(matches!(second.next(), ToCore::Data(data) if data.bytes == b"x"));
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(connection.state.lock().parents.is_empty());
+    }
+
+    /// 6.1: `PROCESS` read right behind `SPAWNED` (the core sends one at
+    /// once) is the session's, though its spawner may not have its answer
+    /// yet. One for a session not shown here is dropped.
+    #[test]
+    fn process_right_after_spawned_is_kept_for_the_session() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, _far) = fake::link(&[], |message, out| {
+            fake::spawning(message, out);
+            if let ToCore::Spawn(spawn) = message {
+                let session = 10 + spawn.req as SessionId;
+                out.send(ToClient::Process(client::Process { session, name: Some("bash".into()), cwd: Some("/home/u".into()) }));
+                out.send(ToClient::Process(client::Process { session: 99, name: Some("other".into()), cwd: None }));
+            }
+        });
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        let reported = Some(Foreground { name: Some("bash".into()), cwd: Some("/home/u".into()) });
+        eventually("the PROCESS is kept", || running.foreground() == reported);
+        quiet(&tab);
+        assert_eq!(connection.state.lock().foreground.len(), 1, "nothing kept for session 99");
+        running.close();
+        assert_eq!(running.foreground(), None);
+    }
+
+    /// 6.3: a `CLOSE` made while the link is down keeps the connection
+    /// reconnecting, past the idle time, until it is written; then, with
+    /// nothing left in use, the connection ends and its relay is killed.
+    #[test]
+    fn a_close_queued_while_disconnected_keeps_the_relay_until_it_is_written() {
+        let (dial, plan) = fake::dialer("A8");
+        let idle = Duration::from_millis(300);
+        let timings = Timings { dead: Duration::from_secs(30), idle, ..fake::quick() };
+        let connection = Connection::relay(dial, "tok", timings).unwrap();
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        plan.next_dial();
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        plan.next_dial();
+        // Closed while reconnecting: the CLOSE waits for a link.
+        running.close();
+        std::thread::sleep(idle * 3);
+        assert!(!connection.is_dead(), "ended with its CLOSE unwritten");
+
+        let id = running.id();
+        let (link, second) = fake::link(&[], listing);
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        let written = loop {
+            match second.next() {
+                ToCore::Close(close) => break (close.session, Instant::now()),
+                other => panic!("not CLOSE: {other:?}"),
+            }
+        };
+        assert_eq!(written.0, id);
+        eventually("the unused connection ends", || connection.is_dead());
+        // Not before `idle` (less the idle thread's look, a fifth of it).
+        assert!(written.1.elapsed() >= idle * 4 / 5, "{:?}", written.1.elapsed());
+        assert!(second.out.is_cut(), "its relay was ended");
+        // It doesn't come back.
+        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// 6.3: an eager connection (a profile that connects at launch) stays
+    /// with nothing using it.
+    #[test]
+    fn an_eager_relay_stays_unused() {
+        let (dial, plan) = fake::dialer("A8");
+        let idle = Duration::from_millis(100);
+        let timings = Timings { dead: Duration::from_secs(30), idle, ..fake::quick() };
+        let (eager, queue) = Connection::new(Transport::Relay { dial, timings }, "tok");
+        eager.set_eager(true);
+        let (writing, idling, reading) = (eager.clone(), eager.clone(), eager.clone());
+        std::thread::spawn(move || writing.write_loop(queue));
+        std::thread::spawn(move || idling.end_when_unused(idle));
+        std::thread::spawn(move || reading.run_relay());
+        let (link, far) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        far.hello();
+        std::thread::sleep(idle * 5);
+        assert!(!eager.is_dead());
+        assert!(!far.out.is_cut());
+        // No longer eager: it ends.
+        eager.set_eager(false);
+        eventually("the unused connection ends", || eager.is_dead());
+        assert!(far.out.is_cut());
     }
 
     #[test]
