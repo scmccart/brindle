@@ -711,6 +711,37 @@ impl<L: EventLoop> Core<L> {
         );
     }
 
+    /// `REPARENT` (Windows): the session's holder makes the client's window
+    /// the owner of the session's console window. It is advisory and has no
+    /// reply; only a session that isn't this client's is refused.
+    #[cfg(windows)]
+    pub(super) fn client_reparent(&mut self, client: Token, reparent: client::Reparent) {
+        let Some(session) = self.client_session(client, reparent.session) else {
+            return;
+        };
+        let holder = session.holder;
+        self.send_holder(
+            holder,
+            ToHolder::Reparent(h1::Reparent {
+                session: reparent.session,
+                hwnd: reparent.hwnd,
+            }),
+        );
+    }
+
+    /// `REPARENT` is for Windows: a session here has no console window.
+    #[cfg(not(windows))]
+    pub(super) fn client_reparent(&mut self, client: Token, reparent: client::Reparent) {
+        self.send_client(
+            client,
+            error(
+                None,
+                Some(reparent.session),
+                "REPARENT is for Windows; this core runs on Linux",
+            ),
+        );
+    }
+
     /// `ATTACH`: a session with no client gets this one, after a replay of
     /// its screen; then the client's size applies. A session that has a
     /// client is refused. When the attach changes the owner, the replay

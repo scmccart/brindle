@@ -79,7 +79,7 @@ $env:BRINDLE_REMOTE_AGENT = "$PWD/target/x86_64-unknown-linux-musl/release/brind
 
 ### Terminal server
 
-On Linux, every local tab runs in the terminal server, which is
+On Linux and Windows, every local tab runs in the terminal server, which is
 `brindle-remote` in two roles. Holders (`brindle-remote hold`) own the PTYs
 and are the programs' parents; the core (`brindle-remote serve`) runs an
 emulator per session, so a client that attaches or reconnects gets the
@@ -90,13 +90,22 @@ every screen, and holders of an older build drain, taking no new sessions.
 Their sockets, locks and logs (`core.log`, `holder-*.log`) are in
 `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else
 `~/.cache/brindle/run`. A socket path must fit in 108 bytes, so keep a custom
-`BRINDLE_SERVER_DIR` short.
+`BRINDLE_SERVER_DIR` short. On Windows the directory is
+`%LOCALAPPDATA%rindleun` (`run-elevated` for an elevated Brindle), or
+`%BRINDLE_SERVER_DIR%`, and the roles run from a per-build copy of
+`brindle-remote.exe`, so a rebuild or an upgrade never needs a running one
+replaced.
 
-The helper is therefore required on Linux, found as for remote profiles:
-`BRINDLE_REMOTE_AGENT`, else `brindle-remote-linux-x86_64` or `brindle-remote`
-beside `brindle`. Without it, a new tab says so and tries again for the next
-one. The release archive and `scripts/install.sh` ship it. Windows tabs don't
-use the server yet.
+The helper is therefore required, found through `BRINDLE_SERVER_HELPER`, else
+on Linux `BRINDLE_REMOTE_AGENT`, else `brindle-remote-linux-x86_64` or
+`brindle-remote` beside `brindle`, and on Windows `brindle-remote.exe` beside
+`brindle.exe`. (On Windows `BRINDLE_REMOTE_AGENT` still names the Linux helper
+for remote profiles.) Without it, a new tab says so and tries again for the
+next one. The Linux release archive and `scripts/install.sh` ship it.
+
+`brindle-remote list`, `kill`, `status` and `stop` manage the server from a
+shell on both platforms, with the same `BRINDLE_SERVER_DIR`; none of them
+starts one.
 
 Closing a zone or a tab ends its programs. Quitting Brindle (ctrl-shift-q,
 closing its window, a crash, or the desktop stopping it at logout) leaves
@@ -182,12 +191,15 @@ cargo build --release
 
 `scripts/fetch-conpty.ps1` downloads Microsoft's packaged ConPTY (the console
 host Windows Terminal ships, MIT-licensed), checked against a pinned hash, and
-the build embeds it in `brindle.exe`. Brindle hosts each tab with it, so what
+the build embeds it in `brindle-remote.exe`, the terminal server's helper,
+which hosts each tab with it, so what
 programs write reaches the terminal unchanged: mouse modes, synchronized
 updates, hyperlinks, notifications and color queries. A build made without it
 warns, and its tabs fall back to the ConPTY built into Windows, which repaints
-output instead of passing it through and drops mouse modes. Brindle logs a
-warning when it falls back. Run the script before `cargo install --path .` too.
+output instead of passing it through and drops mouse modes. The helper logs a
+warning when it falls back. `BRINDLE_CONPTY=inbox` in a profile's environment
+picks the inbox host for that session. Run the script before
+`cargo install --path .` too.
 
 GPUI's release build compiles its shaders with the SDK's `fxc.exe`, which it
 looks for on `PATH` and in SDK 10.0.26100.0. With another SDK version, point
@@ -334,12 +346,16 @@ in `~/.config/brindle` is kept either way.
 
 ### On Windows
 
-There's no installer: `brindle.exe` carries everything it needs, including the
-packaged ConPTY, which it unpacks to `%LOCALAPPDATA%\brindle\conpty` on first
-run. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
-zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with the exe, the Linux
-remote helper and the licences (`SHA256SUMS` beside it lists its hash); unpack it anywhere and run `brindle.exe`. Once
-releases are published to WinGet, it installs as a `brindle` command on `PATH`:
+There's no installer. The terminal server's helper, `brindle-remote.exe`,
+carries the packaged ConPTY and unpacks it to
+`%LOCALAPPDATA%\brindle\conpty\<version>` on first run; it must sit beside
+`brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
+zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
+`brindle-remote.exe`, the Linux remote helper and the licences (`SHA256SUMS`
+beside it lists its hash); unpack it anywhere, keeping the two exes together,
+and run `brindle.exe`. Once releases are published to WinGet, it installs as
+the `brindle` command on `PATH`, with the terminal server's `brindle-remote`
+(`brindle-remote status`, `list`, `kill`, `stop`) beside it:
 
 ```powershell
 winget install scmccart.brindle
@@ -355,7 +371,9 @@ brindle --uninstall-desktop
 winget uninstall scmccart.brindle
 ```
 
-From a checkout, fetch the packaged ConPTY first, so the build embeds it:
+From a checkout, fetch the packaged ConPTY first, so the build embeds it, and
+put `brindle-remote.exe` (`cargo build --release` builds it) beside the
+installed `brindle.exe`, or point `BRINDLE_SERVER_HELPER` at it:
 
 ```powershell
 scripts/fetch-conpty.ps1

@@ -1,11 +1,13 @@
 //! `brindle-remote serve`: the core, which clients talk to.
 //!
-//! The core owns the client socket and drives the holders, which own the
-//! PTYs. It can restart at any time without ending a session: a new core
+//! The core owns the client endpoint (`core.sock` on Linux, a named pipe on
+//! Windows; see `brindle_remote_protocol::endpoint`) and drives the
+//! holders, which own the PTYs. It can restart at any time without ending a session: a new core
 //! adopts the running holders and their sessions.
 //!
-//! - **Single instance:** `core.lock` is flocked for the core's whole life,
-//!   and only then is a stale `core.sock` unlinked and bound. A second
+//! - **Single instance:** `core.lock` is held for the core's whole life,
+//!   and only then is a stale `core.sock` replaced (a pipe leaves nothing
+//!   behind). A second
 //!   `serve` that can't take the lock waits until the winner accepts
 //!   connections, tells its starter it is ready, and exits 0.
 //! - **Clients** ([`clients`]): the peer check before reading anything, the
@@ -13,8 +15,9 @@
 //!   [`CLIENT_QUEUE_HIGH`] queued to a client, its sessions are paused in
 //!   their holders until the queue is under [`CLIENT_QUEUE_LOW`], so a
 //!   stalled client blocks only its own programs.
-//! - **Holders** ([`holders`]): found by their `holder-*.sock` sockets, live
-//!   ones told from stale ones by their lock files, and adopted (`HELLO`,
+//! - **Holders** ([`holders`]): found by their `holder-*.sock` sockets (on
+//!   Windows by their lock files, which name their pipes), live ones told
+//!   from stale ones by their lock files, and adopted (`HELLO`,
 //!   then `WELCOME` with the sessions, checkpoints and tails). Clients are
 //!   accepted once the holders found at startup are adopted, so session ids
 //!   continue from the largest adopted one and returning clients find their
@@ -27,8 +30,11 @@
 //!   [`RECONNECT_GRACE`] for their owners to come back. Each has an
 //!   emulator ([`screen`]) fed with all of its output.
 //! - **Exit:** after [`UNUSED_LIMIT`] with no sessions and no clients, once
-//!   `STOP` has ended every session, or after `STEP_DOWN`. The socket is
-//!   removed first.
+//!   `STOP` has ended every session, or after `STEP_DOWN`. On Linux the
+//!   socket is removed first.
+//! - **Windows:** a client's `REPARENT` goes to its session's holder, and
+//!   at its start the core removes the helper copies of other builds that
+//!   nothing runs from any more ([`prune_copies`]).
 
 mod clients;
 mod holders;
@@ -37,22 +43,22 @@ mod screen;
 mod sessions;
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{Request, ToClient};
+use brindle_remote_protocol::endpoint::{self, Endpoints};
 use brindle_remote_protocol::{RequestId, SessionId};
 
 use self::clients::{Client, Pending};
 use self::holders::{Holder, HolderStart, WaitingSpawn};
 use self::sessions::Session;
-use super::event_loop::{Event, EventLoop, Interest, PollLoop, Token};
+use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
+use super::platform::listen::{self, Identity, Listener};
+use super::platform::lock::Lock;
+use super::platform::sys;
 use super::{build_id, conn, daemon, dir};
 
 /// With no sessions and no clients for this long, the core exits.
@@ -87,14 +93,10 @@ macro_rules! log {
 }
 pub(crate) use log;
 
-/// Runs `brindle-remote serve [--ready-fd N]`. Without `--ready-fd` it stays
-/// in the foreground and logs to stderr.
+/// Runs `brindle-remote serve [--ready-fd N]` (`--ready-handle N` on
+/// Windows). Without it the core stays in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let ready_fd = daemon::parse_ready_fd("serve", args)?;
-    let ready = ready_fd
-        .map(daemon::Ready::from_fd)
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let ready = daemon::ready_from_args("serve", args)?;
     let dir = dir::from_env().map_err(|error| error.to_string())?;
     let paths = Paths::new(&dir).map_err(|error| error.to_string())?;
     let lock = match claim(&paths).map_err(|error| error.to_string())? {
@@ -113,8 +115,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         daemon::daemonize(&log).map_err(|error| error.to_string())?;
     }
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
-    let ev = PollLoop::new().map_err(|error| error.to_string())?;
-    let core = Core::new(ev, dir, paths, lock, build, dir::own_uid()).map_err(|error| {
+    prune_copies(&build);
+    let ev = Loop::new().map_err(|error| error.to_string())?;
+    let core = Core::new(ev, dir, paths, lock, build, Identity::own()).map_err(|error| {
         log!("can't start: {error}");
         error.to_string()
     })?;
@@ -129,37 +132,53 @@ pub fn run(args: &[String]) -> Result<(), String> {
     })
 }
 
-/// The core's files in the server directory.
+/// Where the core listens, and its files in the server directory.
 struct Paths {
+    endpoints: Endpoints,
     lock: PathBuf,
-    socket: PathBuf,
+    /// The socket on Linux, the pipe's name on Windows.
+    endpoint: PathBuf,
     log: PathBuf,
 }
 
 impl Paths {
     fn new(dir: &Path) -> io::Result<Self> {
-        let socket = dir.join("core.sock");
-        // sun_path holds 108 bytes with the terminating NUL.
-        if socket.as_os_str().len() > 107 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "the socket path {} is too long for a Unix socket; set a shorter BRINDLE_SERVER_DIR",
-                    socket.display()
-                ),
-            ));
-        }
+        let endpoints = Endpoints::of(dir)?;
+        let endpoint = endpoints.core();
+        listen::check_path(&endpoint)?;
         Ok(Self {
+            endpoints,
             lock: dir.join("core.lock"),
-            socket,
+            endpoint,
             log: dir.join("core.log"),
         })
     }
 }
 
+/// Removes the per-build helper copies of other builds, where nothing runs
+/// from them any more (Windows runs every role from a copy, since a running
+/// image can't be replaced). A copy still in use stays for a later core.
+#[cfg(windows)]
+fn prune_copies(build: &str) {
+    use brindle_remote_protocol::{server_dir, win};
+
+    let server_dir = std::env::var_os("BRINDLE_SERVER_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()) else {
+        return;
+    };
+    let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local));
+    win::prune_helper_copies(&copies, build);
+}
+
+/// Only Windows runs its roles from per-build copies.
+#[cfg(not(windows))]
+fn prune_copies(_build: &str) {}
+
 enum Claim {
     /// This process holds `core.lock` and becomes the core.
-    Core(File),
+    Core(Lock),
     /// Another core holds it and accepts connections.
     Running,
 }
@@ -169,21 +188,10 @@ enum Claim {
 fn claim(paths: &Paths) -> io::Result<Claim> {
     let deadline = Instant::now() + LOSER_WAIT;
     loop {
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&paths.lock)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if let Some(lock) = Lock::create(&paths.lock)? {
             return Ok(Claim::Core(lock));
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(error);
-        }
-        if UnixStream::connect(&paths.socket).is_ok() {
+        if listen::connect(&paths.endpoint).is_ok() {
             return Ok(Claim::Running);
         }
         if Instant::now() >= deadline {
@@ -198,10 +206,8 @@ fn claim(paths: &Paths) -> io::Result<Claim> {
 
 /// A random id for this core process, for the holders' logs and takeovers.
 fn random_instance() -> u64 {
-    let mut bytes = [0u8; 8];
-    let read = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-    if read == bytes.len() as isize {
-        return u64::from_ne_bytes(bytes);
+    if let Some(random) = sys::random_u64() {
+        return random;
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,11 +237,11 @@ pub(super) struct Core<L: EventLoop> {
     ev: L,
     dir: PathBuf,
     paths: Paths,
-    _lock: File,
-    listener: UnixListener,
+    _lock: Lock,
+    /// Closed when the core exits, before its last messages go out.
+    listener: Option<Listener>,
     /// Clients are accepted once the startup adoption is done.
     accepting: bool,
-    uid: u32,
     build: String,
     instance: u64,
     started: Instant,
@@ -265,27 +271,16 @@ impl<L: EventLoop> Core<L> {
         mut ev: L,
         dir: PathBuf,
         paths: Paths,
-        lock: File,
+        lock: Lock,
         build: String,
-        uid: u32,
+        identity: Identity,
     ) -> io::Result<Self> {
         // The lock is ours, so any socket at this path is stale.
-        match fs::remove_file(&paths.socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let listener = UnixListener::bind(&paths.socket).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("can't listen on {}: {error}", paths.socket.display()),
-            )
-        })?;
-        listener.set_nonblocking(true)?;
-        ev.register(listener.as_raw_fd(), LISTENER, Interest::NONE)?;
+        let listener = Listener::bind(&paths.endpoint, identity)?;
+        ev.register(&listener.source(), LISTENER, Interest::NONE)?;
         log!(
             "listening on {} (version {}, build {build})",
-            paths.socket.display(),
+            paths.endpoint.display(),
             env!("CARGO_PKG_VERSION")
         );
         Ok(Self {
@@ -293,9 +288,8 @@ impl<L: EventLoop> Core<L> {
             dir,
             paths,
             _lock: lock,
-            listener,
+            listener: Some(listener),
             accepting: false,
-            uid,
             build,
             instance: random_instance(),
             started: Instant::now(),
@@ -550,8 +544,12 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn shutdown(mut self) {
-        // Nothing can find this core once the socket is gone.
-        let _ = fs::remove_file(&self.paths.socket);
+        // Nothing can find this core once it stops listening and its socket
+        // is gone. (A pipe's name goes with the listener and the
+        // connections it accepted.)
+        self.drop_source(LISTENER);
+        self.listener = None;
+        let _ = endpoint::remove(&self.paths.endpoint);
         let stepped_down = self.stepping_down.take();
         if stepped_down.is_some() {
             // The checkpoints and GOODBYEs reach the holders before the
@@ -595,315 +593,365 @@ impl<L: EventLoop> Core<L> {
 mod tests {
     use super::*;
     use crate::server::dir::tests::TempDir;
-    use crate::server::peer::tests::{closed_unread, send_hello};
 
     /// A core in a fresh directory that runs, as far as its peer check is
-    /// concerned, as `uid`.
-    fn core_as(temp: &TempDir, uid: u32) -> Core<PollLoop> {
+    /// concerned, as `identity`.
+    fn core_as(temp: &TempDir, identity: Identity) -> Core<Loop> {
         let paths = Paths::new(&temp.0).unwrap();
         let Claim::Core(lock) = claim(&paths).unwrap() else {
             panic!("another core holds the lock");
         };
-        let ev = PollLoop::new().unwrap();
-        Core::new(ev, temp.0.clone(), paths, lock, "test".into(), uid).unwrap()
+        let ev = Loop::new().unwrap();
+        Core::new(ev, temp.0.clone(), paths, lock, "test".into(), identity).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_foreign_uid_is_closed_without_being_read() {
+        use crate::server::platform::listen::tests::TestPeer;
+
         let temp = TempDir::new("core-peer");
         // As if this core ran as someone else.
-        let mut core = core_as(&temp, dir::own_uid().wrapping_add(1));
-        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
-        send_hello(&mut stream);
+        let mut core = core_as(&temp, Identity::own().other());
+        let mut peer = TestPeer::connect(&core.paths.endpoint);
+        peer.send_hello();
         core.accept();
         assert!(core.pending.is_empty() && core.clients.is_empty());
-        assert!(closed_unread(&mut stream));
+        assert!(peer.closed_unread());
         drop(core);
 
         // The same connection from its own user waits for its HELLO.
         let temp = TempDir::new("core-peer-own");
-        let mut core = core_as(&temp, dir::own_uid());
-        let mut stream = UnixStream::connect(temp.0.join("core.sock")).unwrap();
-        send_hello(&mut stream);
+        let mut core = core_as(&temp, Identity::own());
+        let mut peer = TestPeer::connect(&core.paths.endpoint);
+        peer.send_hello();
         core.accept();
         assert_eq!(core.pending.len(), 1);
     }
 
-    use brindle_remote_protocol::Frame;
-    use brindle_remote_protocol::client as c1;
-    use brindle_remote_protocol::holder::{self as h1, SessionMeta, ToHolder};
+    /// The Windows form of the test above. A pipe has no reset, so a client
+    /// can't tell "closed unread" from "closed"; that the listener closes a
+    /// refused peer before reading is its own test's
+    /// (`platform::windows::listen`). Here: the core keeps nothing of a
+    /// peer that runs as another user, and that peer reads the end.
+    #[cfg(windows)]
+    #[test]
+    fn a_foreign_user_is_closed_and_never_becomes_a_client() {
+        use std::io::{Read, Write};
 
-    /// The other end of one of the core's connections, read and written
-    /// without blocking, since the test turns the core's loop itself.
-    struct Peer(conn::Conn);
+        let hello = [1u8, 0, 0, 0, 2, b'{', b'}'];
 
-    impl Peer {
-        fn send(&mut self, frame: io::Result<Frame>) {
-            self.0.queue(&frame.unwrap());
-            self.0.flush().unwrap();
-            assert_eq!(self.0.queued(), 0, "the core's socket was full");
-        }
+        let temp = TempDir::new("core-peer");
+        // As if this core ran as someone else.
+        let mut core = core_as(&temp, Identity::own().other());
+        let mut peer = listen::connect(&core.paths.endpoint).unwrap();
+        peer.write_all(&hello).unwrap();
+        core.accept();
+        assert!(core.pending.is_empty() && core.clients.is_empty());
+        let mut rest = Vec::new();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(peer.read_to_end(&mut rest).unwrap(), 0, "closed, with no answer");
+        drop(core);
 
-        /// The next frame the core has sent, if one is there.
-        fn frame(&mut self) -> Option<Frame> {
-            if let Some(frame) = self.0.next_frame().unwrap() {
-                return Some(frame);
-            }
-            let _ = self.0.read_available();
-            self.0.next_frame().unwrap()
-        }
-
-        fn message(&mut self) -> Option<ToClient> {
-            self.frame().map(|frame| ToClient::decode(&frame).unwrap())
-        }
+        // The same connection from its own user waits for its HELLO.
+        let temp = TempDir::new("core-peer-own");
+        let mut core = core_as(&temp, Identity::own());
+        let mut peer = listen::connect(&core.paths.endpoint).unwrap();
+        peer.write_all(&hello).unwrap();
+        core.accept();
+        assert_eq!(core.pending.len(), 1);
     }
 
-    const SESSION: SessionId = 1;
-    const ATTACH: RequestId = 7;
+    /// A replay waits until its holder's socket has the session's new
+    /// owner. Linux only: the stand-in holder is a locked file and a Unix
+    /// socket, and on Windows `remote-agent/tests/core.rs`'s
+    /// `an_attach_holds_when_the_core_is_killed_as_its_replay_starts`
+    /// covers it.
+    #[cfg(unix)]
+    mod stored_before_told {
+        use std::fs::File;
+        use std::os::fd::AsRawFd as _;
 
-    /// A core that adopted session 1, which is A's, from a holder that then
-    /// stopped reading with far more queued for it than its socket holds,
-    /// and client B, whose `ATTACH` of the session the core has handled:
-    /// the `SET_META` naming B is queued behind all that.
-    struct WaitingAttach {
-        _temp: TempDir,
-        core: Core<PollLoop>,
-        events: Vec<Event>,
-        /// The holder's end of the core's connection, until a test ends it.
-        holder: Option<Peer>,
-        /// What makes it a live holder for the core: its lock and socket.
-        holder_files: Option<(File, UnixListener)>,
-        client: Peer,
-    }
+        use super::*;
 
-    impl WaitingAttach {
-        fn holder(&mut self) -> &mut Peer {
-            self.holder.as_mut().expect("the holder")
-        }
+        use brindle_remote_protocol::Frame;
+        use brindle_remote_protocol::client as c1;
+        use brindle_remote_protocol::holder::{self as h1, SessionMeta, ToHolder};
 
-        fn turn(&mut self) {
-            self.core
-                .turn(&mut self.events, Duration::from_millis(5))
-                .unwrap();
-        }
+        /// The other end of one of the core's connections, read and written
+        /// without blocking, since the test turns the core's loop itself.
+        struct Peer(conn::Conn);
 
-        /// Turns the core until `done`, for a few seconds at most.
-        fn turn_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !done(self) {
-                assert!(Instant::now() < deadline, "never happened: {what}");
-                self.turn();
+        impl Peer {
+            fn send(&mut self, frame: io::Result<Frame>) {
+                self.0.queue(&frame.unwrap());
+                self.0.flush().unwrap();
+                assert_eq!(self.0.queued(), 0, "the core's socket was full");
+            }
+
+            /// The next frame the core has sent, if one is there.
+            fn frame(&mut self) -> Option<Frame> {
+                if let Some(frame) = self.0.next_frame().unwrap() {
+                    return Some(frame);
+                }
+                let _ = self.0.read_available();
+                self.0.next_frame().unwrap()
+            }
+
+            fn message(&mut self) -> Option<ToClient> {
+                self.frame().map(|frame| ToClient::decode(&frame).unwrap())
             }
         }
 
-        fn new(tag: &str) -> Self {
-            let temp = TempDir::new(tag);
-            // A live holder: its lock held, its socket listening.
-            let lock = File::create(temp.0.join("holder-test-0.lock")).unwrap();
-            assert_eq!(
-                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                0
-            );
-            let listener = UnixListener::bind(temp.0.join("holder-test-0.sock")).unwrap();
-            let mut core = core_as(&temp, dir::own_uid());
-            core.discover(true);
-            let holder = Peer(conn::Conn::new(listener.accept().unwrap().0).unwrap());
-            let client = UnixStream::connect(temp.0.join("core.sock")).unwrap();
-            let mut test = Self {
-                _temp: temp,
-                core,
-                events: Vec::new(),
-                holder: Some(holder),
-                holder_files: Some((lock, listener)),
-                client: Peer(conn::Conn::new(client).unwrap()),
-            };
+        const SESSION: SessionId = 1;
+        const ATTACH: RequestId = 7;
 
-            // The holder welcomes the core with A's session.
-            let mut hello = None;
-            test.turn_until("the core's HELLO", |test| {
-                hello = test.holder().frame();
-                hello.is_some()
-            });
-            assert!(matches!(
-                ToHolder::decode(&hello.unwrap()).unwrap(),
-                ToHolder::Hello(_)
-            ));
-            let meta = SessionMeta {
-                command: "cat".into(),
-                key: "key".into(),
-                owner: "a".into(),
-                policy: c1::Policy::Detach,
-                scrollback: 100,
-                ..SessionMeta::default()
-            };
-            test.holder().send(
-                h1::ToCore::Welcome(h1::Welcome {
-                    protocol: h1::PROTOCOLS.max,
-                    build: "test".into(),
-                    pid: std::process::id(),
-                    previous: h1::Previous::Crash,
-                    sessions: vec![h1::HeldSession {
-                        session: SESSION,
-                        pid: 4242,
-                        cols: 80,
-                        rows: 24,
-                        exit: None,
-                        meta: meta.to_value(),
-                        truncated: false,
-                    }],
-                })
-                .encode(),
-            );
-            let blobs = h1::ToCore::checkpoint(SESSION, b"before")
-                .into_iter()
-                .chain(h1::ToCore::tail(SESSION, b""));
-            for message in blobs {
-                test.holder().send(message.encode());
+        /// A core that adopted session 1, which is A's, from a holder that then
+        /// stopped reading with far more queued for it than its socket holds,
+        /// and client B, whose `ATTACH` of the session the core has handled:
+        /// the `SET_META` naming B is queued behind all that.
+        struct WaitingAttach {
+            _temp: TempDir,
+            core: Core<Loop>,
+            events: Vec<Event>,
+            /// The holder's end of the core's connection, until a test ends it.
+            holder: Option<Peer>,
+            /// What makes it a live holder for the core: its lock and socket.
+            holder_files: Option<(File, Listener)>,
+            client: Peer,
+        }
+
+        impl WaitingAttach {
+            fn holder(&mut self) -> &mut Peer {
+                self.holder.as_mut().expect("the holder")
             }
-            test.turn_until("accepting clients", |test| test.core.accepting);
 
-            // B connects.
-            test.client.send(
-                c1::ToCore::Hello(c1::Hello {
-                    min: c1::PROTOCOLS.min,
-                    max: c1::PROTOCOLS.max,
-                    client_version: "test".into(),
-                    client_token: "b".into(),
-                })
-                .encode(),
-            );
-            let mut welcome = None;
-            test.turn_until("the client's WELCOME", |test| {
-                welcome = test.client.message();
-                welcome.is_some()
-            });
-            assert!(matches!(welcome, Some(ToClient::Welcome(_))), "{welcome:?}");
+            fn turn(&mut self) {
+                self.core
+                    .turn(&mut self.events, Duration::from_millis(5))
+                    .unwrap();
+            }
 
-            // The holder reads nothing from here on, and its socket fills.
-            let token = *test.core.holders.keys().next().unwrap();
-            for _ in 0..8 {
-                test.core.send_holder(
-                    token,
-                    ToHolder::Input(h1::Data {
-                        session: SESSION,
-                        bytes: vec![b'x'; 1024 * 1024 - 64],
-                    }),
+            /// Turns the core until `done`, for a few seconds at most.
+            fn turn_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !done(self) {
+                    assert!(Instant::now() < deadline, "never happened: {what}");
+                    self.turn();
+                }
+            }
+
+            fn new(tag: &str) -> Self {
+                let temp = TempDir::new(tag);
+                // A live holder: its lock held, its socket listening.
+                let lock = File::create(temp.0.join("holder-test-0.lock")).unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
                 );
-            }
-            test.turn();
-            assert!(
-                test.core.holders[&token].conn.queued() > 0,
-                "the holder's socket took 8 MiB unread"
-            );
+                let listener =
+                    Listener::bind(&temp.0.join("holder-test-0.sock"), Identity::own()).unwrap();
+                let mut core = core_as(&temp, Identity::own());
+                core.discover(true);
+                let accepted = listener.accept().unwrap().expect("the core's connection");
+                let holder = Peer(conn::Conn::new(accepted).unwrap());
+                let client = listen::connect(&temp.0.join("core.sock")).unwrap();
+                let mut test = Self {
+                    _temp: temp,
+                    core,
+                    events: Vec::new(),
+                    holder: Some(holder),
+                    holder_files: Some((lock, listener)),
+                    client: Peer(conn::Conn::new(client).unwrap()),
+                };
 
-            // B attaches, and the session prints while the replay waits.
-            test.client.send(
-                c1::ToCore::Attach(c1::Attach {
-                    req: ATTACH,
-                    session: SESSION,
-                    cols: 100,
-                    rows: 30,
-                })
-                .encode(),
-            );
-            test.turn_until("the ATTACH is handled", |test| {
-                test.core.sessions[&SESSION].attached.is_some()
-            });
-            test.holder().send(
-                h1::ToCore::Output(h1::Data {
-                    session: SESSION,
-                    bytes: b" and after".to_vec(),
-                })
-                .encode(),
-            );
-            for _ in 0..5 {
+                // The holder welcomes the core with A's session.
+                let mut hello = None;
+                test.turn_until("the core's HELLO", |test| {
+                    hello = test.holder().frame();
+                    hello.is_some()
+                });
+                assert!(matches!(
+                    ToHolder::decode(&hello.unwrap()).unwrap(),
+                    ToHolder::Hello(_)
+                ));
+                let meta = SessionMeta {
+                    command: "cat".into(),
+                    key: "key".into(),
+                    owner: "a".into(),
+                    policy: c1::Policy::Detach,
+                    scrollback: 100,
+                    ..SessionMeta::default()
+                };
+                test.holder().send(
+                    h1::ToCore::Welcome(h1::Welcome {
+                        protocol: h1::PROTOCOLS.max,
+                        build: "test".into(),
+                        pid: std::process::id(),
+                        previous: h1::Previous::Crash,
+                        sessions: vec![h1::HeldSession {
+                            session: SESSION,
+                            pid: 4242,
+                            cols: 80,
+                            rows: 24,
+                            exit: None,
+                            meta: meta.to_value(),
+                            truncated: false,
+                        }],
+                    })
+                    .encode(),
+                );
+                let blobs = h1::ToCore::checkpoint(SESSION, b"before")
+                    .into_iter()
+                    .chain(h1::ToCore::tail(SESSION, b""));
+                for message in blobs {
+                    test.holder().send(message.encode());
+                }
+                test.turn_until("accepting clients", |test| test.core.accepting);
+
+                // B connects.
+                test.client.send(
+                    c1::ToCore::Hello(c1::Hello {
+                        min: c1::PROTOCOLS.min,
+                        max: c1::PROTOCOLS.max,
+                        client_version: "test".into(),
+                        client_token: "b".into(),
+                    })
+                    .encode(),
+                );
+                let mut welcome = None;
+                test.turn_until("the client's WELCOME", |test| {
+                    welcome = test.client.message();
+                    welcome.is_some()
+                });
+                assert!(matches!(welcome, Some(ToClient::Welcome(_))), "{welcome:?}");
+
+                // The holder reads nothing from here on, and its socket fills.
+                let token = *test.core.holders.keys().next().unwrap();
+                for _ in 0..8 {
+                    test.core.send_holder(
+                        token,
+                        ToHolder::Input(h1::Data {
+                            session: SESSION,
+                            bytes: vec![b'x'; 1024 * 1024 - 64],
+                        }),
+                    );
+                }
                 test.turn();
-                let told = test.client.message();
-                assert!(told.is_none(), "told before its meta was stored: {told:?}");
-            }
-            test
-        }
+                assert!(
+                    test.core.holders[&token].conn.queued() > 0,
+                    "the holder's socket took 8 MiB unread"
+                );
 
-        /// The rest of the replay whose `REPLAY_START` the client has, from
-        /// what its socket already holds: the core isn't turned.
-        fn replay_body(&mut self) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            loop {
-                match self.client.message() {
-                    Some(ToClient::Data(data)) => bytes.extend(data.bytes),
-                    Some(ToClient::ReplayEnd(_)) => return bytes,
-                    other => panic!("in the replay: {other:?}"),
+                // B attaches, and the session prints while the replay waits.
+                test.client.send(
+                    c1::ToCore::Attach(c1::Attach {
+                        req: ATTACH,
+                        session: SESSION,
+                        cols: 100,
+                        rows: 30,
+                    })
+                    .encode(),
+                );
+                test.turn_until("the ATTACH is handled", |test| {
+                    test.core.sessions[&SESSION].attached.is_some()
+                });
+                test.holder().send(
+                    h1::ToCore::Output(h1::Data {
+                        session: SESSION,
+                        bytes: b" and after".to_vec(),
+                    })
+                    .encode(),
+                );
+                for _ in 0..5 {
+                    test.turn();
+                    let told = test.client.message();
+                    assert!(told.is_none(), "told before its meta was stored: {told:?}");
+                }
+                test
+            }
+
+            /// The rest of the replay whose `REPLAY_START` the client has, from
+            /// what its socket already holds: the core isn't turned.
+            fn replay_body(&mut self) -> Vec<u8> {
+                let mut bytes = Vec::new();
+                loop {
+                    match self.client.message() {
+                        Some(ToClient::Data(data)) => bytes.extend(data.bytes),
+                        Some(ToClient::ReplayEnd(_)) => return bytes,
+                        other => panic!("in the replay: {other:?}"),
+                    }
                 }
             }
         }
-    }
 
-    fn is_replay_start(message: &ToClient) -> bool {
-        matches!(
-            message,
-            ToClient::ReplayStart(start) if start.req == Some(ATTACH) && start.session == SESSION
-        )
-    }
-
-    #[test]
-    fn an_attachs_replay_waits_until_the_holders_socket_has_its_new_owner() {
-        let mut test = WaitingAttach::new("core-stored");
-        // The holder reads on, a part at a time.
-        let mut start = None;
-        test.turn_until("the replay", |test| {
-            let _ = test.holder().0.read_available();
-            start = test.client.message();
-            start.is_some()
-        });
-        // Nothing came before it, and what the session printed meanwhile is
-        // in it.
-        assert!(start.as_ref().is_some_and(is_replay_start), "{start:?}");
-        let replay = String::from_utf8(test.replay_body()).unwrap();
-        assert!(replay.contains("before and after"), "{replay:?}");
-
-        // The core is killed now, as far as the holder can tell: it reads
-        // what its socket holds, then the end. B's ownership is in that.
-        let WaitingAttach { core, holder, .. } = test;
-        let mut holder = holder.expect("the holder");
-        drop(core);
-        while matches!(holder.0.read_available(), Ok(false)) {}
-        let mut owner = None;
-        while let Some(frame) = holder.0.next_frame().unwrap() {
-            if let ToHolder::SetMeta(update) = ToHolder::decode(&frame).unwrap() {
-                assert_eq!(update.session, SESSION);
-                owner = Some(SessionMeta::from_value(&update.meta).owner);
-            }
+        fn is_replay_start(message: &ToClient) -> bool {
+            matches!(
+                message,
+                ToClient::ReplayStart(start) if start.req == Some(ATTACH) && start.session == SESSION
+            )
         }
-        assert_eq!(owner.as_deref(), Some("b"));
-    }
 
-    #[test]
-    fn a_replay_waiting_for_its_holder_goes_out_when_the_holder_is_lost() {
-        let mut test = WaitingAttach::new("core-stored-lost");
-        // The holder goes, with the new owner never written to it.
-        test.holder = None;
-        test.holder_files = None;
-        let mut start = None;
-        test.turn_until("the replay", |test| {
-            start = test.client.message();
-            start.is_some()
-        });
-        // The replay answers the ATTACH, then the session is lost.
-        assert!(start.as_ref().is_some_and(is_replay_start), "{start:?}");
-        let replay = String::from_utf8(test.replay_body()).unwrap();
-        assert!(replay.contains("before and after"), "{replay:?}");
-        let mut exit = None;
-        test.turn_until("the session's loss", |test| {
-            exit = test.client.message();
-            exit.is_some()
-        });
-        match exit {
-            Some(ToClient::Exit(exit)) => {
-                assert_eq!((exit.session, exit.code), (SESSION, None));
-                assert!(exit.lost.is_some());
+        #[test]
+        fn an_attachs_replay_waits_until_the_holders_socket_has_its_new_owner() {
+            let mut test = WaitingAttach::new("core-stored");
+            // The holder reads on, a part at a time.
+            let mut start = None;
+            test.turn_until("the replay", |test| {
+                let _ = test.holder().0.read_available();
+                start = test.client.message();
+                start.is_some()
+            });
+            // Nothing came before it, and what the session printed meanwhile is
+            // in it.
+            assert!(start.as_ref().is_some_and(is_replay_start), "{start:?}");
+            let replay = String::from_utf8(test.replay_body()).unwrap();
+            assert!(replay.contains("before and after"), "{replay:?}");
+
+            // The core is killed now, as far as the holder can tell: it reads
+            // what its socket holds, then the end. B's ownership is in that.
+            let WaitingAttach { core, holder, .. } = test;
+            let mut holder = holder.expect("the holder");
+            drop(core);
+            while matches!(holder.0.read_available(), Ok(false)) {}
+            let mut owner = None;
+            while let Some(frame) = holder.0.next_frame().unwrap() {
+                if let ToHolder::SetMeta(update) = ToHolder::decode(&frame).unwrap() {
+                    assert_eq!(update.session, SESSION);
+                    owner = Some(SessionMeta::from_value(&update.meta).owner);
+                }
             }
-            other => panic!("{other:?}"),
+            assert_eq!(owner.as_deref(), Some("b"));
         }
-        assert!(test.core.sessions.is_empty());
+
+        #[test]
+        fn a_replay_waiting_for_its_holder_goes_out_when_the_holder_is_lost() {
+            let mut test = WaitingAttach::new("core-stored-lost");
+            // The holder goes, with the new owner never written to it.
+            test.holder = None;
+            test.holder_files = None;
+            let mut start = None;
+            test.turn_until("the replay", |test| {
+                start = test.client.message();
+                start.is_some()
+            });
+            // The replay answers the ATTACH, then the session is lost.
+            assert!(start.as_ref().is_some_and(is_replay_start), "{start:?}");
+            let replay = String::from_utf8(test.replay_body()).unwrap();
+            assert!(replay.contains("before and after"), "{replay:?}");
+            let mut exit = None;
+            test.turn_until("the session's loss", |test| {
+                exit = test.client.message();
+                exit.is_some()
+            });
+            match exit {
+                Some(ToClient::Exit(exit)) => {
+                    assert_eq!((exit.session, exit.code), (SESSION, None));
+                    assert!(exit.lost.is_some());
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(test.core.sessions.is_empty());
+        }
     }
 }

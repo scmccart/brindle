@@ -1,7 +1,7 @@
 //! The cases. Each is one function; `all` lists them in run order.
 //!
-//! Windows runs only its own cases (`win`): the others need X11 and the
-//! Linux terminal server.
+//! Windows runs only its own cases (`win`), which include the `local-server-*`
+//! ones: the others need X11.
 #![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(windows)]

@@ -17,6 +17,9 @@ alacritty_terminal = "0.26.0"
 anyhow = "1"
 base64 = "0.22"
 dirs = "5"
+# Resolving brindle.exe through a WinGet link without the `\\?\` prefix
+# (`remote::exe_paths`); already in the lockfile through gpui_util.
+dunce = "1"
 getrandom = "0.3"
 env_logger = "0.11"
 futures = "0.3"
@@ -33,9 +36,6 @@ toml = "0.8"
 toml_edit = "0.22.27"
 shlex = "1.3"
 unicode-width = "0.2"
-# Names the types in alacritty's `EventedReadWrite` trait (shell integration
-# wraps its PTY); the version alacritty_terminal already uses.
-polling = "=3.11.0"
 raw-window-handle = "0.6"
 
 [target.'cfg(unix)'.dependencies]
@@ -50,8 +50,8 @@ wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.31.2", features = ["client", "staging"] }
 
-# The pseudoconsole, process snapshots, shortcuts and toasts. GPUI already
-# builds this version, so only the features below are new.
+# The terminal server's pipes, process snapshots, shortcuts and toasts. GPUI
+# already builds this version, so only the features below are new.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
   "Data_Xml_Dom",
@@ -66,7 +66,6 @@ windows = { version = "0.61", features = [
   "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
-  "Win32_System_LibraryLoader",
   "Win32_System_Pipes",
   "Win32_System_Registry",
   "Win32_System_Threading",

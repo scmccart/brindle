@@ -196,7 +196,7 @@ enum PaletteKind {
 /// Kills `kill` (if given), then lists the server's detached sessions,
 /// through the process's shared connection. Blocks: off the UI thread.
 fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         let connection = crate::remote::local::shared()?;
         if let Some(id) = kill
@@ -207,7 +207,7 @@ fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
         // A killed session stays listed until its program has exited.
         Ok(connection.list()?.into_iter().filter(|s| !s.attached && Some(s.session) != kill).collect())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = kill;
         Ok(Vec::new())
@@ -403,7 +403,7 @@ impl Workspace {
                     };
                     match (zones, found) {
                         (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", windows))]
                         (None, Some(info)) => {
                             let profile = config.profiles[profile].clone();
                             let terminal = Self::attached_terminal(&info, &profile, &config, cx);
@@ -564,9 +564,8 @@ impl Workspace {
     }
 
     /// A local tab showing `terminal` alone, inserted after the active tab,
-    /// and activated when `activate`. Only attached sessions open this way,
-    /// and only Linux has the terminal server.
-    #[cfg(target_os = "linux")]
+    /// and activated when `activate`. Only attached sessions open this way.
+    #[cfg(any(target_os = "linux", windows))]
     fn insert_terminal_tab(
         &mut self,
         profile: Profile,
@@ -602,7 +601,7 @@ impl Workspace {
 
     /// A terminal attached to the detached session `info`, closing as
     /// `profile` says.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn attached_terminal(info: &SessionInfo, profile: &Profile, config: &Config, cx: &mut Context<Self>) -> Entity<Terminal> {
         // At the session's own size, so attaching resizes nothing; a core
         // that predates sizes in `LIST` reports 0.
@@ -623,11 +622,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
         let found = Self::take_detached(recorded, cx);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if let Some(info) = found {
             return Self::attached_terminal(&info, profile, config, cx);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         let _ = found;
         cx.new(|cx| Terminal::spawn(profile, None, Some(cwd), config, cx))
     }
@@ -637,7 +636,7 @@ impl Workspace {
     /// profile its meta names (the default one when it's gone). The active
     /// tab stays the same.
     pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
             for info in sessions {
@@ -652,7 +651,7 @@ impl Workspace {
                 self.insert_terminal_tab(profile, terminal, activate, window, cx);
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (sessions, window, cx);
     }
 
@@ -1252,7 +1251,7 @@ impl Workspace {
 
     /// Attaches a detached session into a new tab after the active one.
     fn attach_detached_here(&mut self, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
             let index = info
@@ -1264,7 +1263,7 @@ impl Workspace {
             let terminal = Self::attached_terminal(&info, &profile, &config, cx);
             self.insert_terminal_tab(profile, terminal, true, window, cx);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (info, window, cx);
     }
 

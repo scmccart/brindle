@@ -569,13 +569,13 @@ impl ZoneTreeView {
 
     /// The terminal server session zone `id` shows, for session restore.
     pub fn zone_server_session(&self, id: ZoneId, cx: &App) -> Option<crate::session::ServerSession> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let zone = self.zones.get(&id)?;
             let (id, key) = zone.content.as_terminal_view().read(cx).terminal.read(cx).server_session()?;
             Some(crate::session::ServerSession { id, key })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (id, cx);
             None

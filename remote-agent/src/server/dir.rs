@@ -1,81 +1,25 @@
-//! The server directory: where the core's and holders' sockets, locks and
-//! logs live.
-//!
-//! It is `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else
-//! `~/.cache/brindle/run`, created with mode 0700. An existing directory is
-//! used only when it belongs to this user and no one else can enter it.
+//! The server directory: where the core's and holders' locks and logs live,
+//! and on Linux their sockets (Windows names its pipes from the directory
+//! instead). The platform says where it is and who may enter it.
 
-use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Shared with Brindle's client, so both find the same directory.
-pub use brindle_remote_protocol::server_dir::resolve;
+use super::platform::dir;
+pub use super::platform::dir::resolve_from_env;
 
 /// The server directory for this process's environment, created if needed.
 pub fn from_env() -> io::Result<PathBuf> {
-    let dir = resolve_from_env()?;
-    ensure(&dir, own_uid())?;
-    Ok(dir)
-}
-
-/// Where the server directory for this process's environment is, without
-/// creating it.
-pub fn resolve_from_env() -> io::Result<PathBuf> {
-    resolve(
-        std::env::var_os("BRINDLE_SERVER_DIR"),
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        crate::pty::home_dir(&Default::default()),
-    )
-}
-
-pub fn own_uid() -> u32 {
-    unsafe { libc::geteuid() }
-}
-
-/// Creates `dir` (and missing parents) with mode 0700, or checks that the
-/// existing one is a real directory owned by `uid` with no group or other
-/// permissions.
-pub fn ensure(dir: &Path, uid: u32) -> io::Result<()> {
-    match DirBuilder::new().recursive(true).mode(0o700).create(dir) {
-        Ok(()) => {}
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!(
-                    "can't create the server directory {}: {error}",
-                    dir.display()
-                ),
-            ));
-        }
-    }
-    let metadata = fs::symlink_metadata(dir)?;
-    let refuse = |problem: String| {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("refusing the server directory {}: {problem}", dir.display()),
-        ))
-    };
-    if !metadata.is_dir() {
-        return refuse("it is not a directory".into());
-    }
-    if metadata.uid() != uid {
-        return refuse(format!("it belongs to uid {}, not {uid}", metadata.uid()));
-    }
-    let mode = metadata.mode() & 0o7777;
-    if mode & 0o077 != 0 {
-        return refuse(format!("its mode is {mode:04o}; it must be 0700"));
-    }
-    Ok(())
+    let path = resolve_from_env()?;
+    dir::ensure(&path)?;
+    Ok(path)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::*;
 
     /// A fresh, empty directory under the system temp dir, removed on drop.
     pub struct TempDir(pub PathBuf);
@@ -96,40 +40,5 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[test]
-    fn a_new_directory_is_user_only() {
-        let temp = TempDir::new("dir-new");
-        let dir = temp.0.join("a/brindle");
-        ensure(&dir, own_uid()).unwrap();
-        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-        // Existing and correct is fine.
-        ensure(&dir, own_uid()).unwrap();
-    }
-
-    #[test]
-    fn wider_modes_other_owners_and_files_are_refused() {
-        let temp = TempDir::new("dir-bad");
-        let dir = temp.0.join("open");
-        fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
-        let error = ensure(&dir, own_uid()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("0750"), "{error}");
-
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let error = ensure(&dir, own_uid() + 1).unwrap_err();
-        assert!(error.to_string().contains("belongs to uid"), "{error}");
-
-        let file = temp.0.join("file");
-        fs::write(&file, b"").unwrap();
-        assert!(ensure(&file, own_uid()).is_err());
-
-        let link = temp.0.join("link");
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
-        let error = ensure(&link, own_uid()).unwrap_err();
-        assert!(error.to_string().contains("not a directory"), "{error}");
     }
 }

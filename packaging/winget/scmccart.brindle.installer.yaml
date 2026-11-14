@@ -1,6 +1,10 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
-# The release zip holds brindle.exe, which needs nothing beside it, so WinGet
-# installs it as a portable command and links it onto PATH as `brindle`.
+# The release zip holds brindle.exe and the terminal server helper,
+# brindle-remote.exe, which local tabs need beside it. WinGet installs both as
+# portable commands. Each gets an alias because WinGet runs them through
+# symlinks in its Links directory, and Brindle looks for the helper beside the
+# path it was started from, the link: so Links\brindle-remote.exe must exist.
+# It also puts the helper's own commands (list, kill, status, stop) on PATH.
 PackageIdentifier: scmccart.brindle
 PackageVersion: "{{version}}"
 InstallerType: zip
@@ -8,6 +12,8 @@ NestedInstallerType: portable
 NestedInstallerFiles:
   - RelativeFilePath: brindle.exe
     PortableCommandAlias: brindle
+  - RelativeFilePath: brindle-remote.exe
+    PortableCommandAlias: brindle-remote
 # Windows 11 only.
 MinimumOSVersion: 10.0.22000.0
 Installers:

@@ -1,18 +1,15 @@
-//! Windows cases: local tabs through Brindle's own pseudoconsole. They run
-//! PowerShell or cmd, and check the screen dump, the log, the notification
-//! log and the console host process.
+//! Windows cases: local tabs in the case's own terminal server, on its
+//! holder's pseudoconsoles. They run PowerShell or cmd, and check the
+//! screen dump, Brindle's and the holder's logs, the notification log and
+//! the console host process.
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
-
+use super::local_server;
 use crate::brindle::Dump;
-use crate::{Case, Ctx, Outcome, Result, ensure};
+use crate::{Case, Ctx, Outcome, Result, ensure, winproc};
 
 pub fn all() -> Vec<Case> {
     let display = |name, run| Case { name, display: true, run };
@@ -27,6 +24,32 @@ pub fn all() -> Vec<Case> {
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
         display("windows-zones", zones),
+        display("local-server-session", local_server::session),
+        display("local-server-close", local_server::close),
+        display("local-server-quit", local_server::quit),
+        display("local-server-crash", local_server::crash),
+        display("local-server-close-zone", local_server::close_zone),
+        display("local-server-close-window", local_server::close_window),
+        display("local-server-close-command", local_server::close_command),
+        display("local-server-reattach-quit", local_server::reattach_quit),
+        display("local-server-reattach-crash", local_server::reattach_crash),
+        display("local-server-reattach-killed", local_server::reattach_killed),
+        display("local-server-reattach-inactive", local_server::reattach_inactive),
+        display("local-server-reattach-closed-tab", local_server::reattach_closed_tab),
+        display("local-server-reattach-no-restore", local_server::reattach_no_restore),
+        display("local-server-reattach-second", local_server::reattach_second),
+        display("local-server-palette", local_server::palette),
+        display("local-server-attach-flag", local_server::attach_flag),
+        display("local-server-env", local_server::env),
+        display("local-server-core-restart", local_server::core_restart),
+        display("local-server-replay-quiet", local_server::replay_quiet),
+        display("local-server-holder-lost", local_server::holder_lost),
+        display("local-server-no-helper", local_server::no_helper),
+        display("local-server-upgrade", local_server::upgrade),
+        display("local-server-manage", local_server::manage),
+        display("local-server-message-box", local_server::message_box),
+        display("local-server-inbox-host", local_server::inbox_host),
+        display("local-server-elevated", local_server::elevated),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -222,8 +245,25 @@ struct Probe<'a> {
 
 type During<'a> = Option<Probe<'a>>;
 
-/// [`run`] with another config.
+/// [`run`] with another config. The sessions the run leaves detached are
+/// hung up, so the case's next run starts with only the tabs it asks for.
 fn run_with(
+    ctx: &Ctx,
+    config_text: &str,
+    label: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    dump_at: f64,
+    during: During,
+) -> Result<Ran> {
+    let ran = run_keeping(ctx, config_text, label, args, env, dump_at, during)?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(ran)
+}
+
+/// [`run_with`], leaving the sessions the run leaves detached (a quit
+/// leaves every profile tab's) for the next run to attach.
+fn run_keeping(
     ctx: &Ctx,
     config_text: &str,
     label: &str,
@@ -245,6 +285,7 @@ fn run_with(
         .args(["--dump-screen-after", &ctx.secs(dump_at).to_string()])
         .env("BRINDLE_CONFIG", &config)
         .env("BRINDLE_STATE_DIR", ctx.dir.join("state"))
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env("RUST_LOG", "brindle=info,warn")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
@@ -277,29 +318,38 @@ fn run_with(
     Ok(Ran { dump: Dump::parse(&stdout), log, during: seen })
 }
 
-/// The executable names of `pid`'s direct children.
-fn children(pid: u32) -> Vec<String> {
-    let mut names = Vec::new();
-    // SAFETY: a process snapshot, walked with a correctly sized entry and
-    // closed afterwards.
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return names };
-        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
-        while more {
-            if entry.th32ParentProcessID == pid {
-                let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-                names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
-            }
-            more = Process32NextW(snapshot, &mut entry).is_ok();
-        }
-        CloseHandle(snapshot).ok();
+/// The executable names of the processes the case's holders started: their
+/// sessions' console hosts and programs.
+fn holder_children(ctx: &Ctx) -> String {
+    let holders: Vec<u32> =
+        crate::server_processes(&ctx.server_dir).into_iter().filter(|(_, role)| role == "hold").map(|(pid, _)| pid).collect();
+    if holders.is_empty() {
+        return "no holder".into();
     }
-    names
+    let all = winproc::all();
+    let listed: Vec<String> = all.iter().map(|p| format!("{}\t{}\t{}\n", p.pid, p.parent, p.name)).collect();
+    ctx.save("processes.txt", format!("holders: {holders:?}\npid\tparent\tname\n{}", listed.concat()));
+    let names: Vec<String> = all.into_iter().filter(|p| holders.contains(&p.parent)).map(|p| p.name).collect();
+    names.join(",")
 }
 
-fn host_children(pid: u32) -> String {
-    children(pid).join(",")
+/// What the case's holders have logged, which includes the ConPTY their
+/// sessions got. Saved as `holders.log`.
+fn holder_logs(ctx: &Ctx) -> String {
+    let mut logs = String::new();
+    for entry in std::fs::read_dir(&ctx.server_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("holder-") && name.ends_with(".log") {
+            logs.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+    }
+    ctx.save("holders.log", &logs);
+    logs
+}
+
+/// Whether `exe` is on `PATH`.
+fn on_path(exe: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe).is_file()))
 }
 
 /// How many of a `host_children` list are named `name`.
@@ -319,30 +369,55 @@ fn script(ctx: &Ctx, name: &str, body: &str) -> Result<String> {
     Ok(format!("& '{}'\r", path.display().to_string().replace('\\', "/")))
 }
 
+/// A tab's console host is the packaged `OpenConsole.exe`, started by the
+/// holder that owns the session, never by Brindle.
 fn conpty_host(ctx: &Ctx) -> Result<Outcome> {
-    let probe = Probe { run: &host_children, done: &|seen| count(seen, "OpenConsole.exe") > 0 };
+    let hosts = |brindle: u32| format!("{};{}", holder_children(ctx), brindle_hosts(brindle));
+    // Done once the holder has started the tab's console host and program.
+    let started = |seen: &str| {
+        let holder = seen.split_once(';').map_or("", |(holder, _)| holder);
+        count(holder, "OpenConsole.exe") > 0 && count(holder, "cmd.exe") > 0
+    };
+    let probe = Probe { run: &hosts, done: &started };
     let ran = run(ctx, "host", &["-p", "cmd", "--send", "echo hello-host\r"], &[], 4.0, Some(probe))?;
-    ensure!(count(&ran.during, "OpenConsole.exe") > 0, "console hosts under Brindle: {}", ran.during);
-    ensure!(count(&ran.during, "conhost.exe") == 0, "a conhost under Brindle: {}", ran.during);
-    ensure!(ran.log.contains("local tabs use ConPTY"), "no packaged-ConPTY line in host.log");
+    let logs = holder_logs(ctx);
+    let (holder, brindle) = ran.during.split_once(';').unwrap_or_default();
+    ensure!(count(holder, "OpenConsole.exe") > 0, "under the holder: {holder}");
+    ensure!(count(holder, "conhost.exe") == 0, "a conhost under the holder: {holder}");
+    ensure!(count(holder, "cmd.exe") > 0, "the tab's program isn't the holder's: {holder}");
+    ensure!(brindle.is_empty(), "console hosts under Brindle: {brindle}");
+    ensure!(logs.contains("conpty: sessions use ConPTY "), "no packaged-ConPTY line in holders.log");
     ensure!(screen(&ran.dump).contains("hello-host"), "screen:\n{}", screen(&ran.dump));
     Ok(Outcome::Pass)
 }
 
+/// The console hosts among `pid`'s direct children.
+fn brindle_hosts(pid: u32) -> String {
+    let hosts = winproc::all().into_iter().filter(|p| p.parent == pid).map(|p| p.name);
+    hosts.filter(|name| name == "OpenConsole.exe" || name == "conhost.exe").collect::<Vec<_>>().join(",")
+}
+
+/// `BRINDLE_CONPTY=inbox` in Brindle's environment reaches the holder in
+/// each session's environment: both tabs get the `conhost.exe` built into
+/// Windows, and the holder says so once.
 fn conpty_fallback(ctx: &Ctx) -> Result<Outcome> {
+    let hosts = |_: u32| holder_children(ctx);
     let ran = run(
         ctx,
         "fallback",
         &["-p", "cmd", "--send", "echo hello-inbox\r", "--action", "new_tab"],
         &[("BRINDLE_CONPTY", "inbox")],
-        5.0,
+        6.5,
         // One host per tab: done once the second tab's is there.
-        Some(Probe { run: &host_children, done: &|seen| count(seen, "conhost.exe") >= 2 }),
+        Some(Probe { run: &hosts, done: &|seen| count(seen, "conhost.exe") >= 2 }),
     )?;
-    ensure!(count(&ran.during, "conhost.exe") >= 2, "console hosts under Brindle: {}", ran.during);
-    ensure!(count(&ran.during, "OpenConsole.exe") == 0, "OpenConsole under Brindle: {}", ran.during);
-    let warnings = ran.log.matches("BRINDLE_CONPTY=inbox").count();
-    ensure!(warnings == 1, "{warnings} fallback warnings for two tabs; see fallback.log");
+    let logs = holder_logs(ctx);
+    let conhosts = count(&ran.during, "conhost.exe");
+    ensure!(conhosts == 2, "{conhosts} conhosts under the holder for two tabs: {}", ran.during);
+    ensure!(count(&ran.during, "OpenConsole.exe") == 0, "OpenConsole under the holder: {}", ran.during);
+    let lines = logs.matches("BRINDLE_CONPTY=inbox").count();
+    ensure!(lines == 1, "{lines} inbox lines for two tabs; see holders.log");
+    ensure!(!logs.contains("conpty: sessions use ConPTY "), "the packaged ConPTY was loaded; see holders.log");
     ensure!(ran.dump.tabs.len() == 2, "tabs: {:?}", ran.dump.tabs);
     Ok(Outcome::Pass)
 }
@@ -452,14 +527,20 @@ fn title_child(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// Brindle's PowerShell script in PowerShell 7 and 5.1, under a prompt the
-/// user defined: the prompt still draws, and the directory the script
-/// reports is where a new tab, and a restored one, starts. (The marks and
-/// `$LASTEXITCODE` are checked byte for byte by a unit test in conpty.rs.)
+/// user defined: the prompt still draws, its commands are marked (a jump
+/// finds a prompt and the last output is selected exactly), `$LASTEXITCODE`
+/// survives the prompt, and the directory the script reports is where a new
+/// tab, and a restored one, starts. Windows PowerShell is skipped where it
+/// isn't installed.
 fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     // The README's line, run by the brindle.exe under test.
     let bin = ctx.bin.display().to_string().replace('\\', "/");
     let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
     for shell in ["pwsh.exe", "powershell.exe"] {
+        if shell == "powershell.exe" && !on_path(shell) {
+            println!("         {shell} isn't on PATH; its checks are skipped");
+            continue;
+        }
         let config = format!(
             "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
              args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
@@ -468,12 +549,49 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         if shell == "powershell.exe" {
             powershell_warmup(ctx, &bin);
         }
+        // Marks: OSC 133 A puts the jump at the first prompt, C and D (or
+        // the next A) bound the output that gets selected, and the exit
+        // code of the command before is still there for the next line.
+        let marked = run_with(
+            ctx,
+            &config,
+            &format!("{label}-marks"),
+            &[
+                "-p",
+                "si",
+                "--wait-for",
+                "MYPROMPT>",
+                "--send",
+                "1..60\r",
+                "--wait-for",
+                "60\\nMYPROMPT>",
+                "--send",
+                "cmd /c exit 3\r",
+                "--wait-for",
+                "exit 3\\nMYPROMPT>",
+                "--send",
+                "\"code=$LASTEXITCODE\"\r",
+                "--wait-for",
+                "code=3\\nMYPROMPT>",
+                "--action",
+                "select_last_output",
+                "--action",
+                "jump_to_previous_prompt",
+            ],
+            &[],
+            15.0,
+            None,
+        )?;
+        let selection = marked.dump.selection.as_deref();
+        ensure!(selection == Some("code=3"), "{shell}: the last output selected is {selection:?}; see {label}-marks.dump");
+        let top: Vec<&str> = marked.dump.screen.iter().take(2).map(String::as_str).collect();
+        ensure!(top == ["MYPROMPT> 1..60", "1"], "{shell}: after a jump the view starts {top:?}");
         // New tab: inherits the reported directory. The steps wait for the
         // prompts they need, since Windows PowerShell can take longer than a
         // step to start and load the script, and the directory is reported
         // with the prompt after `cd` (`cddone` is split so the typed line
-        // doesn't match).
-        let ran = run_with(
+        // doesn't match). Its tabs' sessions stay for the restore.
+        let ran = run_keeping(
             ctx,
             &config,
             label,
@@ -499,18 +617,22 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         ensure!(ran.dump.tabs.len() == 2, "{shell}: tabs {:?}", ran.dump.tabs);
         ensure!(text.contains("MYPROMPT> "), "{shell}: the user's prompt is gone:\n{text}");
         ensure!(text.contains("dir=C:\\Windows"), "{shell}: the new tab's directory:\n{text}");
-        // Restore: the session written on quit reopens both tabs in C:\Windows.
+        // Restore: the session written on quit reattaches both tabs, the
+        // active one in C:\Windows. Its replay already shows `dir=`, so the
+        // live shell answers with `redir=` (split so the typed line doesn't
+        // match).
         let restored = run_with(
             ctx,
             &config,
             &format!("{label}-restored"),
-            &["--wait-for", "MYPROMPT>", "--send", "\"dir=$PWD\"\r"],
+            &["--wait-for", "MYPROMPT>", "--send", "'re' + \"dir=$PWD\"\r", "--wait-for", "redir="],
             &[],
             8.0,
             None,
         )?;
         let text = screen(&restored.dump);
-        ensure!(text.contains("dir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
+        ensure!(restored.dump.tabs.len() == 2, "{shell}: restored tabs {:?}", restored.dump.tabs);
+        ensure!(text.contains("redir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
         std::fs::remove_dir_all(ctx.dir.join("state")).ok();
     }
     Ok(Outcome::Pass)
@@ -595,7 +717,8 @@ fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
 
 fn zones(ctx: &Ctx) -> Result<Outcome> {
     let restore_config = CONFIG.to_string();
-    let split = run_with(
+    // Its zones' sessions stay for the restore, which reattaches them.
+    let split = run_keeping(
         ctx,
         &restore_config,
         "zones-split",
@@ -653,6 +776,7 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
         "restored zone_list: {:?}",
         restored.dump.zone_list
     );
+    ensure!(screen(&restored.dump).contains("zone1-left"), "restored screen: {}", screen(&restored.dump));
     ensure!(
         restored.dump.palette.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"),
         "palette rows: {:?}",

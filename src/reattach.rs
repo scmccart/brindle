@@ -1,4 +1,5 @@
-//! The detached terminal server sessions a launch attaches (Linux): listed
+//! The detached terminal server sessions a launch attaches (Linux and
+//! Windows): listed
 //! once before any window opens, then taken by the restored zones whose
 //! recorded session they are, and the rest opened as tabs of the first
 //! window, oldest first.
@@ -7,8 +8,8 @@ use crate::remote::protocol::client::SessionInfo;
 use crate::session::ServerSession;
 
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
-/// launches, for a Brindle that doesn't own the session state, and off
-/// Linux.
+/// launches, for a Brindle that doesn't own the session state, and where
+/// no terminal server runs (macOS).
 #[derive(Default)]
 pub struct Detached {
     sessions: Vec<SessionInfo>,
