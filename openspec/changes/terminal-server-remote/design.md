@@ -58,6 +58,7 @@ Alternative considered: a `PING`/`PONG` pair in client protocol 2, answered by t
 `remote::local` becomes per-endpoint:
 - `Host` is `Local` or `Remote(RemoteTarget)`, compared by target identity. It is follow-up 3's `Endpoint` type and replaces the five `profile.remote.is_some()` checks.
 - `shared(host)` keeps a map of `Arc<Connection>`.
+- Each remote host's connection has a `client_token` of its own (`host_token`: the process's token plus a hash of the host), because two endpoints that reach one core (`ssh localhost`, or two names for one machine) would otherwise take each other over (decision 6).
 - `Connection` takes a `Transport`:
   - `Local(Stream)`: as today;
   - `Relay`: the `ssh`/`docker` child plus its pipes.

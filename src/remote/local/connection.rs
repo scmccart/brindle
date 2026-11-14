@@ -18,7 +18,10 @@
 //!   for this client. A `LIST` sent right after `WELCOME` tells which
 //!   sessions it doesn't have: those are lost, and their tabs say so.
 //!   Requests written on a link that ended fail, since their answers are
-//!   gone; the others wait for the next link.
+//!   gone, except attaches (restored zones), which stay pending: the
+//!   reconnect's replay of the session answers one, and one whose session
+//!   the core lists without a client is sent again. The others wait for
+//!   the next link.
 //!   - **Local:** a core is started if none appears within [`START_AFTER`],
 //!     and every session is lost when none answers within
 //!     [`RECONNECT_LIMIT`]. A request waits up to [`REQUEST_LIMIT`].
@@ -128,8 +131,10 @@ enum Waiting {
     /// `SPAWNED`, whose sink then joins the session map.
     Spawn { sink: Sink, reply: Reply<Spawned> },
     /// The `REPLAY_START` answering an `ATTACH` (its pid), whose sink joins
-    /// the map before the replay's first `DATA` is read.
-    Attach { sink: Sink, reply: Reply<u32> },
+    /// the map before the replay's first `DATA` is read. A reconnect's
+    /// replay of the session answers it too, and `attach` is sent again
+    /// when the reconnected core didn't give the session back.
+    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach },
     /// `SESSIONS`.
     List(Reply<Vec<SessionInfo>>),
     /// `OK`.
@@ -155,6 +160,9 @@ struct Pending {
     /// An attach waiting for a relay's first link was told why it can't
     /// connect yet.
     told: bool,
+    /// An attach that went out on a link that ended before its answer.
+    /// The reconnect's `LIST` says what became of it.
+    carried: bool,
 }
 
 impl Pending {
@@ -401,7 +409,7 @@ impl Connection {
                 state.hurry = true;
                 self.wake.notify_all();
             }
-            state.requests.insert(req, Pending { waiting, written: false, told: false });
+            state.requests.insert(req, Pending { waiting, written: false, told: false, carried: false });
         }
         if let Some((connection, abandon)) = abandon
             && !abandon.asked(connection, req)
@@ -471,13 +479,8 @@ impl Connection {
         let session = request.session;
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let pid = self.ask("attach the session", abandon, |req, reply| {
-            let message = ToCore::Attach(client::Attach {
-                req,
-                session,
-                cols: request.cols,
-                rows: request.rows,
-            });
-            (Waiting::Attach { sink, reply }, message)
+            let attach = client::Attach { req, session, cols: request.cols, rows: request.rows };
+            (Waiting::Attach { sink, reply, attach: attach.clone() }, ToCore::Attach(attach))
         })?;
         Ok(Running { id: session, pid, key: request.key, conn: self.clone() })
     }
@@ -708,7 +711,7 @@ impl Connection {
             ToClient::ReplayStart(ReplayStart { req: Some(req), session, pid }) => {
                 let mut state = self.state.lock();
                 match state.requests.remove(&req).map(|pending| pending.waiting) {
-                    Some(Waiting::Attach { sink, reply }) => {
+                    Some(Waiting::Attach { sink, reply, .. }) => {
                         state.sessions.insert(session, sink.clone());
                         drop(state);
                         sink.lock().replay(true);
@@ -738,11 +741,20 @@ impl Connection {
                     }
                 }
             }
-            ToClient::ReplayStart(start) => match self.sink(start.session) {
-                Some(sink) => sink.lock().replay(true),
-                // Not one of this process's tabs (any more): end it.
-                None => self.send(ToCore::Close(SessionRef { session: start.session })),
-            },
+            ToClient::ReplayStart(start) => {
+                let session = start.session;
+                if let Some(sink) = self.sink(session) {
+                    sink.lock().replay(true);
+                } else if let Some((sink, reply)) = self.attached_by_replay(session) {
+                    sink.lock().replay(true);
+                    reply.try_send(Ok(start.pid)).ok();
+                } else {
+                    // Not one of this process's tabs (any more): it stays
+                    // with the core, detached. Only a user's close ends a
+                    // program.
+                    self.send(ToCore::Detach(SessionRef { session }));
+                }
+            }
             ToClient::ReplayEnd(end) => {
                 if let Some(sink) = self.sink(end.session) {
                     sink.lock().replay(false);
@@ -755,7 +767,7 @@ impl Connection {
                 }
             }
             ToClient::Sessions(sessions) => {
-                let lost = {
+                let (lost, (again, gone)) = {
                     let mut state = self.state.lock();
                     if state.list != Some(sessions.req) {
                         return;
@@ -764,10 +776,18 @@ impl Connection {
                     let kept: HashSet<SessionId> =
                         sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
                     state.parents.retain(|session, _| kept.contains(session));
-                    missing(&mut state.sessions, &kept)
+                    let listed: HashMap<SessionId, bool> =
+                        sessions.sessions.iter().map(|s| (s.session, s.attached)).collect();
+                    (missing(&mut state.sessions, &kept), carried_attaches(&mut state.requests, &listed))
                 };
                 for sink in lost {
                     sink.lock().lost("the terminal server no longer has this session");
+                }
+                for (session, pending) in gone {
+                    pending.waiting.fail(format!("the terminal server no longer has session {session}"));
+                }
+                for attach in again {
+                    self.send(ToCore::Attach(attach));
                 }
             }
             // Task 6.1 keeps `PROCESS` for remote sessions' titles.
@@ -779,21 +799,49 @@ impl Connection {
         self.state.lock().sessions.get(&session).cloned()
     }
 
+    /// A replay without a `req` (a reconnect's) of a session an attach
+    /// waits for answers that attach: its sink joins the map.
+    fn attached_by_replay(&self, session: SessionId) -> Option<(Sink, Reply<u32>)> {
+        let mut state = self.state.lock();
+        let req = state.requests.iter().find_map(|(&req, pending)| match &pending.waiting {
+            Waiting::Attach { attach, .. } if attach.session == session => Some(req),
+            _ => None,
+        })?;
+        let Some(Waiting::Attach { sink, reply, .. }) = state.requests.remove(&req).map(|pending| pending.waiting)
+        else {
+            unreachable!("an attach")
+        };
+        state.sessions.insert(session, sink.clone());
+        Some((sink, reply))
+    }
+
     /// The link ended: the writer holds its messages, and requests that
-    /// went out on it fail, since their answers are gone.
+    /// went out on it fail, since their answers are gone. Attaches stay,
+    /// carried over to the next link.
     fn disconnected(&self, reason: &str) {
         if let Some(current) = self.slot.lock().link.take() {
             current.wire.end();
         }
         self.unwatch_link();
-        let mut state = self.state.lock();
-        state.list = None;
-        let lost: Vec<RequestId> =
-            state.requests.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
-        for req in lost {
-            if let Some(pending) = state.requests.remove(&req) {
-                pending.waiting.fail(format!("the terminal server went away ({reason})"));
+        let failed = {
+            let mut state = self.state.lock();
+            state.list = None;
+            let lost: Vec<RequestId> =
+                state.requests.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
+            let mut failed = Vec::new();
+            for req in lost {
+                let Some(pending) = state.requests.get_mut(&req) else { continue };
+                if pending.is_attach() {
+                    pending.written = false;
+                    pending.carried = true;
+                } else if let Some(pending) = state.requests.remove(&req) {
+                    failed.push(pending);
+                }
             }
+            failed
+        };
+        for pending in failed {
+            pending.waiting.fail(format!("the terminal server went away ({reason})"));
         }
     }
 
@@ -1146,6 +1194,35 @@ fn lost_line(name: &str) -> String {
 /// What an attach waiting on a relay's first link is told once.
 fn retrying_line(message: &str) -> String {
     format!("\r\n\x1b[2m{}; retrying…\x1b[22m\r\n", message.replace('\n', "\r\n"))
+}
+
+/// What becomes of the attaches carried over a lost link, from the
+/// reconnected core's `LIST` (`listed`: each session and whether a client
+/// has it). The core gave this client back the sessions it owns before it
+/// answered, so one listed with a client waits for that replay. One listed
+/// without a client is sent again (returned first, no longer carried), and
+/// one not listed is taken out (returned second, with its session).
+fn carried_attaches(
+    requests: &mut HashMap<RequestId, Pending>,
+    listed: &HashMap<SessionId, bool>,
+) -> (Vec<client::Attach>, Vec<(SessionId, Pending)>) {
+    let (mut again, mut gone) = (Vec::new(), Vec::new());
+    let carried: Vec<RequestId> =
+        requests.iter().filter(|(_, pending)| pending.carried).map(|(&req, _)| req).collect();
+    for req in carried {
+        let Some(pending) = requests.get_mut(&req) else { continue };
+        let Waiting::Attach { attach, .. } = &pending.waiting else { continue };
+        let session = attach.session;
+        match listed.get(&session) {
+            Some(true) => {}
+            Some(false) => {
+                again.push(attach.clone());
+                pending.carried = false;
+            }
+            None => gone.extend(requests.remove(&req).map(|pending| (session, pending))),
+        }
+    }
+    (again, gone)
 }
 
 /// Takes the sessions out of `sessions` that the core no longer holds for
@@ -1817,6 +1894,123 @@ mod tests {
         assert_eq!(seen(&gone_tab), "lost the terminal server no longer has this session");
         quiet(&kept_tab);
         quiet(&gone_tab);
+        assert!(!connection.is_dead());
+    }
+
+    /// A relay connection whose links don't die of silence while a test
+    /// checks that nothing more happens.
+    fn steady_relay(name: &str) -> (Arc<Connection>, Plan) {
+        let (dial, plan) = fake::dialer(name);
+        let timings = Timings { dead: Duration::from_secs(30), ..fake::quick() };
+        (Connection::relay(dial, "tok", timings).unwrap(), plan)
+    }
+
+    /// The core's replay of `session`: one with a `req` answers an
+    /// `ATTACH`, one without is a reconnect's.
+    fn replay(out: &fake::Out, session: SessionId, req: Option<RequestId>) {
+        out.send(ToClient::ReplayStart(ReplayStart { req, session, pid: 1000 + session }));
+        out.send(ToClient::Data(Data { session, bytes: b"screen".to_vec() }));
+        out.send(ToClient::ReplayEnd(SessionRef { session }));
+    }
+
+    /// Attaches that went out just before their link dropped stay pending,
+    /// and the reconnect's replays answer them: one the core sends before
+    /// it answers `LIST`, and one it sends after (a new core rebuilding the
+    /// session's screen first).
+    #[test]
+    fn attaches_cut_off_with_their_link_are_answered_by_the_reconnects_replays() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        let (seven_sink, seven_tab) = fake::sink();
+        let (eight_sink, eight_tab) = fake::sink();
+        let (seven, eight) = (connection.clone(), connection.clone());
+        let seven = in_background(move || seven.attach(attach_request(7), seven_sink, None).map(|r| (r.id(), r.pid())));
+        let eight = in_background(move || eight.attach(attach_request(8), eight_sink, None).map(|r| (r.id(), r.pid())));
+        let mut sent: Vec<SessionId> = (0..2)
+            .map(|_| match first.next() {
+                ToCore::Attach(attach) => attach.session,
+                other => panic!("not ATTACH: {other:?}"),
+            })
+            .collect();
+        sent.sort_unstable();
+        assert_eq!(sent, [7, 8]);
+        first.out.cut();
+
+        let (link, second) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                replay(out, 7, None);
+                let attached = |session: SessionId| SessionInfo { session, attached: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![attached(7), attached(8)] }));
+                replay(out, 8, None);
+            }
+        });
+        plan.link(link);
+        assert_eq!(seven.join().unwrap().unwrap(), (7, 1007));
+        assert_eq!(eight.join().unwrap().unwrap(), (8, 1008));
+        for tab in [&seven_tab, &eight_tab] {
+            assert_eq!(seen(tab), "replay true");
+            assert_eq!(seen(tab), "output screen");
+            assert_eq!(seen(tab), "replay false");
+            quiet(tab);
+        }
+        // Neither is asked for again, and nothing is detached or closed.
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// An attach cut off with its link whose session the reconnected core
+    /// lists without a client (it never got the `ATTACH`, or a new core
+    /// adopted the session under its old owner) is sent again after
+    /// `WELCOME`. One whose session isn't listed fails.
+    #[test]
+    fn a_cut_off_attach_the_core_didnt_give_back_is_sent_again() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let (gone_sink, gone_tab) = fake::sink();
+        let (attaching, losing) = (connection.clone(), connection.clone());
+        let attach = in_background(move || attaching.attach(attach_request(7), sink, None).map(|r| (r.id(), r.pid())));
+        let ToCore::Attach(sent) = first.next() else { panic!("not ATTACH") };
+        let gone = in_background(move || losing.attach(attach_request(9), gone_sink, None).map(|r| r.pid()));
+        assert!(matches!(first.next(), ToCore::Attach(attach) if attach.session == 9));
+        first.out.cut();
+
+        let (link, second) = fake::link(&[], |message, out| match message {
+            ToCore::List(list) => {
+                let detached = SessionInfo { session: 7, owned: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![detached] }));
+            }
+            other => replaying(other, out),
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(second.next(), ToCore::Attach(sent));
+        assert_eq!(attach.join().unwrap().unwrap(), (7, 99));
+        assert_eq!(gone.join().unwrap().unwrap_err().to_string(), "the terminal server no longer has session 9");
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "output screen");
+        assert_eq!(seen(&tab), "replay false");
+        quiet(&tab);
+        quiet(&gone_tab);
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// A replay of a session that no tab here shows or waits for (its tab
+    /// closed, or its attach gave up) leaves the session detached: only a
+    /// user's close ends a program.
+    #[test]
+    fn a_replay_nobody_here_waits_for_leaves_the_session_detached() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        far.hello();
+        replay(&far.out, 5, None);
+        assert_eq!(far.next(), ToCore::Detach(SessionRef { session: 5 }));
+        replay(&far.out, 6, Some(77));
+        assert_eq!(far.next(), ToCore::Detach(SessionRef { session: 6 }));
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
         assert!(!connection.is_dead());
     }
 
