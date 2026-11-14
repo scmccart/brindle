@@ -144,9 +144,6 @@ impl Listener {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::process::CommandExt as _;
     use std::process::Command;
 
     use super::*;
