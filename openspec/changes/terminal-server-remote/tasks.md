@@ -43,8 +43,8 @@
 
 ## 5. Client: one connection per endpoint
 
-- [ ] 5.1 Introduce `Host` (`Local`, `Remote(RemoteTarget)`, compared by target identity) and make `shared(host)` keep one `Connection` per host; local behaviour unchanged. Verify with the existing `remote::local` tests and a unit test that two profiles with the same target share a `Host`
-- [ ] 5.2 Give `Connection` a `Transport`:
+- [x] 5.1 Introduce `Host` (`Local`, `Remote(RemoteTarget)`, compared by target identity) and make `shared(host)` keep one `Connection` per host; local behaviour unchanged. Verify with the existing `remote::local` tests and a unit test that two profiles with the same target share a `Host`
+- [x] 5.2 Give `Connection` a `Transport`:
   - local streams as today;
   - relay children with heartbeat send and drop, a 30 s dead-link timeout that kills the child, and a blocking `wait()` thread;
   - per-transport reconnect: relays back off 1 s to 30 s with no time limit, and their requests wait while connecting;
@@ -59,8 +59,8 @@
   - the warm SSH connect making one `ssh` process;
   - the container helper reused across two connections;
   - a squatted directory refused.
-- [ ] 5.4 Build remote `SPAWN`s from the connection's `RELAY_HOST` environment plus `child_env(profile)`, with no command when the profile sets none and no local directory check; set `linger_secs: 300` and `process_info: true` in relay `HELLO`s. Verify with unit tests on the request builder
-- [ ] 5.5 Write the "connection to <endpoint> lost; reconnecting…" line into the endpoint's terminals on a loss, and show a session as lost only from the reconnected core's `LIST`. Verify with a `connection.rs` unit test on an in-memory transport that drops and returns
+- [x] 5.4 Build remote `SPAWN`s from the connection's `RELAY_HOST` environment plus `child_env(profile)`, with no command when the profile sets none and no local directory check; set `linger_secs: 300` and `process_info: true` in relay `HELLO`s. Verify with unit tests on the request builder
+- [x] 5.5 Write the "connection to <endpoint> lost; reconnecting…" line into the endpoint's terminals on a loss, and show a session as lost only from the reconnected core's `LIST`. Verify with a `connection.rs` unit test on an in-memory transport that drops and returns
 
 ## 6. Remote terminals on the server backend
 

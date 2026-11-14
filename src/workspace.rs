@@ -198,7 +198,7 @@ enum PaletteKind {
 fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
     #[cfg(any(target_os = "linux", windows))]
     {
-        let connection = crate::remote::local::shared()?;
+        let connection = crate::remote::local::shared(&crate::remote::local::Host::Local)?;
         if let Some(id) = kill
             && let Err(why) = connection.kill(id)
         {

@@ -21,12 +21,17 @@
 //! tab that needed the server. Nothing is cached, so the next tab tries
 //! again.
 //!
-//! The process keeps one [`Connection`] for all its tabs ([`shared`]). A
-//! tab's [`Session`] gets it, and its session, on a thread of its own.
+//! The process keeps one [`Connection`] per endpoint ([`Host`]) for all
+//! its tabs ([`shared`]). A tab's [`Session`] gets it, and its session, on
+//! a thread of its own. A remote endpoint's connection goes through a
+//! relay (`relay.rs`) instead of the local socket or pipe.
 
 mod connection;
+mod host;
+mod link;
 #[cfg(windows)]
 mod pipe;
+mod relay;
 mod session;
 #[cfg(unix)]
 #[path = "local/unix.rs"]
@@ -37,11 +42,13 @@ mod sys;
 mod upgrade;
 
 pub use connection::{AttachRequest, Connection, SessionSink, SpawnRequest};
+pub use host::Host;
 pub use session::Session;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -64,6 +71,9 @@ const CONNECT_RETRY: Duration = Duration::from_secs(1);
 /// which a new core does only once it has adopted its holders). As long as
 /// such a core may take to answer `HELLO`.
 const BUSY_LIMIT: Duration = HELLO_LIMIT;
+/// How long a remote endpoint's core keeps this client's `kill` sessions
+/// after a relay link drops, for the reconnect to get them back.
+const RELAY_LINGER_SECS: u32 = 300;
 
 #[cfg(not(windows))]
 pub const HELPER_MISSING: &str =
@@ -91,22 +101,61 @@ pub fn client_token() -> &'static str {
     })
 }
 
-/// The process's connection to the core, made (starting a core if needed,
-/// and offering it an upgrade) when there is none or the last one ended.
-/// It blocks, so it runs on a session's start thread ([`Session::start`]),
-/// never on the UI thread.
-pub fn shared() -> Result<Arc<Connection>> {
-    static CURRENT: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
-    let mut current = CURRENT.lock();
-    if let Some(connection) = current.as_ref().filter(|connection| !connection.is_dead()) {
-        return Ok(connection.clone());
+/// The process's connection to `host`'s core. A local one is made
+/// (starting a core if needed, and offering it an upgrade) when there is
+/// none or the last one ended; it blocks, so it runs on a session's start
+/// thread ([`Session::start`]), never on the UI thread. A remote one returns
+/// at once and connects in the background, with requests waiting for it.
+pub fn shared(host: &Host) -> Result<Arc<Connection>> {
+    static CONNECTIONS: LazyLock<Registry> = LazyLock::new(Registry::default);
+    CONNECTIONS.get(host, || match host {
+        Host::Local => {
+            let endpoint = Endpoint::from_env()?;
+            let connected = connect(&endpoint, client_token())?;
+            let connected = upgrade::offer(&endpoint, client_token(), connected)?;
+            Connection::start(endpoint, client_token(), connected)
+        }
+        Host::Remote(target) => {
+            let dial = relay::dial(host.name(), target);
+            Connection::relay(dial, &host_token(host), relay::Timings::default())
+        }
+    })
+}
+
+/// The `client_token` of this process's connection to `host`. Each remote
+/// endpoint gets one of its own, the same for every reconnect: a core takes
+/// a connection's sessions over from any other client with its token, and
+/// two endpoints can be one core (`ssh localhost` beside local tabs, or two
+/// aliases of one machine), which would otherwise take each other over.
+fn host_token(host: &Host) -> String {
+    use std::hash::{BuildHasher as _, BuildHasherDefault, DefaultHasher};
+
+    match host {
+        Host::Local => client_token().to_string(),
+        Host::Remote(_) => {
+            let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(host);
+            format!("{}-{hash:016x}", client_token())
+        }
     }
-    let endpoint = Endpoint::from_env()?;
-    let connected = connect(&endpoint, client_token())?;
-    let connected = upgrade::offer(&endpoint, client_token(), connected)?;
-    let connection = Connection::start(endpoint, client_token(), connected)?;
-    *current = Some(connection.clone());
-    Ok(connection)
+}
+
+/// One connection per host, each made under a lock of its own, so a local
+/// connect that blocks holds up no remote endpoint's.
+#[derive(Default)]
+struct Registry(Mutex<HashMap<Host, Arc<Mutex<Option<Arc<Connection>>>>>>);
+
+impl Registry {
+    /// `host`'s connection, made by `make` when there is none or it ended.
+    fn get(&self, host: &Host, make: impl FnOnce() -> Result<Arc<Connection>>) -> Result<Arc<Connection>> {
+        let slot = self.0.lock().entry(host.clone()).or_default().clone();
+        let mut current = slot.lock();
+        if let Some(connection) = current.as_ref().filter(|connection| !connection.is_dead()) {
+            return Ok(connection.clone());
+        }
+        let connection = make()?;
+        *current = Some(connection.clone());
+        Ok(connection)
+    }
 }
 
 /// The sessions of a core that is already running, attached or not, for a
@@ -297,16 +346,25 @@ pub fn start_core(endpoint: &Endpoint) -> Result<()> {
     )
 }
 
-/// Says `HELLO` and waits for `WELCOME`. An `ERROR` (no common version)
-/// names both sides' ranges.
-pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
-    let hello = ToCore::Hello(Hello {
+/// The `HELLO` this client says. Through a relay it asks the core to keep
+/// its `kill` sessions for [`RELAY_LINGER_SECS`] after the link drops, and
+/// for `PROCESS` reports, since this machine can't read the endpoint's
+/// `/proc`.
+fn hello_message(token: &str, relay: bool) -> Hello {
+    Hello {
         min: client::PROTOCOLS.min,
         max: client::PROTOCOLS.max,
         client_version: format!("brindle {}", env!("CARGO_PKG_VERSION")),
         client_token: token.to_string(),
-        ..Default::default()
-    });
+        linger_secs: if relay { RELAY_LINGER_SECS } else { 0 },
+        process_info: relay,
+    }
+}
+
+/// Says `HELLO` and waits for `WELCOME`. An `ERROR` (no common version)
+/// names both sides' ranges.
+pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
+    let hello = ToCore::Hello(hello_message(token, false));
     let talk = |error: io::Error| anyhow!("terminal server unreachable: {error}");
     stream.set_read_timeout(Some(HELLO_LIMIT)).map_err(talk)?;
     hello.encode().and_then(|frame| frame.write_to(&mut stream)).map_err(talk)?;
@@ -625,6 +683,82 @@ mod tests {
         assert!(error.contains("refused Brindle"), "{error}");
         assert!(error.contains("offered 1–2, supported 3–4"), "{error}");
         assert!(error.contains("brindle-remote stop"), "{error}");
+    }
+
+    /// 5.1: tabs of profiles with the same target share one connection;
+    /// another user or port is another endpoint, and an ended connection is
+    /// replaced.
+    #[test]
+    fn one_connection_per_host() {
+        use crate::config::{Profile, RemoteTarget};
+
+        let target = |user: &str, port: u16| RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: Some(user.into()),
+            port: Some(port),
+            identity_file: None,
+            ssh_args: Vec::new(),
+        };
+        let profile = |name: &str, remote: RemoteTarget| Profile { name: name.into(), remote: Some(remote), ..Default::default() };
+        let registry = Registry::default();
+        let made = std::sync::atomic::AtomicUsize::new(0);
+        let plans = Mutex::new(Vec::new());
+        let make = || {
+            made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (dial, plan) = connection::fake::dialer("A8");
+            plans.lock().push(plan);
+            Connection::relay(dial, "tok", connection::fake::quick())
+        };
+        let shell = registry.get(&Host::of(&profile("A8", target("dev", 22))), make).unwrap();
+        let htop = registry.get(&Host::of(&profile("htop on A8", target("dev", 22))), make).unwrap();
+        assert!(Arc::ptr_eq(&shell, &htop));
+        assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let root = registry.get(&Host::of(&profile("root", target("root", 22))), make).unwrap();
+        let port = registry.get(&Host::of(&profile("port", target("dev", 2222))), make).unwrap();
+        assert!(!Arc::ptr_eq(&shell, &root) && !Arc::ptr_eq(&shell, &port) && !Arc::ptr_eq(&root, &port));
+        assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        // The first endpoint can't be reached and nothing waits: it ends,
+        // and the next tab gets a new connection.
+        plans.lock()[0].fail("ssh: connect to host A8 port 22: Connection refused");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !shell.is_dead() {
+            assert!(Instant::now() < deadline, "the connection never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let again = registry.get(&Host::Remote(target("dev", 22)), make).unwrap();
+        assert!(!Arc::ptr_eq(&shell, &again));
+        assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn each_remote_endpoint_has_a_token_of_its_own() {
+        use crate::config::RemoteTarget;
+
+        let ssh = |host: &str| {
+            Host::Remote(RemoteTarget::Ssh {
+                host: host.into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                ssh_args: Vec::new(),
+            })
+        };
+        assert_eq!(host_token(&Host::Local), client_token());
+        let (a8, localhost) = (host_token(&ssh("A8")), host_token(&ssh("localhost")));
+        assert_eq!(host_token(&ssh("A8")), a8, "stable for reconnects");
+        assert_ne!(a8, localhost);
+        assert!(a8.starts_with(client_token()) && a8 != client_token(), "{a8}");
+    }
+
+    #[test]
+    fn only_a_relay_asks_for_linger_and_process_info() {
+        let local = hello_message("tok", false);
+        assert_eq!((local.linger_secs, local.process_info), (0, false));
+        let relay = hello_message("tok", true);
+        assert_eq!((relay.linger_secs, relay.process_info), (300, true));
+        assert_eq!((relay.min, relay.max), (client::PROTOCOLS.min, client::PROTOCOLS.max));
+        assert_eq!(relay.client_token, "tok");
     }
 
     #[test]

@@ -6,15 +6,16 @@
 //! the `SPAWN` or `ATTACH` itself all happen on a thread of their own, so
 //! opening a tab never blocks the UI thread. Input and resizes made
 //! meanwhile are kept, and go out in order once the core reports the
-//! session. A failure goes to the sink, which shows it in the tab.
+//! session. A failure goes to the sink, which shows it in the tab. A tab
+//! closed while its request waits for a connection withdraws the request.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex;
 
-use super::connection::{Running, Sink};
-use super::{AttachRequest, Connection, SessionSink, SpawnRequest};
+use super::connection::{Abandon, Running, Sink};
+use super::{AttachRequest, Connection, Host, SessionSink, SpawnRequest};
 use crate::remote::protocol::SessionId;
 
 /// How a tab let its session go.
@@ -57,12 +58,14 @@ struct Size {
 /// A local tab's session in the terminal server.
 pub struct Session {
     phase: Arc<Mutex<Phase>>,
+    /// Lets go of the request while it waits.
+    abandon: Arc<Abandon>,
 }
 
 impl Session {
     /// Starts a session in the process's shared connection.
     pub fn start(request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::start_with(super::shared, request, sink)
+        Self::start_with(|| super::shared(&Host::Local), request, sink)
     }
 
     /// Starts a session in the connection `connect` gives, on a thread of
@@ -78,7 +81,7 @@ impl Session {
     /// Attaches a detached session in the process's shared connection; its
     /// replay and then its live output go to `sink`.
     pub fn attach(request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::attach_with(super::shared, request, sink)
+        Self::attach_with(|| super::shared(&Host::Local), request, sink)
     }
 
     /// Attaches a session in the connection `connect` gives, on a thread of
@@ -97,17 +100,18 @@ impl Session {
         sink: Box<dyn SessionSink>,
     ) -> Self {
         let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
+        let abandon = Arc::new(Abandon::default());
         let sink: Sink = Arc::new(Mutex::new(sink));
-        let starting = phase.clone();
+        let (starting, abandoning) = (phase.clone(), abandon.clone());
         let failing = sink.clone();
         let spawned = std::thread::Builder::new()
             .name("server-spawn".into())
-            .spawn(move || run(connect, start, sink, &starting));
+            .spawn(move || run(connect, start, sink, &starting, &abandoning));
         if let Err(error) = spawned {
             *phase.lock() = Phase::Gone;
             failing.lock().failed(&anyhow::Error::from(error).context("starting a thread"));
         }
-        Self { phase }
+        Self { phase, abandon }
     }
 
     /// The program's pid, once the session exists.
@@ -173,6 +177,8 @@ impl Session {
             Phase::Starting { left, input, .. } => {
                 *left = Some(how);
                 input.clear();
+                // A request still waiting for the connection is withdrawn.
+                self.abandon.abandon();
             }
             Phase::Running(running) => {
                 match how {
@@ -193,6 +199,7 @@ fn run(
     start: Start,
     sink: Sink,
     phase: &Mutex<Phase>,
+    abandon: &Abandon,
 ) {
     let left = || matches!(&*phase.lock(), Phase::Starting { left: Some(_), .. });
     let started = connect().and_then(|connection| {
@@ -202,8 +209,8 @@ fn run(
             anyhow::bail!("closed before it started");
         }
         match start {
-            Start::Spawn(request) => connection.spawn(request, sink.clone()),
-            Start::Attach(request) => connection.attach(request, sink.clone()),
+            Start::Spawn(request) => connection.spawn(request, sink.clone(), Some(abandon)),
+            Start::Attach(request) => connection.attach(request, sink.clone(), Some(abandon)),
         }
     });
     let mut phase = phase.lock();
@@ -592,7 +599,7 @@ mod tests {
         let sink: Sink = Arc::new(Mutex::new(Box::new(Recorder(mpsc::channel().0))));
         let running: Vec<_> = (0..2)
             .map(|_| {
-                let running = connection.spawn(request(), sink.clone()).unwrap();
+                let running = connection.spawn(request(), sink.clone(), None).unwrap();
                 assert!(matches!(recv(&core), ToCore::Spawn(_)));
                 running
             })
@@ -671,6 +678,35 @@ mod tests {
         // Input to a session that never started goes nowhere.
         session.input(b"x");
         session.close();
+        assert_eq!(session.pid(), None);
+    }
+
+    /// A tab closed while its attach waits for a relay that isn't up yet
+    /// withdraws the attach: it never goes out, and the tab says nothing.
+    #[test]
+    fn a_tab_closed_while_its_attach_waits_for_a_relay_withdraws_it() {
+        use crate::remote::local::connection::fake;
+
+        let (dial, plan) = fake::dialer("A8");
+        let connection = Connection::relay(dial, "tok", fake::quick()).unwrap();
+        plan.next_dial();
+        let (tx, tab) = mpsc::channel();
+        let attaching = connection.clone();
+        let session = Session::attach_with(move || Ok(attaching), attach_request(5), Box::new(Recorder(tx)));
+        session.input(b"x");
+        // Let the request reach the connection before the tab closes.
+        std::thread::sleep(Duration::from_millis(200));
+        session.detach();
+        let (link, far) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));
+            }
+        });
+        plan.link(link);
+        assert!(connection.list().unwrap().is_empty());
+        assert!(matches!(far.next(), ToCore::List(_)), "no ATTACH before the LIST");
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(tab.recv_timeout(Duration::from_millis(300)).is_err(), "the closed tab says nothing");
         assert_eq!(session.pid(), None);
     }
 
