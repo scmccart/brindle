@@ -154,9 +154,21 @@ pub fn home_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 /// The login shell and home directory of the current user from the passwd
 /// database. `docker exec` sets no `SHELL`.
 pub fn passwd_entry() -> Option<(OsString, PathBuf)> {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStringExt;
+    with_passwd(|entry| {
+        let shell = passwd_field(entry.pw_shell)?;
+        let dir = passwd_field(entry.pw_dir)?;
+        Some((shell, PathBuf::from(dir)))
+    })
+}
 
+/// The current user's name from the passwd database.
+pub fn user_name() -> Option<OsString> {
+    with_passwd(|entry| passwd_field(entry.pw_name)).filter(|name| !name.is_empty())
+}
+
+/// Calls `read` with the current user's passwd entry, whose strings live
+/// only for the call.
+fn with_passwd<T>(read: impl FnOnce(&libc::passwd) -> Option<T>) -> Option<T> {
     let mut buffer = vec![0u8; 4096];
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
     let mut found: *mut libc::passwd = std::ptr::null_mut();
@@ -172,18 +184,23 @@ pub fn passwd_entry() -> Option<(OsString, PathBuf)> {
     if status != 0 || found.is_null() {
         return None;
     }
+    // SAFETY: filled in, since `found` points at it.
     let entry = unsafe { entry.assume_init() };
-    if entry.pw_shell.is_null() || entry.pw_dir.is_null() {
+    read(&entry)
+}
+
+/// One string of a passwd entry; `None` for a null pointer.
+fn passwd_field(field: *const libc::c_char) -> Option<OsString> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+
+    if field.is_null() {
         return None;
     }
-    let shell = unsafe { CStr::from_ptr(entry.pw_shell) }
-        .to_bytes()
-        .to_vec();
-    let dir = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes().to_vec();
-    Some((
-        OsString::from_vec(shell),
-        PathBuf::from(OsString::from_vec(dir)),
-    ))
+    // SAFETY: a passwd entry's strings are NUL-terminated, and the buffer
+    // they point into outlives this call (`with_passwd`).
+    let bytes = unsafe { CStr::from_ptr(field) }.to_bytes().to_vec();
+    Some(OsString::from_vec(bytes))
 }
 
 pub fn expand_remote_cwd(cwd: &str, env: &BTreeMap<String, String>) -> PathBuf {

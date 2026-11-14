@@ -16,6 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::{ready, scope};
 
@@ -143,6 +144,31 @@ impl ReadyPipe {
             },
         }
     }
+
+    /// [`ReadyPipe::read`]'s answer, waiting up to `limit` for it: for a
+    /// starter with no event loop (the relay). `None` if the pipe hasn't
+    /// ended by then.
+    pub fn wait(&mut self, limit: Duration) -> Option<bool> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(ready) = self.read() {
+                return Some(ready);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let mut pollfd = libc::pollfd {
+                fd: self.pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Rounded up, so the wait doesn't end before the deadline. An
+            // interrupted or failed poll just reads again.
+            let wait = left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
+            unsafe { libc::poll(&mut pollfd, 1, wait) };
+        }
+    }
 }
 
 /// A role started by [`start_role`].
@@ -167,17 +193,31 @@ pub fn start_role(
     env: &[(&str, &OsStr)],
     unscoped: impl FnOnce(&str),
 ) -> io::Result<Started> {
+    let decision = scope::current();
+    if let scope::Decision::Plain(reason) = &decision {
+        unscoped(reason);
+    }
+    start_role_as(&decision, role, args, env, |_| {})
+}
+
+/// [`start_role`] with the scope decided by the caller, and `configure`
+/// given the command before it runs: the relay points the role's stdout
+/// away from its own, which carries frames.
+pub fn start_role_as(
+    decision: &scope::Decision,
+    role: &str,
+    args: &[String],
+    env: &[(&str, &OsStr)],
+    configure: impl FnOnce(&mut Command),
+) -> io::Result<Started> {
     let args: Vec<OsString> = args
         .iter()
         .map(|arg| arg.replace(READY_PLACEHOLDER, &READY_FD.to_string()).into())
         .collect();
     let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
-    let decision = scope::current();
-    if let scope::Decision::Plain(reason) = &decision {
-        unscoped(reason);
-    }
-    let mut command = scope::command(&decision, role, &program, &args);
+    let mut command = scope::command(decision, role, &program, &args);
     command.envs(env.iter().copied());
+    configure(&mut command);
     let (child, ready) = spawn_with_ready_pipe(&mut command, READY_FD)?;
     Ok(Started {
         child,
@@ -355,6 +395,27 @@ mod tests {
         write(&role, &[ready::BYTE]);
         drop(role);
         assert_eq!(outcome(&mut read), Some(false));
+    }
+
+    #[test]
+    fn a_starter_without_a_loop_waits_for_the_pipes_end() {
+        // Nothing yet: the wait ends with the limit.
+        let (mut read, role) = ready_pipe();
+        let begin = Instant::now();
+        assert_eq!(read.wait(Duration::from_millis(50)), None);
+        assert!(begin.elapsed() >= Duration::from_millis(50));
+        // The byte and the end, the end coming later.
+        write(&role, &[ready::BYTE]);
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(role);
+        });
+        assert_eq!(read.wait(Duration::from_secs(30)), Some(true));
+        closer.join().unwrap();
+        // A role that ended first.
+        let (mut read, role) = ready_pipe();
+        drop(role);
+        assert_eq!(read.wait(Duration::from_secs(30)), Some(false));
     }
 
     #[test]

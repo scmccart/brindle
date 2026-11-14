@@ -32,6 +32,7 @@ usage: brindle-remote <command>
   --server                          serve one session over stdio (remote tabs)
   serve [--ready-fd N]              run the terminal server's core
   hold [--ready-fd N]               run a holder (started by the core)
+  relay                             connect stdio to the core, starting it if needed (remote tabs)
   check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
   list [--json]                     the server's sessions: id, pid, state, owner, time detached, policy, age, title, command, directory
   kill ID | kill --all              hang up one session, or all of them
@@ -48,6 +49,7 @@ usage: brindle-remote <command>
   serve [--ready-handle N]          run the terminal server's core
   hold [--ready-handle N]           run a holder (started by the core)
   launch <role> [--ready-handle N]  internal: start serve or hold detached
+  relay                             Linux only: connect stdio to the core (remote tabs)
   check --holder-protocols LIST     exit 0 if this binary drives every H1 version in LIST
   list [--json]                     the server's sessions: id, pid, state, owner, time detached, policy, age, title, command, directory
   kill ID | kill --all              hang up one session, or all of them

@@ -57,9 +57,9 @@
 //! - `linger_secs` (a `HELLO` field, capped by the core) asks the core to keep
 //!   the client's `kill` sessions that long after its connection ends, and
 //!   `process_info` asks for `PROCESS`.
-//! - `owned` (a session has an owner) and `detached_secs` (seconds since a
-//!   client was last attached) tell a client whether a detached session's
-//!   owner may still come back.
+//! - `owned` (a session has an owner and no client is attached) and
+//!   `detached_secs` (seconds since a client was last attached) tell a client
+//!   whether a detached session's owner may still come back.
 //!
 //! Protocol 2 adds `PROCESS`, sent only on connections that negotiated 2 and
 //! set `process_info`: the session's foreground program name and working
@@ -308,7 +308,8 @@ pub struct SessionInfo {
     pub started: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// An owner is set: its client may still come back for the session.
+    /// An owner is set and no client is attached: the owner may still come
+    /// back for the session. Always false while attached.
     #[serde(default, skip_serializing_if = "is_false")]
     pub owned: bool,
     /// Seconds since a client was last attached; 0 when attached or unknown.

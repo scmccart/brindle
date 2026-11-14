@@ -3,7 +3,8 @@
 //! (comma- or space-separated), the versions of the running holders it
 //! would take over. The client sends `STEP_DOWN` to the running core only
 //! if it passes. A refusal is also written to the server directory's
-//! `core.log`, beside the running core's own entries.
+//! `core.log`, beside the running core's own entries. A relay makes the same
+//! check in-process ([`refusal`]).
 
 use std::io::Write as _;
 
@@ -17,13 +18,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
         _ => return Err("usage: brindle-remote check --holder-protocols LIST".into()),
     };
     let wanted = parse_protocols(list)?;
+    match refusal("check", &wanted) {
+        None => Ok(()),
+        Some(reason) => Err(format!("upgrade refused: {reason}")),
+    }
+}
+
+/// Why this binary can't take over holders that speak the H1 versions
+/// `wanted`, also written to `core.log` as `who`'s; `None` when it can.
+pub fn refusal(who: &str, wanted: &[u32]) -> Option<String> {
     let missing: Vec<u32> = wanted
         .iter()
         .copied()
         .filter(|&version| !h1::PROTOCOLS.contains(version))
         .collect();
     if missing.is_empty() {
-        return Ok(());
+        return None;
     }
     let build = build_id::current().unwrap_or_else(|_| "unknown".into());
     let missing = missing
@@ -37,8 +47,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
         h1::PROTOCOLS
     );
-    log_refusal(&reason);
-    Err(format!("upgrade refused: {reason}"))
+    log_refusal(who, &reason);
+    Some(reason)
 }
 
 fn parse_protocols(list: &str) -> Result<Vec<u32>, String> {
@@ -53,7 +63,7 @@ fn parse_protocols(list: &str) -> Result<Vec<u32>, String> {
 }
 
 /// Appends a refused upgrade to `core.log`, if the server directory exists.
-fn log_refusal(reason: &str) {
+fn log_refusal(who: &str, reason: &str) {
     let Ok(dir) = dir::resolve_from_env() else {
         return;
     };
@@ -63,7 +73,7 @@ fn log_refusal(reason: &str) {
     if let Ok(mut log) = daemon::open_log(&dir.join("core.log")) {
         let _ = writeln!(
             log,
-            "{} check[{}]: upgrade refused: {reason}",
+            "{} {who}[{}]: upgrade refused: {reason}",
             daemon::timestamp(),
             std::process::id()
         );
@@ -86,5 +96,8 @@ mod tests {
     fn this_binary_drives_its_own_holder_protocols() {
         assert_eq!(run(&["--holder-protocols".into(), "1".into()]), Ok(()));
         assert!(run(&[]).is_err());
+        let own: Vec<u32> = (h1::PROTOCOLS.min..=h1::PROTOCOLS.max).collect();
+        assert_eq!(refusal("test", &own), None);
+        assert_eq!(refusal("test", &[]), None);
     }
 }

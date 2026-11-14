@@ -1,5 +1,7 @@
 mod agent;
 mod conpty;
+#[cfg(target_os = "linux")]
+mod liveness;
 #[cfg(any(target_os = "linux", windows))]
 mod pty;
 #[cfg(any(target_os = "linux", windows))]
@@ -50,6 +52,7 @@ fn run() -> Result<(), String> {
         }
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
+        Some("relay") => relay(&rest),
         // The trampoline that starts a role detached, for the role's starter.
         #[cfg(windows)]
         Some("launch") => server::daemon::launch(&rest),
@@ -66,6 +69,17 @@ fn serve(args: &[String]) -> Result<(), String> {
 #[cfg(any(target_os = "linux", windows))]
 fn hold(args: &[String]) -> Result<(), String> {
     server::holder::run(args)
+}
+
+#[cfg(target_os = "linux")]
+fn relay(args: &[String]) -> Result<(), String> {
+    server::relay::run(args)
+}
+
+/// Remote hosts are Linux: Brindle on Windows runs a Linux host's relay.
+#[cfg(not(target_os = "linux"))]
+fn relay(_args: &[String]) -> Result<(), String> {
+    Err("relay runs only on Linux".into())
 }
 
 /// `check`, `list`, `kill`, `status` and `stop`; `None` for anything else.

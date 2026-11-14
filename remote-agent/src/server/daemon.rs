@@ -6,6 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The trampoline a role is started through on Windows (`launch`).
 #[cfg(windows)]
 pub use super::platform::daemon::launch;
+/// A start with the scope decided by the caller (the relay).
+#[cfg(unix)]
+pub use super::platform::daemon::start_role_as;
 pub use super::platform::daemon::{
     ReadyPipe, daemonize, open_log, ready_from_args, role_args, start_role,
 };

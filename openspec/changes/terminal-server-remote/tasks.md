@@ -25,21 +25,21 @@
 
 ## 4. `brindle-remote relay`
 
-- [ ] 4.1 Add the `relay` subcommand (`remote-agent/src/server/relay.rs`, with `main.rs` and `cli.rs` usage):
+- [x] 4.1 Add the `relay` subcommand (`remote-agent/src/server/relay.rs`, with `main.rs` and `cli.rs` usage):
   - resolve the server directory;
   - connect, or start the core from its own image, choosing a scope only when the user lingers (`/var/lib/systemd/linger/<user>`), otherwise plain with `BRINDLE_NO_SCOPE=1` and one log line;
   - write the marker, then `RELAY_HOST` or `RELAY_ERROR`.
 
   Verify with `remote-agent/tests/relay.rs`: a relay against a temp `BRINDLE_SERVER_DIR` starts a core, reports `HOST` with its environment, and a test client spawns a session through it
-- [ ] 4.2 Relay framing and liveness:
+- [x] 4.2 Relay framing and liveness:
   - copy frames both ways;
   - drop the client's heartbeats;
   - send a heartbeat after 10 s without a write, under one writer lock;
   - stamp a `Liveness` on the stdin reader thread and exit after 60 s of silence, with timings overridable for tests.
 
   Verify in `relay.rs` that a silent client ends the relay, an idle client that sends heartbeats doesn't, a client that stops reading during a flood doesn't, and a protocol-1 core never receives a heartbeat
-- [ ] 4.3 Relay upgrade offer: connect with `<token>-upgrade`, compare with `upgrade::is_newer` against `/proc/<core pid>/exe`'s mtime, check the holder protocols in-process, `STEP_DOWN`, start `serve` from its own image, then connect for the client. Verify in `remote-agent/tests/upgrade.rs` that a newer relay upgrades a running core with sessions kept (same pids), and an older relay leaves it alone
-- [ ] 4.4 Document `relay` in CLAUDE.md's terminal server section (link, liveness, scope decision, upgrade) and in `brindle-remote`'s usage text; verify `brindle-remote --help` lists it
+- [x] 4.3 Relay upgrade offer: connect with `<token>-upgrade`, compare with `upgrade::is_newer` against `/proc/<core pid>/exe`'s mtime, check the holder protocols in-process, `STEP_DOWN`, start `serve` from its own image, then connect for the client. Verify in `remote-agent/tests/upgrade.rs` that a newer relay upgrades a running core with sessions kept (same pids), and an older relay leaves it alone
+- [x] 4.4 Document `relay` in CLAUDE.md's terminal server section (link, liveness, scope decision, upgrade) and in `brindle-remote`'s usage text; verify `brindle-remote --help` lists it
 
 ## 5. Client: one connection per endpoint
 
