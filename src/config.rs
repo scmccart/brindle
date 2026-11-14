@@ -156,6 +156,11 @@ impl Default for NotificationConfig {
 }
 
 /// A remote Linux host or container endpoint.
+///
+/// `connect_at_launch` (either kind, default false) makes Brindle connect to
+/// the endpoint at launch and keep that connection for as long as it runs.
+/// It isn't part of the endpoint: [`RemoteTarget::endpoint`] drops it, and it
+/// is serialized only when set, so the session state never records it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RemoteTarget {
@@ -169,6 +174,8 @@ pub enum RemoteTarget {
         identity_file: Option<String>,
         #[serde(default)]
         ssh_args: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        connect_at_launch: bool,
     },
     Container {
         #[serde(default = "default_container_engine")]
@@ -176,11 +183,37 @@ pub enum RemoteTarget {
         container: String,
         #[serde(default)]
         user: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        connect_at_launch: bool,
     },
+}
+
+impl RemoteTarget {
+    /// Whether Brindle connects to the endpoint at launch and keeps the
+    /// connection (`remote-connections`' "Connecting at launch").
+    pub fn connects_at_launch(&self) -> bool {
+        match self {
+            Self::Ssh { connect_at_launch, .. } | Self::Container { connect_at_launch, .. } => *connect_at_launch,
+        }
+    }
+
+    /// The target as an endpoint, without `connect_at_launch`: what a tab
+    /// on it keeps and the session state records.
+    pub fn endpoint(&self) -> Self {
+        let mut target = self.clone();
+        match &mut target {
+            Self::Ssh { connect_at_launch, .. } | Self::Container { connect_at_launch, .. } => *connect_at_launch = false,
+        }
+        target
+    }
 }
 
 fn default_container_engine() -> String {
     "docker".into()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -460,20 +493,22 @@ mod tests {
         .unwrap();
         assert_eq!(config.profiles.len(), 2);
         match &config.profiles[0].remote {
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch }) => {
                 assert_eq!(host, "A8");
                 assert_eq!(user.as_deref(), Some("ubuntu"));
                 assert_eq!(*port, Some(2222));
                 assert_eq!(identity_file, &None);
                 assert_eq!(ssh_args, &["-v"]);
+                assert!(!connect_at_launch);
             }
             _ => panic!("expected ssh remote"),
         }
         match &config.profiles[1].remote {
-            Some(RemoteTarget::Container { engine, container, user }) => {
+            Some(RemoteTarget::Container { engine, container, user, connect_at_launch }) => {
                 assert_eq!(engine, "docker");
                 assert_eq!(container, "rust-box");
                 assert_eq!(user, &None);
+                assert!(!connect_at_launch);
             }
             _ => panic!("expected container remote"),
         }
@@ -482,6 +517,55 @@ mod tests {
         assert_eq!(config.profiles[0].working_directory(), Some(PathBuf::from("~/src")));
         assert!(Config::parse(
             "[[profiles]]\nname = \"bad\"\nremote = { type = \"ssh\", host = \"A8\", password = \"secret\" }"
+        )
+        .is_err());
+    }
+
+    /// 8.1: either kind takes `connect_at_launch`, false when absent; it
+    /// isn't part of the endpoint.
+    #[test]
+    fn remote_targets_may_connect_at_launch() {
+        let config = Config::parse(
+            r##"
+            [[profiles]]
+            name = "A8"
+            remote = { type = "ssh", host = "A8", connect_at_launch = true }
+
+            [[profiles]]
+            name = "devbox"
+            remote = { type = "container", container = "devbox", connect_at_launch = true }
+
+            [[profiles]]
+            name = "B9"
+            remote = { type = "ssh", host = "B9", connect_at_launch = false }
+
+            [[profiles]]
+            name = "box"
+            remote = { type = "container", container = "box" }
+            "##,
+        )
+        .unwrap();
+        let eager: Vec<bool> =
+            config.profiles.iter().map(|p| p.remote.as_ref().is_some_and(RemoteTarget::connects_at_launch)).collect();
+        assert_eq!(eager, [true, true, false, false]);
+        for profile in &config.profiles {
+            let target = profile.remote.as_ref().unwrap();
+            assert!(!target.endpoint().connects_at_launch(), "{}", profile.name);
+        }
+        let ssh = config.profiles[0].remote.as_ref().unwrap();
+        assert_eq!(
+            ssh.endpoint(),
+            RemoteTarget::Ssh {
+                host: "A8".into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                ssh_args: Vec::new(),
+                connect_at_launch: false,
+            }
+        );
+        assert!(Config::parse(
+            "[[profiles]]\nname = \"bad\"\nremote = { type = \"container\", container = \"c\", connect_at_launch = 1 }"
         )
         .is_err());
     }

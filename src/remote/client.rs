@@ -503,6 +503,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
+            connect_at_launch: false,
         }
     }
 
@@ -511,6 +512,7 @@ mod tests {
             engine: engine.into(),
             container: "devbox".into(),
             user: user.map(Into::into),
+            connect_at_launch: false,
         }
     }
 
@@ -1260,6 +1262,7 @@ mod tests {
                 engine: "docker".into(),
                 container: c.0.clone(),
                 user: user.map(Into::into),
+                connect_at_launch: false,
             }
         }
 
@@ -1269,6 +1272,7 @@ mod tests {
                     engine: "docker".into(),
                     container: container.into(),
                     user: None,
+                    connect_at_launch: false,
                 }),
                 ..Profile::default_shell()
             }
@@ -1309,6 +1313,7 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+                connect_at_launch: false,
             }
         }
 

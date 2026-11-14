@@ -967,7 +967,7 @@ mod tests {
     }
 
     fn ssh(host: &str) -> crate::config::RemoteTarget {
-        crate::config::RemoteTarget::Ssh { host: host.into(), user: None, port: None, identity_file: None, ssh_args: Vec::new() }
+        crate::config::RemoteTarget::Ssh { host: host.into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false }
     }
 
     /// 7.1: a remote zone that recorded a session is attached on the host
@@ -1139,7 +1139,7 @@ mod tests {
 
         // A remote tab's sessions are its endpoint's, which this machine's
         // listing doesn't have: its zones stay, recorded or not.
-        let remote = Some(crate::config::RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new() });
+        let remote = Some(crate::config::RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false });
         let on_a8 = |tab: TabState| match tab {
             TabState::Local { profile, cwd, title, zones, session, .. } => TabState::Local { profile, remote: remote.clone(), cwd, title, zones, session },
             other => other,

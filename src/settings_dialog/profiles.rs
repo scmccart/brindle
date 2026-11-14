@@ -182,6 +182,9 @@ struct Values {
     remote: RemoteKind,
     /// `docker` or `podman`.
     engine: String,
+    /// The target's `connect_at_launch`, kept as it was: a profile saved
+    /// from the editor keeps it, whichever kind of endpoint it is on now.
+    connect_at_launch: bool,
     default: bool,
 }
 
@@ -205,9 +208,10 @@ impl Values {
         ];
         let at = |field: Field| TEXT_FIELDS.iter().position(|f| *f == field).expect("text field");
         let mut engine = ENGINES[0].to_string();
+        let connect_at_launch = p.remote.as_ref().is_some_and(RemoteTarget::connects_at_launch);
         let kind = match &p.remote {
             None => RemoteKind::Local,
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ }) => {
                 texts[at(Field::SshHost)] = host.clone();
                 texts[at(Field::SshUser)] = user.clone().unwrap_or_default();
                 texts[at(Field::SshPort)] = port.map(|p| p.to_string()).unwrap_or_default();
@@ -215,14 +219,14 @@ impl Values {
                 texts[at(Field::SshArgs)] = join_words(ssh_args);
                 RemoteKind::Ssh
             }
-            Some(RemoteTarget::Container { engine: e, container, user }) => {
+            Some(RemoteTarget::Container { engine: e, container, user, connect_at_launch: _ }) => {
                 engine = e.clone();
                 texts[at(Field::Container)] = container.clone();
                 texts[at(Field::ContainerUser)] = user.clone().unwrap_or_default();
                 RemoteKind::Container
             }
         };
-        Self { texts, theme: p.theme.clone(), remote: kind, engine, default }
+        Self { texts, theme: p.theme.clone(), remote: kind, engine, connect_at_launch, default }
     }
 
     fn text(&self, field: Field) -> &str {
@@ -437,6 +441,7 @@ impl ProfileEditor {
                     port,
                     identity_file: optional(Field::SshIdentity),
                     ssh_args: words(Field::SshArgs, &mut errors),
+                    connect_at_launch: self.values.connect_at_launch,
                 })
             }
             RemoteKind::Container => {
@@ -448,6 +453,7 @@ impl ProfileEditor {
                     engine: self.values.engine.clone(),
                     container: container.to_string(),
                     user: optional(Field::ContainerUser),
+                    connect_at_launch: self.values.connect_at_launch,
                 })
             }
         };
@@ -1433,8 +1439,9 @@ theme = "gone"
         editor.set_text(Field::SshArgs, "-J 'my bastion'");
         state.save(&f.path, &[]).unwrap();
         match &f.config().profiles[2].remote {
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch }) => {
                 assert_eq!((host.as_str(), user.as_deref(), *port), ("A8", Some("ubuntu"), Some(2222)));
+                assert!(!connect_at_launch);
                 assert_eq!(identity_file, &None);
                 assert_eq!(ssh_args, &["-J", "my bastion"]);
             }
@@ -1445,6 +1452,37 @@ theme = "gone"
         assert_eq!(editor.remote_kind(), RemoteKind::Ssh);
         assert_eq!(editor.text(Field::SshPort), "2222");
         assert_eq!(editor.text(Field::SshArgs), "-J 'my bastion'");
+    }
+
+    /// 8.1: editing a profile that connects at launch, through either kind
+    /// of target, keeps `connect_at_launch` (the dialog has no control for
+    /// it yet), and one that doesn't still doesn't.
+    #[test]
+    fn saving_an_edit_keeps_connect_at_launch() {
+        let text = "[[profiles]]\nname = \"Shell\"\n\
+                    [[profiles]]\nname = \"A8\"\nremote = { type = \"ssh\", host = \"A8\", connect_at_launch = true }\n\
+                    [[profiles]]\nname = \"box\"\nremote = { type = \"container\", container = \"box\", connect_at_launch = true }\n\
+                    [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n";
+        let f = Fixture::new("connect-at-launch", text);
+        let mut state = f.state();
+        for name in ["A8", "box", "B9"] {
+            edit(&mut state, name).set_text(Field::Cwd, "/srv");
+            state.save(&f.path, &[]).unwrap();
+        }
+        // The kind changed too: SSH to a container, the setting kept.
+        let editor = edit(&mut state, "A8");
+        editor.choose_remote(RemoteKind::Container);
+        editor.set_text(Field::Container, "a8box");
+        state.save(&f.path, &[]).unwrap();
+        let config = f.config();
+        let eager: Vec<(&str, bool, Option<&str>)> = config.profiles[1..]
+            .iter()
+            .map(|p| (p.name.as_str(), p.remote.as_ref().unwrap().connects_at_launch(), p.cwd.as_deref()))
+            .collect();
+        assert_eq!(eager, [("A8", true, Some("/srv")), ("box", true, Some("/srv")), ("B9", false, Some("/srv"))]);
+        assert!(matches!(config.profiles[1].remote, Some(RemoteTarget::Container { .. })));
+        assert_eq!(f.text().matches("connect_at_launch = true").count(), 2, "{}", f.text());
+        assert!(!f.text().contains("connect_at_launch = false"), "{}", f.text());
     }
 
     #[test]
@@ -1459,7 +1497,12 @@ theme = "gone"
         state.save(&f.path, &[]).unwrap();
         assert_eq!(
             f.config().profiles[2].remote,
-            Some(RemoteTarget::Container { engine: "podman".into(), container: "my-box".into(), user: None })
+            Some(RemoteTarget::Container {
+                engine: "podman".into(),
+                container: "my-box".into(),
+                user: None,
+                connect_at_launch: false
+            })
         );
         let editor = edit(&mut state, "Work");
         assert_eq!((editor.remote_kind(), editor.engine()), (RemoteKind::Container, "podman"));

@@ -465,6 +465,7 @@ mod tests {
                 port: None,
                 identity_file: None,
                 ssh_args: Vec::new(),
+                connect_at_launch: false,
             }),
             env: BTreeMap::from([("FOO".to_string(), "1".to_string())]),
             ..Default::default()

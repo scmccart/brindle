@@ -10,6 +10,8 @@
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub mod client;
 mod host;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub mod hosts;
 #[cfg(any(target_os = "linux", windows))]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
@@ -145,6 +147,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             port,
             identity_file,
             ssh_args,
+            connect_at_launch: _,
         } => {
             let mut command = Command::new("ssh");
             command.args([
@@ -178,6 +181,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             engine,
             container,
             user,
+            connect_at_launch: _,
         } => {
             if engine != "docker" && engine != "podman" {
                 bail!("unsupported container engine {engine:?}; use docker or podman");
@@ -207,6 +211,7 @@ mod tests {
             port: Some(2222),
             identity_file: Some("key file".into()),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+            connect_at_launch: false,
         };
         let command = remote_command(
             &target,
@@ -247,6 +252,7 @@ mod tests {
             engine: "docker".into(),
             container: "devbox".into(),
             user: Some("1000".into()),
+            connect_at_launch: false,
         };
         let command =
             remote_command(&target, "/bin/sh", &["-lc".into(), "echo hi".into()]).unwrap();

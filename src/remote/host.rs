@@ -37,9 +37,11 @@ enum Identity<'a> {
 }
 
 impl Host {
-    /// The endpoint a profile's sessions run on.
+    /// The endpoint a profile's sessions run on. Its target carries no
+    /// `connect_at_launch` ([`RemoteTarget::endpoint`]), so a tab's recorded
+    /// target never has it.
     pub fn of(profile: &Profile) -> Self {
-        profile.remote.clone().map_or(Self::Local, Self::Remote)
+        profile.remote.as_ref().map_or(Self::Local, |target| Self::Remote(target.endpoint()))
     }
 
     /// The remote target, for a remote endpoint.
@@ -59,14 +61,17 @@ impl Host {
         // placed here: part of the identity, or not.
         match self {
             Self::Local => Identity::Local,
-            Self::Remote(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args }) => Identity::Ssh {
-                host,
-                user: user.as_deref(),
-                port: *port,
-                identity_file: identity_file.as_deref(),
-                ssh_args,
-            },
-            Self::Remote(RemoteTarget::Container { engine, container, user }) => {
+            // Whether a profile connects at launch says nothing of where.
+            Self::Remote(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ }) => {
+                Identity::Ssh {
+                    host,
+                    user: user.as_deref(),
+                    port: *port,
+                    identity_file: identity_file.as_deref(),
+                    ssh_args,
+                }
+            }
+            Self::Remote(RemoteTarget::Container { engine, container, user, connect_at_launch: _ }) => {
                 Identity::Container { engine, container, user: user.as_deref() }
             }
         }
@@ -116,6 +121,7 @@ mod tests {
             port,
             identity_file: Some("~/.ssh/a8".into()),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+            connect_at_launch: false,
         }
     }
 
@@ -150,6 +156,7 @@ mod tests {
                 port: Some(22),
                 identity_file: Some("~/.ssh/a8".into()),
                 ssh_args: Vec::new(),
+                connect_at_launch: false,
             }),
             Host::Remote(RemoteTarget::Ssh {
                 host: "A8".into(),
@@ -157,6 +164,7 @@ mod tests {
                 port: Some(22),
                 identity_file: None,
                 ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+                connect_at_launch: false,
             }),
         ];
         let mut hosts: HashSet<Host> = HashSet::from([base.clone()]);
@@ -173,6 +181,7 @@ mod tests {
                 engine: engine.into(),
                 container: container.into(),
                 user: user.map(Into::into),
+                connect_at_launch: false,
             })
         };
         let base = container("docker", "devbox", None);
@@ -187,15 +196,42 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
+            connect_at_launch: false,
         });
         assert_ne!(base, ssh);
+    }
+
+    /// 8.1: a profile that connects at launch is on the same endpoint as
+    /// one that doesn't, and its host's target (which a tab records) doesn't
+    /// carry the setting.
+    #[test]
+    fn connecting_at_launch_is_no_part_of_the_endpoint() {
+        let eager = |target: RemoteTarget| match target {
+            RemoteTarget::Ssh { connect_at_launch: _, host, user, port, identity_file, ssh_args } => {
+                RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: true }
+            }
+            RemoteTarget::Container { connect_at_launch: _, engine, container, user } => {
+                RemoteTarget::Container { engine, container, user, connect_at_launch: true }
+            }
+        };
+        let container =
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
+        for target in [ssh(Some("dev"), Some(22)), container] {
+            let on = profile("eager", Some(eager(target.clone())));
+            let off = profile("lazy", Some(target.clone()));
+            assert_eq!(Host::of(&on), Host::of(&off));
+            assert_eq!(Host::Remote(eager(target.clone())), Host::Remote(target.clone()));
+            assert_eq!(Host::of(&on).target(), Some(&target), "the endpoint alone");
+            assert!(!Host::of(&on).target().unwrap().connects_at_launch());
+        }
     }
 
     #[test]
     fn hosts_are_named_for_messages() {
         assert_eq!(Host::Remote(ssh(Some("dev"), Some(2222))).name(), "dev@A8:2222");
         assert_eq!(Host::Remote(ssh(None, None)).name(), "A8");
-        let container = RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None };
+        let container =
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
         assert_eq!(Host::Remote(container).name(), "devbox");
     }
 }

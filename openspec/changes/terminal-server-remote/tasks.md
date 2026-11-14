@@ -78,9 +78,9 @@
 
 ## 8. Eager endpoints, the sessions palette and settings
 
-- [ ] 8.1 Add `connect_at_launch` to both remote target kinds in `config.rs` and `config_edit.rs` (written only when true). Verify with config round-trip tests
-- [ ] 8.2 Add the `Hosts` global (connecting, connected, offline with its error), fed from the connections. Keep eager connections for the process's life, retrying up to 60 s apart. Verify with a unit test of the state transitions on an in-memory transport
-- [ ] 8.3 List every connected endpoint's detached sessions in the sessions palette, grouped local first then by profile order, with inert rows for connecting and offline endpoints. Make `picker_kill` and enter act on the row's connection. Verify with `picker.rs` unit tests of the grouping and the inert rows
+- [x] 8.1 Add `connect_at_launch` to both remote target kinds in `config.rs` and `config_edit.rs` (written only when true). Verify with config round-trip tests
+- [x] 8.2 Add the `Hosts` global (connecting, connected, offline with its error), fed from the connections. Keep eager connections for the process's life, retrying up to 60 s apart. Verify with a unit test of the state transitions on an in-memory transport
+- [x] 8.3 List every connected endpoint's detached sessions in the sessions palette, grouped local first then by profile order, with inert rows for connecting and offline endpoints. Make `picker_kill` and enter act on the row's connection. Verify with `picker.rs` unit tests of the grouping and the inert rows
 - [ ] 8.4 Add the "Connect at launch" `Switch` to the settings dialog's remote section, for both kinds; verify with the settings dialog's unit tests and a `--dump-screen-after` e2e check of the field
 - [ ] 8.5 Document remote persistence, `connect_at_launch`, `loginctl enable-linger` and the sessions palette's hosts in README.md; verify the README's example config parses with a config unit test
 

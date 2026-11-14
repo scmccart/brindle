@@ -58,26 +58,34 @@ pub fn sweep(listed: Vec<SessionInfo>, skip: &[ServerSession]) -> Vec<SessionInf
     sessions
 }
 
-/// Whether `profile` connects at launch. Its `connect_at_launch` setting
-/// comes with task 8.1; until then no profile does.
-pub fn connects_at_launch(_profile: &Profile) -> bool {
-    false
+/// Whether `profile` connects at launch: its remote target's
+/// `connect_at_launch`.
+pub fn connects_at_launch(profile: &Profile) -> bool {
+    profile.remote.as_ref().is_some_and(crate::config::RemoteTarget::connects_at_launch)
 }
 
-/// The remote endpoints a restoring launch connects to: those of its
-/// restored remote zones (`restored`), then those of the profiles that
-/// connect at launch, each once. The flag marks the latter, whose
-/// connections stay eager.
-pub fn launch_hosts(restored: &[Host], config: &Config) -> Vec<(Host, bool)> {
-    let mut hosts: Vec<(Host, bool)> = Vec::new();
-    let eager = config.profiles.iter().filter(|p| connects_at_launch(p)).map(|p| (Host::of(p), true));
-    for (host, eager) in restored.iter().map(|host| (host.clone(), false)).chain(eager) {
-        if host.is_local() {
-            continue;
+/// The endpoints of the profiles that connect at launch, each once, in
+/// profile order: what the process keeps connected while it runs, launches
+/// with `--no-restore` included. One endpoint is eager when any of its
+/// profiles is.
+pub fn eager_hosts(config: &Config) -> Vec<Host> {
+    let mut hosts: Vec<Host> = Vec::new();
+    for host in config.profiles.iter().filter(|p| connects_at_launch(p)).map(Host::of) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
         }
-        match hosts.iter_mut().find(|(known, _)| *known == host) {
-            Some((_, known_eager)) => *known_eager |= eager,
-            None => hosts.push((host, eager)),
+    }
+    hosts
+}
+
+/// The remote endpoints whose first listing a restoring launch sweeps: those
+/// of its restored remote zones (`restored`), then those of the profiles
+/// that connect at launch ([`eager_hosts`]), each once.
+pub fn launch_hosts(restored: &[Host], config: &Config) -> Vec<Host> {
+    let mut hosts: Vec<Host> = Vec::new();
+    for host in restored.iter().cloned().chain(eager_hosts(config)) {
+        if !host.is_local() && !hosts.contains(&host) {
+            hosts.push(host);
         }
     }
     hosts
@@ -275,6 +283,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
+            connect_at_launch: false,
         });
         assert_eq!(remote_profile(&started_with(Some("A8")), &c3, &config), None);
     }
@@ -295,8 +304,30 @@ mod tests {
         let config = profiles();
         let (a8, b9) = (Host::of(&config.profiles[1]), Host::of(&config.profiles[3]));
         let hosts = launch_hosts(&[a8.clone(), Host::Local, b9.clone(), Host::of(&config.profiles[2])], &config);
-        assert_eq!(hosts, [(a8, false), (b9, false)]);
-        assert!(launch_hosts(&[], &config).is_empty(), "no profile connects at launch yet");
+        assert_eq!(hosts, [a8, b9]);
+        assert!(launch_hosts(&[], &config).is_empty(), "no profile connects at launch");
+        assert!(eager_hosts(&config).is_empty());
+    }
+
+    /// 8.1: the profiles with `connect_at_launch` name the eager endpoints,
+    /// each once in profile order (one is eager when any of its profiles
+    /// is); a restoring launch sweeps them after the restored ones.
+    #[test]
+    fn profiles_that_connect_at_launch_make_their_endpoints_eager() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\
+             [[profiles]]\nname = \"devbox\"\nremote = { type = \"container\", container = \"devbox\", connect_at_launch = true }\n\
+             [[profiles]]\nname = \"htop on A8\"\ncommand = \"htop\"\nremote = { type = \"ssh\", host = \"A8\" }\n\
+             [[profiles]]\nname = \"A8\"\nremote = { type = \"ssh\", host = \"A8\", connect_at_launch = true }\n\
+             [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n\
+             [[profiles]]\nname = \"devbox again\"\nremote = { type = \"container\", container = \"devbox\", connect_at_launch = true }\n",
+        )
+        .unwrap();
+        let connects: Vec<bool> = config.profiles.iter().map(connects_at_launch).collect();
+        assert_eq!(connects, [false, true, false, true, false, true]);
+        let (devbox, a8, b9) = (Host::of(&config.profiles[1]), Host::of(&config.profiles[2]), Host::of(&config.profiles[4]));
+        assert_eq!(eager_hosts(&config), [devbox.clone(), a8.clone()]);
+        assert_eq!(launch_hosts(&[b9.clone(), a8.clone()], &config), [b9, a8, devbox]);
     }
 
     #[test]

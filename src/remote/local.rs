@@ -24,7 +24,10 @@
 //! The process keeps one [`Connection`] per endpoint ([`Host`]) for all
 //! its tabs ([`shared`]). A tab's [`Session`] gets it, and its session, on
 //! a thread of its own. A remote endpoint's connection goes through a
-//! relay (`relay.rs`) instead of the local socket or pipe.
+//! relay (`relay.rs`) instead of the local socket or pipe. The endpoints of
+//! profiles that connect at launch are kept connected ([`keep_connected`]),
+//! and each remote connection tells [`watch_hosts`]' callback how it
+//! stands, for `remote::hosts::Hosts`.
 
 mod connection;
 mod link;
@@ -40,7 +43,7 @@ mod sys;
 mod sys;
 mod upgrade;
 
-pub use connection::{AttachRequest, Connection, Foreground, ListingHook, SessionSink, SpawnRequest};
+pub use connection::{AttachRequest, Connection, Foreground, ListingHook, Report, SessionSink, SpawnRequest};
 pub use super::Host;
 /// What `remote::client`'s tests of the relay's launch against real
 /// endpoints start for themselves.
@@ -60,6 +63,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
 
+use super::hosts::LinkState;
 use super::protocol::client::{self, Hello, ToClient, ToCore, Welcome};
 use super::protocol::{Frame, server_dir};
 pub use sys::Stream;
@@ -107,13 +111,22 @@ pub fn client_token() -> &'static str {
     })
 }
 
+/// The process's connections, one per endpoint.
+static CONNECTIONS: LazyLock<Registry> = LazyLock::new(Registry::default);
+/// The remote endpoints the process keeps connected ([`keep_connected`]).
+static EAGER: Mutex<Vec<Host>> = Mutex::new(Vec::new());
+/// Where remote connections report how they stand ([`watch_hosts`]).
+type Watcher = Box<dyn Fn(&Host, u64, LinkState) + Send + Sync>;
+static WATCHER: OnceLock<Watcher> = OnceLock::new();
+
 /// The process's connection to `host`'s core. A local one is made
 /// (starting a core if needed, and offering it an upgrade) when there is
 /// none or the last one ended; it blocks, so it runs on a session's start
 /// thread ([`Session::start`]), never on the UI thread. A remote one returns
-/// at once and connects in the background, with requests waiting for it.
+/// at once and connects in the background, with requests waiting for it;
+/// it is eager from the start when the process keeps `host` connected, and
+/// reports to [`watch_hosts`]' callback.
 pub fn shared(host: &Host) -> Result<Arc<Connection>> {
-    static CONNECTIONS: LazyLock<Registry> = LazyLock::new(Registry::default);
     CONNECTIONS.get(host, || match host {
         Host::Local => {
             let endpoint = Endpoint::from_env()?;
@@ -123,18 +136,92 @@ pub fn shared(host: &Host) -> Result<Arc<Connection>> {
         }
         Host::Remote(target) => {
             let dial = relay::dial(host.name(), target);
-            Connection::relay(dial, &host_token(host), relay::Timings::default())
+            let eager = EAGER.lock().contains(host);
+            let report = WATCHER.get().map(|_| {
+                let host = host.clone();
+                Arc::new(move |conn: u64, state: LinkState| {
+                    if let Some(watch) = WATCHER.get() {
+                        watch(&host, conn, state);
+                    }
+                }) as Report
+            });
+            Connection::relay_with(dial, &host_token(host), relay::Timings::default(), eager, report)
         }
     })
 }
 
+/// The process's connection to `host` if it has one that hasn't ended. It
+/// never connects.
+pub fn existing(host: &Host) -> Option<Arc<Connection>> {
+    CONNECTIONS.existing(host)
+}
+
+/// Makes `watch` the callback every remote connection made from now on
+/// reports its changes of state to, with its host and its id: once, before
+/// any remote connection is made. It is called with a connection's lock
+/// held, from its threads, so it must not block.
+pub fn watch_hosts(watch: impl Fn(&Host, u64, LinkState) + Send + Sync + 'static) {
+    if WATCHER.set(Box::new(watch)).is_err() {
+        log::warn!("remote endpoints are already watched");
+    }
+}
+
+/// Keeps the remote endpoints in `hosts` connected (profiles that connect at
+/// launch): each one's connection is eager, never closing for want of use
+/// and retrying for as long as the process runs, and one not connected yet
+/// is connected to in the background. An endpoint no longer listed loses
+/// that, so its connection closes once nothing uses it. Doesn't block.
+pub fn keep_connected(hosts: Vec<Host>) {
+    let hosts: Vec<Host> = hosts.into_iter().filter(|host| !host.is_local()).collect();
+    let (added, removed) = {
+        let mut eager = EAGER.lock();
+        let change = eager_change(&eager, &hosts);
+        *eager = hosts;
+        change
+    };
+    // Not under `EAGER`: `shared` takes it under a registry slot's lock.
+    for host in &removed {
+        if let Some(connection) = existing(host) {
+            connection.set_eager(false);
+        }
+    }
+    if added.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("eager-connect".into()).spawn(move || {
+        for host in added {
+            match shared(&host) {
+                // One made just now is eager already; one a tab made isn't.
+                // Under `EAGER`, so a later call that drops the host wins.
+                Ok(connection) => {
+                    let eager = EAGER.lock();
+                    if eager.contains(&host) {
+                        connection.set_eager(true);
+                    }
+                }
+                Err(error) => log::warn!("can't connect to {}: {error:#}", host.name()),
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        log::warn!("not connecting at launch: {error}");
+    }
+}
+
+/// Which of `new` aren't in `old` (to connect), and which of `old` aren't in
+/// `new` (to let go), each in its list's order.
+fn eager_change(old: &[Host], new: &[Host]) -> (Vec<Host>, Vec<Host>) {
+    let added = new.iter().filter(|host| !old.contains(host)).cloned().collect();
+    let removed = old.iter().filter(|host| !new.contains(host)).cloned().collect();
+    (added, removed)
+}
+
 /// Hands `hook` the sessions `host`'s core lists once the process's
 /// connection to it is up: at once if it is, else on its first link
-/// (design.md decision 10). Until then the connection keeps trying, and with
-/// `eager` it keeps connecting afterwards too, while nothing else uses it (a
-/// profile that connects at launch). For a remote host: a local one would
-/// block here while connecting. Not on the UI thread.
-pub fn when_listed(host: &Host, eager: bool, hook: ListingHook) {
+/// (design.md decision 10). Until then the connection keeps trying. For a
+/// remote host: a local one would block here while connecting. Not on the
+/// UI thread.
+pub fn when_listed(host: &Host, hook: ListingHook) {
     let mut hook = hook;
     // A connection that ended just now is replaced by the next `shared`.
     for _ in 0..3 {
@@ -145,9 +232,6 @@ pub fn when_listed(host: &Host, eager: bool, hook: ListingHook) {
                 return;
             }
         };
-        if eager {
-            connection.set_eager(true);
-        }
         match connection.on_listing(hook) {
             Ok(()) => return,
             Err(back) => hook = back,
@@ -202,6 +286,13 @@ impl Registry {
         }));
         *current = Some(connection.clone());
         Ok(connection)
+    }
+
+    /// `host`'s connection, if one is made and hasn't ended.
+    fn existing(&self, host: &Host) -> Option<Arc<Connection>> {
+        let slot = self.0.lock().get(host).cloned()?;
+        let current = slot.lock();
+        current.as_ref().filter(|connection| !connection.is_dead()).cloned()
     }
 
     #[cfg(test)]
@@ -768,6 +859,7 @@ mod tests {
             port: Some(port),
             identity_file: None,
             ssh_args: Vec::new(),
+            connect_at_launch: false,
         };
         let profile = |name: &str, remote: RemoteTarget| Profile { name: name.into(), remote: Some(remote), ..Default::default() };
         let registry = Registry::default();
@@ -816,6 +908,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
+            connect_at_launch: false,
         });
         let idle = Duration::from_secs(1);
         let registry = Registry::default();
@@ -878,6 +971,60 @@ mod tests {
         assert_eq!(plans.lock().len(), 2);
     }
 
+    /// The palette's lookup never makes a connection, and doesn't hand out
+    /// one that has ended.
+    #[test]
+    fn looking_a_connection_up_never_makes_one() {
+        use crate::config::RemoteTarget;
+        use connection::fake;
+
+        let host = Host::Remote(RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        let registry = Registry::default();
+        assert!(registry.existing(&host).is_none());
+        assert!(!registry.has(&host), "a lookup makes no slot");
+        let (dial, plan) = fake::dialer("A8");
+        let connection = registry.get(&host, || Connection::relay(dial, "tok", fake::quick())).unwrap();
+        assert!(Arc::ptr_eq(&registry.existing(&host).unwrap(), &connection));
+        // A lazy connection whose first attempt fails ends.
+        plan.fail("ssh: Connection refused");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !connection.is_dead() {
+            assert!(Instant::now() < deadline, "the connection never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(registry.existing(&host).is_none(), "an ended connection isn't handed out");
+    }
+
+    /// A reload's change to the endpoints kept connected: the ones to
+    /// connect and the ones to let go, in order.
+    #[test]
+    fn the_eager_change_names_what_to_connect_and_let_go() {
+        use crate::config::RemoteTarget;
+
+        let ssh = |host: &str| {
+            Host::Remote(RemoteTarget::Ssh {
+                host: host.into(),
+                user: None,
+                port: None,
+                identity_file: None,
+                ssh_args: Vec::new(),
+                connect_at_launch: false,
+            })
+        };
+        let (a8, b9, c7) = (ssh("A8"), ssh("B9"), ssh("C7"));
+        assert_eq!(eager_change(&[], &[a8.clone(), b9.clone()]), (vec![a8.clone(), b9.clone()], vec![]));
+        assert_eq!(eager_change(&[a8.clone(), b9.clone()], &[c7.clone(), a8.clone()]), (vec![c7.clone()], vec![b9.clone()]));
+        assert_eq!(eager_change(&[a8.clone()], &[a8.clone()]), (vec![], vec![]));
+        assert_eq!(eager_change(&[a8.clone(), c7.clone()], &[]), (vec![], vec![a8, c7]));
+    }
+
     #[test]
     fn each_remote_endpoint_has_a_token_of_its_own() {
         use crate::config::RemoteTarget;
@@ -889,6 +1036,7 @@ mod tests {
                 port: None,
                 identity_file: None,
                 ssh_args: Vec::new(),
+                connect_at_launch: false,
             })
         };
         assert_eq!(host_token(&Host::Local), client_token());

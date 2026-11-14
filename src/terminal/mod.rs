@@ -1303,7 +1303,7 @@ mod tests {
         use crate::config::RemoteTarget;
         use crate::remote::protocol::client::Policy;
 
-        let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new() };
+        let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false };
         let profile = Profile {
             name: "htop".into(),
             command: Some("htop".into()),

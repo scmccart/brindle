@@ -39,6 +39,7 @@ use gpui::{
 use crate::actions::{Quit, ReloadConfig};
 use crate::config::Config;
 use crate::latency::Latency;
+use crate::remote::hosts::Hosts;
 use crate::settings::Settings;
 use crate::session::{SessionStore, WindowState};
 use crate::workspace::{Launch, LaunchRequest, Workspace};
@@ -426,7 +427,70 @@ pub(crate) fn reload_config_renaming(cx: &mut App, renames: &[(String, String)])
             window.update(cx, |workspace, _, cx| workspace.apply_config(renames, cx)).ok();
         }
     }
+    keep_hosts_connected(cx);
     cx.refresh_windows();
+}
+
+/// Keeps the remote endpoints' states in the [`Hosts`] global, for the
+/// sessions palette (design.md decision 11): every remote connection reports
+/// its changes on a channel this drains on the UI thread, so nothing polls
+/// them. Then connects to the endpoints of the profiles that connect at
+/// launch, on every launch (`--no-restore` included). Before any window
+/// opens, so the restored tabs' connections report too.
+fn watch_hosts(cx: &mut App) {
+    cx.set_global(Hosts::default());
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        use futures::StreamExt as _;
+
+        let (reported, mut reports) = futures::channel::mpsc::unbounded();
+        remote::local::watch_hosts(move |host, conn, state| {
+            reported.unbounded_send((host.clone(), conn, state)).ok();
+        });
+        cx.spawn(async move |cx| {
+            while let Some(report) = reports.next().await {
+                // What has come meanwhile, applied in one update.
+                let mut batch = vec![report];
+                while let Ok(Some(report)) = reports.try_next() {
+                    batch.push(report);
+                }
+                let applied = cx.update(|cx| {
+                    let changed = cx.update_global(|hosts: &mut Hosts, _| {
+                        batch.into_iter().fold(false, |changed, (host, conn, state)| hosts.apply(&host, conn, state) | changed)
+                    });
+                    if changed {
+                        hosts_changed(cx);
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    keep_hosts_connected(cx);
+}
+
+/// Keeps the endpoints of the config's profiles that connect at launch
+/// connected, and lets go of those it no longer names (a reload).
+fn keep_hosts_connected(cx: &mut App) {
+    let eager = reattach::eager_hosts(&Settings::get(cx).config);
+    let changed = cx.update_global(|hosts: &mut Hosts, _| hosts.want(&eager));
+    #[cfg(any(target_os = "linux", windows))]
+    remote::local::keep_connected(eager);
+    if changed {
+        hosts_changed(cx);
+    }
+}
+
+/// Tells every window the endpoints' states changed.
+fn hosts_changed(cx: &mut App) {
+    for window in cx.windows() {
+        if let Some(window) = window.downcast::<Workspace>() {
+            window.update(cx, |workspace, window, cx| workspace.hosts_changed(window, cx)).ok();
+        }
+    }
 }
 
 fn config_mtime() -> Option<SystemTime> {
@@ -529,10 +593,12 @@ fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
     Some(Vec::new())
 }
 
-/// Connects, on background threads, to the remote endpoints of the restored
-/// zones and of the profiles that connect at launch; on each one's first
-/// listing, attaches its detached sessions that nothing restored as tabs at
-/// the end ([`Workspace::attach_swept`], design.md decision 10).
+/// For a restoring launch: connects, on background threads, to the remote
+/// endpoints of the restored zones and of the profiles that connect at
+/// launch (which [`watch_hosts`] keeps connected whether or not the launch
+/// restores); on each one's first listing, attaches its detached sessions
+/// that nothing restored as tabs at the end ([`Workspace::attach_swept`],
+/// design.md decision 10).
 fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
     #[cfg(any(target_os = "linux", windows))]
     {
@@ -544,14 +610,14 @@ fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
             return;
         }
         let (listed, mut listings) = futures::channel::mpsc::unbounded();
-        for (host, eager) in hosts {
+        for host in hosts {
             let listed = listed.clone();
             let spawned = std::thread::Builder::new().name("launch-connect".into()).spawn(move || {
                 let named = host.clone();
                 let hook: remote::local::ListingHook = Box::new(move |sessions| {
                     listed.unbounded_send((named, sessions)).ok();
                 });
-                remote::local::when_listed(&host, eager, hook);
+                remote::local::when_listed(&host, hook);
             });
             if let Err(error) = spawned {
                 log::warn!("not connecting at launch: {error}");
@@ -801,6 +867,7 @@ fn main() {
             }
             None => (request.unwrap_or_else(|| Launch::Request(LaunchRequest::profile(profile))), None),
         };
+        watch_hosts(cx);
         let Some(window) = open_window(first, cx) else {
             cx.quit();
             return;

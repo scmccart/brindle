@@ -46,6 +46,12 @@
 //!   while the link is down keeps it reconnecting). Unless it is eager, it
 //!   ends [`Timings::idle`] after it was last in use: its process is killed
 //!   and [`super::shared`] forgets it.
+//! - **State reports:** a relay connection made with a [`Report`] tells it
+//!   each change of its state ([`LinkState`], for `remote::hosts::Hosts`):
+//!   connecting until its first link is up, connected while one is, offline
+//!   with why from a failed attempt or a lost link until the next link is
+//!   up, and ended once for good. Reports are sent under the state lock, so
+//!   they come in order, and nothing follows the end.
 //! - **This machine only:** a relay's sessions run on another machine, so
 //!   they are never sent `REPARENT` (a window handle of this one), and
 //!   what is known of their programs comes from `PROCESS` ([`Foreground`]).
@@ -77,6 +83,7 @@ use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
     SessionRef, Spawned, ToClient, ToCore,
 };
+use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
 use crate::remote::protocol::{Frame, RequestId, SessionId};
 
@@ -93,6 +100,13 @@ const RECONNECT_POLL: Duration = Duration::from_millis(100);
 const INPUT_CHUNK: usize = 64 * 1024;
 /// The reader's buffer.
 const READ_BUFFER: usize = 64 * 1024;
+
+/// Where a relay connection tells its changes of state: its id (each
+/// connection's own, increasing) and its new state. Called with the state
+/// lock held, so it must not block.
+pub type Report = Arc<dyn Fn(u64, LinkState) + Send + Sync>;
+
+static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 /// Where a session's output and events go: its terminal.
 pub trait SessionSink: Send {
@@ -255,6 +269,8 @@ struct State {
     ended: Option<String>,
     /// Run once when it ends ([`Connection::on_end`]).
     on_end: Option<Box<dyn FnOnce() + Send>>,
+    /// What was last reported ([`Connection::report`]).
+    reported: Option<LinkState>,
 }
 
 impl State {
@@ -357,6 +373,9 @@ pub struct Connection {
     token: String,
     /// Keep connecting while nothing waits (a profile connects at launch).
     eager: AtomicBool,
+    /// This connection's own, for its reports.
+    id: u64,
+    report: Option<Report>,
 }
 
 /// Lets a starting session's tab let go of its request while it waits:
@@ -398,6 +417,15 @@ impl Abandon {
 
 impl Connection {
     fn new(transport: Transport, token: &str) -> (Arc<Self>, mpsc::Receiver<ToCore>) {
+        Self::made(transport, token, false, None)
+    }
+
+    fn made(
+        transport: Transport,
+        token: &str,
+        eager: bool,
+        report: Option<Report>,
+    ) -> (Arc<Self>, mpsc::Receiver<ToCore>) {
         let (outgoing, queue) = mpsc::channel();
         let this = Arc::new(Self {
             state: Mutex::new(State::default()),
@@ -410,7 +438,9 @@ impl Connection {
             next_req: AtomicU64::new(1),
             transport,
             token: token.to_string(),
-            eager: AtomicBool::new(false),
+            eager: AtomicBool::new(eager),
+            id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+            report,
         });
         (this, queue)
     }
@@ -433,10 +463,23 @@ impl Connection {
 
     /// A connection to a remote endpoint's core through relays that `dial`
     /// starts. It returns at once: the reader thread connects, and requests
-    /// wait for it.
+    /// wait for it. The process makes its own with [`Connection::relay_with`].
+    #[cfg(test)]
     pub fn relay(dial: Arc<dyn Dial>, token: &str, timings: Timings) -> Result<Arc<Self>> {
+        Self::relay_with(dial, token, timings, false, None)
+    }
+
+    /// [`Connection::relay`], eager from the start when `eager` (so even its
+    /// first failure keeps it trying), telling `report` its changes of state.
+    pub fn relay_with(
+        dial: Arc<dyn Dial>,
+        token: &str,
+        timings: Timings,
+        eager: bool,
+        report: Option<Report>,
+    ) -> Result<Arc<Self>> {
         let name = dial.name();
-        let (this, queue) = Self::new(Transport::Relay { dial, timings }, token);
+        let (this, queue) = Self::made(Transport::Relay { dial, timings }, token, eager, report);
         let writing = this.clone();
         std::thread::Builder::new()
             .name("relay-writer".into())
@@ -527,6 +570,26 @@ impl Connection {
         matches!(self.transport, Transport::Relay { .. })
     }
 
+    /// Tells the connection's [`Report`] its new state, under the state
+    /// lock: once, and nothing after it has ended but that it has.
+    fn report(&self, state: &mut State, now: LinkState) {
+        let Some(report) = &self.report else { return };
+        let ending = matches!(now, LinkState::Ended(_));
+        if matches!(state.reported, Some(LinkState::Ended(_)))
+            || (state.ended.is_some() && !ending)
+            || state.reported.as_ref() == Some(&now)
+        {
+            return;
+        }
+        state.reported = Some(now.clone());
+        report(self.id, now);
+    }
+
+    fn report_now(&self, now: LinkState) {
+        let mut state = self.state.lock();
+        self.report(&mut state, now);
+    }
+
     fn send(&self, message: ToCore) {
         self.outgoing.send(message).ok();
     }
@@ -555,13 +618,16 @@ impl Connection {
     }
 
     /// Sends the request `make` builds and waits for its answer: up to
-    /// [`REQUEST_LIMIT`] on the local core, as long as it takes on a relay.
-    /// A request with no message yet (a recorded attach) waits for the next
-    /// listing, which decides it. Not on the UI thread: this blocks.
+    /// `limit` when given, else up to [`REQUEST_LIMIT`] on the local core
+    /// and as long as it takes on a relay. A request with no message yet (a
+    /// recorded attach) waits for the next listing, which decides it. One
+    /// given up on is never sent if it hasn't been, and its late answer is
+    /// dropped. Not on the UI thread: this blocks.
     fn ask<T>(
         &self,
         what: &str,
         abandon: Option<(Weak<Self>, &Abandon)>,
+        limit: Option<Duration>,
         make: impl FnOnce(RequestId, Reply<T>) -> (Waiting, Option<ToCore>),
     ) -> Result<T> {
         let req = self.req();
@@ -591,12 +657,11 @@ impl Connection {
         if let Some(message) = message {
             self.send(message);
         }
-        let answer = if self.is_relay() {
-            answer.recv().map_err(|_| format!("the terminal server didn't {what}"))
-        } else {
-            answer
-                .recv_timeout(REQUEST_LIMIT)
-                .map_err(|_| format!("the terminal server didn't {what} within {} s", REQUEST_LIMIT.as_secs()))
+        let answer = match limit.or_else(|| (!self.is_relay()).then_some(REQUEST_LIMIT)) {
+            None => answer.recv().map_err(|_| format!("the terminal server didn't {what}")),
+            Some(limit) => answer
+                .recv_timeout(limit)
+                .map_err(|_| format!("the terminal server didn't {what} within {} s", limit.as_secs_f32())),
         };
         // Gone already when answered; a late answer is dealt with by `handle`.
         self.state.lock().requests.remove(&req);
@@ -627,7 +692,7 @@ impl Connection {
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink, abandon: Option<&Abandon>) -> Result<Running> {
         let command = Some(request.command).filter(|command| !command.is_empty());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let spawned = self.ask("start the session", abandon, |req, reply| {
+        let spawned = self.ask("start the session", abandon, None, |req, reply| {
             let message = Some(ToCore::Spawn(client::Spawn {
                 req,
                 command,
@@ -654,7 +719,7 @@ impl Connection {
         let session = request.session;
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let check = request.recorded.then(|| request.key.clone());
-        let pid = self.ask("attach the session", abandon, |req, reply| {
+        let pid = self.ask("attach the session", abandon, None, |req, reply| {
             let attach = client::Attach { req, session, cols: request.cols, rows: request.rows };
             let message = check.is_none().then(|| ToCore::Attach(attach.clone()));
             (Waiting::Attach { sink, reply, attach, check }, message)
@@ -663,15 +728,29 @@ impl Connection {
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
+    #[cfg(test)]
     pub fn list(&self) -> Result<Vec<SessionInfo>> {
-        self.ask("list its sessions", None, |req, reply| {
+        self.list_within(None)
+    }
+
+    /// The core's sessions, this client's and detached ones, waiting at
+    /// most `limit` when given (a relay otherwise waits through
+    /// reconnects; a local connection waits its usual limit). Blocks.
+    pub fn list_within(&self, limit: Option<Duration>) -> Result<Vec<SessionInfo>> {
+        self.ask("list its sessions", None, limit, |req, reply| {
             (Waiting::List(reply), Some(ToCore::List(Request { req })))
         })
     }
 
-    /// Ends a session whatever its policy or client. Blocks.
+    #[cfg(test)]
     pub fn kill(&self, session: SessionId) -> Result<()> {
-        self.ask("end the session", None, |req, reply| {
+        self.kill_within(session, None)
+    }
+
+    /// Ends a session whatever its policy or client, waiting at most `limit`
+    /// when given (as [`Connection::list_within`]). Blocks.
+    pub fn kill_within(&self, session: SessionId, limit: Option<Duration>) -> Result<()> {
+        self.ask("end the session", None, limit, |req, reply| {
             let target = KillTarget::Session(session);
             (Waiting::Done(reply), Some(ToCore::Kill(Kill { req, target })))
         })
@@ -725,6 +804,7 @@ impl Connection {
         let Transport::Relay { dial, timings } = &self.transport else { unreachable!("a relay connection") };
         let name = dial.name();
         let mut failures = 0;
+        self.report_now(LinkState::Connecting);
         loop {
             match self.open_relay(dial.as_ref(), timings) {
                 Ok((mut reader, stamp)) => {
@@ -736,6 +816,7 @@ impl Connection {
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
                     self.lost_link(&name);
+                    self.report_now(LinkState::Offline(format!("connection lost: {reason}")));
                 }
                 Err(_) if self.is_dead() => return,
                 Err(error) => {
@@ -744,6 +825,7 @@ impl Connection {
                     if error.downcast_ref::<Refused>().is_some() || !self.failed_to_connect(&message) {
                         return self.ended(&message);
                     }
+                    self.report_now(LinkState::Offline(format!("{error:#}")));
                     failures += 1;
                 }
             }
@@ -771,6 +853,7 @@ impl Connection {
                 // Sooner than the bootstrap's deadline the watchdog waits for.
                 stamp.touch(timings.dead);
                 self.watch_changed.notify_all();
+                self.report_now(LinkState::Connected);
                 Ok((reader, stamp))
             }
             Err(error) => {
@@ -1262,6 +1345,7 @@ impl Connection {
         let (sessions, requests, hook) = {
             let mut state = self.state.lock();
             state.ended.get_or_insert_with(|| reason.to_string());
+            self.report(&mut state, LinkState::Ended(reason.to_string()));
             state.parents.clear();
             state.foreground.clear();
             // No listing will come.
@@ -2535,6 +2619,105 @@ mod tests {
         eager.set_eager(false);
         eventually("the unused connection ends", || eager.is_dead());
         eventually("its relay is ended", || far.out.is_cut());
+    }
+
+    /// A [`Report`] that hands each report to the receiver.
+    fn reporting() -> (Report, mpsc::Receiver<(u64, LinkState)>) {
+        let (tx, rx) = mpsc::channel();
+        (Arc::new(move |id, state| _ = tx.send((id, state))), rx)
+    }
+
+    /// The next report, which must be from connection `id`.
+    fn reported(rx: &mpsc::Receiver<(u64, LinkState)>, id: u64) -> LinkState {
+        let (from, state) = rx.recv_timeout(Duration::from_secs(10)).expect("a report");
+        assert_eq!(from, id, "{state:?} from another connection");
+        state
+    }
+
+    /// 8.2: a relay connection reports connecting, connected once its link
+    /// is up, offline with why once that link is lost and with each failed
+    /// attempt's error after it (never connecting again), connected once a
+    /// link is back, and ended once it is no longer eager and nothing uses
+    /// it. Nothing follows the end.
+    #[test]
+    fn a_relay_reports_connecting_connected_offline_and_connected_again() {
+        let (dial, plan) = fake::dialer("A8");
+        let timings = Timings { dead: Duration::from_secs(30), idle: Duration::from_millis(200), ..fake::quick() };
+        let (report, reports) = reporting();
+        let connection = Connection::relay_with(dial, "tok", timings, true, Some(report)).unwrap();
+        let id = connection.id;
+        assert_eq!(reported(&reports, id), LinkState::Connecting);
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        assert_eq!(reported(&reports, id), LinkState::Connected);
+        first.hello();
+
+        first.out.cut();
+        assert_eq!(
+            reported(&reports, id),
+            LinkState::Offline("connection lost: the terminal server closed the connection".into())
+        );
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        assert_eq!(reported(&reports, id), LinkState::Offline("ssh: connect to host A8 port 22: Connection refused".into()));
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        let (link, second) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        // The same error again says nothing new.
+        assert_eq!(reported(&reports, id), LinkState::Connected);
+        second.hello();
+        assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing while connected");
+
+        connection.set_eager(false);
+        assert_eq!(reported(&reports, id), LinkState::Ended("the connection was no longer used".into()));
+        eventually("its relay is ended", || second.out.is_cut());
+        assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after the end");
+    }
+
+    /// 8.2: a connection made eager keeps trying after its first attempt
+    /// fails, with nothing waiting on it, and says it is offline; one that
+    /// isn't eager ends with the error. Each connection reports with an id
+    /// of its own.
+    #[test]
+    fn an_eager_relay_is_offline_until_its_first_link_and_a_lazy_one_ends() {
+        let (dial, plan) = fake::dialer("devbox");
+        let (report, reports) = reporting();
+        let eager = Connection::relay_with(dial, "tok", fake::quick(), true, Some(report.clone())).unwrap();
+        assert_eq!(reported(&reports, eager.id), LinkState::Connecting);
+        plan.fail("Error response from daemon: container devbox is not running");
+        let offline = LinkState::Offline("Error response from daemon: container devbox is not running".into());
+        assert_eq!(reported(&reports, eager.id), offline);
+        plan.next_dial();
+        plan.next_dial();
+        assert!(!eager.is_dead());
+
+        let (dial, plan) = fake::dialer("devbox");
+        let lazy = Connection::relay_with(dial, "tok", fake::quick(), false, Some(report)).unwrap();
+        assert!(lazy.id > eager.id);
+        assert_eq!(reported(&reports, lazy.id), LinkState::Connecting);
+        plan.fail("Error response from daemon: container devbox is not running");
+        assert_eq!(
+            reported(&reports, lazy.id),
+            LinkState::Ended("can't connect to devbox: Error response from daemon: container devbox is not running".into())
+        );
+        eventually("the connection ends", || lazy.is_dead());
+    }
+
+    /// 8.3: a listing given a limit fails once it passes, with the relay
+    /// down, and the `LIST` it queued is never sent.
+    #[test]
+    fn a_limited_listing_gives_up_and_is_never_sent() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        first.hello();
+        first.out.cut();
+        let error = connection.list_within(Some(Duration::from_millis(200))).unwrap_err().to_string();
+        assert_eq!(error, "the terminal server didn't list its sessions within 0.2 s");
+        assert!(connection.state.lock().requests.is_empty());
+        let (link, second) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)), "the reconnect's own");
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "not the one given up on");
     }
 
     /// 7.1: a session a restored zone recorded waits, through failed
