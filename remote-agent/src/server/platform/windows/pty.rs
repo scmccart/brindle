@@ -663,15 +663,33 @@ mod tests {
         GetConsoleWindow();')::GetConsoleWindow(); Write-Host ('hwnd=' + $w + ';'); \
         Start-Sleep -Seconds 600";
 
+    /// The window [`CONSOLE_WINDOW`] printed, once the whole `hwnd=N;` is in
+    /// `text`.
+    fn printed_window(text: &str) -> Option<u64> {
+        let (_, rest) = text.split_once("hwnd=")?;
+        let (digits, _) = rest.split_once(';')?;
+        digits.parse().ok()
+    }
+
     /// A session of [`CONSOLE_WINDOW`], and its console window.
     fn session_with_a_console_window(extra: &[(&str, &str)]) -> (Session, u64) {
         let args = ["-NoProfile", "-Command", CONSOLE_WINDOW];
         let mut session = Session::start("powershell.exe", &args, extra);
-        session.until(";");
-        let text = session.text();
-        let digits = text.split("hwnd=").nth(1).and_then(|rest| rest.split(';').next());
-        let window: u64 = digits.and_then(|digits| digits.parse().ok()).unwrap_or(0);
-        assert_ne!(window, 0, "no console window in {text:?}");
+        // Waits for the `hwnd=` line itself: the host's title (`ESC ] 0 ;`)
+        // has a `;` too, and may come in an earlier read.
+        let deadline = Instant::now() + LIMIT;
+        let window = loop {
+            if let Some(window) = printed_window(&session.text()) {
+                break window;
+            }
+            assert!(
+                Instant::now() < deadline && !session.ended,
+                "no console window in {:?}",
+                session.text()
+            );
+            session.turn();
+        };
+        assert_ne!(window, 0, "a console window of 0 in {:?}", session.text());
         (session, window)
     }
 
