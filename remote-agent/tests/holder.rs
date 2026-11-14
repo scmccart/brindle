@@ -68,7 +68,7 @@ mod programs {
 
     /// Makes a FIFO at `path`. A session's program that reads it waits until
     /// the test writes to it.
-    fn make_fifo(path: &Path) {
+    pub fn make_fifo(path: &Path) {
         use std::os::unix::ffi::OsStrExt;
 
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -237,6 +237,25 @@ fn a_ready_pipe_is_passed_as_fd_3_whether_or_not_it_is_there_already() {
     // `--ready-fd 3` would name a closed fd.
     assert_passed_as_fd_3(true);
     assert_passed_as_fd_3(false);
+}
+
+/// `Command` reports a failed exec through a close-on-exec pipe in the
+/// child. When that pipe's write end is fd 3, passing the ready pipe as fd 3
+/// replaces it, and the error's bytes arrive in the ready pipe, where the
+/// first of them once read as "ready".
+#[cfg(unix)]
+#[test]
+fn a_failed_exec_isnt_ready_though_its_error_went_down_the_ready_pipe() {
+    let dir = TempDir::new("exec-error");
+    let missing = Path::new("/nonexistent/brindle-remote");
+    let error = start_with(missing, "hold", &dir.path, &[], send_exec_error_down_fd_3)
+        .expect_err("a program that isn't there started");
+    let error = error.to_string();
+    assert!(error.starts_with("hold wasn't ready"), "{error}");
+    // The error did go down the ready pipe: 8 bytes, where a ready server
+    // writes one. (Had it gone to `Command`, the message would name the
+    // missing program instead.)
+    assert!(error.contains("its ready pipe held 8 bytes"), "{error}");
 }
 
 #[test]
@@ -567,6 +586,73 @@ fn hangup_kills_a_child_that_outlives_its_exited_leader() {
     );
 }
 
+/// A holder that ignores SIGHUP, as one started under `nohup` does, must not
+/// pass that on: an exec keeps ignored signals ignored, and a hang-up would
+/// then end its programs only by the SIGKILL that follows the grace period.
+/// The same goes for a signal the holder was started with blocked.
+#[cfg(unix)]
+#[test]
+fn programs_start_with_default_signals_under_a_holder_that_ignores_sighup() {
+    let mut dir = TempDir::new("nohup");
+    start_with(
+        Path::new(BIN),
+        "hold",
+        &dir.path,
+        &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")],
+        || {
+            // SAFETY: async-signal-safe calls, on a set that `sigemptyset`
+            // fills first.
+            unsafe {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                libc::sigemptyset(blocked.as_mut_ptr());
+                libc::sigaddset(blocked.as_mut_ptr(), libc::SIGUSR1);
+                libc::sigprocmask(libc::SIG_BLOCK, blocked.as_ptr(), std::ptr::null_mut());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut core = TestCore::connect_to(&dir);
+    let holder_pid = core.hello(1).welcome().pid;
+    dir.track(holder_pid);
+    // Whether `pid` ignores SIGHUP, and whether it blocks SIGUSR1.
+    let inherited = |pid: u32| {
+        let has = |name: &str, signal: libc::c_int| {
+            signal_set(pid, name).map(|set| set & (1 << (signal - 1)) != 0)
+        };
+        (has("SigIgn", libc::SIGHUP), has("SigBlk", libc::SIGUSR1))
+    };
+    assert_eq!(
+        inherited(holder_pid),
+        (Some(true), Some(true)),
+        "the holder"
+    );
+
+    // `cat` waits to open a FIFO that nobody writes to, so only a signal
+    // ends it. Reading the terminal instead, it would now and then get to
+    // exit by itself when the hang-up closes that (see `hung_up`).
+    let fifo = dir.path.join("never-written");
+    programs::make_fifo(&fifo);
+    let pid = core.spawn(spawn(1, "cat", &[fifo.to_str().unwrap()]));
+    // Should a check below fail: a `cat` that ignores SIGHUP outlives its
+    // holder and waits forever.
+    dir.track(pid);
+    // A forked child is the holder's own image until its exec.
+    assert!(eventually(TIMEOUT, || program_of(pid).as_deref() == Some("cat")));
+    // Only the two the holder was given: what else a program ignores is its
+    // own doing (one built on Rust's runtime ignores SIGPIPE).
+    assert_eq!(inherited(pid), (Some(false), Some(false)), "the program");
+
+    // What a client's `CLOSE` makes the core send.
+    core.hang_up(1);
+    assert_eq!(core.exit_code(1), None, "a signal ended it");
+    // SIGHUP did, at once: not the SIGKILL the holder sends a second later.
+    let ended_by = format!("session 1: killed by signal Some({})", libc::SIGHUP);
+    let logs = dir.logs();
+    assert!(logs.contains(&ended_by), "{logs}");
+}
+
 /// `SPAWN`'s meta, decoded from JSON as a core would send it.
 fn meta() -> h1::Spawn {
     let frame = Frame::new(
@@ -685,10 +771,21 @@ fn set_meta_replaces_what_the_next_core_gets() {
     second.input(1, programs::ENTER);
 }
 
+/// How many bytes wait in `stream`, unread.
+#[cfg(unix)]
+fn unread(stream: &std::os::unix::net::UnixStream) -> libc::c_int {
+    use std::os::fd::AsRawFd;
+
+    let mut waiting: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int, and the fd is open.
+    let result = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+    assert_eq!(result, 0);
+    waiting
+}
+
 #[cfg(unix)]
 #[test]
 fn what_a_core_sent_before_it_went_counts_while_the_holder_had_output_for_it() {
-    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
 
     let (dir, mut first, holder_pid) = holder("write-fail");
@@ -711,13 +808,6 @@ fn what_a_core_sent_before_it_went_counts_while_the_holder_had_output_for_it() {
         }),
     );
     assert!(first.closes(), "the holder kept its first core");
-    let unread = |stream: &UnixStream| {
-        let mut waiting: libc::c_int = 0;
-        // SAFETY: FIONREAD writes one int, and the fd is open.
-        let result = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut waiting) };
-        assert_eq!(result, 0);
-        waiting
-    };
     let mut before = 0;
     assert!(
         eventually(TIMEOUT, || {
@@ -754,6 +844,135 @@ fn what_a_core_sent_before_it_went_counts_while_the_holder_had_output_for_it() {
     let mut last = TestCore::connect_to(&dir);
     let adopted = last.hello(3);
     assert_eq!(adopted.welcome().sessions[0].meta, updated);
+    last.hang_up(1);
+}
+
+/// Sets a socket's send buffer to `bytes`, or to as much as the system lets
+/// it have, and returns the size it got. Root may pass the system's limit
+/// (`net.core.wmem_max`).
+#[cfg(unix)]
+fn set_send_buffer(stream: &std::os::unix::net::UnixStream, bytes: usize) -> usize {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let wanted = bytes as libc::c_int;
+    let size = size_of::<libc::c_int>() as libc::socklen_t;
+    let mut got: libc::c_int = 0;
+    let mut got_size = size;
+    // SAFETY: each option takes or gives one int, and the fd is open.
+    unsafe {
+        let value = (&raw const wanted).cast();
+        if libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUFFORCE, value, size) != 0 {
+            let set = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, value, size);
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        }
+        let value = (&raw mut got).cast();
+        let read = libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, value, &mut got_size);
+        assert_eq!(read, 0, "{}", std::io::Error::last_os_error());
+    }
+    // The kernel reports twice what it was asked for, to count its own
+    // bookkeeping.
+    got as usize / 2
+}
+
+/// A core's last message can lie behind more than the holder reads in one
+/// turn (1 MiB): everything the core sent before it went is in the holder's
+/// socket, up to the socket's send buffer. The buffer is that big only where
+/// the system allows it (for root, or with a raised `net.core.wmem_max`).
+/// Elsewhere this still checks that a message behind a full buffer counts.
+#[cfg(unix)]
+#[test]
+fn everything_a_core_sent_before_it_went_counts_however_much_it_was() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    /// The send buffer to ask for. The kernel gives twice that, to count its
+    /// own bookkeeping, which is still less than the holder reads from a
+    /// core that is gone (16 MiB).
+    const BUFFER: usize = 6 * 1024 * 1024;
+    /// What is kept free of the buffer for the last message.
+    const RESERVE: usize = 64 * 1024;
+
+    let (dir, mut first, holder_pid) = holder("last-words");
+    // It prints without pause, so the holder always has output to send.
+    first.spawn(shell(1, "stty raw -echo; exec yes"));
+
+    // The next core never reads. Once its socket is full, the holder has
+    // output queued for it, which it tries to send at each turn.
+    let mut silent = UnixStream::connect(&dir.holder_endpoints()[0]).unwrap();
+    let bytes = |message: ToHolder| {
+        let mut bytes = Vec::new();
+        message.encode().unwrap().write_to(&mut bytes).unwrap();
+        bytes
+    };
+    let hello = ToHolder::Hello(h1::Hello {
+        min: h1::PROTOCOLS.min,
+        max: h1::PROTOCOLS.max,
+        core_build: "silent".into(),
+        instance: 2,
+    });
+    silent.write_all(&bytes(hello)).unwrap();
+    assert!(first.closes(), "the holder kept its first core");
+    let mut before = 0;
+    assert!(
+        eventually(TIMEOUT, || {
+            let now = unread(&silent);
+            let full = now >= 64 * 1024 && now == before;
+            before = now;
+            full
+        }),
+        "the holder's output never backed up"
+    );
+
+    // The holder doesn't run while the core sends all this and goes, as on
+    // a busy machine. When it runs again, the write it tries first fails.
+    let signal = |signal| unsafe { libc::kill(holder_pid as libc::pid_t, signal) };
+    assert_eq!(signal(libc::SIGSTOP), 0);
+    assert!(eventually(TIMEOUT, || state(holder_pid) == Some('T')));
+
+    // Messages the holder has no use for (input for a session it doesn't
+    // have), until the socket takes no more. One this small is taken whole
+    // or not at all.
+    let buffer = set_send_buffer(&silent, BUFFER);
+    assert!(buffer > 2 * RESERVE, "a send buffer of {buffer} bytes");
+    set_send_buffer(&silent, buffer - RESERVE);
+    silent.set_nonblocking(true).unwrap();
+    let filler = bytes(ToHolder::Input(h1::Data {
+        session: 99,
+        bytes: vec![b'.'; 8 * 1024],
+    }));
+    let mut sent = 0;
+    loop {
+        match silent.write(&filler) {
+            Ok(written) => assert_eq!(written, filler.len(), "part of a message"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("{error}"),
+        }
+        sent += filler.len();
+    }
+    assert!(sent >= 64 * 1024, "only {sent} bytes fit");
+    // Its last message goes behind them, in the room kept for it.
+    let updated = h1::SessionMeta {
+        owner: "b".into(),
+        ..h1::SessionMeta::default()
+    }
+    .to_value();
+    let last_words = bytes(ToHolder::SetMeta(h1::SetMeta {
+        session: 1,
+        meta: updated.clone(),
+    }));
+    set_send_buffer(&silent, buffer);
+    assert_eq!(silent.write(&last_words).unwrap(), last_words.len());
+    drop(silent);
+    assert_eq!(signal(libc::SIGCONT), 0);
+
+    let mut last = TestCore::connect_to(&dir);
+    let adopted = last.hello(3);
+    assert_eq!(
+        adopted.welcome().sessions[0].meta,
+        updated,
+        "the last of {sent} bytes"
+    );
     last.hang_up(1);
 }
 

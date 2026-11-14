@@ -264,10 +264,11 @@ fn connect_started(endpoint: &Endpoint) -> Result<Stream> {
 
 /// How starting a core went.
 struct Start {
-    /// The core wrote its ready byte.
+    /// The core wrote its ready byte. On Linux that is all it wrote before
+    /// its ready pipe ended (`protocol::ready`).
     ready: bool,
     /// The wait ended by the core's doing (its byte, or its exit) and not
-    /// by the time limit.
+    /// by the time limit. On Linux, that is its ready pipe ending.
     signalled: bool,
     /// How the starter exited.
     status: String,
@@ -499,6 +500,20 @@ mod tests {
         let error = connect(&endpoint, "t").unwrap_err().to_string();
         assert!(error.starts_with("terminal server didn't start"), "{error}");
         assert!(error.contains("the directory is refused"), "{error}");
+    }
+
+    // As above. The script writes what a failed exec leaves in the ready
+    // pipe when that pipe took the place of `Command`'s own for the error:
+    // the errno and "NOEX". Their first byte once read as "ready", and the
+    // failure then showed as a server that couldn't be reached.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_execs_error_in_the_ready_pipe_is_a_core_that_didnt_start() {
+        let temp = TempDir::new("exec-error");
+        let helper = temp.script(r"printf '\000\000\000\002NOEX' >&3; exit 1");
+        let endpoint = Endpoint::at(helper, temp.0.join("server"));
+        let error = connect(&endpoint, "t").unwrap_err().to_string();
+        assert!(error.starts_with("terminal server didn't start"), "{error}");
     }
 
     #[cfg(windows)]

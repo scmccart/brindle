@@ -11,9 +11,9 @@
 
 ## 2. Holder hardening (from `harden-terminal-server`)
 
-- [ ] 2.1 In the PTY child's `pre_exec` (`remote-agent/src/pty/unix.rs`), set every signal except `SIGKILL`/`SIGSTOP` to `SIG_DFL` and empty the mask. Verify with a new `remote-agent/tests/holder.rs` case: a holder started with SIGHUP ignored runs `cat`, and a `CLOSE` ends `cat` by SIGHUP before the SIGKILL grace
-- [ ] 2.2 On a failed write to its core, make the holder read until `WouldBlock` (bounded at 16 MiB) before dropping the core. Verify with a holder test where a `SET_META` queued behind a full socket buffer is stored
-- [ ] 2.3 Make starters count a role as ready only when the ready pipe holds exactly the ready byte at EOF, and make roles close the ready fd right after writing it (`platform/unix/daemon.rs`, `src/remote/local/unix.rs`, `tests/support`). Verify with a test that forces a failed exec with `--ready-fd 3` and gets "didn't start", not "ready"
+- [x] 2.1 In the PTY child's `pre_exec` (`remote-agent/src/pty/unix.rs`), set every signal except `SIGKILL`/`SIGSTOP` to `SIG_DFL` and empty the mask. Verify with a new `remote-agent/tests/holder.rs` case: a holder started with SIGHUP ignored runs `cat`, and a `CLOSE` ends `cat` by SIGHUP before the SIGKILL grace
+- [x] 2.2 On a failed write to its core, make the holder read until `WouldBlock` (bounded at 16 MiB) before dropping the core. Verify with a holder test where a `SET_META` queued behind a full socket buffer is stored
+- [x] 2.3 Make starters count a role as ready only when the ready pipe holds exactly the ready byte at EOF, and make roles close the ready fd right after writing it (`platform/unix/daemon.rs`, `src/remote/local/unix.rs`, `tests/support`). Verify with a test that forces a failed exec with `--ready-fd 3` and gets "didn't start", not "ready"
 
 ## 3. Core: takeover, linger, process info
 

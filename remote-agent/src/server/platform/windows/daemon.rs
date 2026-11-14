@@ -43,7 +43,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brindle_remote_protocol::win;
+use brindle_remote_protocol::{ready, win};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
     INVALID_HANDLE_VALUE, SetHandleInformation,
@@ -138,7 +138,7 @@ impl Ready {
 
     /// Tells the starter the server is listening, and closes the pipe.
     pub fn signal(mut self) -> io::Result<()> {
-        self.0.write_all(b"R")
+        self.0.write_all(&[ready::BYTE])
     }
 }
 
@@ -182,7 +182,10 @@ impl ReadyPipe {
     }
 
     /// Whether the role is listening (`true`) or ended before it was
-    /// (`false`); `None` while neither is known.
+    /// (`false`); `None` while neither is known. The first byte says so,
+    /// without the pipe's end that a Linux starter waits for: only the role
+    /// writes to this handle, and a process that inherited it may keep the
+    /// pipe open ([`ready`]).
     pub fn read(&self) -> Option<bool> {
         let mut buffer = [0u8; 16];
         match self.0.read(&mut buffer) {

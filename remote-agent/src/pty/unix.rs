@@ -64,10 +64,14 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
         .stdout(Stdio::from(File::from(slave_stdout)))
         .stderr(Stdio::from(File::from(slave)));
 
-    // The child must become a session leader and acquire the slave as its
-    // controlling terminal for shell job control and tcgetpgrp to work.
+    // Asked here, since the child may make only async-signal-safe calls.
+    let last_signal = libc::SIGRTMAX();
+    // The child starts with default signal handling, whatever this process
+    // has. It must also become a session leader and acquire the slave as
+    // its controlling terminal for shell job control and tcgetpgrp to work.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            default_signals(last_signal)?;
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -81,6 +85,38 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
     let child = command.spawn()?;
     let pid = child.id() as libc::pid_t;
     Ok(SpawnedPty { pid, child, master })
+}
+
+/// For a forked child, before its exec: gives every signal from 1 to
+/// `last` its default action and unblocks them all, as
+/// `POSIX_SPAWN_SETSIGDEF` and `POSIX_SPAWN_SETSIGMASK` would.
+///
+/// An exec keeps ignored signals ignored and blocked ones blocked. So the
+/// program would otherwise get whatever this process was started with: under
+/// `nohup`, a `SIGHUP` it never sees, and a hang-up that only the `SIGKILL`
+/// after it ends.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+fn default_signals(last: libc::c_int) -> io::Result<()> {
+    for signal in 1..=last {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: the default action runs no code of this process. The C
+        // library refuses the few signals it keeps for itself, and that
+        // failure is ignored.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+    let mut none = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigemptyset` fills the set, and only then is it read.
+    unsafe {
+        if libc::sigemptyset(none.as_mut_ptr()) == -1
+            || libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), std::ptr::null_mut()) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn command_for(request: &PtyCommand, program: OsString) -> Command {

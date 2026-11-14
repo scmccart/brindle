@@ -2,8 +2,11 @@
 //! `setsid`, stdio to the log, and the one ready byte.
 //!
 //! The starter runs `brindle-remote <role> --ready-fd N` with the write end
-//! of a pipe as fd `N`, and waits for one byte on the read end. EOF instead
-//! means the server failed before it was listening (its log says why).
+//! of a pipe as fd `N`, and reads the other end until it ends. The server
+//! writes one byte once it is listening and closes the pipe at once, so that
+//! byte and nothing else means it is listening ([`ready`] has the rule and
+//! why the first byte alone doesn't). A pipe that ends without it means the
+//! server failed before it was listening (its log says why).
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -14,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use brindle_remote_protocol::scope;
+use brindle_remote_protocol::{ready, scope};
 
 use super::event_loop::Source;
 
@@ -40,11 +43,14 @@ impl Ready {
         Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    /// Tells the starter the server is listening, and closes the pipe.
+    /// Tells the starter the server is listening, and closes the pipe. The
+    /// starter waits for both: the byte counts only at the pipe's end.
     pub fn signal(self) -> io::Result<()> {
+        let byte = [ready::BYTE];
         loop {
-            let written = unsafe { libc::write(self.0.as_raw_fd(), b"R".as_ptr().cast(), 1) };
+            let written = unsafe { libc::write(self.0.as_raw_fd(), byte.as_ptr().cast(), 1) };
             if written == 1 {
+                // Dropping `self` closes the pipe.
                 return Ok(());
             }
             let error = io::Error::last_os_error();
@@ -87,25 +93,55 @@ pub fn role_args(role: &str) -> Vec<String> {
 }
 
 /// The read end of a started role's ready pipe.
-pub struct ReadyPipe(OwnedFd);
+pub struct ReadyPipe {
+    pipe: OwnedFd,
+    /// What the pipe has held so far.
+    signal: ready::Signal,
+}
 
 impl ReadyPipe {
-    /// What an event loop waits on: readable once the role is listening or
-    /// has failed.
+    fn new(pipe: OwnedFd) -> Self {
+        Self {
+            pipe,
+            signal: ready::Signal::default(),
+        }
+    }
+
+    /// What an event loop waits on: readable when the role has written to
+    /// the pipe, and when the pipe has ended.
     pub fn source(&self) -> Source {
-        Source::of(&self.0)
+        Source::of(&self.pipe)
     }
 
     /// Whether the role is listening (`true`) or ended before it was
-    /// (`false`); `None` while neither is known.
-    pub fn read(&self) -> Option<bool> {
+    /// (`false`); `None` while neither is known, which is until the pipe
+    /// ends. Only then is the ready byte known to be all the pipe held: the
+    /// first bytes of a failed exec's error aren't a ready byte
+    /// ([`ready`]).
+    ///
+    /// Each call reads once, and the loop calls again while there is more
+    /// to read or the end to see.
+    pub fn read(&mut self) -> Option<bool> {
         let mut buffer = [0u8; 16];
-        let read =
-            unsafe { libc::read(self.0.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
-            return None;
+        let read = unsafe {
+            libc::read(
+                self.pipe.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        match read {
+            0 => Some(self.signal.is_ready()),
+            1.. => {
+                self.signal.push(&buffer[..read as usize]);
+                None
+            }
+            _ => match io::Error::last_os_error().kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
+                // Its end can't be read, so nothing says it is listening.
+                _ => Some(false),
+            },
         }
-        Some(read > 0)
     }
 }
 
@@ -145,7 +181,7 @@ pub fn start_role(
     let (child, ready) = spawn_with_ready_pipe(&mut command, READY_FD)?;
     Ok(Started {
         child,
-        ready: ReadyPipe(ready),
+        ready: ReadyPipe::new(ready),
         program,
     })
 }
@@ -153,8 +189,9 @@ pub fn start_role(
 /// Spawns a server's starter (`command`, such as `brindle-remote hold
 /// --ready-fd 3`) with stdin on `/dev/null` and the write end of a new pipe
 /// as fd `ready_fd`. Returns the child, which exits once the server has
-/// detached, and the pipe's non-blocking read end: one byte arrives once the
-/// server is listening, or EOF if it failed first.
+/// detached, and the pipe's non-blocking read end: the ready byte and then
+/// the pipe's end arrive once the server is listening, or just its end if
+/// the server failed first.
 fn spawn_with_ready_pipe(
     command: &mut Command,
     ready_fd: libc::c_int,
@@ -252,18 +289,97 @@ mod tests {
         );
     }
 
+    /// A new ready pipe: the end a starter reads, and the role's end.
+    fn ready_pipe() -> (ReadyPipe, OwnedFd) {
+        let (read, write) = super::super::event_loop::pipe().unwrap();
+        (ReadyPipe::new(read), write)
+    }
+
+    fn write(pipe: &OwnedFd, bytes: &[u8]) {
+        let written = unsafe { libc::write(pipe.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(written, bytes.len() as isize);
+    }
+
+    /// Reads as a loop does, again while there is more to read: whether the
+    /// role is listening, or `None` while the pipe hasn't ended.
+    fn outcome(ready: &mut ReadyPipe) -> Option<bool> {
+        // More reads than any of these pipes takes.
+        (0..8).find_map(|_| ready.read())
+    }
+
     #[test]
     fn the_ready_byte_reaches_the_pipe() {
         use std::os::fd::IntoRawFd;
 
-        let (read, write) = super::super::event_loop::pipe().unwrap();
-        let read = ReadyPipe(read);
+        let (mut read, role) = ready_pipe();
         assert_eq!(read.read(), None);
-        let ready = Ready::from_fd(write.into_raw_fd()).unwrap();
+        let ready = Ready::from_fd(role.into_raw_fd()).unwrap();
         ready.signal().unwrap();
-        assert_eq!(read.read(), Some(true));
-        // The write end was closed with the Ready.
-        assert_eq!(read.read(), Some(false));
+        // The byte and the pipe's end: the write end was closed with the
+        // `Ready`.
+        assert_eq!(outcome(&mut read), Some(true));
         assert!(Ready::from_fd(-1).is_err());
+    }
+
+    #[test]
+    fn the_ready_byte_counts_only_at_the_pipes_end() {
+        let (mut read, role) = ready_pipe();
+        write(&role, &[ready::BYTE]);
+        // More may follow it: a failed exec's error starts with a byte too.
+        assert_eq!(outcome(&mut read), None);
+        drop(role);
+        assert_eq!(outcome(&mut read), Some(true));
+    }
+
+    #[test]
+    fn anything_but_the_one_ready_byte_is_a_role_that_isnt_listening() {
+        let cases: [&[u8]; 4] = [
+            // The role ended before it was listening.
+            b"",
+            // A failed exec's error, as `Command` writes it: the errno
+            // (ENOENT) and "NOEX".
+            &[0, 0, 0, 2, b'N', b'O', b'E', b'X'],
+            b"RR",
+            b"x",
+        ];
+        for bytes in cases {
+            let (mut read, role) = ready_pipe();
+            write(&role, bytes);
+            drop(role);
+            assert_eq!(outcome(&mut read), Some(false), "{bytes:?}");
+        }
+        // Whatever follows the ready byte, and whenever.
+        let (mut read, role) = ready_pipe();
+        write(&role, &[ready::BYTE]);
+        assert_eq!(outcome(&mut read), None);
+        write(&role, &[ready::BYTE]);
+        drop(role);
+        assert_eq!(outcome(&mut read), Some(false));
+    }
+
+    #[test]
+    fn a_loop_waits_for_the_pipes_end_without_spinning() {
+        use std::time::Duration;
+
+        use super::super::event_loop::PollLoop;
+        use crate::server::event_loop::{EventLoop, Interest};
+
+        let (mut read, role) = ready_pipe();
+        let mut ev = PollLoop::new().unwrap();
+        ev.register(&read.source(), 1, Interest::READABLE).unwrap();
+        let mut events = Vec::new();
+        write(&role, &[ready::BYTE]);
+        ev.wait(&mut events, Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(read.read(), None);
+        // The byte is taken, so until the pipe ends there is nothing to
+        // wake up for.
+        ev.wait(&mut events, Some(Duration::from_millis(20)))
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        drop(role);
+        ev.wait(&mut events, Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(read.read(), Some(true));
     }
 }
