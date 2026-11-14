@@ -261,6 +261,14 @@ fn shell_token() -> crate::Result<HANDLE> {
     let mut pid = 0;
     // SAFETY: a window handle and an out pointer to a local.
     unsafe { GetWindowThreadProcessId(shell, Some(&mut pid)) };
+    // Another user's shell would put the unelevated Brindle's pipes under
+    // another SID, apart from the elevated server's for the wrong reason.
+    use brindle_remote_protocol::win;
+    let shell_user = win::principal_of(pid).map_err(|e| format!("the shell's user (pid {pid}): {e}"))?.sid;
+    let own = win::own_sid().map_err(|e| format!("this process's user: {e}"))?;
+    if shell_user != own {
+        return Err(format!("the shell (pid {pid}) runs as {shell_user}, not as this process's {own}"));
+    }
     let process =
         Opened::new(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok_or_else(|| format!("can't open the shell, pid {pid}"))?;
     let mut token = HANDLE::default();
