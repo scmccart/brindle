@@ -26,6 +26,18 @@ pub enum Decision {
     Plain(&'static str),
 }
 
+/// What [`decide`] found: where a role starts, and whether a systemd user
+/// manager is reachable. A caller that starts a role without a scope uses
+/// the flag to tell a host that could have given one from a host with no
+/// systemd (a container).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub decision: Decision,
+    /// Whether `$XDG_RUNTIME_DIR/systemd/private` exists. Always false when
+    /// `BRINDLE_NO_SCOPE=1` switched scopes off, since nothing was looked for.
+    pub user_manager: bool,
+}
+
 /// Decides from the environment's values: `BRINDLE_NO_SCOPE`,
 /// `XDG_RUNTIME_DIR`, `PATH`, and whether a path exists or is an executable
 /// file (the parameters let tests decide without touching the system).
@@ -35,15 +47,19 @@ pub fn decide(
     path: Option<&OsStr>,
     exists: impl Fn(&Path) -> bool,
     executable: impl Fn(&Path) -> bool,
-) -> Decision {
+) -> Outcome {
+    let plain = |reason, user_manager| Outcome {
+        decision: Decision::Plain(reason),
+        user_manager,
+    };
     if no_scope == Some(OsStr::new("1")) {
-        return Decision::Plain("BRINDLE_NO_SCOPE=1");
+        return plain("BRINDLE_NO_SCOPE=1", false);
     }
     let Some(runtime) = runtime_dir.filter(|dir| !dir.is_empty()) else {
-        return Decision::Plain("XDG_RUNTIME_DIR is unset");
+        return plain("XDG_RUNTIME_DIR is unset", false);
     };
     if !exists(&Path::new(runtime).join("systemd/private")) {
-        return Decision::Plain("no systemd user manager");
+        return plain("no systemd user manager", false);
     }
     let found = path.and_then(|path| {
         std::env::split_paths(path)
@@ -52,13 +68,16 @@ pub fn decide(
             .find(|candidate| executable(candidate))
     });
     match found {
-        Some(program) => Decision::Scope(program),
-        None => Decision::Plain("systemd-run isn't on PATH"),
+        Some(program) => Outcome {
+            decision: Decision::Scope(program),
+            user_manager: true,
+        },
+        None => plain("systemd-run isn't on PATH", true),
     }
 }
 
 /// [`decide`] for this process.
-pub fn current() -> Decision {
+pub fn current_outcome() -> Outcome {
     decide(
         std::env::var_os(NO_SCOPE_ENV).as_deref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
@@ -69,6 +88,11 @@ pub fn current() -> Decision {
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         },
     )
+}
+
+/// Where a role starts in this process: [`current_outcome`]'s decision.
+pub fn current() -> Decision {
+    current_outcome().decision
 }
 
 /// The command that runs `program args` for `role` (`serve` or `hold`):
@@ -116,7 +140,7 @@ mod tests {
         Some(OsStr::new(value))
     }
 
-    fn decide_with(no_scope: Option<&OsStr>, runtime: Option<&OsStr>, path: Option<&OsStr>) -> Decision {
+    fn outcome_with(no_scope: Option<&OsStr>, runtime: Option<&OsStr>, path: Option<&OsStr>) -> Outcome {
         decide(
             no_scope,
             runtime,
@@ -124,6 +148,10 @@ mod tests {
             |path| path == Path::new("/run/user/1000/systemd/private"),
             |path| path == Path::new("/usr/bin/systemd-run"),
         )
+    }
+
+    fn decide_with(no_scope: Option<&OsStr>, runtime: Option<&OsStr>, path: Option<&OsStr>) -> Decision {
+        outcome_with(no_scope, runtime, path).decision
     }
 
     #[test]
@@ -153,6 +181,23 @@ mod tests {
             Decision::Plain("systemd-run isn't on PATH")
         );
         assert_eq!(decide_with(None, full.0, None), Decision::Plain("systemd-run isn't on PATH"));
+    }
+
+    #[test]
+    fn the_outcome_says_whether_a_user_manager_was_found() {
+        let full = (os("/run/user/1000"), os("/usr/bin"));
+        let manager = |no_scope, runtime, path| outcome_with(no_scope, runtime, path).user_manager;
+        // A manager with systemd-run: a scope.
+        assert!(manager(None, full.0, full.1));
+        // A manager whose systemd-run is missing: found, still plain.
+        assert!(manager(None, full.0, os("/bin")));
+        assert!(manager(None, full.0, None));
+        // No manager (a container), or no runtime directory to look in.
+        assert!(!manager(None, os("/run/user/1001"), full.1));
+        assert!(!manager(None, None, full.1));
+        assert!(!manager(None, os(""), full.1));
+        // Switched off: nothing is looked for.
+        assert!(!manager(os("1"), full.0, full.1));
     }
 
     #[test]

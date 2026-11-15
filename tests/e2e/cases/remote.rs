@@ -193,6 +193,18 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     );
     container.assert_absent(marker)?;
     container.exec(&["rm", "--force", &planted])?;
+    // The container runs no systemd, so its relay starts the core without a
+    // scope and says so plainly: no user manager could have given one, so no
+    // warning that the sessions may not outlive the login.
+    let logs = container.exec(&["sh", "-c", SERVER_LOGS])?;
+    ensure!(
+        logs.contains("starting the core without a scope of its own"),
+        "the container's core.log doesn't say the core started without a scope: {logs:?}"
+    );
+    ensure!(
+        !logs.contains("may not outlive"),
+        "the container's core.log warns about the login: {logs:?}"
+    );
 
     Ok(Outcome::Pass)
 }

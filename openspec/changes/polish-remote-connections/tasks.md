@@ -33,7 +33,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 2. The relay's scope note (item 3)
 
-- [ ] 2.1 Make `scope::decide` say whether a user manager was found, without changing `scope::current()` for local callers. Make the relay's `decide_scope` a pure function that returns the decision and its note. Log the "may not outlive the login" warning only when a user manager is reachable and the core starts without a scope (design decision 3).
+- [x] 2.1 Make `scope::decide` say whether a user manager was found, without changing `scope::current()` for local callers. Make the relay's `decide_scope` a pure function that returns the decision and its note. Log the "may not outlive the login" warning only when a user manager is reachable and the core starts without a scope (design decision 3).
 
   Verify:
   - table tests in `remote-agent/src/server/relay.rs` for: scope; no linger with a user manager (warns); `systemd-run` missing with a user manager (warns); no user manager (no warning); `BRINDLE_NO_SCOPE=1` (no warning);
@@ -41,7 +41,8 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - `remote-container-exec` asserting that the container's `core.log` says the core started without a scope, and doesn't contain `may not outlive`.
 
   The Docker fixtures run no systemd, so the rows that warn are unit-tested only.
-- [ ] 2.2 Update `relay.rs`'s module doc (step 2) and CLAUDE.md's "Relay" bullet on the scope line. Verify `cargo doc -p brindle-remote-agent --no-deps` builds without warnings.
+  The `remote-container-exec` assertion is written; its e2e run happens in 8.2.
+- [x] 2.2 Update `relay.rs`'s module doc (step 2) and CLAUDE.md's "Relay" bullet on the scope line. Verify `cargo doc -p brindle-remote-agent --no-deps` builds without warnings.
 
 ## 3. What keeps a relay connection trying (items 4, 5 and 6)
 
