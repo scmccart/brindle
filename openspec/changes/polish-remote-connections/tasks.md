@@ -156,17 +156,15 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - **Windows:** the user ran `scripts/run-throwaway.ps1` with an ssh profile on 2026-11-15: no label wraps, but the "Connect at launch" row is shorter than the text-field rows, which led to 7.2.
 
   Verify: record here, from both checks, whether any label wraps. If one wraps on Linux, also size the label column to the widest label (design decision 8) as part of 7.2.
-- [x] 7.2 Lay the profile editor's rows out on one height increment (design decision 8):
-  - add `FIELD_STEP` (18 px) to `brindle-ui`, and define `Input`'s height as `2 × FIELD_STEP`;
-  - give every profile editor row's control line a height of `2 × FIELD_STEP`, its control centred;
-  - give an error line one `FIELD_STEP`, its text centred.
+- [ ] 7.2 Give the profile editor's rows one control height, as shadcn's horizontal `Field` (design decision 8):
+  - `brindle-ui`'s `FIELD_HEIGHT` (36 px, shadcn's `h-9`), which `Input` uses; no `FIELD_STEP`;
+  - every profile editor row's control line at least `FIELD_HEIGHT` tall, its control centred;
+  - an error message beneath the control line at its natural height, after a small gap, indented to the controls, wrapping when long.
 
   Verify:
-  - a pure helper for a row's height in increments (control line, plus an error line when there is one), with a unit test in `profiles.rs`, and `cargo test -p brindle settings_dialog`;
-  - `cargo test -p brindle-ui`;
+  - `cargo test -p brindle settings_dialog` and `cargo test -p brindle-ui`;
   - `settings-editor-connect-at-launch`'s capture on Linux: the "Connect at launch" row's switch is centred in a 36 px band, the same as the text field rows above it (looked at by eye, recorded here);
   - the user's Windows check again, with `scripts/run-throwaway.ps1`.
-  - Done: `FIELD_STEP`/`FIELD_HEIGHT` in `brindle-ui`, `Input` uses `FIELD_HEIGHT`, the editor's rows use `row_steps`. The capture check runs on Linux in 8.2, and the user's Windows check is pending.
 
 ## 8. Platform checks
 

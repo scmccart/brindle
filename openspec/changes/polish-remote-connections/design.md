@@ -151,19 +151,20 @@ It has three operations: an answer arrives, a session is killed, and a view is b
 
 `attach_swept` and `attach_detached_here` both call it. `Workspace` passes the profile name of the first tab on the endpoint, which is the only lookup that needs GPUI. `reattach::swept_tabs(listed, skip, host, config, first_tab_profile)` joins `sweep` with this choice, so `attach_swept` only inserts tabs. This is decided question 4, which keeps today's behaviour, now specified.
 
-### 8. The profile editor's rows share one height increment
+### 8. The profile editor's rows share one control height
 
-The user asked on 2026-11-15 for a standard height for the profile editor's fields. It replaces the earlier plan, which only made the label column fit. On Windows no label wraps (the user's check), so that plan was not needed there.
+The user asked on 2026-11-15 for a standard height for the profile editor's fields, aligned with shadcn/ui. It replaces the earlier plan, which only made the label column fit. On Windows no label wraps (the user's check), so that plan was not needed there.
 
-- `brindle-ui` gets one increment, `FIELD_STEP` (18 px), half of `Input`'s 36 px height (`h_9`). `Input` is defined in terms of it, so the two can't drift apart.
-- Every profile editor row's control line is `2 × FIELD_STEP` tall, with its control centred: text fields, choices, the "Connect at launch" switch and the "Default" checkbox alike. An error line beneath a row takes one more `FIELD_STEP`, with its text centred in it, so the rows below it move by a whole increment.
-- The gap between rows stays as it is (`gap_1`); the increment governs rows, not the space between them.
+- `brindle-ui` gets `FIELD_HEIGHT`, 36 px: shadcn's `h-9`, the height of its `Input`, `SelectTrigger` and default `Button`. `Input` uses it.
+- Every profile editor row's control line is at least `FIELD_HEIGHT` tall (`min_h`), with its control centred: text fields, choices, the "Connect at launch" switch and the "Default" checkbox alike. This is shadcn's horizontal `Field`: label and control in a row, `items-center`.
+- An error message sits beneath its row's control line at its natural height, a small gap below it, indented to the controls, and wraps when long, as shadcn's `FieldError` does. Rows are not snapped to a grid.
+- The gap between rows stays as it is (`gap_1`).
 - Label wrap: Linux's capture (`settings-editor-connect-at-launch`) is still checked. If a label wraps there, the label column's width becomes the widest label's shaped width at the dialog's text size, measured when the editor opens, labels become `whitespace_nowrap`, and the error line's indent follows the column.
 
 Alternatives considered:
-- Padding only the switch and checkbox rows to 36 px: it fixes today's two rows but leaves the next control to drift again, and error lines would still move the rows below by odd amounts.
-- An increment of a full 36 px: an error line would add a whole text field's height of mostly empty space.
-- A height for every control in `brindle-ui` (checkbox, switch): they are drawn at their own sizes elsewhere (the theme list, the gallery), and only the editor's rows need to line up.
+- A grid of half-height steps (18 px), an error line taking exactly one: tried first (02eaa06) and dropped. shadcn has no row grid, and a long error would overflow its fixed line.
+- Padding only the switch and checkbox rows to 36 px: it fixes today's two rows but leaves the next control to drift again.
+- A height for every control in `brindle-ui` (checkbox, switch): shadcn draws them at their own sizes (`size-4`, the switch's track), as the theme list and the gallery do, and only the editor's rows need to line up.
 
 ### 9. Pure seams for the wiring
 
