@@ -178,7 +178,14 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 8. Platform checks
 
-- [ ] 8.1 On Windows, run `cargo test --workspace --locked` and `cargo build --release --locked` and confirm both pass, along with the e2e and perf self-tests (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`, `BRINDLE_PERF=1 cargo test --test perf -- --self-test`) and `BRINDLE_E2E=1 cargo test --test e2e -- --list`. With the user's go-ahead (it opens windows on the desktop), also run `BRINDLE_E2E=1 cargo test --test e2e -- local-server-palette`, which includes `local-server-palette-highlight`. Record the results here.
+- [x] 8.1 On Windows, run `cargo test --workspace --locked` and `cargo build --release --locked` and confirm both pass, along with the e2e and perf self-tests (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`, `BRINDLE_PERF=1 cargo test --test perf -- --self-test`) and `BRINDLE_E2E=1 cargo test --test e2e -- --list`. With the user's go-ahead (it opens windows on the desktop), also run `BRINDLE_E2E=1 cargo test --test e2e -- local-server-palette`, which includes `local-server-palette-highlight`. Record the results here.
+
+  Results on Windows at 31e8b33 (2026-11-15; the user approved the windowed runs):
+  - `cargo test --workspace --locked`: 902 passed, 1 failed (`list_shows_whether_a_detached_sessions_owner_may_come_back`, intermittent; a lost `DETACH` in the core, fixed by 3.6), 3 ignored.
+  - Release build ok; the e2e self-test (8 groups) and perf self-test (3) ok; `--list` 43 cases.
+  - Full Windows e2e: 36 passed, 0 failed, 3 skipped (`local-server-elevated`, not elevated; `remote-container-exec` and `remote-ssh-container`, no Linux helper). `local-server-palette` and `local-server-palette-highlight` passed.
+  - Gallery `--check`: 100 ok, including the two command-list scenarios from 4.1.
+  - After 3.6 (58ab4f9): `cargo test -p brindle-remote-agent` all ok; the owner test 30/30 alone and 30/30 under load.
 - [ ] 8.2 Ask the Linux machine's session to run, at the pushed branch:
   - `cargo test --locked` and `cargo build --release --locked`;
   - `cargo build -p brindle-remote-agent`, then `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 BRINDLE_REMOTE_E2E_REQUIRED=1 cargo test --test e2e`, and `-- remote` three times. `BRINDLE_REMOTE_E2E_REQUIRED=1` stops a missing Docker daemon from passing as a skip;
