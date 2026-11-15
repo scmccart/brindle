@@ -14,7 +14,10 @@
 //!   `HELLO`/`WELCOME` handshake, and per-client queues. Past
 //!   [`CLIENT_QUEUE_HIGH`] queued to a client, its sessions are paused in
 //!   their holders until the queue is under [`CLIENT_QUEUE_LOW`], so a
-//!   stalled client blocks only its own programs.
+//!   stalled client blocks only its own programs. A client found gone by a
+//!   failed write is dropped only once what it had sent is handled (up to
+//!   [`DEAD_CLIENT_READ_LIMIT`]), so a `DETACH` sent just before it closed
+//!   still counts.
 //! - **Takeover:** a client that connects with the token of one still
 //!   connected replaces it: the old connection, which stopped delivering
 //!   without closing (a dropped network link), is closed, and its sessions
@@ -87,6 +90,10 @@ pub const MAX_LINGER: Duration = Duration::from_secs(600);
 pub const CLIENT_QUEUE_HIGH: usize = 1024 * 1024;
 /// ...until its queue is back under this.
 pub const CLIENT_QUEUE_LOW: usize = 256 * 1024;
+/// When a write to a client fails, the core still reads what that client
+/// had sent, up to this much, before it drops the client (the holder's
+/// `DEAD_CORE_READ_LIMIT`, for clients).
+pub const DEAD_CLIENT_READ_LIMIT: usize = 16 * 1024 * 1024;
 /// How long a losing `serve` waits for the winner to accept connections.
 const LOSER_WAIT: Duration = Duration::from_secs(2);
 /// How long clients wait, unaccepted, for the startup adoption.
