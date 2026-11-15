@@ -246,7 +246,7 @@ fn status_shows_the_core_and_each_holder() {
     assert_eq!(status["running"], true);
     assert_eq!(status["core_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["core_build"], welcome.core_build.as_str());
-    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 2 }));
+    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 3 }));
     assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 2 }));
     assert_eq!(status["pid"], client.core_pid());
     assert!(status["uptime_secs"].is_u64());

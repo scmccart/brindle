@@ -1592,11 +1592,11 @@ fn a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write() {
     assert!(matches!(observer.reply(901), ToClient::Ok(_)));
 }
 
-/// A client that negotiated protocol 2 and asked for process info.
+/// A client that negotiated protocol 2 or later and asked for process info.
 #[cfg(unix)]
 fn asking_for_processes(dir: &TempDir, token: &str) -> TestClient {
     let client = TestClient::hello_with(&dir.path, token, |hello| hello.process_info = true);
-    assert_eq!(client.welcome.as_ref().unwrap().protocol, 2);
+    assert!(client.welcome.as_ref().unwrap().protocol >= 2);
     client
 }
 
