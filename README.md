@@ -123,12 +123,12 @@ does, without opening a tab of the profile first. The window doesn't wait for
 it. A host that can't be reached counts as offline and is retried, at most 60 s
 apart. A stopped container is never started: it is offline too.
 
-On a host that runs systemd, the server outlives the SSH login that started it
-only when the user has lingering enabled (`loginctl enable-linger`, run once on
-the host). Without it, the server is not started in a systemd scope of its
-own, and where systemd ends a user's processes with their last login
-(`KillUserProcesses=yes`) it ends then, and the sessions with it. A container's
-server ends with the container.
+On a host that runs systemd, run `loginctl enable-linger` once, as the user
+Brindle logs in as. Without lingering, the server runs inside your SSH login's
+session. If the host's systemd ends a user's processes at logout
+(`KillUserProcesses=yes` in `logind.conf`), closing your last login there ends
+the server and every remote tab's session with it. A container's server ends
+with the container.
 
 "Attach Session…" in the command palette lists the detached sessions of every
 host Brindle is connected to, under a heading for each: this machine first,
