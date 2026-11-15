@@ -49,7 +49,7 @@
   - the first run splits a tab and quits; the listing shows both sessions with a layout;
   - a second, `--no-restore` run quits with its own tab;
   - a third, restoring run has two tabs, the second with `--- zones count=2` after `next_tab`.
-- [ ] 6.2 Update CLAUDE.md: the "Core" paragraph (`meta.layout`, kept on `DETACH`, cleared on `ATTACH`, 64 KiB), "Protocols" (`DETACH`'s and `SessionInfo`'s `layout`), "Brindle's client" (the quit sends each tab's layout) and "Reattach" (`layout::group` in the sweeps). Verify by reading the changed paragraphs against the code.
+- [x] 6.2 Update CLAUDE.md: the "Core" paragraph (`meta.layout`, kept on `DETACH`, cleared on `ATTACH`, 64 KiB), "Protocols" (`DETACH`'s and `SessionInfo`'s `layout`), "Brindle's client" (the quit sends each tab's layout) and "Reattach" (`layout::group` in the sweeps). Verify by reading the changed paragraphs against the code.
 - [ ] 6.3 Run `cargo test --workspace --locked`, `cargo build --release --locked` and the `local-server` e2e cases under `scripts/with-xvfb`, and verify all pass.
 
 ## Workflow follow-up
