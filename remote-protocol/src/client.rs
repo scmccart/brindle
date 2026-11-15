@@ -1,6 +1,6 @@
 //! The terminal server's client protocol, between a client (Brindle, or the
 //! `brindle-remote` management commands) and the core. This is protocols 1
-//! and 2.
+//! to 3.
 //!
 //! Frames use the crate's header (`type: u8`, `len: u32 BE`). `DATA` is
 //! binary: a `u32` BE session id, then the bytes (input from the client,
@@ -24,6 +24,7 @@
 //! |   11 | `STOP`          | client → core | `req`                                                          |
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
+//! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
@@ -44,7 +45,7 @@
 //!   `REPLAY_END`, or `ERROR`.
 //! - `LIST` → `SESSIONS`; `STATUS` → `SERVER_STATUS`; `KILL`, `STOP` and
 //!   `STEP_DOWN` → `OK` or `ERROR`.
-//! - `RESIZE`, `CLOSE`, `DETACH` and `REPARENT` have no reply; a refused one
+//! - `RESIZE`, `CLOSE`, `DETACH`, `REPARENT` and `SET_LAYOUT` have no reply; a refused one
 //!   gets an `ERROR` with its `session`.
 //!
 //! Fields marked `?` were added within protocol 1. They are left out when
@@ -70,6 +71,13 @@
 //! directory when either changed (a field is `null` when unknown). Nothing
 //! else differs from protocol 1, so a core that speaks both and a client that
 //! speaks only 1 agree on 1.
+//!
+//! Protocol 3 adds `SET_LAYOUT`, which a client sends only on a connection that
+//! negotiated 3: it replaces the layout of a session the client has attached,
+//! as `DETACH`'s `layout` does, so a client that ends without detaching still
+//! leaves its last one. The core refuses it with an `ERROR` naming the session
+//! on a connection below 3, from a client without the session attached, or for
+//! a session it doesn't have. Nothing else differs from protocol 2.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -82,7 +90,7 @@ use crate::wire::{self, RequestId, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The client protocol versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 2);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 3);
 
 pub const MSG_DATA: u8 = 1;
 pub const MSG_HELLO: u8 = 2;
@@ -97,6 +105,8 @@ pub const MSG_STATUS: u8 = 10;
 pub const MSG_STOP: u8 = 11;
 pub const MSG_STEP_DOWN: u8 = 12;
 pub const MSG_REPARENT: u8 = 13;
+/// Protocol 3.
+pub const MSG_SET_LAYOUT: u8 = 14;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -230,7 +240,17 @@ pub struct Detach {
     pub layout: Option<serde_json::Value>,
 }
 
-/// The largest `DETACH` layout the core keeps, as encoded JSON.
+/// `SET_LAYOUT` (protocol 3): the layout of a session the client has
+/// attached, replacing the one it had; `None` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetLayout {
+    pub session: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
+}
+
+/// The largest layout the core keeps (`DETACH`, `SET_LAYOUT`), as encoded
+/// JSON.
 pub const MAX_LAYOUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +439,8 @@ pub enum ToCore {
     Stop(Request),
     StepDown(Request),
     Reparent(Reparent),
+    /// Protocol 3.
+    SetLayout(SetLayout),
 }
 
 impl ToCore {
@@ -437,6 +459,7 @@ impl ToCore {
             Self::Stop(m) => wire::json(MSG_STOP, m),
             Self::StepDown(m) => wire::json(MSG_STEP_DOWN, m),
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
+            Self::SetLayout(m) => wire::json(MSG_SET_LAYOUT, m),
         }
     }
 
@@ -455,6 +478,7 @@ impl ToCore {
             MSG_STOP => Self::Stop(wire::from_json("STOP", frame)?),
             MSG_STEP_DOWN => Self::StepDown(wire::from_json("STEP_DOWN", frame)?),
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
+            MSG_SET_LAYOUT => Self::SetLayout(wire::from_json("SET_LAYOUT", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -612,6 +636,14 @@ pub(crate) mod samples {
                 session: 7,
                 hwnd: 0x0001_0a2c,
             }),
+            ToCore::SetLayout(SetLayout {
+                session: 7,
+                layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k7"}})),
+            }),
+            ToCore::SetLayout(SetLayout {
+                session: 8,
+                layout: None,
+            }),
         ]
     }
 
@@ -738,7 +770,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_DATA..=MSG_REPARENT {
+        for expected in MSG_DATA..=MSG_SET_LAYOUT {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -901,14 +933,29 @@ mod tests {
         assert_eq!(answer_hello(&hello(1, 1), PROTOCOLS), Ok(1));
         assert_eq!(answer_hello(&hello(1, 2), PROTOCOLS), Ok(2));
         assert_eq!(answer_hello(&hello(1, 4), VersionRange::new(1, 3)), Ok(3));
-        let error = answer_hello(&hello(3, 4), PROTOCOLS).unwrap_err();
-        assert!(error.message.contains("3–4"), "{}", error.message);
-        assert!(error.message.contains("supported 1–2"), "{}", error.message);
+        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(3));
+        let error = answer_hello(&hello(4, 5), PROTOCOLS).unwrap_err();
+        assert!(error.message.contains("4–5"), "{}", error.message);
+        assert!(error.message.contains("supported 1–3"), "{}", error.message);
         assert_eq!(error.req, None);
         // A core that still speaks only protocol 1 refuses a client that
         // speaks only 2.
         let error = answer_hello(&hello(2, 2), VersionRange::new(1, 1)).unwrap_err();
         assert!(error.message.contains("supported 1"), "{}", error.message);
+    }
+
+    /// A client that speaks 1–3 and a core of the previous release (1–2)
+    /// agree on 2: the client then sends no `SET_LAYOUT`.
+    #[test]
+    fn a_protocol_3_client_and_a_protocol_2_core_agree_on_2() {
+        let client = Hello {
+            min: PROTOCOLS.min,
+            max: PROTOCOLS.max,
+            client_token: "t".into(),
+            ..Default::default()
+        };
+        assert_eq!(answer_hello(&client, VersionRange::new(1, 2)), Ok(2));
+        assert_eq!(answer_hello(&client, PROTOCOLS), Ok(3));
     }
 
     #[test]

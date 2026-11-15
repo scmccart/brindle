@@ -54,10 +54,10 @@
 
 ## 7. Live layout updates (protocol 3)
 
-- [ ] 7.1 In `remote-protocol/src/client.rs`, set `PROTOCOLS` to 1–3. Add `MSG_SET_LAYOUT` (14), `SetLayout { session, layout? }` and `ToCore::SetLayout`, plus the docs table row and the protocol 3 note. Add it to the roundtrip samples. Verify with `cargo test -p brindle-remote-protocol`.
-- [ ] 7.2 Add a `client-set-layout` transcript (a new `Protocol::Client3`) and update the negotiation tests: a 1–3 client and a 1–2 core agree on 2, and two 1–3 sides agree on 3. Verify that `BRINDLE_REGEN_FIXTURES=1` only adds the new fixture, and that `cargo test --workspace --locked --test transcripts` passes.
-- [ ] 7.3 In the core, keep each client's negotiated protocol (`Client.protocol` in `core/clients.rs`). Add `client_set_layout` in `core/sessions.rs`: an `ERROR` on protocol < 3, from a client that doesn't have the session attached, or for an unknown session; the 64 KiB cap; `store_meta` only when the layout changed. Verify with `cargo build -p brindle-remote-agent`.
-- [ ] 7.4 Add `TestClient::hello_3` and `set_layout` to `remote-agent/tests/support`. Add tests to `remote-agent/tests/core.rs`: the latest `SET_LAYOUT` is listed after its client is SIGKILLed; it survives a core restart; it is refused from another client and on protocol 2. Verify with `cargo test -p brindle-remote-agent --test core layout`.
+- [x] 7.1 In `remote-protocol/src/client.rs`, set `PROTOCOLS` to 1–3. Add `MSG_SET_LAYOUT` (14), `SetLayout { session, layout? }` and `ToCore::SetLayout`, plus the docs table row and the protocol 3 note. Add it to the roundtrip samples. Verify with `cargo test -p brindle-remote-protocol`.
+- [x] 7.2 Add a `client-set-layout` transcript (a new `Protocol::Client3`) and update the negotiation tests: a 1–3 client and a 1–2 core agree on 2, and two 1–3 sides agree on 3. Verify that `BRINDLE_REGEN_FIXTURES=1` only adds the new fixture, and that `cargo test --workspace --locked --test transcripts` passes.
+- [x] 7.3 In the core, keep each client's negotiated protocol (`Client.protocol` in `core/clients.rs`). Add `client_set_layout` in `core/sessions.rs`: an `ERROR` on protocol < 3, from a client that doesn't have the session attached, or for an unknown session; the 64 KiB cap; `store_meta` only when the layout changed. Verify with `cargo build -p brindle-remote-agent`.
+- [x] 7.4 Add `TestClient::hello_3` and `set_layout` to `remote-agent/tests/support`. Add tests to `remote-agent/tests/core.rs`: the latest `SET_LAYOUT` is listed after its client is SIGKILLed; it survives a core restart; it is refused from another client and on protocol 2. Verify with `cargo test -p brindle-remote-agent --test core layout`.
 - [ ] 7.5 Brindle:
   - `Connection` keeps the link's negotiated protocol (`State.protocol`, set in `up` from each `WELCOME`).
   - `Running::set_layout` sends `SET_LAYOUT` on protocol ≥ 3, only when the layout differs from the last one sent.

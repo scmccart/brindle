@@ -78,6 +78,8 @@ enum Protocol {
     /// Client protocol 2: the same frames plus `PROCESS`, and `HELLO`'s
     /// `linger_secs` and `process_info`.
     Client2,
+    /// Client protocol 3: protocol 2 plus `SET_LAYOUT`.
+    Client3,
     /// The link to a `brindle-remote relay`: the client protocol and the
     /// relay's own frames.
     Relay,
@@ -87,10 +89,10 @@ enum Protocol {
 impl Protocol {
     fn decode(self, sender: &str, frame: &Frame) -> std::io::Result<Step> {
         Ok(match (self, sender) {
-            (Self::Client | Self::Client2 | Self::Relay, "client") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "client") => {
                 Step::Client(client::ToCore::decode(frame)?)
             }
-            (Self::Client | Self::Client2 | Self::Relay, "core") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "core") => {
                 Step::CoreToClient(client::ToClient::decode(frame)?)
             }
             (Self::Relay, "relay") => Step::Relay(relay::RelayMessage::decode(frame)?),
@@ -104,6 +106,7 @@ impl Protocol {
         match self {
             Self::Client => "protocol 1 (client <-> core)",
             Self::Client2 => "protocol 2 (client <-> core)",
+            Self::Client3 => "protocol 3 (client <-> core)",
             Self::Relay => "relay link (Brindle <-> brindle-remote relay)",
             Self::Holder => "H1 (core <-> holder)",
         }
@@ -303,7 +306,7 @@ fn every_message_type_appears_in_a_transcript() {
         }
     }
     let client_types =
-        (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
+        (client::MSG_DATA..=client::MSG_SET_LAYOUT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
     for msg_type in client_types {
         assert!(
             seen.contains_key(&("client", msg_type)),
@@ -606,7 +609,7 @@ fn transcripts() -> Vec<Transcript> {
                 // unification turns it on in a workspace build).
                 let layout = json!({
                     "index": 0,
-                    "quit": "1f2e-9a",
+                    "origin": "1f2e-9a",
                     "title": "logs",
                     "v": 1,
                     "zones": {
@@ -649,6 +652,38 @@ fn transcripts() -> Vec<Transcript> {
                         req: 3,
                         sessions: vec![client::SessionInfo { attached: true, ..listed(1, KEY, None) }],
                     })),
+                ]
+            },
+        },
+        Transcript {
+            name: "client-set-layout",
+            protocol: Protocol::Client3,
+            about: "Protocol 3: a client keeps an attached session's layout current with SET_LAYOUT; one for a session it hasn't attached is refused.",
+            steps: {
+                // Keys in sorted order (see client-layout).
+                let layout = |index: u32| {
+                    json!({"index": index, "origin": "1f2e-9a", "v": 1, "zones": {"active": true, "key": KEY}})
+                };
+                vec![
+                    c(client::ToCore::Hello(client::Hello {
+                        min: 1,
+                        max: 3,
+                        client_version: "0.5.0".into(),
+                        client_token: TOKEN.into(),
+                        ..Default::default()
+                    })),
+                    s(client::ToClient::Welcome(client::Welcome {
+                        protocol: 3,
+                        core_version: "0.5.0".into(),
+                        core_build: "d3f2".into(),
+                        pid: 4242,
+                        holder_protocols: vec![2],
+                    })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: Some(layout(0)) })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: Some(layout(1)) })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 9, layout: Some(layout(0)) })),
+                    error(None, Some(9), "session 9 isn't attached to this client"),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: None })),
                 ]
             },
         },

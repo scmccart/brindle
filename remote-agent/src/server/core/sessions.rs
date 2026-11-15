@@ -195,6 +195,26 @@ impl Session {
     }
 }
 
+/// The layout a client gave session `id` (`DETACH`, `SET_LAYOUT`), unless its
+/// JSON is over `MAX_LAYOUT`: then none is kept, and that is logged.
+fn kept_layout(
+    id: SessionId,
+    layout: Option<brindle_remote_protocol::serde_json::Value>,
+) -> Option<brindle_remote_protocol::serde_json::Value> {
+    layout.filter(|layout| {
+        let size = brindle_remote_protocol::serde_json::to_vec(layout)
+            .map_or(usize::MAX, |bytes| bytes.len());
+        let kept = size <= client::MAX_LAYOUT;
+        if !kept {
+            log!(
+                "session {id}: not keeping its {size}-byte layout (over {})",
+                client::MAX_LAYOUT
+            );
+        }
+        kept
+    })
+}
+
 /// The command line `list` shows; empty for the login shell.
 /// A new session's key: 128 random bits as hex, from `/dev/urandom`. If
 /// that can't be read, the time, pid and a counter stand in: unique enough
@@ -922,20 +942,31 @@ impl<L: EventLoop> Core<L> {
         };
         session.meta.owner.clear();
         session.meta.policy = Policy::Detach;
-        session.meta.layout = detach.layout.filter(|layout| {
-            let size = brindle_remote_protocol::serde_json::to_vec(layout).map_or(usize::MAX, |bytes| bytes.len());
-            let kept = size <= client::MAX_LAYOUT;
-            if !kept {
-                log!(
-                    "session {id}: not keeping its {size}-byte layout (over {})",
-                    client::MAX_LAYOUT
-                );
-            }
-            kept
-        });
+        session.meta.layout = kept_layout(id, detach.layout);
         self.store_meta(id);
         self.detach_session(id);
         self.checkpoint(id);
+    }
+
+    /// `SET_LAYOUT` (protocol 3): the attached client's layout for the
+    /// session replaces the one it had, as a `DETACH`'s would, so a client
+    /// that ends without detaching leaves its last one. It reaches the
+    /// holder only when it changed. Refused on a connection below protocol
+    /// 3, and from a client that doesn't have the session attached.
+    pub(super) fn client_set_layout(&mut self, client: Token, set: client::SetLayout) {
+        let id = set.session;
+        if self.clients.get(&client).is_some_and(|c| c.protocol < 3) {
+            let message = "SET_LAYOUT needs client protocol 3";
+            return self.send_client(client, error(None, Some(id), message));
+        }
+        let Some(session) = self.client_session(client, id) else {
+            return;
+        };
+        let layout = kept_layout(id, set.layout);
+        if session.meta.layout != layout {
+            session.meta.layout = layout;
+            self.store_meta(id);
+        }
     }
 
     /// Sends the session's meta to its holder (`SET_META`), so a later core
