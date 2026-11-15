@@ -1,6 +1,6 @@
 //! The terminal server's client protocol, between a client (Brindle, or the
 //! `brindle-remote` management commands) and the core. This is protocols 1
-//! and 2.
+//! to 3.
 //!
 //! Frames use the crate's header (`type: u8`, `len: u32 BE`). `DATA` is
 //! binary: a `u32` BE session id, then the bytes (input from the client,
@@ -17,20 +17,21 @@
 //! |    4 | `RESIZE`        | client → core | `session, cols, rows, cell_w, cell_h`                          |
 //! |    5 | `CLOSE`         | client → core | `session`                                                      |
 //! |    6 | `ATTACH`        | client → core | `req, session, cols, rows`                                     |
-//! |    7 | `DETACH`        | client → core | `session`                                                      |
+//! |    7 | `DETACH`        | client → core | `session, layout?`                                             |
 //! |    8 | `LIST`          | client → core | `req`                                                          |
 //! |    9 | `KILL`          | client → core | `req, target: {"session": id} \| "all"`                        |
 //! |   10 | `STATUS`        | client → core | `req`                                                          |
 //! |   11 | `STOP`          | client → core | `req`                                                          |
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
+//! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
 //! |   35 | `EXIT`          | core → client | `session, code?`                                               |
 //! |   36 | `REPLAY_START`  | core → client | `req?, session, pid`                                           |
 //! |   37 | `REPLAY_END`    | core → client | `session`                                                      |
-//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?}]` |
+//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?, layout?}]` |
 //! |   39 | `SERVER_STATUS` | core → client | `req, core_version, core_build, protocols, holder_protocols, pid, uptime_secs, clients, holders` |
 //! |   40 | `OK`            | core → client | `req`                                                          |
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
@@ -44,7 +45,7 @@
 //!   `REPLAY_END`, or `ERROR`.
 //! - `LIST` → `SESSIONS`; `STATUS` → `SERVER_STATUS`; `KILL`, `STOP` and
 //!   `STEP_DOWN` → `OK` or `ERROR`.
-//! - `RESIZE`, `CLOSE`, `DETACH` and `REPARENT` have no reply; a refused one
+//! - `RESIZE`, `CLOSE`, `DETACH`, `REPARENT` and `SET_LAYOUT` have no reply; a refused one
 //!   gets an `ERROR` with its `session`.
 //!
 //! Fields marked `?` were added within protocol 1. They are left out when
@@ -60,12 +61,23 @@
 //! - `owned` (a session has an owner and no client is attached) and
 //!   `detached_secs` (seconds since a client was last attached) tell a client
 //!   whether a detached session's owner may still come back.
+//! - `layout` (on `DETACH`, and in `SESSIONS` while the session stays
+//!   detached) is the client's record of where the session sat, which the
+//!   core keeps in the session's meta without reading it, up to
+//!   [`MAX_LAYOUT`] bytes of JSON, and drops when a client attaches it.
 //!
 //! Protocol 2 adds `PROCESS`, sent only on connections that negotiated 2 and
 //! set `process_info`: the session's foreground program name and working
 //! directory when either changed (a field is `null` when unknown). Nothing
 //! else differs from protocol 1, so a core that speaks both and a client that
 //! speaks only 1 agree on 1.
+//!
+//! Protocol 3 adds `SET_LAYOUT`, which a client sends only on a connection that
+//! negotiated 3: it replaces the layout of a session the client has attached,
+//! as `DETACH`'s `layout` does, so a client that ends without detaching still
+//! leaves its last one. The core refuses it with an `ERROR` naming the session
+//! on a connection below 3, from a client without the session attached, or for
+//! a session it doesn't have. Nothing else differs from protocol 2.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -78,7 +90,7 @@ use crate::wire::{self, RequestId, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The client protocol versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 2);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 3);
 
 pub const MSG_DATA: u8 = 1;
 pub const MSG_HELLO: u8 = 2;
@@ -93,6 +105,8 @@ pub const MSG_STATUS: u8 = 10;
 pub const MSG_STOP: u8 = 11;
 pub const MSG_STEP_DOWN: u8 = 12;
 pub const MSG_REPARENT: u8 = 13;
+/// Protocol 3.
+pub const MSG_SET_LAYOUT: u8 = 14;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -210,11 +224,34 @@ pub struct Resize {
     pub cell_h: u16,
 }
 
-/// A message that names only a session: `CLOSE`, `DETACH`, `REPLAY_END`.
+/// A message that names only a session: `CLOSE`, `REPLAY_END`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
     pub session: SessionId,
 }
+
+/// `DETACH`: the session keeps running with no client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detach {
+    pub session: SessionId,
+    /// The client's record of where the session sat (its tab), kept for
+    /// whichever client attaches it later. Opaque to the core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
+}
+
+/// `SET_LAYOUT` (protocol 3): the layout of a session the client has
+/// attached, replacing the one it had; `None` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetLayout {
+    pub session: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
+}
+
+/// The largest layout the core keeps (`DETACH`, `SET_LAYOUT`), as encoded
+/// JSON.
+pub const MAX_LAYOUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exit {
@@ -315,6 +352,10 @@ pub struct SessionInfo {
     /// Seconds since a client was last attached; 0 when attached or unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub detached_secs: u64,
+    /// The layout its last client detached it with ([`Detach::layout`]);
+    /// none while attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -391,13 +432,15 @@ pub enum ToCore {
     Resize(Resize),
     Close(SessionRef),
     Attach(Attach),
-    Detach(SessionRef),
+    Detach(Detach),
     List(Request),
     Kill(Kill),
     Status(Request),
     Stop(Request),
     StepDown(Request),
     Reparent(Reparent),
+    /// Protocol 3.
+    SetLayout(SetLayout),
 }
 
 impl ToCore {
@@ -416,6 +459,7 @@ impl ToCore {
             Self::Stop(m) => wire::json(MSG_STOP, m),
             Self::StepDown(m) => wire::json(MSG_STEP_DOWN, m),
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
+            Self::SetLayout(m) => wire::json(MSG_SET_LAYOUT, m),
         }
     }
 
@@ -434,6 +478,7 @@ impl ToCore {
             MSG_STOP => Self::Stop(wire::from_json("STOP", frame)?),
             MSG_STEP_DOWN => Self::StepDown(wire::from_json("STEP_DOWN", frame)?),
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
+            MSG_SET_LAYOUT => Self::SetLayout(wire::from_json("SET_LAYOUT", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -567,7 +612,14 @@ pub(crate) mod samples {
                 cols: 100,
                 rows: 30,
             }),
-            ToCore::Detach(SessionRef { session: 3 }),
+            ToCore::Detach(Detach {
+                session: 3,
+                layout: None,
+            }),
+            ToCore::Detach(Detach {
+                session: 4,
+                layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k4", "active": true}})),
+            }),
             ToCore::List(Request { req: 3 }),
             ToCore::Kill(Kill {
                 req: 4,
@@ -583,6 +635,14 @@ pub(crate) mod samples {
             ToCore::Reparent(Reparent {
                 session: 7,
                 hwnd: 0x0001_0a2c,
+            }),
+            ToCore::SetLayout(SetLayout {
+                session: 7,
+                layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k7"}})),
+            }),
+            ToCore::SetLayout(SetLayout {
+                session: 8,
+                layout: None,
             }),
         ]
     }
@@ -654,6 +714,7 @@ pub(crate) mod samples {
                     profile: Some("Shell".into()),
                     owned: true,
                     detached_secs: 42,
+                    layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k3"}})),
                 }],
             }),
             ToClient::ServerStatus(ServerStatus {
@@ -709,7 +770,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_DATA..=MSG_REPARENT {
+        for expected in MSG_DATA..=MSG_SET_LAYOUT {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -872,14 +933,29 @@ mod tests {
         assert_eq!(answer_hello(&hello(1, 1), PROTOCOLS), Ok(1));
         assert_eq!(answer_hello(&hello(1, 2), PROTOCOLS), Ok(2));
         assert_eq!(answer_hello(&hello(1, 4), VersionRange::new(1, 3)), Ok(3));
-        let error = answer_hello(&hello(3, 4), PROTOCOLS).unwrap_err();
-        assert!(error.message.contains("3–4"), "{}", error.message);
-        assert!(error.message.contains("supported 1–2"), "{}", error.message);
+        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(3));
+        let error = answer_hello(&hello(4, 5), PROTOCOLS).unwrap_err();
+        assert!(error.message.contains("4–5"), "{}", error.message);
+        assert!(error.message.contains("supported 1–3"), "{}", error.message);
         assert_eq!(error.req, None);
         // A core that still speaks only protocol 1 refuses a client that
         // speaks only 2.
         let error = answer_hello(&hello(2, 2), VersionRange::new(1, 1)).unwrap_err();
         assert!(error.message.contains("supported 1"), "{}", error.message);
+    }
+
+    /// A client that speaks 1–3 and a core of the previous release (1–2)
+    /// agree on 2: the client then sends no `SET_LAYOUT`.
+    #[test]
+    fn a_protocol_3_client_and_a_protocol_2_core_agree_on_2() {
+        let client = Hello {
+            min: PROTOCOLS.min,
+            max: PROTOCOLS.max,
+            client_token: "t".into(),
+            ..Default::default()
+        };
+        assert_eq!(answer_hello(&client, VersionRange::new(1, 2)), Ok(2));
+        assert_eq!(answer_hello(&client, PROTOCOLS), Ok(3));
     }
 
     #[test]

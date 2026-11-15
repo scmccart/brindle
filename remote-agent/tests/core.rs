@@ -1160,6 +1160,148 @@ fn an_explicit_detach_keeps_a_kill_session_and_clears_its_owner() {
     other.attach(session, 80, 24).unwrap();
 }
 
+use brindle_remote_protocol::serde_json;
+
+fn layout_of(client: &mut TestClient, session: SessionId) -> Option<serde_json::Value> {
+    let listed = client.list();
+    listed
+        .iter()
+        .find(|s| s.session == session)
+        .expect("the session is listed")
+        .layout
+        .clone()
+}
+
+fn tab_layout(keys: &[&str]) -> serde_json::Value {
+    serde_json::json!({"v": 1, "quit": "q", "index": 0, "keys": keys})
+}
+
+/// A layout given with `DETACH` is listed while the session stays
+/// detached; a `DETACH` without one (an older client's) lists none.
+#[test]
+fn a_detach_keeps_its_layout_for_the_list() {
+    let (_dir, mut a) = core("layout-listed");
+    let (laid_out, _) = a.spawn(detach(programs::echoer()));
+    let (plain, _) = a.spawn(detach(programs::echoer()));
+    let layout = tab_layout(&["one", "two"]);
+    a.detach_with(laid_out, Some(layout.clone()));
+    a.detach(plain);
+    assert_eq!(layout_of(&mut a, laid_out), Some(layout));
+    assert_eq!(layout_of(&mut a, plain), None);
+}
+
+/// The layout is in the holder's meta: a new core lists it too.
+#[test]
+fn a_layout_survives_a_core_restart() {
+    let mut dir = TempDir::new("layout-restart");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (session, pid) = a.spawn(detach(programs::echoer()));
+    dir.track(parent(pid).unwrap());
+    let layout = tab_layout(&["kept"]);
+    a.detach_with(session, Some(layout.clone()));
+    assert_eq!(layout_of(&mut a, session), Some(layout.clone()));
+
+    kill_core_and_wait_for_another(&dir, &mut a);
+    let mut b = TestClient::hello(&dir.path, "b");
+    assert_eq!(layout_of(&mut b, session), Some(layout));
+}
+
+/// Attaching drops the layout, in this core and in the holder: a later
+/// detach without one, and the next core, list none.
+#[test]
+fn an_attach_drops_the_layout() {
+    let mut dir = TempDir::new("layout-attach");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (session, pid) = a.spawn(detach(programs::echoer()));
+    dir.track(parent(pid).unwrap());
+    a.detach_with(session, Some(tab_layout(&["gone"])));
+    let mut b = TestClient::hello(&dir.path, "b");
+    b.attach(session, 80, 24).unwrap();
+    assert_eq!(layout_of(&mut a, session), None, "listed while attached");
+    b.detach(session);
+    assert_eq!(layout_of(&mut a, session), None);
+
+    kill_core_and_wait_for_another(&dir, &mut a);
+    let mut c = TestClient::hello(&dir.path, "c");
+    assert_eq!(layout_of(&mut c, session), None, "the holder kept it");
+}
+
+/// A layout over 64 KiB isn't kept, but the detach still applies.
+#[test]
+fn an_oversized_layout_is_dropped_and_the_detach_applies() {
+    let (_dir, mut a) = core("layout-oversized");
+    let (session, _) = a.spawn(programs::echoer());
+    let big = serde_json::json!({"v": 1, "pad": "x".repeat(client::MAX_LAYOUT)});
+    a.detach_with(session, Some(big));
+    let listed = a.list();
+    let info = listed.iter().find(|s| s.session == session).unwrap();
+    assert_eq!(
+        (info.attached, info.policy, info.layout.clone()),
+        (false, client::Policy::Detach, None)
+    );
+}
+
+
+/// The attached client's latest `SET_LAYOUT` is what a client that ended
+/// without detaching leaves, and it survives a core restart.
+#[test]
+fn the_latest_set_layout_outlives_its_client_and_the_core() {
+    let mut dir = TempDir::new("layout-live");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let (session, pid) = a.spawn(detach(programs::echoer()));
+    dir.track(parent(pid).unwrap());
+    a.set_layout(session, Some(tab_layout(&["first"])));
+    a.set_layout(session, Some(tab_layout(&["second"])));
+    // Killed: no DETACH. A `list` from A itself orders it after the sets.
+    a.list();
+    drop(a);
+    let mut b = TestClient::hello(&dir.path, "b");
+    assert!(
+        eventually(TIMEOUT, || b.list().iter().any(|s| s.session == session && !s.attached)),
+        "A's session never lost its client"
+    );
+    assert_eq!(layout_of(&mut b, session), Some(tab_layout(&["second"])));
+
+    kill_core_and_wait_for_another(&dir, &mut b);
+    let mut c = TestClient::hello(&dir.path, "c");
+    assert_eq!(layout_of(&mut c, session), Some(tab_layout(&["second"])));
+}
+
+/// `SET_LAYOUT` is refused from a client that doesn't have the session
+/// attached, and on a connection below protocol 3; neither changes it.
+#[test]
+fn set_layout_is_refused_from_others_and_below_protocol_3() {
+    let (dir, mut a) = core("layout-refused");
+    let (session, _) = a.spawn(detach(programs::echoer()));
+    a.set_layout(session, Some(tab_layout(&["mine"])));
+    let mut other = TestClient::hello(&dir.path, "other");
+    other.set_layout(session, Some(tab_layout(&["theirs"])));
+    match other.recv() {
+        ToClient::Error(e) => {
+            assert_eq!(e.session, Some(session));
+            assert!(e.message.contains("isn't attached"), "{}", e.message);
+        }
+        reply => panic!("not refused: {reply:?}"),
+    }
+    let mut old = TestClient::hello_with(&dir.path, "old", |hello| hello.max = 2);
+    old.set_layout(session, None);
+    match old.recv() {
+        ToClient::Error(e) => assert!(e.message.contains("protocol 3"), "{}", e.message),
+        reply => panic!("not refused: {reply:?}"),
+    }
+    a.detach(session);
+    // The DETACH without one clears it; before that, it was A's.
+    assert_eq!(layout_of(&mut a, session), None);
+    let mut b = TestClient::hello(&dir.path, "b");
+    b.attach(session, 80, 24).unwrap();
+    b.set_layout(session, Some(tab_layout(&["b"])));
+    b.detach_with(session, Some(tab_layout(&["b", "detached"])));
+    assert_eq!(layout_of(&mut b, session), Some(tab_layout(&["b", "detached"])));
+}
+
 #[test]
 fn owner_and_policy_changes_survive_a_core_restart() {
     let mut dir = TempDir::new("set-meta-restart");
@@ -1450,11 +1592,11 @@ fn a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write() {
     assert!(matches!(observer.reply(901), ToClient::Ok(_)));
 }
 
-/// A client that negotiated protocol 2 and asked for process info.
+/// A client that negotiated protocol 2 or later and asked for process info.
 #[cfg(unix)]
 fn asking_for_processes(dir: &TempDir, token: &str) -> TestClient {
     let client = TestClient::hello_with(&dir.path, token, |hello| hello.process_info = true);
-    assert_eq!(client.welcome.as_ref().unwrap().protocol, 2);
+    assert!(client.welcome.as_ref().unwrap().protocol >= 2);
     client
 }
 

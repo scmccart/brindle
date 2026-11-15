@@ -57,6 +57,7 @@ impl<L: EventLoop> Core<L> {
                         .detached_since
                         .filter(|_| detached)
                         .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
+                    layout: session.meta.layout.clone().filter(|_| detached),
                 }
             })
             .collect();

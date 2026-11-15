@@ -872,7 +872,17 @@ impl TestClient {
     }
 
     pub fn detach(&mut self, session: SessionId) {
-        self.send(client::ToCore::Detach(client::SessionRef { session }));
+        self.detach_with(session, None);
+    }
+
+    /// `SET_LAYOUT` (protocol 3) for a session this client has attached.
+    pub fn set_layout(&mut self, session: SessionId, layout: Option<brindle_remote_protocol::serde_json::Value>) {
+        self.send(client::ToCore::SetLayout(client::SetLayout { session, layout }));
+    }
+
+    /// `DETACH` with a layout for the core to keep.
+    pub fn detach_with(&mut self, session: SessionId, layout: Option<brindle_remote_protocol::serde_json::Value>) {
+        self.send(client::ToCore::Detach(client::Detach { session, layout }));
     }
 
     /// The next `PROCESS` for `session` within `timeout`, if one comes.

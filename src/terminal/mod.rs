@@ -929,7 +929,7 @@ impl Terminal {
     /// The user closed the terminal: its program ends. Once is enough:
     /// later calls, and the drop, do nothing.
     pub fn close(&mut self) {
-        self.leave(true);
+        self.leave(true, None);
     }
 
     /// Brindle is quitting: the program is left as the terminal's
@@ -937,24 +937,40 @@ impl Terminal {
     /// one's ends), as the drop would. It is done explicitly because the
     /// drop can't be relied on: on Windows GPUI keeps the focused
     /// terminal's view alive past the process's exit. Once is enough:
-    /// later calls, and the drop, do nothing.
-    pub fn quit(&mut self) {
-        self.leave(false);
+    /// later calls, and the drop, do nothing. A kept session is detached
+    /// with `layout`, the layout of the tab it was in (`crate::layout`).
+    pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
+        self.leave(false, layout);
     }
 
     /// Ends the terminal's connection to its program: `close` ends the
     /// program; otherwise a server session's program is left as its
     /// [`Closing`] says. A message terminal has no program.
-    fn leave(&mut self, close: bool) {
+    /// Keeps the layout of the tab this terminal is in current on its
+    /// server session (`crate::layout`), as it changes; a message terminal
+    /// has none.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        match &self.backend {
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { session, closing: Closing::Keeps, .. } if !self.exited => session.set_layout(layout),
+            _ => {
+                let _ = layout;
+            }
+        }
+    }
+
+    fn leave(&mut self, close: bool, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
             Backend::Server { session, closing, .. } => match (close, closing) {
-                (false, Closing::Keeps) => session.detach(),
+                (false, Closing::Keeps) => session.detach_with(layout),
                 _ => session.close(),
             },
             Backend::Remote => {}
         }
         let _ = close;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let _ = layout;
     }
 
     /// The terminal server session (id and key) this terminal shows, once
@@ -977,7 +993,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.leave(false);
+        self.leave(false, None);
     }
 }
 

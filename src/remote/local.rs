@@ -900,14 +900,14 @@ mod tests {
             let frame = Frame::read_from(&mut stream).unwrap();
             let ToCore::Hello(hello) = ToCore::decode(&frame).unwrap() else { panic!("not HELLO") };
             assert_eq!(hello.client_token, "tok");
-            let refusal = client::answer_hello(&hello, client::VersionRange::new(3, 4)).unwrap_err();
+            let refusal = client::answer_hello(&hello, client::VersionRange::new(4, 5)).unwrap_err();
             ToClient::Error(refusal).encode().unwrap().write_to(&mut stream).unwrap();
         });
         let endpoint = Endpoint::at(temp.0.join("unused"), dir);
         let error = connect(&endpoint, "tok").unwrap_err().to_string();
         core.join().unwrap();
         assert!(error.contains("refused Brindle"), "{error}");
-        assert!(error.contains("offered 1–2, supported 3–4"), "{error}");
+        assert!(error.contains("offered 1–3, supported 4–5"), "{error}");
         assert!(error.contains("brindle-remote stop"), "{error}");
     }
 

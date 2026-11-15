@@ -184,16 +184,28 @@ impl Session {
     /// Ends the session (`CLOSE`), or makes sure it ends as soon as it
     /// starts. A session that already exited sends nothing.
     pub fn close(&self) {
-        self.leave(Leaving::End);
+        self.leave(Leaving::End, None);
     }
 
     /// Leaves the session running with no client (`DETACH`), now or as soon
-    /// as it starts. A session that already exited sends nothing.
-    pub fn detach(&self) {
-        self.leave(Leaving::Keep);
+    /// as it starts, with `layout`, the layout of the tab it was in, which
+    /// the core keeps for whichever client attaches it next. A session still
+    /// starting has no key for a layout to name, and detaches without one. A
+    /// session that already exited sends nothing.
+    pub fn detach_with(&self, layout: Option<serde_json::Value>) {
+        self.leave(Leaving::Keep, layout);
     }
 
-    fn leave(&self, how: Leaving) {
+    /// Keeps the core's copy of the session's layout current
+    /// ([`Running::set_layout`]: only changes, only on client protocol 3).
+    /// A session not running yet sends nothing; the next call catches it.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        if let Phase::Running(running) = &*self.phase.lock() {
+            running.set_layout(layout);
+        }
+    }
+
+    fn leave(&self, how: Leaving, layout: Option<serde_json::Value>) {
         let mut phase = self.phase.lock();
         match &mut *phase {
             Phase::Starting { left, input, .. } => {
@@ -205,7 +217,7 @@ impl Session {
             Phase::Running(running) => {
                 match how {
                     Leaving::End => running.close(),
-                    Leaving::Keep => running.detach(),
+                    Leaving::Keep => running.detach(layout),
                 }
                 *phase = Phase::Gone;
             }
@@ -255,7 +267,7 @@ fn run(
     };
     match left {
         Some(Leaving::End) => return running.close(),
-        Some(Leaving::Keep) => return running.detach(),
+        Some(Leaving::Keep) => return running.detach(None),
         None => {}
     }
     if let Some(size) = resize {
@@ -373,6 +385,15 @@ mod tests {
     /// (which may reply) and reports it.
     fn scripted_core(
         dir: &std::path::Path,
+        answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
+    ) -> mpsc::Receiver<ToCore> {
+        scripted_core_at(dir, 1, answer)
+    }
+
+    /// [`scripted_core`], agreeing on client protocol `protocol`.
+    fn scripted_core_at(
+        dir: &std::path::Path,
+        protocol: u32,
         mut answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
     ) -> mpsc::Receiver<ToCore> {
         let listener = Listener::bind(dir);
@@ -383,7 +404,7 @@ mod tests {
                 panic!("not HELLO")
             };
             let welcome = Welcome {
-                protocol: 1,
+                protocol,
                 core_version: "0.0.0".into(),
                 core_build: "test".into(),
                 pid: std::process::id(),
@@ -492,14 +513,71 @@ mod tests {
         assert_eq!(session.pid(), Some(99));
         assert_eq!(session.id_and_key(), Some((5, "k5".to_string())));
 
-        session.detach();
+        session.detach_with(None);
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == 5));
         // Gone: neither again, nor a close.
-        session.detach();
+        session.detach_with(None);
         session.close();
         session.input(b"late");
         assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A quit's detach carries its tab's layout to the core.
+    #[test]
+    fn a_detach_with_a_layout_sends_it() {
+        let dir = temp_dir("detach-layout");
+        let core = scripted_core(&dir, replaying);
+        let (tx, _tab) = mpsc::channel();
+        let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
+        assert!(matches!(recv(&core), ToCore::Attach(_)));
+        let layout = serde_json::json!({"v": 1, "quit": "q", "index": 0, "zones": {"key": "k5", "active": true}});
+        // Once the attach is answered: a session still starting has no key.
+        eventually(|| session.pid().is_some());
+        session.detach_with(Some(layout.clone()));
+        loop {
+            match recv(&core) {
+                ToCore::Detach(detach) => {
+                    assert_eq!((detach.session, detach.layout), (5, Some(layout)));
+                    break;
+                }
+                ToCore::Resize(_) | ToCore::Data(_) => {}
+                other => panic!("not DETACH: {other:?}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On client protocol 3 a layout goes out only when it changed; below 3
+    /// none does (the quit's `DETACH` carries it).
+    #[test]
+    fn layouts_are_sent_once_per_change_and_only_on_protocol_3() {
+        for protocol in [3, 2] {
+            let dir = temp_dir(&format!("set-layout-{protocol}"));
+            let core = scripted_core_at(&dir, protocol, replaying);
+            let (tx, _tab) = mpsc::channel();
+            let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
+            assert!(matches!(recv(&core), ToCore::Attach(_)));
+            eventually(|| session.pid().is_some());
+            let one = serde_json::json!({"v": 1, "origin": "o", "index": 0, "zones": {"key": "k5"}});
+            let two = serde_json::json!({"v": 1, "origin": "o", "index": 1, "zones": {"key": "k5"}});
+            for layout in [&one, &one, &two, &two] {
+                session.set_layout(Some(layout.clone()));
+            }
+            // The detach marks the end of what the session sent.
+            session.detach_with(None);
+            let mut sent = Vec::new();
+            loop {
+                match recv(&core) {
+                    ToCore::SetLayout(set) => sent.push(set.layout),
+                    ToCore::Detach(_) => break,
+                    _ => {}
+                }
+            }
+            let expected = if protocol >= 3 { vec![Some(one), Some(two)] } else { Vec::new() };
+            assert_eq!(sent, expected, "protocol {protocol}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
@@ -535,7 +613,7 @@ mod tests {
         let (tx, _tab) = mpsc::channel();
         let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
         got.recv_timeout(Duration::from_secs(10)).unwrap();
-        session.detach();
+        session.detach_with(None);
         release.send(()).unwrap();
         let ToCore::Attach(_) = recv(&core) else { panic!("not ATTACH") };
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == 5));
@@ -572,19 +650,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         ended.close();
-        ended.detach();
+        ended.detach_with(None);
         assert!(matches!(recv(&core), ToCore::Close(close) if close.session == id));
 
         let (exited, tab, _) = start("/exits");
         assert_eq!(seen(&tab), "exited Some(0)");
         exited.close();
-        exited.detach();
+        exited.detach_with(None);
         assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "nothing for an exited session");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// What quitting does to a window's tabs: each terminal leaves its
-    /// session explicitly (`Terminal::quit`: a profile tab's is detached,
+    /// session explicitly (`Terminal::quit_with`: a profile tab's is detached,
     /// an `-e` one's closed), then the drop, when GPUI runs it, leaves it
     /// again, which sends nothing more. The flush before the exit returns
     /// once both are written.
@@ -611,9 +689,9 @@ mod tests {
         let (ended, ended_id) = start();
 
         // The quit, then the drops.
-        kept.detach();
+        kept.detach_with(None);
         ended.close();
-        kept.detach();
+        kept.detach_with(None);
         ended.close();
         assert!(connection.flush(Instant::now() + Duration::from_secs(10)), "not written");
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == kept_id));
@@ -814,7 +892,7 @@ mod tests {
         session.input(b"x");
         // Let the request reach the connection before the tab closes.
         std::thread::sleep(Duration::from_millis(200));
-        session.detach();
+        session.detach_with(None);
         let (link, far) = fake::link(&[], |message, out| {
             if let ToCore::List(list) = message {
                 out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));

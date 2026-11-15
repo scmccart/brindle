@@ -46,6 +46,8 @@ pub(super) struct Client {
     linger: Duration,
     /// It speaks protocol 2 and asked for `PROCESS`.
     pub(super) process_info: bool,
+    /// The client protocol its `HELLO` negotiated.
+    pub(super) protocol: u32,
     /// A write to it failed: what it sent is being handled before it is
     /// dropped ([`Core::drop_failed_client`]), and nothing more is sent.
     failed: bool,
@@ -195,6 +197,7 @@ impl<L: EventLoop> Core<L> {
                 over: false,
                 linger,
                 process_info,
+                protocol,
                 failed: false,
             },
         );
@@ -293,8 +296,9 @@ impl<L: EventLoop> Core<L> {
             ToCore::Resize(resize) => self.client_resize(client, resize),
             ToCore::Close(target) => self.client_close(client, target.session),
             ToCore::Reparent(reparent) => self.client_reparent(client, reparent),
+            ToCore::SetLayout(set) => self.client_set_layout(client, set),
             ToCore::Attach(attach) => self.client_attach(client, attach),
-            ToCore::Detach(target) => self.client_detach(client, target.session),
+            ToCore::Detach(detach) => self.client_detach(client, detach),
             ToCore::List(request) => self.client_list(client, request.req),
             ToCore::Kill(kill) => self.client_kill(client, kill),
             ToCore::Status(request) => self.client_status(client, request.req),

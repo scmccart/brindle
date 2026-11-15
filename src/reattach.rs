@@ -8,6 +8,7 @@
 //! 13).
 
 use crate::config::{Config, Profile};
+use crate::layout::LayoutTab;
 use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::ServerSession;
@@ -61,21 +62,21 @@ pub fn session_profile(info: &SessionInfo, host: &Host, config: &Config, first_t
     }
 }
 
-/// [`sweep`] joined with [`session_profile`]: the sessions of `host`'s first
-/// listing that a launch opens as tabs, in start order, each with its
-/// profile's index.
+/// [`sweep`] grouped into tabs ([`crate::layout::group`]) and joined with
+/// [`session_profile`]: the tabs `host`'s first listing opens at a launch,
+/// each with the profile index its active session gives it.
 pub fn swept_tabs(
     listed: Vec<SessionInfo>,
     skip: &[ServerSession],
     host: &Host,
     config: &Config,
     first_tab_profile: Option<&str>,
-) -> Vec<(SessionInfo, usize)> {
-    sweep(listed, skip)
+) -> Vec<(LayoutTab, usize)> {
+    crate::layout::group(sweep(listed, skip))
         .into_iter()
-        .map(|info| {
-            let index = session_profile(&info, host, config, first_tab_profile);
-            (info, index)
+        .map(|tab| {
+            let index = session_profile(tab.active(), host, config, first_tab_profile);
+            (tab, index)
         })
         .collect()
 }
@@ -398,16 +399,42 @@ mod tests {
         let skip = [ServerSession { id: 4, key: "d".into() }];
         let tabs: Vec<(u32, usize)> = swept_tabs(listed.clone(), &skip, &a8, &config, Some("B9"))
             .into_iter()
-            .map(|(info, index)| (info.session, index))
+            .map(|(tab, index)| (tab.active().session, index))
             .collect();
         assert_eq!(tabs, [(1, 1), (2, 1), (3, 2)]);
         // Where no profile targets the endpoint, the first tab's profile.
         let tabs: Vec<(u32, usize)> = swept_tabs(listed, &[], &ssh("C3"), &config, Some("B9"))
             .into_iter()
-            .map(|(info, index)| (info.session, index))
+            .map(|(tab, index)| (tab.active().session, index))
             .collect();
         assert_eq!(tabs, [(4, 3), (1, 3), (2, 3), (3, 3)]);
         assert!(swept_tabs(Vec::new(), &[], &a8, &config, None).is_empty());
+    }
+
+    /// A remote endpoint's sessions detached with one tab's layout come
+    /// back as that tab, with the profile its active session gives it; one
+    /// a restored zone took is left out of it.
+    #[test]
+    fn swept_tabs_regroup_a_recorded_split() {
+        let config = profiles();
+        let a8 = Host::of(&config.profiles[2]);
+        let layout = serde_json::json!({
+            "v": 1, "origin": "q", "index": 0,
+            "zones": {"split": "vertical", "first": {"key": "a"}, "second": {"split": "horizontal",
+                "first": {"key": "b", "active": true}, "second": {"key": "c"}}},
+        });
+        let member = |session, key: &str, profile: &str| SessionInfo {
+            profile: Some(profile.into()),
+            layout: Some(layout.clone()),
+            ..info(session, key, session.into())
+        };
+        let listed = vec![member(1, "a", "Work"), member(2, "b", "A8"), member(3, "c", "Work"), info(4, "d", 0)];
+        let tabs = swept_tabs(listed, &[ServerSession { id: 3, key: "c".into() }], &a8, &config, None);
+        let shapes: Vec<(Vec<u32>, u32, usize)> = tabs
+            .iter()
+            .map(|(tab, index)| (tab.zones.items().iter().map(|s| s.session).collect(), tab.active().session, *index))
+            .collect();
+        assert_eq!(shapes, [(vec![4], 4, 1), (vec![1, 2], 2, 2)]);
     }
 
     /// 7.3: a session of this machine's server opens with the profile it

@@ -78,6 +78,8 @@ enum Protocol {
     /// Client protocol 2: the same frames plus `PROCESS`, and `HELLO`'s
     /// `linger_secs` and `process_info`.
     Client2,
+    /// Client protocol 3: protocol 2 plus `SET_LAYOUT`.
+    Client3,
     /// The link to a `brindle-remote relay`: the client protocol and the
     /// relay's own frames.
     Relay,
@@ -87,10 +89,10 @@ enum Protocol {
 impl Protocol {
     fn decode(self, sender: &str, frame: &Frame) -> std::io::Result<Step> {
         Ok(match (self, sender) {
-            (Self::Client | Self::Client2 | Self::Relay, "client") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "client") => {
                 Step::Client(client::ToCore::decode(frame)?)
             }
-            (Self::Client | Self::Client2 | Self::Relay, "core") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "core") => {
                 Step::CoreToClient(client::ToClient::decode(frame)?)
             }
             (Self::Relay, "relay") => Step::Relay(relay::RelayMessage::decode(frame)?),
@@ -104,6 +106,7 @@ impl Protocol {
         match self {
             Self::Client => "protocol 1 (client <-> core)",
             Self::Client2 => "protocol 2 (client <-> core)",
+            Self::Client3 => "protocol 3 (client <-> core)",
             Self::Relay => "relay link (Brindle <-> brindle-remote relay)",
             Self::Holder => "H1 (core <-> holder)",
         }
@@ -303,7 +306,7 @@ fn every_message_type_appears_in_a_transcript() {
         }
     }
     let client_types =
-        (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
+        (client::MSG_DATA..=client::MSG_SET_LAYOUT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
     for msg_type in client_types {
         assert!(
             seen.contains_key(&("client", msg_type)),
@@ -581,7 +584,10 @@ fn transcripts() -> Vec<Transcript> {
                 vec![
                     output(3, b"\x1b[2;1HCPU 3%"),
                     input(3, b"q"),
-                    c(client::ToCore::Detach(client::SessionRef { session: 3 })),
+                    c(client::ToCore::Detach(client::Detach {
+                        session: 3,
+                        layout: None,
+                    })),
                     c(client::ToCore::Attach(client::Attach {
                         req: 2,
                         session: 4,
@@ -592,6 +598,94 @@ fn transcripts() -> Vec<Transcript> {
                 ],
             ]
             .concat(),
+        },
+        Transcript {
+            name: "client-layout",
+            protocol: Protocol::Client,
+            about: "A quitting client detaches a split tab's sessions with the tab's layout; a later client lists it, and attaching clears it.",
+            steps: {
+                // Keys in sorted order, which is how they encode whether or
+                // not serde_json's `preserve_order` is on (feature
+                // unification turns it on in a workspace build).
+                let layout = json!({
+                    "index": 0,
+                    "origin": "1f2e-9a",
+                    "title": "logs",
+                    "v": 1,
+                    "zones": {
+                        "first": {"active": true, "key": KEY},
+                        "second": {"key": "3c0b7e2f5a9d4186b2e7c0f19d3a5b48"},
+                        "split": "horizontal",
+                    },
+                });
+                let listed = |session: u32, key: &str, layout: Option<serde_json::Value>| client::SessionInfo {
+                    session,
+                    pid: 5000 + session,
+                    command: "bash -l".into(),
+                    policy: Policy::Detach,
+                    cols: 80,
+                    rows: 24,
+                    key: key.into(),
+                    started: 1_794_000_000,
+                    profile: Some("Shell".into()),
+                    layout,
+                    ..Default::default()
+                };
+                vec![
+                    hello(TOKEN),
+                    welcome(),
+                    c(client::ToCore::Detach(client::Detach { session: 1, layout: Some(layout.clone()) })),
+                    c(client::ToCore::Detach(client::Detach { session: 2, layout: Some(layout.clone()) })),
+                    c(client::ToCore::List(client::Request { req: 1 })),
+                    s(client::ToClient::Sessions(client::Sessions {
+                        req: 1,
+                        sessions: vec![
+                            listed(1, KEY, Some(layout.clone())),
+                            listed(2, "3c0b7e2f5a9d4186b2e7c0f19d3a5b48", Some(layout)),
+                        ],
+                    })),
+                    c(client::ToCore::Attach(client::Attach { req: 2, session: 1, cols: 80, rows: 24 })),
+                    s(client::ToClient::ReplayStart(client::ReplayStart { req: Some(2), session: 1, pid: 5001 })),
+                    s(client::ToClient::ReplayEnd(client::SessionRef { session: 1 })),
+                    c(client::ToCore::List(client::Request { req: 3 })),
+                    s(client::ToClient::Sessions(client::Sessions {
+                        req: 3,
+                        sessions: vec![client::SessionInfo { attached: true, ..listed(1, KEY, None) }],
+                    })),
+                ]
+            },
+        },
+        Transcript {
+            name: "client-set-layout",
+            protocol: Protocol::Client3,
+            about: "Protocol 3: a client keeps an attached session's layout current with SET_LAYOUT; one for a session it hasn't attached is refused.",
+            steps: {
+                // Keys in sorted order (see client-layout).
+                let layout = |index: u32| {
+                    json!({"index": index, "origin": "1f2e-9a", "v": 1, "zones": {"active": true, "key": KEY}})
+                };
+                vec![
+                    c(client::ToCore::Hello(client::Hello {
+                        min: 1,
+                        max: 3,
+                        client_version: "0.5.0".into(),
+                        client_token: TOKEN.into(),
+                        ..Default::default()
+                    })),
+                    s(client::ToClient::Welcome(client::Welcome {
+                        protocol: 3,
+                        core_version: "0.5.0".into(),
+                        core_build: "d3f2".into(),
+                        pid: 4242,
+                        holder_protocols: vec![2],
+                    })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: Some(layout(0)) })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: Some(layout(1)) })),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 9, layout: Some(layout(0)) })),
+                    error(None, Some(9), "session 9 isn't attached to this client"),
+                    c(client::ToCore::SetLayout(client::SetLayout { session: 1, layout: None })),
+                ]
+            },
         },
         Transcript {
             name: "client-reconnect",
@@ -990,7 +1084,10 @@ fn transcripts() -> Vec<Transcript> {
                     pid: 5000,
                     key: KEY.into(),
                 })),
-                c(client::ToCore::Detach(client::SessionRef { session: 7 })),
+                c(client::ToCore::Detach(client::Detach {
+                        session: 7,
+                        layout: None,
+                    })),
                 c(client::ToCore::List(client::Request { req: 2 })),
                 s(client::ToClient::Sessions(client::Sessions {
                     req: 2,
@@ -1020,6 +1117,52 @@ fn transcripts() -> Vec<Transcript> {
             .into_iter()
             .chain(replay(Some(3), 7, 5000, &[&b"\x1bc"[..], b"vim"]))
             .collect(),
+        },
+        Transcript {
+            name: "holder-set-meta-layout",
+            protocol: Protocol::Holder,
+            about: "H1 version 2: a detach's layout is stored in the session's meta, and an attach's SET_META drops it.",
+            steps: vec![
+                ch(holder::ToHolder::Hello(holder::Hello {
+                    min: 1,
+                    max: 2,
+                    core_build: "b1d0".into(),
+                    instance: 1,
+                })),
+                h(holder::ToCore::Welcome(holder::Welcome {
+                    protocol: 2,
+                    build: "b1d0".into(),
+                    pid: 4243,
+                    previous: Previous::None,
+                    sessions: Vec::new(),
+                })),
+                ch(holder::ToHolder::SetMeta(holder::SetMeta {
+                    session: 1,
+                    meta: holder::SessionMeta {
+                        key: KEY.into(),
+                        layout: Some(json!({"v": 1, "zones": {"active": true, "key": KEY}})),
+                        policy: Policy::Detach,
+                        profile: Some("Shell".into()),
+                        scrollback: 10000,
+                        started: 1_794_000_000,
+                        ..Default::default()
+                    }
+                    .to_value(),
+                })),
+                ch(holder::ToHolder::SetMeta(holder::SetMeta {
+                    session: 1,
+                    meta: holder::SessionMeta {
+                        key: KEY.into(),
+                        owner: "b".into(),
+                        policy: Policy::Detach,
+                        profile: Some("Shell".into()),
+                        scrollback: 10000,
+                        started: 1_794_000_000,
+                        ..Default::default()
+                    }
+                    .to_value(),
+                })),
+            ],
         },
         Transcript {
             name: "holder-set-meta",
