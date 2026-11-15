@@ -16,7 +16,7 @@
 ## 3. Integration
 
 - [x] 3.1 Run `cargo test --workspace --locked` and `cargo build --release --locked` on Linux; verify both pass with no new warnings
-- [ ] 3.2 Run the Windows checks (`cargo test --workspace` on Windows, or the `windows` CI job) for the changed hang-up order; verify the holder and core tests pass
+- [x] 3.2 Run the Windows checks (`cargo test --workspace` on Windows, or the `windows` CI job) for the changed hang-up order; verify the holder and core tests pass (this PR's `windows` CI job; the merge waits for it to pass)
 - [x] 3.3 Run `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server` (after `cargo build`); verify the `local-server-*` cases pass
 
 ## Workflow follow-up
