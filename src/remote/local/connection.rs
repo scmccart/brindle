@@ -2752,7 +2752,13 @@ mod tests {
         let (link, first) = fake::link(&[], |_, _| {});
         plan.link(link);
         first.hello();
+        // Listed only once the connection has lost the link it had: a `LIST`
+        // the writer is still trying on the cut link is one the reader's
+        // loss fails as "went away". (Before the link is up the slot is
+        // empty too, so up comes first.)
+        eventually("the link is up", || connection.slot.lock().link.is_some());
         first.out.cut();
+        eventually("the link is down", || connection.slot.lock().link.is_none());
         let error = connection.list_within(Some(Duration::from_millis(200))).unwrap_err().to_string();
         assert_eq!(error, "the terminal server didn't list its sessions within 0.2 s");
         assert!(connection.state.lock().requests.is_empty());
