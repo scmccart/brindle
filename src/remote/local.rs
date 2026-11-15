@@ -84,6 +84,10 @@ const BUSY_LIMIT: Duration = HELLO_LIMIT;
 /// How long a remote endpoint's core keeps this client's `kill` sessions
 /// after a relay link drops, for the reconnect to get them back.
 const RELAY_LINGER_SECS: u32 = 300;
+/// How long an exiting Brindle waits, at most, for its connections to write
+/// what its closing tabs sent ([`flush`]). Writing to a link that is up
+/// takes far less.
+pub const QUIT_FLUSH: Duration = Duration::from_millis(500);
 
 #[cfg(not(windows))]
 pub const HELPER_MISSING: &str =
@@ -154,6 +158,18 @@ pub fn shared(host: &Host) -> Result<Arc<Connection>> {
 /// never connects.
 pub fn existing(host: &Host) -> Option<Arc<Connection>> {
     CONNECTIONS.existing(host)
+}
+
+/// Waits up to `limit` for every connection of the process to write what
+/// was sent on it so far ([`Connection::flush`]); true when all did. Brindle
+/// calls it as it exits, once its tabs are gone: quitting detaches their
+/// sessions, and a `DETACH` still queued when the process ends is lost (on
+/// Windows the exit ends every other thread at once). The core would then
+/// see only the connection close, leave the sessions their owner, and the
+/// next launch would leave them in the sessions palette for 5 minutes
+/// instead of opening them as tabs.
+pub fn flush(limit: Duration) -> bool {
+    CONNECTIONS.flush(Instant::now() + limit)
 }
 
 /// Makes `watch` the callback every remote connection made from now on
@@ -293,6 +309,26 @@ impl Registry {
         let slot = self.0.lock().get(host).cloned()?;
         let current = slot.lock();
         current.as_ref().filter(|connection| !connection.is_dead()).cloned()
+    }
+
+    /// Flushes every connection ([`Connection::flush`]) by one `deadline`.
+    /// A slot's lock is held while its connection is made, which blocks
+    /// (connecting, starting a core), so it is waited for only until then.
+    fn flush(&self, deadline: Instant) -> bool {
+        let slots: Vec<Slot> = self.0.lock().values().cloned().collect();
+        let mut flushed = true;
+        for slot in slots {
+            let Some(current) = slot.try_lock_until(deadline) else {
+                flushed = false;
+                continue;
+            };
+            let connection = current.clone();
+            drop(current);
+            if let Some(connection) = connection {
+                flushed &= connection.flush(deadline);
+            }
+        }
+        flushed
     }
 
     #[cfg(test)]
@@ -969,6 +1005,32 @@ mod tests {
         let next = registry.get(&host, make).unwrap();
         assert!(!Arc::ptr_eq(&connection, &next));
         assert_eq!(plans.lock().len(), 2);
+    }
+
+    /// An exiting Brindle's flush waits for a connection still being made
+    /// (a local connect blocks while it starts a core) only until its
+    /// deadline, and has nothing to wait for once it has failed.
+    #[test]
+    fn a_flush_waits_for_a_connection_being_made_only_until_its_deadline() {
+        let registry = Registry::default();
+        let making = Registry(registry.0.clone());
+        let (started_making, making_started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let maker = std::thread::spawn(move || {
+            making.get(&Host::Local, || {
+                started_making.send(()).unwrap();
+                released.recv().ok();
+                Err(anyhow!("no core"))
+            })
+        });
+        making_started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let started = Instant::now();
+        assert!(!registry.flush(started + Duration::from_millis(200)));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200) && waited < Duration::from_secs(5), "waited {waited:?}");
+        release.send(()).unwrap();
+        assert!(maker.join().unwrap().is_err());
+        assert!(registry.flush(Instant::now() + Duration::from_secs(1)), "no connection is left to wait for");
     }
 
     /// The palette's lookup never makes a connection, and doesn't hand out

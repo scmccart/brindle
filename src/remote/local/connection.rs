@@ -12,7 +12,10 @@
 //!   never blocks on the link. While the link is down it holds them, so
 //!   input typed meanwhile reaches each session once reconnected. A
 //!   request's message that nobody waits for any more (withdrawn, failed or
-//!   timed out) isn't sent.
+//!   timed out) isn't sent. [`Connection::flush`] waits, for a bounded
+//!   time, until it is done with what was sent so far: a process that
+//!   exits right after its tabs closed would otherwise end the writer
+//!   before their `DETACH`es were written.
 //! - **Reconnect:** when a link ends, the reader connects again with the
 //!   same `client_token`. The core then replays every session it still has
 //!   for this client. A `LIST` sent right after `WELCOME` tells which
@@ -307,6 +310,9 @@ struct Slot {
     /// `None` while reconnecting.
     link: Option<Current>,
     closed: bool,
+    /// How many of the messages sent ([`Connection::sent`]) the writer is
+    /// done with: written, or dropped as no longer wanted.
+    handled: u64,
 }
 
 /// When a relay link counts as dead, as the watchdog reads it: a deadline
@@ -364,7 +370,12 @@ pub struct Connection {
     /// connection ended.
     wake: Condvar,
     outgoing: mpsc::Sender<ToCore>,
+    /// How many messages went to the writer, counted before each is queued
+    /// ([`Connection::flush`] waits for [`Slot::handled`] to catch up).
+    sent: AtomicU64,
     slot: Mutex<Slot>,
+    /// A link came up or went, the writer finished a message, or the
+    /// connection ended.
     slot_ready: Condvar,
     watch: Mutex<Watch>,
     watch_changed: Condvar,
@@ -431,6 +442,7 @@ impl Connection {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             outgoing,
+            sent: AtomicU64::new(0),
             slot: Mutex::new(Slot::default()),
             slot_ready: Condvar::new(),
             watch: Mutex::new(Watch::default()),
@@ -591,7 +603,31 @@ impl Connection {
     }
 
     fn send(&self, message: ToCore) {
+        self.sent.fetch_add(1, Ordering::AcqRel);
         self.outgoing.send(message).ok();
+    }
+
+    /// Waits until the writer is done with every message sent before the
+    /// call, or until `deadline`; true once it is. This is for a process
+    /// about to exit: its tabs' `DETACH`es (and `CLOSE`s) are only queued,
+    /// and an exit before the writer runs loses them, so the core takes the
+    /// quit for a client that dropped and may come back. A link that is
+    /// down writes nothing until the next, which won't come, so it isn't
+    /// waited for: false at once, as for a connection that ended.
+    pub fn flush(&self, deadline: Instant) -> bool {
+        let target = self.sent.load(Ordering::Acquire);
+        let mut slot = self.slot.lock();
+        loop {
+            if slot.handled >= target {
+                return true;
+            }
+            if slot.closed || slot.link.is_none() {
+                return false;
+            }
+            if self.slot_ready.wait_until(&mut slot, deadline).timed_out() {
+                return slot.handled >= target;
+            }
+        }
     }
 
     /// Sends `CLOSE` for `session`, which keeps the connection in use until
@@ -1408,7 +1444,10 @@ impl Connection {
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 },
             };
-            if !self.write(&message) {
+            let open = self.write(&message);
+            self.slot.lock().handled += 1;
+            self.slot_ready.notify_all();
+            if !open {
                 return;
             }
             last = Instant::now();
@@ -1501,6 +1540,9 @@ impl Connection {
         let mut slot = self.slot.lock();
         if slot.link.as_ref().is_some_and(|current| Arc::ptr_eq(&current.wire, wire)) {
             slot.link = None;
+            drop(slot);
+            // A flush waiting on it gives up.
+            self.slot_ready.notify_all();
         }
     }
 
@@ -2836,6 +2878,100 @@ mod tests {
         plan.fail("offline");
         eventually("the connection ends", || ended.is_dead());
         assert!(ended.on_listing(hook(&got)).is_err());
+    }
+
+    /// A link that holds every frame while it is shut, as a stalled one
+    /// does, and keeps the type of each frame it passed on.
+    struct Gate {
+        inner: Arc<dyn Wire>,
+        shut: Mutex<bool>,
+        opened: Condvar,
+        passed: Mutex<Vec<u8>>,
+    }
+
+    impl Gate {
+        fn around(link: Link) -> (Link, Arc<Self>) {
+            let gate = Arc::new(Self {
+                inner: link.wire,
+                shut: Mutex::new(false),
+                opened: Condvar::new(),
+                passed: Mutex::new(Vec::new()),
+            });
+            (Link { reader: link.reader, wire: gate.clone() }, gate)
+        }
+
+        fn shut(&self, shut: bool) {
+            *self.shut.lock() = shut;
+            self.opened.notify_all();
+        }
+
+        /// Whether a frame of `message`'s type has gone through.
+        fn passed(&self, message: &ToCore) -> bool {
+            let kind = message.encode().unwrap().msg_type;
+            self.passed.lock().contains(&kind)
+        }
+    }
+
+    impl Wire for Gate {
+        fn send(&self, frame: &Frame) -> io::Result<()> {
+            let mut shut = self.shut.lock();
+            while *shut {
+                self.opened.wait(&mut shut);
+            }
+            drop(shut);
+            self.inner.send(frame)?;
+            self.passed.lock().push(frame.msg_type);
+            Ok(())
+        }
+
+        fn end(&self) {
+            self.inner.end();
+        }
+    }
+
+    /// What an exiting Brindle waits for: a flush returns once the
+    /// messages sent before it are written, not when they are only queued
+    /// (a quit's `DETACH` that the exit cut off left its session an owner,
+    /// so the next launch didn't open it as a tab). It gives up at its
+    /// deadline on a stalled link, and at once on a link that is down.
+    #[test]
+    fn a_flush_returns_once_what_was_sent_is_written() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        let (link, gate) = Gate::around(link);
+        plan.link(link);
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        assert!(connection.flush(Instant::now()), "nothing is left to write");
+
+        // Stalled: the DETACH is queued, not written, by the deadline.
+        let detach = ToCore::Detach(SessionRef { session: running.id() });
+        gate.shut(true);
+        running.detach();
+        let started = Instant::now();
+        assert!(!connection.flush(started + Duration::from_millis(300)));
+        assert!(started.elapsed() >= Duration::from_millis(300), "gave up after {:?}", started.elapsed());
+        assert!(!gate.passed(&detach));
+
+        // Written while a flush waits: the flush returns, with it written.
+        let flushing = connection.clone();
+        let flush = in_background(move || flushing.flush(Instant::now() + Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!flush.is_finished(), "returned before the DETACH was written");
+        gate.shut(false);
+        assert!(flush.join().unwrap());
+        assert!(gate.passed(&detach), "returned before the DETACH was written");
+        assert_eq!(far.next(), detach);
+
+        // Down: nothing can be written until a next link, which an exiting
+        // process won't wait for.
+        far.out.cut();
+        eventually("the link is down", || connection.slot.lock().link.is_none());
+        connection.send(ToCore::Detach(SessionRef { session: 99 }));
+        let started = Instant::now();
+        assert!(!connection.flush(started + Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
     }
 
     #[test]

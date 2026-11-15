@@ -956,6 +956,15 @@ fn main() {
             .detach();
         }
     });
+    // GPUI's shutdown has closed the windows, and their terminals detached
+    // (or closed) their sessions on the way out, but those messages are only
+    // queued for the connections' writer threads, which the exit would end
+    // (Windows ends them at once). A lost `DETACH` leaves a session its
+    // owner, so the next launch wouldn't open it as a tab.
+    #[cfg(any(target_os = "linux", windows))]
+    if !remote::local::flush(remote::local::QUIT_FLUSH) {
+        log::info!("quitting before every terminal server connection had written what its tabs sent");
+    }
 }
 
 /// `--wait-for`: polls the active terminal's screen until it shows `text`,
