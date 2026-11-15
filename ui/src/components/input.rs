@@ -53,7 +53,7 @@ impl RenderOnce for Input {
         let handle = self.input.read(cx).focus_handle(cx);
         let ring_shown = shows_ring(handle.is_focused(window), modality(window, cx), true);
         let style = input_style(ring_shown, self.invalid, t);
-        // h-9 (two `FIELD_STEP`s) w-full min-w-0 rounded-md border
+        // h-9 (`FIELD_HEIGHT`) w-full min-w-0 rounded-md border
         // border-input bg-transparent px-3 py-1 text-sm
         let mut frame = div()
             .flex()

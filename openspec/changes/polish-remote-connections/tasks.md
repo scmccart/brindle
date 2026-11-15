@@ -156,7 +156,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - **Windows:** the user ran `scripts/run-throwaway.ps1` with an ssh profile on 2026-11-15: no label wraps, but the "Connect at launch" row is shorter than the text-field rows, which led to 7.2.
 
   Verify: record here, from both checks, whether any label wraps. If one wraps on Linux, also size the label column to the widest label (design decision 8) as part of 7.2.
-- [ ] 7.2 Give the profile editor's rows one control height, as shadcn's horizontal `Field` (design decision 8):
+- [x] 7.2 Give the profile editor's rows one control height, as shadcn's horizontal `Field` (design decision 8):
   - `brindle-ui`'s `FIELD_HEIGHT` (36 px, shadcn's `h-9`), which `Input` uses; no `FIELD_STEP`;
   - every profile editor row's control line at least `FIELD_HEIGHT` tall, its control centred;
   - an error message beneath the control line at its natural height, after a small gap, indented to the controls, wrapping when long.
@@ -165,6 +165,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - `cargo test -p brindle settings_dialog` and `cargo test -p brindle-ui`;
   - `settings-editor-connect-at-launch`'s capture on Linux: the "Connect at launch" row's switch is centred in a 36 px band, the same as the text field rows above it (looked at by eye, recorded here);
   - the user's Windows check again, with `scripts/run-throwaway.ps1`.
+  - Done in code; the capture check runs on Linux in 8.2 and the user's Windows check is pending.
 
 ## 8. Platform checks
 

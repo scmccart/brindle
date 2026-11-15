@@ -61,11 +61,10 @@ rule, not a convenience.
     the `Dialog` chrome and `PopoverContent`. A focusable control takes its
     `FocusHandle` from the owner (`.focus(&handle)`); without one it can't
     take keyboard focus.
-    - `FIELD_STEP` (18px) is the increment a form lays its rows on, and
-      `FIELD_HEIGHT` (two steps, 36px) is an `Input`'s height. An owner gives
-      each row's control line `FIELD_HEIGHT` with the control centred
-      (whatever it is: a field, a select, a switch, a checkbox) and an error
-      line under it one `FIELD_STEP`.
+    - `FIELD_HEIGHT` (36px, shadcn's `h-9`) is an `Input`'s height. An owner
+      gives each row's control line at least that (`min_h`) with the control
+      centred (whatever it is: a field, a select, a switch, a checkbox), and
+      puts an error message under it at its natural height.
     - `Toggle` (`Toggle::new(id, "Aa")` or `Toggle::icon_only(id, icon)`):
       shadcn's toggle, a button with a `pressed` state the owner holds.
       Variants default and outline, sizes default, sm and lg (`h-9`, `h-8`,

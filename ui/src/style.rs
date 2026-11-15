@@ -938,18 +938,10 @@ pub const CARD_BORDER: Pixels = px(1.);
 /// button (1.5rem) at the 16px root.
 pub const CARD_HEADER_HEIGHT: Pixels = px(28.);
 
-/// One increment of a form's rows: half of a text field's height. A form
-/// row's control line is [`FIELD_HEIGHT`] (two increments) whatever the
-/// control, and a message under it takes one more, so rows line up and an
-/// error moves the rows below by a whole increment. In pixels, so an owner
-/// can count rows without a rem size.
-pub const FIELD_STEP: Pixels = px(FIELD_STEP_PX);
-
-/// A text field's height, two [`FIELD_STEP`]s: shadcn's `h-9` at the 16px
-/// root. `Input` is this tall.
-pub const FIELD_HEIGHT: Pixels = px(2. * FIELD_STEP_PX);
-
-const FIELD_STEP_PX: f32 = 18.;
+/// A text field's height: shadcn's `h-9` at the 16px root. `Input` is this
+/// tall, and a form row's control line is at least this tall whatever the
+/// control. In pixels, so an owner can use it without a rem size.
+pub const FIELD_HEIGHT: Pixels = px(36.);
 
 /// A card's own colours, which its owner may give it (a pane drawn in its
 /// terminal's colours). A colour left `None` comes from the tokens, so a
@@ -1051,9 +1043,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn field_height_is_two_steps_and_shadcns_h_9() {
-        assert_eq!(FIELD_STEP, px(18.));
-        assert_eq!(FIELD_HEIGHT, FIELD_STEP * 2.);
+    fn field_height_is_shadcns_h_9() {
         // `h_9` is 2.25rem, 36px at the 16px root.
         assert_eq!(FIELD_HEIGHT, rems(2.25).to_pixels(px(16.)));
     }
