@@ -81,6 +81,13 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 - [x] 3.4 Add `Hosts::apply_all(batch) -> bool` and use it in `main.rs`'s `watch_hosts`. Verify with a `src/remote/hosts.rs` test: a batch applies in order, and returns true when any report changed what the palette shows.
 - [x] 3.5 Describe the close limit, the withdrawn listing hook and eager refusals in `connection.rs`'s module doc ("A relay's first connect", "A relay's lifetime") and in CLAUDE.md's "Brindle's client" and "Reattach" bullets. Verify that `grep -n "close_limit" CLAUDE.md src/remote/local/connection.rs` finds the module doc, `State::in_use`'s comment (today's "until it is written") and the CLAUDE.md bullet.
 
+- [ ] 3.6 Handle what a client sent before dropping it on a failed write (design decision 10). Found by 8.1: on Windows `list_shows_whether_a_detached_sessions_owner_may_come_back` lost a `DETACH` about 1 run in 25. The core's write to a client that had just closed failed (`ERROR_NO_DATA`), and `flush_client` dropped the client without reading the `DETACH` already in its pipe, so the session kept its owner. Brindle's quit (`DETACH`s, then exit) has the same shape whenever the core has output queued for it. Have the core read and handle a failing client's buffered frames, up to a limit, before `client_gone`, as the holder's `flush_core` does for its core.
+
+  Verify:
+  - a `remote-agent/tests/core.rs` test that fails without the fix: a client detaches a session while its other session floods output, closes, and the session lists `unowned` (Windows, in a loop of 20 attempts; a Linux counterpart where the same path applies);
+  - `list_shows_whether_a_detached_sessions_owner_may_come_back` 30 times alone and 5 times under load;
+  - `cargo test -p brindle-remote-agent`.
+
 ## 4. The command list keeps a named highlight (item 7, `brindle-ui`)
 
 - [x] 4.1 Let `CommandRows::build` take an item to highlight, falling back to the first enabled match, and let `Command::set_groups` take it. Keep the list's scroll offset while the kept row is in view (design decision 5).

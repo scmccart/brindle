@@ -177,6 +177,14 @@ Item 12's functions, each with `#[test]`s in its own module:
 
 `launch_hosts` and `eager_hosts` already have tests. What is left in `Workspace` and `main.rs` is spawning work and applying the results.
 
+### 10. The core reads a failing client before dropping it
+
+Found while verifying (8.1). `Core::flush_client` drops a client as soon as a write to it fails, and a `DETACH` already in that client's pipe is never handled: `client_gone` keeps the owner of a `detach` session, so the session lists `owned`, and the next launch within 5 minutes doesn't sweep it. Brindle's quit has this shape whenever the core has output queued for its connection.
+
+On a failed write, the core reads what the client sent, up to a limit, and handles those frames before `client_gone`. This is the holder's `flush_core` (`DEAD_CORE_READ_LIMIT`), applied to clients. Frames that would answer the client are dropped, since the client is gone. Alternatives considered:
+- Giving `DETACH` a reply, and having Brindle wait for it on quit: a protocol change, and quit would wait on the core.
+- Only a barrier in the test: it hides the bug.
+
 ## Risks / Trade-offs
 
 - [A `CLOSE` given up after 5 minutes leaves a `detach` program running on the host, still owned. A later launch's sweep reopens it after the 5-minute owner grace, though the user closed it.] → The log names the sessions, and the palette can kill them. Open question 1's alternative B fixes this if it turns out to matter.
