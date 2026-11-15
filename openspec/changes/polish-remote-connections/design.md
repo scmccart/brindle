@@ -151,23 +151,19 @@ It has three operations: an answer arrives, a session is killed, and a view is b
 
 `attach_swept` and `attach_detached_here` both call it. `Workspace` passes the profile name of the first tab on the endpoint, which is the only lookup that needs GPUI. `reattach::swept_tabs(listed, skip, host, config, first_tab_profile)` joins `sweep` with this choice, so `attach_swept` only inserts tabs. This is decided question 4, which keeps today's behaviour, now specified.
 
-### 8. The label column fits its widest label
+### 8. The profile editor's rows share one height increment
 
-First, confirm the wrap. Capture the profile editor of an ssh profile in `settings-editor-connect-at-launch`:
-- on Linux under `scripts/with-xvfb`, with fontconfig's default UI font;
-- on Windows, with Segoe UI.
+The user asked on 2026-11-15 for a standard height for the profile editor's fields. It replaces the earlier plan, which only made the label column fit. On Windows no label wraps (the user's check), so that plan was not needed there.
 
-If no label wraps on either platform, the item ends there, with the captures as evidence.
-
-If a label wraps:
-- The column's width becomes the widest label's shaped width at the dialog's text size, through `window.text_system()`. It is measured when the editor opens and again when the root text size changes, not every frame.
-- Labels are also `whitespace_nowrap`.
-- The error line's indent (`pl(128)`) becomes the column's width plus the row's gap.
+- `brindle-ui` gets one increment, `FIELD_STEP` (18 px), half of `Input`'s 36 px height (`h_9`). `Input` is defined in terms of it, so the two can't drift apart.
+- Every profile editor row's control line is `2 × FIELD_STEP` tall, with its control centred: text fields, choices, the "Connect at launch" switch and the "Default" checkbox alike. An error line beneath a row takes one more `FIELD_STEP`, with its text centred in it, so the rows below it move by a whole increment.
+- The gap between rows stays as it is (`gap_1`); the increment governs rows, not the space between them.
+- Label wrap: Linux's capture (`settings-editor-connect-at-launch`) is still checked. If a label wraps there, the label column's width becomes the widest label's shaped width at the dialog's text size, measured when the editor opens, labels become `whitespace_nowrap`, and the error line's indent follows the column.
 
 Alternatives considered:
-- A wider fixed column: it breaks with the next font or a longer label.
-- A shorter label: the spec, the dump and the e2e case pin "Connect at launch".
-- `whitespace_nowrap` alone: labels of different widths would misalign the controls.
+- Padding only the switch and checkbox rows to 36 px: it fixes today's two rows but leaves the next control to drift again, and error lines would still move the rows below by odd amounts.
+- An increment of a full 36 px: an error line would add a whole text field's height of mostly empty space.
+- A height for every control in `brindle-ui` (checkbox, switch): they are drawn at their own sizes elsewhere (the theme list, the gallery), and only the editor's rows need to line up.
 
 ### 9. Pure seams for the wiring
 

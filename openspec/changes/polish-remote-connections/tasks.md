@@ -149,21 +149,23 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   No new e2e case: the dump doesn't show a tab's profile, and the choice is the pure function's. `remote-ssh-connect-at-launch` keeps passing.
 - [x] 6.2 Update CLAUDE.md's "Reattach" bullet and the doc comments of `attach_swept`, `attach_detached_here` and `profile_on` to the one rule. Verify that `grep -rn "a restored one, for a launch" src` finds nothing.
 
-## 7. The profile editor's label column (item 11)
+## 7. The profile editor's rows (item 11)
 
-- [ ] 7.1 Confirm the wrap.
+- [ ] 7.1 Confirm the label wrap.
   - **Linux:** extend `settings-editor-connect-at-launch` with a window capture of an ssh profile's editor, saved in the case directory, and run it with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- settings-editor-connect-at-launch`.
-  - **Windows:** the suite can't capture there. Hand the user `scripts/run-throwaway.ps1 -Config <file>` with an ssh profile, and ask whether "Connect at launch" wraps.
+  - **Windows:** the user ran `scripts/run-throwaway.ps1` with an ssh profile on 2026-11-15: no label wraps, but the "Connect at launch" row is shorter than the text-field rows, which led to 7.2.
 
-  Verify: record here, from both checks, whether any label wraps.
-- [ ] 7.2 If a label wraps on either platform, size the label column to the widest label at the dialog's text size, make labels `whitespace_nowrap`, and indent errors to match (design decision 8).
+  Verify: record here, from both checks, whether any label wraps. If one wraps on Linux, also size the label column to the widest label (design decision 8) as part of 7.2.
+- [ ] 7.2 Lay the profile editor's rows out on one height increment (design decision 8):
+  - add `FIELD_STEP` (18 px) to `brindle-ui`, and define `Input`'s height as `2 × FIELD_STEP`;
+  - give every profile editor row's control line a height of `2 × FIELD_STEP`, its control centred;
+  - give an error line one `FIELD_STEP`, its text centred.
 
   Verify:
-  - `settings-editor-connect-at-launch` checks its capture: the label column's text in the "Connect at launch" row forms a single line;
-  - the user's Windows check again;
-  - `cargo test -p brindle settings_dialog`.
-
-  If no label wraps, mark this task done as not needed, citing 7.1.
+  - a pure helper for a row's height in increments (control line, plus an error line when there is one), with a unit test in `profiles.rs`, and `cargo test -p brindle settings_dialog`;
+  - `cargo test -p brindle-ui`;
+  - `settings-editor-connect-at-launch`'s capture on Linux: the "Connect at launch" row's switch is centred in a 36 px band, the same as the text field rows above it (looked at by eye, recorded here);
+  - the user's Windows check again, with `scripts/run-throwaway.ps1`.
 
 ## 8. Platform checks
 

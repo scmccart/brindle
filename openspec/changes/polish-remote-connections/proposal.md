@@ -64,9 +64,9 @@ Each item says what happens at HEAD (after `terminal-server-remote`) and what ch
 
 ### Settings
 
-11. **"Connect at launch" stays on one line.**
-    - **Now:** the profile editor's labels sit in a fixed 120 px column (`render_profile_editor`). "Connect at launch" is the longest label, and at the dialog's `text_sm` it may wrap, depending on the platform's UI font. This hasn't been confirmed.
-    - **Change:** confirm it with window captures on Linux and Windows. If it wraps, size the label column to the widest label at the dialog's text size, so no label wraps. The label text stays as it is, since the spec, the dump and `settings-editor-connect-at-launch` all pin it.
+11. **The profile editor's rows share one height.**
+    - **Now:** each row is as tall as its control. A text field or choice is 36 px, while the "Connect at launch" switch and the "Default" checkbox are only as tall as their note, so those rows look squeezed beside the others. The labels sit in a fixed 120 px column, and on Windows (Segoe UI) "Connect at launch", the longest, doesn't wrap (the user checked on 2026-11-15).
+    - **Change:** the editor lays its rows out on one height increment, half a text field's height (18 px). Every row's control line is two increments, whatever its control, and an error line beneath adds one. Linux's capture confirms that no label wraps there either. If one does, the label column is sized to the widest label as well.
 
 ### Tests
 
@@ -117,7 +117,7 @@ Items 3, 11 and 12 change no requirement: they are a log line, a layout fix and 
 - `remote-agent/src/server/relay.rs`: `decide_scope` and `start_core`'s log line.
 - `ui/src/components/command.rs`: replacing the items while keeping a highlight. `src/picker.rs`: the sessions palette's state, and the highlight in the `--- palette` dump.
 - `src/workspace.rs`, `src/main.rs` and `src/reattach.rs`: the palette and sweep wiring, and its seams. `src/remote/hosts.rs`: applying a batch of reports.
-- `src/settings_dialog/profiles.rs`: the label column.
+- `src/settings_dialog/profiles.rs`: the rows' height (and the label column, if a label wraps on Linux). `ui/`: the height increment, beside the `Input`'s height.
 - Tests:
   - unit tests in the files above;
   - the e2e cases `remote-offline`, `remote-ssh-network`, `remote-container-exec`, `settings-editor-connect-at-launch` and the e2e harness's palette parser;
