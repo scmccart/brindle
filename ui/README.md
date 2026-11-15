@@ -150,7 +150,14 @@ rule, not a convenience.
   - entities the owner creates, keeps and subscribes to: `Select`
     (`SelectEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`
-    (`TextInputEvent::Changed`). `Popover` is a `RenderOnce` whose open state
+    (`TextInputEvent::Changed`). `Command::set_groups(groups, keep, cx)`
+    replaces the items and leaves the filter text alone: with `keep: None`
+    the first enabled match is highlighted and the list returns to the top,
+    and with `keep: Some(ix)`, an index across the new groups, that item
+    stays highlighted while it matches and is enabled (else the first enabled
+    match is) and the list keeps its scroll offset, moving only as far as the
+    highlighted row needs to be in view. `CommandRows::build` takes the same
+    `keep`. The owner maps its own identities to the index. `Popover` is a `RenderOnce` whose open state
     lives in keyed state; its trigger closure wires `PopoverTrigger::on_click`
     into the trigger's own click.
     - Menus: `Menu` is the content both openers show, a list of `MenuEntry`

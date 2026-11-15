@@ -197,7 +197,7 @@ impl Palette {
         if let Mode::List(list) = &mut self.mode {
             list.command.update(cx, |command, cx| {
                 command.set_empty_message(empty, cx);
-                command.set_groups(command_groups(&groups), cx);
+                command.set_groups(command_groups(&groups), None, cx);
             });
             list.groups = groups;
         }
@@ -536,7 +536,7 @@ mod tests {
         let expected = [("this machine", 2), ("this machine", 1), ("B9", 7), ("A8", 2), ("A8", 1), ("C7", 1)];
         assert_eq!(targets, expected.map(|(host, id)| (host.to_string(), id)));
         assert_eq!(text(&palette.groups[1].rows[0].detail), Some("5m ago"));
-        let rows = CommandRows::build(&command_groups(&palette.groups), "");
+        let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
         assert_eq!(rows.highlighted_item(), Some(0), "the newest local session");
     }
 
@@ -578,7 +578,7 @@ mod tests {
         assert!(palette.rows.iter().all(|row| row.session().is_none()), "no row's actions reach a connection");
         assert_eq!(palette.empty, None, "the command list has rows, so its message wouldn't show");
         assert!(palette.groups.iter().flat_map(|group| &group.rows).all(|row| row.disabled));
-        let rows = CommandRows::build(&command_groups(&palette.groups), "");
+        let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
         assert_eq!(rows.highlighted_item(), None, "nothing to confirm");
 
         // Beside a session the inert row is the endpoint's alone, and the
@@ -587,7 +587,7 @@ mod tests {
         let palette = session_palette(&listed, &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["B9"]), (Some("A8"), vec!["build"])]);
         assert_eq!(palette.rows[0], SessionRow::Inert);
-        let rows = CommandRows::build(&command_groups(&palette.groups), "");
+        let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
         assert_eq!(rows.highlighted_item(), Some(1));
         assert_eq!(palette.rows[1].session().map(|(host, info)| (host.clone(), info.session)), Some((a8(), 4)));
     }

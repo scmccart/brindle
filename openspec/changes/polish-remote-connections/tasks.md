@@ -83,12 +83,13 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 4. The command list keeps a named highlight (item 7, `brindle-ui`)
 
-- [ ] 4.1 Let `CommandRows::build` take an item to highlight, falling back to the first enabled match, and let `Command::set_groups` take it. Keep the list's scroll offset while the kept row is in view (design decision 5).
+- [x] 4.1 Let `CommandRows::build` take an item to highlight, falling back to the first enabled match, and let `Command::set_groups` take it. Keep the list's scroll offset while the kept row is in view (design decision 5).
 
   Verify:
   - `cargo test -p brindle-ui command`: the kept item stays highlighted; a filtered-out or disabled one falls back to the first enabled match; the filter text is unchanged;
   - the gallery's `-- --check` gains the `ui-components` scenarios "Items replaced" and "Named item filtered out". It opens a window: run it under `scripts/with-xvfb` on Linux, or ask first.
-- [ ] 4.2 Document the parameter in `ui/README.md`'s Command entry and on the method. Verify `cargo doc -p brindle-ui --no-deps` builds without warnings.
+    - The gallery check is built here but not run; it runs under `scripts/with-xvfb` on Linux in 8.2.
+- [x] 4.2 Document the parameter in `ui/README.md`'s Command entry and on the method. Verify `cargo doc -p brindle-ui --no-deps` builds without warnings.
 
 ## 5. The sessions palette (items 7, 8 and 9)
 
