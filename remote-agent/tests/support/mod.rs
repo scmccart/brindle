@@ -371,17 +371,18 @@ impl TestCore {
         self.send(ToHolder::Hangup(SessionRef { session }));
     }
 
-    /// Hangs `session` up and waits for its `EXITED`, whatever the status.
-    ///
-    /// For a program blocked reading the terminal, the status isn't the
-    /// holder's to decide. Closing the PTY makes the kernel fail that read
-    /// (EIO) and then send `SIGHUP`. Nearly always the signal kills the
-    /// program (no status), but now and then it gets through "the read
-    /// failed, exit 1" first, as `cat` and `sh`'s `read` do. Either way the
-    /// session ended, which is what a hang-up is for.
+    /// Hangs `session` up and waits for its `EXITED`, checking that the
+    /// hang-up ended it ([`assert_hung_up`]).
     pub fn hang_up_and_wait(&mut self, session: SessionId) {
         self.hang_up(session);
-        self.exit_code(session);
+        self.hung_up(session);
+    }
+
+    /// Waits for the `EXITED` of a session that was hung up, checking that
+    /// the hang-up ended it ([`assert_hung_up`]).
+    pub fn hung_up(&mut self, session: SessionId) {
+        let code = self.exit_code(session);
+        assert_hung_up(session, code);
     }
 }
 
@@ -396,6 +397,18 @@ impl Drop for TestCore {
             let _ = reader.join();
         }
     }
+}
+
+/// Checks the exit `code` of a session that was hung up. On Linux the
+/// holder signals before it closes the terminal, so `SIGHUP` ends the
+/// program, which then has no code. On Windows it has the code the
+/// console's end or the holder ended it with.
+#[track_caller]
+pub fn assert_hung_up(session: SessionId, code: Option<i32>) {
+    #[cfg(unix)]
+    assert_eq!(code, None, "session {session} wasn't ended by a signal");
+    #[cfg(windows)]
+    assert!(code.is_some(), "session {session} ended with no code");
 }
 
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -769,11 +782,10 @@ impl TestClient {
     }
 
     /// Waits for the `EXIT` of a session that was hung up (`CLOSE`, `KILL`
-    /// or `STOP`), whatever its status. A program blocked reading the
-    /// terminal, such as `cat`, may exit by itself before the signal kills
-    /// it: see [`TestCore::hang_up_and_wait`].
+    /// or `STOP`), checking that the hang-up ended it ([`assert_hung_up`]).
     pub fn hung_up(&mut self, session: SessionId) {
-        self.exit_code(session);
+        let code = self.exit_code(session);
+        assert_hung_up(session, code);
     }
 
     /// `session`'s output up to its `EXIT`, and its code. Other messages are

@@ -229,19 +229,6 @@ fn say(client: &mut TestClient, session: SessionId, word: &str) {
     client.output_until(session, &programs::echo_of(word));
 }
 
-/// Waits for the `EXIT` of a session that was hung up. On Linux its
-/// status isn't the server's to decide: the signal nearly always ends the
-/// program (no exit code), but one blocked reading the terminal now and then
-/// gets through "the read failed, exit 1" first. On Windows it has the code
-/// the console's end or the holder ended it with.
-fn hung_up(client: &mut TestClient, session: SessionId) {
-    let code = client.exit_code(session);
-    #[cfg(windows)]
-    assert!(code.is_some());
-    #[cfg(unix)]
-    let _ = code;
-}
-
 // 4.1
 
 #[test]
@@ -716,7 +703,7 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
         target: client::KillTarget::Session(first),
     }));
     assert!(matches!(client.reply(100), ToClient::Ok(_)));
-    hung_up(&mut client, first);
+    client.hung_up(first);
     assert!(!alive(first_pid));
 
     client.send(client::ToCore::Kill(client::Kill {
@@ -733,12 +720,12 @@ fn kill_and_stop_end_sessions_whatever_their_policy() {
     let holder = parent(kept_pid).unwrap();
     client.send(client::ToCore::Stop(client::Request { req: 102 }));
     assert!(matches!(client.reply(102), ToClient::Ok(_)));
-    hung_up(&mut client, kept);
+    client.hung_up(kept);
     // It doesn't read the terminal, so on Linux only the signal ends it.
     #[cfg(unix)]
     assert_eq!(client.exit_code(plain), None);
     #[cfg(windows)]
-    hung_up(&mut client, plain);
+    client.hung_up(plain);
     assert!(client.closes());
     assert!(!alive(kept_pid) && !alive(plain_pid));
     assert!(gone(core_pid) && gone(holder));
@@ -1765,7 +1752,7 @@ mod on_windows {
         client.send(client::ToCore::Close(client::SessionRef {
             session: closed,
         }));
-        hung_up(&mut client, closed);
+        client.hung_up(closed);
         assert!(!alive(pid));
 
         // Another client can't use these sessions.
@@ -2132,7 +2119,7 @@ mod on_windows {
         }
         // It has no answer: the next message is the close's.
         client.send(client::ToCore::Close(client::SessionRef { session }));
-        hung_up(&mut client, session);
+        client.hung_up(session);
     }
 
     /// The names in `dir`, sorted.

@@ -410,6 +410,11 @@ pub struct Endpoint {
     /// Where the per-build copies of the helper go, which roles run from.
     #[cfg(windows)]
     copies: PathBuf,
+    /// Whether a core started here may run in a systemd scope of its own
+    /// (`scope::current()` decides). Only the environment's server may:
+    /// tests' stand-in cores never become units.
+    #[cfg(not(windows))]
+    pub(crate) scope: bool,
 }
 
 impl Endpoint {
@@ -439,10 +444,13 @@ impl Endpoint {
             dir,
             #[cfg(windows)]
             copies,
+            #[cfg(not(windows))]
+            scope: true,
         })
     }
 
-    /// The server in `dir`, as if `BRINDLE_SERVER_DIR` had named it.
+    /// The server in `dir`, as if `BRINDLE_SERVER_DIR` had named it. A core
+    /// it starts never runs in a scope, whatever the environment says.
     #[cfg(test)]
     pub fn at(helper: PathBuf, dir: PathBuf) -> Self {
         Self {
@@ -450,6 +458,8 @@ impl Endpoint {
             #[cfg(windows)]
             copies: server_dir::helper_copies(Some(&dir), std::path::Path::new("")),
             dir,
+            #[cfg(not(windows))]
+            scope: false,
         }
     }
 

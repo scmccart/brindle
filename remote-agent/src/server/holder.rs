@@ -832,18 +832,17 @@ impl<L: EventLoop> Holder<L> {
         session.input.extend(data.bytes);
     }
 
-    /// Closes the session's PTY and hangs its process group up, then kills
-    /// it after the grace period. Says whether it exists.
+    /// Hangs the session's process group up, then closes its PTY, and kills
+    /// the group after the grace period. Says whether it exists.
+    ///
+    /// The signal goes first: closing the PTY first fails a pending read of
+    /// the terminal (EIO) before the kernel's own `SIGHUP` arrives, and a
+    /// program blocked reading it, such as `cat`, now and then exits 1 from
+    /// that failed read instead of dying of the signal.
     fn hang_up(&mut self, id: SessionId) -> bool {
         let Some(session) = self.sessions.get_mut(&id) else {
             return false;
         };
-        if session.pty.take().is_some() {
-            let _ = self.ev.deregister(session.token);
-            self.sources.remove(&session.token);
-        }
-        session.input.clear();
-        session.output_closed = true;
         if session.reaped.is_none() {
             let group = session.program.group();
             group.hang_up();
@@ -851,6 +850,12 @@ impl<L: EventLoop> Holder<L> {
                 .push((id, group, Instant::now() + GRACEFUL_SHUTDOWN));
             log!("session {id}: hung up");
         }
+        if session.pty.take().is_some() {
+            let _ = self.ev.deregister(session.token);
+            self.sources.remove(&session.token);
+        }
+        session.input.clear();
+        session.output_closed = true;
         true
     }
 
