@@ -581,7 +581,10 @@ fn transcripts() -> Vec<Transcript> {
                 vec![
                     output(3, b"\x1b[2;1HCPU 3%"),
                     input(3, b"q"),
-                    c(client::ToCore::Detach(client::SessionRef { session: 3 })),
+                    c(client::ToCore::Detach(client::Detach {
+                        session: 3,
+                        layout: None,
+                    })),
                     c(client::ToCore::Attach(client::Attach {
                         req: 2,
                         session: 4,
@@ -592,6 +595,59 @@ fn transcripts() -> Vec<Transcript> {
                 ],
             ]
             .concat(),
+        },
+        Transcript {
+            name: "client-layout",
+            protocol: Protocol::Client,
+            about: "A quitting client detaches a split tab's sessions with the tab's layout; a later client lists it, and attaching clears it.",
+            steps: {
+                let layout = json!({
+                    "v": 1,
+                    "quit": "1f2e-9a",
+                    "index": 0,
+                    "title": "logs",
+                    "zones": {
+                        "split": "horizontal",
+                        "first": {"key": KEY, "active": true},
+                        "second": {"key": "3c0b7e2f5a9d4186b2e7c0f19d3a5b48"},
+                    },
+                });
+                let listed = |session: u32, key: &str, layout: Option<serde_json::Value>| client::SessionInfo {
+                    session,
+                    pid: 5000 + session,
+                    command: "bash -l".into(),
+                    policy: Policy::Detach,
+                    cols: 80,
+                    rows: 24,
+                    key: key.into(),
+                    started: 1_794_000_000,
+                    profile: Some("Shell".into()),
+                    layout,
+                    ..Default::default()
+                };
+                vec![
+                    hello(TOKEN),
+                    welcome(),
+                    c(client::ToCore::Detach(client::Detach { session: 1, layout: Some(layout.clone()) })),
+                    c(client::ToCore::Detach(client::Detach { session: 2, layout: Some(layout.clone()) })),
+                    c(client::ToCore::List(client::Request { req: 1 })),
+                    s(client::ToClient::Sessions(client::Sessions {
+                        req: 1,
+                        sessions: vec![
+                            listed(1, KEY, Some(layout.clone())),
+                            listed(2, "3c0b7e2f5a9d4186b2e7c0f19d3a5b48", Some(layout)),
+                        ],
+                    })),
+                    c(client::ToCore::Attach(client::Attach { req: 2, session: 1, cols: 80, rows: 24 })),
+                    s(client::ToClient::ReplayStart(client::ReplayStart { req: Some(2), session: 1, pid: 5001 })),
+                    s(client::ToClient::ReplayEnd(client::SessionRef { session: 1 })),
+                    c(client::ToCore::List(client::Request { req: 3 })),
+                    s(client::ToClient::Sessions(client::Sessions {
+                        req: 3,
+                        sessions: vec![client::SessionInfo { attached: true, ..listed(1, KEY, None) }],
+                    })),
+                ]
+            },
         },
         Transcript {
             name: "client-reconnect",
@@ -990,7 +1046,10 @@ fn transcripts() -> Vec<Transcript> {
                     pid: 5000,
                     key: KEY.into(),
                 })),
-                c(client::ToCore::Detach(client::SessionRef { session: 7 })),
+                c(client::ToCore::Detach(client::Detach {
+                        session: 7,
+                        layout: None,
+                    })),
                 c(client::ToCore::List(client::Request { req: 2 })),
                 s(client::ToClient::Sessions(client::Sessions {
                     req: 2,
@@ -1020,6 +1079,52 @@ fn transcripts() -> Vec<Transcript> {
             .into_iter()
             .chain(replay(Some(3), 7, 5000, &[&b"\x1bc"[..], b"vim"]))
             .collect(),
+        },
+        Transcript {
+            name: "holder-set-meta-layout",
+            protocol: Protocol::Holder,
+            about: "H1 version 2: a detach's layout is stored in the session's meta, and an attach's SET_META drops it.",
+            steps: vec![
+                ch(holder::ToHolder::Hello(holder::Hello {
+                    min: 1,
+                    max: 2,
+                    core_build: "b1d0".into(),
+                    instance: 1,
+                })),
+                h(holder::ToCore::Welcome(holder::Welcome {
+                    protocol: 2,
+                    build: "b1d0".into(),
+                    pid: 4243,
+                    previous: Previous::None,
+                    sessions: Vec::new(),
+                })),
+                ch(holder::ToHolder::SetMeta(holder::SetMeta {
+                    session: 1,
+                    meta: holder::SessionMeta {
+                        key: KEY.into(),
+                        layout: Some(json!({"v": 1, "zones": {"key": KEY, "active": true}})),
+                        policy: Policy::Detach,
+                        profile: Some("Shell".into()),
+                        scrollback: 10000,
+                        started: 1_794_000_000,
+                        ..Default::default()
+                    }
+                    .to_value(),
+                })),
+                ch(holder::ToHolder::SetMeta(holder::SetMeta {
+                    session: 1,
+                    meta: holder::SessionMeta {
+                        key: KEY.into(),
+                        owner: "b".into(),
+                        policy: Policy::Detach,
+                        profile: Some("Shell".into()),
+                        scrollback: 10000,
+                        started: 1_794_000_000,
+                        ..Default::default()
+                    }
+                    .to_value(),
+                })),
+            ],
         },
         Transcript {
             name: "holder-set-meta",

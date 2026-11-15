@@ -643,6 +643,11 @@ pub struct SessionMeta {
     /// Random, so a session can be told apart from a later one that got
     /// its id from another core; empty for sessions spawned before keys.
     pub key: String,
+    /// The layout its last client detached it with (client `DETACH`'s
+    /// `layout`); none while a client has it attached. Left out when
+    /// none, so a meta without one encodes as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
     /// The owning client's `client_token`; empty for a session explicitly
     /// detached, which no reconnect gets back.
     pub owner: String,
@@ -679,6 +684,7 @@ impl SessionMeta {
             command: parse(object, "command"),
             cwd: parse(object, "cwd"),
             key: parse(object, "key"),
+            layout: object.get("layout").filter(|value| !value.is_null()).cloned(),
             owner: parse(object, "owner"),
             policy: parse(object, "policy"),
             profile: parse(object, "profile"),
@@ -907,6 +913,7 @@ mod tests {
             command: "bash -l".into(),
             cwd: Some("/home/u".into()),
             key: "9f2c41d0".into(),
+            layout: None,
             owner: "4f1c9a".into(),
             policy: crate::client::Policy::Detach,
             profile: Some("Shell".into()),
@@ -918,6 +925,18 @@ mod tests {
             r#"{"command":"bash -l","cwd":"/home/u","key":"9f2c41d0","owner":"4f1c9a","policy":"detach","profile":"Shell","scrollback":10000,"started":1794000000}"#
         );
         assert_eq!(SessionMeta::from_value(&meta.to_value()), meta);
+        // A layout sits in sorted order, kept as the client sent it.
+        let laid_out = SessionMeta {
+            layout: Some(serde_json::json!({"v": 1, "zones": {"key": "9f2c41d0"}})),
+            ..meta.clone()
+        };
+        assert_eq!(
+            serde_json::to_string(&laid_out.to_value()).unwrap(),
+            r#"{"command":"bash -l","cwd":"/home/u","key":"9f2c41d0","layout":{"v":1,"zones":{"key":"9f2c41d0"}},"owner":"4f1c9a","policy":"detach","profile":"Shell","scrollback":10000,"started":1794000000}"#
+        );
+        assert_eq!(SessionMeta::from_value(&laid_out.to_value()), laid_out);
+        let null = serde_json::json!({"layout": null, "owner": "o"});
+        assert_eq!(SessionMeta::from_value(&null).layout, None);
         assert_eq!(SessionMeta::from_value(&samples::meta()).owner, "4f1c9a");
 
         let odd = serde_json::json!({"owner": 7, "policy": "kill", "later": [1]});

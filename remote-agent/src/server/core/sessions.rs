@@ -277,6 +277,7 @@ impl<L: EventLoop> Core<L> {
             command: command_line(&spawn),
             cwd: spawn.cwd.clone(),
             key: session_key(),
+            layout: None,
             owner: self.client_token(client).unwrap_or_default().to_string(),
             policy: spawn.policy,
             profile: spawn.profile.clone(),
@@ -881,12 +882,19 @@ impl<L: EventLoop> Core<L> {
             return self.send_client(client, error(Some(attach.req), Some(id), message));
         }
         log!("session {id}: attached to client {client}");
-        if let Some(token) = self.client_token(client).map(str::to_string) {
-            let session = self.sessions.get_mut(&id).expect("the session");
-            if session.meta.owner != token {
-                session.meta.owner = token;
-                self.store_meta(id);
-            }
+        let token = self.client_token(client).map(str::to_string);
+        let session = self.sessions.get_mut(&id).expect("the session");
+        // An attached session's layout is its client's window: the one it
+        // was detached with no longer says where it is.
+        let mut changed = session.meta.layout.take().is_some();
+        if let Some(token) = token
+            && session.meta.owner != token
+        {
+            session.meta.owner = token;
+            changed = true;
+        }
+        if changed {
+            self.store_meta(id);
         }
         self.replay(
             client,
@@ -898,8 +906,10 @@ impl<L: EventLoop> Core<L> {
 
     /// `DETACH`: the session keeps running with no client, whatever its
     /// policy: a `kill` session becomes `detach`. It also loses its owner,
-    /// so no reconnect gives it back to a client that let it go.
-    pub(super) fn client_detach(&mut self, client: Token, id: SessionId) {
+    /// so no reconnect gives it back to a client that let it go. The layout
+    /// it comes with is kept in its meta, unless it is over `MAX_LAYOUT`.
+    pub(super) fn client_detach(&mut self, client: Token, detach: client::Detach) {
+        let id = detach.session;
         if self.client_session(client, id).is_none() {
             return;
         }
@@ -912,6 +922,17 @@ impl<L: EventLoop> Core<L> {
         };
         session.meta.owner.clear();
         session.meta.policy = Policy::Detach;
+        session.meta.layout = detach.layout.filter(|layout| {
+            let size = serde_json::to_vec(layout).map_or(usize::MAX, |bytes| bytes.len());
+            let kept = size <= client::MAX_LAYOUT;
+            if !kept {
+                log!(
+                    "session {id}: not keeping its {size}-byte layout (over {})",
+                    client::MAX_LAYOUT
+                );
+            }
+            kept
+        });
         self.store_meta(id);
         self.detach_session(id);
         self.checkpoint(id);

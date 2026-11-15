@@ -872,7 +872,12 @@ impl TestClient {
     }
 
     pub fn detach(&mut self, session: SessionId) {
-        self.send(client::ToCore::Detach(client::SessionRef { session }));
+        self.detach_with(session, None);
+    }
+
+    /// `DETACH` with a layout for the core to keep.
+    pub fn detach_with(&mut self, session: SessionId, layout: Option<serde_json::Value>) {
+        self.send(client::ToCore::Detach(client::Detach { session, layout }));
     }
 
     /// The next `PROCESS` for `session` within `timeout`, if one comes.

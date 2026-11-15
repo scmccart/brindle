@@ -12,6 +12,9 @@ path = "src/main.rs"
 [dependencies]
 brindle-remote-protocol = { path = "../remote-protocol" }
 brindle-term-core = { path = "../term-core" }
+# A detach's layout, which the core only measures and keeps; the protocol
+# crate already builds this version.
+serde_json = "1.0.145"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

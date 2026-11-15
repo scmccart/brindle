@@ -2,17 +2,17 @@
 
 ## 1. Protocol fields (`remote-protocol`)
 
-- [ ] 1.1 Add `client::Detach { session, layout: Option<serde_json::Value> }` (`layout` skipped when `None`) and make `ToCore::Detach` carry it instead of `SessionRef`; update the module's message table and field notes. Verify `cargo test -p brindle-remote-protocol` passes with the existing transcript bytes for `DETACH` unchanged.
-- [ ] 1.2 Add `SessionInfo.layout: Option<serde_json::Value>` (skipped when `None`) and document it in the `SESSIONS` row. Verify with the same test run.
-- [ ] 1.3 Add `holder::SessionMeta.layout: Option<serde_json::Value>`, kept in sorted field order and read by `from_value`. Verify by extending the `SessionMeta` round-trip test with a layout, and with a malformed one read as `None`.
-- [ ] 1.4 Extend the client transcript samples (`samples::to_core`, `samples::to_client`) with a `DETACH` carrying a layout and a `SESSIONS` entry with one, and pin their encodings. Verify `cargo test -p brindle-remote-protocol`.
+- [x] 1.1 Add `client::Detach { session, layout: Option<serde_json::Value> }` (`layout` skipped when `None`) and make `ToCore::Detach` carry it instead of `SessionRef`; update the module's message table and field notes. Verify `cargo test -p brindle-remote-protocol` passes with the existing transcript bytes for `DETACH` unchanged.
+- [x] 1.2 Add `SessionInfo.layout: Option<serde_json::Value>` (skipped when `None`) and document it in the `SESSIONS` row. Verify with the same test run.
+- [x] 1.3 Add `holder::SessionMeta.layout: Option<serde_json::Value>`, kept in sorted field order and read by `from_value`. Verify by extending the `SessionMeta` round-trip test with a layout, and with a malformed one read as `None`.
+- [x] 1.4 Extend the client transcript samples (`samples::to_core`, `samples::to_client`) with a `DETACH` carrying a layout and a `SESSIONS` entry with one, and pin their encodings. Verify `cargo test -p brindle-remote-protocol`.
 
 ## 2. Core keeps the layout (`remote-agent`)
 
-- [ ] 2.1 In `core/sessions.rs` `client_detach`, take the `Detach` message: store `layout` in `session.meta` when its encoding is at most `MAX_LAYOUT` (64 KiB), else log and drop it, before the existing `store_meta`. In `client_attach`, clear `meta.layout` and send `store_meta` when it was set, even when the owner is unchanged. Update `clients.rs` dispatch. Verify `cargo build -p brindle-remote-agent`.
-- [ ] 2.2 List `meta.layout` in `core/manage.rs` `client_list`. Verify by the tests in 2.4.
-- [ ] 2.3 Give the test client in `remote-agent/tests/support` a `detach_with(session, layout)`, with `detach` sending `layout: None`. Verify the existing `core.rs` tests still pass.
-- [ ] 2.4 Add tests to `remote-agent/tests/core.rs`, and verify with `cargo test -p brindle-remote-agent --test core`:
+- [x] 2.1 In `core/sessions.rs` `client_detach`, take the `Detach` message: store `layout` in `session.meta` when its encoding is at most `MAX_LAYOUT` (64 KiB), else log and drop it, before the existing `store_meta`. In `client_attach`, clear `meta.layout` and send `store_meta` when it was set, even when the owner is unchanged. Update `clients.rs` dispatch. Verify `cargo build -p brindle-remote-agent`.
+- [x] 2.2 List `meta.layout` in `core/manage.rs` `client_list`. Verify by the tests in 2.4.
+- [x] 2.3 Give the test client in `remote-agent/tests/support` a `detach_with(session, layout)`, with `detach` sending `layout: None`. Verify the existing `core.rs` tests still pass.
+- [x] 2.4 Add tests to `remote-agent/tests/core.rs`, and verify with `cargo test -p brindle-remote-agent --test core`:
   - a layout given with `DETACH` is listed;
   - it survives `kill_core_and_wait_for_another`;
   - an `ATTACH` clears it;

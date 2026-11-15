@@ -17,7 +17,7 @@
 //! |    4 | `RESIZE`        | client → core | `session, cols, rows, cell_w, cell_h`                          |
 //! |    5 | `CLOSE`         | client → core | `session`                                                      |
 //! |    6 | `ATTACH`        | client → core | `req, session, cols, rows`                                     |
-//! |    7 | `DETACH`        | client → core | `session`                                                      |
+//! |    7 | `DETACH`        | client → core | `session, layout?`                                             |
 //! |    8 | `LIST`          | client → core | `req`                                                          |
 //! |    9 | `KILL`          | client → core | `req, target: {"session": id} \| "all"`                        |
 //! |   10 | `STATUS`        | client → core | `req`                                                          |
@@ -30,7 +30,7 @@
 //! |   35 | `EXIT`          | core → client | `session, code?`                                               |
 //! |   36 | `REPLAY_START`  | core → client | `req?, session, pid`                                           |
 //! |   37 | `REPLAY_END`    | core → client | `session`                                                      |
-//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?}]` |
+//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?, layout?}]` |
 //! |   39 | `SERVER_STATUS` | core → client | `req, core_version, core_build, protocols, holder_protocols, pid, uptime_secs, clients, holders` |
 //! |   40 | `OK`            | core → client | `req`                                                          |
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
@@ -60,6 +60,10 @@
 //! - `owned` (a session has an owner and no client is attached) and
 //!   `detached_secs` (seconds since a client was last attached) tell a client
 //!   whether a detached session's owner may still come back.
+//! - `layout` (on `DETACH`, and in `SESSIONS` while the session stays
+//!   detached) is the client's record of where the session sat, which the
+//!   core keeps in the session's meta without reading it, up to
+//!   [`MAX_LAYOUT`] bytes of JSON, and drops when a client attaches it.
 //!
 //! Protocol 2 adds `PROCESS`, sent only on connections that negotiated 2 and
 //! set `process_info`: the session's foreground program name and working
@@ -210,11 +214,24 @@ pub struct Resize {
     pub cell_h: u16,
 }
 
-/// A message that names only a session: `CLOSE`, `DETACH`, `REPLAY_END`.
+/// A message that names only a session: `CLOSE`, `REPLAY_END`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
     pub session: SessionId,
 }
+
+/// `DETACH`: the session keeps running with no client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detach {
+    pub session: SessionId,
+    /// The client's record of where the session sat (its tab), kept for
+    /// whichever client attaches it later. Opaque to the core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
+}
+
+/// The largest `DETACH` layout the core keeps, as encoded JSON.
+pub const MAX_LAYOUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exit {
@@ -315,6 +332,10 @@ pub struct SessionInfo {
     /// Seconds since a client was last attached; 0 when attached or unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub detached_secs: u64,
+    /// The layout its last client detached it with ([`Detach::layout`]);
+    /// none while attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -391,7 +412,7 @@ pub enum ToCore {
     Resize(Resize),
     Close(SessionRef),
     Attach(Attach),
-    Detach(SessionRef),
+    Detach(Detach),
     List(Request),
     Kill(Kill),
     Status(Request),
@@ -567,7 +588,14 @@ pub(crate) mod samples {
                 cols: 100,
                 rows: 30,
             }),
-            ToCore::Detach(SessionRef { session: 3 }),
+            ToCore::Detach(Detach {
+                session: 3,
+                layout: None,
+            }),
+            ToCore::Detach(Detach {
+                session: 4,
+                layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k4", "active": true}})),
+            }),
             ToCore::List(Request { req: 3 }),
             ToCore::Kill(Kill {
                 req: 4,
@@ -654,6 +682,7 @@ pub(crate) mod samples {
                     profile: Some("Shell".into()),
                     owned: true,
                     detached_secs: 42,
+                    layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k3"}})),
                 }],
             }),
             ToClient::ServerStatus(ServerStatus {

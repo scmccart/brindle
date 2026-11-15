@@ -294,7 +294,7 @@ impl<L: EventLoop> Core<L> {
             ToCore::Close(target) => self.client_close(client, target.session),
             ToCore::Reparent(reparent) => self.client_reparent(client, reparent),
             ToCore::Attach(attach) => self.client_attach(client, attach),
-            ToCore::Detach(target) => self.client_detach(client, target.session),
+            ToCore::Detach(detach) => self.client_detach(client, detach),
             ToCore::List(request) => self.client_list(client, request.req),
             ToCore::Kill(kill) => self.client_kill(client, kill),
             ToCore::Status(request) => self.client_status(client, request.req),
