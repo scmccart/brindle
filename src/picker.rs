@@ -592,6 +592,32 @@ mod tests {
         assert_eq!(palette.rows[1].session().map(|(host, info)| (host.clone(), info.session)), Some((a8(), 4)));
     }
 
+    /// An offline row shows its reason's first line, and the reasons a
+    /// failed launch builds put the cause there, the other lines below
+    /// (design decision 1).
+    #[test]
+    fn an_offline_row_shows_the_cause_of_a_multi_line_reason() {
+        let reasons = [
+            // ssh 255: the error, then its warning.
+            (
+                "SSH connection failed: ssh: connect to host A8 port 22: Connection refused\nWarning: Permanently added 'a8'.",
+                "offline: SSH connection failed: ssh: connect to host A8 port 22: Connection refused",
+            ),
+            // A container's launch: the cause, the exit, then the stream's problem.
+            (
+                "the relay didn't start: Error response from daemon: container abc is not running (docker exited with 1)\n\
+                 the stream ended before the frame marker",
+                "offline: the relay didn't start: Error response from daemon: container abc is not running (docker exited with 1)",
+            ),
+        ];
+        for (reason, row) in reasons {
+            let listed = [(a8(), Listing::Offline(reason.into()))];
+            let palette = session_palette(&listed, &[], &config(), 0);
+            let offline = palette.groups.iter().flat_map(|group| &group.rows).find(|row| row.label.as_ref() == "A8").unwrap();
+            assert_eq!(text(&offline.detail), Some(row), "{reason}");
+        }
+    }
+
     /// A killed session's row goes at once, from its endpoint only: the
     /// same key elsewhere stays.
     #[test]

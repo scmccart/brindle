@@ -4,7 +4,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 1. Failure reasons (items 1 and 2)
 
-- [ ] 1.1 Name the cause on a launch failure's first line (design decision 1):
+- [x] 1.1 Name the cause on a launch failure's first line (design decision 1):
   - add one pure helper that picks the last non-empty stderr line;
   - use it in `local::relay::start`'s `Unstarted` message (`the relay didn't start: <cause> (<program> exited with N)`, then the other stderr lines and the stream problem);
   - use it in `client::bootstrap_failure`.
@@ -13,7 +13,9 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - unit tests in `src/remote/local/relay.rs` and `src/remote/client.rs` with multi-line stderr: docker's single line, ssh warnings before its error, and nothing on stderr (today's text unchanged);
   - a `picker.rs` test that an offline endpoint with a multi-line reason shows the cause;
   - `remote-offline` asserting that the stopped container's row contains `is not running` and the refused SSH endpoint's row contains `Connection refused` (`scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- remote-offline` on Linux).
-- [ ] 1.2 Say what ended a relay link (design decision 2):
+
+  Done: the unit and picker tests pass, and `remote-offline`'s assertions are written and build. Its Linux run happens in 8.2.
+- [x] 1.2 Say what ended a relay link (design decision 2):
   - `Connection::read` returns how the stream ended;
   - the watchdog marks the link's `Stamp` expired before ending it;
   - `run_relay` builds the reason from the expiry, `Wire::why()`, or a clean exit, and uses it for the log line, `LinkState::Offline` and failed requests;
@@ -23,7 +25,11 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - `connection.rs` unit tests on the fake transport (whose wire gets a settable `why`): a process that exits with a status and stderr names them; a watchdog end says `nothing read from A8 for …`; a clean exit says `the relay closed the connection`;
   - `a_relay_reports_connecting_connected_offline_and_connected_again`'s pinned `Offline` text updated;
   - `remote-ssh-network` asserting that its `connection to … ended (` log line names `ssh exited with 255` or `nothing read from`, and never says `the terminal server closed the connection`.
-- [ ] 1.3 Describe how a lost link's reason is built in `connection.rs`'s module doc and in CLAUDE.md's "Brindle's client" bullet. Verify that `grep -rn "the terminal server closed the connection" CLAUDE.md src/remote/local` finds it only for the local transport and in its tests.
+
+  Done: the unit tests pass, and `remote-ssh-network`'s assertions are written and build. Its Linux run happens in 8.2.
+- [x] 1.3 Describe how a lost link's reason is built in `connection.rs`'s module doc and in CLAUDE.md's "Brindle's client" bullet. Verify that `grep -rn "the terminal server closed the connection" CLAUDE.md src/remote/local` finds it only for the local transport and in its tests.
+
+  Done: the grep finds CLAUDE.md's bullet (naming the local transport), `Ending::local_text` and its test.
 
 ## 2. The relay's scope note (item 3)
 

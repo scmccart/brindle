@@ -38,6 +38,18 @@
 //!   [`Timings::dead`] (killing its process), and the writer sends a
 //!   heartbeat after [`Timings::heartbeat`] without a write. A frame being
 //!   handled isn't silence.
+//! - **Why a relay link ended:** the reason goes into the log line, the
+//!   offline report ([`LinkState::Offline`]) and the requests that fail with
+//!   the link. [`Connection::read`] says how the stream ended, and
+//!   `relay_link_ended` picks the reason: if the watchdog ended the link
+//!   (it marks the link's `Stamp` expired first, so the reader can tell),
+//!   `nothing read from <name> for <limit>`; else the relay process's own
+//!   account ([`Wire::why`]: `ssh exited with 255: <cause>`, the cause being
+//!   the last line it wrote to stderr), which a killed process never gets
+//!   to give; else `the relay closed the connection`, as a process that
+//!   exited 0 with nothing to say, or `reading from the relay failed: …`.
+//!   Only the local core's socket or pipe says `the terminal server closed
+//!   the connection`.
 //! - **A relay's first connect:** until a link has been up, a failed attempt
 //!   fails new tabs' requests (spawns, lists, kills) with its error, while
 //!   attaches (restored zones) keep waiting through the retries and are told
@@ -320,13 +332,16 @@ struct Slot {
 struct Stamp {
     epoch: Instant,
     deadline: AtomicU64,
+    /// Set by the watchdog before it ends the link, so the reader can tell
+    /// a link that went silent from a process that ended by itself.
+    expired: AtomicBool,
 }
 
 impl Stamp {
     const HELD: u64 = u64::MAX;
 
     fn new(limit: Duration) -> Self {
-        let stamp = Self { epoch: Instant::now(), deadline: AtomicU64::new(0) };
+        let stamp = Self { epoch: Instant::now(), deadline: AtomicU64::new(0), expired: AtomicBool::new(false) };
         stamp.touch(limit);
         stamp
     }
@@ -340,6 +355,15 @@ impl Stamp {
     /// Never dead until the next [`Stamp::touch`].
     fn hold(&self) {
         self.deadline.store(Self::HELD, Ordering::Release);
+    }
+
+    /// The watchdog is ending the link for want of anything read.
+    fn expire(&self) {
+        self.expired.store(true, Ordering::Release);
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -822,7 +846,7 @@ impl Connection {
     fn run_local(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
         let Transport::Local(endpoint) = &self.transport else { unreachable!("a local connection") };
         loop {
-            let reason = self.read(&mut BufReader::with_capacity(READ_BUFFER, reader), None);
+            let reason = self.read(&mut BufReader::with_capacity(READ_BUFFER, reader), None).local_text();
             log::warn!("terminal server connection ended ({reason}); reconnecting");
             self.disconnected(&reason);
             match self.reconnect_local(endpoint) {
@@ -843,12 +867,13 @@ impl Connection {
         self.report_now(LinkState::Connecting);
         loop {
             match self.open_relay(dial.as_ref(), timings) {
-                Ok((mut reader, stamp)) => {
+                Ok((mut reader, stamp, wire)) => {
                     failures = 0;
-                    let reason = self.read(&mut reader, Some((&stamp, timings.dead)));
+                    let ending = self.read(&mut reader, Some((&stamp, timings.dead)));
                     if self.is_dead() {
                         return;
                     }
+                    let reason = relay_link_ended(&name, timings.dead, stamp.expired(), &ending, || wire.why());
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
                     self.lost_link(&name);
@@ -878,7 +903,7 @@ impl Connection {
         &self,
         dial: &dyn Dial,
         timings: &Timings,
-    ) -> Result<(BufReader<Box<dyn Read + Send>>, Arc<Stamp>)> {
+    ) -> Result<(BufReader<Box<dyn Read + Send>>, Arc<Stamp>, Arc<dyn Wire>)> {
         let Link { reader, wire } = dial.launch()?;
         let stamp = Arc::new(Stamp::new(timings.bootstrap));
         self.watch_link(&wire, &stamp);
@@ -890,7 +915,7 @@ impl Connection {
                 stamp.touch(timings.dead);
                 self.watch_changed.notify_all();
                 self.report_now(LinkState::Connected);
-                Ok((reader, stamp))
+                Ok((reader, stamp, wire))
             }
             Err(error) => {
                 self.unwatch_link();
@@ -972,14 +997,15 @@ impl Connection {
         Ok(())
     }
 
-    /// Reads one link until it ends, saying why. On a relay, `liveness`'s
-    /// stamp is held while each frame is handled and then touched.
-    fn read(&self, reader: &mut impl BufRead, liveness: Option<(&Stamp, Duration)>) -> String {
+    /// Reads one link until its stream ends, saying how. On a relay,
+    /// `liveness`'s stamp is held while each frame is handled and then
+    /// touched.
+    fn read(&self, reader: &mut impl BufRead, liveness: Option<(&Stamp, Duration)>) -> Ending {
         loop {
             let frame = match Frame::read_from_or_eof(reader) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => return "the terminal server closed the connection".to_string(),
-                Err(error) => return format!("reading from the terminal server failed: {error}"),
+                Ok(None) => return Ending::Closed,
+                Err(error) => return Ending::Failed(error),
             };
             if let Some((stamp, _)) = liveness {
                 stamp.hold();
@@ -1325,6 +1351,8 @@ impl Connection {
                     log::warn!("nothing from {name} in time: ending the link");
                     watch.link = None;
                     drop(watch);
+                    // Before the end, which is what the reader sees.
+                    stamp.expire();
                     wire.end();
                     watch = self.watch.lock();
                 }
@@ -1560,6 +1588,57 @@ impl Connection {
             }
             None => false,
         }
+    }
+}
+
+/// How a link's stream ended.
+enum Ending {
+    /// The far side closed it.
+    Closed,
+    /// Reading from it failed.
+    Failed(io::Error),
+}
+
+impl Ending {
+    /// The reason for the local core's socket or pipe, which only the core
+    /// can close.
+    fn local_text(&self) -> String {
+        match self {
+            Ending::Closed => "the terminal server closed the connection".to_string(),
+            Ending::Failed(error) => format!("reading from the terminal server failed: {error}"),
+        }
+    }
+}
+
+/// A duration as a reason gives it: whole seconds as `30 s`, else `400 ms`.
+fn span_text(span: Duration) -> String {
+    if span.subsec_nanos() == 0 { format!("{} s", span.as_secs()) } else { format!("{} ms", span.as_millis()) }
+}
+
+/// Why a relay link ended, in the order that tells the most (design
+/// decision 2): the watchdog ended it for silence (`expired`; the process
+/// was killed, so what it says would only report that); else what the relay's
+/// process says (`why`, asked only then, since it may wait for the exit: its
+/// status and what it wrote to stderr); else how the stream ended. A
+/// process that exited 0 with nothing to say is a relay that closed the
+/// connection, as it does when its core connection closes.
+fn relay_link_ended(
+    name: &str,
+    dead: Duration,
+    expired: bool,
+    ending: &Ending,
+    why: impl FnOnce() -> String,
+) -> String {
+    if expired {
+        return format!("nothing read from {name} for {}", span_text(dead));
+    }
+    let why = why();
+    if !why.is_empty() {
+        return why;
+    }
+    match ending {
+        Ending::Closed => "the relay closed the connection".to_string(),
+        Ending::Failed(error) => format!("reading from the relay failed: {error}"),
     }
 }
 
@@ -1822,6 +1901,8 @@ pub(super) mod fake {
     pub struct Out {
         writer: Arc<Mutex<Option<io::PipeWriter>>>,
         cut: Arc<AtomicBool>,
+        /// What the link's [`Wire::why`] says, as a relay's process would.
+        why: Arc<Mutex<String>>,
     }
 
     impl Out {
@@ -1849,6 +1930,11 @@ pub(super) mod fake {
         pub fn is_cut(&self) -> bool {
             self.cut.load(Ordering::Acquire)
         }
+
+        /// Sets what the wire says of why the link ended, before it is cut.
+        pub fn set_why(&self, why: &str) {
+            *self.why.lock() = why.to_string();
+        }
     }
 
     struct PipeWire {
@@ -1866,6 +1952,10 @@ pub(super) mod fake {
 
         fn end(&self) {
             self.far.cut();
+        }
+
+        fn why(&self) -> String {
+            self.far.why.lock().clone()
         }
     }
 
@@ -1895,7 +1985,7 @@ pub(super) mod fake {
     pub fn link(env: &[(&str, &str)], mut answer: impl FnMut(&ToCore, &Out) + Send + 'static) -> (Link, Far) {
         let (client_reader, far_writer) = io::pipe().unwrap();
         let (mut far_reader, client_writer) = io::pipe().unwrap();
-        let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default() };
+        let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default(), why: Arc::default() };
         out.relay(RelayMessage::Host(RelayHost {
             version: "0.0.0".into(),
             build: "relay".into(),
@@ -2697,7 +2787,7 @@ mod tests {
         first.out.cut();
         assert_eq!(
             reported(&reports, id),
-            LinkState::Offline("connection lost: the terminal server closed the connection".into())
+            LinkState::Offline("connection lost: the relay closed the connection".into())
         );
         plan.fail("ssh: connect to host A8 port 22: Connection refused");
         assert_eq!(reported(&reports, id), LinkState::Offline("ssh: connect to host A8 port 22: Connection refused".into()));
@@ -2713,6 +2803,80 @@ mod tests {
         assert_eq!(reported(&reports, id), LinkState::Ended("the connection was no longer used".into()));
         eventually("its relay is ended", || second.out.is_cut());
         assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after the end");
+    }
+
+    /// An eager relay connection that reports its states, with the plan for
+    /// its links, once it reports connecting.
+    fn reporting_relay(name: &str, timings: Timings) -> (Arc<Connection>, Plan, mpsc::Receiver<(u64, LinkState)>) {
+        let (dial, plan) = fake::dialer(name);
+        let (report, reports) = reporting();
+        let connection = Connection::relay_with(dial, "tok", timings, true, Some(report)).unwrap();
+        assert_eq!(reported(&reports, connection.id), LinkState::Connecting);
+        (connection, plan, reports)
+    }
+
+    /// 1.2: a link whose relay process ended says how: its status and what it
+    /// wrote, in the offline report and in the failed requests.
+    #[test]
+    fn a_link_lost_to_its_process_ending_names_its_exit() {
+        let timings = Timings { dead: Duration::from_secs(30), ..fake::quick() };
+        let (connection, plan, reports) = reporting_relay("A8", timings);
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        assert_eq!(reported(&reports, connection.id), LinkState::Connected);
+        first.hello();
+        // A request written on the link, which the loss fails.
+        let (sink, _tab) = fake::sink();
+        let spawning = connection.clone();
+        let spawn = in_background(move || spawning.spawn(spawn_request(&[]), sink, None).map(|r| r.id()));
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+
+        let why = "ssh exited with 255: Timeout, server A8 not responding.";
+        first.out.set_why(why);
+        first.out.cut();
+        assert_eq!(reported(&reports, connection.id), LinkState::Offline(format!("connection lost: {why}")));
+        assert_eq!(spawn.join().unwrap().unwrap_err().to_string(), format!("the terminal server went away ({why})"));
+    }
+
+    /// 1.2: a link the watchdog ended for silence says so, not what the
+    /// kill it caused looks like (the wire's `why` is ignored).
+    #[test]
+    fn a_link_ended_by_the_watchdog_says_nothing_was_read() {
+        let timings = Timings { dead: Duration::from_millis(400), ..fake::quick() };
+        let (connection, plan, reports) = reporting_relay("A8", timings);
+        let (link, first) = fake::link(&[], |_, _| {});
+        // What a killed process would report.
+        first.out.set_why("ssh ended: signal: 9 (SIGKILL)");
+        plan.link(link);
+        assert_eq!(reported(&reports, connection.id), LinkState::Connected);
+        assert_eq!(
+            reported(&reports, connection.id),
+            LinkState::Offline("connection lost: nothing read from A8 for 400 ms".into())
+        );
+        assert!(first.out.is_cut());
+    }
+
+    /// 1.2: how a link's reason is chosen, whichever the order the facts
+    /// come in.
+    #[test]
+    fn a_relay_links_reason_is_the_silence_then_the_process_then_the_stream() {
+        let dead = Duration::from_secs(30);
+        let ending = |ending: &Ending, expired: bool, why: &str| {
+            relay_link_ended("A8", dead, expired, ending, || why.to_string())
+        };
+        let failed = Ending::Failed(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        // Silence wins, and never asks the process (a kill's status).
+        let never = || -> String { panic!("asked the process") };
+        assert_eq!(relay_link_ended("A8", dead, true, &Ending::Closed, never), "nothing read from A8 for 30 s");
+        // The process's own account.
+        assert_eq!(ending(&Ending::Closed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        assert_eq!(ending(&failed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        // Nothing from the process: how the stream ended.
+        assert_eq!(ending(&Ending::Closed, false, ""), "the relay closed the connection");
+        assert_eq!(ending(&failed, false, ""), "reading from the relay failed: reset");
+        // The local core's text is its own.
+        assert_eq!(Ending::Closed.local_text(), "the terminal server closed the connection");
+        assert_eq!(failed.local_text(), "reading from the terminal server failed: reset");
     }
 
     /// 8.2: a connection made eager keeps trying after its first attempt

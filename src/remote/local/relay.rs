@@ -179,18 +179,33 @@ pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
             process.wait_for(EXIT_WAIT)
         });
         let problem = if late { format!("no frame marker within {} s", limit.as_secs()) } else { error.to_string() };
-        let mut message = format!("the relay didn't start: {problem}");
-        if let Some(status) = status {
-            message.push_str(&format!(" ({program} {})", exit_text(status)));
-        }
         let said = kept.text(EXIT_WAIT);
-        if !said.is_empty() {
-            message.push_str(&format!("\n{said}"));
-        }
+        let exit = status.map(|status| format!("{program} {}", exit_text(status)));
+        let message = unstarted_message(&problem, exit.as_deref(), &said);
         return Err(Unstarted { code: status.and_then(|status| status.code()), said, message });
     }
     let wire = Arc::new(ChildWire { stdin: Mutex::new(Some(stdin)), process, stderr: kept, program });
     Ok(Link { reader: Box::new(stdout), wire })
+}
+
+/// What a tab shows for a relay that didn't start. When the process wrote to
+/// stderr, the first line names its cause (the last line it wrote,
+/// [`client::split_cause`]) and how the process ended; the other stderr lines
+/// and then the stream's `problem` follow. With nothing on stderr the problem
+/// is the first line.
+fn unstarted_message(problem: &str, exit: Option<&str>, said: &str) -> String {
+    let ending = exit.map(|exit| format!(" ({exit})")).unwrap_or_default();
+    let Some((cause, rest)) = client::split_cause(said) else {
+        return format!("the relay didn't start: {problem}{ending}");
+    };
+    let mut message = format!("the relay didn't start: {cause}{ending}");
+    if !rest.is_empty() {
+        message.push('\n');
+        message.push_str(&rest);
+    }
+    message.push('\n');
+    message.push_str(problem);
+    message
 }
 
 fn exit_text(status: ExitStatus) -> String {
@@ -345,16 +360,27 @@ impl Wire for ChildWire {
     }
 
     fn why(&self) -> String {
-        let mut why = match self.process.wait_for(EXIT_WAIT) {
-            Some(status) => format!("{} {}", self.program, exit_text(status)),
-            None => String::new(),
-        };
+        let status = self.process.wait_for(EXIT_WAIT);
         let said = self.stderr.text(EXIT_WAIT);
-        if !said.is_empty() {
-            why.push_str(if why.is_empty() { "" } else { ": " });
-            why.push_str(&said);
+        let exit = status.map(|status| format!("{} {}", self.program, exit_text(status)));
+        match client::split_cause(&said) {
+            // A process that exited 0 and wrote nothing has nothing to add
+            // to a stream that ended.
+            None if status.is_some_and(|status| status.success()) => String::new(),
+            None => exit.unwrap_or_default(),
+            // The cause first, as in a launch failure's message.
+            Some((cause, rest)) => {
+                let mut why = match exit {
+                    Some(exit) => format!("{exit}: {cause}"),
+                    None => cause.to_string(),
+                };
+                if !rest.is_empty() {
+                    why.push('\n');
+                    why.push_str(&rest);
+                }
+                why
+            }
         }
-        why
     }
 }
 
@@ -575,6 +601,56 @@ mod tests {
         assert_eq!(error.downcast_ref::<Unstarted>().and_then(|e| e.code), Some(97));
         let missing = start(Command::new("brindle-no-such-program"), Duration::from_secs(5)).err().expect("an error");
         assert!(missing.message.starts_with("can't run brindle-no-such-program"), "{}", missing.message);
+    }
+
+    /// The first line of a tab's message names the cause (design decision
+    /// 1); everything else the process said, and the stream's problem, stays
+    /// below it.
+    #[test]
+    fn a_launch_failures_first_line_is_the_last_thing_the_process_said() {
+        let problem = "the stream ended before the frame marker";
+        let exit = Some("docker exited with 1");
+        // docker: one line.
+        let docker = "Error response from daemon: container abc is not running";
+        assert_eq!(
+            unstarted_message(problem, exit, docker),
+            format!("the relay didn't start: {docker} (docker exited with 1)\n{problem}")
+        );
+        // ssh: its warning, then its error.
+        let ssh = "Warning: Permanently added 'a8' (ED25519).\nssh: connect to host a8 port 22: Connection refused\n";
+        assert_eq!(
+            unstarted_message(problem, Some("ssh exited with 255"), ssh),
+            format!(
+                "the relay didn't start: ssh: connect to host a8 port 22: Connection refused \
+                 (ssh exited with 255)\nWarning: Permanently added 'a8' (ED25519).\n{problem}"
+            )
+        );
+        // Nothing on stderr: today's text.
+        assert_eq!(
+            unstarted_message(problem, exit, ""),
+            format!("the relay didn't start: {problem} (docker exited with 1)")
+        );
+        assert_eq!(unstarted_message("no frame marker within 60 s", None, "  \n"), "the relay didn't start: no frame marker within 60 s");
+    }
+
+    /// A process's `why`: its exit, then the cause, then the other lines; and
+    /// nothing for a process that exited cleanly with nothing to say.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_ends_says_how_its_process_ended() {
+        // A process that writes its marker, runs `script` and exits `code`.
+        let why = |script: &str, code: i32| {
+            let mut command = Command::new("sh");
+            command.args(["-c", &format!("printf '\\000BRINDLE-FRAMES1\\n'; {script}; exit {code}")]);
+            let mut link = start(command, Duration::from_secs(20)).unwrap_or_else(|e| panic!("{e}"));
+            let mut rest = Vec::new();
+            link.reader.read_to_end(&mut rest).ok();
+            link.wire.why()
+        };
+        assert_eq!(why("", 0), "");
+        assert_eq!(why("", 3), "sh exited with 3");
+        assert_eq!(why("echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom");
+        assert_eq!(why("echo warning >&2; echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom\nwarning");
     }
 
     /// A launch whose output ends before it has exited isn't killed for it:

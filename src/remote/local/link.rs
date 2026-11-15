@@ -19,7 +19,8 @@ pub trait Wire: Send + Sync {
     fn end(&self);
     /// Why the link ended, when the far side knows more than the end of the
     /// stream says (a relay process's exit status and what it wrote to
-    /// stderr); empty otherwise.
+    /// stderr, the cause first); empty otherwise, and for a process that
+    /// exited 0 with nothing to say.
     fn why(&self) -> String {
         String::new()
     }

@@ -524,6 +524,17 @@ impl Cut {
             Ok(noticed.then_some(()))
         })?;
         let noticed = cut.elapsed();
+        // The log says what ended the link: ssh's own exit, or the dead-link
+        // limit, and never the local core's wording.
+        let line = log_line(&self.log, &ended).ok_or("the link's end isn't in Brindle's log")?;
+        ensure!(
+            line.contains(&format!("{ended} (")) && !line.contains("the terminal server closed the connection"),
+            "the link ended without a cause of its own: {line:?}"
+        );
+        ensure!(
+            line.contains("ssh exited with 255") || line.contains("nothing read from"),
+            "the link's end doesn't name ssh's exit or the silence: {line:?}"
+        );
         // Brindle retries while the network is down, and fails.
         let failed = format!("can't connect to {}", self.endpoint);
         poll(slow, 30.0, "a reconnect failing", || {
@@ -675,15 +686,17 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(6.0)
         .run()?;
     let palette = &out.dump.palette;
-    for endpoint in [
-        format!("remote@{}", container.name),
-        format!("root@127.0.0.1:{port}"),
+    // Each row's reason names its cause (the row shows its first line).
+    for (endpoint, cause) in [
+        (format!("remote@{}", container.name), "is not running"),
+        (format!("root@127.0.0.1:{port}"), "Connection refused"),
     ] {
         let offline = format!("{endpoint}  offline: ");
-        ensure!(
-            palette.iter().any(|row| row.starts_with(&offline)),
-            "no offline row for {endpoint}: {palette:?}"
-        );
+        let row = palette.iter().find(|row| row.starts_with(&offline));
+        let Some(row) = row else {
+            return Err(format!("no offline row for {endpoint}: {palette:?}").into());
+        };
+        ensure!(row.contains(cause), "{endpoint}'s row doesn't say {cause:?}: {row:?}");
     }
     ensure!(
         !container.running()?,
@@ -1031,6 +1044,15 @@ fn ssh_processes(brindle: u32) -> Vec<u32> {
         .collect();
     pids.sort();
     pids
+}
+
+/// The first line of the log at `path` that contains `text`.
+fn log_line(path: &Path, text: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.contains(text))
+        .map(str::to_string)
 }
 
 /// How many lines of the log at `path` contain `text`.
