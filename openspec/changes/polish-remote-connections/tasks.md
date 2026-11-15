@@ -131,7 +131,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 6. A session's profile on an endpoint (item 10)
 
-- [ ] 6.1 Add `reattach::session_profile` and `reattach::swept_tabs` (design decision 7; decided question 4). Make `attach_swept` and `attach_detached_here` use them, passing the profile name of the first tab on the endpoint; `profile_on` keeps only that lookup.
+- [x] 6.1 Add `reattach::session_profile` and `reattach::swept_tabs` (design decision 7; decided question 4). Make `attach_swept` and `attach_detached_here` use them, passing the profile name of the first tab on the endpoint; `profile_on` keeps only that lookup.
 
   Verify with `reattach.rs` tests:
   - the profile the session started with, when it targets the endpoint;
@@ -142,7 +142,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - `swept_tabs` keeping the sweep's order with each session's profile.
 
   No new e2e case: the dump doesn't show a tab's profile, and the choice is the pure function's. `remote-ssh-connect-at-launch` keeps passing.
-- [ ] 6.2 Update CLAUDE.md's "Reattach" bullet and the doc comments of `attach_swept`, `attach_detached_here` and `profile_on` to the one rule. Verify that `grep -rn "a restored one, for a launch" src` finds nothing.
+- [x] 6.2 Update CLAUDE.md's "Reattach" bullet and the doc comments of `attach_swept`, `attach_detached_here` and `profile_on` to the one rule. Verify that `grep -rn "a restored one, for a launch" src` finds nothing.
 
 ## 7. The profile editor's label column (item 11)
 

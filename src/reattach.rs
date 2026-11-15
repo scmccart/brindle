@@ -45,6 +45,41 @@ pub fn remote_profile(info: &SessionInfo, host: &Host, config: &Config) -> Optio
         .or_else(|| (0..config.profiles.len()).find(on_host))
 }
 
+/// The profile a detached session of `host`'s server opens a tab with, the
+/// one rule for a launch's sweep and the sessions palette (design.md
+/// decision 7). This machine's: [`local_profile`]. A remote endpoint's, the
+/// first of: the profile it was started with, when that targets `host`; the
+/// first profile that targets `host`; `first_tab_profile` (the name of the
+/// profile of the first tab on `host`), when that profile exists; the
+/// default profile. The tab runs on `host` whatever the profile targets.
+pub fn session_profile(info: &SessionInfo, host: &Host, config: &Config, first_tab_profile: Option<&str>) -> usize {
+    match host {
+        Host::Local => local_profile(info, config),
+        Host::Remote(_) => remote_profile(info, host, config)
+            .or_else(|| first_tab_profile.and_then(|name| config.profile_index(name)))
+            .unwrap_or_else(|| config.default_profile_index()),
+    }
+}
+
+/// [`sweep`] joined with [`session_profile`]: the sessions of `host`'s first
+/// listing that a launch opens as tabs, in start order, each with its
+/// profile's index.
+pub fn swept_tabs(
+    listed: Vec<SessionInfo>,
+    skip: &[ServerSession],
+    host: &Host,
+    config: &Config,
+    first_tab_profile: Option<&str>,
+) -> Vec<(SessionInfo, usize)> {
+    sweep(listed, skip)
+        .into_iter()
+        .map(|info| {
+            let index = session_profile(&info, host, config, first_tab_profile);
+            (info, index)
+        })
+        .collect()
+}
+
 /// What a remote endpoint's first listing of the launch attaches as tabs:
 /// the [`sweepable`] sessions not in `skip` (those restored into a zone, or
 /// shown already), in start order.
@@ -301,6 +336,78 @@ mod tests {
             connect_at_launch: false,
         });
         assert_eq!(remote_profile(&started_with(Some("A8")), &c3, &config), None);
+    }
+
+    fn ssh(host: &str) -> Host {
+        Host::Remote(crate::config::RemoteTarget::Ssh {
+            host: host.into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        })
+    }
+
+    /// 6.1: one rule for a session's profile on an endpoint.
+    #[test]
+    fn a_session_on_an_endpoint_takes_the_first_profile_that_exists() {
+        let config = profiles();
+        let a8 = Host::of(&config.profiles[2]);
+        // The profile it started with, when it targets the endpoint.
+        assert_eq!(session_profile(&started_with(Some("A8")), &a8, &config, Some("Work")), 2);
+        // Else the first profile that targets the endpoint, whatever the first tab's.
+        assert_eq!(session_profile(&started_with(Some("B9")), &a8, &config, Some("Work")), 1);
+        assert_eq!(session_profile(&started_with(None), &a8, &config, None), 1);
+        // No profile targets the endpoint: the first tab's profile ...
+        let c3 = ssh("C3");
+        assert_eq!(session_profile(&started_with(Some("A8")), &c3, &config, Some("B9")), 3);
+        assert_eq!(session_profile(&started_with(None), &c3, &config, Some("Work")), 4);
+        // ... else the default, when that tab's profile is gone or there is no tab.
+        assert_eq!(session_profile(&started_with(None), &c3, &config, Some("Gone")), 0);
+        assert_eq!(session_profile(&started_with(None), &c3, &config, None), 0);
+    }
+
+    /// 6.1: a local session ignores the first tab's profile.
+    #[test]
+    fn a_local_session_is_unchanged_by_the_first_tab_profile() {
+        let config = profiles();
+        for first in [None, Some("B9"), Some("Gone")] {
+            assert_eq!(session_profile(&started_with(Some("Work")), &Host::Local, &config, first), 4);
+            assert_eq!(session_profile(&started_with(Some("A8")), &Host::Local, &config, first), 0);
+            assert_eq!(session_profile(&started_with(None), &Host::Local, &config, first), 0);
+        }
+    }
+
+    /// 6.1: the swept tabs keep the sweep's order and skips, each with the
+    /// profile the one rule gives it.
+    #[test]
+    fn swept_tabs_keep_the_sweeps_order_with_each_sessions_profile() {
+        let config = profiles();
+        let a8 = Host::of(&config.profiles[2]);
+        let with = |session, key: &str, started, profile: Option<&str>| SessionInfo {
+            profile: profile.map(Into::into),
+            ..info(session, key, started)
+        };
+        let listed = vec![
+            with(3, "c", 30, Some("A8")),
+            with(1, "a", 10, Some("Work")),
+            with(2, "b", 20, None),
+            with(4, "d", 5, Some("htop on A8")),
+        ];
+        let skip = [ServerSession { id: 4, key: "d".into() }];
+        let tabs: Vec<(u32, usize)> = swept_tabs(listed.clone(), &skip, &a8, &config, Some("B9"))
+            .into_iter()
+            .map(|(info, index)| (info.session, index))
+            .collect();
+        assert_eq!(tabs, [(1, 1), (2, 1), (3, 2)]);
+        // Where no profile targets the endpoint, the first tab's profile.
+        let tabs: Vec<(u32, usize)> = swept_tabs(listed, &[], &ssh("C3"), &config, Some("B9"))
+            .into_iter()
+            .map(|(info, index)| (info.session, index))
+            .collect();
+        assert_eq!(tabs, [(4, 3), (1, 3), (2, 3), (3, 3)]);
+        assert!(swept_tabs(Vec::new(), &[], &a8, &config, None).is_empty());
     }
 
     /// 7.3: a session of this machine's server opens with the profile it

@@ -750,27 +750,25 @@ impl Workspace {
     }
 
     /// Opens a tab at the end for each session `host`'s first listing of the
-    /// launch has that the launch attaches ([`crate::reattach::sweep`]):
+    /// launch has that the launch attaches ([`crate::reattach::swept_tabs`]):
     /// not restored into a zone, not shown here already, and with no owner
-    /// that may come back. Each takes the profile it was started with when
-    /// that targets `host`, else the first that does; when none does, the
-    /// profile of the restored tab that brought the launch to `host` (or
-    /// the default one), on `host` all the same. The active tab stays the
-    /// same, and the replays raise no bells or notifications.
+    /// that may come back. Each takes the profile
+    /// [`crate::reattach::session_profile`] gives it, on `host` whatever that
+    /// profile targets. The active tab stays the same, and the replays raise
+    /// no bells or notifications.
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach_swept(&mut self, host: Host, listed: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let mut skip: Vec<session::ServerSession> =
             self.restored_sessions.iter().filter(|(on, _)| *on == host).map(|(_, s)| s.clone()).collect();
         skip.extend(self.sessions_on(&host, cx));
-        let sessions = crate::reattach::sweep(listed, &skip);
-        if sessions.is_empty() {
+        let first = self.profile_on(&host);
+        let tabs = crate::reattach::swept_tabs(listed, &skip, &host, &config, first.as_deref());
+        if tabs.is_empty() {
             return;
         }
-        log::info!("attaching {} detached session(s) on {}", sessions.len(), host.name());
-        let fallback = self.profile_on(&host, &config);
-        for info in sessions {
-            let index = crate::reattach::remote_profile(&info, &host, &config).unwrap_or(fallback);
+        log::info!("attaching {} detached session(s) on {}", tabs.len(), host.name());
+        for (info, index) in tabs {
             let profile = config.profiles[index].clone();
             let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
             let activate = self.tabs.is_empty();
@@ -778,16 +776,11 @@ impl Workspace {
         }
     }
 
-    /// The profile a session of `host` opens with when no profile targets
-    /// `host`: that of a tab on `host` (a restored one, for a launch), or
-    /// the default one.
+    /// The name of the profile of the first tab on `host`, the one lookup
+    /// [`crate::reattach::session_profile`] needs from the window.
     #[cfg(any(target_os = "linux", windows))]
-    fn profile_on(&self, host: &Host, config: &Config) -> usize {
-        self.tabs
-            .iter()
-            .find(|tab| tab.host == *host)
-            .and_then(|tab| config.profile_index(&tab.profile.name))
-            .unwrap_or_else(|| config.default_profile_index())
+    fn profile_on(&self, host: &Host) -> Option<String> {
+        self.tabs.iter().find(|tab| tab.host == *host).map(|tab| tab.profile.name.clone())
     }
 
     /// The sessions this window's tabs on `host` show (or are attaching).
@@ -1447,19 +1440,14 @@ impl Workspace {
     }
 
     /// Attaches a detached session of `host` into a new tab after the
-    /// active one, on `host`. A local one takes the profile it was started
-    /// with (unless that is gone or remote: the default); a remote one the
-    /// profile it was started with when that targets `host`, else the first
-    /// that does (else a tab's on `host`, or the default).
+    /// active one, on `host`, with the profile
+    /// [`crate::reattach::session_profile`] gives it.
     fn attach_detached_here(&mut self, host: Host, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            let index = match &host {
-                Host::Local => crate::reattach::local_profile(&info, &config),
-                Host::Remote(_) => crate::reattach::remote_profile(&info, &host, &config)
-                    .unwrap_or_else(|| self.profile_on(&host, &config)),
-            };
+            let first = self.profile_on(&host);
+            let index = crate::reattach::session_profile(&info, &host, &config, first.as_deref());
             let profile = config.profiles[index].clone();
             let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
             self.insert_terminal_tab(profile, host, terminal, true, window, cx);
