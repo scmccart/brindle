@@ -160,11 +160,15 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 7. The profile editor's rows (item 11)
 
-- [ ] 7.1 Confirm the label wrap.
+- [x] 7.1 Confirm the label wrap.
   - **Linux:** extend `settings-editor-connect-at-launch` with a window capture of an ssh profile's editor, saved in the case directory, and run it with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- settings-editor-connect-at-launch`.
   - **Windows:** the user ran `scripts/run-throwaway.ps1` with an ssh profile on 2026-11-15: no label wraps, but the "Connect at launch" row is shorter than the text-field rows, which led to 7.2.
 
   Verify: record here, from both checks, whether any label wraps. If one wraps on Linux, also size the label column to the widest label (design decision 8) as part of 7.2.
+
+  Results: no label wraps on either platform.
+  - Windows (the user, 2026-11-15): no wrap; the short switch row led to 7.2.
+  - Linux (`ssh-editor.ppm` at 31e8b33, under `scripts/with-xvfb`): every label on one line. "Connect at launch" ends about 13 px before its switch.
 - [x] 7.2 Give the profile editor's rows one control height, as shadcn's horizontal `Field` (design decision 8):
   - `brindle-ui`'s `FIELD_HEIGHT` (36 px, shadcn's `h-9`), which `Input` uses; no `FIELD_STEP`;
   - every profile editor row's control line at least `FIELD_HEIGHT` tall, its control centred;
@@ -186,12 +190,25 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - Full Windows e2e: 36 passed, 0 failed, 3 skipped (`local-server-elevated`, not elevated; `remote-container-exec` and `remote-ssh-container`, no Linux helper). `local-server-palette` and `local-server-palette-highlight` passed.
   - Gallery `--check`: 100 ok, including the two command-list scenarios from 4.1.
   - After 3.6 (58ab4f9): `cargo test -p brindle-remote-agent` all ok; the owner test 30/30 alone and 30/30 under load.
-- [ ] 8.2 Ask the Linux machine's session to run, at the pushed branch:
+- [x] 8.2 Ask the Linux machine's session to run, at the pushed branch:
   - `cargo test --locked` and `cargo build --release --locked`;
   - `cargo build -p brindle-remote-agent`, then `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 BRINDLE_REMOTE_E2E_REQUIRED=1 cargo test --test e2e`, and `-- remote` three times. `BRINDLE_REMOTE_E2E_REQUIRED=1` stops a missing Docker daemon from passing as a skip;
   - `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client`, after rebuilding the static helper with README's Docker command.
 
   Record the results here. The only warning allowed is the known `proc-macro-error2` / `num-bigint-dig` future-incompatibility note.
+
+  Results on Linux (2026-11-15):
+  - At 07340d1: `cargo test --locked --no-fail-fast` 871 passed, 0 failed, 3 ignored. The first run, at 02eaa06, had found two Unix-only tests broken by this branch (the relay exit test's shell script, and the relay test still expecting the login warning under `BRINDLE_NO_SCOPE=1`). 07340d1 fixed both.
+  - At 02eaa06:
+    - `cargo build --release --locked` ok.
+    - Full e2e (`BRINDLE_E2E_SLOW=2`, `BRINDLE_REMOTE_E2E_REQUIRED=1`): 121 passed, 0 failed, 0 skipped. That includes `remote-offline`, `remote-ssh-network`, `remote-container-exec`, `remote-ssh-restored-closed`, `remote-palette-slow-host` (44 s), `local-server-palette-highlight`, `local-server-palette` and `settings-editor-connect-at-launch`.
+    - `-- remote` three times: 9/9 each.
+    - The Docker transport test (`remote::client`, static helper rebuilt): 21 passed.
+    - Gallery `--check` under xvfb: 49 ok, 0 failed, 51 skipped (Windows-only), including both 4.1 scenarios.
+  - At 31e8b33: `settings-editor-connect-at-launch` ok. Its capture shows the "Connect at launch" row as tall as "Host" (40 px pitch, 36 px controls), with its switch centred.
+  - At 2f71fed: the 3.6 test logged `detached by` before every `write failed: Broken pipe` in all 20 attempts, so the failed-write path is exercised on Linux too.
+  - Warnings: only the known `proc-macro-error2` / `num-bigint-dig` note.
+
 
 ## Workflow follow-up
 
