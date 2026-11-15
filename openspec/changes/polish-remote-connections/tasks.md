@@ -93,7 +93,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 5. The sessions palette (items 7, 8 and 9)
 
-- [ ] 5.1 Give each `SessionRow` a key, and move the palette's state into a pure model in `picker.rs` (design decision 6). The model holds:
+- [x] 5.1 Give each `SessionRow` a key, and move the palette's state into a pure model in `picker.rs` (design decision 6). The model holds:
   - each endpoint's listing or that it is pending, with its round;
   - the killed sessions;
   - the highlighted row's key;
@@ -107,8 +107,10 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - the note's position and when it shows. Update `connecting_and_offline_endpoints_are_rows_that_do_nothing` for the new order.
 
   Also verify `remote-offline` asserting that the "No detached sessions" row comes after both offline rows.
-- [ ] 5.2 Add `highlighted=N|none` to the `--- palette list` dump line. Update the e2e harness's parser in `tests/e2e/brindle.rs` and its self-test, and CLAUDE.md's description of the dump. Verify `BRINDLE_E2E=1 cargo test --test e2e -- --self-test` and `cargo test -p brindle picker`.
-- [ ] 5.3 Keep the model in `PaletteKind::Sessions`, apply each endpoint's answer as it arrives instead of after `join_all`, and keep the highlight through refreshes and kills. Add the pure seams `palette_endpoints` and `listing_from`, and have `listing_of` call `listing_from`.
+  Done: the model tests and the updated `connecting_and_offline_endpoints_are_rows_that_do_nothing` pass, and `remote-offline`'s assertion (the note after both offline rows) is written and builds. Its Linux run happens in 8.2.
+- [x] 5.2 Add `highlighted=N|none` to the `--- palette list` dump line. Update the e2e harness's parser in `tests/e2e/brindle.rs` and its self-test, and CLAUDE.md's description of the dump. Verify `BRINDLE_E2E=1 cargo test --test e2e -- --self-test` and `cargo test -p brindle picker`.
+  Done: `Dump::palette_highlighted` reads it, and the harness self-test and `cargo test -p brindle picker` pass.
+- [x] 5.3 Keep the model in `PaletteKind::Sessions`, apply each endpoint's answer as it arrives instead of after `join_all`, and keep the highlight through refreshes and kills. Add the pure seams `palette_endpoints` and `listing_from`, and have `listing_of` call `listing_from`.
 
   Verify:
   - unit tests for both seams in `workspace.rs`;
@@ -119,7 +121,8 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
     Each run takes one dump, since a dump ends the run.
   - `local-server-palette` keeps passing.
-- [ ] 5.4 Open the palette when every endpoint has answered or after `OPEN_GRACE` (about 250 ms), whichever comes first (decided question 3).
+  Done: the unit tests for `palette_endpoints` and `listing_from` pass. `local-server-palette-highlight` is written, builds, and is in both platforms' lists; it opens windows, so its run happens in 8.1 (Windows, with the user's go-ahead) and 8.2 (Linux), as does `local-server-palette`'s.
+- [x] 5.4 Open the palette when every endpoint has answered or after `OPEN_GRACE` (about 250 ms), whichever comes first (decided question 3).
 
   Verify:
   - model tests: a palette whose endpoints all answer within the grace opens complete; otherwise it opens with pending rows; the note never shows while an endpoint is pending;
@@ -127,7 +130,9 @@ The tasks follow the answers to design.md's decided questions (each the recommen
     - an SSH profile connects at launch to the fixture, and the container is paused (`docker pause`) once Brindle is connected;
     - `attach_session`, with a dump within 1 s of it;
     - the dump shows this machine's rows and the endpoint's `listing sessions…` row, before `LIST_LIMIT` (2 s) passes.
-- [ ] 5.5 Update CLAUDE.md's `picker.rs` and "Reattach" bullets ("concurrently… within `LIST_LIMIT`") and the doc comments of `refresh_sessions_palette` and `session_palette`. Verify that `grep -rn "OPEN_GRACE" CLAUDE.md src/workspace.rs` finds the CLAUDE.md bullet and `refresh_sessions_palette`'s doc, and that `grep -n "inert first row above" src/picker.rs` finds nothing.
+  Done: the model tests pass. `remote-palette-slow-host` is written and builds. It needs Docker, so it is in the Linux list only, and its run happens in 8.2.
+- [x] 5.5 Update CLAUDE.md's `picker.rs` and "Reattach" bullets ("concurrently… within `LIST_LIMIT`") and the doc comments of `refresh_sessions_palette` and `session_palette`. Verify that `grep -rn "OPEN_GRACE" CLAUDE.md src/workspace.rs` finds the CLAUDE.md bullet and `refresh_sessions_palette`'s doc, and that `grep -n "inert first row above" src/picker.rs` finds nothing.
+  Done: `grep -rn "OPEN_GRACE" CLAUDE.md src/workspace.rs` finds the Reattach bullet, the new sessions-palette bullet and `refresh_sessions_palette`'s doc, and `grep -n "inert first row above" src/picker.rs` finds nothing.
 
 ## 6. A session's profile on an endpoint (item 10)
 

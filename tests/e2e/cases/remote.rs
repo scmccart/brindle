@@ -872,21 +872,111 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     let palette = &out.dump.palette;
     // Each row's reason names its cause (the row shows its first line).
+    let mut offline_rows = Vec::new();
     for (endpoint, cause) in [
         (format!("remote@{}", container.name), "is not running"),
         (format!("root@127.0.0.1:{port}"), "Connection refused"),
     ] {
         let offline = format!("{endpoint}  offline: ");
-        let row = palette.iter().find(|row| row.starts_with(&offline));
-        let Some(row) = row else {
+        let at = palette.iter().position(|row| row.starts_with(&offline));
+        let Some(at) = at else {
             return Err(format!("no offline row for {endpoint}: {palette:?}").into());
         };
+        let row = &palette[at];
         ensure!(row.contains(cause), "{endpoint}'s row doesn't say {cause:?}: {row:?}");
+        offline_rows.push(at);
     }
+    // Nothing is detached anywhere, and every endpoint has answered: the
+    // palette says so, after both endpoints' rows.
+    let note = palette.iter().position(|row| row == "No detached sessions");
+    let Some(note) = note else {
+        return Err(format!("no \"No detached sessions\" row: {palette:?}").into());
+    };
+    ensure!(
+        offline_rows.iter().all(|&at| at < note),
+        "the note (row {note}) doesn't come after both offline rows {offline_rows:?}: {palette:?}"
+    );
     ensure!(
         !container.running()?,
         "the stopped container {} is running",
         container.name
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The sessions palette opens without waiting for a host that is slow to
+/// answer. A first run leaves a local shell detached. The second connects at
+/// launch to the SSH fixture, which is paused (`docker pause`) once Brindle
+/// is connected to it: the host's link stays up but goes silent. "Attach
+/// Session…" then opens within the open grace, with this machine's session
+/// and the host's `listing sessions…` row, long before the listing gives up
+/// (`LIST_LIMIT`, 2 s).
+///
+/// The steps are spaced far enough apart that the pause (made by a timeline
+/// call, once the relay runs in the container) comes before the palette's
+/// step, and the dump follows that step by well under `LIST_LIMIT`.
+pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
+    // The run's steps: one that only takes an interval, then the palette's,
+    // and the dump just after it.
+    const INTERVAL: f64 = 6.0;
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    needs
+        .run(ctx, "first", "")
+        .keep_detached()
+        .send("echo left-$((1+1))\r")
+        .wait_for("left-2")
+        .dump_at(5.0)
+        .run()?;
+    let left = poll(ctx.secs(1.0), 10.0, "the first run's shell detached", || {
+        let sessions = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(match sessions.as_slice() {
+            [session] if !session.attached => Some(session.clone()),
+            _ => None,
+        })
+    })?;
+
+    let (waiting, pausing) = (ssh.container.docker.clone(), ssh.container.docker.clone());
+    let slow = ctx.secs(1.0);
+    let out = needs
+        .run(ctx, "second", &ssh.profile(SSH_PROFILE, "ssh-slow-host", true))
+        .step_interval(INTERVAL)
+        .modality("keyboard")
+        .action("attach_session")
+        // Brindle's relay runs in the container: the endpoint is connected.
+        .call_at(1.0, move |_| {
+            poll(slow, 10.0, "Brindle's relay in the container", || {
+                Ok((!waiting.relays()?.is_empty()).then_some(()))
+            })
+        })
+        // The pause comes a couple of (stretched) seconds before the
+        // palette's step, so the silent link isn't given up on first: the
+        // steps count from the window's first appearance, a little after
+        // the spawn this counts from.
+        .call_at(INTERVAL * 2.5 - 2.0, move |_| pausing.pause())
+        .dump_at(INTERVAL * 2.5 + 0.7)
+        .run();
+    // Back in order, so the container's logs and removal work.
+    ssh.container.unpause().ok();
+    let out = out?;
+
+    let palette = &out.dump.palette;
+    let endpoint = format!("root@{}:{}", ssh.host, ssh.port);
+    let pending = format!("{endpoint}  listing sessions…");
+    ensure!(
+        palette.len() == 3 && palette[2] == pending,
+        "want this machine's session, then {pending:?}, not listed yet or offline: {palette:?}"
+    );
+    ensure!(
+        !palette[1].starts_with(&endpoint) && !palette[1].starts_with("No detached"),
+        "the first row isn't this machine's session {left:?}: {palette:?}"
+    );
+    ensure!(
+        out.dump.palette_highlighted()? == Some(0),
+        "this machine's session isn't highlighted: {palette:?}"
     );
     Ok(Outcome::Pass)
 }
@@ -1709,6 +1799,16 @@ impl Docker {
     fn running(&self) -> Result<bool> {
         let state = docker_ok(&["inspect", "--format", "{{.State.Running}}", &self.name])?;
         Ok(state.trim() == "true")
+    }
+
+    /// Freezes its processes (`docker pause`): connections to it stay open,
+    /// and nothing answers on them.
+    fn pause(&self) -> Result {
+        docker_ok(&["pause", &self.name]).map(drop)
+    }
+
+    fn unpause(&self) -> Result {
+        docker_ok(&["unpause", &self.name]).map(drop)
     }
 
     /// Stops it at once (its `sleep` ignores SIGTERM).

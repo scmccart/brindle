@@ -13,9 +13,10 @@
 //! never emits `DismissEvent`, so the overlay never closes behind the
 //! owner's back.
 //!
-//! The sessions palette's rows are built here too, purely
-//! ([`session_palette`]): grouped by endpoint, with a row that does nothing
-//! for each endpoint still connecting or offline.
+//! The sessions palette's state and rows are built here too, purely
+//! ([`SessionsModel`], [`session_palette`]): grouped by endpoint, with a row
+//! that does nothing for each endpoint still being listed, still connecting
+//! or offline.
 
 use std::rc::Rc;
 
@@ -191,15 +192,31 @@ impl Palette {
     }
 
     /// Replaces a list's groups and its empty message (`None`: the command
-    /// list's own), keeping its filter text. The command list highlights
+    /// list's own), keeping its filter text. `keep` names the row to keep
+    /// highlighted, by its index across the new groups (the list then also
+    /// keeps its scroll offset); with `None` the command list highlights
     /// the first match again.
-    pub fn set_groups(&mut self, groups: Vec<PaletteGroup>, empty: Option<SharedString>, cx: &mut Context<Self>) {
+    pub fn set_groups(
+        &mut self,
+        groups: Vec<PaletteGroup>,
+        empty: Option<SharedString>,
+        keep: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if let Mode::List(list) = &mut self.mode {
             list.command.update(cx, |command, cx| {
                 command.set_empty_message(empty, cx);
-                command.set_groups(command_groups(&groups), None, cx);
+                command.set_groups(command_groups(&groups), keep, cx);
             });
             list.groups = groups;
+        }
+    }
+
+    /// A list's highlighted row, by its index across the groups.
+    pub fn highlighted(&self, cx: &App) -> Option<usize> {
+        match &self.mode {
+            Mode::List(list) => list.command.read(cx).highlighted(),
+            Mode::Prompt(_) => None,
         }
     }
 
@@ -216,7 +233,11 @@ impl Palette {
         match &self.mode {
             Mode::List(list) => {
                 let command = list.command.read(cx);
-                let mut out = format!("--- palette list query={:?}\n", command.query(cx));
+                let highlighted = command
+                    .highlighted()
+                    .and_then(|item| command.rows().matches().iter().position(|&ix| ix == item))
+                    .map_or_else(|| "none".to_string(), |at| at.to_string());
+                let mut out = format!("--- palette list query={:?} highlighted={highlighted}\n", command.query(cx));
                 for &ix in command.rows().matches() {
                     let Some(row) = list.row(ix) else { continue };
                     out.push_str(&row.label);
@@ -297,6 +318,9 @@ pub enum Listing {
     Connecting,
     /// It can't be reached, or didn't answer, and why.
     Offline(String),
+    /// It hasn't answered yet: [`SessionsModel`] starts every endpoint
+    /// here, and [`session_palette`] lists it as `listing sessions…`.
+    Pending,
 }
 
 /// What a sessions palette row stands for, by row across the groups.
@@ -305,9 +329,22 @@ pub enum SessionRow {
     /// A detached session of `host`'s core: enter attaches it, and
     /// `picker_kill` ends it, both on `host`'s connection.
     Session { host: Host, info: SessionInfo },
-    /// A row that does nothing: an endpoint connecting or offline, or the
-    /// note that nothing is detached.
-    Inert,
+    /// A row that does nothing: `host` being listed, connecting or offline.
+    Endpoint(Host),
+    /// A row that does nothing: the note that nothing is detached.
+    Note,
+}
+
+/// What stays the same about a sessions palette row when the rows around it
+/// change: how the model finds the highlighted row again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowKey {
+    /// A session: its endpoint, id and key (ids restart in a fresh core).
+    Session { host: Host, id: u32, key: String },
+    /// An endpoint's row.
+    Endpoint(Host),
+    /// The note.
+    Note,
 }
 
 impl SessionRow {
@@ -315,7 +352,15 @@ impl SessionRow {
     pub fn session(&self) -> Option<(&Host, &SessionInfo)> {
         match self {
             Self::Session { host, info } => Some((host, info)),
-            Self::Inert => None,
+            Self::Endpoint(_) | Self::Note => None,
+        }
+    }
+
+    pub fn key(&self) -> RowKey {
+        match self {
+            Self::Session { host, info } => RowKey::Session { host: host.clone(), id: info.session, key: info.key.clone() },
+            Self::Endpoint(host) => RowKey::Endpoint(host.clone()),
+            Self::Note => RowKey::Note,
         }
     }
 }
@@ -332,6 +377,10 @@ pub struct SessionPalette {
 /// What the sessions palette says when nothing is detached anywhere.
 pub const NO_DETACHED: &str = "No detached sessions";
 
+/// How long the sessions palette waits for every endpoint to answer before
+/// it opens with the answers it has, listing the others as pending.
+pub const OPEN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The sessions palette for what each endpoint `listed` (this machine's
 /// listing among them), without the sessions in `killed` (endpoint, id and
 /// key: they stay listed until their programs have exited), at `now` (unix
@@ -342,11 +391,12 @@ pub const NO_DETACHED: &str = "No detached sessions";
 /// targets (a tab's, after a reload), by name. Each one's detached sessions
 /// are newest first, under its name when any remote endpoint lists one
 /// ("This machine" over the local ones); with only this machine's, there is
-/// no heading. An endpoint still connecting or offline gets one row that
-/// does nothing, saying so. When nothing is detached, the palette says so:
-/// as its empty message, or as an inert first row above the endpoints'
-/// rows (the command list shows its empty message only when it has no
-/// rows).
+/// no heading. An endpoint still being listed, still connecting or offline
+/// gets one row that does nothing, saying so. When nothing is detached
+/// anywhere and no endpoint is still being listed, the palette says so: as
+/// its empty message, or, when an endpoint has a row, as a note row after
+/// every endpoint's (the command list shows its empty message only when it
+/// has no rows).
 pub fn session_palette(
     listed: &[(Host, Listing)],
     killed: &[(Host, u32, String)],
@@ -377,6 +427,7 @@ pub fn session_palette(
         .map(|(host, listing)| {
             let part = match listing {
                 Listing::Sessions(sessions) => Ok(detached(host, sessions)),
+                Listing::Pending => Err(inert(host.name(), Some("listing sessions…".into()))),
                 Listing::Connecting => Err(inert(host.name(), Some("connecting…".into()))),
                 Listing::Offline(why) => {
                     let why = why.lines().next().unwrap_or_default();
@@ -390,11 +441,10 @@ pub fn session_palette(
     let headings = parts.iter().any(|(host, part)| !host.is_local() && lists(part));
     let any_session = parts.iter().any(|(_, part)| lists(part));
 
+    let pending = listed.iter().any(|(_, listing)| *listing == Listing::Pending);
+    let endpoint_rows = parts.iter().any(|(_, part)| part.is_err());
+
     let (mut groups, mut rows) = (Vec::new(), Vec::new());
-    if !any_session && parts.iter().any(|(_, part)| part.is_err()) {
-        groups.push(PaletteGroup::unnamed(vec![inert(NO_DETACHED.into(), None)]));
-        rows.push(SessionRow::Inert);
-    }
     for (host, part) in parts {
         match part {
             Ok(sessions) if sessions.is_empty() => {}
@@ -409,9 +459,15 @@ pub fn session_palette(
             }
             Err(row) => {
                 groups.push(PaletteGroup::unnamed(vec![row]));
-                rows.push(SessionRow::Inert);
+                rows.push(SessionRow::Endpoint(host.clone()));
             }
         }
+    }
+    // After every endpoint's row, and not while one is still being listed:
+    // its sessions may be about to appear.
+    if !any_session && endpoint_rows && !pending {
+        groups.push(PaletteGroup::unnamed(vec![inert(NO_DETACHED.into(), None)]));
+        rows.push(SessionRow::Note);
     }
     let empty = rows.is_empty().then(|| NO_DETACHED.into());
     if groups.is_empty() {
@@ -419,6 +475,132 @@ pub fn session_palette(
         groups.push(PaletteGroup::unnamed(Vec::new()));
     }
     SessionPalette { groups, rows, empty }
+}
+
+/// What [`SessionsModel::view`] gives the palette: its groups and empty
+/// message, and the row to keep highlighted (an index across the groups).
+#[derive(Debug, PartialEq)]
+pub struct SessionsView {
+    pub groups: Vec<PaletteGroup>,
+    pub empty: Option<SharedString>,
+    pub keep: Option<usize>,
+}
+
+/// An endpoint's place in a [`SessionsModel`].
+#[derive(Debug)]
+struct Endpoint {
+    host: Host,
+    listing: Listing,
+    /// The round `listing` is from; 0 for none yet.
+    answered: u64,
+}
+
+/// The sessions palette's state, apart from GPUI: what each endpoint
+/// listed or that it hasn't answered yet, the round of listings they
+/// belong to, the sessions killed from it and the highlighted row.
+///
+/// A round is one set of listings, started when the palette opens, when an
+/// endpoint's state changes or after a kill. An answer applies one at a time
+/// and only to the current round (an earlier round's is dropped). A new
+/// round keeps what each endpoint last listed on display until its answer
+/// arrives, so rows don't flicker back to `listing sessions…`; an endpoint
+/// that has never answered shows that.
+#[derive(Debug)]
+pub struct SessionsModel {
+    round: u64,
+    endpoints: Vec<Endpoint>,
+    killed: Vec<(Host, u32, String)>,
+    /// The highlighted row, and where it was in `rows`.
+    highlighted: Option<(RowKey, usize)>,
+    /// The rows of the last [`SessionsModel::view`].
+    rows: Vec<SessionRow>,
+}
+
+impl SessionsModel {
+    /// A model at `round` for `hosts` in order, none of which has answered.
+    pub fn new(round: u64, hosts: impl IntoIterator<Item = Host>) -> Self {
+        let mut model = Self { round, endpoints: Vec::new(), killed: Vec::new(), highlighted: None, rows: Vec::new() };
+        model.start_round(round, hosts);
+        model
+    }
+
+    pub fn round(&self) -> u64 {
+        self.round
+    }
+
+    /// Starts `round` for `hosts`, in order. An endpoint already known keeps
+    /// its listing until it answers again.
+    pub fn start_round(&mut self, round: u64, hosts: impl IntoIterator<Item = Host>) {
+        self.round = round;
+        let mut known = std::mem::take(&mut self.endpoints);
+        self.endpoints = hosts
+            .into_iter()
+            .map(|host| match known.iter().position(|endpoint| endpoint.host == host) {
+                Some(at) => known.swap_remove(at),
+                None => Endpoint { host, listing: Listing::Pending, answered: 0 },
+            })
+            .collect();
+    }
+
+    /// `host`'s answer in `round`. Returns whether it applied: an answer
+    /// from another round, or from an endpoint the round doesn't have, is
+    /// dropped.
+    pub fn answer(&mut self, round: u64, host: &Host, listing: Listing) -> bool {
+        if round != self.round {
+            return false;
+        }
+        let Some(endpoint) = self.endpoints.iter_mut().find(|endpoint| endpoint.host == *host) else {
+            return false;
+        };
+        endpoint.listing = listing;
+        endpoint.answered = round;
+        true
+    }
+
+    /// Whether every endpoint has answered in the current round: the palette
+    /// opens at once when it has, and otherwise after [`OPEN_GRACE`].
+    pub fn complete(&self) -> bool {
+        self.endpoints.iter().all(|endpoint| endpoint.answered == self.round)
+    }
+
+    /// Removes a session's row from now on: it stays gone while its program
+    /// exits and the listings catch up.
+    pub fn kill(&mut self, host: Host, id: u32, key: String) {
+        self.killed.push((host, id, key));
+    }
+
+    /// What the palette's list highlights now, as an index into the rows of
+    /// the last view (`None`: nothing, as for a list with no enabled row).
+    /// The next view keeps that row highlighted.
+    pub fn highlight(&mut self, item: Option<usize>) {
+        self.highlighted = item.and_then(|at| Some((self.rows.get(at)?.key(), at)));
+    }
+
+    /// The rows of the last view, by index across the groups.
+    pub fn rows(&self) -> &[SessionRow] {
+        &self.rows
+    }
+
+    /// The palette for the endpoints' listings so far at `now` (unix
+    /// seconds), keeping the highlight where the user left it.
+    ///
+    /// The highlighted row stays highlighted while it is listed. A row that
+    /// is gone (a kill) passes the highlight to the row now at its place,
+    /// else to the last row, skipping rows that do nothing.
+    pub fn view(&mut self, config: &Config, now: u64) -> SessionsView {
+        let listed: Vec<(Host, Listing)> =
+            self.endpoints.iter().map(|endpoint| (endpoint.host.clone(), endpoint.listing.clone())).collect();
+        let shown = session_palette(&listed, &self.killed, config, now);
+        let enabled = |at: &usize| matches!(shown.rows[*at], SessionRow::Session { .. });
+        let keep = self.highlighted.as_ref().and_then(|(key, place)| {
+            shown.rows.iter().position(|row| row.key() == *key).or_else(|| {
+                (*place..shown.rows.len()).find(enabled).or_else(|| (0..shown.rows.len().min(*place)).rev().find(enabled))
+            })
+        });
+        self.highlighted = keep.map(|at| (shown.rows[at].key(), at));
+        self.rows = shown.rows;
+        SessionsView { groups: shown.groups, empty: shown.empty, keep }
+    }
 }
 
 /// A row that does nothing.
@@ -559,7 +741,7 @@ mod tests {
 
     /// An endpoint still connecting or offline is one row that does
     /// nothing: muted and never highlighted, so enter on it opens nothing.
-    /// With no session anywhere an inert row says so first.
+    /// With no session anywhere an inert row says so, after the endpoints'.
     #[test]
     fn connecting_and_offline_endpoints_are_rows_that_do_nothing() {
         let listed = [
@@ -568,13 +750,13 @@ mod tests {
             (b9(), Listing::Connecting),
         ];
         let palette = session_palette(&listed, &[], &config(), 0);
-        assert_eq!(labels(&palette), [(None, vec![NO_DETACHED]), (None, vec!["B9"]), (None, vec!["A8"])]);
-        assert_eq!(text(&palette.groups[1].rows[0].detail), Some("connecting…"));
+        assert_eq!(labels(&palette), [(None, vec!["B9"]), (None, vec!["A8"]), (None, vec![NO_DETACHED])]);
+        assert_eq!(text(&palette.groups[0].rows[0].detail), Some("connecting…"));
         assert_eq!(
-            text(&palette.groups[2].rows[0].detail),
+            text(&palette.groups[1].rows[0].detail),
             Some("offline: ssh: connect to host A8 port 22: Connection refused")
         );
-        assert_eq!(palette.rows, [SessionRow::Inert, SessionRow::Inert, SessionRow::Inert]);
+        assert_eq!(palette.rows, [SessionRow::Endpoint(b9()), SessionRow::Endpoint(a8()), SessionRow::Note]);
         assert!(palette.rows.iter().all(|row| row.session().is_none()), "no row's actions reach a connection");
         assert_eq!(palette.empty, None, "the command list has rows, so its message wouldn't show");
         assert!(palette.groups.iter().flat_map(|group| &group.rows).all(|row| row.disabled));
@@ -586,7 +768,7 @@ mod tests {
         let listed = [(a8(), Listing::Sessions(vec![info(4, "build", 0)])), (b9(), Listing::Offline("refused".into()))];
         let palette = session_palette(&listed, &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["B9"]), (Some("A8"), vec!["build"])]);
-        assert_eq!(palette.rows[0], SessionRow::Inert);
+        assert_eq!(palette.rows[0], SessionRow::Endpoint(b9()));
         let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
         assert_eq!(rows.highlighted_item(), Some(1));
         assert_eq!(palette.rows[1].session().map(|(host, info)| (host.clone(), info.session)), Some((a8(), 4)));
@@ -631,5 +813,184 @@ mod tests {
         assert_eq!(labels(&palette), [(Some("This machine"), vec!["shell"]), (Some("A8"), vec!["build"])]);
         let killed = [(a8(), 1, "shell-1".to_string()), (a8(), 2, "build-2".to_string())];
         assert_eq!(labels(&session_palette(&listed, &killed, &config(), 0)), [(None, vec!["shell"])]);
+    }
+
+    /// An endpoint still being listed is a row that does nothing, in its
+    /// place, and the note that nothing is detached waits for it.
+    #[test]
+    fn a_pending_endpoint_is_a_row_and_holds_back_the_note() {
+        let listed = [(Host::Local, Listing::Sessions(Vec::new())), (a8(), Listing::Pending)];
+        let palette = session_palette(&listed, &[], &config(), 0);
+        assert_eq!(labels(&palette), [(None, vec!["A8"])]);
+        assert_eq!(text(&palette.groups[0].rows[0].detail), Some("listing sessions…"));
+        assert_eq!(palette.rows, [SessionRow::Endpoint(a8())]);
+        assert_eq!(palette.empty, None, "the command list has a row");
+        let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
+        assert_eq!(rows.highlighted_item(), None, "a row that does nothing can't be chosen");
+
+        // Another endpoint's sessions list beside it.
+        let listed = [(b9(), Listing::Sessions(vec![info(1, "top", 0)])), (a8(), Listing::Pending)];
+        let palette = session_palette(&listed, &[], &config(), 0);
+        assert_eq!(labels(&palette), [(Some("B9"), vec!["top"]), (None, vec!["A8"])]);
+
+        // Once it has answered with nothing, the note comes last.
+        let listed = [(Host::Local, Listing::Sessions(Vec::new())), (a8(), Listing::Sessions(Vec::new()))];
+        let palette = session_palette(&listed, &[], &config(), 0);
+        assert!(palette.rows.is_empty() && text(&palette.empty) == Some(NO_DETACHED), "no row to put a note after");
+    }
+
+    fn hosts() -> [Host; 3] {
+        [Host::Local, b9(), a8()]
+    }
+
+    /// A model of this machine, B9 and A8 at `round`, that has each of
+    /// `answers` (this machine's, B9's and A8's, `None` for none yet).
+    fn model(round: u64, answers: [Option<Listing>; 3]) -> SessionsModel {
+        let mut model = SessionsModel::new(round, hosts());
+        for (host, answer) in hosts().into_iter().zip(answers) {
+            if let Some(listing) = answer {
+                assert!(model.answer(round, &host, listing));
+            }
+        }
+        model
+    }
+
+    fn sessions(titles: &[&str]) -> Option<Listing> {
+        Some(Listing::Sessions(titles.iter().zip(1..).map(|(title, id)| info(id, title, 100 - id as u64)).collect()))
+    }
+
+    /// The labels of `model`'s rows, in order, by `view`.
+    fn shown(model: &mut SessionsModel) -> (Vec<String>, Option<usize>) {
+        let view = model.view(&config(), 200);
+        let labels = view.groups.iter().flat_map(|g| &g.rows).map(|row| row.label.to_string()).collect();
+        (labels, view.keep)
+    }
+
+    /// An answer from an earlier round is dropped, one from an endpoint the
+    /// round doesn't have too; one from the current round applies.
+    #[test]
+    fn an_answer_from_an_earlier_round_is_dropped() {
+        let mut model = SessionsModel::new(1, hosts());
+        model.start_round(2, hosts());
+        assert!(!model.answer(1, &Host::Local, Listing::Sessions(vec![info(1, "old", 0)])));
+        assert!(!model.answer(2, &Host::Remote(ssh("C7")), Listing::Connecting));
+        assert!(!model.complete());
+        assert!(model.answer(2, &Host::Local, Listing::Sessions(vec![info(1, "new", 0)])));
+        assert_eq!(shown(&mut model).0, ["new", "B9", "A8"]);
+    }
+
+    /// 5.4: a palette whose endpoints all answer within the grace opens
+    /// complete; otherwise it opens with a row for each endpoint still out,
+    /// and no note.
+    #[test]
+    fn the_palette_is_complete_once_every_endpoint_answered() {
+        let mut model = model(1, [sessions(&[]), None, None]);
+        assert!(!model.complete(), "two endpoints are out");
+        assert_eq!(shown(&mut model).0, ["B9", "A8"], "a row each, and no note");
+        assert!(model.answer(1, &b9(), Listing::Connecting));
+        assert!(!model.complete());
+        assert_eq!(shown(&mut model).0, ["B9", "A8"], "A8 is still out: no note");
+        assert!(model.answer(1, &a8(), Listing::Offline("refused".into())));
+        assert!(model.complete());
+        assert_eq!(shown(&mut model).0, ["B9", "A8", NO_DETACHED], "all answered: the note comes last");
+
+        let mut model = model_with_all_answered();
+        assert!(model.complete());
+        assert_eq!(shown(&mut model).0, ["shell", "top"].map(String::from));
+    }
+
+    fn model_with_all_answered() -> SessionsModel {
+        model(1, [sessions(&["shell"]), sessions(&["top"]), sessions(&[])])
+    }
+
+    /// A new round keeps what an endpoint last listed on display until it
+    /// answers again, and is complete only once every endpoint has.
+    #[test]
+    fn a_new_round_keeps_what_was_listed_until_the_answer() {
+        let mut model = model_with_all_answered();
+        model.start_round(2, hosts());
+        assert!(!model.complete());
+        assert_eq!(shown(&mut model).0, ["shell", "top"], "no flicker back to pending");
+        for host in hosts() {
+            assert!(model.answer(2, &host, Listing::Sessions(Vec::new())));
+        }
+        assert!(model.complete());
+        assert_eq!(shown(&mut model).0, [] as [&str; 0]);
+    }
+
+    /// The highlighted session stays highlighted when an answer adds rows
+    /// above it.
+    #[test]
+    fn the_highlighted_session_stays_when_an_answer_adds_rows_above() {
+        let mut model = model(1, [sessions(&["a", "b", "c"]), None, sessions(&["x"])]);
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["a", "b", "c", "B9", "x"].map(String::from));
+        assert_eq!(keep, None, "nothing was highlighted yet: the list's first");
+        // The user moved to "b" (item 1), then B9 answers with sessions above A8's.
+        model.highlight(Some(1));
+        assert!(model.answer(1, &b9(), Listing::Sessions(vec![info(7, "top", 500), info(8, "vim", 400)])));
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["a", "b", "c", "top", "vim", "x"].map(String::from));
+        assert_eq!(keep, Some(1));
+        // Rows now come in above it: a session is added to this machine's.
+        model.highlight(keep);
+        assert!(model.answer(1, &Host::Local, Listing::Sessions(vec![info(9, "new", 900), info(1, "a", 99), info(2, "b", 98)])));
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["new", "a", "b", "top", "vim", "x"].map(String::from));
+        assert_eq!(keep, Some(2), "still \"b\"");
+        // A highlighted endpoint-less palette (nothing enabled) keeps nothing.
+        model.highlight(None);
+        assert_eq!(shown(&mut model).1, None);
+    }
+
+    /// A killed row passes its highlight to the row now at its place, else
+    /// to the last, and the rows that do nothing are skipped.
+    #[test]
+    fn a_killed_row_passes_its_highlight_to_the_next_row_else_the_last() {
+        let mut model = model(1, [sessions(&["a", "b", "c"]), None, None]);
+        model.answer(1, &b9(), Listing::Connecting);
+        model.answer(1, &a8(), Listing::Connecting);
+        assert_eq!(shown(&mut model).0, ["a", "b", "c", "B9", "A8"].map(String::from));
+
+        model.highlight(Some(1));
+        shown(&mut model);
+        model.kill(Host::Local, 2, "b-2".into());
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["a", "c", "B9", "A8"].map(String::from));
+        assert_eq!(keep, Some(1), "\"c\" took the place");
+
+        // The last session: the endpoint rows after it do nothing, so the
+        // highlight goes back to the last session.
+        model.kill(Host::Local, 3, "c-3".into());
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["a", "B9", "A8"].map(String::from));
+        assert_eq!(keep, Some(0));
+
+        // Nothing left to highlight: the endpoints' rows and the note do
+        // nothing.
+        model.kill(Host::Local, 1, "a-1".into());
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["B9", "A8", NO_DETACHED].map(String::from));
+        assert_eq!(keep, None);
+        assert_eq!(model.rows(), [SessionRow::Endpoint(b9()), SessionRow::Endpoint(a8()), SessionRow::Note]);
+    }
+
+    /// The note's place: after every endpoint's row, and only when nothing
+    /// is listed anywhere and nothing is pending.
+    #[test]
+    fn the_note_comes_after_every_endpoint_and_only_once_nothing_is_pending() {
+        let mut model = model(1, [sessions(&[]), None, None]);
+        assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()), "two are pending");
+        model.answer(1, &b9(), Listing::Offline("down".into()));
+        assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()), "A8 is pending");
+        model.answer(1, &a8(), Listing::Connecting);
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["B9", "A8", NO_DETACHED].map(String::from));
+        assert_eq!(keep, None);
+        assert_eq!(model.rows().last(), Some(&SessionRow::Note));
+        // A session anywhere replaces it.
+        model.start_round(2, hosts());
+        model.answer(2, &a8(), Listing::Sessions(vec![info(1, "build", 0)]));
+        assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()));
     }
 }

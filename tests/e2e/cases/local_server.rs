@@ -810,6 +810,78 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The sessions palette keeps its highlight by identity. Four tabs' shells
+/// are left detached, each showing its own marker, listed newest first:
+/// `mk4`, `mk3`, `mk2`, `mk1`.
+///
+/// - A second run moves down one row and kills it (`mk3`): its row is gone
+///   and the highlight is on the row that was listed third, now at index 1.
+/// - That run's own tab is left detached too, newest of all. A third run
+///   (listing it, `mk4`, `mk2`, `mk1`) does the same, killing `mk4`, then
+///   presses enter: the attached session is the one that was listed third,
+///   `mk2`.
+///
+/// Each run takes one dump, since a dump ends the run.
+pub fn palette_highlight(ctx: &Ctx) -> Result<Outcome> {
+    let srv = Server::of(ctx);
+    let marker = |tab: u32| format!("mk{tab}-{}", tab + 1);
+    let mut first = Run::new(ctx, "first").keep_detached().prompt();
+    for tab in 1..=4 {
+        if tab > 1 {
+            first = first.action("new_tab").prompt();
+        }
+        first = first.send(&format!("{}\r", echo_sum(&format!("mk{tab}"), tab, 1))).wait_for(&marker(tab));
+    }
+    // Quitting leaves the four tabs' shells detached.
+    first.dump_at(later(14.0) + if cfg!(windows) { 16.0 } else { 0.0 }).run()?;
+    detached_pids(&srv, 10.0, 4)?;
+
+    let second = Run::new(ctx, "second")
+        .keep_detached()
+        .prompt()
+        .action("attach_session")
+        .key("down")
+        .key("ctrl-shift-delete")
+        .dump_at(later(7.0))
+        .run()?;
+    let highlighted = second.dump.palette_highlighted()?;
+    ensure!(
+        second.dump.palette.len() == 1 + 3,
+        "the killed session's row is still listed, or another is gone: {:?}",
+        second.dump.palette
+    );
+    ensure!(
+        highlighted == Some(1),
+        "the highlight isn't on the row that was listed third: {:?}",
+        second.dump.palette
+    );
+    // `mk3`'s program ended, and nothing else did; this run's own tab is the
+    // new detached one.
+    detached_pids(&srv, 10.0, 4)?;
+
+    let third = Run::new(ctx, "third")
+        .keep_detached()
+        .prompt()
+        .action("attach_session")
+        .key("down")
+        .key("ctrl-shift-delete")
+        .key("enter")
+        .dump_at(later(8.0))
+        .run()?;
+    ensure!(third.dump.palette.is_empty(), "the palette is still open: {:?}", third.dump.palette);
+    ensure!(third.dump.tabs.len() == 2 && third.dump.tabs[1].1, "tabs: {:?}", third.dump.tabs);
+    screen_has(&third, &marker(2))?;
+    for other in [1, 3, 4] {
+        ensure!(
+            !third.dump.screen.iter().any(|line| line.contains(&marker(other))),
+            "the attached tab shows {}: {:?}",
+            marker(other),
+            third.dump.screen
+        );
+    }
+    Ok(Outcome::Pass)
+}
+
 /// `brindle --attach ID` opens that session as the active tab; an id the
 /// server doesn't have gives a tab saying so.
 pub fn attach_flag(ctx: &Ctx) -> Result<Outcome> {
