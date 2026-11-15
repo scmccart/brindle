@@ -313,6 +313,10 @@ pub struct Workspace {
     /// endpoint leaves those to their zones ([`Workspace::attach_swept`]).
     restored_hosts: Vec<Host>,
     restored_sessions: Vec<(Host, session::ServerSession)>,
+    /// Brindle is quitting, and the terminals have left their sessions
+    /// ([`Workspace::quit`]): nothing is recorded any more, since the zones
+    /// no longer know their sessions.
+    quitting: bool,
 }
 
 impl Workspace {
@@ -357,7 +361,15 @@ impl Workspace {
             windowed_size: std::cell::Cell::new(window.bounds().size),
             restored_hosts: Vec::new(),
             restored_sessions: Vec::new(),
+            quitting: false,
         };
+        // A close the window manager or Windows asks for (its close button,
+        // alt-F4, the taskbar) quits too.
+        let workspace = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            workspace.update(cx, |ws, cx| ws.quit(window, cx)).ok();
+            true
+        });
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
             // Foreground processes change without any event (e.g. `vim`
             // starting), so poll their names gently. The same poll records
@@ -531,12 +543,31 @@ impl Workspace {
     /// Stores this window's snapshot, when session restore is on and this
     /// process owns the session.
     pub fn record_session(&self, window: &Window, cx: &mut Context<Self>) {
-        if !cx.update_global(|store: &mut SessionStore, _| store.is_owner()) {
+        if self.quitting || !cx.update_global(|store: &mut SessionStore, _| store.is_owner()) {
             return;
         }
         let state = self.snapshot(window, cx);
         let (id, order) = (self.window_id, self.order);
         cx.update_global(|store: &mut SessionStore, _| store.record(id, order, state));
+    }
+
+    /// Brindle is quitting, or this window is closing, which quits it:
+    /// records the window while its zones still know their sessions, then
+    /// has every tab's terminals leave their programs as their `Closing`
+    /// says ([`Terminal::quit`]: profile tabs' sessions are detached, `-e`
+    /// ones end). Their drops would do the same, but GPUI doesn't always
+    /// run them before the process exits: on Windows the focused
+    /// terminal's view outlives the exit, held by the input handler of a
+    /// window whose destruction never runs. Once is enough.
+    pub fn quit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        self.record_session(window, cx);
+        self.quitting = true;
+        for tab in &self.tabs {
+            tab.zones.update(cx, |zones, cx| zones.quit_all(cx));
+        }
     }
 
     fn settings(cx: &App) -> &Config {
@@ -1094,7 +1125,8 @@ impl Workspace {
     }
 
     /// Closing the window quits Brindle: its terminals' programs keep running.
-    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit(window, cx);
         window.remove_window();
     }
 

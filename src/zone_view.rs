@@ -667,6 +667,15 @@ impl ZoneTreeView {
         }
     }
 
+    /// Leaves every zone's program as its terminal's `Closing` says, when
+    /// Brindle quits ([`Terminal::quit`]).
+    pub fn quit_all(&mut self, cx: &mut Context<Self>) {
+        self.shutting_down = true;
+        for terminal in self.terminals(cx) {
+            terminal.update(cx, |t, _| t.quit());
+        }
+    }
+
     /// Every zone's terminal.
     pub fn terminals(&self, cx: &App) -> Vec<Entity<Terminal>> {
         self.zones.values().map(|z| z.content.as_terminal_view().read(cx).terminal.clone()).collect()

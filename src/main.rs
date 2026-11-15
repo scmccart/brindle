@@ -657,7 +657,8 @@ fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
 }
 
 /// Writes the session state when it changes (off the UI thread), and once
-/// more, synchronously, when Brindle quits.
+/// more, synchronously, when Brindle quits, after each window still open
+/// has recorded itself and left its terminals' sessions (`Workspace::quit`).
 fn record_session(cx: &mut App) {
     fn pending(cx: &mut App) -> Option<String> {
         cx.update_global(|store: &mut SessionStore, _| {
@@ -682,10 +683,14 @@ fn record_session(cx: &mut App) {
     })
     .detach();
     cx.on_app_quit(|cx| {
-        // The windows still open now are the ones to keep.
+        // The windows still open now are the ones to keep. Each detaches
+        // its tabs' sessions (`-e` ones close) itself, every debug run's
+        // included, rather than leaving it to the terminals' drops, which
+        // on Windows don't run before the exit. A window that closed did
+        // so as it closed.
         for window in cx.windows() {
             if let Some(window) = window.downcast::<Workspace>() {
-                window.update(cx, |ws, window, cx| ws.record_session(window, cx)).ok();
+                window.update(cx, |ws, window, cx| ws.quit(window, cx)).ok();
             }
         }
         if let Some(text) = pending(cx) {
@@ -956,11 +961,12 @@ fn main() {
             .detach();
         }
     });
-    // GPUI's shutdown has closed the windows, and their terminals detached
-    // (or closed) their sessions on the way out, but those messages are only
-    // queued for the connections' writer threads, which the exit would end
-    // (Windows ends them at once). A lost `DETACH` leaves a session its
-    // owner, so the next launch wouldn't open it as a tab.
+    // Every way out of `run` has detached (or closed) the tabs' sessions:
+    // the quit (`record_session`'s quit handler) or the window's close
+    // (`Workspace::quit`). Those messages are only queued for the
+    // connections' writer threads, which the exit would end (Windows ends
+    // them at once). A lost `DETACH` leaves a session its owner, so the
+    // next launch wouldn't open it as a tab.
     #[cfg(any(target_os = "linux", windows))]
     if !remote::local::flush(remote::local::QUIT_FLUSH) {
         log::info!("quitting before every terminal server connection had written what its tabs sent");

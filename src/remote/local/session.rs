@@ -583,6 +583,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// What quitting does to a window's tabs: each terminal leaves its
+    /// session explicitly (`Terminal::quit`: a profile tab's is detached,
+    /// an `-e` one's closed), then the drop, when GPUI runs it, leaves it
+    /// again, which sends nothing more. The flush before the exit returns
+    /// once both are written.
+    #[test]
+    fn quitting_leaves_each_session_once_and_the_flush_writes_it() {
+        let dir = temp_dir("quit");
+        let core = scripted_core(&dir, |message, stream| {
+            if let ToCore::Spawn(spawn) = message {
+                let spawned = Spawned { req: spawn.req, session: 30 + spawn.req as u32, pid: 1, key: "k".into() };
+                send(stream, ToClient::Spawned(spawned));
+            }
+        });
+        let connection = connector(&dir)().unwrap();
+        let start = || {
+            let connection = connection.clone();
+            let session = Session::start_with(move || Ok(connection), request(), Box::new(Recorder(mpsc::channel().0)));
+            let ToCore::Spawn(spawn) = recv(&core) else { panic!("not SPAWN") };
+            while session.pid().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (session, 30 + spawn.req as u32)
+        };
+        let (kept, kept_id) = start();
+        let (ended, ended_id) = start();
+
+        // The quit, then the drops.
+        kept.detach();
+        ended.close();
+        kept.detach();
+        ended.close();
+        assert!(connection.flush(Instant::now() + Duration::from_secs(10)), "not written");
+        assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == kept_id));
+        assert!(matches!(recv(&core), ToCore::Close(close) if close.session == ended_id));
+        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "a session was left twice");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_connection_lists_kills_and_ends_all_before_quitting() {
         let dir = temp_dir("manage");

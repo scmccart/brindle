@@ -932,6 +932,16 @@ impl Terminal {
         self.leave(true);
     }
 
+    /// Brindle is quitting: the program is left as the terminal's
+    /// [`Closing`] says (a profile tab's session is detached, an `-e`
+    /// one's ends), as the drop would. It is done explicitly because the
+    /// drop can't be relied on: on Windows GPUI keeps the focused
+    /// terminal's view alive past the process's exit. Once is enough:
+    /// later calls, and the drop, do nothing.
+    pub fn quit(&mut self) {
+        self.leave(false);
+    }
+
     /// Ends the terminal's connection to its program: `close` ends the
     /// program; otherwise a server session's program is left as its
     /// [`Closing`] says. A message terminal has no program.
