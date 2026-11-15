@@ -449,6 +449,7 @@ fn self_test() -> i32 {
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),
         ("pixel scans", capture::self_test_scan),
+        ("remote parsing", cases::self_test_remote),
         #[cfg(windows)]
         ("windows processes", winproc::self_test),
         #[cfg(windows)]

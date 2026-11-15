@@ -86,7 +86,7 @@
 
 ## 9. End-to-end checks
 
-- [ ] 9.1 Extend the Docker `remote-*` e2e cases (`tests/e2e/cases/remote.rs`) to:
+- [x] 9.1 Extend the Docker `remote-*` e2e cases (`tests/e2e/cases/remote.rs`) to:
   - quit with an SSH tab and relaunch, getting the same pid;
   - split sharing one connection;
   - cut the network (`docker network disconnect`) and restore it, getting the session back;
