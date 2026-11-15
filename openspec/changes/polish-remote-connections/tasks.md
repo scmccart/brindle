@@ -1,6 +1,6 @@
 # Tasks
 
-The tasks follow design.md's recommended answer to each open question. Settle those questions with the user first; each one names the tasks that change if the answer differs.
+The tasks follow the answers to design.md's decided questions (each the recommendation: 1A, 2A, 3B, 4A, 5A).
 
 ## 1. Failure reasons (items 1 and 2)
 
@@ -39,7 +39,7 @@ The tasks follow design.md's recommended answer to each open question. Settle th
 
 ## 3. What keeps a relay connection trying (items 4, 5 and 6)
 
-- [ ] 3.1 Bound an unwritten `CLOSE` (design decision 4; open question 1):
+- [ ] 3.1 Bound an unwritten `CLOSE` (design decision 4; decided question 1):
   - add `Timings::close_limit` (5 min; tests shorten it);
   - keep the time the oldest unwritten `CLOSE` was queued;
   - stop counting the closes in `State::in_use` once the limit passes with no link up;
@@ -58,13 +58,13 @@ The tasks follow design.md's recommended answer to each open question. Settle th
   Verify:
   - a `connection.rs` test: a hook alone keeps the connection trying, and once withdrawn, with nothing else in use, the connection ends and the hook is dropped. Update `a_listing_hook_gets_the_first_listing_and_keeps_the_relay_connecting` to match;
   - `reattach.rs` tests: an endpoint with another tab left, an eager endpoint and this machine are never named;
-  - `session.rs`'s `a_tab_closed_while_its_attach_waits_for_a_relay_withdraws_it` and `a_tab_closed_while_attaching_leaves_the_session_detached` keep passing: the closed restored tab sends no `CLOSE`, and its session stays detached (open question 5);
+  - `session.rs`'s `a_tab_closed_while_its_attach_waits_for_a_relay_withdraws_it` and `a_tab_closed_while_attaching_leaves_the_session_detached` keep passing: the closed restored tab sends no `CLOSE`, and its session stays detached (decided question 5);
   - a new e2e case `remote-ssh-restored-closed`:
     - a first run leaves a local tab and an SSH tab detached, and quits;
     - the SSH fixture is then stopped, so its port refuses;
     - a restoring second run shows the SSH zone connecting, then closes that tab;
     - within 15 s Brindle has no `ssh` child, and it starts none in the 10 s after that (`ssh_processes`).
-- [ ] 3.3 Retry a refused eager connection (open question 2): `run_relay` ends on `Refused` only when the connection isn't eager. An eager one reports `Offline` with the refusal, fails the new tabs' waiting requests with it, and backs off up to the eager cap.
+- [ ] 3.3 Retry a refused eager connection (decided question 2): `run_relay` ends on `Refused` only when the connection isn't eager. An eager one reports `Offline` with the refusal, fails the new tabs' waiting requests with it, and backs off up to the eager cap.
 
   Verify with a `connection.rs` test whose fake core answers `HELLO` with an error and then with `WELCOME`: the eager connection reports `Offline(<refusal>)`, fails a spawn with it, and is `Connected` after the next attempt. `an_eager_relay_is_offline_until_its_first_link_and_a_lazy_one_ends` keeps checking that a connection that isn't eager ends.
 
@@ -109,7 +109,7 @@ The tasks follow design.md's recommended answer to each open question. Settle th
 
     Each run takes one dump, since a dump ends the run.
   - `local-server-palette` keeps passing.
-- [ ] 5.4 Open the palette when every endpoint has answered or after `OPEN_GRACE` (about 250 ms), whichever comes first (open question 3).
+- [ ] 5.4 Open the palette when every endpoint has answered or after `OPEN_GRACE` (about 250 ms), whichever comes first (decided question 3).
 
   Verify:
   - model tests: a palette whose endpoints all answer within the grace opens complete; otherwise it opens with pending rows; the note never shows while an endpoint is pending;
@@ -121,7 +121,7 @@ The tasks follow design.md's recommended answer to each open question. Settle th
 
 ## 6. A session's profile on an endpoint (item 10)
 
-- [ ] 6.1 Add `reattach::session_profile` and `reattach::swept_tabs` (design decision 7; open question 4). Make `attach_swept` and `attach_detached_here` use them, passing the profile name of the first tab on the endpoint; `profile_on` keeps only that lookup.
+- [ ] 6.1 Add `reattach::session_profile` and `reattach::swept_tabs` (design decision 7; decided question 4). Make `attach_swept` and `attach_detached_here` use them, passing the profile name of the first tab on the endpoint; `profile_on` keeps only that lookup.
 
   Verify with `reattach.rs` tests:
   - the profile the session started with, when it targets the endpoint;
@@ -162,6 +162,6 @@ The tasks follow design.md's recommended answer to each open question. Settle th
 
 ## Workflow follow-up
 
-- Settle design.md's open questions with the user before implementing. If an answer differs from the recommendation, update the spec text and the tasks it names first (`openspec-update-change`).
+- design.md's questions were settled on 2026-11-15, each with its recommendation.
 - Run `openspec validate polish-remote-connections --strict` before opening the PR.
 - Archive the change after review (`openspec archive polish-remote-connections`).
