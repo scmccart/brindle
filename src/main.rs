@@ -9,6 +9,7 @@ mod desktop;
 mod find_bar;
 mod instance;
 mod latency;
+mod layout;
 mod notify;
 mod picker;
 mod primary;

@@ -744,6 +744,41 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A split tab comes back from the layout its sessions were detached with,
+/// though the state file no longer records it: a `--no-restore` run's quit
+/// replaced the file, and the next launch sweeps the split's sessions into
+/// one tab, its active zone focused.
+pub fn layout(ctx: &Ctx) -> Result<Outcome> {
+    let srv = Server::of(ctx);
+    Run::new(ctx, "split")
+        .keep_detached()
+        .restore()
+        .prompt()
+        .send(&format!("{}\r", echo_sum("left", 2, 2)))
+        .wait_for("left-4")
+        .action("split_zone_right")
+        .prompt()
+        .send(&format!("{}\r", echo_sum("right", 3, 3)))
+        .wait_for("right-6")
+        .dump_at(later(6.0))
+        .run()?;
+    detached_pids(&srv, 10.0, 2)?;
+    let listed: serde_json::Value = serde_json::from_str(&srv.command(&["list", "--json"])?)
+        .map_err(|e| format!("list --json: {e}"))?;
+    let layouts: Vec<&serde_json::Value> =
+        listed.as_array().into_iter().flatten().filter_map(|s| s.get("layout")).collect();
+    ensure!(layouts.len() == 2 && layouts[0] == layouts[1], "the split's layouts: {listed}");
+    ensure!(layouts[0]["zones"]["split"] == "horizontal", "not the split: {}", layouts[0]);
+
+    let other = Run::new(ctx, "no-restore").keep_detached().prompt().dump_at(later(4.0)).run()?;
+    ensure!(other.dump.tabs.len() == 1, "the no-restore run's tabs: {:?}", other.dump.tabs);
+    let back = Run::new(ctx, "back").keep_detached().restore().action("next_tab").dump_at(later(5.0)).run()?;
+    ensure!(back.dump.tabs.len() == 2 && back.dump.tabs[1].1, "tabs: {:?}", back.dump.tabs);
+    ensure!(back.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", back.dump.zones);
+    screen_has(&back, "right-6")?;
+    Ok(Outcome::Pass)
+}
+
 /// A debug run beside a running Brindle runs on its own: it attaches none
 /// of the detached sessions.
 pub fn reattach_second(ctx: &Ctx) -> Result<Outcome> {

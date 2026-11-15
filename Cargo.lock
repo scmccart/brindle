@@ -716,7 +716,6 @@ dependencies = [
  "brindle-term-core",
  "embed-resource",
  "libc",
- "serde_json",
  "windows 0.61.3",
 ]
 

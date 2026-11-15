@@ -668,11 +668,24 @@ impl ZoneTreeView {
     }
 
     /// Leaves every zone's program as its terminal's `Closing` says, when
-    /// Brindle quits ([`Terminal::quit`]).
-    pub fn quit_all(&mut self, cx: &mut Context<Self>) {
+    /// Brindle quits ([`Terminal::quit_with`]).
+    /// Brindle is quitting: every terminal leaves its program as its
+    /// `Closing` says, a kept session detached with this tab's layout (its
+    /// split tree with the zones' session keys, `quit`'s `index`th tab,
+    /// titled `title`), so a launch that sweeps it rebuilds the tab.
+    pub fn quit_all(&mut self, quit: &str, index: usize, title: Option<&str>, cx: &mut Context<Self>) {
         self.shutting_down = true;
+        let layout = crate::layout::record(
+            &self.tree,
+            self.active,
+            &mut |id| self.zone_server_session(id, cx).map(|session| session.key).filter(|key| !key.is_empty()),
+            quit,
+            index,
+            title,
+        );
         for terminal in self.terminals(cx) {
-            terminal.update(cx, |t, _| t.quit());
+            let layout = layout.clone();
+            terminal.update(cx, |t, _| t.quit_with(layout));
         }
     }
 

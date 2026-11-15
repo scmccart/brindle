@@ -591,7 +591,7 @@ impl Workspace {
     /// Brindle is quitting, or this window is closing, which quits it:
     /// records the window while its zones still know their sessions, then
     /// has every tab's terminals leave their programs as their `Closing`
-    /// says ([`Terminal::quit`]: profile tabs' sessions are detached, `-e`
+    /// says ([`Terminal::quit_with`]: profile tabs' sessions are detached, `-e`
     /// ones end). Their drops would do the same, but GPUI doesn't always
     /// run them before the process exits: on Windows the focused
     /// terminal's view outlives the exit, held by the input handler of a
@@ -602,8 +602,11 @@ impl Workspace {
         }
         self.record_session(window, cx);
         self.quitting = true;
-        for tab in &self.tabs {
-            tab.zones.update(cx, |zones, cx| zones.quit_all(cx));
+        // Each tab's kept sessions are detached with its layout.
+        let quit = crate::layout::quit_id();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let title = tab.manual_title.clone();
+            tab.zones.update(cx, |zones, cx| zones.quit_all(&quit, index, title.as_deref(), cx));
         }
     }
 
@@ -693,6 +696,59 @@ impl Workspace {
         id
     }
 
+    /// Opens a tab a sweep grouped from `host`'s detached sessions
+    /// ([`crate::layout::group`]) at the end, with `profile`: one session as
+    /// [`Workspace::insert_terminal_tab`] does, several in their recorded
+    /// split with its active zone focused, either way with the recorded
+    /// title. It is activated only when it is the window's first tab.
+    #[cfg(any(target_os = "linux", windows))]
+    fn insert_layout_tab(
+        &mut self,
+        profile: Profile,
+        host: Host,
+        tab: crate::layout::LayoutTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = Self::settings(cx).clone();
+        let activate = self.tabs.is_empty();
+        let title = tab.title.clone();
+        let id = match tab.into_single() {
+            Ok(info) => {
+                let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
+                self.insert_terminal_tab(profile, host, terminal, activate, window, cx)
+            }
+            Err(tab) => {
+                let (tree, leaves, active) = tab.into_tree();
+                let terminals: Vec<_> = leaves
+                    .into_iter()
+                    .map(|(id, info)| (id, Self::attached_terminal(&host, &info, &profile, &config, cx)))
+                    .collect();
+                let theme = self.tab_theme(&profile, &config);
+                let font_size = profile.font_size;
+                let (p_clone, tree_host) = (profile.clone(), host.clone());
+                let view = cx.new(|cx| {
+                    ZoneTreeView::from_restored(p_clone, tree_host, theme, font_size, tree, terminals, active, window, cx)
+                });
+                let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
+                let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
+                let id = tab.id;
+                if activate {
+                    self.insert_tab(tab, None, window, cx);
+                } else {
+                    let at = self.tabs.len();
+                    self.insert_tab_inactive(tab, Some(at), cx);
+                }
+                id
+            }
+        };
+        if let Some(title) = title
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
+        {
+            tab.set_manual_title(&title, &mut None, cx);
+        }
+    }
+
     /// The detached session a restored zone recorded, when the launch's
     /// listing still has it ([`crate::reattach::Detached`]).
     fn take_detached(recorded: Option<&session::ServerSession>, cx: &mut App) -> Option<SessionInfo> {
@@ -761,20 +817,20 @@ impl Workspace {
         cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))
     }
 
-    /// Opens a tab for each of `sessions` (detached sessions of this
-    /// machine nothing restored took), after the others and in this order,
-    /// each with the profile it was started with, or the default one when
-    /// that is gone or remote. The active tab stays the same.
+    /// Opens `sessions` (detached sessions of this machine nothing restored
+    /// took) as tabs after the others: those detached with one tab's layout
+    /// together in its split, the rest one per tab, in the order
+    /// [`crate::layout::group`] gives. Each tab takes the profile its active
+    /// session was started with, or the default one when that is gone or
+    /// remote. The active tab stays the same.
     pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            for info in sessions {
-                let profile = config.profiles[crate::reattach::local_profile(&info, &config)].clone();
+            for tab in crate::layout::group(sessions) {
+                let profile = config.profiles[crate::reattach::local_profile(tab.active(), &config)].clone();
                 // The launch listed this machine's sessions.
-                let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
-                let activate = self.tabs.is_empty();
-                self.insert_terminal_tab(profile, Host::Local, terminal, activate, window, cx);
+                self.insert_layout_tab(profile, Host::Local, tab, window, cx);
             }
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -804,12 +860,10 @@ impl Workspace {
         if tabs.is_empty() {
             return;
         }
-        log::info!("attaching {} detached session(s) on {}", tabs.len(), host.name());
-        for (info, index) in tabs {
+        log::info!("attaching {} detached session tab(s) on {}", tabs.len(), host.name());
+        for (tab, index) in tabs {
             let profile = config.profiles[index].clone();
-            let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
-            let activate = self.tabs.is_empty();
-            self.insert_terminal_tab(profile, host.clone(), terminal, activate, window, cx);
+            self.insert_layout_tab(profile, host.clone(), tab, window, cx);
         }
     }
 

@@ -155,6 +155,7 @@ fn unix() -> Vec<Case> {
         display("local-server-reattach-closed-tab", local_server::reattach_closed_tab),
         display("local-server-reattach-no-restore", local_server::reattach_no_restore),
         display("local-server-reattach-second", local_server::reattach_second),
+        display("local-server-layout", local_server::layout),
         display("local-server-palette", local_server::palette),
         display("local-server-palette-highlight", local_server::palette_highlight),
         display("local-server-attach-flag", local_server::attach_flag),

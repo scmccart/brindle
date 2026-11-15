@@ -109,7 +109,7 @@ use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
-    SessionRef, Spawned, ToClient, ToCore,
+    Detach, SessionRef, Spawned, ToClient, ToCore,
 };
 use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
@@ -1167,7 +1167,7 @@ impl Connection {
                         if let Some(other) = other {
                             other.fail("answered with REPLAY_START".into());
                         }
-                        self.send(ToCore::Detach(SessionRef { session }));
+                        self.send(ToCore::Detach(Detach { session, layout: None }));
                     }
                 }
             }
@@ -1191,7 +1191,7 @@ impl Connection {
                     // Not one of this process's tabs (any more): it stays
                     // with the core, detached. Only a user's close ends a
                     // program.
-                    self.send(ToCore::Detach(SessionRef { session }));
+                    self.send(ToCore::Detach(Detach { session, layout: None }));
                 }
             }
             ToClient::ReplayEnd(end) => {
@@ -1916,11 +1916,12 @@ impl Running {
         }
     }
 
-    /// Leaves the session running with no client (`DETACH`), unless it
-    /// already exited or was lost.
-    pub fn detach(&self) {
+    /// Leaves the session running with no client (`DETACH`), with the
+    /// layout of the tab it was in for whichever client attaches it next,
+    /// unless it already exited or was lost.
+    pub fn detach(&self, layout: Option<serde_json::Value>) {
         if self.conn.forget(self.id, false) {
-            self.conn.send(ToCore::Detach(SessionRef { session: self.id }));
+            self.conn.send(ToCore::Detach(Detach { session: self.id, layout }));
         }
     }
 }
@@ -2675,9 +2676,9 @@ mod tests {
         plan.link(link);
         far.hello();
         replay(&far.out, 5, None);
-        assert_eq!(far.next(), ToCore::Detach(SessionRef { session: 5 }));
+        assert_eq!(far.next(), ToCore::Detach(Detach { session: 5, layout: None }));
         replay(&far.out, 6, Some(77));
-        assert_eq!(far.next(), ToCore::Detach(SessionRef { session: 6 }));
+        assert_eq!(far.next(), ToCore::Detach(Detach { session: 6, layout: None }));
         assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
         assert!(!connection.is_dead());
     }
@@ -3393,9 +3394,9 @@ mod tests {
         assert!(connection.flush(Instant::now()), "nothing is left to write");
 
         // Stalled: the DETACH is queued, not written, by the deadline.
-        let detach = ToCore::Detach(SessionRef { session: running.id() });
+        let detach = ToCore::Detach(Detach { session: running.id(), layout: None });
         gate.shut(true);
-        running.detach();
+        running.detach(None);
         let started = Instant::now();
         assert!(!connection.flush(started + Duration::from_millis(300)));
         assert!(started.elapsed() >= Duration::from_millis(300), "gave up after {:?}", started.elapsed());
@@ -3415,7 +3416,7 @@ mod tests {
         // process won't wait for.
         far.out.cut();
         eventually("the link is down", || connection.slot.lock().link.is_none());
-        connection.send(ToCore::Detach(SessionRef { session: 99 }));
+        connection.send(ToCore::Detach(Detach { session: 99, layout: None }));
         let started = Instant::now();
         assert!(!connection.flush(started + Duration::from_secs(10)));
         assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());

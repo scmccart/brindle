@@ -923,7 +923,7 @@ impl<L: EventLoop> Core<L> {
         session.meta.owner.clear();
         session.meta.policy = Policy::Detach;
         session.meta.layout = detach.layout.filter(|layout| {
-            let size = serde_json::to_vec(layout).map_or(usize::MAX, |bytes| bytes.len());
+            let size = brindle_remote_protocol::serde_json::to_vec(layout).map_or(usize::MAX, |bytes| bytes.len());
             let kept = size <= client::MAX_LAYOUT;
             if !kept {
                 log!(

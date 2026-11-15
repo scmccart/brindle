@@ -1160,6 +1160,8 @@ fn an_explicit_detach_keeps_a_kill_session_and_clears_its_owner() {
     other.attach(session, 80, 24).unwrap();
 }
 
+use brindle_remote_protocol::serde_json;
+
 fn layout_of(client: &mut TestClient, session: SessionId) -> Option<serde_json::Value> {
     let listed = client.list();
     listed
