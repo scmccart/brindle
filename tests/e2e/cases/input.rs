@@ -19,7 +19,7 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
     let want = Input { text: "split".into(), cursor: 4, selection: (4, 4) };
     ensure!(out.dump.input.as_ref() == Some(&want), "input {:?}, want {want:?}", out.dump.input);
     ensure!(
-        out.dump.palette.first().is_some_and(|l| l == "list query=\"split\""),
+        out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"split\" highlighted=")),
         "palette {:?}",
         out.dump.palette
     );

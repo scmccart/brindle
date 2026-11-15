@@ -214,13 +214,26 @@ fn hidden_command(program: &str) -> Command {
     command
 }
 
-/// "what failed", plus the command's stderr when it printed any.
+/// Splits what a failed command wrote to stderr into the line that names its
+/// cause and the other lines (in their order, joined by newlines, possibly
+/// empty). The cause is the last non-empty line: docker and podman print
+/// just one, ssh prints its warnings before its error, and a login script
+/// that printed before a failing `exec` ends with the `exec`'s error. `None`
+/// when nothing was written.
+pub(crate) fn split_cause(stderr: &str) -> Option<(&str, String)> {
+    let lines: Vec<&str> = stderr.lines().map(str::trim_end).filter(|line| !line.trim().is_empty()).collect();
+    let (cause, rest) = lines.split_last()?;
+    Some((cause.trim(), rest.join("\n")))
+}
+
+/// "what failed: <cause>", with the command's other stderr lines below it
+/// when it printed more than one: the first line, which is all a palette row
+/// shows, names the cause.
 fn bootstrap_failure(what: &str, stderr: &str) -> anyhow::Error {
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        anyhow::anyhow!("{what}")
-    } else {
-        anyhow::anyhow!("{what}: {stderr}")
+    match split_cause(stderr) {
+        None => anyhow::anyhow!("{what}"),
+        Some((cause, rest)) if rest.is_empty() => anyhow::anyhow!("{what}: {cause}"),
+        Some((cause, rest)) => anyhow::anyhow!("{what}: {cause}\n{rest}"),
     }
 }
 
@@ -744,6 +757,48 @@ mod tests {
         let devbox = Scripted::new([Err(exited(255, "boom"))], []);
         let error = devbox.launch(&container_of("docker", None)).unwrap_err();
         assert!(error.downcast_ref::<Unstarted>().is_some(), "{error}");
+    }
+
+    /// A failure's first line names its cause, which is the last line of
+    /// what the command wrote; the other lines follow it.
+    #[test]
+    fn the_cause_is_the_last_line_of_stderr() {
+        // docker's single line.
+        let docker = "Error response from daemon: container abc is not running";
+        assert_eq!(split_cause(docker), Some((docker, String::new())));
+        // ssh's warnings come before its error.
+        let ssh = "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.\r\n\
+                   ssh: connect to host 127.0.0.1 port 2222: Connection refused\r\n";
+        let (cause, rest) = split_cause(ssh).unwrap();
+        assert_eq!(cause, "ssh: connect to host 127.0.0.1 port 2222: Connection refused");
+        assert_eq!(rest, "Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.");
+        // Blank lines and indentation don't count.
+        assert_eq!(split_cause("noise\n\n  boom  \n \n"), Some(("boom", "noise".to_string())));
+        // Nothing written: no cause.
+        assert_eq!(split_cause(""), None);
+        assert_eq!(split_cause(" \n\r\n"), None);
+
+        assert_eq!(bootstrap_failure("what failed", "").to_string(), "what failed");
+        assert_eq!(bootstrap_failure("what failed", docker).to_string(), format!("what failed: {docker}"));
+        assert_eq!(
+            bootstrap_failure("what failed", "one\ntwo\nthree").to_string(),
+            "what failed: three\none\ntwo"
+        );
+    }
+
+    #[test]
+    fn an_ssh_failure_names_its_error_before_ssh_warnings() {
+        let said = "Warning: Permanently added 'a8' (ED25519) to the list of known hosts.\n\
+                    kex_exchange_identification: read: Connection reset by peer";
+        let host = Scripted::new([Err(exited(255, said))], []);
+        let error = host.launch(&ssh_host()).unwrap_err().to_string();
+        let (first, others) = error.split_once('\n').expect("the other lines follow");
+        assert_eq!(first, "SSH connection failed: kex_exchange_identification: read: Connection reset by peer");
+        assert_eq!(others, "Warning: Permanently added 'a8' (ED25519) to the list of known hosts.");
+
+        // Nothing on stderr: today's text.
+        let host = Scripted::new([Err(exited(255, ""))], []);
+        assert_eq!(host.launch(&ssh_host()).unwrap_err().to_string(), "SSH connection failed");
     }
 
     #[test]

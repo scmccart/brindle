@@ -88,7 +88,7 @@ fn a_relay_starts_the_core_reports_its_host_and_relays_a_session() {
     assert!(
         logs.lines().any(|line| line.contains("relay[")
             && line.contains("without a scope of its own (BRINDLE_NO_SCOPE=1)")
-            && line.contains("may not outlive the login")),
+            && !line.contains("may not outlive")),
         "{logs}"
     );
 

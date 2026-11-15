@@ -763,6 +763,19 @@ impl Dump {
         line.split(' ').find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
     }
 
+    /// The open palette list's highlighted row (`highlighted=N|none` on its
+    /// header line): its index among the rows the dump lists, from 0, or
+    /// `None` when nothing is highlighted.
+    pub fn palette_highlighted(&self) -> Result<Option<usize>> {
+        let header = self.palette.first().filter(|line| line.starts_with("list ")).ok_or("no palette list in the dump")?;
+        // The query is quoted and may hold spaces, so the field is the last one.
+        let field = header.rsplit_once(" highlighted=").ok_or_else(|| format!("no highlighted= on {header:?}"))?.1;
+        match field {
+            "none" => Ok(None),
+            at => at.parse().map(Some).map_err(|_| format!("highlighted={at:?} on {header:?}")),
+        }
+    }
+
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
@@ -861,6 +874,17 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.palette == ["list query=\"splt\"", "Split Zone Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
     let input = Input { text: "split".into(), cursor: 4, selection: (1, 4) };
     ensure!(dump.input == Some(input), "input {:?}", dump.input);
+    ensure!(dump.palette_highlighted().is_err(), "a header with no highlighted= has none to read");
+    let dump = Dump::parse(
+        "--- palette list query=\"a highlighted=9\" highlighted=2\nbuild  /tmp · 5m ago\nlogs\nvim\n\
+         --- input text=\"\" cursor=0 selection=0..0\n",
+    );
+    ensure!(dump.palette_highlighted() == Ok(Some(2)), "highlighted {:?}", dump.palette_highlighted());
+    ensure!(dump.palette.len() == 4, "the rows after the header {:?}", dump.palette);
+    let dump = Dump::parse("--- palette list query=\"\" highlighted=none\nA8  listing sessions…\n");
+    ensure!(dump.palette_highlighted() == Ok(None), "highlighted {:?}", dump.palette_highlighted());
+    ensure!(Dump::parse("--- palette prompt \"Name\" text=\"\"\n").palette_highlighted().is_err(), "a prompt has no list");
+    ensure!(Dump::parse("nothing").palette_highlighted().is_err(), "no palette, no highlight");
     let line = "--- settings section=Profiles mode=editor name=\"Shell\" field=\"Theme\" theme=\"e2e-alt\" default=true invalid=[] can_save=true error=None\n";
     let dump = Dump::parse(line);
     let settings = dump.settings.as_deref().unwrap_or("");

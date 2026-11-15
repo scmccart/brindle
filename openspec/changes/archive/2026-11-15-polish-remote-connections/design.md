@@ -151,23 +151,20 @@ It has three operations: an answer arrives, a session is killed, and a view is b
 
 `attach_swept` and `attach_detached_here` both call it. `Workspace` passes the profile name of the first tab on the endpoint, which is the only lookup that needs GPUI. `reattach::swept_tabs(listed, skip, host, config, first_tab_profile)` joins `sweep` with this choice, so `attach_swept` only inserts tabs. This is decided question 4, which keeps today's behaviour, now specified.
 
-### 8. The label column fits its widest label
+### 8. The profile editor's rows share one control height
 
-First, confirm the wrap. Capture the profile editor of an ssh profile in `settings-editor-connect-at-launch`:
-- on Linux under `scripts/with-xvfb`, with fontconfig's default UI font;
-- on Windows, with Segoe UI.
+The user asked on 2026-11-15 for a standard height for the profile editor's fields, aligned with shadcn/ui. It replaces the earlier plan, which only made the label column fit. On Windows no label wraps (the user's check), so that plan was not needed there.
 
-If no label wraps on either platform, the item ends there, with the captures as evidence.
-
-If a label wraps:
-- The column's width becomes the widest label's shaped width at the dialog's text size, through `window.text_system()`. It is measured when the editor opens and again when the root text size changes, not every frame.
-- Labels are also `whitespace_nowrap`.
-- The error line's indent (`pl(128)`) becomes the column's width plus the row's gap.
+- `brindle-ui` gets `FIELD_HEIGHT`, 36 px: shadcn's `h-9`, the height of its `Input`, `SelectTrigger` and default `Button`. `Input` uses it.
+- Every profile editor row's control line is at least `FIELD_HEIGHT` tall (`min_h`), with its control centred: text fields, choices, the "Connect at launch" switch and the "Default" checkbox alike. This is shadcn's horizontal `Field`: label and control in a row, `items-center`.
+- An error message sits beneath its row's control line at its natural height, a small gap below it, indented to the controls, and wraps when long, as shadcn's `FieldError` does. Rows are not snapped to a grid.
+- The gap between rows stays as it is (`gap_1`).
+- Label wrap: Linux's capture (`settings-editor-connect-at-launch`) is still checked. If a label wraps there, the label column's width becomes the widest label's shaped width at the dialog's text size, measured when the editor opens, labels become `whitespace_nowrap`, and the error line's indent follows the column.
 
 Alternatives considered:
-- A wider fixed column: it breaks with the next font or a longer label.
-- A shorter label: the spec, the dump and the e2e case pin "Connect at launch".
-- `whitespace_nowrap` alone: labels of different widths would misalign the controls.
+- A grid of half-height steps (18 px), an error line taking exactly one: tried first (02eaa06) and dropped. shadcn has no row grid, and a long error would overflow its fixed line.
+- Padding only the switch and checkbox rows to 36 px: it fixes today's two rows but leaves the next control to drift again.
+- A height for every control in `brindle-ui` (checkbox, switch): shadcn draws them at their own sizes (`size-4`, the switch's track), as the theme list and the gallery do, and only the editor's rows need to line up.
 
 ### 9. Pure seams for the wiring
 
@@ -179,6 +176,14 @@ Item 12's functions, each with `#[test]`s in its own module:
 - `Hosts::apply_all(batch) -> bool`, the fold `main.rs`'s `watch_hosts` runs over a batch of reports.
 
 `launch_hosts` and `eager_hosts` already have tests. What is left in `Workspace` and `main.rs` is spawning work and applying the results.
+
+### 10. The core reads a failing client before dropping it
+
+Found while verifying (8.1). `Core::flush_client` drops a client as soon as a write to it fails, and a `DETACH` already in that client's pipe is never handled: `client_gone` keeps the owner of a `detach` session, so the session lists `owned`, and the next launch within 5 minutes doesn't sweep it. Brindle's quit has this shape whenever the core has output queued for its connection.
+
+On a failed write, the core reads what the client sent, up to a limit, and handles those frames before `client_gone`. This is the holder's `flush_core` (`DEAD_CORE_READ_LIMIT`), applied to clients. Frames that would answer the client are dropped, since the client is gone. Alternatives considered:
+- Giving `DETACH` a reply, and having Brindle wait for it on quit: a protocol change, and quit would wait on the core.
+- Only a barrier in the test: it hides the bug.
 
 ## Risks / Trade-offs
 

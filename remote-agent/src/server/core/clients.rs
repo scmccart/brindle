@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::{RequestId, SessionId};
 
-use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, MAX_LINGER, Source, log};
+use super::{
+    CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, DEAD_CLIENT_READ_LIMIT, MAX_LINGER, Source, log,
+};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
 
@@ -44,6 +46,9 @@ pub(super) struct Client {
     linger: Duration,
     /// It speaks protocol 2 and asked for `PROCESS`.
     pub(super) process_info: bool,
+    /// A write to it failed: what it sent is being handled before it is
+    /// dropped ([`Core::drop_failed_client`]), and nothing more is sent.
+    failed: bool,
 }
 
 impl<L: EventLoop> Core<L> {
@@ -190,6 +195,7 @@ impl<L: EventLoop> Core<L> {
                 over: false,
                 linger,
                 process_info,
+                failed: false,
             },
         );
         self.reattach(token);
@@ -298,11 +304,15 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Queues a message for a client. Past [`CLIENT_QUEUE_HIGH`] the client's
-    /// sessions are paused in their holders.
+    /// sessions are paused in their holders. A client whose write failed is
+    /// sent nothing: it is gone.
     pub(super) fn send_client(&mut self, client: Token, message: ToClient) {
         let Some(entry) = self.clients.get_mut(&client) else {
             return;
         };
+        if entry.failed {
+            return;
+        }
         queue(&mut entry.conn, message);
         if entry.conn.queued() >= EAGER_FLUSH {
             // A failure shows again in the loop's own flush, which drops
@@ -316,18 +326,37 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Sends what the socket takes; back under [`CLIENT_QUEUE_LOW`], the
-    /// client's sessions are resumed.
+    /// client's sessions are resumed. A failed write drops the client once
+    /// what it sent is handled ([`Core::drop_failed_client`]).
     pub(super) fn flush_client(&mut self, client: Token) {
         let Some(entry) = self.clients.get_mut(&client) else {
             return;
         };
         if let Err(error) = entry.conn.flush() {
-            return self.drop_client(client, &format!("write failed: {error}"));
+            return self.drop_failed_client(client, &format!("write failed: {error}"));
         }
         if entry.over && entry.conn.queued() < CLIENT_QUEUE_LOW {
             entry.over = false;
             self.pause_client_sessions(client, false);
         }
+    }
+
+    /// A write to the client failed, so it is gone, but what it sent before
+    /// it went still counts, as in [`Core::read_client`]: a client that
+    /// detaches its sessions and then closes (Brindle quitting) may be found
+    /// gone by a write before the core has read its `DETACH`es. All of it is
+    /// read, up to [`DEAD_CLIENT_READ_LIMIT`] rather than one turn's budget,
+    /// since this connection has no later turn, and its frames are handled
+    /// before the close policies apply. What would answer them is dropped.
+    fn drop_failed_client(&mut self, client: Token, reason: &str) {
+        let Some(entry) = self.clients.get_mut(&client) else {
+            return;
+        };
+        entry.failed = true;
+        // A read that fails after some bytes keeps them.
+        let _ = entry.conn.read_up_to(DEAD_CLIENT_READ_LIMIT);
+        self.process_client_frames(client);
+        self.drop_client(client, reason);
     }
 
     /// The client is gone, and its sessions' close policies apply.

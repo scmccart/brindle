@@ -15,7 +15,11 @@
 //!    takes its scopes with it. Otherwise the core starts plain, in the
 //!    login's session (which outlives the login unless the host sets
 //!    `KillUserProcesses=yes`), with `BRINDLE_NO_SCOPE=1` so its holders do
-//!    too, and `core.log` gets one line saying so.
+//!    too, and `core.log` gets one line saying so and why. The line adds that
+//!    the sessions may not outlive the login only when a user manager is
+//!    reachable (the user doesn't linger, or `systemd-run` is missing): a
+//!    host with no user manager, a container for one, or `BRINDLE_NO_SCOPE=1`
+//!    gets the plain line, since no scope was possible to ask for.
 //! 3. **Upgrade:** on a connection of its own (token `relay-<pid>-upgrade`,
 //!    which owns nothing), the relay reads `WELCOME` and compares its build
 //!    with the core's by the rules a local client uses
@@ -350,13 +354,10 @@ impl Server {
     fn start_core(&self) -> Result<(), String> {
         let user = crate::pty::user_name();
         let lingers = lingers(user.as_deref(), |path| path.exists());
-        let decision = decide_scope(scope::current(), lingers);
+        let ScopeChoice { decision, note } = decide_scope(scope::current_outcome(), lingers);
         let mut env: Vec<(&str, &OsStr)> = vec![("BRINDLE_SERVER_DIR", self.dir.as_os_str())];
-        if let scope::Decision::Plain(reason) = &decision {
-            self.log.line(format_args!(
-                "starting the core without a scope of its own ({reason}); its sessions may not \
-                 outlive the login unless the user lingers (`loginctl enable-linger`)"
-            ));
+        if let Some(note) = note {
+            self.log.line(format_args!("{note}"));
             env.push((scope::NO_SCOPE_ENV, OsStr::new("1")));
         }
         let started = daemon::start_role_as(
@@ -566,14 +567,46 @@ fn runs(pid: u32) -> bool {
     !matches!(state, None | Some('Z' | 'X'))
 }
 
+/// Where a relay starts a core, and the line for `core.log` when that is
+/// without a scope.
+#[derive(Debug, PartialEq, Eq)]
+struct ScopeChoice {
+    decision: scope::Decision,
+    /// `Some` exactly when `decision` is [`scope::Decision::Plain`].
+    note: Option<String>,
+}
+
 /// Where a relay starts a core: as `current` (this process's environment)
 /// decides, except that a scope needs the user to linger, since otherwise the
 /// user manager stops after the last login and takes its scopes with it.
-fn decide_scope(current: scope::Decision, lingers: bool) -> scope::Decision {
-    match current {
+///
+/// The note says the core starts without a scope and why. It adds that the
+/// sessions may not outlive the login only when a user manager is reachable,
+/// the one case where a scope was possible (the user doesn't linger, or
+/// `systemd-run` is missing). With no user manager (a container, a host
+/// without systemd) or `BRINDLE_NO_SCOPE=1`, nothing could have been done
+/// about it, so the note stays plain.
+fn decide_scope(current: scope::Outcome, lingers: bool) -> ScopeChoice {
+    let scope::Outcome {
+        decision,
+        user_manager,
+    } = current;
+    let decision = match decision {
         scope::Decision::Scope(_) if !lingers => scope::Decision::Plain("the user doesn't linger"),
         decision => decision,
-    }
+    };
+    let note = match &decision {
+        scope::Decision::Scope(_) => None,
+        scope::Decision::Plain(reason) if user_manager => Some(format!(
+            "starting the core without a scope of its own ({reason}); its sessions may not \
+             outlive the login if the host sets KillUserProcesses=yes (`loginctl enable-linger` \
+             keeps them)"
+        )),
+        scope::Decision::Plain(reason) => Some(format!(
+            "starting the core without a scope of its own ({reason})"
+        )),
+    };
+    ScopeChoice { decision, note }
 }
 
 /// Whether `user` lingers: `/var/lib/systemd/linger/<user>` exists.
@@ -708,18 +741,58 @@ fn heartbeats(output: &Output, every: Duration, ended: &Sender<End>) {
 mod tests {
     use super::*;
 
+    fn outcome(decision: scope::Decision, user_manager: bool) -> scope::Outcome {
+        scope::Outcome {
+            decision,
+            user_manager,
+        }
+    }
+
     #[test]
-    fn a_scope_needs_a_lingering_user() {
+    fn the_login_warning_is_logged_only_where_a_user_manager_could_have_given_a_scope() {
         let scoped = || scope::Decision::Scope(PathBuf::from("/usr/bin/systemd-run"));
-        assert_eq!(decide_scope(scoped(), true), scoped());
-        assert_eq!(
-            decide_scope(scoped(), false),
-            scope::Decision::Plain("the user doesn't linger")
-        );
-        // Without a user manager, lingering changes nothing.
-        let plain = scope::Decision::Plain("no systemd user manager");
-        assert_eq!(decide_scope(plain.clone(), true), plain);
-        assert_eq!(decide_scope(plain.clone(), false), plain);
+        const WARNING: &str = "may not outlive the login";
+
+        // A scope for a lingering user: nothing to say.
+        let choice = decide_scope(outcome(scoped(), true), true);
+        assert_eq!(choice, ScopeChoice { decision: scoped(), note: None });
+
+        // A user manager but no linger: plain, and the warning.
+        let choice = decide_scope(outcome(scoped(), true), false);
+        assert_eq!(choice.decision, scope::Decision::Plain("the user doesn't linger"));
+        let note = choice.note.expect("a note");
+        assert!(note.contains("without a scope of its own (the user doesn't linger)"), "{note}");
+        assert!(note.contains(WARNING) && note.contains("enable-linger"), "{note}");
+
+        // A user manager but no systemd-run: plain, and the warning, whatever
+        // the linger file says.
+        for lingers in [true, false] {
+            let missing = scope::Decision::Plain("systemd-run isn't on PATH");
+            let choice = decide_scope(outcome(missing.clone(), true), lingers);
+            assert_eq!(choice.decision, missing);
+            let note = choice.note.expect("a note");
+            assert!(note.contains("systemd-run isn't on PATH") && note.contains(WARNING), "{note}");
+        }
+
+        // No user manager (a container): plain with its reason, no warning,
+        // whatever the linger file says.
+        for lingers in [true, false] {
+            for reason in ["no systemd user manager", "XDG_RUNTIME_DIR is unset"] {
+                let plain = scope::Decision::Plain(reason);
+                let choice = decide_scope(outcome(plain.clone(), false), lingers);
+                assert_eq!(choice.decision, plain);
+                let note = choice.note.expect("a note");
+                assert!(note.contains("without a scope of its own"), "{note}");
+                assert!(note.contains(reason) && !note.contains(WARNING), "{note}");
+            }
+        }
+
+        // BRINDLE_NO_SCOPE=1: the same, no warning.
+        let off = scope::Decision::Plain("BRINDLE_NO_SCOPE=1");
+        let choice = decide_scope(outcome(off.clone(), false), true);
+        assert_eq!(choice.decision, off);
+        let note = choice.note.expect("a note");
+        assert!(note.contains("BRINDLE_NO_SCOPE=1") && !note.contains(WARNING), "{note}");
     }
 
     #[test]

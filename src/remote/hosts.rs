@@ -22,8 +22,9 @@ pub enum LinkState {
     /// No link is up, and why: an attempt failed, or the link was lost. It
     /// stays offline through later attempts until a link is up.
     Offline(String),
-    /// The connection ended for good, and why: nothing used it, or the
-    /// endpoint's server refused this Brindle. Its last report.
+    /// The connection ended for good, and why: nothing used it (its unwritten
+    /// `CLOSE`s given up, if any), or the endpoint's server refused this
+    /// Brindle and no profile connects to it at launch. Its last report.
     Ended(String),
 }
 
@@ -120,6 +121,13 @@ impl Hosts {
         std::mem::replace(&mut entry.state, state.clone()) != state
     }
 
+    /// Applies a batch of reports ([`Hosts::apply`]), each `(host, conn,
+    /// state)`, in order. Says whether any changed what the palette shows.
+    pub fn apply_all(&mut self, batch: impl IntoIterator<Item = (Host, u64, LinkState)>) -> bool {
+        // `|`, not `||`: every report applies, whatever the earlier ones did.
+        batch.into_iter().fold(false, |changed, (host, conn, state)| self.apply(&host, conn, state) | changed)
+    }
+
     /// Each endpoint and its state, in the order they were first known.
     pub fn states(&self) -> Vec<(Host, HostState)> {
         self.entries.iter().map(|entry| (entry.host.clone(), entry.state.clone())).collect()
@@ -194,6 +202,36 @@ mod tests {
         hosts.apply(&a8, 4, LinkState::Connecting);
         hosts.apply(&a8, 3, LinkState::Ended("the old one".into()));
         assert_eq!(hosts.state(&a8), Some(&HostState::Connecting), "a replaced connection's end");
+    }
+
+    /// 3.4: a batch of reports applies in order, every one of them, and
+    /// says whether any changed what the palette shows.
+    #[test]
+    fn a_batch_applies_in_order_and_says_whether_anything_changed() {
+        let (mut hosts, a8, b9) = (Hosts::default(), ssh("A8"), ssh("B9"));
+        let batch = vec![
+            (a8.clone(), 1, LinkState::Connecting),
+            (a8.clone(), 1, LinkState::Connected),
+            (b9.clone(), 2, LinkState::Offline("ssh: Connection refused".into())),
+        ];
+        assert!(hosts.apply_all(batch));
+        assert_eq!(hosts.states(), [(a8.clone(), HostState::Connected), (b9.clone(), offline("ssh: Connection refused"))]);
+        // Nothing new: no change.
+        assert!(!hosts.apply_all(vec![(a8.clone(), 1, LinkState::Connected)]));
+        assert!(!hosts.apply_all(Vec::new()));
+        // A change after reports that change nothing still counts, and the
+        // last report wins.
+        let batch = vec![
+            (a8.clone(), 1, LinkState::Connected),
+            (b9.clone(), 2, LinkState::Connected),
+            (b9.clone(), 2, LinkState::Offline("connection lost: ssh exited with 255".into())),
+        ];
+        assert!(hosts.apply_all(batch));
+        assert_eq!(hosts.state(&b9), Some(&offline("connection lost: ssh exited with 255")));
+        // A change before reports that change nothing does too.
+        let batch = vec![(a8.clone(), 1, LinkState::Ended("the connection was no longer used".into())), (b9, 2, LinkState::Offline("connection lost: ssh exited with 255".into()))];
+        assert!(hosts.apply_all(batch));
+        assert_eq!(hosts.state(&a8), None);
     }
 
     /// A reload that turns connecting at launch off forgets an eager host

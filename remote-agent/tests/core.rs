@@ -86,6 +86,11 @@ mod programs {
         assert_eq!(output.len(), FLOOD, "every byte of output");
     }
 
+    /// Prints lines until it is ended.
+    pub fn floods() -> Spawn {
+        client_shell("exec yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    }
+
     /// Starts a child that runs until it is ended, and waits for it.
     pub fn with_a_child() -> Spawn {
         client_shell("sleep 1000 & echo \"bg=$!.\"; wait")
@@ -169,6 +174,13 @@ mod programs {
     /// Fails unless `output` is all of [`flood`]'s.
     pub fn check_flood(output: &[u8]) {
         check_lines(output, FLOOD_LINES);
+    }
+
+    /// Prints lines until it is ended.
+    pub fn floods() -> Spawn {
+        client_shell(
+            "for /l %i in (0,0,1) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        )
     }
 
     /// Starts a child that runs until it is ended, and waits for it.
@@ -1369,6 +1381,86 @@ fn the_session_list_tells_a_dropped_owner_from_an_explicit_detach() {
     let info = listed(&mut observer, released);
     assert!(!info.attached && !info.owned, "{info:?}");
     assert!((2..60).contains(&info.detached_secs), "{info:?}");
+}
+
+/// How many times [`a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write`]
+/// tries its race.
+const DETACH_RACE_ATTEMPTS: usize = 20;
+
+/// `polish-remote-connections` 3.6: a client detaches a session and closes
+/// while the core is writing its other session's output to it, as Brindle's
+/// quit does. The core may find the client gone by a failed write before it
+/// reads the `DETACH`, which must count all the same: the session loses its
+/// owner. Which comes first is a race, so it is tried several times.
+#[test]
+fn a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write() {
+    let mut dir = TempDir::new("detach-write-fails");
+    start_core(&dir.path, &[]).unwrap();
+    let mut observer = TestClient::hello(&dir.path, "observer");
+    dir.track(observer.core_pid());
+    let mut kept_their_owner = Vec::new();
+    for attempt in 0..DETACH_RACE_ATTEMPTS {
+        let stream = connect(&core_endpoint(&dir.path)).unwrap();
+        let mut reader = stream.try_clone().unwrap();
+        let closer = stream.try_clone().unwrap();
+        let mut owner =
+            TestClient::over(stream).greet(&format!("token-detach-write-{attempt}"), |_| {});
+        let (released, _) = owner.spawn(detach(programs::sleeps()));
+        owner.spawn(programs::floods());
+        // Another thread reads the flood, so the core keeps writing to this
+        // connection and is about to write again when it closes.
+        let draining = thread::spawn(move || {
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                match std::io::Read::read(&mut reader, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(300));
+        owner.detach(released);
+        close(&closer);
+        drop(owner);
+        drop(closer);
+        draining.join().unwrap();
+
+        // It loses its client through the DETACH, or else with the
+        // connection; only the DETACH clears its owner.
+        let mut info = None;
+        assert!(
+            eventually(TIMEOUT, || {
+                let listed = observer.list();
+                info = listed.into_iter().find(|info| info.session == released);
+                info.as_ref().is_some_and(|info| !info.attached)
+            }),
+            "session {released} kept its client: {info:?}"
+        );
+        if info.is_some_and(|info| info.owned) {
+            kept_their_owner.push(released);
+        }
+    }
+    let logs = dir.logs();
+    let clients: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains(" left (") || line.contains("detached by"))
+        .collect();
+    assert!(
+        kept_their_owner.is_empty(),
+        "{} of {DETACH_RACE_ATTEMPTS} DETACHes were lost (sessions {kept_their_owner:?}):\n{}",
+        kept_their_owner.len(),
+        clients.join("\n")
+    );
+    observer.send(client::ToCore::Stop(client::Request { req: 901 }));
+    assert!(matches!(observer.reply(901), ToClient::Ok(_)));
 }
 
 /// A client that negotiated protocol 2 and asked for process info.

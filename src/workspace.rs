@@ -18,7 +18,7 @@ use crate::actions::*;
 use crate::config::{Config, Profile};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SubmitFn};
+use crate::picker::{Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
@@ -197,12 +197,11 @@ enum PaletteKind {
     Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
     Prompt,
     /// The detached sessions of this machine's terminal server and of each
-    /// remote endpoint's: what each endpoint listed, what each row stands
-    /// for (enter attaches a session into a new tab, `picker_kill` ends it,
-    /// both on its endpoint's connection), and the sessions killed from it
-    /// (endpoint, id and key), whose rows stay gone while their programs
-    /// exit.
-    Sessions { listed: Vec<(Host, Listing)>, rows: Vec<SessionRow>, killed: Vec<(Host, u32, String)> },
+    /// remote endpoint's: the model that holds what each endpoint listed,
+    /// the sessions killed from it and the highlighted row, and knows what
+    /// each row stands for (enter attaches a session into a new tab,
+    /// `picker_kill` ends it, both on its endpoint's connection).
+    Sessions { model: SessionsModel },
 }
 
 /// How long the sessions palette waits for a remote endpoint's listing
@@ -210,48 +209,82 @@ enum PaletteKind {
 #[cfg(any(target_os = "linux", windows))]
 const LIST_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The endpoints the sessions palette lists, with how each stands: this
+/// machine first, then the [`Hosts`] endpoints (`states`) in their order.
+fn palette_endpoints(states: Vec<(Host, HostState)>) -> Vec<(Host, HostState)> {
+    let mut endpoints = vec![(Host::Local, HostState::Connected)];
+    endpoints.extend(states.into_iter().filter(|(host, _)| !host.is_local()));
+    endpoints
+}
+
+/// What the sessions palette lists for `host`, `state` being how the
+/// endpoint stands and `listed` what asking it gave (`Err`: why that
+/// failed; `None`: it wasn't asked, which is how a connecting or offline
+/// endpoint is). A connecting or offline endpoint says so; this machine's
+/// failure is logged and lists nothing; any other endpoint that can't
+/// answer is offline. Sessions attached to a client are left out.
+fn listing_from(host: &Host, state: &HostState, listed: Option<Result<Vec<SessionInfo>, String>>) -> Listing {
+    match (host, state) {
+        (Host::Remote(_), HostState::Connecting) => return Listing::Connecting,
+        (Host::Remote(_), HostState::Offline(why)) => return Listing::Offline(why.clone()),
+        _ => {}
+    }
+    match listed.unwrap_or_else(|| Err("no listing was made".into())) {
+        Ok(sessions) => Listing::Sessions(sessions.into_iter().filter(|s| !s.attached).collect()),
+        Err(why) if host.is_local() => {
+            log::warn!("listing sessions: {why}");
+            Listing::Sessions(Vec::new())
+        }
+        Err(why) => Listing::Offline(why),
+    }
+}
+
 /// Kills session `kill` (if given), then lists `host`'s detached sessions
 /// for the sessions palette, `state` being how the endpoint stands. Blocks:
 /// off the UI thread. This machine's server is listed through the shared
-/// connection, as ever (a failure is logged, and lists nothing). A remote
-/// endpoint is listed only when connected, on the connection the process
-/// has (none is made), within [`LIST_LIMIT`]; one connecting or offline
-/// says so, and one that doesn't answer is offline.
+/// connection, as ever. A remote endpoint is listed only when connected,
+/// on the connection the process has (none is made), within [`LIST_LIMIT`];
+/// [`listing_from`] decides what that gives.
 fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> Listing {
+    let listed = match (host, state) {
+        (Host::Remote(_), HostState::Connecting | HostState::Offline(_)) => None,
+        _ => Some(list_sessions(host, kill)),
+    };
+    listing_from(host, state, listed)
+}
+
+/// Kills session `kill` (if given) on `host`'s connection, then lists its
+/// sessions.
+fn list_sessions(host: &Host, kill: Option<u32>) -> Result<Vec<SessionInfo>, String> {
     #[cfg(any(target_os = "linux", windows))]
     {
         use crate::remote::local;
 
-        let connection = match (host, state) {
-            (Host::Local, _) => local::shared(host),
-            (Host::Remote(_), HostState::Connecting) => return Listing::Connecting,
-            (Host::Remote(_), HostState::Offline(why)) => return Listing::Offline(why.clone()),
-            (Host::Remote(_), HostState::Connected) => {
-                local::existing(host).ok_or_else(|| anyhow::anyhow!("the connection ended"))
-            }
+        let connection = match host {
+            Host::Local => local::shared(host),
+            Host::Remote(_) => local::existing(host).ok_or_else(|| anyhow::anyhow!("the connection ended")),
         };
         let limit = (!host.is_local()).then_some(LIST_LIMIT);
-        let listed = connection.and_then(|connection| {
-            if let Some(id) = kill
-                && let Err(why) = connection.kill_within(id, limit)
-            {
-                log::warn!("killing session {id} on {}: {why:#}", host.name());
-            }
-            connection.list_within(limit)
-        });
-        match listed {
-            Ok(sessions) => Listing::Sessions(sessions.into_iter().filter(|s| !s.attached).collect()),
-            Err(why) if host.is_local() => {
-                log::warn!("listing sessions: {why:#}");
-                Listing::Sessions(Vec::new())
-            }
-            Err(why) => Listing::Offline(format!("{why:#}")),
-        }
+        connection
+            .and_then(|connection| {
+                if let Some(id) = kill
+                    && let Err(why) = connection.kill_within(id, limit)
+                {
+                    log::warn!("killing session {id} on {}: {why:#}", host.name());
+                }
+                connection.list_within(limit)
+            })
+            .map_err(|why| format!("{why:#}"))
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (host, state, kill);
-        Listing::Sessions(Vec::new())
+        let _ = (host, kill);
+        Ok(Vec::new())
     }
 }
 
@@ -264,9 +297,12 @@ pub struct Workspace {
     palette: UiOverlay<Palette>,
     /// What the open palette is for, and the subscription to its events.
     palette_kind: Option<PaletteKind>,
-    /// The sessions palette's latest listing: an older one that answers
-    /// later is dropped.
+    /// The sessions palette's latest round of listings: an older round's
+    /// answers are dropped.
     sessions_listing: u64,
+    /// The sessions palette that isn't open yet: it collects the endpoints'
+    /// answers until all are in or `OPEN_GRACE` has passed.
+    sessions_opening: Option<SessionsModel>,
     _palette_subscription: Option<Subscription>,
     /// The settings dialog's modal slot. A press on its backdrop does
     /// nothing, so a stray click never throws away a preview or an edit.
@@ -341,6 +377,7 @@ impl Workspace {
             palette: UiOverlay::modal(),
             palette_kind: None,
             sessions_listing: 0,
+            sessions_opening: None,
             _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
@@ -750,27 +787,25 @@ impl Workspace {
     }
 
     /// Opens a tab at the end for each session `host`'s first listing of the
-    /// launch has that the launch attaches ([`crate::reattach::sweep`]):
+    /// launch has that the launch attaches ([`crate::reattach::swept_tabs`]):
     /// not restored into a zone, not shown here already, and with no owner
-    /// that may come back. Each takes the profile it was started with when
-    /// that targets `host`, else the first that does; when none does, the
-    /// profile of the restored tab that brought the launch to `host` (or
-    /// the default one), on `host` all the same. The active tab stays the
-    /// same, and the replays raise no bells or notifications.
+    /// that may come back. Each takes the profile
+    /// [`crate::reattach::session_profile`] gives it, on `host` whatever that
+    /// profile targets. The active tab stays the same, and the replays raise
+    /// no bells or notifications.
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach_swept(&mut self, host: Host, listed: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let mut skip: Vec<session::ServerSession> =
             self.restored_sessions.iter().filter(|(on, _)| *on == host).map(|(_, s)| s.clone()).collect();
         skip.extend(self.sessions_on(&host, cx));
-        let sessions = crate::reattach::sweep(listed, &skip);
-        if sessions.is_empty() {
+        let first = self.profile_on(&host);
+        let tabs = crate::reattach::swept_tabs(listed, &skip, &host, &config, first.as_deref());
+        if tabs.is_empty() {
             return;
         }
-        log::info!("attaching {} detached session(s) on {}", sessions.len(), host.name());
-        let fallback = self.profile_on(&host, &config);
-        for info in sessions {
-            let index = crate::reattach::remote_profile(&info, &host, &config).unwrap_or(fallback);
+        log::info!("attaching {} detached session(s) on {}", tabs.len(), host.name());
+        for (info, index) in tabs {
             let profile = config.profiles[index].clone();
             let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
             let activate = self.tabs.is_empty();
@@ -778,16 +813,11 @@ impl Workspace {
         }
     }
 
-    /// The profile a session of `host` opens with when no profile targets
-    /// `host`: that of a tab on `host` (a restored one, for a launch), or
-    /// the default one.
+    /// The name of the profile of the first tab on `host`, the one lookup
+    /// [`crate::reattach::session_profile`] needs from the window.
     #[cfg(any(target_os = "linux", windows))]
-    fn profile_on(&self, host: &Host, config: &Config) -> usize {
-        self.tabs
-            .iter()
-            .find(|tab| tab.host == *host)
-            .and_then(|tab| config.profile_index(&tab.profile.name))
-            .unwrap_or_else(|| config.default_profile_index())
+    fn profile_on(&self, host: &Host) -> Option<String> {
+        self.tabs.iter().find(|tab| tab.host == *host).map(|tab| tab.profile.name.clone())
     }
 
     /// The sessions this window's tabs on `host` show (or are attaching).
@@ -1003,13 +1033,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Removes tab `ix`, ending its terminals' programs.
+    /// Removes tab `ix`, ending its terminals' programs. When it was the
+    /// last tab on a remote endpoint that no profile connects to at launch,
+    /// the launch stops waiting for that endpoint's first listing
+    /// ([`crate::remote::local::stop_listing`]), so it doesn't sweep it.
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
+        #[cfg(any(target_os = "linux", windows))]
+        let before: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
         let tab = self.tabs.remove(ix);
         tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            let after: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
+            let eager = crate::reattach::eager_hosts(Self::settings(cx));
+            for host in crate::reattach::endpoints_without_tabs(&before, &after, &eager) {
+                crate::remote::local::stop_listing(&host);
+            }
+        }
         if self.tabs.is_empty() {
             // Nothing to restore for a window whose tabs all closed.
             let id = self.window_id;
@@ -1327,8 +1370,9 @@ impl Workspace {
             }
             // A prompt has no rows to confirm.
             PaletteKind::Prompt => self.palette_kind = Some(PaletteKind::Prompt),
-            PaletteKind::Sessions { listed, rows, killed } => {
-                let target = rows.get(ix).and_then(SessionRow::session).map(|(host, info)| (host.clone(), info.clone()));
+            PaletteKind::Sessions { model } => {
+                let target =
+                    model.rows().get(ix).and_then(SessionRow::session).map(|(host, info)| (host.clone(), info.clone()));
                 match target {
                     Some((host, info)) => {
                         self.dismiss_overlay(window, cx);
@@ -1336,7 +1380,7 @@ impl Workspace {
                     }
                     // A row that does nothing (the command list confirms
                     // none of them anyway).
-                    None => self.palette_kind = Some(PaletteKind::Sessions { listed, rows, killed }),
+                    None => self.palette_kind = Some(PaletteKind::Sessions { model }),
                 }
             }
         }
@@ -1359,94 +1403,119 @@ impl Workspace {
         }
     }
 
-    /// Kills `kill` first, if given (an endpoint and a session id), then
-    /// lists the detached sessions of this machine and of each remote
-    /// endpoint the [`Hosts`] global holds, each on a background thread, and
-    /// shows them in the sessions palette once all have answered. Only the
-    /// latest listing is shown, and unless `opening`, only in a sessions
-    /// palette still open: one closed meanwhile stays closed.
+    /// Starts a round of listings: kills `kill` first, if given (an endpoint
+    /// and a session id), then lists the detached sessions of this machine
+    /// and of each remote endpoint the [`Hosts`] global holds
+    /// ([`palette_endpoints`]), each on a background thread. Each endpoint's
+    /// answer is applied as it arrives ([`Workspace::sessions_answered`]),
+    /// and only if it is of the latest round.
+    ///
+    /// With `opening`, the sessions palette doesn't exist yet. It opens
+    /// when every endpoint has answered, or after `OPEN_GRACE`
+    /// ([`crate::picker::OPEN_GRACE`], about 250 ms), whichever comes first:
+    /// the usual palette opens complete, and a slow endpoint doesn't keep it
+    /// closed, but is listed as `listing sessions…` until it answers. Without
+    /// `opening`, the answers go to the open sessions palette's model, which
+    /// keeps the highlighted row where it was; a palette closed meanwhile
+    /// stays closed.
     fn refresh_sessions_palette(&mut self, kill: Option<(Host, u32)>, opening: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let mut endpoints = vec![(Host::Local, HostState::Connected)];
-        endpoints.extend(cx.try_global::<Hosts>().map(Hosts::states).unwrap_or_default());
+        let endpoints = palette_endpoints(cx.try_global::<Hosts>().map(Hosts::states).unwrap_or_default());
         self.sessions_listing += 1;
-        let listing = self.sessions_listing;
-        let listings: Vec<_> = endpoints
-            .into_iter()
-            .map(|(host, state)| {
-                let kill = kill.as_ref().filter(|(on, _)| *on == host).map(|(_, id)| *id);
-                cx.background_executor().spawn(async move {
-                    let listed = listing_of(&host, &state, kill);
-                    (host, listed)
-                })
-            })
-            .collect();
-        cx.spawn_in(window, async move |this, cx| {
-            let listed = futures::future::join_all(listings).await;
-            this.update_in(cx, |this, window, cx| {
-                let open = matches!(&this.palette_kind, Some(PaletteKind::Sessions { .. }));
-                if listing == this.sessions_listing && (open || opening) {
-                    this.show_sessions_palette(listed, window, cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Shows what the endpoints `listed` in the sessions palette: in place
-    /// in an open one, keeping its filter text and the sessions killed from
-    /// it, else in a new one.
-    fn show_sessions_palette(&mut self, listed: Vec<(Host, Listing)>, window: &mut Window, cx: &mut Context<Self>) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let killed = match &self.palette_kind {
-            Some(PaletteKind::Sessions { killed, .. }) => killed.clone(),
-            _ => Vec::new(),
-        };
-        let shown = crate::picker::session_palette(&listed, &killed, Self::settings(cx), now);
-        if let Some(PaletteKind::Sessions { listed: kept, rows, .. }) = &mut self.palette_kind
-            && let Some(palette) = self.palette.view().cloned()
-        {
-            *kept = listed;
-            *rows = shown.rows;
-            palette.update(cx, |palette, cx| palette.set_groups(shown.groups, shown.empty, cx));
-            cx.notify();
+        let round = self.sessions_listing;
+        let hosts = endpoints.iter().map(|(host, _)| host.clone());
+        if opening {
+            self.sessions_opening = Some(SessionsModel::new(round, hosts));
+        } else if let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind {
+            model.start_round(round, hosts);
+        } else {
             return;
         }
-        let palette = cx.new(|cx| Palette::list_grouped(shown.groups, "Attach a detached session", shown.empty, cx));
-        self.show_palette(palette, PaletteKind::Sessions { listed, rows: shown.rows, killed }, window, cx);
+        for (host, state) in endpoints {
+            let kill = kill.as_ref().filter(|(on, _)| *on == host).map(|(_, id)| *id);
+            let listing = {
+                let host = host.clone();
+                cx.background_executor().spawn(async move { listing_of(&host, &state, kill) })
+            };
+            cx.spawn_in(window, async move |this, cx| {
+                let listed = listing.await;
+                this.update_in(cx, |this, window, cx| this.sessions_answered(round, host, listed, window, cx)).ok();
+            })
+            .detach();
+        }
+        if opening {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(crate::picker::OPEN_GRACE).await;
+                this.update_in(cx, |this, window, cx| {
+                    if this.sessions_opening.as_ref().is_some_and(|model| model.round() == round) {
+                        this.open_sessions_palette(window, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// `host`'s listing in `round` has arrived: into the open sessions
+    /// palette, which shows it at once, or into the one still opening, which
+    /// opens if that was the last answer it waited for.
+    fn sessions_answered(&mut self, round: u64, host: Host, listed: Listing, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind {
+            if model.answer(round, &host, listed) {
+                self.show_sessions_palette(cx);
+            }
+        } else if let Some(model) = &mut self.sessions_opening
+            && model.answer(round, &host, listed)
+            && model.complete()
+        {
+            self.open_sessions_palette(window, cx);
+        }
+    }
+
+    /// Opens the sessions palette with what the endpoints have listed so far.
+    fn open_sessions_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut model) = self.sessions_opening.take() else { return };
+        let view = model.view(Self::settings(cx), unix_now());
+        let palette = cx.new(|cx| Palette::list_grouped(view.groups, "Attach a detached session", view.empty, cx));
+        self.show_palette(palette, PaletteKind::Sessions { model }, window, cx);
+    }
+
+    /// Shows the open sessions palette's model in place: its filter text
+    /// stays, and so does the highlighted row (by identity, as the user left
+    /// it in the list).
+    fn show_sessions_palette(&mut self, cx: &mut Context<Self>) {
+        let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind else { return };
+        let Some(palette) = self.palette.view().cloned() else { return };
+        model.highlight(palette.read(cx).highlighted(cx));
+        let view = model.view(Self::settings(cx), unix_now());
+        palette.update(cx, |palette, cx| palette.set_groups(view.groups, view.empty, view.keep, cx));
+        cx.notify();
     }
 
     /// `picker_kill` in the sessions palette: ends that session on its
     /// endpoint, and shows the list again.
     fn palette_kill(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteKind::Sessions { listed, rows, killed }) = &mut self.palette_kind else {
+        let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind else {
             return;
         };
-        let Some((host, info)) = rows.get(ix).and_then(SessionRow::session) else { return };
-        let (host, id) = (host.clone(), info.session);
-        killed.push((host.clone(), id, info.key.clone()));
-        // Its row goes at once, so enter can't attach it meanwhile.
-        let listed = listed.clone();
-        self.show_sessions_palette(listed, window, cx);
+        let Some((host, info)) = model.rows().get(ix).and_then(SessionRow::session) else { return };
+        let (host, id, key) = (host.clone(), info.session, info.key.clone());
+        model.kill(host.clone(), id, key);
+        // Its row goes at once, so enter can't attach it meanwhile, and the
+        // highlight passes to the row that takes its place.
+        self.show_sessions_palette(cx);
         self.refresh_sessions_palette(Some((host, id)), false, window, cx);
     }
 
     /// Attaches a detached session of `host` into a new tab after the
-    /// active one, on `host`. A local one takes the profile it was started
-    /// with (unless that is gone or remote: the default); a remote one the
-    /// profile it was started with when that targets `host`, else the first
-    /// that does (else a tab's on `host`, or the default).
+    /// active one, on `host`, with the profile
+    /// [`crate::reattach::session_profile`] gives it.
     fn attach_detached_here(&mut self, host: Host, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            let index = match &host {
-                Host::Local => crate::reattach::local_profile(&info, &config),
-                Host::Remote(_) => crate::reattach::remote_profile(&info, &host, &config)
-                    .unwrap_or_else(|| self.profile_on(&host, &config)),
-            };
+            let first = self.profile_on(&host);
+            let index = crate::reattach::session_profile(&info, &host, &config, first.as_deref());
             let profile = config.profiles[index].clone();
             let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
             self.insert_terminal_tab(profile, host, terminal, true, window, cx);
@@ -1522,6 +1591,9 @@ impl Workspace {
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette.close(window, cx);
         self.palette_kind = None;
+        // A sessions palette still collecting answers isn't opened over
+        // whatever replaces this overlay.
+        self.sessions_opening = None;
         self._palette_subscription = None;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
@@ -2453,6 +2525,74 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use gpui::size;
+
+    fn ssh_host(host: &str) -> Host {
+        Host::Remote(crate::config::RemoteTarget::Ssh {
+            host: host.into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        })
+    }
+
+    /// 5.3: the sessions palette lists this machine first, then the
+    /// `Hosts` endpoints in their order, each with its state.
+    #[test]
+    fn palette_endpoints_list_this_machine_first_then_the_hosts_in_order() {
+        assert_eq!(palette_endpoints(Vec::new()), [(Host::Local, HostState::Connected)]);
+        let states = vec![
+            (ssh_host("B9"), HostState::Connecting),
+            (ssh_host("A8"), HostState::Offline("refused".into())),
+            (ssh_host("C7"), HostState::Connected),
+        ];
+        assert_eq!(
+            palette_endpoints(states.clone()),
+            [
+                (Host::Local, HostState::Connected),
+                (ssh_host("B9"), HostState::Connecting),
+                (ssh_host("A8"), HostState::Offline("refused".into())),
+                (ssh_host("C7"), HostState::Connected),
+            ]
+        );
+        // This machine is never listed twice.
+        let mut again = states;
+        again.insert(0, (Host::Local, HostState::Connected));
+        assert_eq!(palette_endpoints(again).iter().filter(|(host, _)| host.is_local()).count(), 1);
+    }
+
+    /// 5.3: what the palette lists for an endpoint, from its state and what
+    /// asking it gave, without the I/O.
+    #[test]
+    fn listing_from_decides_what_the_palette_lists() {
+        let (a8, session) = (ssh_host("A8"), |id, attached| SessionInfo { session: id, attached, ..Default::default() });
+        let sessions = || Ok(vec![session(1, false), session(2, true), session(3, false)]);
+        let kept = |listing: Listing| match listing {
+            Listing::Sessions(sessions) => sessions.iter().map(|s| s.session).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+
+        // Attached sessions are left out, on this machine and elsewhere.
+        assert_eq!(kept(listing_from(&Host::Local, &HostState::Connected, Some(sessions()))), [1, 3]);
+        assert_eq!(kept(listing_from(&a8, &HostState::Connected, Some(sessions()))), [1, 3]);
+
+        // A connecting or offline endpoint says so, whatever was asked.
+        assert_eq!(listing_from(&a8, &HostState::Connecting, None), Listing::Connecting);
+        assert_eq!(listing_from(&a8, &HostState::Connecting, Some(sessions())), Listing::Connecting);
+        assert_eq!(
+            listing_from(&a8, &HostState::Offline("refused".into()), None),
+            Listing::Offline("refused".into())
+        );
+
+        // A failure to list: this machine lists nothing, any other endpoint is offline.
+        assert_eq!(listing_from(&Host::Local, &HostState::Connected, Some(Err("boom".into()))), Listing::Sessions(Vec::new()));
+        assert_eq!(
+            listing_from(&a8, &HostState::Connected, Some(Err("the connection ended".into()))),
+            Listing::Offline("the connection ended".into())
+        );
+        assert!(matches!(listing_from(&a8, &HostState::Connected, None), Listing::Offline(_)), "connected but never asked");
+    }
 
     /// 6.2: a tab stays on the host it was made on. Once its profile moves
     /// to another endpoint, a reload gives the tab the moved profile, but a

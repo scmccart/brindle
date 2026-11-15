@@ -39,6 +39,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-reattach-no-restore", local_server::reattach_no_restore),
         display("local-server-reattach-second", local_server::reattach_second),
         display("local-server-palette", local_server::palette),
+        display("local-server-palette-highlight", local_server::palette_highlight),
         display("local-server-attach-flag", local_server::attach_flag),
         display("local-server-env", local_server::env),
         display("local-server-core-restart", local_server::core_restart),

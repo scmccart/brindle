@@ -19,6 +19,9 @@
 //!   is back it has the same session again, with what was typed meanwhile;
 //! - `remote-ssh-connect-at-launch`: a profile that connects at launch
 //!   attaches a session an earlier run left detached on its host;
+//! - `remote-ssh-restored-closed`: a restored SSH tab whose host now
+//!   refuses, closed while it connects, takes the launch's wait for that
+//!   host with it, so Brindle stops dialling it;
 //! - `remote-offline`: with its container stopped, and an SSH host that
 //!   refuses, "Attach Session…" lists each eager profile's endpoint offline.
 //!
@@ -31,7 +34,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -193,6 +196,18 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     );
     container.assert_absent(marker)?;
     container.exec(&["rm", "--force", &planted])?;
+    // The container runs no systemd, so its relay starts the core without a
+    // scope and says so plainly: no user manager could have given one, so no
+    // warning that the sessions may not outlive the login.
+    let logs = container.exec(&["sh", "-c", SERVER_LOGS])?;
+    ensure!(
+        logs.contains("starting the core without a scope of its own"),
+        "the container's core.log doesn't say the core started without a scope: {logs:?}"
+    );
+    ensure!(
+        !logs.contains("may not outlive"),
+        "the container's core.log warns about the login: {logs:?}"
+    );
 
     Ok(Outcome::Pass)
 }
@@ -524,6 +539,17 @@ impl Cut {
             Ok(noticed.then_some(()))
         })?;
         let noticed = cut.elapsed();
+        // The log says what ended the link: ssh's own exit, or the dead-link
+        // limit, and never the local core's wording.
+        let line = log_line(&self.log, &ended).ok_or("the link's end isn't in Brindle's log")?;
+        ensure!(
+            line.contains(&format!("{ended} (")) && !line.contains("the terminal server closed the connection"),
+            "the link ended without a cause of its own: {line:?}"
+        );
+        ensure!(
+            line.contains("ssh exited with 255") || line.contains("nothing read from"),
+            "the link's end doesn't name ssh's exit or the silence: {line:?}"
+        );
         // Brindle retries while the network is down, and fails.
         let failed = format!("can't connect to {}", self.endpoint);
         poll(slow, 30.0, "a reconnect failing", || {
@@ -649,6 +675,176 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A restored SSH tab closed while its host refuses: a first run leaves a
+/// local tab and an SSH tab detached, and the SSH fixture is then stopped,
+/// so its port refuses. The restoring run shows the SSH zone connecting and
+/// closes its tab, the window's last on that host, which isn't one a profile
+/// connects to at launch: that withdraws the launch's wait for the host's
+/// sessions, so its connection ends, and Brindle dials it no
+/// more (no `ssh`, no failed attempt), and "Attach Session…" no longer
+/// lists it.
+pub fn ssh_restored_closed(ctx: &Ctx) -> Result<Outcome> {
+    const CHECKED: &str = "CLOSED-CHECKED";
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-restored-closed", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        // The local tab's session is the next run's too.
+        .keep_detached()
+        .action("new_tab_with_profile_2")
+        .wait_for(SSH_PROMPT)
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let tabs = &first.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
+    let docker = ssh.container.docker.clone();
+    poll(ctx.secs(1.0), 10.0, "the SSH tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    poll(ctx.secs(1.0), 10.0, "the local tab's session detached", || {
+        let local = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(matches!(local.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    ssh.container.stop()?;
+    let (host, port) = (ssh.host.clone(), ssh.port);
+    poll(ctx.secs(1.0), 10.0, "the stopped fixture's port refusing", || {
+        Ok(TcpStream::connect((host.as_str(), port)).is_err().then_some(()))
+    })?;
+
+    let endpoint = format!("root@{}:{}", ssh.host, ssh.port);
+    let checks = ctx.dir.join("checks.txt");
+    let closed = ClosedTab {
+        endpoint: endpoint.clone(),
+        log: ctx.dir.join("second.log"),
+        save: checks.clone(),
+        helper: ctx.helper.clone(),
+        server_dir: ctx.server_dir.clone(),
+        checked: CHECKED,
+        slow: ctx.secs(1.0),
+    };
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        // The checks take up to 25 s after the close, which the marker's
+        // wait (30 step intervals) must cover.
+        .step_interval(1.5)
+        // The restored SSH tab is the active one, as it was at the quit.
+        .wait_for(&format!("connecting to {endpoint}"))
+        .action("close_tab")
+        .wait_for(CHECKED)
+        .action("attach_session")
+        .call_at(1.0, move |brindle| closed.run(brindle))
+        .dump_at(40.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    ensure!(
+        second.dump.tabs.len() == 1,
+        "tabs: {:?}",
+        second.dump.tabs
+    );
+    ensure!(
+        fs::read_to_string(&checks).is_ok(),
+        "the closed tab's connection wasn't checked"
+    );
+    let palette = &second.dump.palette;
+    ensure!(!palette.is_empty(), "\"Attach Session…\" didn't open");
+    ensure!(
+        !palette.iter().any(|row| row.contains(&endpoint)),
+        "\"Attach Session…\" still lists {endpoint}: {palette:?}"
+    );
+    Ok(Outcome::Pass)
+}
+
+/// `remote-ssh-restored-closed`'s timeline: once the restored SSH tab has
+/// closed, withdrawing the launch's wait for its endpoint's sessions (the
+/// log says so), the endpoint's connection ends within 15 s, unused or at
+/// its next failed attempt, and its `ssh` is gone, and in the 10 s after
+/// that Brindle starts no `ssh` and fails no attempt. Then it marks the
+/// local tab with `checked`.
+struct ClosedTab {
+    /// The endpoint, as Brindle's log names it (`root@HOST:PORT`).
+    endpoint: String,
+    /// Brindle's log.
+    log: PathBuf,
+    /// Where the timings go, for the report.
+    save: PathBuf,
+    /// The case's terminal server, which the local tab runs in.
+    helper: PathBuf,
+    server_dir: PathBuf,
+    checked: &'static str,
+    slow: f64,
+}
+
+impl ClosedTab {
+    fn run(&self, brindle: u32) -> Result {
+        let slow = self.slow;
+        let withdrawn = format!("not waiting for {}'s sessions any more", self.endpoint);
+        poll(slow, 30.0, "the SSH tab closed, withdrawing the launch's wait", || {
+            Ok((logged(&self.log, &withdrawn) > 0).then_some(()))
+        })?;
+        let closed = Instant::now();
+        // It was dialling the stopped endpoint until then.
+        let failed = format!("can't connect to {}", self.endpoint);
+        ensure!(
+            logged(&self.log, &failed) > 0,
+            "no failed attempt on {} before the close",
+            self.endpoint
+        );
+        // With nothing waiting on it, the connection ends at its next
+        // failed attempt, which logs only the failure, or `Timings::idle`
+        // (5 s) later, unused, whichever comes first.
+        let at_close = logged(&self.log, &failed);
+        let unused = format!("closing the unused connection to {}", self.endpoint);
+        poll(slow, 15.0, "the connection ended and its ssh gone", || {
+            let ended = logged(&self.log, &unused) > 0 || logged(&self.log, &failed) > at_close;
+            Ok((ended && ssh_processes(brindle).is_empty()).then_some(()))
+        })?;
+        let ended = closed.elapsed();
+        let attempts = logged(&self.log, &failed);
+        // A refused `ssh` lives for milliseconds, which sampling can miss,
+        // but each attempt logs its failure.
+        let watch = Instant::now();
+        let mut started: Vec<u32> = Vec::new();
+        while watch.elapsed() < Duration::from_secs_f64(10.0 * slow) {
+            for pid in ssh_processes(brindle) {
+                if !started.contains(&pid) {
+                    started.push(pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let later = logged(&self.log, &failed) - attempts;
+        let text = format!(
+            "connection ended {:.1}s after the close\nfailed attempts {attempts} before, {later} after\n\
+             ssh after {started:?}\n",
+            ended.as_secs_f64()
+        );
+        fs::write(&self.save, text).map_err(|e| e.to_string())?;
+        ensure!(
+            started.is_empty(),
+            "Brindle started ssh {started:?} after the connection ended"
+        );
+        ensure!(
+            later == 0,
+            "Brindle dialled {} {later} more times after the connection ended",
+            self.endpoint
+        );
+        let local = poll(slow, 10.0, "the restored local tab", || {
+            Ok(local_sessions(&self.helper, &self.server_dir)?
+                .into_iter()
+                .find(|s| s.attached))
+        })?;
+        mark_tty(local.pid, self.checked)
+    }
+}
+
 /// Profiles that connect at launch to endpoints that can't be reached: a
 /// stopped container and an SSH port that refuses. "Attach Session…" lists
 /// each as offline, and the container stays stopped.
@@ -675,20 +871,112 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(6.0)
         .run()?;
     let palette = &out.dump.palette;
-    for endpoint in [
-        format!("remote@{}", container.name),
-        format!("root@127.0.0.1:{port}"),
+    // Each row's reason names its cause (the row shows its first line).
+    let mut offline_rows = Vec::new();
+    for (endpoint, cause) in [
+        (format!("remote@{}", container.name), "is not running"),
+        (format!("root@127.0.0.1:{port}"), "Connection refused"),
     ] {
         let offline = format!("{endpoint}  offline: ");
-        ensure!(
-            palette.iter().any(|row| row.starts_with(&offline)),
-            "no offline row for {endpoint}: {palette:?}"
-        );
+        let at = palette.iter().position(|row| row.starts_with(&offline));
+        let Some(at) = at else {
+            return Err(format!("no offline row for {endpoint}: {palette:?}").into());
+        };
+        let row = &palette[at];
+        ensure!(row.contains(cause), "{endpoint}'s row doesn't say {cause:?}: {row:?}");
+        offline_rows.push(at);
     }
+    // Nothing is detached anywhere, and every endpoint has answered: the
+    // palette says so, after both endpoints' rows.
+    let note = palette.iter().position(|row| row == "No detached sessions");
+    let Some(note) = note else {
+        return Err(format!("no \"No detached sessions\" row: {palette:?}").into());
+    };
+    ensure!(
+        offline_rows.iter().all(|&at| at < note),
+        "the note (row {note}) doesn't come after both offline rows {offline_rows:?}: {palette:?}"
+    );
     ensure!(
         !container.running()?,
         "the stopped container {} is running",
         container.name
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The sessions palette opens without waiting for a host that is slow to
+/// answer. A first run leaves a local shell detached. The second connects at
+/// launch to the SSH fixture, which is paused (`docker pause`) once Brindle
+/// is connected to it: the host's link stays up but goes silent. "Attach
+/// Session…" then opens within the open grace, with this machine's session
+/// and the host's `listing sessions…` row, long before the listing gives up
+/// (`LIST_LIMIT`, 2 s).
+///
+/// The steps are spaced far enough apart that the pause (made by a timeline
+/// call, once the relay runs in the container) comes before the palette's
+/// step, and the dump follows that step by well under `LIST_LIMIT`.
+pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
+    // The run's steps: one that only takes an interval, then the palette's,
+    // and the dump just after it.
+    const INTERVAL: f64 = 6.0;
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    needs
+        .run(ctx, "first", "")
+        .keep_detached()
+        .send("echo left-$((1+1))\r")
+        .wait_for("left-2")
+        .dump_at(5.0)
+        .run()?;
+    let left = poll(ctx.secs(1.0), 10.0, "the first run's shell detached", || {
+        let sessions = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(match sessions.as_slice() {
+            [session] if !session.attached => Some(session.clone()),
+            _ => None,
+        })
+    })?;
+
+    let (waiting, pausing) = (ssh.container.docker.clone(), ssh.container.docker.clone());
+    let slow = ctx.secs(1.0);
+    let out = needs
+        .run(ctx, "second", &ssh.profile(SSH_PROFILE, "ssh-slow-host", true))
+        .step_interval(INTERVAL)
+        .modality("keyboard")
+        .action("attach_session")
+        // Brindle's relay runs in the container: the endpoint is connected.
+        .call_at(1.0, move |_| {
+            poll(slow, 10.0, "Brindle's relay in the container", || {
+                Ok((!waiting.relays()?.is_empty()).then_some(()))
+            })
+        })
+        // The pause comes a couple of (stretched) seconds before the
+        // palette's step, so the silent link isn't given up on first: the
+        // steps count from the window's first appearance, a little after
+        // the spawn this counts from.
+        .call_at(INTERVAL * 2.5 - 2.0, move |_| pausing.pause())
+        .dump_at(INTERVAL * 2.5 + 0.7)
+        .run();
+    // Back in order, so the container's logs and removal work.
+    ssh.container.unpause().ok();
+    let out = out?;
+
+    let palette = &out.dump.palette;
+    let endpoint = format!("root@{}:{}", ssh.host, ssh.port);
+    let pending = format!("{endpoint}  listing sessions…");
+    ensure!(
+        palette.len() == 3 && palette[2] == pending,
+        "want this machine's session, then {pending:?}, not listed yet or offline: {palette:?}"
+    );
+    ensure!(
+        !palette[1].starts_with(&endpoint) && !palette[1].starts_with("No detached"),
+        "the first row isn't this machine's session {left:?}: {palette:?}"
+    );
+    ensure!(
+        out.dump.palette_highlighted()? == Some(0),
+        "this machine's session isn't highlighted: {palette:?}"
     );
     Ok(Outcome::Pass)
 }
@@ -1031,6 +1319,15 @@ fn ssh_processes(brindle: u32) -> Vec<u32> {
         .collect();
     pids.sort();
     pids
+}
+
+/// The first line of the log at `path` that contains `text`.
+fn log_line(path: &Path, text: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.contains(text))
+        .map(str::to_string)
 }
 
 /// How many lines of the log at `path` contain `text`.
@@ -1502,6 +1799,16 @@ impl Docker {
     fn running(&self) -> Result<bool> {
         let state = docker_ok(&["inspect", "--format", "{{.State.Running}}", &self.name])?;
         Ok(state.trim() == "true")
+    }
+
+    /// Freezes its processes (`docker pause`): connections to it stay open,
+    /// and nothing answers on them.
+    fn pause(&self) -> Result {
+        docker_ok(&["pause", &self.name]).map(drop)
+    }
+
+    fn unpause(&self) -> Result {
+        docker_ok(&["unpause", &self.name]).map(drop)
     }
 
     /// Stops it at once (its `sleep` ignores SIGTERM).

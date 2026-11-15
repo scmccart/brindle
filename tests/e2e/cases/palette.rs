@@ -56,7 +56,7 @@ fn expect_closed(out: &Output, what: &str) -> Result {
 /// focus back to the tab.
 pub fn escape(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "open").key("ctrl-shift-p").dump_at(step_time(1) + 1.0).run()?;
-    ensure!(out.dump.palette.first().is_some_and(|l| l == "list query=\"\""), "palette {:?}", out.dump.palette);
+    ensure!(out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"\" highlighted=")), "palette {:?}", out.dump.palette);
     expect_focus(&out, "palette", "with the palette open")?;
 
     let out = Run::new(ctx, "escape").key("ctrl-shift-p").key("escape").dump_at(step_time(2) + 1.0).run()?;
@@ -104,7 +104,7 @@ pub fn tab_stays(ctx: &Ctx) -> Result<Outcome> {
     expect_focus(&out, "palette", "after tab and shift-tab")?;
     let want = Input { text: "split".into(), cursor: 5, selection: (5, 5) };
     ensure!(out.dump.input.as_ref() == Some(&want), "input {:?}, want {want:?}", out.dump.input);
-    ensure!(out.dump.palette.first().is_some_and(|l| l == "list query=\"split\""), "palette {:?}", out.dump.palette);
+    ensure!(out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"split\" highlighted=")), "palette {:?}", out.dump.palette);
     ensure!(!out.dump.screen.iter().any(|l| l.contains("spl")), "typed into the terminal: {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }
@@ -292,7 +292,7 @@ pub fn fits_window(ctx: &Ctx) -> Result<Outcome> {
 /// The palette's rows, opened with no filter.
 fn rows(out: &Output) -> Result<&[String]> {
     let (header, rows) = out.dump.palette.split_first().ok_or("the palette isn't open")?;
-    ensure!(header == "list query=\"\"", "palette header {header:?}");
+    ensure!(header.starts_with("list query=\"\" highlighted="), "palette header {header:?}");
     Ok(rows)
 }
 

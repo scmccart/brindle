@@ -848,7 +848,8 @@ use crate::actions::{
     SettingsSectionPrev,
 };
 use brindle_ui::{
-    ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, Switch, TextInput, TextInputEvent,
+    ActiveTheme as _, ButtonVariant, Checkbox, FIELD_HEIGHT, Input, Select, SelectEvent, Switch, TextInput,
+    TextInputEvent,
 };
 
 /// The fields shown as a select rather than text.
@@ -1177,12 +1178,22 @@ impl SettingsDialog {
                     .children(this.profile_input(field).map(|input| Input::new(input).invalid(error.is_some())))
                     .into_any_element(),
             };
+            // The control line is at least a text field tall with its control
+            // centred; an error sits under it at its natural height.
             div()
                 .flex()
                 .flex_col()
                 .flex_none()
                 .gap_0p5()
-                .child(div().flex().items_center().gap_2().child(label(field.label())).child(control))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_h(FIELD_HEIGHT)
+                        .child(label(field.label()))
+                        .child(control),
+                )
                 .when_some(error, |d, e| {
                     d.child(div().pl(px(128.0)).text_xs().text_color(red).child(SharedString::from(e)))
                 })

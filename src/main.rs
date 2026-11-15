@@ -455,9 +455,7 @@ fn watch_hosts(cx: &mut App) {
                     batch.push(report);
                 }
                 let applied = cx.update(|cx| {
-                    let changed = cx.update_global(|hosts: &mut Hosts, _| {
-                        batch.into_iter().fold(false, |changed, (host, conn, state)| hosts.apply(&host, conn, state) | changed)
-                    });
+                    let changed = cx.update_global(|hosts: &mut Hosts, _| hosts.apply_all(batch));
                     if changed {
                         hosts_changed(cx);
                     }

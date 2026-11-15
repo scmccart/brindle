@@ -343,7 +343,14 @@ pub fn editor_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
         let run = Run::new(ctx, name).config(REMOTE_PROFILE).action("open_settings").key("end").action("settings_edit");
         (0..7).fold(run, |run, _| run.action("settings_next_field"))
     };
-    let out = to_switch("off").dump_at(step_time(10) + 0.8).run()?;
+    // The window is captured while the ssh profile's editor shows (the last
+    // stop has run, the dump is a little later), so a run on Linux can show
+    // whether a label in the editor's left column ("Connect at launch")
+    // wraps onto two lines. Nothing checks the capture yet (OpenSpec change
+    // `polish-remote-connections`, 7.1).
+    let out = to_switch("ssh-editor").capture_at(step_time(10) + 0.5).dump_at(step_time(10) + 0.8).run()?;
+    ensure!(out.image.is_some(), "no capture of the ssh profile's editor");
+    println!("         ssh profile editor capture: {}", ctx.dir.join("ssh-editor.ppm").display());
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(
         settings.contains("mode=editor name=\"Remote\" field=\"Connect at launch\"")

@@ -9,7 +9,9 @@
 //! list and has the focus; typing filters the items by [`filter`]'s
 //! case-insensitive subsequence match, keeping their order, hiding groups
 //! left with no items and showing a message when nothing matches. Each
-//! change to the filter highlights the first match ([`CommandRows`]). A
+//! change to the filter highlights the first match ([`CommandRows`]); an
+//! owner that replaces the items ([`Command::set_groups`]) can name the item
+//! to keep highlighted instead. A
 //! group can take a separator above it ([`CommandGroup::separator`]),
 //! shadcn's `CommandSeparator`: a line across the list, shown only while
 //! the groups on both sides of it list items.
@@ -165,7 +167,7 @@ pub struct CommandRows {
 
 impl Default for CommandRows {
     fn default() -> Self {
-        Self::build(&[], "")
+        Self::build(&[], "", None)
     }
 }
 
@@ -174,9 +176,13 @@ impl CommandRows {
     /// A group with no matching item is left out, heading and all; a group
     /// with no heading lists its items alone. A group's separator is listed
     /// above it only when the group just before it lists items too, so a
-    /// separator is never first, last or next to another. The first enabled
-    /// match is highlighted.
-    pub fn build(groups: &[CommandGroup], query: &str) -> Self {
+    /// separator is never first, last or next to another.
+    ///
+    /// `keep` names the item to highlight, by its index across the groups
+    /// (what [`CommandEvent::Confirmed`] carries). It is highlighted when
+    /// it matches `query` and is enabled; otherwise, and when `keep` is
+    /// `None`, the first enabled match is.
+    pub fn build(groups: &[CommandGroup], query: &str, keep: Option<usize>) -> Self {
         let mut rows = Vec::new();
         let mut row_groups = Vec::new();
         let mut matches = Vec::new();
@@ -209,6 +215,9 @@ impl CommandRows {
         }
         let mut nav = ListNav::new(matches.len(), true);
         nav.first(|rank| enabled[rank]);
+        if let Some(rank) = keep.and_then(|item| matches.iter().position(|&m| m == item)).filter(|&rank| enabled[rank]) {
+            nav.highlight = Some(rank);
+        }
         Self { rows, row_groups, matches, enabled, nav }
     }
 
@@ -328,6 +337,9 @@ pub struct Command {
     filter: Entity<TextInput>,
     rows: CommandRows,
     list: ListState,
+    /// A row to scroll into view once the list has measured its rows, which
+    /// is after the next paint of a replaced list.
+    reveal_pending: Option<usize>,
     empty_message: SharedString,
     _filter_changes: Subscription,
 }
@@ -344,9 +356,9 @@ impl Command {
     pub fn new(groups: Vec<CommandGroup>, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| TextInput::new("", cx).with_placeholder(PLACEHOLDER));
         let subscription = cx.subscribe(&filter, |this, _, _: &TextInputEvent, cx| this.refilter(cx));
-        let rows = CommandRows::build(&groups, "");
+        let rows = CommandRows::build(&groups, "", None);
         let list = ListState::new(rows.len(), ListAlignment::Top, LIST_OVERDRAW).measure_all();
-        Self { groups, filter, rows, list, empty_message: EMPTY_MESSAGE.into(), _filter_changes: subscription }
+        Self { groups, filter, rows, list, reveal_pending: None, empty_message: EMPTY_MESSAGE.into(), _filter_changes: subscription }
     }
 
     /// The filter input's placeholder.
@@ -379,10 +391,28 @@ impl Command {
         self.groups.iter().flat_map(|group| &group.items).nth(ix)
     }
 
-    /// Replaces the groups and filters them by the current query.
-    pub fn set_groups(&mut self, groups: Vec<CommandGroup>, cx: &mut Context<Self>) {
+    /// Replaces the groups and filters them by the current query, which is
+    /// left as it is.
+    ///
+    /// With `keep: None` the first enabled match is highlighted and the list
+    /// starts at the top, as for a change to the filter. With `keep` naming
+    /// an item of the new groups, by its index across them, that item stays
+    /// highlighted when it matches the query and is enabled (otherwise the
+    /// first enabled match is), and the list keeps its scroll offset, only
+    /// moving as far as the highlighted row needs to be in view. An owner
+    /// that refreshes a list the user is moving through uses it to keep
+    /// their place; it maps its own identities to the new index.
+    pub fn set_groups(&mut self, groups: Vec<CommandGroup>, keep: Option<usize>, cx: &mut Context<Self>) {
         self.groups = groups;
-        self.refilter(cx);
+        let scroll = keep.map(|_| self.list.logical_scroll_top());
+        self.rebuild(keep, cx);
+        if let Some(scroll) = scroll {
+            // `reset` scrolls to the top and forgets every row's height, so
+            // the offset goes back now and the reveal waits for a layout
+            // that measures the rows (`render`).
+            self.list.scroll_to(scroll);
+            self.reveal_pending = self.rows.highlighted_row();
+        }
     }
 
     /// The filter input, for an owner that reads its text or feeds it.
@@ -413,9 +443,16 @@ impl Command {
     /// Rebuilds the rows for the current query: the first match is
     /// highlighted and the list starts at the top.
     fn refilter(&mut self, cx: &mut Context<Self>) {
+        self.rebuild(None, cx);
+    }
+
+    /// Rebuilds the rows for the current query, highlighting `keep` if it
+    /// matches and is enabled.
+    fn rebuild(&mut self, keep: Option<usize>, cx: &mut Context<Self>) {
         let query = self.filter.read(cx).text().to_string();
-        self.rows = CommandRows::build(&self.groups, &query);
+        self.rows = CommandRows::build(&self.groups, &query, keep);
         self.list.reset(self.rows.len());
+        self.reveal_pending = None;
         cx.notify();
     }
 
@@ -570,9 +607,20 @@ impl Command {
 }
 
 impl Render for Command {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let style = command_style(cx.ui_theme());
         let empty = self.rows.is_empty();
+        if let Some(row) = self.reveal_pending.take() {
+            // The rows are measured by this frame's paint; the reveal then
+            // leaves the offset alone if the row is in view.
+            let this = cx.entity();
+            window.on_next_frame(move |_, cx| {
+                this.update(cx, |this, cx| {
+                    this.list.scroll_to_reveal_item(row);
+                    cx.notify();
+                });
+            });
+        }
         // CommandList: max-h-[300px] overflow-y-auto. Each row carries its
         // group's p-1 (`render_row`). The list sizes itself to its rows up
         // to the cap.
@@ -660,7 +708,7 @@ mod tests {
     /// The spec's scenario: `spr` leaves `Split Right` alone, highlighted.
     #[test]
     fn filtering_hides_empty_groups_and_highlights_the_first_match() {
-        let rows = CommandRows::build(&groups(), "spr");
+        let rows = CommandRows::build(&groups(), "spr", None);
         // The Tabs group and the unnamed one have no match, so no heading
         // and no item of theirs is listed.
         assert_eq!(rows.rows(), [Heading(1), Item { item: 2, rank: 0 }]);
@@ -672,7 +720,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // The plain scenario, with no headings at all.
         let plain = [CommandGroup::unnamed(["Split Right", "Close Tab"])];
-        let rows = CommandRows::build(&plain, "spr");
+        let rows = CommandRows::build(&plain, "spr", None);
         assert_eq!(rows.rows(), [Item { item: 0, rank: 0 }]);
         assert_eq!(rows.highlighted_item(), Some(0));
     }
@@ -681,7 +729,7 @@ mod tests {
     /// them, with the first item highlighted.
     #[test]
     fn an_empty_query_lists_everything() {
-        let rows = CommandRows::build(&groups(), "");
+        let rows = CommandRows::build(&groups(), "", None);
         assert_eq!(
             rows.rows(),
             [
@@ -697,7 +745,7 @@ mod tests {
         assert_eq!(rows.matches(), [0, 1, 2, 3, 4]);
         assert_eq!(rows.highlight(), Some(0));
         // A match in several groups keeps each group's heading.
-        let rows = CommandRows::build(&groups(), "ta");
+        let rows = CommandRows::build(&groups(), "ta", None);
         assert_eq!(rows.rows(), [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }]);
     }
 
@@ -706,7 +754,7 @@ mod tests {
     /// its last; a filtered group's edges are its listed rows.
     #[test]
     fn rows_know_their_groups_edges() {
-        let rows = CommandRows::build(&groups(), "");
+        let rows = CommandRows::build(&groups(), "", None);
         // Heading(0), New Tab, Close Tab, Heading(1), Split Right, Split Down, Reload Config.
         let edges: Vec<_> = (0..rows.len()).map(|row| rows.group_edges(row)).collect();
         assert_eq!(
@@ -724,7 +772,7 @@ mod tests {
         );
         assert_eq!(rows.group_edges(7), None);
         // Filtered: Tabs keeps its heading and Close Tab, which is now last.
-        let rows = CommandRows::build(&groups(), "clo");
+        let rows = CommandRows::build(&groups(), "clo", None);
         assert_eq!(rows.rows(), [Heading(0), Item { item: 1, rank: 0 }]);
         assert_eq!(rows.group_edges(0), Some((true, false)));
         assert_eq!(rows.group_edges(1), Some((false, true)));
@@ -735,7 +783,7 @@ mod tests {
     /// empty message does.
     #[test]
     fn nothing_matches() {
-        let rows = CommandRows::build(&groups(), "zzz");
+        let rows = CommandRows::build(&groups(), "zzz", None);
         assert!(rows.is_empty());
         assert!(rows.rows().is_empty());
         assert_eq!(rows.highlight(), None);
@@ -745,14 +793,14 @@ mod tests {
         let mut rows = rows;
         assert_eq!(rows.down(), None);
         assert_eq!(rows.up(), None);
-        assert_eq!(CommandRows::default(), CommandRows::build(&[], ""));
+        assert_eq!(CommandRows::default(), CommandRows::build(&[], "", None));
     }
 
     /// The spec's scenario: down from the last item highlights the first.
     /// Each move returns the row to scroll into view, headings counted.
     #[test]
     fn navigation_wraps_over_the_matches_and_names_their_rows() {
-        let mut rows = CommandRows::build(&groups(), "");
+        let mut rows = CommandRows::build(&groups(), "", None);
         assert_eq!(rows.last(), Some(6));
         assert_eq!(rows.highlighted_item(), Some(4));
         assert_eq!(rows.down(), Some(1));
@@ -779,7 +827,7 @@ mod tests {
             CommandItem::new("Kill").disabled(true),
             CommandItem::new("Rename"),
         ])];
-        let mut rows = CommandRows::build(&groups, "");
+        let mut rows = CommandRows::build(&groups, "", None);
         // The first enabled match is highlighted, not the first match.
         assert_eq!(rows.highlight(), Some(1));
         assert_eq!(rows.down(), Some(3));
@@ -793,7 +841,7 @@ mod tests {
         assert_eq!(rows.highlighted_item(), Some(3));
         // All disabled: nothing is highlighted.
         let all = [CommandGroup::unnamed([CommandItem::new("Attach").disabled(true)])];
-        let rows = CommandRows::build(&all, "");
+        let rows = CommandRows::build(&all, "", None);
         assert_eq!(rows.highlight(), None);
         assert!(!rows.is_empty());
     }
@@ -811,7 +859,7 @@ mod tests {
     /// last row and Panes' heading, and another above the unnamed group.
     #[test]
     fn separators_list_between_groups() {
-        let rows = CommandRows::build(&separated(), "");
+        let rows = CommandRows::build(&separated(), "", None);
         assert_eq!(
             rows.rows(),
             [
@@ -848,7 +896,7 @@ mod tests {
             ]
         );
         // Without the flags, nothing changes from before.
-        assert!(!CommandRows::build(&groups(), "").rows().iter().any(|row| matches!(row, Separator(_))));
+        assert!(!CommandRows::build(&groups(), "", None).rows().iter().any(|row| matches!(row, Separator(_))));
     }
 
     /// The spec's scenario: a separator shows only while the groups on both
@@ -857,18 +905,18 @@ mod tests {
     fn separators_hide_beside_an_empty_group() {
         // Panes only: Tabs above its separator is gone, so the Panes heading
         // is first, and the unnamed group below the other is gone too.
-        let rows = CommandRows::build(&separated(), "spr");
+        let rows = CommandRows::build(&separated(), "spr", None);
         assert_eq!(rows.rows(), [Heading(1), Item { item: 2, rank: 0 }]);
         assert_eq!(rows.highlighted_row(), Some(1));
         // Tabs and the unnamed group, but not Panes between them: both
         // separators are beside Panes, so neither shows.
-        let rows = CommandRows::build(&separated(), "e");
+        let rows = CommandRows::build(&separated(), "e", None);
         assert_eq!(
             rows.rows(),
             [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }, Item { item: 4, rank: 2 }]
         );
         // Tabs and Panes: one separator, and none last.
-        let rows = CommandRows::build(&separated(), "t");
+        let rows = CommandRows::build(&separated(), "t", None);
         assert_eq!(
             rows.rows(),
             [
@@ -882,13 +930,13 @@ mod tests {
             ]
         );
         // The unnamed group alone: no separator first.
-        let rows = CommandRows::build(&separated(), "rel");
+        let rows = CommandRows::build(&separated(), "rel", None);
         assert_eq!(rows.rows(), [Item { item: 4, rank: 0 }]);
         // Nothing matches: nothing, separators included, is listed.
-        assert!(CommandRows::build(&separated(), "zzz").rows().is_empty());
+        assert!(CommandRows::build(&separated(), "zzz", None).rows().is_empty());
         // A separator on the first group has nothing above it.
         let first = [CommandGroup::new("Tabs", ["New Tab"]).separator(true)];
-        assert_eq!(CommandRows::build(&first, "").rows(), [Heading(0), Item { item: 0, rank: 0 }]);
+        assert_eq!(CommandRows::build(&first, "", None).rows(), [Heading(0), Item { item: 0, rank: 0 }]);
         // A group with no items lists nothing, and neither does the
         // separator above it or the one below.
         let empty = [
@@ -897,7 +945,7 @@ mod tests {
             CommandGroup::unnamed(["Reload Config"]).separator(true),
         ];
         assert_eq!(
-            CommandRows::build(&empty, "").rows(),
+            CommandRows::build(&empty, "", None).rows(),
             [Heading(0), Item { item: 0, rank: 0 }, Item { item: 1, rank: 1 }]
         );
     }
@@ -932,7 +980,7 @@ mod tests {
         };
         let queries = ["", "e", "t", "s", "spr", "rel", "a", "c", "d", "w", "o", "zzz", "ta", "cl"];
         for query in queries {
-            let rows = CommandRows::build(&groups, query);
+            let rows = CommandRows::build(&groups, query, None);
             let list = rows.rows();
             for (row, kind) in list.iter().enumerate() {
                 let Separator(group) = *kind else { continue };
@@ -952,7 +1000,7 @@ mod tests {
     /// highlight never lands on and `row_of` never names.
     #[test]
     fn navigation_passes_over_separators() {
-        let mut rows = CommandRows::build(&separated(), "");
+        let mut rows = CommandRows::build(&separated(), "", None);
         assert_eq!(rows.highlighted_row(), Some(1));
         // Close Tab (row 2), then over the separator and Panes' heading to
         // Split Right (row 5).
@@ -980,11 +1028,50 @@ mod tests {
             CommandGroup::new("Panes", [CommandItem::new("Split Right").disabled(true), CommandItem::new("Split Down")])
                 .separator(true),
         ];
-        let mut rows = CommandRows::build(&groups, "");
+        let mut rows = CommandRows::build(&groups, "", None);
         assert_eq!(rows.rows()[3], Separator(1));
         assert_eq!(rows.down(), Some(6));
         assert_eq!(rows.highlighted_item(), Some(3));
         assert_eq!(rows.down(), Some(1));
+    }
+
+    /// The spec's "Items replaced": `beta` keeps the highlight when an item
+    /// is inserted before it, whose index across the groups moves.
+    #[test]
+    fn a_named_item_keeps_the_highlight() {
+        let old = [CommandGroup::unnamed(["alpha", "beta", "gamma"])];
+        assert_eq!(CommandRows::build(&old, "", Some(1)).highlighted_item(), Some(1));
+        let new = [CommandGroup::unnamed(["alpha", "beta", "delta", "gamma"])];
+        let rows = CommandRows::build(&new, "", Some(1));
+        assert_eq!(rows.highlighted_item(), Some(1));
+        assert_eq!(rows.highlight(), Some(1));
+        assert_eq!(rows.highlighted_row(), Some(1));
+        // Naming nothing is the first match, as before.
+        assert_eq!(CommandRows::build(&new, "", None).highlighted_item(), Some(0));
+        // Across groups, under a filter: ranks count the matches only.
+        let rows = CommandRows::build(&groups(), "p", Some(3));
+        assert_eq!(rows.matches(), [2, 3]);
+        assert_eq!(rows.highlighted_item(), Some(3));
+        assert_eq!(rows.highlight(), Some(1));
+    }
+
+    /// The spec's "Named item filtered out", and the other ways a named item
+    /// can't hold the highlight.
+    #[test]
+    fn a_named_item_that_cannot_be_highlighted_falls_back_to_the_first_match() {
+        let items = [CommandGroup::unnamed(["alpha", "beta", "gamma", "omega"])];
+        // `beta` doesn't match `ga`; `gamma` is the first that does.
+        let rows = CommandRows::build(&items, "ga", Some(1));
+        assert_eq!(rows.matches(), [2, 3]);
+        assert_eq!(rows.highlighted_item(), Some(2));
+        // Disabled.
+        let disabled = [CommandGroup::new("a", [CommandItem::new("alpha"), CommandItem::new("beta").disabled(true)])];
+        assert_eq!(CommandRows::build(&disabled, "", Some(1)).highlighted_item(), Some(0));
+        // Past the end.
+        assert_eq!(CommandRows::build(&items, "", Some(9)).highlighted_item(), Some(0));
+        // Nothing enabled to fall back to.
+        let none = [CommandGroup::unnamed([CommandItem::new("alpha").disabled(true)])];
+        assert_eq!(CommandRows::build(&none, "", Some(0)).highlighted_item(), None);
     }
 
     #[test]

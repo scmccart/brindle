@@ -38,17 +38,42 @@
 //!   [`Timings::dead`] (killing its process), and the writer sends a
 //!   heartbeat after [`Timings::heartbeat`] without a write. A frame being
 //!   handled isn't silence.
+//! - **Why a relay link ended:** the reason goes into the log line, the
+//!   offline report ([`LinkState::Offline`]) and the requests that fail with
+//!   the link. [`Connection::read`] says how the stream ended, and
+//!   `relay_link_ended` picks the reason: if the watchdog ended the link
+//!   (it marks the link's `Stamp` expired first, so the reader can tell),
+//!   `nothing read from <name> for <limit>`; else the relay process's own
+//!   account ([`Wire::why`]: `ssh exited with 255: <cause>`, the cause being
+//!   the last line it wrote to stderr), which a killed process never gets
+//!   to give; else `the relay closed the connection`, as a process that
+//!   exited 0 with nothing to say, or `reading from the relay failed: …`.
+//!   Only the local core's socket or pipe says `the terminal server closed
+//!   the connection`.
 //! - **A relay's first connect:** until a link has been up, a failed attempt
 //!   fails new tabs' requests (spawns, lists, kills) with its error, while
 //!   attaches (restored zones) keep waiting through the retries and are told
-//!   the error once. With no attach waiting, the connection ends, unless it
-//!   is eager (connects at launch). A new tab's request made while it
-//!   retries asks for an attempt at once.
+//!   the error once. With no attach or listing hook waiting, the connection
+//!   ends, unless it is eager (connects at launch). A new tab's request made
+//!   while it retries asks for an attempt at once.
+//! - **A refusal:** a core that refuses this Brindle ([`Refused`]) ends a
+//!   connection that isn't eager, so its tab shows the refusal at once. An
+//!   eager one reports it offline, fails new tabs' requests with it (after a
+//!   first link too, since no retry clears it soon) and retries like any
+//!   failed attempt, at most [`Timings::eager_cap`] apart: the refusal ends
+//!   once the refusing core exits and the next relay starts this build's.
 //! - **A relay's lifetime:** it is in use while it shows a session, a
-//!   request waits on it or a `CLOSE` is still to be written (one queued
-//!   while the link is down keeps it reconnecting). Unless it is eager, it
-//!   ends [`Timings::idle`] after it was last in use: its process is killed
-//!   and [`super::shared`] forgets it.
+//!   request waits on it, a launch's listing hook waits on it, or a `CLOSE`
+//!   is still to be written. A hook counts until it has its listing or is
+//!   withdrawn ([`Connection::stop_listing`]: the window's last tab on the
+//!   endpoint went). A `CLOSE` queued while the link is down keeps it
+//!   reconnecting for at most [`Timings::close_limit`] (5 min) after the
+//!   oldest was queued; if no link is up by then, the closes are given up,
+//!   never written, and their programs left running: the log, and the
+//!   connection's end if nothing else uses it, say `not ending session <ids>
+//!   on <name>: it couldn't be reached within 5 minutes of the close`.
+//!   Unless it is eager, it ends [`Timings::idle`] after it was last in use:
+//!   its process is killed and [`super::shared`] forgets it.
 //! - **State reports:** a relay connection made with a [`Report`] tells it
 //!   each change of its state ([`LinkState`], for `remote::hosts::Hosts`):
 //!   connecting until its first link is up, connected while one is, offline
@@ -64,7 +89,7 @@
 //!   when the link is up). The listing must have the recorded session with
 //!   its key and no client; then its `ATTACH` goes out at the listed size,
 //!   which its replay is rendered at. Both keep a relay connecting, as an
-//!   attach does.
+//!   attach does; a hook only until it is withdrawn.
 //!
 //! The reader holds the state lock only to look a sink up; each sink has
 //! its own lock, taken without the state lock, so parsing never waits on
@@ -262,10 +287,14 @@ struct State {
     on_listing: Vec<ListingHook>,
     /// A link has been up.
     connected: bool,
+    /// A link is up now.
+    linked: bool,
     /// A new tab's request wants a relay attempt now, not after the pause.
     hurry: bool,
-    /// `CLOSE`s sent to the writer and not yet written.
-    closing: usize,
+    /// The sessions whose `CLOSE`s went to the writer and aren't written
+    /// yet, with when each was queued, oldest first. The writer skips one
+    /// that is no longer here: it was given up ([`State::give_up_closes`]).
+    closing: Vec<(SessionId, Instant)>,
     /// Since when a relay connection has been out of use ([`State::in_use`]).
     idle_since: Option<Instant>,
     /// The connection ended for good, and why; the next tab makes a new one.
@@ -285,9 +314,35 @@ impl State {
     }
 
     /// Something needs the connection: a session it shows, a request
-    /// waiting on it, a listing hook, or a `CLOSE` it hasn't written yet.
+    /// waiting on it, a listing hook (until it is withdrawn), or a `CLOSE` it
+    /// hasn't written yet. A `CLOSE` counts until it is written, or, with no
+    /// link up, until [`Timings::close_limit`] after the oldest was queued:
+    /// then the closes are given up ([`State::give_up_closes`]) and count no
+    /// more.
     fn in_use(&self) -> bool {
-        !self.sessions.is_empty() || !self.requests.is_empty() || !self.on_listing.is_empty() || self.closing > 0
+        !self.sessions.is_empty() || !self.requests.is_empty() || !self.on_listing.is_empty() || !self.closing.is_empty()
+    }
+
+    /// Queues `session`'s `CLOSE`, which keeps the connection in use.
+    fn closing(&mut self, session: SessionId) {
+        self.closing.push((session, Instant::now()));
+    }
+
+    /// The `CLOSE`s given up, taken out: all of them once the oldest was
+    /// queued `limit` ago with no link up, else none.
+    fn give_up_closes(&mut self, limit: Duration) -> Vec<SessionId> {
+        match self.closing.first() {
+            Some(&(_, queued)) if !self.linked && queued.elapsed() >= limit => {
+                self.closing.drain(..).map(|(session, _)| session).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// When the `CLOSE`s are given up if no link comes up first.
+    fn closes_due(&self, limit: Duration) -> Option<Instant> {
+        let (_, queued) = self.closing.first().filter(|_| !self.linked)?;
+        Some(*queued + limit)
     }
 
     /// A recorded attach or a listing hook waits for the core's `LIST`.
@@ -320,13 +375,16 @@ struct Slot {
 struct Stamp {
     epoch: Instant,
     deadline: AtomicU64,
+    /// Set by the watchdog before it ends the link, so the reader can tell
+    /// a link that went silent from a process that ended by itself.
+    expired: AtomicBool,
 }
 
 impl Stamp {
     const HELD: u64 = u64::MAX;
 
     fn new(limit: Duration) -> Self {
-        let stamp = Self { epoch: Instant::now(), deadline: AtomicU64::new(0) };
+        let stamp = Self { epoch: Instant::now(), deadline: AtomicU64::new(0), expired: AtomicBool::new(false) };
         stamp.touch(limit);
         stamp
     }
@@ -340,6 +398,15 @@ impl Stamp {
     /// Never dead until the next [`Stamp::touch`].
     fn hold(&self) {
         self.deadline.store(Self::HELD, Ordering::Release);
+    }
+
+    /// The watchdog is ending the link for want of anything read.
+    fn expire(&self) {
+        self.expired.store(true, Ordering::Release);
+    }
+
+    fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -503,7 +570,7 @@ impl Connection {
         let idling = this.clone();
         std::thread::Builder::new()
             .name("relay-idle".into())
-            .spawn(move || idling.end_when_unused(timings.idle))?;
+            .spawn(move || idling.end_when_unused(timings.idle, timings.close_limit))?;
         let reading = this.clone();
         std::thread::Builder::new()
             .name("relay-reader".into())
@@ -540,27 +607,41 @@ impl Connection {
         true
     }
 
-    /// Ends a relay connection [`Timings::idle`] after it was last in use
-    /// ([`State::in_use`]), unless it is eager. It looks five times per
-    /// `limit`, so it ends at most a fifth of `limit` late.
-    fn end_when_unused(&self, limit: Duration) {
-        let look = (limit / 5).max(Duration::from_millis(1));
+    /// Ends a relay connection `idle` ([`Timings::idle`]) after it was last
+    /// in use ([`State::in_use`]), unless it is eager. With no link up, it
+    /// gives the `CLOSE`s not written up `close_limit` after the oldest was
+    /// queued, eager or not, and logs the sessions left running; that is
+    /// then the end's reason, unless the connection is used again first. It
+    /// looks five times per `idle`, and when the closes are due, so it ends
+    /// at most a fifth of `idle` late.
+    fn end_when_unused(&self, idle: Duration, close_limit: Duration) {
+        let look = (idle / 5).max(Duration::from_millis(1));
+        let mut given_up: Option<String> = None;
         let mut state = self.state.lock();
         loop {
             if state.ended.is_some() {
                 return;
             }
+            let sessions = state.give_up_closes(close_limit);
+            if !sessions.is_empty() {
+                let text = not_ending(&sessions, &self.name(), close_limit);
+                log::warn!("{text}");
+                given_up = Some(text);
+            }
             if self.eager.load(Ordering::Acquire) || state.in_use() {
                 state.idle_since = None;
-            } else if state.idle_since.get_or_insert_with(Instant::now).elapsed() >= limit {
+                given_up = None;
+            } else if state.idle_since.get_or_insert_with(Instant::now).elapsed() >= idle {
                 // Under the lock, so no request slips in to wait on it.
-                let reason = "the connection was no longer used".to_string();
+                let reason = given_up.take().unwrap_or_else(|| "the connection was no longer used".to_string());
                 state.ended = Some(reason.clone());
                 drop(state);
                 log::info!("closing the unused connection to {}", self.name());
                 return self.ended(&reason);
             }
-            self.wake.wait_for(&mut state, look);
+            let due = state.closes_due(close_limit).map(|due| due.saturating_duration_since(Instant::now()));
+            let wait = due.map_or(look, |due| due.min(look)).max(Duration::from_millis(1));
+            self.wake.wait_for(&mut state, wait);
         }
     }
 
@@ -631,9 +712,9 @@ impl Connection {
     }
 
     /// Sends `CLOSE` for `session`, which keeps the connection in use until
-    /// it is written.
+    /// it is written or given up ([`State::in_use`]).
     fn send_close(&self, session: SessionId) {
-        self.state.lock().closing += 1;
+        self.state.lock().closing(session);
         self.send(ToCore::Close(SessionRef { session }));
     }
 
@@ -644,7 +725,7 @@ impl Connection {
         let mut state = self.state.lock();
         let shown = state.remove(session).is_some();
         if shown && closing {
-            state.closing += 1;
+            state.closing(session);
         }
         shown
     }
@@ -794,7 +875,8 @@ impl Connection {
 
     /// Hands `hook` the core's next listing: at once once a link is up,
     /// else on the first link. It keeps a relay connecting until then, as
-    /// an attach does. Gives `hook` back when the connection has ended.
+    /// an attach does, unless it is withdrawn ([`Connection::stop_listing`]).
+    /// Gives `hook` back when the connection has ended.
     pub fn on_listing(&self, hook: ListingHook) -> std::result::Result<(), ListingHook> {
         let mut state = self.state.lock();
         if state.ended.is_some() {
@@ -803,6 +885,17 @@ impl Connection {
         state.on_listing.push(hook);
         self.request_list(&mut state);
         Ok(())
+    }
+
+    /// Withdraws the listing hooks still waiting ([`Connection::on_listing`]):
+    /// they are dropped without a listing, and no longer keep the connection
+    /// in use, so with nothing else using it, it ends [`Timings::idle`] later.
+    /// Says whether any was waiting.
+    pub fn stop_listing(&self) -> bool {
+        let hooks = std::mem::take(&mut self.state.lock().on_listing);
+        // The idle thread counts from now.
+        self.wake.notify_all();
+        !hooks.is_empty()
     }
 
     /// Asks for the core's sessions for what waits on a listing, unless a
@@ -822,7 +915,7 @@ impl Connection {
     fn run_local(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
         let Transport::Local(endpoint) = &self.transport else { unreachable!("a local connection") };
         loop {
-            let reason = self.read(&mut BufReader::with_capacity(READ_BUFFER, reader), None);
+            let reason = self.read(&mut BufReader::with_capacity(READ_BUFFER, reader), None).local_text();
             log::warn!("terminal server connection ended ({reason}); reconnecting");
             self.disconnected(&reason);
             match self.reconnect_local(endpoint) {
@@ -843,12 +936,13 @@ impl Connection {
         self.report_now(LinkState::Connecting);
         loop {
             match self.open_relay(dial.as_ref(), timings) {
-                Ok((mut reader, stamp)) => {
+                Ok((mut reader, stamp, wire)) => {
                     failures = 0;
-                    let reason = self.read(&mut reader, Some((&stamp, timings.dead)));
+                    let ending = self.read(&mut reader, Some((&stamp, timings.dead)));
                     if self.is_dead() {
                         return;
                     }
+                    let reason = relay_link_ended(&name, timings.dead, stamp.expired(), &ending, || wire.why());
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
                     self.lost_link(&name);
@@ -858,7 +952,8 @@ impl Connection {
                 Err(error) => {
                     let message = format!("can't connect to {name}: {error:#}");
                     log::warn!("{message}");
-                    if error.downcast_ref::<Refused>().is_some() || !self.failed_to_connect(&message) {
+                    let refused = error.downcast_ref::<Refused>().is_some();
+                    if !self.failed_to_connect(&message, refused) {
                         return self.ended(&message);
                     }
                     self.report_now(LinkState::Offline(format!("{error:#}")));
@@ -878,7 +973,7 @@ impl Connection {
         &self,
         dial: &dyn Dial,
         timings: &Timings,
-    ) -> Result<(BufReader<Box<dyn Read + Send>>, Arc<Stamp>)> {
+    ) -> Result<(BufReader<Box<dyn Read + Send>>, Arc<Stamp>, Arc<dyn Wire>)> {
         let Link { reader, wire } = dial.launch()?;
         let stamp = Arc::new(Stamp::new(timings.bootstrap));
         self.watch_link(&wire, &stamp);
@@ -890,7 +985,7 @@ impl Connection {
                 stamp.touch(timings.dead);
                 self.watch_changed.notify_all();
                 self.report_now(LinkState::Connected);
-                Ok((reader, stamp))
+                Ok((reader, stamp, wire))
             }
             Err(error) => {
                 self.unwatch_link();
@@ -953,6 +1048,7 @@ impl Connection {
             let wanted = after_loss || state.waits_for_listing();
             // Under the same lock: what registers after this asks itself.
             state.connected = true;
+            state.linked = true;
             wanted.then(|| {
                 let listing = Listing { req: self.req(), after_loss };
                 state.list = Some(listing);
@@ -972,14 +1068,15 @@ impl Connection {
         Ok(())
     }
 
-    /// Reads one link until it ends, saying why. On a relay, `liveness`'s
-    /// stamp is held while each frame is handled and then touched.
-    fn read(&self, reader: &mut impl BufRead, liveness: Option<(&Stamp, Duration)>) -> String {
+    /// Reads one link until its stream ends, saying how. On a relay,
+    /// `liveness`'s stamp is held while each frame is handled and then
+    /// touched.
+    fn read(&self, reader: &mut impl BufRead, liveness: Option<(&Stamp, Duration)>) -> Ending {
         loop {
             let frame = match Frame::read_from_or_eof(reader) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => return "the terminal server closed the connection".to_string(),
-                Err(error) => return format!("reading from the terminal server failed: {error}"),
+                Ok(None) => return Ending::Closed,
+                Err(error) => return Ending::Failed(error),
             };
             if let Some((stamp, _)) = liveness {
                 stamp.hold();
@@ -1197,6 +1294,7 @@ impl Connection {
         let failed = {
             let mut state = self.state.lock();
             state.list = None;
+            state.linked = false;
             let lost: Vec<RequestId> =
                 state.requests.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
             let mut failed = Vec::new();
@@ -1225,14 +1323,18 @@ impl Connection {
         }
     }
 
-    /// A relay attempt failed with `message`. Before the first link, new
-    /// tabs' requests fail with it, and the attaches that wait on are told
-    /// it once. Says whether to keep trying: always once a link has been
-    /// up, else while an attach waits or the connection is eager.
-    fn failed_to_connect(&self, message: &str) -> bool {
+    /// A relay attempt failed with `message`; `refused` when the core
+    /// refused this Brindle ([`Refused`]). Before the first link, new tabs'
+    /// requests fail with it, and the attaches that wait on are told it once;
+    /// after a refusal, new tabs' requests fail with it after a first link
+    /// too, since retrying won't clear it soon. Says whether to keep trying:
+    /// after a refusal only while the connection is eager; otherwise always
+    /// once a link has been up, and before that while an attach or a listing
+    /// hook waits or the connection is eager.
+    fn failed_to_connect(&self, message: &str, refused: bool) -> bool {
         let (failed, told, keep) = {
             let mut state = self.state.lock();
-            if state.connected {
+            if state.connected && !refused {
                 return true;
             }
             let new_tabs: Vec<RequestId> =
@@ -1240,9 +1342,13 @@ impl Connection {
             let failed: Vec<Pending> = new_tabs.into_iter().filter_map(|req| state.requests.remove(&req)).collect();
             // This attempt answered them: only a later tab hurries the next.
             state.hurry = false;
+            // Attaches carried over a lost link aren't told: their tabs say
+            // the link was lost.
+            let first = !state.connected;
             let told: Vec<Sink> = state
                 .requests
                 .values_mut()
+                .filter(|_| first)
                 .filter_map(|pending| match &pending.waiting {
                     Waiting::Attach { sink, .. } if !pending.told => {
                         pending.told = true;
@@ -1251,9 +1357,9 @@ impl Connection {
                     _ => None,
                 })
                 .collect();
-            let keep = self.eager.load(Ordering::Acquire)
-                || state.requests.values().any(Pending::is_attach)
-                || !state.on_listing.is_empty();
+            let eager = self.eager.load(Ordering::Acquire);
+            let keep = eager
+                || (!refused && (state.requests.values().any(Pending::is_attach) || !state.on_listing.is_empty()));
             if !keep {
                 // Under the same lock, so no attach slips in to wait on a
                 // connection that has stopped trying.
@@ -1325,6 +1431,8 @@ impl Connection {
                     log::warn!("nothing from {name} in time: ending the link");
                     watch.link = None;
                     drop(watch);
+                    // Before the end, which is what the reader sees.
+                    stamp.expire();
                     wire.end();
                     watch = self.watch.lock();
                 }
@@ -1503,6 +1611,12 @@ impl Connection {
             {
                 return true;
             }
+            // Given up while no link was up ([`State::give_up_closes`]).
+            if let ToCore::Close(close) = message
+                && !self.state.lock().closing.iter().any(|&(session, _)| session == close.session)
+            {
+                return true;
+            }
             let frame = match encode(message, current.host.as_deref()) {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -1518,9 +1632,11 @@ impl Connection {
             };
             match current.wire.send(&frame) {
                 Ok(()) => {
-                    if matches!(message, ToCore::Close(_)) {
+                    if let ToCore::Close(close) = message {
                         let mut state = self.state.lock();
-                        state.closing = state.closing.saturating_sub(1);
+                        if let Some(ix) = state.closing.iter().position(|&(session, _)| session == close.session) {
+                            state.closing.remove(ix);
+                        }
                     }
                     return true;
                 }
@@ -1560,6 +1676,76 @@ impl Connection {
             }
             None => false,
         }
+    }
+}
+
+/// How a link's stream ended.
+enum Ending {
+    /// The far side closed it.
+    Closed,
+    /// Reading from it failed.
+    Failed(io::Error),
+}
+
+impl Ending {
+    /// The reason for the local core's socket or pipe, which only the core
+    /// can close.
+    fn local_text(&self) -> String {
+        match self {
+            Ending::Closed => "the terminal server closed the connection".to_string(),
+            Ending::Failed(error) => format!("reading from the terminal server failed: {error}"),
+        }
+    }
+}
+
+/// A duration as a reason gives it: whole minutes as `5 minutes`, whole
+/// seconds as `30 s`, else `400 ms`.
+fn span_text(span: Duration) -> String {
+    match (span.as_secs(), span.subsec_nanos()) {
+        (60, 0) => "1 minute".to_string(),
+        (secs, 0) if secs > 0 && secs % 60 == 0 => format!("{} minutes", secs / 60),
+        (secs, 0) => format!("{secs} s"),
+        _ => format!("{} ms", span.as_millis()),
+    }
+}
+
+/// What a connection logs, and ends with if nothing else uses it, when it
+/// gives up the `CLOSE`s of `sessions` on endpoint `name`: no link came up
+/// within `limit` ([`Timings::close_limit`]) of the oldest.
+fn not_ending(sessions: &[SessionId], name: &str, limit: Duration) -> String {
+    let ids: Vec<String> = sessions.iter().map(ToString::to_string).collect();
+    let noun = if sessions.len() == 1 { "session" } else { "sessions" };
+    format!(
+        "not ending {noun} {} on {name}: it couldn't be reached within {} of the close",
+        ids.join(", "),
+        span_text(limit)
+    )
+}
+
+/// Why a relay link ended, in the order that tells the most (design
+/// decision 2): the watchdog ended it for silence (`expired`; the process
+/// was killed, so what it says would only report that); else what the relay's
+/// process says (`why`, asked only then, since it may wait for the exit: its
+/// status and what it wrote to stderr); else how the stream ended. A
+/// process that exited 0 with nothing to say is a relay that closed the
+/// connection, as it does when its core connection closes.
+fn relay_link_ended(
+    name: &str,
+    dead: Duration,
+    expired: bool,
+    ending: &Ending,
+    why: impl FnOnce() -> String,
+) -> String {
+    if expired {
+        return format!("nothing read from {name} for {}", span_text(dead));
+    }
+    let why = why();
+    if !why.is_empty() {
+        return why;
+    }
+    match ending {
+        Ending::Closed => "the relay closed the connection".to_string(),
+        Ending::Failed(error) => format!("reading from the relay failed: {error}"),
     }
 }
 
@@ -1761,6 +1947,8 @@ pub(super) mod fake {
             // Long: most tests leave a connection unused for a while and
             // then use it again. The idle tests shorten it.
             idle: Duration::from_secs(60),
+            // Long, as `idle`: the close limit's tests shorten it.
+            close_limit: Duration::from_secs(60),
         }
     }
 
@@ -1822,6 +2010,8 @@ pub(super) mod fake {
     pub struct Out {
         writer: Arc<Mutex<Option<io::PipeWriter>>>,
         cut: Arc<AtomicBool>,
+        /// What the link's [`Wire::why`] says, as a relay's process would.
+        why: Arc<Mutex<String>>,
     }
 
     impl Out {
@@ -1849,6 +2039,11 @@ pub(super) mod fake {
         pub fn is_cut(&self) -> bool {
             self.cut.load(Ordering::Acquire)
         }
+
+        /// Sets what the wire says of why the link ended, before it is cut.
+        pub fn set_why(&self, why: &str) {
+            *self.why.lock() = why.to_string();
+        }
     }
 
     struct PipeWire {
@@ -1866,6 +2061,10 @@ pub(super) mod fake {
 
         fn end(&self) {
             self.far.cut();
+        }
+
+        fn why(&self) -> String {
+            self.far.why.lock().clone()
         }
     }
 
@@ -1895,16 +2094,8 @@ pub(super) mod fake {
     pub fn link(env: &[(&str, &str)], mut answer: impl FnMut(&ToCore, &Out) + Send + 'static) -> (Link, Far) {
         let (client_reader, far_writer) = io::pipe().unwrap();
         let (mut far_reader, client_writer) = io::pipe().unwrap();
-        let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default() };
-        out.relay(RelayMessage::Host(RelayHost {
-            version: "0.0.0".into(),
-            build: "relay".into(),
-            env: env.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
-            shell: "/bin/bash".into(),
-            home: "/home/u".into(),
-            server_dir: "/run/user/1000/brindle".into(),
-            core_pid: 4242,
-        }));
+        let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default(), why: Arc::default() };
+        out.relay(relay_host(env));
         let (got_tx, got) = mpsc::channel();
         let (hello_tx, hello) = mpsc::channel();
         let heartbeats = Arc::new(AtomicUsize::new(0));
@@ -1938,6 +2129,37 @@ pub(super) mod fake {
         });
         let wire = Arc::new(PipeWire { pipe: Mutex::new(client_writer), far: out.clone() });
         (Link { reader: Box::new(client_reader), wire }, Far { out, got, hello, heartbeats })
+    }
+
+    /// The fake relay's `RELAY_HOST`, with `env`.
+    fn relay_host(env: &[(&str, &str)]) -> RelayMessage {
+        RelayMessage::Host(RelayHost {
+            version: "0.0.0".into(),
+            build: "relay".into(),
+            env: env.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
+            shell: "/bin/bash".into(),
+            home: "/home/u".into(),
+            server_dir: "/run/user/1000/brindle".into(),
+            core_pid: 4242,
+        })
+    }
+
+    /// A link to a fake relay whose core refuses this Brindle: it answers
+    /// `HELLO` with an `ERROR` saying `why`, as a core that shares no
+    /// protocol version with it does.
+    pub fn refusing(why: &str) -> Link {
+        let (client_reader, far_writer) = io::pipe().unwrap();
+        let (mut far_reader, client_writer) = io::pipe().unwrap();
+        let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default(), why: Arc::default() };
+        out.relay(relay_host(&[]));
+        let (far, why) = (out.clone(), why.to_string());
+        std::thread::spawn(move || {
+            let frame = Frame::read_from(&mut far_reader).unwrap();
+            let ToCore::Hello(_) = ToCore::decode(&frame).unwrap() else { panic!("not HELLO") };
+            far.send(ToClient::Error(client::ErrorMessage { req: None, session: None, message: why }));
+        });
+        let wire = Arc::new(PipeWire { pipe: Mutex::new(client_writer), far: out });
+        Link { reader: Box::new(client_reader), wire }
     }
 
     /// Answers each `SPAWN` with session `10 + req`.
@@ -2598,13 +2820,15 @@ mod tests {
     }
 
     /// 6.3: a `CLOSE` made while the link is down keeps the connection
-    /// reconnecting, past the idle time, until it is written; then, with
-    /// nothing left in use, the connection ends and its relay is killed.
+    /// reconnecting, past the idle time, until it is written within its
+    /// limit; then, with nothing left in use, the connection ends and its
+    /// relay is killed.
     #[test]
     fn a_close_queued_while_disconnected_keeps_the_relay_until_it_is_written() {
         let (dial, plan) = fake::dialer("A8");
         let idle = Duration::from_millis(300);
-        let timings = Timings { dead: Duration::from_secs(30), idle, ..fake::quick() };
+        let close_limit = Duration::from_secs(30);
+        let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
         let connection = Connection::relay(dial, "tok", timings).unwrap();
         let (link, first) = fake::link(&[], fake::spawning);
         plan.link(link);
@@ -2638,6 +2862,81 @@ mod tests {
         assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
+    /// 3.1: a `CLOSE` made while the link is down keeps the connection
+    /// trying only for its limit. With still no link up, it is given up: the
+    /// connection ends with a reason naming the session it left running, and
+    /// dials no more.
+    #[test]
+    fn a_close_not_written_within_its_limit_is_given_up_and_the_relay_ends() {
+        let (dial, plan) = fake::dialer("A8");
+        let (idle, close_limit) = (Duration::from_millis(200), Duration::from_millis(600));
+        let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
+        let connection = Connection::relay(dial, "tok", timings).unwrap();
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        plan.next_dial();
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        // Reconnecting: the attempt waits on the test, so no link comes up.
+        plan.next_dial();
+        running.close();
+        let closed = Instant::now();
+        eventually("the connection ends", || connection.is_dead());
+        assert!(closed.elapsed() >= close_limit, "ended {:?} after the close", closed.elapsed());
+        let reason = format!("not ending session {} on A8: it couldn't be reached within 600 ms of the close", running.id());
+        assert_eq!(connection.list().unwrap_err().to_string(), reason);
+        // The attempt under way finds the connection ended; none follows.
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err(), "dialled again");
+    }
+
+    /// 3.1: an eager connection keeps trying past the close limit, but the
+    /// `CLOSE` it gave up isn't written once a link is back: the program is
+    /// left running, as when Brindle ends without quitting.
+    #[test]
+    fn a_close_given_up_is_never_written() {
+        let (dial, plan) = fake::dialer("A8");
+        let (idle, close_limit) = (Duration::from_millis(100), Duration::from_millis(300));
+        let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
+        let connection = Connection::relay_with(dial, "tok", timings, true, None).unwrap();
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        plan.next_dial();
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        plan.next_dial();
+        running.close();
+        eventually("the close is given up", || connection.state.lock().closing.is_empty());
+        std::thread::sleep(idle * 3);
+        assert!(!connection.is_dead(), "an eager connection ended");
+        let (link, second) = fake::link(&[], listing);
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "the CLOSE given up went out");
+    }
+
+    /// 3.1: what a connection says of the closes it gave up, and its limit
+    /// as reasons give it.
+    #[test]
+    fn closes_given_up_name_their_sessions() {
+        let limit = Timings::default().close_limit;
+        assert_eq!(
+            not_ending(&[7], "A8", limit),
+            "not ending session 7 on A8: it couldn't be reached within 5 minutes of the close"
+        );
+        assert_eq!(
+            not_ending(&[7, 9], "dev@A8:2222", Duration::from_millis(600)),
+            "not ending sessions 7, 9 on dev@A8:2222: it couldn't be reached within 600 ms of the close"
+        );
+        assert_eq!(span_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(span_text(Duration::from_secs(90)), "90 s");
+        assert_eq!(span_text(Duration::from_secs(30)), "30 s");
+    }
+
     /// 6.3: an eager connection (a profile that connects at launch) stays
     /// with nothing using it.
     #[test]
@@ -2649,7 +2948,7 @@ mod tests {
         eager.set_eager(true);
         let (writing, idling, reading) = (eager.clone(), eager.clone(), eager.clone());
         std::thread::spawn(move || writing.write_loop(queue));
-        std::thread::spawn(move || idling.end_when_unused(idle));
+        std::thread::spawn(move || idling.end_when_unused(idle, timings.close_limit));
         std::thread::spawn(move || reading.run_relay());
         let (link, far) = fake::link(&[], |_, _| {});
         plan.link(link);
@@ -2697,7 +2996,7 @@ mod tests {
         first.out.cut();
         assert_eq!(
             reported(&reports, id),
-            LinkState::Offline("connection lost: the terminal server closed the connection".into())
+            LinkState::Offline("connection lost: the relay closed the connection".into())
         );
         plan.fail("ssh: connect to host A8 port 22: Connection refused");
         assert_eq!(reported(&reports, id), LinkState::Offline("ssh: connect to host A8 port 22: Connection refused".into()));
@@ -2713,6 +3012,80 @@ mod tests {
         assert_eq!(reported(&reports, id), LinkState::Ended("the connection was no longer used".into()));
         eventually("its relay is ended", || second.out.is_cut());
         assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after the end");
+    }
+
+    /// An eager relay connection that reports its states, with the plan for
+    /// its links, once it reports connecting.
+    fn reporting_relay(name: &str, timings: Timings) -> (Arc<Connection>, Plan, mpsc::Receiver<(u64, LinkState)>) {
+        let (dial, plan) = fake::dialer(name);
+        let (report, reports) = reporting();
+        let connection = Connection::relay_with(dial, "tok", timings, true, Some(report)).unwrap();
+        assert_eq!(reported(&reports, connection.id), LinkState::Connecting);
+        (connection, plan, reports)
+    }
+
+    /// 1.2: a link whose relay process ended says how: its status and what it
+    /// wrote, in the offline report and in the failed requests.
+    #[test]
+    fn a_link_lost_to_its_process_ending_names_its_exit() {
+        let timings = Timings { dead: Duration::from_secs(30), ..fake::quick() };
+        let (connection, plan, reports) = reporting_relay("A8", timings);
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        assert_eq!(reported(&reports, connection.id), LinkState::Connected);
+        first.hello();
+        // A request written on the link, which the loss fails.
+        let (sink, _tab) = fake::sink();
+        let spawning = connection.clone();
+        let spawn = in_background(move || spawning.spawn(spawn_request(&[]), sink, None).map(|r| r.id()));
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+
+        let why = "ssh exited with 255: Timeout, server A8 not responding.";
+        first.out.set_why(why);
+        first.out.cut();
+        assert_eq!(reported(&reports, connection.id), LinkState::Offline(format!("connection lost: {why}")));
+        assert_eq!(spawn.join().unwrap().unwrap_err().to_string(), format!("the terminal server went away ({why})"));
+    }
+
+    /// 1.2: a link the watchdog ended for silence says so, not what the
+    /// kill it caused looks like (the wire's `why` is ignored).
+    #[test]
+    fn a_link_ended_by_the_watchdog_says_nothing_was_read() {
+        let timings = Timings { dead: Duration::from_millis(400), ..fake::quick() };
+        let (connection, plan, reports) = reporting_relay("A8", timings);
+        let (link, first) = fake::link(&[], |_, _| {});
+        // What a killed process would report.
+        first.out.set_why("ssh ended: signal: 9 (SIGKILL)");
+        plan.link(link);
+        assert_eq!(reported(&reports, connection.id), LinkState::Connected);
+        assert_eq!(
+            reported(&reports, connection.id),
+            LinkState::Offline("connection lost: nothing read from A8 for 400 ms".into())
+        );
+        assert!(first.out.is_cut());
+    }
+
+    /// 1.2: how a link's reason is chosen, whichever the order the facts
+    /// come in.
+    #[test]
+    fn a_relay_links_reason_is_the_silence_then_the_process_then_the_stream() {
+        let dead = Duration::from_secs(30);
+        let ending = |ending: &Ending, expired: bool, why: &str| {
+            relay_link_ended("A8", dead, expired, ending, || why.to_string())
+        };
+        let failed = Ending::Failed(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        // Silence wins, and never asks the process (a kill's status).
+        let never = || -> String { panic!("asked the process") };
+        assert_eq!(relay_link_ended("A8", dead, true, &Ending::Closed, never), "nothing read from A8 for 30 s");
+        // The process's own account.
+        assert_eq!(ending(&Ending::Closed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        assert_eq!(ending(&failed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        // Nothing from the process: how the stream ended.
+        assert_eq!(ending(&Ending::Closed, false, ""), "the relay closed the connection");
+        assert_eq!(ending(&failed, false, ""), "reading from the relay failed: reset");
+        // The local core's text is its own.
+        assert_eq!(Ending::Closed.local_text(), "the terminal server closed the connection");
+        assert_eq!(failed.local_text(), "reading from the terminal server failed: reset");
     }
 
     /// 8.2: a connection made eager keeps trying after its first attempt
@@ -2742,6 +3115,40 @@ mod tests {
             LinkState::Ended("can't connect to devbox: Error response from daemon: container devbox is not running".into())
         );
         eventually("the connection ends", || lazy.is_dead());
+    }
+
+    /// 3.3: an eager connection whose core refuses this Brindle keeps
+    /// trying: it reports the refusal offline, fails a new tab's spawn with
+    /// it, and is connected once a core welcomes it. One that isn't eager
+    /// ends on a refusal (`a_relay_error_is_what_a_new_tab_shows` covers its
+    /// end with the error).
+    #[test]
+    fn an_eager_relay_retries_after_a_refusal() {
+        let timings = Timings { dead: Duration::from_secs(30), ..fake::quick() };
+        let (connection, plan, reports) = reporting_relay("A8", timings);
+        let (sink, _tab) = fake::sink();
+        let spawning = connection.clone();
+        let spawn = in_background(move || spawning.spawn(spawn_request(&[]), sink, None).map(|r| r.id()));
+        waiting(&connection, 1);
+        let why = "no common protocol version (offered 1–2, supported 3–4)";
+        plan.link(fake::refusing(why));
+        let refusal = format!("{:#}", super::super::refused(why));
+        assert_eq!(reported(&reports, connection.id), LinkState::Offline(refusal.clone()));
+        assert_eq!(spawn.join().unwrap().unwrap_err().to_string(), format!("can't connect to A8: {refusal}"));
+        assert!(!connection.is_dead());
+        // The next attempt finds a core that welcomes it.
+        plan.next_dial();
+        let (link, far) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        assert_eq!(reported(&reports, connection.id), LinkState::Connected);
+        far.hello();
+
+        // Not eager: a refusal ends it.
+        let (dial, plan) = fake::dialer("B9");
+        let lazy = Connection::relay(dial, "tok", timings).unwrap();
+        plan.link(fake::refusing(why));
+        eventually("the connection ends", || lazy.is_dead());
+        assert_eq!(lazy.list().unwrap_err().to_string(), format!("can't connect to B9: {refusal}"));
     }
 
     /// 8.3: a listing given a limit fails once it passes, with the relay
@@ -2846,7 +3253,8 @@ mod tests {
     }
 
     /// 7.2: a launch's listing hook gets the endpoint's first listing,
-    /// keeping a relay that can't connect yet trying, as an attach does.
+    /// keeping a relay that can't connect yet trying, as an attach does,
+    /// until it is withdrawn (`a_withdrawn_listing_hook_lets_the_relay_end`).
     /// Once a link is up, a hook asks for a listing of its own. A connection
     /// that ended gives the hook back.
     #[test]
@@ -2884,6 +3292,39 @@ mod tests {
         plan.fail("offline");
         eventually("the connection ends", || ended.is_dead());
         assert!(ended.on_listing(hook(&got)).is_err());
+    }
+
+    /// 3.2: a listing hook alone keeps a relay that can't connect trying,
+    /// past its idle time. Withdrawn (the window's last tab on the endpoint
+    /// went), it is dropped without a listing, and with nothing else using
+    /// it the connection ends and dials no more.
+    #[test]
+    fn a_withdrawn_listing_hook_lets_the_relay_end() {
+        let (dial, plan) = fake::dialer("A8");
+        let idle = Duration::from_millis(200);
+        let timings = Timings { dead: Duration::from_secs(30), idle, ..fake::quick() };
+        let connection = Connection::relay(dial, "tok", timings).unwrap();
+        let (got, hooked) = mpsc::channel::<Vec<SessionInfo>>();
+        // The hook holds the only sender: once it is dropped, the receiver
+        // hears so.
+        assert!(connection.on_listing(Box::new(move |sessions| _ = got.send(sessions))).is_ok());
+        plan.next_dial();
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        // The next attempt waits on the test.
+        plan.next_dial();
+        std::thread::sleep(idle * 3);
+        assert!(!connection.is_dead(), "the hook keeps it trying");
+
+        let withdrawn = Instant::now();
+        assert!(connection.stop_listing(), "no hook was waiting");
+        assert!(!connection.stop_listing(), "withdrawn twice");
+        let heard = hooked.recv_timeout(Duration::from_secs(10)).map(|sessions| sessions.len());
+        assert_eq!(heard, Err(mpsc::RecvTimeoutError::Disconnected), "the hook wasn't dropped");
+        eventually("the connection ends", || connection.is_dead());
+        assert!(withdrawn.elapsed() >= idle * 4 / 5, "ended {:?} after the withdrawal", withdrawn.elapsed());
+        assert_eq!(connection.list().unwrap_err().to_string(), "the connection was no longer used");
+        plan.fail("ssh: connect to host A8 port 22: Connection refused");
+        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err(), "dialled again");
     }
 
     /// A link that holds every frame while it is shut, as a stalled one

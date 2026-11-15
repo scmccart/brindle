@@ -2414,6 +2414,10 @@ mod check {
         c.run_check("command-nothing-matches-hides-headings", check).await;
         let check = command_wraps(&mut c).await;
         c.run_check("command-navigation-skips-disabled-and-wraps", check).await;
+        let check = command_items_replaced(&mut c).await;
+        c.run_check("command-items-replaced-keeps-the-named-highlight", check).await;
+        let check = command_named_item_filtered_out(&mut c).await;
+        c.run_check("command-named-item-filtered-out-falls-back-to-the-first-match", check).await;
         let check = command_rows_fill_the_width(&mut c).await;
         c.run_check("command-rows-fill-the-group-width-under-a-filter-border", check).await;
         let check = command_separator_spans_the_list(&mut c).await;
@@ -3545,6 +3549,71 @@ mod check {
             let highlight = read(c)?;
             ensure!(highlight == Some(expected), "{key} highlighted {highlight:?}, expected {expected}");
         }
+        Ok(())
+    }
+
+    /// Replaces the inline command list's items, naming the item to keep
+    /// highlighted, and reads back the filter text and the highlighted item.
+    fn command_replace(
+        c: &mut Checker,
+        command: &Entity<brindle_ui::Command>,
+        items: &[&str],
+        keep: Option<usize>,
+    ) -> Result<(String, Option<usize>), Failure> {
+        let groups = vec![brindle_ui::CommandGroup::unnamed(items.iter().copied())];
+        let command = command.clone();
+        c.with(move |_, _, cx| {
+            command.update(cx, |command, cx| command.set_groups(groups, keep, cx));
+            (command.read(cx).query(cx), command.read(cx).highlighted())
+        })
+    }
+
+    /// The spec's "Items replaced": `alpha`, `beta` and `gamma` with `beta`
+    /// highlighted, replaced by `alpha`, `beta`, `delta` and `gamma` naming
+    /// `beta`: it is still highlighted and the filter text is unchanged.
+    async fn command_items_replaced(c: &mut Checker) -> Check {
+        let command = command_focused(c).await?;
+        let result = command_items_replaced_in(c, &command).await;
+        let groups = super::command_groups();
+        c.with(move |_, _, cx| command.update(cx, |command, cx| command.set_groups(groups, None, cx)))?;
+        result
+    }
+
+    async fn command_items_replaced_in(c: &mut Checker, command: &Entity<brindle_ui::Command>) -> Check {
+        command_replace(c, command, &["alpha", "beta", "gamma"], None)?;
+        c.key("down").await?;
+        let highlighted = c.read(command, |command, _| command.highlighted())?;
+        ensure!(highlighted == Some(1), "down highlighted {highlighted:?}, expected beta (1)");
+        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some(1))?;
+        ensure!(highlighted == Some(1), "beta isn't highlighted after the items were replaced: {highlighted:?}");
+        ensure!(query.is_empty(), "the filter text changed to {query:?}");
+        Ok(())
+    }
+
+    /// The spec's "Named item filtered out": with the filter `ga`, replacing
+    /// the items and naming `beta`, which doesn't match, highlights the
+    /// first item matching `ga`.
+    async fn command_named_item_filtered_out(c: &mut Checker) -> Check {
+        let command = command_focused(c).await?;
+        let result = command_named_item_filtered_out_in(c, &command).await;
+        let groups = super::command_groups();
+        c.with(move |_, _, cx| {
+            command.update(cx, |command, cx| {
+                command.set_groups(groups, None, cx);
+                command.set_query("", cx);
+            })
+        })?;
+        result
+    }
+
+    async fn command_named_item_filtered_out_in(c: &mut Checker, command: &Entity<brindle_ui::Command>) -> Check {
+        command_replace(c, command, &["alpha", "beta", "gamma"], None)?;
+        for key in ["g", "a"] {
+            c.key(key).await?;
+        }
+        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some(1))?;
+        ensure!(query == "ga", "the filter text changed to {query:?}");
+        ensure!(highlighted == Some(3), "gamma (3) isn't highlighted under `ga`: {highlighted:?}");
         Ok(())
     }
 

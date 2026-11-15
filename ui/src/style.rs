@@ -938,6 +938,11 @@ pub const CARD_BORDER: Pixels = px(1.);
 /// button (1.5rem) at the 16px root.
 pub const CARD_HEADER_HEIGHT: Pixels = px(28.);
 
+/// A text field's height: shadcn's `h-9` at the 16px root. `Input` is this
+/// tall, and a form row's control line is at least this tall whatever the
+/// control. In pixels, so an owner can use it without a rem size.
+pub const FIELD_HEIGHT: Pixels = px(36.);
+
 /// A card's own colours, which its owner may give it (a pane drawn in its
 /// terminal's colours). A colour left `None` comes from the tokens, so a
 /// card given none looks as shadcn's does.
@@ -1036,6 +1041,12 @@ mod tests {
     use gpui::hsla;
 
     use super::*;
+
+    #[test]
+    fn field_height_is_shadcns_h_9() {
+        // `h_9` is 2.25rem, 36px at the 16px root.
+        assert_eq!(FIELD_HEIGHT, rems(2.25).to_pixels(px(16.)));
+    }
 
     type Pick = fn(&Tokens) -> Hsla;
 
