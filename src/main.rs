@@ -39,6 +39,7 @@ use gpui::{
 use crate::actions::{Quit, ReloadConfig};
 use crate::config::Config;
 use crate::latency::Latency;
+use crate::remote::hosts::Hosts;
 use crate::settings::Settings;
 use crate::session::{SessionStore, WindowState};
 use crate::workspace::{Launch, LaunchRequest, Workspace};
@@ -426,7 +427,70 @@ pub(crate) fn reload_config_renaming(cx: &mut App, renames: &[(String, String)])
             window.update(cx, |workspace, _, cx| workspace.apply_config(renames, cx)).ok();
         }
     }
+    keep_hosts_connected(cx);
     cx.refresh_windows();
+}
+
+/// Keeps the remote endpoints' states in the [`Hosts`] global, for the
+/// sessions palette (design.md decision 11): every remote connection reports
+/// its changes on a channel this drains on the UI thread, so nothing polls
+/// them. Then connects to the endpoints of the profiles that connect at
+/// launch, on every launch (`--no-restore` included). Before any window
+/// opens, so the restored tabs' connections report too.
+fn watch_hosts(cx: &mut App) {
+    cx.set_global(Hosts::default());
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        use futures::StreamExt as _;
+
+        let (reported, mut reports) = futures::channel::mpsc::unbounded();
+        remote::local::watch_hosts(move |host, conn, state| {
+            reported.unbounded_send((host.clone(), conn, state)).ok();
+        });
+        cx.spawn(async move |cx| {
+            while let Some(report) = reports.next().await {
+                // What has come meanwhile, applied in one update.
+                let mut batch = vec![report];
+                while let Ok(Some(report)) = reports.try_next() {
+                    batch.push(report);
+                }
+                let applied = cx.update(|cx| {
+                    let changed = cx.update_global(|hosts: &mut Hosts, _| {
+                        batch.into_iter().fold(false, |changed, (host, conn, state)| hosts.apply(&host, conn, state) | changed)
+                    });
+                    if changed {
+                        hosts_changed(cx);
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    keep_hosts_connected(cx);
+}
+
+/// Keeps the endpoints of the config's profiles that connect at launch
+/// connected, and lets go of those it no longer names (a reload).
+fn keep_hosts_connected(cx: &mut App) {
+    let eager = reattach::eager_hosts(&Settings::get(cx).config);
+    let changed = cx.update_global(|hosts: &mut Hosts, _| hosts.want(&eager));
+    #[cfg(any(target_os = "linux", windows))]
+    remote::local::keep_connected(eager);
+    if changed {
+        hosts_changed(cx);
+    }
+}
+
+/// Tells every window the endpoints' states changed.
+fn hosts_changed(cx: &mut App) {
+    for window in cx.windows() {
+        if let Some(window) = window.downcast::<Workspace>() {
+            window.update(cx, |workspace, window, cx| workspace.hosts_changed(window, cx)).ok();
+        }
+    }
 }
 
 fn config_mtime() -> Option<SystemTime> {
@@ -529,6 +593,49 @@ fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
     Some(Vec::new())
 }
 
+/// For a restoring launch: connects, on background threads, to the remote
+/// endpoints of the restored zones and of the profiles that connect at
+/// launch (which [`watch_hosts`] keeps connected whether or not the launch
+/// restores); on each one's first listing, attaches its detached sessions
+/// that nothing restored as tabs at the end ([`Workspace::attach_swept`],
+/// design.md decision 10).
+fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        use futures::StreamExt as _;
+
+        let restored = window.update(cx, |ws, _, _| ws.restored_hosts().to_vec()).unwrap_or_default();
+        let hosts = reattach::launch_hosts(&restored, &Settings::get(cx).config);
+        if hosts.is_empty() {
+            return;
+        }
+        let (listed, mut listings) = futures::channel::mpsc::unbounded();
+        for host in hosts {
+            let listed = listed.clone();
+            let spawned = std::thread::Builder::new().name("launch-connect".into()).spawn(move || {
+                let named = host.clone();
+                let hook: remote::local::ListingHook = Box::new(move |sessions| {
+                    listed.unbounded_send((named, sessions)).ok();
+                });
+                remote::local::when_listed(&host, hook);
+            });
+            if let Err(error) = spawned {
+                log::warn!("not connecting at launch: {error}");
+            }
+        }
+        // Ends once every hook has run or was dropped with its connection.
+        drop(listed);
+        cx.spawn(async move |cx| {
+            while let Some((host, sessions)) = listings.next().await {
+                window.update(cx, |ws, window, cx| ws.attach_swept(host, sessions, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = (window, cx);
+}
+
 /// The recorded windows, merged into the one window Brindle has, without
 /// the zones whose sessions are gone (when `listed`: the `Detached` global
 /// holds the launch's listing); `None` when the state file is missing,
@@ -550,7 +657,8 @@ fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
 }
 
 /// Writes the session state when it changes (off the UI thread), and once
-/// more, synchronously, when Brindle quits.
+/// more, synchronously, when Brindle quits, after each window still open
+/// has recorded itself and left its terminals' sessions (`Workspace::quit`).
 fn record_session(cx: &mut App) {
     fn pending(cx: &mut App) -> Option<String> {
         cx.update_global(|store: &mut SessionStore, _| {
@@ -575,10 +683,14 @@ fn record_session(cx: &mut App) {
     })
     .detach();
     cx.on_app_quit(|cx| {
-        // The windows still open now are the ones to keep.
+        // The windows still open now are the ones to keep. Each detaches
+        // its tabs' sessions (`-e` ones close) itself, every debug run's
+        // included, rather than leaving it to the terminals' drops, which
+        // on Windows don't run before the exit. A window that closed did
+        // so as it closed.
         for window in cx.windows() {
             if let Some(window) = window.downcast::<Workspace>() {
-                window.update(cx, |ws, window, cx| ws.record_session(window, cx)).ok();
+                window.update(cx, |ws, window, cx| ws.quit(window, cx)).ok();
             }
         }
         if let Some(text) = pending(cx) {
@@ -760,6 +872,7 @@ fn main() {
             }
             None => (request.unwrap_or_else(|| Launch::Request(LaunchRequest::profile(profile))), None),
         };
+        watch_hosts(cx);
         let Some(window) = open_window(first, cx) else {
             cx.quit();
             return;
@@ -771,6 +884,9 @@ fn main() {
         }
         if let Some(request) = request {
             window.update(cx, |ws, window, cx| ws.open(request, window, cx)).ok();
+        }
+        if restoring {
+            sweep_launch_hosts(window, cx);
         }
         watch_config(cx);
         record_session(cx);
@@ -845,6 +961,16 @@ fn main() {
             .detach();
         }
     });
+    // Every way out of `run` has detached (or closed) the tabs' sessions:
+    // the quit (`record_session`'s quit handler) or the window's close
+    // (`Workspace::quit`). Those messages are only queued for the
+    // connections' writer threads, which the exit would end (Windows ends
+    // them at once). A lost `DETACH` leaves a session its owner, so the
+    // next launch wouldn't open it as a tab.
+    #[cfg(any(target_os = "linux", windows))]
+    if !remote::local::flush(remote::local::QUIT_FLUSH) {
+        log::info!("quitting before every terminal server connection had written what its tabs sent");
+    }
 }
 
 /// `--wait-for`: polls the active terminal's screen until it shows `text`,

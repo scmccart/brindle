@@ -53,10 +53,22 @@ impl Conn {
 
     /// Reads what the socket has, up to a budget. Returns `true` at EOF.
     pub fn read_available(&mut self) -> io::Result<bool> {
+        self.read_up_to(READ_BUDGET)
+    }
+
+    /// Reads what the socket has, until it has no more or `limit` bytes are
+    /// read. Returns `true` at EOF.
+    ///
+    /// [`Conn::read_available`] is this with a turn's budget, after which
+    /// the loop comes back for the rest. A connection that is about to be
+    /// dropped has no later turn, so its owner passes all it is willing to
+    /// hold instead.
+    pub fn read_up_to(&mut self, limit: usize) -> io::Result<bool> {
         let mut buffer = [0u8; 64 * 1024];
         let mut read_total = 0;
-        while read_total < READ_BUDGET {
-            match self.stream.read(&mut buffer) {
+        while read_total < limit {
+            let wanted = buffer.len().min(limit - read_total);
+            match self.stream.read(&mut buffer[..wanted]) {
                 Ok(0) => return Ok(true),
                 Ok(read) => {
                     read_total += read;
@@ -329,6 +341,42 @@ mod tests {
             sender.flush().unwrap();
         }
         assert_eq!((sender.written(), sender.queued()), (end, 0));
+    }
+
+    /// Linux only: what one side wrote is all in the socket at once, so a
+    /// read takes exactly what it asks for. A Windows pipe hands its bytes
+    /// over one overlapped read at a time.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_stops_at_its_limit_or_when_the_socket_has_no_more() {
+        let frames = [
+            Frame::new(1, vec![1; 10_000]).unwrap(),
+            Frame::new(2, vec![2; 10_000]).unwrap(),
+            Frame::new(3, vec![3; 10_000]).unwrap(),
+        ];
+        let (a, b) = Stream::pair().unwrap();
+        let mut sender = Conn::new(a).unwrap();
+        let mut receiver = Conn::new(b).unwrap();
+        for frame in &frames {
+            sender.queue(frame);
+        }
+        sender.flush().unwrap();
+        assert_eq!(sender.queued(), 0, "a socket holds this much");
+
+        // The first frame and not a byte more, though more is waiting.
+        assert!(!receiver.read_up_to(FRAME_HEADER_LEN + 10_000).unwrap());
+        assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[0]));
+        assert_eq!(receiver.next_frame().unwrap(), None);
+        assert!(receiver.input.is_empty(), "read past the limit");
+        assert!(receiver.input_waiting(), "the rest is in the socket");
+        // A limit past what the socket holds takes all of it, and stops
+        // there: the peer is still connected.
+        assert!(!receiver.read_up_to(usize::MAX).unwrap());
+        assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[1]));
+        assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[2]));
+        assert!(!receiver.input_waiting());
+        drop(sender);
+        assert!(receiver.read_up_to(usize::MAX).unwrap(), "EOF");
     }
 
     #[test]

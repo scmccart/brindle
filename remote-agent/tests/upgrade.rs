@@ -1,8 +1,8 @@
 //! Upgrades (task 6.1): `STEP_DOWN`, adoption by the next core, draining
-//! holders of another build, the `check` command, and a next core that
-//! won't start.
+//! holders of another build, the `check` command, a next core that won't
+//! start, and (on Linux) the upgrade a relay offers.
 //!
-//! Every test runs on both platforms. On Windows the console host renders
+//! Every test but the relay's runs on both platforms. On Windows the console host renders
 //! what a program prints, so a replay is compared with what a client saw
 //! rather than with the program's bytes, and since a running image can't
 //! be replaced, the older build is another copy of the binary.
@@ -22,6 +22,8 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, ReplayStart};
 
 use support::programs::{self, ENTER, say};
+#[cfg(unix)]
+use support::relay::Relay;
 use support::*;
 
 /// How long a Windows session that has printed everything stays quiet
@@ -390,4 +392,111 @@ fn a_next_core_that_wont_start_is_replaced_by_the_holders_own() {
     let mut client = TestClient::hello(&dir.path, "t");
     replays(&mut client, 2);
     say(&mut client, killed, "back");
+}
+
+/// Sets `path`'s file time to an hour before the built binary's, so that
+/// for the same version the built binary counts as the newer build.
+#[cfg(unix)]
+fn older_than_the_built_binary(path: &Path) {
+    let built = fs::metadata(BIN).unwrap().modified().unwrap();
+    let file = fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(built - Duration::from_secs(3600)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_newer_relay_upgrades_the_core_and_keeps_its_sessions() {
+    let mut dir = TempDir::new("relay-upgrade");
+    let (old_bin, new_build) = other_build_copy(&dir);
+    older_than_the_built_binary(&old_bin);
+    start(
+        &old_bin,
+        "serve",
+        &dir.path,
+        &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")],
+    )
+    .unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let old_core = a.core_pid();
+    dir.track(old_core);
+    assert_ne!(a.welcome.as_ref().unwrap().core_build, new_build);
+    let (echo, echo_pid) = a.spawn(programs::echoer());
+    let mut detach = programs::sleeps();
+    detach.policy = client::Policy::Detach;
+    let (kept, kept_pid) = a.spawn(detach);
+    let holder = parent(echo_pid).unwrap();
+    dir.track(holder);
+
+    // A relay of the built binary: the same version, another build, a later
+    // file.
+    let mut relay = Relay::start(Path::new(BIN), &dir.path, &[]);
+    let host = relay.host();
+    dir.track(host.core_pid);
+    let mut through = relay.client("r");
+    assert_ne!(host.core_pid, old_core);
+    assert!(gone(old_core), "the old core still runs");
+    assert!(a.closes());
+    assert_eq!(host.build, new_build);
+    assert_eq!(through.welcome.as_ref().unwrap().core_build, new_build);
+    assert_eq!(through.core_pid(), host.core_pid);
+    runs_the_built_binary(host.core_pid);
+
+    // The sessions kept running under their holder, and come back to their
+    // client.
+    let mut a = TestClient::hello(&dir.path, "a");
+    let back = replays(&mut a, 2);
+    assert_eq!(back[&echo].0.pid, echo_pid);
+    assert_eq!(back[&kept].0.pid, kept_pid);
+    for pid in [echo_pid, kept_pid] {
+        assert_eq!(parent(pid), Some(holder));
+    }
+    say(&mut a, echo, "upgraded");
+
+    // And the relay's client works on the new core.
+    let (via, via_pid) = through.spawn(programs::echoer());
+    dir.track(parent(via_pid).unwrap());
+    say(&mut through, via, "through the relay");
+
+    let logs = dir.logs();
+    for entry in ["upgrading the core", "upgrade: client", "upgrade: took holder"] {
+        assert!(logs.contains(entry), "no {entry:?} in
+{logs}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_older_or_equal_relay_leaves_the_core_alone() {
+    let mut dir = TempDir::new("relay-keep");
+    let (old_bin, built) = other_build_copy(&dir);
+    older_than_the_built_binary(&old_bin);
+    start_core(&dir.path, &[]).unwrap();
+    let mut a = TestClient::hello(&dir.path, "a");
+    let core = a.core_pid();
+    dir.track(core);
+    assert_eq!(a.welcome.as_ref().unwrap().core_build, built);
+    let (echo, echo_pid) = a.spawn(programs::echoer());
+    dir.track(parent(echo_pid).unwrap());
+
+    for (bin, equal) in [(old_bin.as_path(), false), (Path::new(BIN), true)] {
+        let mut relay = Relay::start(bin, &dir.path, &[]);
+        let host = relay.host();
+        let mut through = relay.client(if equal { "equal" } else { "older" });
+        assert_eq!(host.core_pid, core, "equal build: {equal}");
+        assert_eq!(host.build == built, equal);
+        assert_eq!(through.core_pid(), core);
+        assert!(
+            through
+                .list()
+                .iter()
+                .any(|session| session.session == echo && session.pid == echo_pid)
+        );
+    }
+    assert!(alive(core));
+    say(&mut a, echo, "untouched");
+    let logs = dir.logs();
+    assert!(
+        !logs.contains("upgrading the core") && !logs.contains("upgrade: client"),
+        "{logs}"
+    );
 }

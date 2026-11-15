@@ -52,6 +52,11 @@ fn unix() -> Vec<Case> {
         display("dump-wait-for-clean", dump::wait_for_clean),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
+        display("remote-ssh-quit", remote::ssh_quit),
+        display("remote-ssh-split", remote::ssh_split),
+        display("remote-ssh-network", remote::ssh_network),
+        display("remote-ssh-connect-at-launch", remote::ssh_connect_at_launch),
+        display("remote-offline", remote::offline),
         display("colors-local", colors::local),
         display("colors-split-zone", colors::split_zone),
         display("colors-reload", colors::reload),
@@ -69,6 +74,7 @@ fn unix() -> Vec<Case> {
         display("settings-focus-rings", settings::focus_rings),
         display("settings-editor-select-ring", settings::editor_select_ring),
         display("settings-list-stop", settings::list_stop),
+        display("settings-editor-connect-at-launch", settings::editor_connect_at_launch),
         display("settings-enter-on-button", settings::enter_on_button),
         display("settings-section-shortcuts", settings::section_shortcuts),
         display("settings-section-list", settings::section_list),
@@ -159,6 +165,11 @@ fn unix() -> Vec<Case> {
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),
     ]
+}
+
+/// The remote cases' parsers (`--self-test`).
+pub fn self_test_remote() -> Result {
+    remote::self_test()
 }
 
 /// The active terminal's cell grid, from the run's dump.

@@ -18,14 +18,16 @@ use crate::actions::*;
 use crate::config::{Config, Profile};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{Palette, PaletteEvent, PaletteRow, PromptRequest, SubmitFn};
+use crate::picker::{Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SubmitFn};
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
 };
+use crate::remote::Host;
+use crate::remote::hosts::{HostState, Hosts};
 use crate::remote::protocol::client::SessionInfo;
-use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState, ZoneNodeState};
+use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState};
 use crate::settings::Settings;
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
@@ -57,7 +59,11 @@ pub enum TabOrigin {
 
 pub struct Tab {
     pub id: u64,
+    /// The tab's profile, as the config has it now.
     pub profile: Profile,
+    /// The endpoint the tab opened on: where its zones run, and where new
+    /// ones start, whatever its profile targets now. It never changes.
+    pub host: Host,
     /// The tab's zones: one terminal, or a split tree of them.
     pub zones: Entity<ZoneTreeView>,
     pub origin: TabOrigin,
@@ -76,6 +82,7 @@ pub struct Tab {
 impl Tab {
     fn new(
         profile: Profile,
+        host: Host,
         zones: Entity<ZoneTreeView>,
         origin: TabOrigin,
         subscriptions: Vec<Subscription>,
@@ -85,6 +92,7 @@ impl Tab {
         let mut tab = Self {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             profile,
+            host,
             zones,
             origin,
             bell: false,
@@ -188,60 +196,63 @@ enum PaletteKind {
     /// when it opened, which they run in.
     Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
     Prompt,
-    /// The terminal server's detached sessions, by row: enter attaches one
-    /// into a new tab, `picker_kill` ends it.
-    Sessions { sessions: Vec<SessionInfo> },
+    /// The detached sessions of this machine's terminal server and of each
+    /// remote endpoint's: what each endpoint listed, what each row stands
+    /// for (enter attaches a session into a new tab, `picker_kill` ends it,
+    /// both on its endpoint's connection), and the sessions killed from it
+    /// (endpoint, id and key), whose rows stay gone while their programs
+    /// exit.
+    Sessions { listed: Vec<(Host, Listing)>, rows: Vec<SessionRow>, killed: Vec<(Host, u32, String)> },
 }
 
-/// Kills `kill` (if given), then lists the server's detached sessions,
-/// through the process's shared connection. Blocks: off the UI thread.
-fn detached_now(kill: Option<u32>) -> anyhow::Result<Vec<SessionInfo>> {
+/// How long the sessions palette waits for a remote endpoint's listing
+/// before it counts the endpoint as offline.
+#[cfg(any(target_os = "linux", windows))]
+const LIST_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Kills session `kill` (if given), then lists `host`'s detached sessions
+/// for the sessions palette, `state` being how the endpoint stands. Blocks:
+/// off the UI thread. This machine's server is listed through the shared
+/// connection, as ever (a failure is logged, and lists nothing). A remote
+/// endpoint is listed only when connected, on the connection the process
+/// has (none is made), within [`LIST_LIMIT`]; one connecting or offline
+/// says so, and one that doesn't answer is offline.
+fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> Listing {
     #[cfg(any(target_os = "linux", windows))]
     {
-        let connection = crate::remote::local::shared()?;
-        if let Some(id) = kill
-            && let Err(why) = connection.kill(id)
-        {
-            log::warn!("killing session {id}: {why:#}");
+        use crate::remote::local;
+
+        let connection = match (host, state) {
+            (Host::Local, _) => local::shared(host),
+            (Host::Remote(_), HostState::Connecting) => return Listing::Connecting,
+            (Host::Remote(_), HostState::Offline(why)) => return Listing::Offline(why.clone()),
+            (Host::Remote(_), HostState::Connected) => {
+                local::existing(host).ok_or_else(|| anyhow::anyhow!("the connection ended"))
+            }
+        };
+        let limit = (!host.is_local()).then_some(LIST_LIMIT);
+        let listed = connection.and_then(|connection| {
+            if let Some(id) = kill
+                && let Err(why) = connection.kill_within(id, limit)
+            {
+                log::warn!("killing session {id} on {}: {why:#}", host.name());
+            }
+            connection.list_within(limit)
+        });
+        match listed {
+            Ok(sessions) => Listing::Sessions(sessions.into_iter().filter(|s| !s.attached).collect()),
+            Err(why) if host.is_local() => {
+                log::warn!("listing sessions: {why:#}");
+                Listing::Sessions(Vec::new())
+            }
+            Err(why) => Listing::Offline(format!("{why:#}")),
         }
-        // A killed session stays listed until its program has exited.
-        Ok(connection.list()?.into_iter().filter(|s| !s.attached && Some(s.session) != kill).collect())
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = kill;
-        Ok(Vec::new())
+        let _ = (host, state, kill);
+        Listing::Sessions(Vec::new())
     }
-}
-
-/// The sessions palette's rows: newest first, each with its directory and
-/// age at `now` (unix seconds).
-fn session_rows(sessions: &mut [SessionInfo], now: u64) -> Vec<PaletteRow> {
-    sessions.sort_by_key(|s| std::cmp::Reverse((s.started, s.session)));
-    sessions
-        .iter()
-        .map(|s| {
-            let age = crate::reattach::age(s.started, now);
-            let detail = match (&s.cwd, age) {
-                (Some(cwd), Some(age)) => format!("{cwd} · {age} ago"),
-                (Some(cwd), None) => cwd.clone(),
-                (None, Some(age)) => format!("{age} ago"),
-                (None, None) => String::new(),
-            };
-            PaletteRow {
-                label: crate::reattach::label(s).into(),
-                detail: (!detail.is_empty()).then(|| detail.into()),
-                shortcut: None,
-            }
-        })
-        .collect()
-}
-
-/// The sessions palette's empty message for `count` detached sessions: it
-/// says there are none only when there are none; a filter matching none of
-/// them gets the command list's own "No results found.".
-fn sessions_empty_message(count: usize) -> Option<SharedString> {
-    (count == 0).then(|| "No detached sessions".into())
 }
 
 
@@ -253,6 +264,9 @@ pub struct Workspace {
     palette: UiOverlay<Palette>,
     /// What the open palette is for, and the subscription to its events.
     palette_kind: Option<PaletteKind>,
+    /// The sessions palette's latest listing: an older one that answers
+    /// later is dropped.
+    sessions_listing: u64,
     _palette_subscription: Option<Subscription>,
     /// The settings dialog's modal slot. A press on its backdrop does
     /// nothing, so a stray click never throws away a preview or an edit.
@@ -294,6 +308,15 @@ pub struct Workspace {
     /// The window's size as recorded for restore: the size it opened
     /// with, until the user resizes it (see [`recorded_size`]).
     windowed_size: std::cell::Cell<Size<Pixels>>,
+    /// The remote endpoints of the restored tabs, each once, and the
+    /// sessions restored zones recorded there: a launch's sweep of an
+    /// endpoint leaves those to their zones ([`Workspace::attach_swept`]).
+    restored_hosts: Vec<Host>,
+    restored_sessions: Vec<(Host, session::ServerSession)>,
+    /// Brindle is quitting, and the terminals have left their sessions
+    /// ([`Workspace::quit`]): nothing is recorded any more, since the zones
+    /// no longer know their sessions.
+    quitting: bool,
 }
 
 impl Workspace {
@@ -317,6 +340,7 @@ impl Workspace {
             active: 0,
             palette: UiOverlay::modal(),
             palette_kind: None,
+            sessions_listing: 0,
             _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
@@ -335,7 +359,17 @@ impl Workspace {
             window_id: window.window_handle().window_id().as_u64(),
             order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             windowed_size: std::cell::Cell::new(window.bounds().size),
+            restored_hosts: Vec::new(),
+            restored_sessions: Vec::new(),
+            quitting: false,
         };
+        // A close the window manager or Windows asks for (its close button,
+        // alt-F4, the taskbar) quits too.
+        let workspace = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            workspace.update(cx, |ws, cx| ws.quit(window, cx)).ok();
+            true
+        });
         this._title_refresh = cx.spawn_in(window, async move |this, cx| {
             // Foreground processes change without any event (e.g. `vim`
             // starting), so poll their names gently. The same poll records
@@ -376,7 +410,7 @@ impl Workspace {
     /// naming it and why not.
     fn launch_attach(&mut self, session: u32, target: Result<SessionInfo, String>, window: &mut Window, cx: &mut Context<Self>) {
         match target {
-            Ok(info) => self.attach_detached_here(info, window, cx),
+            Ok(info) => self.attach_detached_here(Host::Local, info, window, cx),
             Err(why) => {
                 // A message tab: never recorded for session restore.
                 let config = Self::settings(cx);
@@ -388,7 +422,9 @@ impl Workspace {
     }
 
     /// Opens a recorded window's tabs in order, and activates the recorded
-    /// active tab.
+    /// active tab. Zones that recorded a session get it back: this
+    /// machine's from the launch's listing, a remote endpoint's once that
+    /// endpoint answers (the window never waits for it).
     fn restore(&mut self, state: WindowState, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
@@ -396,20 +432,19 @@ impl Workspace {
         for (ix, entry) in state.tabs.iter().enumerate() {
             match session::resolve_tab(entry, &config, &home) {
                 None => {}
-                Some(RestoredTab::Local { profile, cwd, title, zones, session }) => {
-                    let found = match zones {
-                        Some(_) => None,
-                        None => Self::take_detached(session.as_ref(), cx),
-                    };
-                    match (zones, found) {
-                        (Some(zones), _) => self.restore_local_zones(profile, zones, window, cx),
-                        #[cfg(any(target_os = "linux", windows))]
-                        (None, Some(info)) => {
+                Some(RestoredTab::Local { profile, host, cwd, title, zones, session }) => {
+                    if !host.is_local() && !self.restored_hosts.contains(&host) {
+                        self.restored_hosts.push(host.clone());
+                    }
+                    match (zones, session) {
+                        (Some(zones), _) => self.restore_zones(profile, host, zones, window, cx),
+                        (None, Some(recorded)) => {
                             let profile = config.profiles[profile].clone();
-                            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
-                            self.insert_terminal_tab(profile, terminal, true, window, cx);
+                            let terminal = self.restored_terminal(&profile, &host, cwd, Some(&recorded), &config, cx);
+                            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
                         }
-                        _ => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
+                        // No record: the tab follows its profile.
+                        (None, None) => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
                     }
                     let Some(tab) = self.tabs.get_mut(self.active) else { continue };
                     if let Some(title) = title {
@@ -426,9 +461,12 @@ impl Workspace {
         }
     }
 
-    fn restore_local_zones(
+    /// A restored split tab on `host`: the endpoint its zones recorded
+    /// sessions on, else its profile's (`session::resolve_tab`).
+    fn restore_zones(
         &mut self,
         profile_ix: usize,
+        host: Host,
         zones: RestoredZoneNode,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -439,18 +477,19 @@ impl Workspace {
         let terminals: Vec<_> = leaves
             .into_iter()
             .map(|(id, cwd, session)| {
-                let terminal = Self::restored_terminal(&profile, cwd, session.as_ref(), &config, cx);
+                let terminal = self.restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
                 (id, terminal)
             })
             .collect();
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
+        let tree_host = host.clone();
         let view = cx.new(|cx| {
-            ZoneTreeView::from_restored(p_clone, theme, font_size, tree, terminals, active_id, window, cx)
+            ZoneTreeView::from_restored(p_clone, tree_host, theme, font_size, tree, terminals, active_id, window, cx)
         });
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -466,18 +505,20 @@ impl Workspace {
                 TabOrigin::Message => SnapshotTab::Skip,
                 TabOrigin::Local => {
                     let z = tab.zones.read(cx);
-                    let zones = ZoneNodeState::from_tree(z.tree(), z.active_id(), &mut |id| {
-                        (z.zone_working_directory(id, cx), z.zone_server_session(id, cx))
-                    });
-                    // A single zone's session is the tab's.
-                    let session = zones.is_none().then(|| z.zone_server_session(z.active_id(), cx)).flatten();
-                    SnapshotTab::Local {
-                        profile: tab.profile.name.clone(),
-                        remote: tab.profile.remote.clone(),
-                        cwd: z.active_terminal(cx).and_then(|t| t.read(cx).working_directory()),
-                        title: tab.manual_title.clone(),
-                        zones,
-                        session,
+                    // Zones that only show a message (a failed attach) aren't
+                    // recorded, and neither is a tab of nothing else.
+                    match session::record_zones(z.tree(), z.active_id(), &mut |id| z.zone_record(id, cx)) {
+                        None => SnapshotTab::Skip,
+                        Some(recorded) => SnapshotTab::Local {
+                            profile: tab.profile.name.clone(),
+                            // Where it runs, which its profile may no longer name.
+                            remote: tab.host.target().cloned(),
+                            cwd: recorded.cwd,
+                            title: tab.manual_title.clone(),
+                            zones: recorded.zones,
+                            // A single zone's session is the tab's.
+                            session: recorded.session,
+                        },
                     }
                 }
             });
@@ -502,12 +543,31 @@ impl Workspace {
     /// Stores this window's snapshot, when session restore is on and this
     /// process owns the session.
     pub fn record_session(&self, window: &Window, cx: &mut Context<Self>) {
-        if !cx.update_global(|store: &mut SessionStore, _| store.is_owner()) {
+        if self.quitting || !cx.update_global(|store: &mut SessionStore, _| store.is_owner()) {
             return;
         }
         let state = self.snapshot(window, cx);
         let (id, order) = (self.window_id, self.order);
         cx.update_global(|store: &mut SessionStore, _| store.record(id, order, state));
+    }
+
+    /// Brindle is quitting, or this window is closing, which quits it:
+    /// records the window while its zones still know their sessions, then
+    /// has every tab's terminals leave their programs as their `Closing`
+    /// says ([`Terminal::quit`]: profile tabs' sessions are detached, `-e`
+    /// ones end). Their drops would do the same, but GPUI doesn't always
+    /// run them before the process exits: on Windows the focused
+    /// terminal's view outlives the exit, held by the input handler of a
+    /// window whose destruction never runs. Once is enough.
+    pub fn quit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        self.record_session(window, cx);
+        self.quitting = true;
+        for tab in &self.tabs {
+            tab.zones.update(cx, |zones, cx| zones.quit_all(cx));
+        }
     }
 
     fn settings(cx: &App) -> &Config {
@@ -522,10 +582,10 @@ impl Workspace {
     }
 
     /// The active directory only has meaning to a profile on the same host
-    /// or container.
+    /// or container as the active tab ([`same_endpoint`]).
     fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
-        if tab.profile.remote != profile.remote {
+        if !same_endpoint(&tab.host, profile) {
             return None;
         }
         tab.active_terminal(cx)?.read(cx).working_directory()
@@ -553,22 +613,26 @@ impl Workspace {
             if profile.cwd.is_none() { self.active_cwd_for(&profile, cx) } else { None }
         });
 
-        let terminal = cx.new(|cx| Terminal::spawn(&profile, command, cwd, &config, cx));
+        // The tab is on the profile's endpoint from now on.
+        let host = Host::of(&profile);
+        let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
     }
 
-    /// A local tab showing `terminal` alone, inserted after the active tab,
-    /// and activated when `activate`. Only attached sessions open this way.
-    #[cfg(any(target_os = "linux", windows))]
+    /// A tab on `host` showing `terminal` alone: inserted after the active
+    /// tab and activated when `activate`, else at the end. Attached and
+    /// restored sessions open this way: `host` is the one they run on.
     fn insert_terminal_tab(
         &mut self,
         profile: Profile,
+        host: Host,
         terminal: Entity<Terminal>,
         activate: bool,
         window: &mut Window,
@@ -578,9 +642,10 @@ impl Workspace {
         let theme = self.tab_theme(&profile, &config);
         let font_size = profile.font_size;
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, font_size, terminal, window, cx));
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
         if activate {
             self.insert_tab(tab, None, window, cx);
@@ -599,60 +664,143 @@ impl Workspace {
         cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take(recorded))
     }
 
-    /// A terminal attached to the detached session `info`, closing as
-    /// `profile` says.
+    /// A terminal attached to the detached session `info` of `host`'s
+    /// server, closing as `profile` says.
     #[cfg(any(target_os = "linux", windows))]
-    fn attached_terminal(info: &SessionInfo, profile: &Profile, config: &Config, cx: &mut Context<Self>) -> Entity<Terminal> {
+    fn attached_terminal(
+        host: &Host,
+        info: &SessionInfo,
+        profile: &Profile,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> Entity<Terminal> {
         // At the session's own size, so attaching resizes nothing; a core
         // that predates sizes in `LIST` reports 0.
         let default = crate::terminal::GridSize::default();
         let (cols, rows) = if info.cols > 0 && info.rows > 0 { (info.cols, info.rows) } else { (default.cols, default.rows) };
-        let request = crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows };
+        let request =
+            crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows, recorded: false };
         let what = crate::reattach::label(info);
-        cx.new(|cx| Terminal::attach(request, what, profile, config, cx))
+        cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
 
-    /// A restored zone's terminal: its recorded session attached when the
-    /// launch found it still detached, else `profile` spawned in `cwd`.
+    /// A restored zone's terminal on `host`. Its recorded session is
+    /// attached: on this machine when the launch's listing found it still
+    /// detached; on a remote endpoint once its listing there confirms it,
+    /// which the zone waits for, saying it is connecting. Otherwise
+    /// `profile` is spawned in `cwd`.
     fn restored_terminal(
+        &mut self,
         profile: &Profile,
+        host: &Host,
         cwd: PathBuf,
         recorded: Option<&session::ServerSession>,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        let found = Self::take_detached(recorded, cx);
         #[cfg(any(target_os = "linux", windows))]
-        if let Some(info) = found {
-            return Self::attached_terminal(&info, profile, config, cx);
+        match recorded {
+            Some(recorded) if !host.is_local() => {
+                self.restored_sessions.push((host.clone(), recorded.clone()));
+                let request = crate::remote::local::AttachRequest {
+                    session: recorded.id,
+                    key: recorded.key.clone(),
+                    cols: 0,
+                    rows: 0,
+                    recorded: true,
+                };
+                let what = host.name();
+                return cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx));
+            }
+            Some(recorded) => {
+                if let Some(info) = Self::take_detached(Some(recorded), cx) {
+                    return Self::attached_terminal(host, &info, profile, config, cx);
+                }
+            }
+            None => {}
         }
         #[cfg(not(any(target_os = "linux", windows)))]
-        let _ = found;
-        cx.new(|cx| Terminal::spawn(profile, None, Some(cwd), config, cx))
+        let _ = recorded;
+        cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))
     }
 
-    /// Opens a tab for each of `sessions` (detached sessions nothing
-    /// restored took), after the others and in this order, each with the
-    /// profile its meta names (the default one when it's gone). The active
-    /// tab stays the same.
+    /// Opens a tab for each of `sessions` (detached sessions of this
+    /// machine nothing restored took), after the others and in this order,
+    /// each with the profile it was started with, or the default one when
+    /// that is gone or remote. The active tab stays the same.
     pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
             for info in sessions {
-                let index = info
-                    .profile
-                    .as_deref()
-                    .and_then(|name| config.profile_index(name))
-                    .unwrap_or_else(|| config.default_profile_index());
-                let profile = config.profiles[index].clone();
-                let terminal = Self::attached_terminal(&info, &profile, &config, cx);
+                let profile = config.profiles[crate::reattach::local_profile(&info, &config)].clone();
+                // The launch listed this machine's sessions.
+                let terminal = Self::attached_terminal(&Host::Local, &info, &profile, &config, cx);
                 let activate = self.tabs.is_empty();
-                self.insert_terminal_tab(profile, terminal, activate, window, cx);
+                self.insert_terminal_tab(profile, Host::Local, terminal, activate, window, cx);
             }
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (sessions, window, cx);
+    }
+
+    /// The remote endpoints of the restored tabs, each once.
+    pub fn restored_hosts(&self) -> &[Host] {
+        &self.restored_hosts
+    }
+
+    /// Opens a tab at the end for each session `host`'s first listing of the
+    /// launch has that the launch attaches ([`crate::reattach::sweep`]):
+    /// not restored into a zone, not shown here already, and with no owner
+    /// that may come back. Each takes the profile it was started with when
+    /// that targets `host`, else the first that does; when none does, the
+    /// profile of the restored tab that brought the launch to `host` (or
+    /// the default one), on `host` all the same. The active tab stays the
+    /// same, and the replays raise no bells or notifications.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn attach_swept(&mut self, host: Host, listed: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        let mut skip: Vec<session::ServerSession> =
+            self.restored_sessions.iter().filter(|(on, _)| *on == host).map(|(_, s)| s.clone()).collect();
+        skip.extend(self.sessions_on(&host, cx));
+        let sessions = crate::reattach::sweep(listed, &skip);
+        if sessions.is_empty() {
+            return;
+        }
+        log::info!("attaching {} detached session(s) on {}", sessions.len(), host.name());
+        let fallback = self.profile_on(&host, &config);
+        for info in sessions {
+            let index = crate::reattach::remote_profile(&info, &host, &config).unwrap_or(fallback);
+            let profile = config.profiles[index].clone();
+            let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
+            let activate = self.tabs.is_empty();
+            self.insert_terminal_tab(profile, host.clone(), terminal, activate, window, cx);
+        }
+    }
+
+    /// The profile a session of `host` opens with when no profile targets
+    /// `host`: that of a tab on `host` (a restored one, for a launch), or
+    /// the default one.
+    #[cfg(any(target_os = "linux", windows))]
+    fn profile_on(&self, host: &Host, config: &Config) -> usize {
+        self.tabs
+            .iter()
+            .find(|tab| tab.host == *host)
+            .and_then(|tab| config.profile_index(&tab.profile.name))
+            .unwrap_or_else(|| config.default_profile_index())
+    }
+
+    /// The sessions this window's tabs on `host` show (or are attaching).
+    #[cfg(any(target_os = "linux", windows))]
+    fn sessions_on(&self, host: &Host, cx: &App) -> Vec<session::ServerSession> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.host == *host)
+            .flat_map(|tab| {
+                let zones = tab.zones.read(cx);
+                zones.tree().leaves().into_iter().filter_map(|id| zones.zone_server_session(id, cx)).collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
@@ -882,8 +1030,10 @@ impl Workspace {
         let theme = config.profile_theme(&profile);
         let terminal = cx.new(|cx| Terminal::message(text, theme.clone(), &config, cx));
         let p_clone = profile.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, theme, profile.font_size, terminal, window, cx));
-        let tab = Tab::new(profile, view, TabOrigin::Message, Vec::new(), cx);
+        let host = Host::of(&profile);
+        let tree_host = host.clone();
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, terminal, window, cx));
+        let tab = Tab::new(profile, host, view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -975,7 +1125,8 @@ impl Workspace {
     }
 
     /// Closing the window quits Brindle: its terminals' programs keep running.
-    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit(window, cx);
         window.remove_window();
     }
 
@@ -1098,6 +1249,7 @@ impl Workspace {
                 label: (*label).into(),
                 detail: None,
                 shortcut: shortcut(&**action, &tab_focus, window),
+                disabled: false,
             })
             .collect();
         let actions = commands.into_iter().map(|(_, a)| a).collect();
@@ -1175,10 +1327,16 @@ impl Workspace {
             }
             // A prompt has no rows to confirm.
             PaletteKind::Prompt => self.palette_kind = Some(PaletteKind::Prompt),
-            PaletteKind::Sessions { sessions } => {
-                self.dismiss_overlay(window, cx);
-                if let Some(info) = sessions.into_iter().nth(ix) {
-                    self.attach_detached_here(info, window, cx);
+            PaletteKind::Sessions { listed, rows, killed } => {
+                let target = rows.get(ix).and_then(SessionRow::session).map(|(host, info)| (host.clone(), info.clone()));
+                match target {
+                    Some((host, info)) => {
+                        self.dismiss_overlay(window, cx);
+                        self.attach_detached_here(host, info, window, cx);
+                    }
+                    // A row that does nothing (the command list confirms
+                    // none of them anyway).
+                    None => self.palette_kind = Some(PaletteKind::Sessions { listed, rows, killed }),
                 }
             }
         }
@@ -1190,81 +1348,111 @@ impl Workspace {
         if self.close_palette_toggling(|k| matches!(k, PaletteKind::Sessions { .. }), window, cx) {
             return;
         }
-        self.refresh_sessions_palette(None, window, cx);
+        self.refresh_sessions_palette(None, true, window, cx);
     }
 
-    /// Kills `kill` first, if given, then lists the detached sessions and
-    /// shows them in the sessions palette. After a kill, only a sessions
-    /// palette still open is refreshed: one closed meanwhile stays closed.
-    fn refresh_sessions_palette(&mut self, kill: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
-        let listing = cx.background_executor().spawn(async move { detached_now(kill) });
+    /// The remote endpoints' states changed (the [`Hosts`] global): an open
+    /// sessions palette lists them again.
+    pub fn hosts_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.palette_kind, Some(PaletteKind::Sessions { .. })) {
+            self.refresh_sessions_palette(None, false, window, cx);
+        }
+    }
+
+    /// Kills `kill` first, if given (an endpoint and a session id), then
+    /// lists the detached sessions of this machine and of each remote
+    /// endpoint the [`Hosts`] global holds, each on a background thread, and
+    /// shows them in the sessions palette once all have answered. Only the
+    /// latest listing is shown, and unless `opening`, only in a sessions
+    /// palette still open: one closed meanwhile stays closed.
+    fn refresh_sessions_palette(&mut self, kill: Option<(Host, u32)>, opening: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut endpoints = vec![(Host::Local, HostState::Connected)];
+        endpoints.extend(cx.try_global::<Hosts>().map(Hosts::states).unwrap_or_default());
+        self.sessions_listing += 1;
+        let listing = self.sessions_listing;
+        let listings: Vec<_> = endpoints
+            .into_iter()
+            .map(|(host, state)| {
+                let kill = kill.as_ref().filter(|(on, _)| *on == host).map(|(_, id)| *id);
+                cx.background_executor().spawn(async move {
+                    let listed = listing_of(&host, &state, kill);
+                    (host, listed)
+                })
+            })
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let listed = listing.await;
+            let listed = futures::future::join_all(listings).await;
             this.update_in(cx, |this, window, cx| {
                 let open = matches!(&this.palette_kind, Some(PaletteKind::Sessions { .. }));
-                if kill.is_some() && !open {
-                    return;
+                if listing == this.sessions_listing && (open || opening) {
+                    this.show_sessions_palette(listed, window, cx);
                 }
-                let sessions = listed.unwrap_or_else(|why| {
-                    log::warn!("listing sessions: {why:#}");
-                    Vec::new()
-                });
-                this.show_sessions_palette(sessions, window, cx);
             })
             .ok();
         })
         .detach();
     }
 
-    fn show_sessions_palette(&mut self, mut sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shows what the endpoints `listed` in the sessions palette: in place
+    /// in an open one, keeping its filter text and the sessions killed from
+    /// it, else in a new one.
+    fn show_sessions_palette(&mut self, listed: Vec<(Host, Listing)>, window: &mut Window, cx: &mut Context<Self>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let rows = session_rows(&mut sessions, now);
-        let empty = sessions_empty_message(sessions.len());
-        // An open sessions palette takes the new list in place, keeping its
-        // filter text.
-        if let Some(PaletteKind::Sessions { sessions: listed }) = &mut self.palette_kind
+        let killed = match &self.palette_kind {
+            Some(PaletteKind::Sessions { killed, .. }) => killed.clone(),
+            _ => Vec::new(),
+        };
+        let shown = crate::picker::session_palette(&listed, &killed, Self::settings(cx), now);
+        if let Some(PaletteKind::Sessions { listed: kept, rows, .. }) = &mut self.palette_kind
             && let Some(palette) = self.palette.view().cloned()
         {
-            *listed = sessions;
-            palette.update(cx, |palette, cx| palette.set_rows(rows, empty, cx));
+            *kept = listed;
+            *rows = shown.rows;
+            palette.update(cx, |palette, cx| palette.set_groups(shown.groups, shown.empty, cx));
             cx.notify();
             return;
         }
-        let palette = cx.new(|cx| Palette::list_with_empty(rows, "Attach a detached session", empty, cx));
-        self.show_palette(palette, PaletteKind::Sessions { sessions }, window, cx);
+        let palette = cx.new(|cx| Palette::list_grouped(shown.groups, "Attach a detached session", shown.empty, cx));
+        self.show_palette(palette, PaletteKind::Sessions { listed, rows: shown.rows, killed }, window, cx);
     }
 
-    /// `picker_kill` in the sessions palette: ends that session, and shows
-    /// the list again.
+    /// `picker_kill` in the sessions palette: ends that session on its
+    /// endpoint, and shows the list again.
     fn palette_kill(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteKind::Sessions { sessions }) = &self.palette_kind else {
+        let Some(PaletteKind::Sessions { listed, rows, killed }) = &mut self.palette_kind else {
             return;
         };
-        let Some(id) = sessions.get(ix).map(|s| s.session) else { return };
+        let Some((host, info)) = rows.get(ix).and_then(SessionRow::session) else { return };
+        let (host, id) = (host.clone(), info.session);
+        killed.push((host.clone(), id, info.key.clone()));
         // Its row goes at once, so enter can't attach it meanwhile.
-        let rest = sessions.iter().filter(|s| s.session != id).cloned().collect();
-        self.show_sessions_palette(rest, window, cx);
-        self.refresh_sessions_palette(Some(id), window, cx);
+        let listed = listed.clone();
+        self.show_sessions_palette(listed, window, cx);
+        self.refresh_sessions_palette(Some((host, id)), false, window, cx);
     }
 
-    /// Attaches a detached session into a new tab after the active one.
-    fn attach_detached_here(&mut self, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
+    /// Attaches a detached session of `host` into a new tab after the
+    /// active one, on `host`. A local one takes the profile it was started
+    /// with (unless that is gone or remote: the default); a remote one the
+    /// profile it was started with when that targets `host`, else the first
+    /// that does (else a tab's on `host`, or the default).
+    fn attach_detached_here(&mut self, host: Host, info: SessionInfo, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            let index = info
-                .profile
-                .as_deref()
-                .and_then(|name| config.profile_index(name))
-                .unwrap_or_else(|| config.default_profile_index());
+            let index = match &host {
+                Host::Local => crate::reattach::local_profile(&info, &config),
+                Host::Remote(_) => crate::reattach::remote_profile(&info, &host, &config)
+                    .unwrap_or_else(|| self.profile_on(&host, &config)),
+            };
             let profile = config.profiles[index].clone();
-            let terminal = Self::attached_terminal(&info, &profile, &config, cx);
-            self.insert_terminal_tab(profile, terminal, true, window, cx);
+            let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
+            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
         }
         #[cfg(not(any(target_os = "linux", windows)))]
-        let _ = (info, window, cx);
+        let _ = (host, info, window, cx);
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -1435,11 +1623,11 @@ impl Workspace {
                 tab.profile.name = new.to_string();
             }
         }
+        // A tab whose profile now targets another endpoint stays on its
+        // own host (`Tab::host`): its splits start there.
         for tab in &mut self.tabs {
-            if let Some(p) = config.profile(&tab.profile.name) {
-                let remote = tab.profile.remote.clone();
-                tab.profile = p.clone();
-                tab.profile.remote = remote;
+            if let Some(profile) = reloaded_profile(&tab.profile, &config) {
+                tab.profile = profile;
             }
         }
         let mut snapshot = None;
@@ -1899,6 +2087,19 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
     renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
 }
 
+/// Whether a directory from a terminal on `host` means anything to a new
+/// tab of `profile`: only on the same endpoint.
+fn same_endpoint(host: &Host, profile: &Profile) -> bool {
+    *host == Host::of(profile)
+}
+
+/// A tab's profile once the config is reloaded: the config's profile of
+/// that name, whatever it targets now; `None` when the config has none,
+/// and the tab keeps its own.
+fn reloaded_profile(current: &Profile, config: &Config) -> Option<Profile> {
+    config.profile(&current.name).cloned()
+}
+
 /// Gives a tab's terminals `theme`, keeping its font size.
 fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
     let profile = tab.profile.clone();
@@ -1931,6 +2132,7 @@ fn profile_rows(profiles: &[Profile], shortcut: impl Fn(usize) -> Option<SharedS
             label: profile.name.clone().into(),
             detail: Some(profile.description().into()),
             shortcut: shortcut(ix),
+            disabled: false,
         })
         .collect()
 }
@@ -2252,6 +2454,55 @@ mod tests {
     use super::*;
     use gpui::size;
 
+    /// 6.2: a tab stays on the host it was made on. Once its profile moves
+    /// to another endpoint, a reload gives the tab the moved profile, but a
+    /// split (the profile on the tab's host) still starts on the old host,
+    /// and the tab's directories mean nothing to a new tab of the profile.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_tab_keeps_its_host_when_its_profile_moves() {
+        use crate::config::RemoteTarget;
+
+        let ssh = |host: &str| RemoteTarget::Ssh {
+            host: host.into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        };
+        let before = Profile {
+            name: "logs".into(),
+            command: Some("htop".into()),
+            remote: Some(ssh("old-host")),
+            ..Default::default()
+        };
+        let tab_host = Host::of(&before);
+        let moved = Profile { remote: Some(ssh("new-host")), ..before.clone() };
+        let mut config = Config::default();
+        config.profiles = vec![moved.clone()];
+
+        let reloaded = reloaded_profile(&before, &config).expect("the profile is still there");
+        assert_eq!(reloaded.remote, moved.remote);
+        let split = |profile: &Profile, host: &Host| {
+            crate::terminal::spawn_request(profile, host, None, Some("/var/log/brindle-nowhere".into()), &config)
+        };
+        let (request, doing) = split(&reloaded, &tab_host);
+        assert_eq!(doing, "start \"htop\" on old-host");
+        assert_eq!(request.cwd.as_deref(), Some("/var/log/brindle-nowhere"), "the old host's directory, unchecked");
+        assert!(same_endpoint(&tab_host, &before));
+        assert!(!same_endpoint(&tab_host, &reloaded));
+
+        // A local tab whose profile now names a remote still splits here.
+        let (request, doing) = split(&reloaded, &Host::Local);
+        assert_eq!(doing, "start \"htop\"");
+        assert_eq!(request.cwd, None, "no such directory on this machine");
+        assert!(!same_endpoint(&Host::Local, &reloaded));
+
+        // A profile the config dropped leaves the tab its own.
+        assert!(reloaded_profile(&before, &Config::default()).is_none());
+    }
+
     /// The spec's drag scenario: the first tab dropped on the third lands in
     /// the third place; one dropped from the right lands before its target;
     /// a drop on itself or out of range moves nothing.
@@ -2280,16 +2531,6 @@ mod tests {
         }
         assert!(!returns_from_strip("enter", Modifiers::shift()));
         assert!(!returns_from_strip("escape", Modifiers::control()));
-    }
-
-    /// The sessions palette says "No detached sessions" only when there
-    /// are none; a filter that matches none of several gets the command
-    /// list's own empty message.
-    #[test]
-    fn sessions_palette_says_none_only_when_there_are_none() {
-        assert_eq!(sessions_empty_message(0).as_ref().map(|m| m.as_ref()), Some("No detached sessions"));
-        assert_eq!(sessions_empty_message(1), None);
-        assert_eq!(sessions_empty_message(3), None);
     }
 
     /// The keys `shortcut` shows for `action` in a local tab's terminal with

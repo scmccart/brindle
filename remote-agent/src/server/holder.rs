@@ -14,7 +14,9 @@
 //!   which it holds for its whole life, and its log.
 //! - **One core at a time:** a newer `HELLO` takes the holder over from the
 //!   connected core. `WELCOME` lists the sessions, then each one's
-//!   checkpoint and tail follow.
+//!   checkpoint and tail follow. A core that is gone is dropped only once
+//!   what it had sent is handled, even when a write to it is what failed
+//!   (up to [`DEAD_CORE_READ_LIMIT`]).
 //! - **Backpressure:** past [`CORE_QUEUE_HIGH`] queued to the core, it stops
 //!   reading PTYs, and it doesn't read a session the core has paused. With
 //!   no core, it reads a session until its tail is full, so the program
@@ -63,6 +65,9 @@ pub const CORE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 pub const UNUSED_LIMIT: Duration = Duration::from_secs(10);
 /// Input queued for one session past this is refused with an `ERROR`.
 const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+/// When a write to its core fails, the holder still reads what that core
+/// had sent, up to this much, before it drops the core.
+pub const DEAD_CORE_READ_LIMIT: usize = 16 * 1024 * 1024;
 /// A connection must send `HELLO` within this long.
 const HELLO_LIMIT: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 16;
@@ -568,8 +573,10 @@ impl<L: EventLoop> Holder<L> {
         {
             // What the core sent before it went still counts, as in
             // `read_core`: it may already have told a client about it (an
-            // attach's `SET_META`).
-            let _ = core.conn.read_available();
+            // attach's `SET_META`). All of it, not one turn's budget: this
+            // connection has no later turn, and a socket buffer may be set
+            // to hold more than that budget.
+            let _ = core.conn.read_up_to(DEAD_CORE_READ_LIMIT);
             self.process_core_frames();
             self.lose_core(&format!("write failed: {error}"));
         }
@@ -925,7 +932,7 @@ impl<L: EventLoop> Holder<L> {
     }
 
     fn read_core_ready(&mut self, token: Token) {
-        let Some(ready) = self.core_ready.get(&token) else {
+        let Some(ready) = self.core_ready.get_mut(&token) else {
             return;
         };
         let Some(listening) = ready.read() else {

@@ -12,6 +12,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::ready;
+
 use super::TIMEOUT;
 
 /// A connection to a server's endpoint.
@@ -95,9 +97,24 @@ pub fn pass_fd_as(fd: RawFd, target: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Runs `bin <role> --ready-fd 3` for `dir` and waits for its ready byte.
-/// Fails, with the server's stderr, if it exits before being ready.
+/// Runs `bin <role> --ready-fd 3` for `dir` and waits for it to be ready:
+/// for its ready pipe to end, having held the ready byte and nothing else
+/// ([`ready`]). Fails, with the server's stderr, if it exits before being
+/// ready.
 pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Result<()> {
+    start_with(bin, role, dir, env, || Ok(()))
+}
+
+/// [`start`], with `in_child` run in the forked child before its exec, once
+/// the ready pipe is its fd 3. What it sets up there, such as an ignored
+/// signal, the server inherits. It may make only async-signal-safe calls.
+pub fn start_with(
+    bin: &Path,
+    role: &str,
+    dir: &Path,
+    env: &[(&str, &str)],
+    in_child: impl FnMut() -> io::Result<()> + Send + Sync + 'static,
+) -> io::Result<()> {
     let mut fds = [-1; 2];
     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
@@ -113,6 +130,7 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(move || pass_fd_as(write_fd, 3));
+        command.pre_exec(in_child);
     }
     // A freshly written binary can be briefly busy: another test thread's
     // fork may still hold the writer's fd until it execs.
@@ -127,19 +145,15 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         }
     };
     drop(write);
-    let mut pollfd = libc::pollfd {
-        fd: read.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, TIMEOUT.as_millis() as libc::c_int) };
-    let mut byte = [0u8; 1];
-    let got =
-        ready == 1 && unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) } == 1;
+    let signal = read_ready_pipe(&read);
     let output = child.wait_with_output()?;
-    if !got {
+    if !signal.is_some_and(|signal| signal.is_ready()) {
+        let pipe = match signal {
+            Some(signal) => format!("its ready pipe held {} bytes", signal.len()),
+            None => "its ready pipe didn't end".to_string(),
+        };
         return Err(io::Error::other(format!(
-            "{role} wasn't ready ({}): {}",
+            "{role} wasn't ready ({}; {pipe}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         )));
@@ -151,6 +165,83 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
         )));
     }
     Ok(())
+}
+
+/// Reads a ready pipe to its end: what it held, or `None` if it didn't end
+/// within [`TIMEOUT`]. A server closes it right after its ready byte, and
+/// one that fails before that closes it by exiting.
+fn read_ready_pipe(pipe: &OwnedFd) -> Option<ready::Signal> {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut signal = ready::Signal::default();
+    let mut buffer = [0u8; 16];
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd: pipe.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Rounded up, so the wait doesn't end before the deadline.
+        let wait = left.as_nanos().div_ceil(1_000_000) as libc::c_int;
+        match unsafe { libc::poll(&mut pollfd, 1, wait) } {
+            1 => {}
+            0 => return None,
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+            _ => return None,
+        }
+        let read =
+            unsafe { libc::read(pipe.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        match read {
+            0 => return Some(signal),
+            1.. => signal.push(&buffer[..read as usize]),
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            _ => return None,
+        }
+    }
+}
+
+/// For a forked child, before its exec and once the ready pipe is its fd 3:
+/// puts that pipe in the place of every close-on-exec fd the child has.
+/// One of those is the pipe through which Rust's `Command` reports a failed
+/// exec, so the error goes down the ready pipe instead, as it does when that
+/// pipe's write end happens to be fd 3 and passing the ready pipe replaces
+/// it. For a program that can't be run: one that runs would keep the fds.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+pub fn send_exec_error_down_fd_3() -> io::Result<()> {
+    // Far past any fd of a test.
+    const FDS: libc::c_int = 4096;
+    for fd in 4..FDS {
+        // SAFETY: syscalls on fd numbers; a closed one is an error.
+        let replaced = unsafe {
+            match libc::fcntl(fd, libc::F_GETFD) {
+                flags if flags != -1 && flags & libc::FD_CLOEXEC != 0 => libc::dup2(3, fd),
+                _ => 0,
+            }
+        };
+        if replaced == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The name of the program `pid` runs, `None` once the pid is gone. A
+/// forked child has its parent's until its exec.
+pub fn program_of(pid: u32) -> Option<String> {
+    let name = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(name.trim_end().to_string())
+}
+
+/// One of the signal sets in `/proc/<pid>/status` (`SigIgn` for the ignored
+/// signals, `SigBlk` for the blocked ones), where bit `n - 1` stands for
+/// signal `n`. `None` once the pid is gone.
+pub fn signal_set(pid: u32, name: &str) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        let set = line.strip_prefix(name)?.strip_prefix(':')?;
+        u64::from_str_radix(set.trim(), 16).ok()
+    })
 }
 
 /// The state letter in `/proc/<pid>/stat`, `None` once the pid is gone.

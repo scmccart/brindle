@@ -8,7 +8,8 @@
 //!   connecting to one;
 //! - `lock`: the single-instance and holder locks;
 //! - `daemon`: starting a role detached, and its ready signal;
-//! - `pty`: a session's PTY and program (spawn, I/O, resize, hang up, exit);
+//! - `pty`: a session's PTY and program (spawn, I/O, resize, hang up, exit),
+//!   and for the core its foreground program (none on Windows);
 //! - `dir`: finding and securing the server directory;
 //! - `sys`: the running binary and random numbers.
 //!

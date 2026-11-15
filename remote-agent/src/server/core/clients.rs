@@ -1,6 +1,8 @@
 //! The core's client connections: accepting with the peer check, the
-//! `HELLO`/`WELCOME` handshake, requests, and the per-client queues whose
-//! length pauses the client's sessions.
+//! `HELLO`/`WELCOME` handshake (with what the client asked for: a linger
+//! for its `kill` sessions, process info), the takeover of a stale
+//! connection with the same token, requests, and the per-client queues
+//! whose length pauses the client's sessions.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -8,7 +10,7 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::{RequestId, SessionId};
 
-use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, Source, log};
+use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, MAX_LINGER, Source, log};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
 
@@ -37,6 +39,11 @@ pub(super) struct Client {
     pub(super) token: String,
     /// Its queue passed [`CLIENT_QUEUE_HIGH`], so its sessions are paused.
     pub(super) over: bool,
+    /// How long its `kill` sessions wait for it once its connection ends:
+    /// its `HELLO`'s `linger_secs`, at most [`MAX_LINGER`].
+    linger: Duration,
+    /// It speaks protocol 2 and asked for `PROCESS`.
+    pub(super) process_info: bool,
 }
 
 impl<L: EventLoop> Core<L> {
@@ -160,10 +167,19 @@ impl<L: EventLoop> Core<L> {
                 holder_protocols,
             }),
         );
+        let linger = Duration::from_secs(hello.linger_secs.into()).min(MAX_LINGER);
+        let process_info = protocol >= 2 && hello.process_info;
         log!(
-            "client {token} connected ({:?}, protocol {protocol})",
-            hello.client_version
+            "client {token} connected ({:?}, protocol {protocol}{}{})",
+            hello.client_version,
+            if linger.is_zero() {
+                String::new()
+            } else {
+                format!(", linger {}s", linger.as_secs())
+            },
+            if process_info { ", process info" } else { "" }
         );
+        self.take_over(token, &hello.client_token);
         self.sources.insert(token, Source::Client);
         self.clients.insert(
             token,
@@ -172,10 +188,59 @@ impl<L: EventLoop> Core<L> {
                 interest: Interest::READABLE,
                 token: hello.client_token,
                 over: false,
+                linger,
+                process_info,
             },
         );
         self.reattach(token);
         self.process_client_frames(token);
+    }
+
+    /// A `HELLO` with the token of a client that is still connected: that
+    /// connection is stale (one that stopped delivering without closing, as
+    /// a dropped network link leaves it), and `new` takes its place. It is
+    /// closed without its sessions' close policies applying: they keep
+    /// their owner, so [`Core::reattach`] gives each to `new` with its
+    /// replay. Its requests still waiting fail: spawns not yet sent to a
+    /// holder get their `ERROR` (if the old connection still takes it), and
+    /// sessions still starting are hung up ([`Core::client_replaced`]). An
+    /// empty token owns nothing, so it replaces nothing.
+    fn take_over(&mut self, new: Token, client_token: &str) {
+        if client_token.is_empty() {
+            return;
+        }
+        let stale: Vec<Token> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.token == client_token)
+            .map(|(&token, _)| token)
+            .collect();
+        for old in stale {
+            log!(
+                "client {new} has the token of client {old}, which it replaces; {} session(s) go to the new one",
+                self.sessions_of(old).len()
+            );
+            let (failed, kept) = std::mem::take(&mut self.waiting)
+                .into_iter()
+                .partition(|waiting| waiting.client == old);
+            self.waiting = kept;
+            for waiting in failed {
+                self.send_client(
+                    old,
+                    error(
+                        Some(waiting.spawn.req),
+                        None,
+                        "this connection was replaced by a newer one with its token",
+                    ),
+                );
+            }
+            if let Some(mut stale) = self.clients.remove(&old) {
+                // Whatever the socket takes now; nothing waits for the rest.
+                let _ = stale.conn.flush();
+            }
+            self.drop_source(old);
+            self.client_replaced(old);
+        }
     }
 
     pub(super) fn read_client(&mut self, token: Token) {
@@ -267,16 +332,16 @@ impl<L: EventLoop> Core<L> {
 
     /// The client is gone, and its sessions' close policies apply.
     pub(super) fn drop_client(&mut self, client: Token, reason: &str) {
-        if self.clients.remove(&client).is_none() {
+        let Some(entry) = self.clients.remove(&client) else {
             return;
-        }
+        };
         self.drop_source(client);
         self.waiting.retain(|waiting| waiting.client != client);
         log!(
             "client {client} left ({reason}) with {} session(s)",
             self.sessions_of(client).len()
         );
-        self.client_gone(client);
+        self.client_gone(client, entry.linger);
     }
 
     pub(super) fn client_token(&self, client: Token) -> Option<&str> {

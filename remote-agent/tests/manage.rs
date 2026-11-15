@@ -1,4 +1,5 @@
-//! The management commands (task 6.2): `brindle-remote list`, `kill`,
+//! The management commands (task 6.2, and the owner columns of
+//! `terminal-server-remote` 3.4): `brindle-remote list`, `kill`,
 //! `status` and `stop`, run against a real core, on Linux and Windows.
 
 #![cfg(any(target_os = "linux", windows))]
@@ -116,32 +117,93 @@ fn list_shows_one_line_per_session() {
         .lines()
         .map(|line| line.split('\t').map(String::from).collect())
         .collect();
-    // The age (column 5) depends on the clock: a few seconds at most.
+    // The age (column 7) and the time detached (column 5) depend on the
+    // clock: a few seconds at most.
+    let mut detached_for = Vec::new();
     for line in &mut lines {
-        let age = line.remove(4);
+        let age = line.remove(6);
         assert!(age.ends_with('s') && !age.contains('m'), "{age}");
+        detached_for.push(line.remove(4));
     }
-    let line = |session: u32, pid: u32, state: &str, policy: &str, command: &str, cwd: &str| {
-        [&*session.to_string(), &*pid.to_string(), state, policy, &title(session), command, cwd]
+    assert_eq!(detached_for[0], "-", "attached");
+    assert!(detached_for[1].ends_with('s') && !detached_for[1].contains('m'), "{detached_for:?}");
+    let line = |session: u32, pid: u32, state: &str, owner: &str, policy: &str, command: &str, cwd: &str| {
+        [&*session.to_string(), &*pid.to_string(), state, owner, policy, &title(session), command, cwd]
             .map(String::from)
             .to_vec()
     };
     assert_eq!(
         lines,
         [
-            line(first, first_pid, "attached", "kill", &first_command, &first_dir),
-            line(second, second_pid, "detached", "detach", &second_command, &second_dir),
+            line(first, first_pid, "attached", "-", "kill", &first_command, &first_dir),
+            // Its client let it go, so it has no owner.
+            line(second, second_pid, "detached", "unowned", "detach", &second_command, &second_dir),
         ]
     );
     // Nothing titles a Linux session here.
     #[cfg(unix)]
     assert_eq!((title(first), title(second)), ("-".into(), "-".into()));
 
+    // The time detached ticks on between two lists.
+    let unclocked = |sessions: Vec<SessionInfo>| -> Vec<SessionInfo> {
+        sessions
+            .into_iter()
+            .map(|session| SessionInfo { detached_secs: 0, ..session })
+            .collect()
+    };
     let output = succeeded(cli(&dir.path, &["list", "--json"]));
     let sessions: Vec<SessionInfo> = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(sessions, client.list());
+    assert_eq!(unclocked(sessions.clone()), unclocked(client.list()));
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[1].policy, client::Policy::Detach);
+}
+
+#[test]
+fn list_shows_whether_a_detached_sessions_owner_may_come_back() {
+    let (dir, mut owner) = core("cli-owned");
+    let detached = || client::Spawn {
+        policy: client::Policy::Detach,
+        ..programs::sleeps()
+    };
+    let (dropped, _) = owner.spawn(detached());
+    let (released, _) = owner.spawn(detached());
+    owner.detach(released);
+    // Its connection ends without a DETACH for `dropped`.
+    drop(owner);
+    let listed = || -> Vec<Vec<String>> {
+        stdout(&succeeded(cli(&dir.path, &["list"])))
+            .lines()
+            .map(|line| line.split('\t').map(String::from).collect())
+            .collect()
+    };
+    assert!(
+        eventually(TIMEOUT, || listed().iter().all(|line| line[2] == "detached")),
+        "{:?}",
+        listed()
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let lines = listed();
+    let line = |session: u32| lines.iter().find(|line| line[0] == session.to_string()).unwrap();
+    assert_eq!(line(dropped)[3], "owned", "{lines:?}");
+    assert_eq!(line(released)[3], "unowned", "{lines:?}");
+    for session in [dropped, released] {
+        let detached = &line(session)[4];
+        assert!(detached.ends_with('s') && detached != "0s", "{lines:?}");
+    }
+
+    let output = succeeded(cli(&dir.path, &["list", "--json"]));
+    let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let json = |session: u32| {
+        sessions
+            .iter()
+            .find(|info| info["session"] == session)
+            .unwrap()
+    };
+    assert_eq!(json(dropped)["owned"], true, "{sessions:?}");
+    assert!(json(released).get("owned").is_none(), "false is left out: {sessions:?}");
+    for session in [dropped, released] {
+        assert!(json(session)["detached_secs"].as_u64().is_some_and(|secs| secs >= 1), "{sessions:?}");
+    }
 }
 
 #[test]
@@ -184,7 +246,7 @@ fn status_shows_the_core_and_each_holder() {
     assert_eq!(status["running"], true);
     assert_eq!(status["core_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["core_build"], welcome.core_build.as_str());
-    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 1 }));
+    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 2 }));
     assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 2 }));
     assert_eq!(status["pid"], client.core_pid());
     assert!(status["uptime_secs"].is_u64());

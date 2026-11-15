@@ -164,7 +164,7 @@ Brindle SHALL show a single window. No command SHALL open another window; openin
 - **THEN** "Close Window" is listed and "New Window" is not
 
 ### Requirement: Quitting keeps programs running
-Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every open local terminal's program running detached, on Linux and on Windows, so the next launch brings it back (see `session-restore`), except `-e` command terminals, which end. Brindle SHALL NOT ask. When Brindle ends without quitting (a crash, a signal, the desktop stopping it), the same terminals SHALL keep running.
+Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every open local or remote terminal's program running detached, on Linux and on Windows, so the next launch brings it back (see `session-restore`), except `-e` command terminals, which end. Brindle SHALL NOT ask. When Brindle ends without quitting (a crash, a signal, the desktop stopping it), the same terminals SHALL keep running.
 
 #### Scenario: Quit
 - **WHEN** the window holds three local tabs and the user presses ctrl-shift-q
@@ -181,6 +181,10 @@ Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every op
 #### Scenario: Command tab
 - **WHEN** a tab runs `brindle -e sleep 1000`'s command and the user quits
 - **THEN** that `sleep` is gone within a few seconds and no session is listed for it
+
+#### Scenario: Remote tab
+- **WHEN** the window holds an SSH tab on `A8` running `sleep 1000` and the user presses ctrl-shift-q
+- **THEN** Brindle exits without asking, and on `A8` the `sleep` keeps running and is listed as detached
 
 ### Requirement: Tab strip keyboard navigation
 The `focus_tab_strip` action SHALL move focus to the active tab in the strip. With the strip focused, left, right, home and end SHALL change the active tab as a tab list does and the terminal below SHALL show the new tab, without taking focus. Enter and escape SHALL return focus to the active tab's terminal. A pointer press on a tab SHALL activate it and leave focus in its terminal, not in the strip.

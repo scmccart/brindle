@@ -54,7 +54,7 @@ Running a command SHALL close the palette, return keyboard focus to the tab, and
 - **THEN** the active zone is split, as with its shortcut, and focus moves to the new zone
 
 ### Requirement: Sessions palette
-The `Attach Session…` command (Linux and Windows) SHALL open a palette listing the local terminal server's detached sessions, newest first, each row showing the session's title (else its command), its working directory and how long ago it started. Typed text SHALL filter the rows as in the command palette. With no detached sessions the palette SHALL say so. Sessions attached to any client SHALL NOT be listed.
+The `Attach Session…` command (Linux and Windows) SHALL open a palette listing the detached sessions of the local terminal server and of every remote endpoint Brindle is connected to. The rows SHALL be grouped by endpoint, local first, then remote endpoints in profile order. Within a group they SHALL be newest first. Each row SHALL show the session's title (else its command), its working directory and how long ago it started. Each endpoint Brindle is connecting to, or that is offline, SHALL be listed as a row saying so. Typed text SHALL filter the rows as in the command palette. With no detached sessions anywhere the palette SHALL say so. Sessions attached to any client SHALL NOT be listed.
 
 #### Scenario: Nothing detached
 - **WHEN** every session is attached and the user runs "Attach Session…"
@@ -64,8 +64,16 @@ The `Attach Session…` command (Linux and Windows) SHALL open a palette listing
 - **WHEN** on Windows a `--no-restore` launch left a PowerShell session detached, and the user runs "Attach Session…"
 - **THEN** the palette lists that session with its title and directory
 
+#### Scenario: Remote host's sessions
+- **WHEN** Brindle is connected to `A8`, which has a detached session titled `build`, and the user runs "Attach Session…"
+- **THEN** the palette lists `build` under `A8`, after the local sessions
+
+#### Scenario: Offline host
+- **WHEN** profile `A8` connects at launch, `A8` can't be reached, and the user runs "Attach Session…"
+- **THEN** the palette has a row saying `A8` is offline, and choosing it opens nothing
+
 ### Requirement: Sessions palette actions
-In the sessions palette, enter SHALL attach the selected session into a new tab after the active tab, and make it active. `picker_kill` (ctrl-shift-delete) SHALL end the selected session and refresh the list.
+In the sessions palette, enter SHALL attach the selected session into a new tab after the active tab, and make it active. A remote session's tab SHALL use the profile it was started with when that profile targets its endpoint, else the first profile that does. `picker_kill` (ctrl-shift-delete) SHALL end the selected session, local or remote, and refresh the list.
 
 #### Scenario: Attach a detached session
 - **WHEN** a `--no-restore` launch left a session running `top` detached, and the user runs "Attach Session…" and presses enter on its row
@@ -74,6 +82,10 @@ In the sessions palette, enter SHALL attach the selected session into a new tab 
 #### Scenario: Kill from the palette
 - **WHEN** the user selects a session's row and presses ctrl-shift-delete
 - **THEN** the session's program ends and its row disappears
+
+#### Scenario: Attach a remote session
+- **WHEN** the user presses enter on a row listed under `A8`
+- **THEN** a new active tab shows that session, and splitting its zone opens the new zone on `A8`
 
 ### Requirement: Commands listed for the active tab
 The palette SHALL list the commands that apply to the tab that had focus when it opened, each with a readable name. Commands that do not apply to that tab SHALL NOT be listed. Commands that only work inside a palette, and the "none" action, SHALL NOT be listed. The list SHALL be in a stable order. The `Rename Tab` command SHALL be listed for every tab.

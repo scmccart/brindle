@@ -9,12 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
-use super::PtyCommand;
-
-/// How long to wait for a session to go after `SIGKILL`.
-pub const FORCED_SHUTDOWN: Duration = Duration::from_secs(1);
+use super::{Foreground, PtyCommand};
 
 pub struct SpawnedPty {
     pub pid: libc::pid_t,
@@ -64,10 +60,14 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
         .stdout(Stdio::from(File::from(slave_stdout)))
         .stderr(Stdio::from(File::from(slave)));
 
-    // The child must become a session leader and acquire the slave as its
-    // controlling terminal for shell job control and tcgetpgrp to work.
+    // Asked here, since the child may make only async-signal-safe calls.
+    let last_signal = libc::SIGRTMAX();
+    // The child starts with default signal handling, whatever this process
+    // has. It must also become a session leader and acquire the slave as
+    // its controlling terminal for shell job control and tcgetpgrp to work.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            default_signals(last_signal)?;
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -81,6 +81,38 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
     let child = command.spawn()?;
     let pid = child.id() as libc::pid_t;
     Ok(SpawnedPty { pid, child, master })
+}
+
+/// For a forked child, before its exec: gives every signal from 1 to
+/// `last` its default action and unblocks them all, as
+/// `POSIX_SPAWN_SETSIGDEF` and `POSIX_SPAWN_SETSIGMASK` would.
+///
+/// An exec keeps ignored signals ignored and blocked ones blocked. So the
+/// program would otherwise get whatever this process was started with: under
+/// `nohup`, a `SIGHUP` it never sees, and a hang-up that only the `SIGKILL`
+/// after it ends.
+///
+/// Makes only async-signal-safe calls, as `pre_exec` needs.
+fn default_signals(last: libc::c_int) -> io::Result<()> {
+    for signal in 1..=last {
+        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+            continue;
+        }
+        // SAFETY: the default action runs no code of this process. The C
+        // library refuses the few signals it keeps for itself, and that
+        // failure is ignored.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+    let mut none = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigemptyset` fills the set, and only then is it read.
+    unsafe {
+        if libc::sigemptyset(none.as_mut_ptr()) == -1
+            || libc::sigprocmask(libc::SIG_SETMASK, none.as_ptr(), std::ptr::null_mut()) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn command_for(request: &PtyCommand, program: OsString) -> Command {
@@ -118,9 +150,21 @@ pub fn home_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
 /// The login shell and home directory of the current user from the passwd
 /// database. `docker exec` sets no `SHELL`.
 pub fn passwd_entry() -> Option<(OsString, PathBuf)> {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStringExt;
+    with_passwd(|entry| {
+        let shell = passwd_field(entry.pw_shell)?;
+        let dir = passwd_field(entry.pw_dir)?;
+        Some((shell, PathBuf::from(dir)))
+    })
+}
 
+/// The current user's name from the passwd database.
+pub fn user_name() -> Option<OsString> {
+    with_passwd(|entry| passwd_field(entry.pw_name)).filter(|name| !name.is_empty())
+}
+
+/// Calls `read` with the current user's passwd entry, whose strings live
+/// only for the call.
+fn with_passwd<T>(read: impl FnOnce(&libc::passwd) -> Option<T>) -> Option<T> {
     let mut buffer = vec![0u8; 4096];
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
     let mut found: *mut libc::passwd = std::ptr::null_mut();
@@ -136,18 +180,23 @@ pub fn passwd_entry() -> Option<(OsString, PathBuf)> {
     if status != 0 || found.is_null() {
         return None;
     }
+    // SAFETY: filled in, since `found` points at it.
     let entry = unsafe { entry.assume_init() };
-    if entry.pw_shell.is_null() || entry.pw_dir.is_null() {
+    read(&entry)
+}
+
+/// One string of a passwd entry; `None` for a null pointer.
+fn passwd_field(field: *const libc::c_char) -> Option<OsString> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+
+    if field.is_null() {
         return None;
     }
-    let shell = unsafe { CStr::from_ptr(entry.pw_shell) }
-        .to_bytes()
-        .to_vec();
-    let dir = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes().to_vec();
-    Some((
-        OsString::from_vec(shell),
-        PathBuf::from(OsString::from_vec(dir)),
-    ))
+    // SAFETY: a passwd entry's strings are NUL-terminated, and the buffer
+    // they point into outlives this call (`with_passwd`).
+    let bytes = unsafe { CStr::from_ptr(field) }.to_bytes().to_vec();
+    Some(OsString::from_vec(bytes))
 }
 
 pub fn expand_remote_cwd(cwd: &str, env: &BTreeMap<String, String>) -> PathBuf {
@@ -273,18 +322,24 @@ pub fn resize(
     Ok(())
 }
 
-/// The foreground process of the PTY (else the session's own program), its
-/// name and its working directory.
-pub fn inspect_process(
-    pty_fd: RawFd,
-    child_pid: libc::pid_t,
-) -> brindle_remote_protocol::ProcessInfo {
-    let foreground_group = Some(unsafe { libc::tcgetpgrp(pty_fd) }).filter(|pid| *pid > 0);
-    let pid = foreground_group
+/// The foreground process of the terminal that `pid` (a session's
+/// program) controls, else `pid` itself: its name and working directory.
+/// For the terminal server's core, which knows a session's program but not
+/// its PTY, so it reads the terminal's foreground group (`tpgid`) from
+/// `/proc/<pid>/stat` instead of asking the PTY.
+pub fn foreground_process(pid: libc::pid_t) -> Foreground {
+    let foreground = stat_field(pid, STAT_TPGID)
+        .filter(|group| *group > 0)
         .and_then(find_process_in_group)
-        .unwrap_or(child_pid);
+        .unwrap_or(pid);
+    describe(foreground, pid)
+}
+
+/// The name and working directory of `pid`; the directory of `fallback`
+/// (the session's program) when `pid`'s can't be read.
+fn describe(pid: libc::pid_t, fallback: libc::pid_t) -> Foreground {
     let proc_dir = format!("/proc/{pid}");
-    let foreground_name = fs::read_to_string(format!("{proc_dir}/comm"))
+    let name = fs::read_to_string(format!("{proc_dir}/comm"))
         .ok()
         .map(|name| {
             name.trim_end_matches(|character| character == '\r' || character == '\n')
@@ -292,14 +347,27 @@ pub fn inspect_process(
         })
         .filter(|name| !name.is_empty());
     let cwd = fs::read_link(format!("{proc_dir}/cwd"))
-        .or_else(|_| fs::read_link(format!("/proc/{child_pid}/cwd")))
+        .or_else(|_| fs::read_link(format!("/proc/{fallback}/cwd")))
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
-    brindle_remote_protocol::ProcessInfo {
-        pid: pid.max(0) as u32,
-        foreground_name,
-        cwd,
-    }
+    Foreground { name, cwd }
+}
+
+/// `/proc/<pid>/stat`'s fields after the command, counted from 0: state,
+/// ppid, pgrp, session, tty_nr, tpgid (fields 3 to 8 in proc(5)).
+const STAT_PGRP: usize = 2;
+const STAT_TPGID: usize = 5;
+
+fn stat_field(pid: libc::pid_t, field: usize) -> Option<libc::pid_t> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_field(&stat, field)
+}
+
+/// A numeric field of a `/proc/<pid>/stat` line, counted from the one
+/// after the command, which may itself hold spaces and parentheses.
+fn parse_stat_field(stat: &str, field: usize) -> Option<libc::pid_t> {
+    let fields = stat.get(stat.rfind(')')? + 1..)?;
+    fields.split_whitespace().nth(field)?.parse().ok()
 }
 
 fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
@@ -323,10 +391,7 @@ fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
 }
 
 fn process_group(pid: libc::pid_t) -> Option<libc::pid_t> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields = stat.get(stat.rfind(')')? + 1..)?;
-    // Fields after the command are: state (3), ppid (4), pgrp (5).
-    fields.split_whitespace().nth(2)?.parse().ok()
+    stat_field(pid, STAT_PGRP)
 }
 
 /// Sends `signal` to the process group led by `pid` (a session's program,
@@ -342,6 +407,32 @@ pub fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_fields_count_from_after_the_command() {
+        // A command with spaces and parentheses of its own.
+        let stat = "4242 (my (odd) cmd) S 1 4240 4240 34816 4250 4194560 101 0 0 0";
+        assert_eq!(parse_stat_field(stat, STAT_PGRP), Some(4240));
+        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(4250));
+        // No controlling terminal.
+        let stat = "7 (kthreadd) S 2 0 0 0 -1 2129984 0 0";
+        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(-1));
+        assert_eq!(parse_stat_field("garbage", STAT_TPGID), None);
+    }
+
+    #[test]
+    fn a_process_without_a_terminal_is_its_own_foreground() {
+        let pid = std::process::id() as libc::pid_t;
+        let own = foreground_process(pid);
+        // On a terminal or not, the answer is a process that runs.
+        assert!(own.name.is_some_and(|name| !name.is_empty()));
+        assert!(own.cwd.is_some());
+        // Without one, it is this process.
+        if stat_field(pid, STAT_TPGID).is_none_or(|group| group <= 0) {
+            let cwd = std::env::current_dir().unwrap();
+            assert_eq!(foreground_process(pid).cwd.map(PathBuf::from), Some(cwd));
+        }
+    }
 
     #[test]
     fn cwd_tilde_uses_remote_environment_home() {

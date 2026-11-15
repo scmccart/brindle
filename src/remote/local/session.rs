@@ -1,4 +1,5 @@
-//! A local tab's session, as its terminal holds it from the moment the tab
+//! A tab's session in a terminal server, this machine's or a remote
+//! endpoint's ([`Host`]), as its terminal holds it from the moment the tab
 //! opens.
 //!
 //! [`Session::start`] and [`Session::attach`] return at once: connecting
@@ -6,15 +7,16 @@
 //! the `SPAWN` or `ATTACH` itself all happen on a thread of their own, so
 //! opening a tab never blocks the UI thread. Input and resizes made
 //! meanwhile are kept, and go out in order once the core reports the
-//! session. A failure goes to the sink, which shows it in the tab.
+//! session. A failure goes to the sink, which shows it in the tab. A tab
+//! closed while its request waits for a connection withdraws the request.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex;
 
-use super::connection::{Running, Sink};
-use super::{AttachRequest, Connection, SessionSink, SpawnRequest};
+use super::connection::{Abandon, Running, Sink};
+use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
 use crate::remote::protocol::SessionId;
 
 /// How a tab let its session go.
@@ -54,15 +56,20 @@ struct Size {
     cell_h: u16,
 }
 
-/// A local tab's session in the terminal server.
+/// A tab's session in a terminal server.
 pub struct Session {
     phase: Arc<Mutex<Phase>>,
+    /// Lets go of the request while it waits.
+    abandon: Arc<Abandon>,
+    /// The session an attach asked for, which it stands for until it is
+    /// answered: a tab recorded while its endpoint is offline keeps it.
+    requested: Option<(SessionId, String)>,
 }
 
 impl Session {
-    /// Starts a session in the process's shared connection.
-    pub fn start(request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::start_with(super::shared, request, sink)
+    /// Starts a session on `host`, through the process's connection to it.
+    pub fn start(host: Host, request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
+        Self::start_with(move || super::shared(&host), request, sink)
     }
 
     /// Starts a session in the connection `connect` gives, on a thread of
@@ -75,10 +82,10 @@ impl Session {
         Self::begin(connect, Start::Spawn(request), sink)
     }
 
-    /// Attaches a detached session in the process's shared connection; its
-    /// replay and then its live output go to `sink`.
-    pub fn attach(request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::attach_with(super::shared, request, sink)
+    /// Attaches a detached session on `host`, through the process's
+    /// connection to it; its replay and then its live output go to `sink`.
+    pub fn attach(host: Host, request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
+        Self::attach_with(move || super::shared(&host), request, sink)
     }
 
     /// Attaches a session in the connection `connect` gives, on a thread of
@@ -96,21 +103,27 @@ impl Session {
         start: Start,
         sink: Box<dyn SessionSink>,
     ) -> Self {
+        let requested = match &start {
+            Start::Attach(request) => Some((request.session, request.key.clone())),
+            Start::Spawn(_) => None,
+        };
         let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
+        let abandon = Arc::new(Abandon::default());
         let sink: Sink = Arc::new(Mutex::new(sink));
-        let starting = phase.clone();
+        let (starting, abandoning) = (phase.clone(), abandon.clone());
         let failing = sink.clone();
         let spawned = std::thread::Builder::new()
             .name("server-spawn".into())
-            .spawn(move || run(connect, start, sink, &starting));
+            .spawn(move || run(connect, start, sink, &starting, &abandoning));
         if let Err(error) = spawned {
             *phase.lock() = Phase::Gone;
             failing.lock().failed(&anyhow::Error::from(error).context("starting a thread"));
         }
-        Self { phase }
+        Self { phase, abandon, requested }
     }
 
-    /// The program's pid, once the session exists.
+    /// The program's pid, once the session exists. It is a process of the
+    /// session's host, which may not be this machine.
     pub fn pid(&self) -> Option<u32> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some(running.pid()),
@@ -119,10 +132,21 @@ impl Session {
     }
 
     /// The session's id and key, once it exists (the key is empty from a
-    /// core that predates keys).
+    /// core that predates keys). An attach reports the session it asked
+    /// for until it is answered; only a pending spawn reports none.
     pub fn id_and_key(&self) -> Option<(SessionId, String)> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some((running.id(), running.key().to_string())),
+            Phase::Starting { .. } => self.requested.clone(),
+            Phase::Gone => None,
+        }
+    }
+
+    /// What the core last reported of the session's foreground program
+    /// (`PROCESS`, which only a relay connection asks for), while it runs.
+    pub fn foreground(&self) -> Option<Foreground> {
+        match &*self.phase.lock() {
+            Phase::Running(running) => running.foreground(),
             _ => None,
         }
     }
@@ -145,7 +169,9 @@ impl Session {
 
     /// Makes the window `hwnd` the owner of the session's console window
     /// (`REPARENT`), now or as soon as it starts or attaches, and again
-    /// after each reconnect's replay. Only a Windows core takes it.
+    /// after each reconnect's replay. Only a Windows core takes it, so a
+    /// remote session (on a relay connection) never sends it.
+
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn reparent(&self, hwnd: u64) {
         match &mut *self.phase.lock() {
@@ -173,6 +199,8 @@ impl Session {
             Phase::Starting { left, input, .. } => {
                 *left = Some(how);
                 input.clear();
+                // A request still waiting for the connection is withdrawn.
+                self.abandon.abandon();
             }
             Phase::Running(running) => {
                 match how {
@@ -193,6 +221,7 @@ fn run(
     start: Start,
     sink: Sink,
     phase: &Mutex<Phase>,
+    abandon: &Abandon,
 ) {
     let left = || matches!(&*phase.lock(), Phase::Starting { left: Some(_), .. });
     let started = connect().and_then(|connection| {
@@ -202,8 +231,8 @@ fn run(
             anyhow::bail!("closed before it started");
         }
         match start {
-            Start::Spawn(request) => connection.spawn(request, sink.clone()),
-            Start::Attach(request) => connection.attach(request, sink.clone()),
+            Start::Spawn(request) => connection.spawn(request, sink.clone(), Some(abandon)),
+            Start::Attach(request) => connection.attach(request, sink.clone(), Some(abandon)),
         }
     });
     let mut phase = phase.lock();
@@ -272,6 +301,9 @@ mod tests {
         }
         fn failed(&mut self, error: &anyhow::Error) {
             self.0.send(format!("failed {error:#}")).ok();
+        }
+        fn foreground(&mut self) {
+            self.0.send("foreground".into()).ok();
         }
     }
 
@@ -378,7 +410,7 @@ mod tests {
     }
 
     fn attach_request(session: SessionId) -> AttachRequest {
-        AttachRequest { session, key: format!("k{session}"), cols: 120, rows: 40 }
+        AttachRequest { session, key: format!("k{session}"), cols: 120, rows: 40, recorded: false }
     }
 
     /// Answers `ATTACH` of session 5 with a replay, then live output.
@@ -551,6 +583,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// What quitting does to a window's tabs: each terminal leaves its
+    /// session explicitly (`Terminal::quit`: a profile tab's is detached,
+    /// an `-e` one's closed), then the drop, when GPUI runs it, leaves it
+    /// again, which sends nothing more. The flush before the exit returns
+    /// once both are written.
+    #[test]
+    fn quitting_leaves_each_session_once_and_the_flush_writes_it() {
+        let dir = temp_dir("quit");
+        let core = scripted_core(&dir, |message, stream| {
+            if let ToCore::Spawn(spawn) = message {
+                let spawned = Spawned { req: spawn.req, session: 30 + spawn.req as u32, pid: 1, key: "k".into() };
+                send(stream, ToClient::Spawned(spawned));
+            }
+        });
+        let connection = connector(&dir)().unwrap();
+        let start = || {
+            let connection = connection.clone();
+            let session = Session::start_with(move || Ok(connection), request(), Box::new(Recorder(mpsc::channel().0)));
+            let ToCore::Spawn(spawn) = recv(&core) else { panic!("not SPAWN") };
+            while session.pid().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (session, 30 + spawn.req as u32)
+        };
+        let (kept, kept_id) = start();
+        let (ended, ended_id) = start();
+
+        // The quit, then the drops.
+        kept.detach();
+        ended.close();
+        kept.detach();
+        ended.close();
+        assert!(connection.flush(Instant::now() + Duration::from_secs(10)), "not written");
+        assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == kept_id));
+        assert!(matches!(recv(&core), ToCore::Close(close) if close.session == ended_id));
+        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "a session was left twice");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_connection_lists_kills_and_ends_all_before_quitting() {
         let dir = temp_dir("manage");
@@ -592,7 +663,7 @@ mod tests {
         let sink: Sink = Arc::new(Mutex::new(Box::new(Recorder(mpsc::channel().0))));
         let running: Vec<_> = (0..2)
             .map(|_| {
-                let running = connection.spawn(request(), sink.clone()).unwrap();
+                let running = connection.spawn(request(), sink.clone(), None).unwrap();
                 assert!(matches!(recv(&core), ToCore::Spawn(_)));
                 running
             })
@@ -658,6 +729,60 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 6.1: a session keeps the last `PROCESS` for it, from the one the
+    /// core sends right behind `SPAWNED`; only a new name tells the tab.
+    /// `PROCESS` for another session is no one's, and an exit clears it.
+    #[test]
+    fn a_session_keeps_the_last_process_its_core_reported() {
+        let dir = temp_dir("process");
+        let process = |session: SessionId, name: &str, cwd: &str| {
+            ToClient::Process(client::Process { session, name: Some(name.into()), cwd: Some(cwd.into()) })
+        };
+        let core = scripted_core(&dir, move |message, stream| match message {
+            ToCore::Spawn(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: 7, pid: 4242, key: "k7".into() }));
+                send(stream, process(7, "bash", "/home/u"));
+                send(stream, process(8, "other", "/elsewhere"));
+            }
+            ToCore::Data(data) if data.bytes == b"cd /tmp\r" => send(stream, process(7, "bash", "/tmp")),
+            ToCore::Data(data) if data.bytes == b"htop\r" => send(stream, process(7, "htop", "/tmp")),
+            ToCore::Data(data) if data.bytes == b"exit\r" => {
+                send(stream, ToClient::Exit(client::Exit { session: 7, code: Some(0), lost: None }))
+            }
+            _ => {}
+        });
+        let (tx, tab) = mpsc::channel();
+        let session = Session::start_with(connector(&dir), request(), Box::new(Recorder(tx)));
+        assert_eq!(session.foreground(), None, "nothing before the session runs");
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        assert_eq!(seen(&tab), "foreground");
+        let reported = |name: &str, cwd: &str| Some(Foreground { name: Some(name.into()), cwd: Some(cwd.into()) });
+        eventually(|| session.foreground() == reported("bash", "/home/u"));
+
+        // A new directory with the same program changes no title.
+        session.input(b"cd /tmp\r");
+        recv(&core);
+        eventually(|| session.foreground() == reported("bash", "/tmp"));
+        session.input(b"htop\r");
+        recv(&core);
+        assert_eq!(seen(&tab), "foreground");
+        assert_eq!(session.foreground(), reported("htop", "/tmp"));
+
+        session.input(b"exit\r");
+        recv(&core);
+        assert_eq!(seen(&tab), "exited Some(0)");
+        assert_eq!(session.foreground(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn eventually(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_failure_goes_to_the_tab() {
         let (tx, seen) = mpsc::channel();
@@ -672,6 +797,71 @@ mod tests {
         session.input(b"x");
         session.close();
         assert_eq!(session.pid(), None);
+    }
+
+    /// A tab closed while its attach waits for a relay that isn't up yet
+    /// withdraws the attach: it never goes out, and the tab says nothing.
+    #[test]
+    fn a_tab_closed_while_its_attach_waits_for_a_relay_withdraws_it() {
+        use crate::remote::local::connection::fake;
+
+        let (dial, plan) = fake::dialer("A8");
+        let connection = Connection::relay(dial, "tok", fake::quick()).unwrap();
+        plan.next_dial();
+        let (tx, tab) = mpsc::channel();
+        let attaching = connection.clone();
+        let session = Session::attach_with(move || Ok(attaching), attach_request(5), Box::new(Recorder(tx)));
+        session.input(b"x");
+        // Let the request reach the connection before the tab closes.
+        std::thread::sleep(Duration::from_millis(200));
+        session.detach();
+        let (link, far) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));
+            }
+        });
+        plan.link(link);
+        assert!(connection.list().unwrap().is_empty());
+        assert!(matches!(far.next(), ToCore::List(_)), "no ATTACH before the LIST");
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(tab.recv_timeout(Duration::from_millis(300)).is_err(), "the closed tab says nothing");
+        assert_eq!(session.pid(), None);
+    }
+
+    /// 7.1: until its attach is answered, a session reports the one it
+    /// asked for, so a quit while its endpoint is offline records the zone
+    /// again; a pending spawn reports none, and neither does an attach
+    /// that failed.
+    #[test]
+    fn a_pending_attach_reports_the_requested_id_and_key() {
+        let (release, wait) = mpsc::channel::<()>();
+        let (tx, tab) = mpsc::channel();
+        let session = Session::attach_with(
+            move || {
+                wait.recv().ok();
+                anyhow::bail!("can't connect to A8: offline")
+            },
+            AttachRequest { recorded: true, ..attach_request(5) },
+            Box::new(Recorder(tx)),
+        );
+        assert_eq!(session.id_and_key(), Some((5, "k5".to_string())));
+        assert_eq!(session.pid(), None);
+
+        let (spawn_tx, _spawn_tab) = mpsc::channel();
+        let (_hold, held) = mpsc::channel::<()>();
+        let spawning = Session::start_with(
+            move || {
+                held.recv().ok();
+                anyhow::bail!("unused")
+            },
+            request(),
+            Box::new(Recorder(spawn_tx)),
+        );
+        assert_eq!(spawning.id_and_key(), None);
+
+        release.send(()).unwrap();
+        assert_eq!(seen(&tab), "failed can't connect to A8: offline");
+        assert_eq!(session.id_and_key(), None);
     }
 
     #[test]

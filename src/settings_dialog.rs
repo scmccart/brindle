@@ -1020,6 +1020,7 @@ pub struct SettingsDialog {
     _profile_subscriptions: Vec<Subscription>,
     /// The profile editor's default checkbox.
     default_handle: FocusHandle,
+    connect_handle: FocusHandle,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
     /// The section and kind of view focus was last placed for.
@@ -1094,6 +1095,7 @@ impl SettingsDialog {
             profile_selects: Vec::new(),
             _profile_subscriptions: Vec::new(),
             default_handle: cx.focus_handle(),
+            connect_handle: cx.focus_handle(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
             placed_for,
@@ -1138,6 +1140,9 @@ impl SettingsDialog {
         }
         if self.default_handle.is_focused(window) {
             return profiles::Field::Default.label();
+        }
+        if self.connect_handle.is_focused(window) {
+            return profiles::Field::ConnectAtLaunch.label();
         }
         if let Some((b, _)) = self.buttons.iter().find(|(_, h)| h.is_focused(window)) {
             return b.label();

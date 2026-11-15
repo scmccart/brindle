@@ -585,7 +585,7 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn read_holder_ready(&mut self) {
-        let Some(start) = &self.holder_start else {
+        let Some(start) = &mut self.holder_start else {
             return;
         };
         let Some(listening) = start.ready.read() else {

@@ -17,6 +17,8 @@ mod windows;
 pub use windows::*;
 
 pub mod programs;
+#[cfg(unix)]
+pub mod relay;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -29,6 +31,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{self, ToClient};
+use brindle_remote_protocol::relay::{MSG_RELAY_HEARTBEAT, is_relay_type};
 use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
@@ -525,9 +528,9 @@ pub enum Recv {
     TimedOut,
 }
 
-/// A client for tests: protocol 1 over the core's endpoint, read on the
-/// calling thread (so a test can stop reading, or hand the connection to
-/// another process).
+/// A client for tests: protocol 1 over the core's endpoint (or a relay's
+/// stdio), read on the calling thread (so a test can stop reading, or hand
+/// the connection to another process).
 pub struct TestClient {
     stream: Stream,
     input: Vec<u8>,
@@ -535,6 +538,9 @@ pub struct TestClient {
     closed: bool,
     next_req: RequestId,
     pub welcome: Option<client::Welcome>,
+    /// How many `RELAY_HEARTBEAT`s arrived (from a relay; a core sends
+    /// none), which [`TestClient::next`] skips.
+    pub heartbeats: usize,
 }
 
 impl TestClient {
@@ -542,6 +548,11 @@ impl TestClient {
         let endpoint = core_endpoint(dir);
         let stream = connect(&endpoint)
             .unwrap_or_else(|error| panic!("connect {}: {error}", endpoint.display()));
+        Self::over(stream)
+    }
+
+    /// A client on `stream`, before its `HELLO`.
+    pub fn over(stream: Stream) -> Self {
         Self {
             stream,
             input: Vec::new(),
@@ -549,23 +560,37 @@ impl TestClient {
             closed: false,
             next_req: 1,
             welcome: None,
+            heartbeats: 0,
         }
     }
 
     /// Connects and says `HELLO` with `token`, expecting `WELCOME`.
     pub fn hello(dir: &Path, token: &str) -> Self {
-        let mut client = Self::connect(dir);
-        client.send(client::ToCore::Hello(client::Hello {
+        Self::hello_with(dir, token, |_| {})
+    }
+
+    /// Connects and says `HELLO` with `token`, as `edit` changes it (a
+    /// linger, process info, another protocol range), expecting `WELCOME`.
+    pub fn hello_with(dir: &Path, token: &str, edit: impl FnOnce(&mut client::Hello)) -> Self {
+        Self::connect(dir).greet(token, edit)
+    }
+
+    /// Says `HELLO` with `token`, as `edit` changes it, expecting `WELCOME`.
+    pub fn greet(mut self, token: &str, edit: impl FnOnce(&mut client::Hello)) -> Self {
+        let mut hello = client::Hello {
             min: client::PROTOCOLS.min,
             max: client::PROTOCOLS.max,
             client_version: "test".into(),
             client_token: token.into(),
-        }));
-        match client.recv() {
-            ToClient::Welcome(welcome) => client.welcome = Some(welcome),
+            ..Default::default()
+        };
+        edit(&mut hello);
+        self.send(client::ToCore::Hello(hello));
+        match self.recv() {
+            ToClient::Welcome(welcome) => self.welcome = Some(welcome),
             other => panic!("expected WELCOME, got {other:?}"),
         }
-        client
+        self
     }
 
     /// The core's pid, from `WELCOME`.
@@ -574,11 +599,12 @@ impl TestClient {
     }
 
     pub fn send(&mut self, message: client::ToCore) {
-        message
-            .encode()
-            .unwrap()
-            .write_to(&mut self.stream)
-            .unwrap();
+        self.send_frame(&message.encode().unwrap());
+    }
+
+    /// Sends any frame (a relay's heartbeat, say).
+    pub fn send_frame(&mut self, frame: &Frame) {
+        frame.write_to(&mut self.stream).unwrap();
     }
 
     fn frame(&mut self) -> Option<Frame> {
@@ -600,6 +626,15 @@ impl TestClient {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(frame) = self.frame() {
+                if frame.msg_type == MSG_RELAY_HEARTBEAT {
+                    self.heartbeats += 1;
+                    continue;
+                }
+                assert!(
+                    !is_relay_type(frame.msg_type),
+                    "a relay frame of type {:#x} amid the protocol",
+                    frame.msg_type
+                );
                 return Recv::Message(ToClient::decode(&frame).unwrap());
             }
             if self.closed {
@@ -826,6 +861,40 @@ impl TestClient {
 
     pub fn detach(&mut self, session: SessionId) {
         self.send(client::ToCore::Detach(client::SessionRef { session }));
+    }
+
+    /// The next `PROCESS` for `session` within `timeout`, if one comes.
+    /// Other messages are kept for later.
+    pub fn process_within(
+        &mut self,
+        session: SessionId,
+        timeout: Duration,
+    ) -> Option<client::Process> {
+        let deadline = Instant::now() + timeout;
+        let mut kept: Vec<ToClient> = self.backlog.drain(..).collect();
+        // One already received comes first.
+        let found = match kept
+            .iter()
+            .position(|message| matches!(message, ToClient::Process(p) if p.session == session))
+        {
+            Some(at) => match kept.remove(at) {
+                ToClient::Process(process) => Some(process),
+                _ => unreachable!(),
+            },
+            None => loop {
+                match self.next(deadline.saturating_duration_since(Instant::now())) {
+                    Recv::Message(ToClient::Process(process)) if process.session == session => {
+                        break Some(process);
+                    }
+                    Recv::Message(other) => kept.push(other),
+                    Recv::TimedOut => break None,
+                    Recv::Closed => panic!("the core closed the connection"),
+                }
+            },
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        found
     }
 
     /// Sends a request built with a fresh `req` and returns its reply.

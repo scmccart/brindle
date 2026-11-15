@@ -327,6 +327,49 @@ pub fn editor_select_ring(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A remote profile, added after `Shell`, that nothing connects to unless a
+/// tab opens on it (it doesn't connect at launch).
+const REMOTE_PROFILE: &str =
+    "\n[[profiles]]\nname = \"Remote\"\nremote = { type = \"ssh\", host = \"e2e-nonexistent.invalid\" }\n";
+
+/// The profile editor's "Connect at launch" switch (OpenSpec change
+/// `terminal-server-remote`, 8.4): shown for a remote profile as the stop
+/// after its ssh fields, off as the config has it, turned on by space, and
+/// not shown for a local profile. Nothing is saved, so nothing connects.
+pub fn editor_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
+    // Name, then Remote, Host, User, Port, Identity file, ssh arguments, and
+    // the switch: seven stops. `end` selects the last profile.
+    let to_switch = |name: &'static str| {
+        let run = Run::new(ctx, name).config(REMOTE_PROFILE).action("open_settings").key("end").action("settings_edit");
+        (0..7).fold(run, |run, _| run.action("settings_next_field"))
+    };
+    let out = to_switch("off").dump_at(step_time(10) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("mode=editor name=\"Remote\" field=\"Connect at launch\"")
+            && settings.contains("remote=ssh connect_at_launch=false"),
+        "dialog state: {settings:?}"
+    );
+    ensure!(out.dump.focus_stop.as_deref() == Some("Connect at launch"), "focus stop: {:?}", out.dump.focus_stop);
+
+    let out = to_switch("on").key("space").dump_at(step_time(11) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("field=\"Connect at launch\"") && settings.contains("remote=ssh connect_at_launch=true"),
+        "dialog state after space: {settings:?}"
+    );
+    ensure!(
+        config_text(ctx)? == format!("{}{REMOTE_PROFILE}", brindle::config("e2e")),
+        "turning the switch on changed the config"
+    );
+
+    // A local profile has no such stop: its dump shows none.
+    let out = edit_shell(Run::new(ctx, "local")).dump_at(step_time(2) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.contains("remote=none connect_at_launch=-"), "dialog state for a local profile: {settings:?}");
+    Ok(Outcome::Pass)
+}
+
 /// The theme list is one Tab stop with a ring: end, home and down move its
 /// selection, and tab goes on to the first footer button. The profile
 /// list takes the same keys.

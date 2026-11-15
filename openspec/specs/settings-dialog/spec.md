@@ -237,7 +237,7 @@ alt-up and alt-down, and the move buttons, SHALL move the selected profile one p
 - **THEN** the config order is `Shell`, `Work`, `tmux`, and ctrl-alt-2 opens `Work`
 
 ### Requirement: Remote target in the profile editor
-The profile editor SHALL show a "Remote" field with the choices `none`, `ssh` and `container`. For `ssh` it SHALL show host, user, port, identity file and ssh arguments; for `container` it SHALL show engine (`docker` or `podman`), container and user. Fields of the other kinds SHALL be hidden. Choosing `none` SHALL remove the profile's `remote` on save. Saving SHALL write the `remote` table with blank optional fields as absent keys and ssh arguments as shell words, as for the profile's other list fields.
+The profile editor SHALL show a "Remote" field with the choices `none`, `ssh` and `container`. For `ssh` it SHALL show host, user, port, identity file and ssh arguments; for `container` it SHALL show engine (`docker` or `podman`), container and user. For both it SHALL show a "Connect at launch" switch. Fields of the other kinds SHALL be hidden. Choosing `none` SHALL remove the profile's `remote` on save. Saving SHALL write the `remote` table with blank optional fields as absent keys, the switch only when on, and ssh arguments as shell words, as for the profile's other list fields.
 
 #### Scenario: Add an SSH target
 - **WHEN** the user sets Remote to `ssh`, host to `A8` and user to `ubuntu` on profile `Work` and saves
@@ -254,6 +254,10 @@ The profile editor SHALL show a "Remote" field with the choices `none`, `ssh` an
 #### Scenario: Existing target shown
 - **WHEN** the user opens a profile whose config has `remote = { type = "ssh", host = "A8", port = 2222 }`
 - **THEN** the editor shows Remote `ssh`, host `A8` and port `2222`
+
+#### Scenario: Connect at launch
+- **WHEN** the user turns on "Connect at launch" for an `ssh` target with host `A8` and saves
+- **THEN** the profile has `remote = { type = "ssh", host = "A8", connect_at_launch = true }`
 
 ### Requirement: Remote target validation
 An `ssh` target SHALL need a non-blank host and a container target a non-blank container. A port SHALL be blank or a number from 1 to 65535. An invalid field SHALL be marked and SHALL block saving.

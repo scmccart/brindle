@@ -299,7 +299,7 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
     if let Some(remote) = &p.remote {
         let mut target = InlineTable::new();
         match remote {
-            RemoteTarget::Ssh { host, user, port, identity_file, ssh_args } => {
+            RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ } => {
                 target.insert("type", Value::from("ssh"));
                 target.insert("host", Value::from(host.as_str()));
                 if let Some(user) = user { target.insert("user", Value::from(user.as_str())); }
@@ -307,12 +307,16 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
                 if let Some(identity) = identity_file { target.insert("identity_file", Value::from(identity.as_str())); }
                 if let Some(args) = strings(ssh_args) { target.insert("ssh_args", args); }
             }
-            RemoteTarget::Container { engine, container, user } => {
+            RemoteTarget::Container { engine, container, user, connect_at_launch: _ } => {
                 target.insert("type", Value::from("container"));
                 target.insert("engine", Value::from(engine.as_str()));
                 target.insert("container", Value::from(container.as_str()));
                 if let Some(user) = user { target.insert("user", Value::from(user.as_str())); }
             }
+        }
+        // Written only when on: off is the default.
+        if remote.connects_at_launch() {
+            target.insert("connect_at_launch", Value::from(true));
         }
         target.fmt();
         set_value(table, "remote", Value::InlineTable(target));
@@ -765,10 +769,57 @@ background = "nope"
                 port: Some(2222),
                 identity_file: Some("~/.ssh/work".into()),
                 ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
+                connect_at_launch: false,
             }),
             ..Default::default()
         };
         upsert_profile(&mut doc, None, &profile).unwrap();
+        assert_eq!(reparse(&doc).profiles[1].remote, profile.remote);
+    }
+
+    /// 8.1: `connect_at_launch` on either kind of target, absent, false or
+    /// true in the file, reads back as written when the profile is saved
+    /// again, and is written only when true.
+    #[test]
+    fn connect_at_launch_round_trips_and_is_written_only_when_on() {
+        let kinds = [
+            ("ssh", "{ type = \"ssh\", host = \"A8\"", "type = \"ssh\", host = \"A8\""),
+            ("container", "{ type = \"container\", container = \"devbox\"", "container = \"devbox\""),
+        ];
+        for (kind, open, written) in kinds {
+            for (setting, on) in [("", false), (", connect_at_launch = false", false), (", connect_at_launch = true", true)] {
+                let text = format!("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"R\"\nremote = {open}{setting} }}\n");
+                let case = format!("{kind}{setting}");
+                let mut doc = parse(&text).unwrap();
+                let read = reparse(&doc).profiles[1].clone();
+                let target = read.remote.clone().expect("a remote target");
+                assert_eq!(target.connects_at_launch(), on, "{case}");
+                upsert_profile(&mut doc, Some(&ProfileRef { index: 1, name: Some("R".into()) }), &read).unwrap();
+                let saved = doc.to_string();
+                assert!(saved.contains(written), "{case}: {saved}");
+                assert_eq!(saved.contains("connect_at_launch = true"), on, "{case}: {saved}");
+                assert!(!saved.contains("connect_at_launch = false"), "{case}: {saved}");
+                assert_eq!(reparse(&doc).profiles[1].remote, Some(target), "{case}");
+            }
+        }
+        // A new profile too, and turning it off removes the key.
+        let mut doc = parse("[[profiles]]\nname = \"Shell\"\n").unwrap();
+        let mut profile = Profile {
+            name: "devbox".into(),
+            remote: Some(RemoteTarget::Container {
+                engine: "podman".into(),
+                container: "devbox".into(),
+                user: None,
+                connect_at_launch: true,
+            }),
+            ..Default::default()
+        };
+        upsert_profile(&mut doc, None, &profile).unwrap();
+        assert_eq!(reparse(&doc).profiles[1].remote, profile.remote);
+        let at = ProfileRef { index: 1, name: Some("devbox".into()) };
+        profile.remote = profile.remote.as_ref().map(RemoteTarget::endpoint);
+        upsert_profile(&mut doc, Some(&at), &profile).unwrap();
+        assert!(!doc.to_string().contains("connect_at_launch"), "{doc}");
         assert_eq!(reparse(&doc).profiles[1].remote, profile.remote);
     }
 

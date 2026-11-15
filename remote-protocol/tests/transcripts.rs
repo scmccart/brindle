@@ -1,4 +1,5 @@
-//! Transcript tests that pin protocol 1 and H1 on the wire.
+//! Transcript tests that pin client protocols 1 and 2, the relay link and H1
+//! on the wire.
 //!
 //! Each fixture in `tests/fixtures/` is one connection's frames in order, as
 //! hex text: `<sender> <type> <length> <payload>` per frame, with a comment
@@ -23,6 +24,7 @@ use std::sync::Once;
 use brindle_remote_protocol::Frame;
 use brindle_remote_protocol::client::{self, KillTarget, Policy, VersionRange};
 use brindle_remote_protocol::holder::{self, Previous};
+use brindle_remote_protocol::relay;
 use serde_json::json;
 
 /// One frame of a transcript, with its sender.
@@ -32,6 +34,8 @@ enum Step {
     CoreToClient(client::ToClient),
     CoreToHolder(holder::ToHolder),
     Holder(holder::ToCore),
+    /// A frame of the relay's own, from `brindle-remote relay`.
+    Relay(relay::RelayMessage),
 }
 
 impl Step {
@@ -40,6 +44,7 @@ impl Step {
             Self::Client(_) => "client",
             Self::CoreToClient(_) | Self::CoreToHolder(_) => "core",
             Self::Holder(_) => "holder",
+            Self::Relay(_) => "relay",
         }
     }
 
@@ -49,6 +54,7 @@ impl Step {
             Self::CoreToClient(m) => m.encode(),
             Self::CoreToHolder(m) => m.encode(),
             Self::Holder(m) => m.encode(),
+            Self::Relay(m) => m.encode(),
         }
         .unwrap()
     }
@@ -59,6 +65,7 @@ impl Step {
             Self::CoreToClient(m) => format!("{m:?}"),
             Self::CoreToHolder(m) => format!("{m:?}"),
             Self::Holder(m) => format!("{m:?}"),
+            Self::Relay(m) => format!("Relay{m:?}"),
         };
         debug.split('(').next().unwrap().to_string()
     }
@@ -66,15 +73,27 @@ impl Step {
 
 #[derive(Clone, Copy)]
 enum Protocol {
+    /// Client protocol 1.
     Client,
+    /// Client protocol 2: the same frames plus `PROCESS`, and `HELLO`'s
+    /// `linger_secs` and `process_info`.
+    Client2,
+    /// The link to a `brindle-remote relay`: the client protocol and the
+    /// relay's own frames.
+    Relay,
     Holder,
 }
 
 impl Protocol {
     fn decode(self, sender: &str, frame: &Frame) -> std::io::Result<Step> {
         Ok(match (self, sender) {
-            (Self::Client, "client") => Step::Client(client::ToCore::decode(frame)?),
-            (Self::Client, "core") => Step::CoreToClient(client::ToClient::decode(frame)?),
+            (Self::Client | Self::Client2 | Self::Relay, "client") => {
+                Step::Client(client::ToCore::decode(frame)?)
+            }
+            (Self::Client | Self::Client2 | Self::Relay, "core") => {
+                Step::CoreToClient(client::ToClient::decode(frame)?)
+            }
+            (Self::Relay, "relay") => Step::Relay(relay::RelayMessage::decode(frame)?),
             (Self::Holder, "core") => Step::CoreToHolder(holder::ToHolder::decode(frame)?),
             (Self::Holder, "holder") => Step::Holder(holder::ToCore::decode(frame)?),
             _ => panic!("unknown sender {sender:?}"),
@@ -84,6 +103,8 @@ impl Protocol {
     fn title(self) -> &'static str {
         match self {
             Self::Client => "protocol 1 (client <-> core)",
+            Self::Client2 => "protocol 2 (client <-> core)",
+            Self::Relay => "relay link (Brindle <-> brindle-remote relay)",
             Self::Holder => "H1 (core <-> holder)",
         }
     }
@@ -105,6 +126,9 @@ fn fixture_path(name: &str) -> PathBuf {
 /// Shows a payload for a comment: JSON as text, binary as its session id and
 /// the rest escaped.
 fn describe(name: &str, frame: &Frame) -> String {
+    if name.starts_with("Relay") && frame.payload.is_empty() {
+        return "(empty)".to_string();
+    }
     if frame.payload.first() == Some(&b'{')
         && let Ok(text) = std::str::from_utf8(&frame.payload)
     {
@@ -273,16 +297,23 @@ fn every_message_type_appears_in_a_transcript() {
             let kind = match step {
                 Step::Client(_) | Step::CoreToClient(_) => "client",
                 Step::CoreToHolder(_) | Step::Holder(_) => "holder",
+                Step::Relay(_) => "relay",
             };
             seen.insert((kind, step.encode().msg_type), ());
         }
     }
     let client_types =
-        (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_OK);
+        (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
     for msg_type in client_types {
         assert!(
             seen.contains_key(&("client", msg_type)),
             "client type {msg_type}"
+        );
+    }
+    for msg_type in relay::MSG_RELAY_HOST..=relay::MSG_RELAY_ERROR {
+        assert!(
+            seen.contains_key(&("relay", msg_type)),
+            "relay type {msg_type:#x}"
         );
     }
     let holder_types =
@@ -319,8 +350,43 @@ fn hello(token: &str) -> Step {
         max: 1,
         client_version: "0.3.0".into(),
         client_token: token.into(),
+        ..Default::default()
     }))
 }
+
+/// What a protocol-2 client sends from a remote host: it lingers and wants
+/// process info.
+fn hello_2(token: &str) -> Step {
+    c(client::ToCore::Hello(client::Hello {
+        min: 1,
+        max: 2,
+        client_version: "0.4.0".into(),
+        client_token: token.into(),
+        linger_secs: 300,
+        process_info: true,
+    }))
+}
+
+fn welcome_2() -> Step {
+    s(client::ToClient::Welcome(client::Welcome {
+        protocol: 2,
+        core_version: "0.4.0".into(),
+        core_build: "c2e1".into(),
+        pid: 4242,
+        holder_protocols: vec![1, 2],
+    }))
+}
+
+fn process(session: u32, name: Option<&str>, cwd: Option<&str>) -> Step {
+    s(client::ToClient::Process(client::Process {
+        session,
+        name: name.map(Into::into),
+        cwd: cwd.map(Into::into),
+    }))
+}
+
+/// The versions a core that still speaks only protocol 1 answers with.
+const CORE_PROTOCOL_1: VersionRange = VersionRange::new(1, 1);
 
 fn welcome() -> Step {
     s(client::ToClient::Welcome(client::Welcome {
@@ -589,7 +655,7 @@ fn transcripts() -> Vec<Transcript> {
                     req: 4,
                     core_version: "0.3.0".into(),
                     core_build: "b1d0".into(),
-                    protocols: client::PROTOCOLS,
+                    protocols: CORE_PROTOCOL_1,
                     holder_protocols: VersionRange::new(1, 1),
                     pid: 4242,
                     uptime_secs: 3600,
@@ -630,22 +696,115 @@ fn transcripts() -> Vec<Transcript> {
         Transcript {
             name: "client-hello-refused",
             protocol: Protocol::Client,
-            about: "A client whose versions the core doesn't speak gets an ERROR naming both ranges.",
+            about: "A client whose versions the core doesn't speak (here a protocol-1 core) gets an ERROR naming both ranges.",
             steps: vec![
                 c(client::ToCore::Hello(client::Hello {
                     min: 2,
                     max: 3,
                     client_version: "0.9.0".into(),
                     client_token: TOKEN.into(),
+                    ..Default::default()
                 })),
                 error(
                     None,
                     None,
-                    &client::negotiate(VersionRange::new(2, 3), client::PROTOCOLS)
+                    &client::negotiate(VersionRange::new(2, 3), CORE_PROTOCOL_1)
                         .unwrap_err()
                         .to_string(),
                 ),
             ],
+        },
+        Transcript {
+            name: "client-process-info",
+            protocol: Protocol::Client2,
+            about: "Protocol 2: a HELLO asking for linger and process info, PROCESS on changes, and the owner state in a list.",
+            steps: vec![
+                hello_2(TOKEN),
+                welcome_2(),
+                c(client::ToCore::Spawn(client::Spawn {
+                    profile: Some("A8".into()),
+                    ..spawn_message(1, "/bin/bash", Policy::Detach)
+                })),
+                spawned(1, 1, 5000),
+                process(1, Some("bash"), Some("/home/u")),
+                input(1, b"sleep 30\r"),
+                process(1, Some("sleep"), None),
+                c(client::ToCore::List(client::Request { req: 2 })),
+                s(client::ToClient::Sessions(client::Sessions {
+                    req: 2,
+                    sessions: vec![
+                        client::SessionInfo {
+                            session: 1,
+                            pid: 5000,
+                            attached: true,
+                            command: "/bin/bash -l".into(),
+                            policy: Policy::Detach,
+                            cols: 80,
+                            rows: 24,
+                            owned: true,
+                            ..Default::default()
+                        },
+                        client::SessionInfo {
+                            session: 2,
+                            pid: 5001,
+                            command: "htop".into(),
+                            policy: Policy::Detach,
+                            cols: 100,
+                            rows: 30,
+                            owned: true,
+                            detached_secs: 125,
+                            ..Default::default()
+                        },
+                    ],
+                })),
+            ],
+        },
+        Transcript {
+            name: "client-old-core",
+            protocol: Protocol::Client2,
+            about: "A protocol-1 and 2 client's HELLO to a core that speaks only 1: it is answered with protocol 1 and gets no PROCESS.",
+            steps: vec![
+                hello_2(TOKEN),
+                welcome(),
+                spawn(1, "/bin/bash", Policy::Kill),
+                spawned(1, 1, 5000),
+                output(1, b"$ "),
+            ],
+        },
+        Transcript {
+            name: "relay-link",
+            protocol: Protocol::Relay,
+            about: "A relay's link: its host frame, the client protocol piped through, and a heartbeat.",
+            steps: vec![
+                Step::Relay(relay::RelayMessage::Host(relay::RelayHost {
+                    version: "0.4.0".into(),
+                    build: "c2e1".into(),
+                    env: BTreeMap::from([
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/usr/local/bin:/usr/bin".into()),
+                        ("SHELL".into(), "/bin/bash".into()),
+                    ]),
+                    shell: "/bin/bash".into(),
+                    home: "/home/u".into(),
+                    server_dir: "/run/user/1000/brindle".into(),
+                    core_pid: 4242,
+                })),
+                hello_2(TOKEN),
+                welcome_2(),
+                Step::Relay(relay::RelayMessage::Heartbeat),
+                spawn(1, "/bin/bash", Policy::Detach),
+                spawned(1, 1, 5000),
+                process(1, Some("bash"), Some("/home/u")),
+                Step::Relay(relay::RelayMessage::Heartbeat),
+            ],
+        },
+        Transcript {
+            name: "relay-error",
+            protocol: Protocol::Relay,
+            about: "A relay that can't reach or start its core says why and ends.",
+            steps: vec![Step::Relay(relay::RelayMessage::Error(relay::RelayError {
+                message: "can't start the terminal server: no server directory ($HOME is unset); core log /tmp/brindle/core.log".into(),
+            }))],
         },
         Transcript {
             name: "holder-spawn-io",
@@ -848,6 +1007,7 @@ fn transcripts() -> Vec<Transcript> {
                         title: "vim notes.md".into(),
                         started: 1_794_000_000,
                         profile: Some("Shell".into()),
+                        ..Default::default()
                     }],
                 })),
                 c(client::ToCore::Attach(client::Attach {

@@ -1,5 +1,6 @@
-mod agent;
 mod conpty;
+#[cfg(target_os = "linux")]
+mod liveness;
 #[cfg(any(target_os = "linux", windows))]
 mod pty;
 #[cfg(any(target_os = "linux", windows))]
@@ -11,7 +12,7 @@ use std::process::ExitCode;
 #[cfg(any(target_os = "linux", windows))]
 const USAGE: &str = server::cli::USAGE;
 #[cfg(not(any(target_os = "linux", windows)))]
-const USAGE: &str = "usage: brindle-remote --version | --server";
+const USAGE: &str = "usage: brindle-remote --version";
 
 fn main() -> ExitCode {
     match run() {
@@ -25,11 +26,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
-    if env::var_os("BRINDLE_REMOTE_UNLINK").is_some()
-        && let Ok(exe) = env::current_exe()
-    {
-        std::fs::remove_file(exe).ok();
-    }
     let mode = args.next();
     let rest: Vec<String> = args.collect();
     let has_extra = !rest.is_empty();
@@ -42,14 +38,9 @@ fn run() -> Result<(), String> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("--server") => {
-            if has_extra {
-                return Err("--server does not accept arguments".into());
-            }
-            agent::serve_stdio().map_err(|error| error.to_string())
-        }
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
+        Some("relay") => relay(&rest),
         // The trampoline that starts a role detached, for the role's starter.
         #[cfg(windows)]
         Some("launch") => server::daemon::launch(&rest),
@@ -66,6 +57,17 @@ fn serve(args: &[String]) -> Result<(), String> {
 #[cfg(any(target_os = "linux", windows))]
 fn hold(args: &[String]) -> Result<(), String> {
     server::holder::run(args)
+}
+
+#[cfg(target_os = "linux")]
+fn relay(args: &[String]) -> Result<(), String> {
+    server::relay::run(args)
+}
+
+/// Remote hosts are Linux: Brindle on Windows runs a Linux host's relay.
+#[cfg(not(target_os = "linux"))]
+fn relay(_args: &[String]) -> Result<(), String> {
+    Err("relay runs only on Linux".into())
 }
 
 /// `check`, `list`, `kill`, `status` and `stop`; `None` for anything else.
