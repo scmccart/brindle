@@ -94,7 +94,14 @@
   - an offline row for a stopped container.
 
   Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- remote` on Linux
-- [ ] 9.2 Run `cargo test --workspace --locked` and `cargo build --release --locked` on Windows and confirm both pass. Ask the Linux machine's session to run the same commands plus `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` and `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client`, and record the results
+- [x] 9.2 Run `cargo test --workspace --locked` and `cargo build --release --locked` on Windows and confirm both pass. Ask the Linux machine's session to run the same commands plus `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` and `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client`, and record the results
+
+  Results (`1485bcb` changed only `tests/e2e`, so the runs at `5e6455e` stand for it):
+  - Windows, `5e6455e`: `cargo test --workspace --locked` passed (brindle 369 passed, 1 ignored; no failures in any binary); `cargo build --release --locked` passed; the e2e and perf self-tests passed (7 and 3 ok).
+  - Windows, `1485bcb`: `cargo build --workspace --locked` and `cargo test --workspace --locked --no-run` passed; e2e `--list` (38 cases) and `--self-test` (8 ok) passed.
+  - Linux, `1485bcb`: `cargo test --locked` passed (836 passed, 3 ignored); `cargo build --release --locked` passed; `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SLOW=2 cargo test --test e2e` passed (118 passed), and `-- remote` passed three times (7 passed each).
+  - Linux, `5e6455e`: `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client` passed (19 passed).
+  - The only warning anywhere is the known `proc-macro-error2` / `num-bigint-dig` future-incompat note.
 
 ## Workflow follow-up
 
