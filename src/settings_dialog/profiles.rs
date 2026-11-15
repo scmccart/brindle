@@ -834,6 +834,18 @@ impl ProfilesState {
     }
 }
 
+/// How many `brindle_ui::FIELD_STEP`s an editor row is tall: its control
+/// line takes two, whatever the control, and a validation error under it
+/// one more.
+pub(super) fn row_steps(has_error: bool) -> u32 {
+    CONTROL_STEPS + if has_error { ERROR_STEPS } else { 0 }
+}
+
+/// The control line's height, in increments: a text field's.
+const CONTROL_STEPS: u32 = 2;
+/// An error line's height, in increments.
+const ERROR_STEPS: u32 = 1;
+
 // ---- view -------------------------------------------------------------------
 
 use gpui::prelude::FluentBuilder as _;
@@ -848,7 +860,8 @@ use crate::actions::{
     SettingsSectionPrev,
 };
 use brindle_ui::{
-    ActiveTheme as _, ButtonVariant, Checkbox, Input, Select, SelectEvent, Switch, TextInput, TextInputEvent,
+    ActiveTheme as _, ButtonVariant, Checkbox, FIELD_STEP, Input, Select, SelectEvent, Switch, TextInput,
+    TextInputEvent,
 };
 
 /// The fields shown as a select rather than text.
@@ -1177,14 +1190,36 @@ impl SettingsDialog {
                     .children(this.profile_input(field).map(|input| Input::new(input).invalid(error.is_some())))
                     .into_any_element(),
             };
+            // The control line is two increments with its control centred,
+            // an error line one more with its text centred, and no gap
+            // between them, so a row is a whole number of increments.
             div()
                 .flex()
                 .flex_col()
                 .flex_none()
-                .gap_0p5()
-                .child(div().flex().items_center().gap_2().child(label(field.label())).child(control))
+                .h(FIELD_STEP * row_steps(error.is_some()) as f32)
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .h(FIELD_STEP * CONTROL_STEPS as f32)
+                        .child(label(field.label()))
+                        .child(control),
+                )
                 .when_some(error, |d, e| {
-                    d.child(div().pl(px(128.0)).text_xs().text_color(red).child(SharedString::from(e)))
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(FIELD_STEP * ERROR_STEPS as f32)
+                            .pl(px(128.0))
+                            .text_xs()
+                            .text_color(red)
+                            .child(SharedString::from(e)),
+                    )
                 })
                 .into_any_element()
         };
@@ -1385,6 +1420,15 @@ theme = "gone"
             Ok(_) => Vec::new(),
             Err(errors) => errors.into_iter().map(|(f, _)| f).collect(),
         }
+    }
+
+    #[test]
+    fn rows_are_two_increments_and_an_error_adds_one() {
+        assert_eq!(row_steps(false), 2);
+        assert_eq!(row_steps(true), 3);
+        // Two increments are a text field's height, so every control's line
+        // matches an `Input`.
+        assert_eq!(brindle_ui::FIELD_STEP * row_steps(false) as f32, brindle_ui::FIELD_HEIGHT);
     }
 
     #[test]

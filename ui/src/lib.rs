@@ -21,7 +21,7 @@ pub use icon::{Icon, IconElement, LEGIBLE_ICON_STROKE, stroke_width};
 pub use primitives::*;
 pub use style::{
     ButtonSize, ButtonStyle, ButtonVariant, CARD_BORDER, CARD_HEADER_HEIGHT, CardColors, CardStyle, CheckboxStyle,
-    CommandStyle, DialogStyle, InputStyle, MenuStyle,
+    CommandStyle, DialogStyle, FIELD_HEIGHT, FIELD_STEP, InputStyle, MenuStyle,
     PopoverStyle, SelectStyle, SwitchStyle, TabColors, TabDragStyle, TabListStyle, TabStyle, TabWidth,
     ToggleSize, ToggleStyle, ToggleVariant, TooltipStyle, button_style, checkbox_style, command_style, dialog_style,
     card_style, focus_ring, input_style, menu_style, popover_style, select_style, switch_style, switch_thumb_offset,

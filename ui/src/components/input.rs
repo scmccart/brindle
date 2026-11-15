@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::components::FocusRing;
 use crate::primitives::focus_visible::{focus_from_pointer, modality, shows_ring};
-use crate::style::input_style;
+use crate::style::{FIELD_HEIGHT, input_style};
 use crate::text_input::TextInput;
 use crate::theme::ActiveTheme;
 
@@ -53,12 +53,12 @@ impl RenderOnce for Input {
         let handle = self.input.read(cx).focus_handle(cx);
         let ring_shown = shows_ring(handle.is_focused(window), modality(window, cx), true);
         let style = input_style(ring_shown, self.invalid, t);
-        // h-9 w-full min-w-0 rounded-md border border-input bg-transparent
-        // px-3 py-1 text-sm
+        // h-9 (two `FIELD_STEP`s) w-full min-w-0 rounded-md border
+        // border-input bg-transparent px-3 py-1 text-sm
         let mut frame = div()
             .flex()
             .items_center()
-            .h_9()
+            .h(FIELD_HEIGHT)
             .w_full()
             .min_w_0()
             .px_3()
