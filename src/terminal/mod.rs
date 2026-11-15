@@ -946,6 +946,19 @@ impl Terminal {
     /// Ends the terminal's connection to its program: `close` ends the
     /// program; otherwise a server session's program is left as its
     /// [`Closing`] says. A message terminal has no program.
+    /// Keeps the layout of the tab this terminal is in current on its
+    /// server session (`crate::layout`), as it changes; a message terminal
+    /// has none.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        match &self.backend {
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { session, closing: Closing::Keeps, .. } if !self.exited => session.set_layout(layout),
+            _ => {
+                let _ = layout;
+            }
+        }
+    }
+
     fn leave(&mut self, close: bool, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]

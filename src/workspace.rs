@@ -603,10 +603,24 @@ impl Workspace {
         self.record_session(window, cx);
         self.quitting = true;
         // Each tab's kept sessions are detached with its layout.
-        let quit = crate::layout::quit_id();
         for (index, tab) in self.tabs.iter().enumerate() {
             let title = tab.manual_title.clone();
-            tab.zones.update(cx, |zones, cx| zones.quit_all(&quit, index, title.as_deref(), cx));
+            tab.zones.update(cx, |zones, cx| zones.quit_all(index, title.as_deref(), cx));
+        }
+    }
+
+    /// Keeps each local tab's layout current on its sessions' servers
+    /// (`ZoneTreeView::send_layout`, which sends only changes): called once a
+    /// second with the session recorder, so a change reaches the server
+    /// within about a second, and a Brindle that crashes leaves its splits.
+    pub fn send_layouts(&self, cx: &App) {
+        if self.quitting {
+            return;
+        }
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if tab.origin == TabOrigin::Local {
+                tab.zones.read(cx).send_layout(index, tab.manual_title.as_deref(), cx);
+            }
         }
     }
 

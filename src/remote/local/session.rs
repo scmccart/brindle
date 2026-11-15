@@ -196,6 +196,15 @@ impl Session {
         self.leave(Leaving::Keep, layout);
     }
 
+    /// Keeps the core's copy of the session's layout current
+    /// ([`Running::set_layout`]: only changes, only on client protocol 3).
+    /// A session not running yet sends nothing; the next call catches it.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        if let Phase::Running(running) = &*self.phase.lock() {
+            running.set_layout(layout);
+        }
+    }
+
     fn leave(&self, how: Leaving, layout: Option<serde_json::Value>) {
         let mut phase = self.phase.lock();
         match &mut *phase {
@@ -376,6 +385,15 @@ mod tests {
     /// (which may reply) and reports it.
     fn scripted_core(
         dir: &std::path::Path,
+        answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
+    ) -> mpsc::Receiver<ToCore> {
+        scripted_core_at(dir, 1, answer)
+    }
+
+    /// [`scripted_core`], agreeing on client protocol `protocol`.
+    fn scripted_core_at(
+        dir: &std::path::Path,
+        protocol: u32,
         mut answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
     ) -> mpsc::Receiver<ToCore> {
         let listener = Listener::bind(dir);
@@ -386,7 +404,7 @@ mod tests {
                 panic!("not HELLO")
             };
             let welcome = Welcome {
-                protocol: 1,
+                protocol,
                 core_version: "0.0.0".into(),
                 core_build: "test".into(),
                 pid: std::process::id(),
@@ -528,6 +546,38 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On client protocol 3 a layout goes out only when it changed; below 3
+    /// none does (the quit's `DETACH` carries it).
+    #[test]
+    fn layouts_are_sent_once_per_change_and_only_on_protocol_3() {
+        for protocol in [3, 2] {
+            let dir = temp_dir(&format!("set-layout-{protocol}"));
+            let core = scripted_core_at(&dir, protocol, replaying);
+            let (tx, _tab) = mpsc::channel();
+            let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
+            assert!(matches!(recv(&core), ToCore::Attach(_)));
+            eventually(|| session.pid().is_some());
+            let one = serde_json::json!({"v": 1, "origin": "o", "index": 0, "zones": {"key": "k5"}});
+            let two = serde_json::json!({"v": 1, "origin": "o", "index": 1, "zones": {"key": "k5"}});
+            for layout in [&one, &one, &two, &two] {
+                session.set_layout(Some(layout.clone()));
+            }
+            // The detach marks the end of what the session sent.
+            session.detach_with(None);
+            let mut sent = Vec::new();
+            loop {
+                match recv(&core) {
+                    ToCore::SetLayout(set) => sent.push(set.layout),
+                    ToCore::Detach(_) => break,
+                    _ => {}
+                }
+            }
+            let expected = if protocol >= 3 { vec![Some(one), Some(two)] } else { Vec::new() };
+            assert_eq!(sent, expected, "protocol {protocol}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

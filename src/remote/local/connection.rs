@@ -109,7 +109,7 @@ use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
-    Detach, SessionRef, Spawned, ToClient, ToCore,
+    Detach, SessionRef, SetLayout, Spawned, ToClient, ToCore,
 };
 use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
@@ -303,6 +303,9 @@ struct State {
     on_end: Option<Box<dyn FnOnce() + Send>>,
     /// What was last reported ([`Connection::report`]).
     reported: Option<LinkState>,
+    /// The client protocol the current (or last) link's `WELCOME` agreed
+    /// on; 0 before the first.
+    protocol: u32,
 }
 
 impl State {
@@ -526,9 +529,10 @@ impl Connection {
 
     /// Starts the reader and writer threads on a negotiated local connection.
     pub fn start(endpoint: Endpoint, token: &str, connected: Connected) -> Result<Arc<Self>> {
+        let protocol = connected.welcome.protocol;
         let link = Link::local(connected.stream)?;
         let (this, queue) = Self::new(Transport::Local(endpoint), token);
-        this.up(link.wire, None)?;
+        this.up(link.wire, None, protocol)?;
         let writing = this.clone();
         std::thread::Builder::new()
             .name("server-writer".into())
@@ -826,7 +830,7 @@ impl Connection {
             }));
             (Waiting::Spawn { sink, reply }, message)
         })?;
-        Ok(Running { id: spawned.session, pid: spawned.pid, key: spawned.key, conn: self.clone() })
+        Ok(Running { id: spawned.session, pid: spawned.pid, key: spawned.key, conn: self.clone(), layout: Mutex::default() })
     }
 
     /// Attaches a detached session, whose replay and then live output go to
@@ -841,7 +845,7 @@ impl Connection {
             let message = check.is_none().then(|| ToCore::Attach(attach.clone()));
             (Waiting::Attach { sink, reply, attach, check }, message)
         })?;
-        Ok(Running { id: session, pid, key: request.key, conn: self.clone() })
+        Ok(Running { id: session, pid, key: request.key, conn: self.clone(), layout: Mutex::default() })
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
@@ -979,7 +983,7 @@ impl Connection {
         self.watch_link(&wire, &stamp);
         let mut reader = BufReader::with_capacity(READ_BUFFER, reader);
         let greeted = self.greet(&dial.name(), &mut reader, wire.as_ref());
-        match greeted.and_then(|host| self.up(wire.clone(), Some(host))) {
+        match greeted.and_then(|(host, protocol)| self.up(wire.clone(), Some(host), protocol)) {
             Ok(()) => {
                 // Sooner than the bootstrap's deadline the watchdog waits for.
                 stamp.touch(timings.dead);
@@ -998,7 +1002,7 @@ impl Connection {
     /// Reads the relay's `RELAY_HOST` (or its `RELAY_ERROR`) and says
     /// `HELLO` at once, since the core drops a client that hasn't within
     /// 5 s; then waits for `WELCOME`. Heartbeats are skipped.
-    fn greet(&self, name: &str, reader: &mut impl BufRead, wire: &dyn Wire) -> Result<RelayHost> {
+    fn greet(&self, name: &str, reader: &mut impl BufRead, wire: &dyn Wire) -> Result<(RelayHost, u32)> {
         let host = loop {
             let frame = next_frame(reader, wire)?;
             if !is_relay_type(frame.msg_type) {
@@ -1025,7 +1029,7 @@ impl Connection {
                         host.version,
                         host.build
                     );
-                    return Ok(host);
+                    return Ok((host, welcome.protocol));
                 }
                 ToClient::Error(error) => return Err(super::refused(&error.message)),
                 other => bail!("the terminal server answered HELLO with {other:?}"),
@@ -1037,13 +1041,14 @@ impl Connection {
     /// sessions the core no longer has, and so it does on the first link
     /// when a recorded attach or a listing hook waits for one; then the
     /// writer gets the link.
-    fn up(&self, wire: Arc<dyn Wire>, host: Option<RelayHost>) -> Result<()> {
+    fn up(&self, wire: Arc<dyn Wire>, host: Option<RelayHost>, protocol: u32) -> Result<()> {
         let list = {
             let mut state = self.state.lock();
             if let Some(reason) = &state.ended {
                 // It ended while this link was starting.
                 bail!("{reason}");
             }
+            state.protocol = protocol;
             let after_loss = state.connected;
             let wanted = after_loss || state.waits_for_listing();
             // Under the same lock: what registers after this asks itself.
@@ -1478,7 +1483,7 @@ impl Connection {
         let Connected { stream, welcome } = connected;
         log::info!("reconnected to the terminal server (core pid {})", welcome.pid);
         let link = Link::local(stream)?;
-        self.up(link.wire, None)?;
+        self.up(link.wire, None, welcome.protocol)?;
         Ok(link.reader)
     }
 
@@ -1856,6 +1861,9 @@ pub struct Running {
     pid: u32,
     key: String,
     conn: Arc<Connection>,
+    /// The layout last sent with `SET_LAYOUT`, so an unchanged one isn't
+    /// sent again.
+    layout: Mutex<Option<serde_json::Value>>,
 }
 
 impl Running {
@@ -1914,6 +1922,21 @@ impl Running {
         if self.conn.forget(self.id, true) {
             self.conn.send(ToCore::Close(SessionRef { session: self.id }));
         }
+    }
+
+    /// Makes `layout` the session's layout on the core (`SET_LAYOUT`), when it
+    /// differs from the one last sent and the link speaks client protocol 3;
+    /// a core below 3 gets it only with the `DETACH` on quit.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        if self.conn.state.lock().protocol < 3 {
+            return;
+        }
+        let mut sent = self.layout.lock();
+        if *sent == layout {
+            return;
+        }
+        *sent = layout.clone();
+        self.conn.send(ToCore::SetLayout(SetLayout { session: self.id, layout }));
     }
 
     /// Leaves the session running with no client (`DETACH`), with the

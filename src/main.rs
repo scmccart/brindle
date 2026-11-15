@@ -655,7 +655,9 @@ fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
     session::drop_lost_zones(window, |recorded| detached.has(recorded))
 }
 
-/// Writes the session state when it changes (off the UI thread), and once
+/// Writes the session state when it changes (off the UI thread), and sends
+/// changed tab layouts to the terminal server, both checked once a second;
+/// and writes the state once
 /// more, synchronously, when Brindle quits, after each window still open
 /// has recorded itself and left its terminals' sessions (`Workspace::quit`).
 fn record_session(cx: &mut App) {
@@ -673,6 +675,18 @@ fn record_session(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
+            // Each window's tabs keep their sessions' layouts current on
+            // the same tick: a throttle, changes only (`send_layouts`).
+            let sent = cx.update(|cx| {
+                for window in cx.windows() {
+                    if let Some(window) = window.downcast::<Workspace>() {
+                        window.read_with(cx, |ws, cx| ws.send_layouts(cx)).ok();
+                    }
+                }
+            });
+            if sent.is_err() {
+                break;
+            }
             let Ok(text) = cx.update(pending) else { break };
             if let Some(text) = text {
                 let generation = session::next_generation();

@@ -1,10 +1,11 @@
-//! The layout a quitting Brindle detaches each tab's terminal server
-//! sessions with, and how a launch's sweep puts sessions back into their tabs
-//! from it (OpenSpec change `session-layout-in-server`).
+//! The layout Brindle keeps with each tab's terminal server sessions, while
+//! it runs (`SET_LAYOUT`, client protocol 3, once a second when it changed)
+//! and as it detaches them on quit, and how a launch's sweep puts sessions
+//! back into their tabs from it (OpenSpec change `session-layout-in-server`).
 //!
 //! Every session of a tab is detached with the same blob: the tab's split
 //! tree with session keys as leaves, its active zone, its manual title and
-//! its place among the quit's tabs ([`record`]). The core keeps it in the
+//! its place among the tabs of the Brindle that recorded it ([`record`]). The core keeps it in the
 //! session's meta without reading it and lists it with the session while it
 //! stays detached. A sweep groups the sessions it opens by the tab they name
 //! ([`group`]), so a split comes back whichever Brindle sweeps it.
@@ -26,9 +27,10 @@ pub const VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub v: u32,
-    /// The quit that recorded it ([`quit_id`]); with `index`, the tab.
-    pub quit: String,
-    /// The tab's place in the strip at that quit.
+    /// The Brindle process that recorded it ([`origin_id`]); with `index`,
+    /// the tab.
+    pub origin: String,
+    /// The tab's place in the strip when recorded.
     pub index: u32,
     /// Its manual title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,13 +63,17 @@ impl Node {
     }
 }
 
-/// An id for one quit of one Brindle, shared by the layouts of all its
-/// tabs: unique enough to keep two quits' tabs apart.
-pub fn quit_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{:x}-{nanos:x}", std::process::id())
+/// The id of this Brindle process, shared by the layouts of all its tabs
+/// (made once: its pid and the time it was first asked for): unique enough to
+/// keep two Brindles' tabs apart.
+pub fn origin_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("{:x}-{nanos:x}", std::process::id())
+    })
 }
 
 /// The layout a tab's sessions are detached with: `tree` with each zone's
@@ -79,7 +85,7 @@ pub fn record(
     tree: &ZoneTree,
     active: ZoneId,
     key_of: &mut impl FnMut(ZoneId) -> Option<String>,
-    quit: &str,
+    origin: &str,
     index: usize,
     title: Option<&str>,
 ) -> Option<serde_json::Value> {
@@ -102,7 +108,7 @@ pub fn record(
     }
     let layout = Layout {
         v: VERSION,
-        quit: quit.to_string(),
+        origin: origin.to_string(),
         index: u32::try_from(index).unwrap_or(u32::MAX),
         title: title.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
         zones,
@@ -239,13 +245,13 @@ fn layout_of(info: &SessionInfo) -> Option<Layout> {
 /// a restored zone) open as. Sessions detached with one tab's layout are
 /// that tab, its split tree pruned to the sessions here (a split's sibling
 /// takes a missing zone's place; the first zone is active when the recorded
-/// active one is missing). The rest are tabs of their own. A quit's tabs
+/// active one is missing). The rest are tabs of their own. A Brindle's tabs
 /// keep their recorded order, together where the oldest session among them
 /// sorts; a tab of its own sorts by its session; sessions sort by start time,
 /// then id.
 pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
     struct Group {
-        /// `(quit, index)` for a recorded tab.
+        /// `(origin, index)` for a recorded tab.
         tab: Option<(String, u32)>,
         layout: Option<Layout>,
         members: Vec<SessionInfo>,
@@ -256,14 +262,14 @@ pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
             groups.push(Group { tab: None, layout: None, members: vec![info] });
             continue;
         };
-        let tab = (layout.quit.clone(), layout.index);
+        let tab = (layout.origin.clone(), layout.index);
         match groups.iter_mut().find(|g| g.tab.as_ref() == Some(&tab)) {
             Some(group) => group.members.push(info),
             None => groups.push(Group { tab: Some(tab), layout: Some(layout), members: vec![info] }),
         }
     }
 
-    // Each tab with its sort key: where its quit (or its own session) sorts,
+    // Each tab with its sort key: where its origin (or its own session) sorts,
     // then its index.
     let mut tabs: Vec<((u64, u32, String, u32), LayoutTab)> = Vec::new();
     let flat = |info: SessionInfo, tabs: &mut Vec<_>| {
@@ -271,7 +277,7 @@ pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
         tabs.push((key, LayoutTab { title: None, zones: Tree::leaf(info) }));
     };
     for group in groups {
-        let (Some((quit, index)), Some(layout)) = (group.tab, group.layout) else {
+        let (Some((origin, index)), Some(layout)) = (group.tab, group.layout) else {
             group.members.into_iter().for_each(|info| flat(info, &mut tabs));
             continue;
         };
@@ -283,24 +289,24 @@ pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
         }
         let oldest = zones.items().into_iter().map(|s| (s.started, s.session)).min().unwrap_or_default();
         let title = layout.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
-        tabs.push(((oldest.0, oldest.1, quit, index), LayoutTab { title, zones }));
+        tabs.push(((oldest.0, oldest.1, origin, index), LayoutTab { title, zones }));
         // Members its tree doesn't name (another detach of the same tab
         // can't make these; kept anyway) are tabs of their own.
         let mut left: Vec<SessionInfo> = members.into_values().collect();
         left.sort_by_key(|s| (s.started, s.session));
         left.into_iter().for_each(|info| flat(info, &mut tabs));
     }
-    // A quit sorts by its oldest session over all its tabs.
+    // An origin sorts by its oldest session over all its tabs.
     let mut anchors: HashMap<String, (u64, u32)> = HashMap::new();
-    for ((started, session, quit, _), _) in &tabs {
-        if !quit.is_empty() {
-            let anchor = anchors.entry(quit.clone()).or_insert((*started, *session));
+    for ((started, session, origin, _), _) in &tabs {
+        if !origin.is_empty() {
+            let anchor = anchors.entry(origin.clone()).or_insert((*started, *session));
             *anchor = (*anchor).min((*started, *session));
         }
     }
-    tabs.sort_by_key(|((started, session, quit, index), _)| {
-        let anchor = anchors.get(quit).copied().unwrap_or((*started, *session));
-        (anchor, quit.clone(), *index)
+    tabs.sort_by_key(|((started, session, origin, index), _)| {
+        let anchor = anchors.get(origin).copied().unwrap_or((*started, *session));
+        (anchor, origin.clone(), *index)
     });
     tabs.into_iter().map(|(_, tab)| tab).collect()
 }
@@ -340,7 +346,7 @@ mod tests {
             recorded,
             json!({
                 "v": 1,
-                "quit": "q1",
+                "origin": "q1",
                 "index": 4,
                 "title": "logs",
                 "zones": {
@@ -351,7 +357,7 @@ mod tests {
             })
         );
         let single = record(&ZoneTree::Leaf(ZoneId(1)), ZoneId(1), &mut key_of, "q1", 0, Some("  ")).unwrap();
-        assert_eq!(single, json!({"v": 1, "quit": "q1", "index": 0, "zones": {"key": "k1", "active": true}}));
+        assert_eq!(single, json!({"v": 1, "origin": "q1", "index": 0, "zones": {"key": "k1", "active": true}}));
     }
 
     #[test]
@@ -368,8 +374,8 @@ mod tests {
             json!({"split": "vertical", "first": {"key": "k1", "active": true}, "second": {"key": "k2"}})
         );
         assert_eq!(record(&ZoneTree::Leaf(ZoneId(3)), ZoneId(3), &mut key_of, "q", 0, None), None);
-        assert_eq!(quit_id().is_empty(), false);
-        assert_ne!(quit_id(), quit_id(), "two quits differ");
+        assert!(!origin_id().is_empty());
+        assert_eq!(origin_id(), origin_id(), "made once per process");
     }
 
     fn info(session: u32, key: &str, started: u64) -> SessionInfo {
@@ -381,9 +387,9 @@ mod tests {
     }
 
     /// A tab of the keys `a` and `b` split, `b` active.
-    fn pair(quit: &str, index: u32, a: &str, b: &str) -> serde_json::Value {
+    fn pair(origin: &str, index: u32, a: &str, b: &str) -> serde_json::Value {
         json!({
-            "v": 1, "quit": quit, "index": index, "title": "logs",
+            "v": 1, "origin": origin, "index": index, "title": "logs",
             "zones": {"split": "horizontal", "first": {"key": a}, "second": {"key": b, "active": true}},
         })
     }
@@ -426,11 +432,11 @@ mod tests {
             // Names another session only.
             laid_out(1, "a", 10, pair("q", 0, "x", "y")),
             // Another format version.
-            laid_out(2, "b", 20, json!({"v": 2, "quit": "q", "index": 1, "zones": {"key": "b"}})),
+            laid_out(2, "b", 20, json!({"v": 2, "origin": "q", "index": 1, "zones": {"key": "b"}})),
             // Not a layout.
             laid_out(3, "c", 30, json!("junk")),
             // A core that predates keys.
-            laid_out(4, "", 40, json!({"v": 1, "quit": "q", "index": 2, "zones": {"key": ""}})),
+            laid_out(4, "", 40, json!({"v": 1, "origin": "q", "index": 2, "zones": {"key": ""}})),
             info(5, "e", 5),
         ]);
         let order: Vec<u32> = tabs.iter().map(|t| t.active().session).collect();
@@ -439,13 +445,13 @@ mod tests {
     }
 
     #[test]
-    fn a_quits_tabs_keep_their_order_where_its_oldest_session_sorts() {
+    fn a_brindles_tabs_keep_their_order_where_its_oldest_session_sorts() {
         let tabs = group(vec![
-            // Quit q: tab 1 (c alone) is older than tab 0 (a | b).
+            // Brindle q: tab 1 (c alone) is older than tab 0 (a | b).
             laid_out(1, "a", 50, pair("q", 0, "a", "b")),
             laid_out(2, "b", 51, pair("q", 0, "a", "b")),
-            laid_out(3, "c", 20, json!({"v": 1, "quit": "q", "index": 1, "zones": {"key": "c", "active": true}})),
-            // Quit r: one tab, started between.
+            laid_out(3, "c", 20, json!({"v": 1, "origin": "q", "index": 1, "zones": {"key": "c", "active": true}})),
+            // Brindle r: one tab, started between.
             laid_out(4, "d", 30, pair("r", 0, "d", "e")),
             laid_out(5, "e", 31, pair("r", 0, "d", "e")),
             // Flat sessions, before, between and after.
@@ -459,7 +465,7 @@ mod tests {
 
     #[test]
     fn titles_are_trimmed_and_blank_ones_dropped() {
-        let titled = |title: &str| json!({"v": 1, "quit": "q", "index": 0, "title": title, "zones": {"key": "a"}});
+        let titled = |title: &str| json!({"v": 1, "origin": "q", "index": 0, "title": title, "zones": {"key": "a"}});
         assert_eq!(group(vec![laid_out(1, "a", 1, titled("  build "))])[0].title.as_deref(), Some("build"));
         assert_eq!(group(vec![laid_out(1, "a", 1, titled("   "))])[0].title, None);
     }

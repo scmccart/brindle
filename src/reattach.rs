@@ -419,7 +419,7 @@ mod tests {
         let config = profiles();
         let a8 = Host::of(&config.profiles[2]);
         let layout = serde_json::json!({
-            "v": 1, "quit": "q", "index": 0,
+            "v": 1, "origin": "q", "index": 0,
             "zones": {"split": "vertical", "first": {"key": "a"}, "second": {"split": "horizontal",
                 "first": {"key": "b", "active": true}, "second": {"key": "c"}}},
         });

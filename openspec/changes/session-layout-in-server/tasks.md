@@ -58,14 +58,14 @@
 - [x] 7.2 Add a `client-set-layout` transcript (a new `Protocol::Client3`) and update the negotiation tests: a 1–3 client and a 1–2 core agree on 2, and two 1–3 sides agree on 3. Verify that `BRINDLE_REGEN_FIXTURES=1` only adds the new fixture, and that `cargo test --workspace --locked --test transcripts` passes.
 - [x] 7.3 In the core, keep each client's negotiated protocol (`Client.protocol` in `core/clients.rs`). Add `client_set_layout` in `core/sessions.rs`: an `ERROR` on protocol < 3, from a client that doesn't have the session attached, or for an unknown session; the 64 KiB cap; `store_meta` only when the layout changed. Verify with `cargo build -p brindle-remote-agent`.
 - [x] 7.4 Add `TestClient::hello_3` and `set_layout` to `remote-agent/tests/support`. Add tests to `remote-agent/tests/core.rs`: the latest `SET_LAYOUT` is listed after its client is SIGKILLed; it survives a core restart; it is refused from another client and on protocol 2. Verify with `cargo test -p brindle-remote-agent --test core layout`.
-- [ ] 7.5 Brindle:
+- [x] 7.5 Brindle:
   - `Connection` keeps the link's negotiated protocol (`State.protocol`, set in `up` from each `WELCOME`).
   - `Running::set_layout` sends `SET_LAYOUT` on protocol ≥ 3, only when the layout differs from the last one sent.
   - Add `Session::set_layout`, `Terminal::set_layout`, `ZoneTreeView::layout(index, title, cx)` (shared with `quit_all`) and `Workspace::send_layouts`, called from `main.rs`'s once-a-second `record_session` tick.
   - Rename `quit_id` to `origin_id` (made once per process) and the JSON field `quit` to `origin`.
 
   Verify with a unit test in `session.rs` or `connection.rs` (the same layout twice sends one `SET_LAYOUT`, and protocol 2 sends none) and the existing layout tests.
-- [ ] 7.6 Add the `local-server-layout-live` e2e case: split a tab, wait for both shells, then SIGKILL Brindle about 3 s later. `brindle-remote list --json` must then show both sessions with one layout naming both. Register it in `cases/mod.rs` and `cases/win.rs`, and verify it under `scripts/with-xvfb`.
+- [x] 7.6 Add the `local-server-layout-live` e2e case: split a tab, wait for both shells, then SIGKILL Brindle about 3 s later. `brindle-remote list --json` must then show both sessions with one layout naming both. Register it in `cases/mod.rs` and `cases/win.rs`, and verify it under `scripts/with-xvfb`.
 - [ ] 7.7 Update CLAUDE.md for protocol 3, `SET_LAYOUT` and the live sends. Re-run `cargo test --workspace --locked`, `cargo build --release --locked` and the `local-server` e2e cases under `scripts/with-xvfb`, and verify all pass.
 
 ## Workflow follow-up
