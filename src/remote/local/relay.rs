@@ -646,7 +646,7 @@ mod tests {
         // A process that writes its marker, runs `script` and exits `code`.
         let why = |script: &str, code: i32| {
             let mut command = Command::new("sh");
-            command.args(["-c", &format!("printf '\\000BRINDLE-FRAMES1\\n'; {script}; exit {code}")]);
+            command.args(["-c", &format!("printf '\\000BRINDLE-FRAMES1\\n'; {script}{}exit {code}", if script.is_empty() { "" } else { "; " })]);
             let mut link = start(command, Duration::from_secs(20)).unwrap_or_else(|e| panic!("{e}"));
             let mut rest = Vec::new();
             link.reader.read_to_end(&mut rest).ok();
