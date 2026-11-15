@@ -1,45 +1,21 @@
-# Proposal
-
-**Status: outline only.** Items 1, 4 and 5 moved to `terminal-server-remote` (its decision 12), which settles the signal question as "every signal". Items 2 and 3 remain here.
-
-This collects the follow-ups that `fix-flaky-tests` found but left out of scope. Each item still needs its own decision before specs, design or tasks are written. Items may split out into their own changes. It builds on `fix-flaky-tests` (#47), which added `pass_fd_as`, `TestClient::hung_up` and the holder's read before losing a core.
-
 ## Why
 
-Root-causing the flaky tests (#32, #36) turned up a few defects and hazards that weren't flakes:
-- Session programs can inherit an ignored SIGHUP, so closing a tab doesn't hang them up.
-- The unit tests leak a process-wide `XDG_RUNTIME_DIR` into tests that start real systemd scopes.
-- There are three narrow races in the hang-up and server-start paths.
+Root-causing the flaky tests (#32, #36, `fix-flaky-tests`) turned up defects that weren't flakes. `terminal-server-remote` fixed three of them (default signal handling for session programs, draining a dead core, the ready pipe mistaken for an exec error). Two remain:
+- A unit test sets `XDG_RUNTIME_DIR` for the whole test process, so whether the `remote::local` tests start real systemd scopes on a desktop depends on test order (#43).
+- A hang-up closes the PTY before it signals, so a program blocked reading its terminal sometimes ends by "read failed, exit 1" instead of SIGHUP (#46, item 1). The spec already says a hang-up ends such a program with SIGHUP; today that holds about 3,999 times in 4,000.
 
-None fails today in normal use. They are cheap to fix while the analysis is fresh.
+Both are cheap to fix while the analysis is fresh.
 
 ## What Changes
 
-1. **Session programs start with default signal handling (#44, bug).**
-   - Today `remote-agent/src/pty.rs` execs the program with Brindle's or the holder's dispositions and signal mask. Under `nohup`, an ignored SIGHUP reaches every session, and a hang-up then relies on the holder's SIGKILL 1 s later.
-   - Reset the job-control and termination signals to `SIG_DFL` and clear the mask in the child before exec. This applies to the holder and to the stdio `--server` agent, which share `pty.rs`.
-   - Add a holder test that runs with SIGHUP ignored.
-2. **Unit tests don't change the process environment (#43, bug).**
-   - `src/instance.rs`'s test sets `XDG_RUNTIME_DIR` with `set_var`. The `remote::local` tests read it through `scope::current()`, so depending on test order they create real `brindle-serve-*.scope` units on a desktop.
-   - Pass the runtime directory in, or have the `remote::local` tests set `BRINDLE_NO_SCOPE=1`.
-   - Audit the other `set_var`/`remove_var` calls in tests for the same leak.
-3. **Hang-up signals before it closes (#46, item 1).**
-   - The holder closes the PTY master before it sends SIGHUP, so a program blocked reading the terminal exits 1 on EIO about once in 4,000 hang-ups, instead of dying of SIGHUP.
-   - Signalling the process group first gave a SIGHUP death in 24,000 of 24,000 tries.
-   - Open question: does a consistent exit status matter enough (`EXIT` reporting, notifications) to change the order?
-4. **A holder drains a dead core fully (#46, item 2).**
-   - On a failed write to its core, the holder reads once, up to 1 MiB, before dropping the core.
-   - Read until `WouldBlock`, bounded, so a frame like `SET_META` can't be lost behind a larger socket buffer.
-5. **The ready pipe can't be mistaken for an exec error (#46, item 3).**
-   - With `--ready-fd 3`, the ready pipe's `dup2` can replace `Command`'s exec-error pipe, and a failed exec's error bytes would read as "ready".
-   - Check the ready byte's value, or choose the fd number after the spawn's own pipes.
-The GPUI window fixes found in the same analysis (#45) need a gpui upgrade. They belong to `update-dependencies`, not this change.
+- **A hang-up signals before it closes the terminal.** The holder sends SIGHUP to the session's process group first, then closes the PTY, then keeps the SIGKILL after the grace period. Signalling first gave a SIGHUP death in 24,000 of 24,000 tries. The session's exit is then reported the same way every time (killed by SIGHUP, no exit code), which `EXIT` and the notifications built on it rely on. On Windows the order of closing the pseudoconsole and the holder's pipe ends changes the same way, with no visible effect: the close already runs on a thread of its own.
+- **Tests that need hang-ups to end by SIGHUP say so.** `TestCore::hang_up_and_wait` and `TestClient::hung_up` stop accepting "either ending" on Linux and check for SIGHUP; a new holder test hangs up a blocked `cat` many times and expects SIGHUP each time.
+- **Unit tests don't change the process environment.**
+  - The instance socket's path can be given to `listen` and `forward` rather than read from `XDG_RUNTIME_DIR`, so `instance`'s test needs no `set_var`.
+  - Starting a core takes the scope decision from the `Endpoint` instead of the environment. `Endpoint::at` (the tests' constructor) never uses a scope, so the `remote::local` tests that start stand-in cores can't create `brindle-serve-*.scope` units, whatever ran before them.
+  - The remaining `set_var` calls in tests stay where they are, because they are in opt-in tests that run alone (`a_real_core_starts_from_a_copy_and_answers`, ignored) or under the Docker test's own lock (`BRINDLE_REMOTE_DOCKER_TEST`). Each gets a comment saying why that is safe.
 
-## Open questions
-
-- Should items 3–5 go in at all, given that no failure is known? Item 1 and item 2 are real bugs.
-- Should "programs start with default signal handling" and "a hang-up ends programs by SIGHUP" become spec requirements, or stay implementation detail?
-- Which signals to reset: SIGHUP, SIGINT, SIGQUIT, SIGPIPE, SIGTERM, SIGCHLD, SIGTSTP, SIGTTIN, SIGTTOU, or every signal, as `posix_spawn` with `POSIX_SPAWN_SETSIGDEF` would?
+The GPUI window fixes found in the same analysis (#45) need a gpui upgrade and belong to `update-dependencies`.
 
 ## Capabilities
 
@@ -47,16 +23,15 @@ The GPUI window fixes found in the same analysis (#45) need a gpui upgrade. They
 - None.
 
 ### Modified Capabilities
-- `terminal-server`: likely "Sessions" or "Close policies". Session programs start with default signal dispositions, and a hang-up ends them with SIGHUP even when Brindle or the server was started with it ignored. To be confirmed by the open question above.
-- `remote-connections`: possibly the same guarantee for the stdio helper's sessions.
+- `terminal-server`: "Programs start with default signal handling" gains the hang-up order: a program blocked reading its terminal ends by SIGHUP, not by a failed read.
 
-Items 2, 4 and 5 are test or internal robustness work with no requirement change.
+The environment fix is test-only and changes no requirement.
 
 ## Impact
 
-- `remote-agent/src/pty.rs`: the child's signal reset (holder and stdio agent).
-- `remote-agent/src/server/holder.rs`: the hang-up order, and draining before `lose_core`.
-- `remote-agent/src/server/daemon.rs`, `src/remote/local.rs` (`start_core`, `pass_fd_as`), `remote-agent/tests/support/mod.rs`: the ready-fd handling.
-- `src/instance.rs` tests, and the `remote::local` tests.
-- Tests: `remote-agent/tests/holder.rs` gains an ignored-SIGHUP case. Existing tests that accept either ending of a hung-up `cat` (`TestClient::hung_up`) could tighten if item 3 lands.
-- Issues: closes #43, and #46 item 1 when decided. #44 and #46 items 2 and 3 are closed by `terminal-server-remote`.
+- `remote-agent/src/server/holder.rs` (`Holder::hang_up`): signal, then drop the PTY.
+- `remote-agent/tests/support/mod.rs` and the `hung_up` helpers in `remote-agent/tests/{holder,core,manage,upgrade}.rs`: stricter on Linux; `holder.rs` gains a repeated blocked-`cat` test.
+- `src/instance.rs` (Unix): `listen` and `forward` resolve the socket path and call path-taking forms, which the test calls with its own path.
+- `src/remote/local.rs`, `src/remote/local/unix.rs`: `Endpoint` carries whether to use a scope; `from_env` asks `scope::current()`, `at` says no.
+- `src/remote/client.rs` tests: comments only.
+- Issues: closes #43 and #46 item 1.
