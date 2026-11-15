@@ -143,6 +143,8 @@ A remote zone with a session record SHALL be restored without waiting for its en
 ### Requirement: Launch reattaches detached terminals
 On every restoring launch, Brindle SHALL attach every detached local terminal server session it doesn't restore into a zone, each as a new tab, in the order the sessions were started. Each tab SHALL use the profile its session was started with, or the default profile when that profile is gone or isn't local. The same SHALL happen for each remote endpoint the launch connects to: the endpoints of restored remote zones and of profiles that connect at launch. When such an endpoint first connects during the launch, its detached sessions SHALL open as new tabs at the end of the strip. Each SHALL use the first of these profiles that exists: the profile it was started with, when that profile targets the endpoint; the first profile that targets the endpoint; the profile of the first tab on the endpoint; the default profile. It SHALL run on that endpoint, whatever its profile targets. Brindle SHALL stop waiting for an endpoint's first connection once the window has no tab on it, unless a profile connects to it at launch; that endpoint's sessions SHALL then not be attached this way. Local or remote, a session whose owner left without detaching it less than 5 minutes earlier SHALL NOT be attached this way, since its owner may be reconnecting; it stays in the sessions palette. The active tab SHALL stay the one the launch would otherwise make active. Replayed output SHALL raise no bells or notifications.
 
+Sessions attached this way that were detached with the layout of one tab (see "Quitting records each tab with its sessions") SHALL open together as that tab: its split tree without the zones whose sessions aren't attached this way (a split's sibling takes a missing zone's place), its recorded active zone focused, or its first zone when that one is missing, and its manual title. The tab SHALL use the profile its active zone's session gives it by the rules above. Tabs recorded by the same quit SHALL keep their recorded order, together at the place of the oldest session among them; a session without a usable layout SHALL open as a tab of its own.
+
 #### Scenario: Session left by a skipped launch
 - **WHEN** a session is detached because the last launch was `--no-restore`, and the user quits and launches `brindle`
 - **THEN** the window shows the recorded tabs, the recorded active tab still active, followed by a tab showing that session
@@ -170,6 +172,26 @@ On every restoring launch, Brindle SHALL attach every detached local terminal se
 #### Scenario: Restored tab closed before its host answers
 - **WHEN** a launch restored a tab on `A8`, `A8` can't be reached, no profile connects to `A8` at launch, and the user closes that tab
 - **THEN** Brindle stops connecting to `A8`, and `A8`'s detached sessions don't open as tabs when `A8` can be reached later in that run
+
+#### Scenario: Splits come back without the state file
+- **WHEN** Brindle quit with a tab split into two zones, and Brindle is launched with another state directory against the same terminal server
+- **THEN** the launch opens one tab with both sessions in the recorded split, the recorded active zone focused
+
+#### Scenario: Splits of a skipped launch's tabs
+- **WHEN** Brindle quit with a split tab titled `logs`, then a `--no-restore` launch quit with one other tab, which replaced the state file's record
+- **THEN** the next launch restores that other tab, followed by one tab titled `logs` with both zones in their split
+
+#### Scenario: Splits from another machine
+- **WHEN** Brindle on Windows quit with a split tab on `A8`, and Brindle on `A8` launches with profile `A8` connecting at launch
+- **THEN** the `A8` launch opens one tab with both sessions in their split
+
+#### Scenario: One session of a split ended
+- **WHEN** a split tab's sessions were detached with its layout, and one of them was ended with `brindle-remote kill` before the next launch
+- **THEN** the other session opens as a single-zone tab
+
+#### Scenario: One session of a split attached elsewhere
+- **WHEN** one session of a recorded split was attached through the sessions palette by another Brindle that still shows it
+- **THEN** the launch opens the other session as a single-zone tab
 
 ### Requirement: Local tabs restore their profile, zones and directory
 A restored local tab SHALL restore its recorded zone split tree, with each zone running the tab's recorded profile in that zone's recorded working directory, and focus the tab's recorded active zone. Each zone's recorded directory SHALL be the working directory of that zone's foreground process, the same directory a new tab or split would inherit. A recorded local tab without a split tree SHALL restore as a single zone in the tab's recorded working directory. When a recorded local tab has a manual title, that title SHALL be restored with the tab. A zone with a recorded terminal server session SHALL instead be attached to that session, or not restored, as defined by "Restored zones get their sessions back".
@@ -220,3 +242,14 @@ A state file written by a version that had tmux support MAY contain tmux entries
 #### Scenario: Only tmux entries
 - **WHEN** the state file records only `kind = "tmux"` entries
 - **THEN** after a launch the window opens with the default profile's tab, as it does with no state file
+
+### Requirement: Quitting records each tab with its sessions
+When Brindle quits and leaves a tab's sessions detached, local or remote, it SHALL give each of them its tab's layout: the tab's split tree with its sessions as leaves, the active zone, the manual title and the tab's place among the tabs. Zones without a running session SHALL be left out of it, their split's sibling taking their place. A session that ends a tab (an `-e` tab's) records nothing.
+
+#### Scenario: Split tab detached with its layout
+- **WHEN** a tab split into two zones runs two shells and the user quits Brindle
+- **THEN** `brindle-remote list` shows both sessions detached, each with a layout naming both sessions
+
+#### Scenario: Zone showing only a message
+- **WHEN** a two-zone tab's one zone shows only a failed attach's message and the user quits Brindle
+- **THEN** the other zone's session is detached with a layout of that zone alone
