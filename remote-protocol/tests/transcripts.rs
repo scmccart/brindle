@@ -601,15 +601,18 @@ fn transcripts() -> Vec<Transcript> {
             protocol: Protocol::Client,
             about: "A quitting client detaches a split tab's sessions with the tab's layout; a later client lists it, and attaching clears it.",
             steps: {
+                // Keys in sorted order, which is how they encode whether or
+                // not serde_json's `preserve_order` is on (feature
+                // unification turns it on in a workspace build).
                 let layout = json!({
-                    "v": 1,
-                    "quit": "1f2e-9a",
                     "index": 0,
+                    "quit": "1f2e-9a",
                     "title": "logs",
+                    "v": 1,
                     "zones": {
-                        "split": "horizontal",
-                        "first": {"key": KEY, "active": true},
+                        "first": {"active": true, "key": KEY},
                         "second": {"key": "3c0b7e2f5a9d4186b2e7c0f19d3a5b48"},
+                        "split": "horizontal",
                     },
                 });
                 let listed = |session: u32, key: &str, layout: Option<serde_json::Value>| client::SessionInfo {
@@ -1102,7 +1105,7 @@ fn transcripts() -> Vec<Transcript> {
                     session: 1,
                     meta: holder::SessionMeta {
                         key: KEY.into(),
-                        layout: Some(json!({"v": 1, "zones": {"key": KEY, "active": true}})),
+                        layout: Some(json!({"v": 1, "zones": {"active": true, "key": KEY}})),
                         policy: Policy::Detach,
                         profile: Some("Shell".into()),
                         scrollback: 10000,
