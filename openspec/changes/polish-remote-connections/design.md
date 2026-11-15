@@ -28,7 +28,7 @@ See proposal.md for the items and what each one observes at HEAD. The parts of t
 
 **Non-Goals:**
 - Changing the reconnect backoff, the dead-link limit, `LIST_LIMIT` or the owner grace.
-- Recording undelivered closes across launches (open question 1, alternative B).
+- Recording undelivered closes across launches (decided question 1, alternative B).
 - Specifying `core.log`'s wording.
 - `harden-terminal-server`'s items 2 and 3, and README's wording about lingering.
 
@@ -90,13 +90,13 @@ No spec change: `core.log`'s lines aren't specified, and "A server started by a 
 One rule replaces the three places listed in Context. A relay connection keeps trying, and stays in use, while any of these holds:
 - **A terminal uses it:** it shows a session, or a request waits on it (spawn, attach, list, kill). As now.
 - **It is eager:** a profile connects to it at launch. As now.
-  - A refusal no longer ends an eager connection. It reports `Offline(<refusal>)`, fails the new tabs' requests waiting on it with that message (as a failed first attempt does), and backs off up to the eager cap (open question 2).
+  - A refusal no longer ends an eager connection. It reports `Offline(<refusal>)`, fails the new tabs' requests waiting on it with that message (as a failed first attempt does), and backs off up to the eager cap (decided question 2).
   - A connection that isn't eager still ends on a refusal, so its tab shows the refusal at once.
-- **A `CLOSE` hasn't been written yet,** for at most `Timings::close_limit` (5 min) after it was queued (open question 1).
+- **A `CLOSE` hasn't been written yet,** for at most `Timings::close_limit` (5 min) after it was queued (decided question 1).
   - `State` keeps the time the oldest unwritten `CLOSE` was queued. Once that passes with no link up, the connection stops counting them, and it logs `not ending session(s) <ids> on <name>: it couldn't be reached within 5 minutes of the close`.
   - The idle rule then ends it: the relay process is killed, and the writer's queue goes with the connection.
   - If a link comes up in time, the `CLOSE`s are written as now.
-  - Only a running session gets a `CLOSE`. A tab closed while its spawn or attach is still waiting withdraws the request (`Session::leave`, `Abandon`), as now: a spawn starts nothing, and an attach leaves its session detached on the host. So closing a restored tab whose host can't be reached queues nothing, and only the listing hook below was keeping its connection (open question 5).
+  - Only a running session gets a `CLOSE`. A tab closed while its spawn or attach is still waiting withdraws the request (`Session::leave`, `Abandon`), as now: a spawn starts nothing, and an attach leaves its session detached on the host. So closing a restored tab whose host can't be reached queues nothing, and only the listing hook below was keeping its connection (decided question 5).
 - **The launch's listing hook,** until it is withdrawn.
   - When the window's last tab on an endpoint goes (a tab closed, or its last zone), and the endpoint isn't eager, `Workspace` calls a new `local::stop_listing(host)`. It drops that connection's hooks, which ends the sweep's wait for that endpoint.
   - The pure part, which endpoints just lost their last tab, is a function of the tabs' hosts before and after the close, and the eager hosts.
@@ -132,7 +132,7 @@ A model in `picker.rs` holds the palette's state:
 It has three operations: an answer arrives, a session is killed, and a view is built for the config and the time (groups, row targets, the empty message, the index to highlight). `Workspace` keeps the model in `PaletteKind::Sessions`, spawns the listings, and applies each view.
 
 - **Answers:** they apply one at a time as they arrive, instead of after `join_all`. An answer from an earlier round is dropped, as `sessions_listing` does now.
-- **Opening** (open question 3): the palette opens when every endpoint in the round has answered, or after `OPEN_GRACE` (about 250 ms), whichever comes first.
+- **Opening** (decided question 3): the palette opens when every endpoint in the round has answered, or after `OPEN_GRACE` (about 250 ms), whichever comes first.
   - An endpoint still out, this machine included, gets an inert row: `<name>  listing sessions…`.
   - The "No detached sessions" note shows only once nothing is pending, and it comes after every endpoint's row (item 9).
 - **Seams** (item 12):
@@ -149,7 +149,7 @@ It has three operations: an answer arrives, a session is killed, and a view is b
   - `first_tab_profile`, by name;
   - the default profile.
 
-`attach_swept` and `attach_detached_here` both call it. `Workspace` passes the profile name of the first tab on the endpoint, which is the only lookup that needs GPUI. `reattach::swept_tabs(listed, skip, host, config, first_tab_profile)` joins `sweep` with this choice, so `attach_swept` only inserts tabs. This is open question 4; the recommendation keeps today's behaviour, now specified.
+`attach_swept` and `attach_detached_here` both call it. `Workspace` passes the profile name of the first tab on the endpoint, which is the only lookup that needs GPUI. `reattach::swept_tabs(listed, skip, host, config, first_tab_profile)` joins `sweep` with this choice, so `attach_swept` only inserts tabs. This is decided question 4, which keeps today's behaviour, now specified.
 
 ### 8. The label column fits its widest label
 
@@ -193,9 +193,9 @@ Item 12's functions, each with `#[test]`s in its own module:
 
 None. Nothing in the protocol, the config or the state file changes. The `--- palette list` dump line gains a field, and the e2e harness's parser is updated in the same change.
 
-## Open Questions
+## Decided Questions
 
-The specs and tasks are written to each recommendation. Each question names the text that changes if another answer is chosen. These need the user's decision before implementation starts.
+The user chose the recommendation for all five on 2026-11-15: 1A, 2A, 3B, 4A and 5A. The specs and tasks are written to these answers. Each question still names the text that would change under another answer, so a later move (to 1B and 5B together, say) knows what to touch.
 
 1. **What becomes of a `CLOSE` that can't be delivered?** (item 4)
    - **A.** It keeps the connection trying for 5 minutes after the close, then is dropped with a log line naming the sessions.

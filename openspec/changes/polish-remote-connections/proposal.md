@@ -32,15 +32,15 @@ Each item says what happens at HEAD (after `terminal-server-remote`) and what ch
 
 4. **A closed terminal's `CLOSE` keeps its connection trying for a bounded time.**
    - **Now:** a `CLOSE` queued while the link is down keeps the connection in use (`State::in_use` counts `closing`). After its first link, a relay connection retries without limit. So when the last tab on a host that is gone for good is closed, Brindle runs `ssh` every 30 s for the rest of its life, and the host's offline row never goes away. This is archived decision 9, pinned by `a_close_queued_while_disconnected_keeps_the_relay_until_it_is_written`.
-   - **Change:** an unwritten `CLOSE` keeps the connection trying for at most 5 minutes after the close (open question 1). Then the connection ends, and a log line names the sessions left running on the host.
+   - **Change:** an unwritten `CLOSE` keeps the connection trying for at most 5 minutes after the close (decided question 1). Then the connection ends, and a log line names the sessions left running on the host.
 5. **An endpoint stops being tried once its restored zones are closed.**
    - **Now:** a restoring launch waits for the first listing of each restored zone's endpoint, so it can sweep its detached sessions (`local::when_listed`). That listing hook keeps the connection trying, because `on_listing` counts in `State::in_use` and in `failed_to_connect`'s decision to keep going.
      - So an endpoint that was offline at launch is retried until it first answers, even after every zone on it has closed and their attaches were withdrawn.
      - HEAD's "One connection per host" already says the connection should end then.
-   - **Change:** when the window's last tab on such an endpoint closes, and no profile connects to the endpoint at launch, the launch's wait for its listing is withdrawn. The connection then ends like any unused one, and that endpoint's sessions aren't swept in this launch. The closed tab's own session stays detached on the host, as today (open question 5).
+   - **Change:** when the window's last tab on such an endpoint closes, and no profile connects to the endpoint at launch, the launch's wait for its listing is withdrawn. The connection then ends like any unused one, and that endpoint's sessions aren't swept in this launch. The closed tab's own session stays detached on the host, as today (decided question 5).
 6. **An eager endpoint whose server refused Brindle is retried.**
    - **Now:** `run_relay` ends the connection on `Refused` (the endpoint's core answered `HELLO` with an error), even for an eager endpoint. `keep_connected` dials only endpoints that are new to the config. So the endpoint stays offline until a tab is opened on it, a reload drops it and adds it back, or Brindle restarts. "Connecting at launch" already says an eager endpoint is retried.
-   - **Change:** an eager connection counts a refusal as a failed attempt and retries with the usual pauses, at most 60 s apart (open question 2). A tab's own connection still ends on a refusal, which its tab shows.
+   - **Change:** an eager connection counts a refusal as a failed attempt and retries with the usual pauses, at most 60 s apart (decided question 2). A tab's own connection still ends on a refusal, which its tab shows.
 
 ### The sessions palette
 
@@ -49,7 +49,7 @@ Each item says what happens at HEAD (after `terminal-server-remote`) and what ch
    - **Change:** the highlighted session stays highlighted for as long as it is listed. When a session is killed, its highlight passes to the row that takes its place. `brindle-ui`'s command list gets a way for its owner to replace the items and name the one to keep highlighted.
 8. **The palette opens without waiting for slow endpoints.**
    - **Now:** `refresh_sessions_palette` waits for every endpoint's listing (`join_all`) before it shows anything. A connected endpoint whose link has gone quiet takes `LIST_LIMIT` (2 s). While this machine's core restarts, its listing can take up to the local request limit.
-   - **Change:** the palette opens once every endpoint has answered or a short grace has passed, whichever comes first (open question 3).
+   - **Change:** the palette opens once every endpoint has answered or a short grace has passed, whichever comes first (decided question 3).
      - An endpoint that hasn't answered yet gets a row saying its sessions are being listed. Its sessions replace that row when it answers, and the highlight stays where it was (item 7).
      - The palette doesn't say "No detached sessions" until every endpoint has answered.
 9. **"No detached sessions" comes after the endpoints' rows.**
@@ -60,7 +60,7 @@ Each item says what happens at HEAD (after `terminal-server-remote`) and what ch
 
 10. **The profile for a session on an endpoint no profile targets is specified.**
     - **Now:** this happens when a restored zone's profile now targets another host. Both the launch sweep (`Workspace::attach_swept`) and the palette's attach (`attach_detached_here`) then open the session on that endpoint, with the profile of the first tab already on it (`profile_on`), else the default profile. The specs ("Launch reattaches detached terminals" and "Sessions palette actions") say only "else the first profile that does", and here none does.
-    - **Change:** both specs adopt the current rule, for both paths (open question 4).
+    - **Change:** both specs adopt the current rule, for both paths (decided question 4).
 
 ### Settings
 
