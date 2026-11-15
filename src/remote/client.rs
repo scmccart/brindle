@@ -1232,6 +1232,12 @@ mod tests {
                 "{} not found; build it with the docker command in README.md",
                 helper.display()
             );
+            // SAFETY: only with `BRINDLE_REMOTE_DOCKER_TEST=1`, a run filtered
+            // to `remote::client`, and under `DOCKER_TEST_LOCK`, which every
+            // Docker test here holds while it uses `BRINDLE_REMOTE_AGENT`.
+            // Another test in the same process that reads it
+            // (`find_server_helper`) would see the helper, so the opt-in run
+            // stays filtered.
             unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
             Some((turn, helper))
         }
@@ -1510,6 +1516,7 @@ mod tests {
         fn scenario_bad_helper(c: &Container, dir: &Path) -> Scenario {
             let bad = dir.join("not-a-helper");
             std::fs::write(&bad, b"this is not an executable\n").map_err(|e| e.to_string())?;
+            // SAFETY: as in `opted_in`, whose turn this scenario runs in.
             unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &bad) };
             match connect(&container_target(c, None)) {
                 Ok(host) => Err(format!("connected: {host:?}")),
@@ -1774,6 +1781,7 @@ mod tests {
             failures.record("g bad helper", scenario_bad_helper(&ubuntu, &scratch));
             // Deploying another build removed the first one's directory.
             failures.record("g the other build is all that is kept", scenario_one_helper_kept(&ubuntu));
+            // SAFETY: as in `opted_in`, whose turn this test holds.
             unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
             match Container::start("alpine", "alpine") {
                 Ok(alpine) => {

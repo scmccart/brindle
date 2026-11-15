@@ -44,7 +44,10 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
     // SAFETY: freshly created and not owned elsewhere.
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let write_fd = write.as_raw_fd();
-    let decision = scope::current();
+    let decision = match endpoint.scope {
+        true => scope::current(),
+        false => scope::Decision::Plain("the endpoint uses no scope"),
+    };
     if let scope::Decision::Plain(reason) = &decision {
         log::info!("starting the terminal server without a scope of its own: {reason}");
     }

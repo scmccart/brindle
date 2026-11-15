@@ -174,19 +174,6 @@ fn holder_exits(dir: &TempDir, pid: u32) -> bool {
     eventually(TIMEOUT, || !alive(pid) && dir.holder_endpoints().is_empty())
 }
 
-/// Waits for the `EXITED` of a session that was hung up. On Linux its
-/// status isn't the server's to decide: the signal nearly always ends the
-/// program (no exit code), but one blocked reading the terminal now and then
-/// gets through "the read failed, exit 1" first. On Windows it has the code
-/// the console's end or the holder ended it with.
-fn hung_up(core: &mut TestCore, session: u32) {
-    let code = core.exit_code(session);
-    #[cfg(windows)]
-    assert!(code.is_some());
-    #[cfg(unix)]
-    let _ = code;
-}
-
 #[cfg(unix)]
 /// Runs `printf R >&3` with a new pipe's write end passed as fd 3, and checks
 /// that the byte arrives. The pipe is first put on fd 3 itself (`on_target`),
@@ -630,8 +617,8 @@ fn programs_start_with_default_signals_under_a_holder_that_ignores_sighup() {
     );
 
     // `cat` waits to open a FIFO that nobody writes to, so only a signal
-    // ends it. Reading the terminal instead, it would now and then get to
-    // exit by itself when the hang-up closes that (see `hung_up`).
+    // ends it, not the terminal's closing (see
+    // `a_program_reading_its_terminal_is_hung_up_by_sighup`).
     let fifo = dir.path.join("never-written");
     programs::make_fifo(&fifo);
     let pid = core.spawn(spawn(1, "cat", &[fifo.to_str().unwrap()]));
@@ -651,6 +638,42 @@ fn programs_start_with_default_signals_under_a_holder_that_ignores_sighup() {
     let ended_by = format!("session 1: killed by signal Some({})", libc::SIGHUP);
     let logs = dir.logs();
     assert!(logs.contains(&ended_by), "{logs}");
+}
+
+/// A hang-up signals before it closes the terminal, so a program blocked
+/// reading it dies of `SIGHUP` every time. Closing first, the failed read
+/// (EIO) now and then reached `cat` before the signal, and it exited 1:
+/// about once in 4,000 hang-ups under a loaded test run, and never in 8,000
+/// on an idle machine, so these rounds check the outcome rather than catch
+/// the old order.
+#[cfg(unix)]
+#[test]
+fn a_program_reading_its_terminal_is_hung_up_by_sighup() {
+    const ROUNDS: u32 = 200;
+    let (dir, mut core, _) = holder("sighup-first");
+    // Whether `pid` is `cat`, asleep: blocked reading its terminal.
+    let blocked = |pid: u32| {
+        program_of(pid).as_deref() == Some("cat")
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.starts_with('S')))
+                .unwrap_or(false)
+    };
+    for session in 1..=ROUNDS {
+        let pid = core.spawn(spawn(session, "cat", &[]));
+        assert!(eventually(TIMEOUT, || blocked(pid)), "round {session}: never blocked");
+        let hung_up_at = std::time::Instant::now();
+        core.hang_up(session);
+        assert_eq!(core.exit_code(session), None, "round {session}: not ended by a signal");
+        assert!(
+            hung_up_at.elapsed() < Duration::from_millis(500),
+            "round {session}: took {:?}",
+            hung_up_at.elapsed()
+        );
+    }
+    let sighup = format!(": killed by signal Some({})", libc::SIGHUP);
+    let logs = dir.logs();
+    assert_eq!(logs.matches(&sighup).count(), ROUNDS as usize, "{logs}");
 }
 
 /// `SPAWN`'s meta, decoded from JSON as a core would send it.
@@ -1027,7 +1050,7 @@ fn a_tail_past_its_limit_is_truncated() {
     // At most what the waiting program's console still had to say.
     assert!(adopted.tails[&1].len() < 4096);
     core.hang_up(1);
-    hung_up(&mut core, 1);
+    core.hung_up(1);
 }
 
 #[cfg(unix)]
@@ -1321,7 +1344,7 @@ mod on_windows {
         assert!(eventually(TIMEOUT, || !alive(pid) && !alive(ping[0])));
 
         core.hang_up(2);
-        hung_up(&mut core, 2);
+        core.hung_up(2);
         assert!(!alive(plain));
     }
 
@@ -1346,7 +1369,7 @@ mod on_windows {
             assert_ne!(code, Some(TERMINATED), "session {session}: the close never reached it");
         }
         core.hang_up(1);
-        hung_up(&mut core, 1);
+        core.hung_up(1);
         assert!(!alive(plain));
     }
 
@@ -1400,7 +1423,7 @@ mod on_windows {
         );
         assert!(!adopted.welcome().sessions[0].truncated);
         core.hang_up(1);
-        hung_up(&mut core, 1);
+        core.hung_up(1);
     }
 
     /// About 2.9 MB of output: more than a tail and the pipes hold.
@@ -1438,7 +1461,7 @@ mod on_windows {
         // No gap, and in order.
         programs::check_lines(&stream, LINES);
         core.hang_up(1);
-        hung_up(&mut core, 1);
+        core.hung_up(1);
         assert!(holder_exits(&dir, holder_pid));
     }
 
@@ -1460,7 +1483,7 @@ mod on_windows {
         let output = core.output_until(1, b"DONE\r\n");
         programs::check_lines(&output, LINES);
         core.hang_up(1);
-        hung_up(&mut core, 1);
+        core.hung_up(1);
     }
 
     #[test]
@@ -1494,6 +1517,6 @@ mod on_windows {
         }
         // It has no answer: the next message is the hang-up's.
         core.hang_up(1);
-        hung_up(&mut core, 1);
+        core.hung_up(1);
     }
 }

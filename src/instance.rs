@@ -130,7 +130,11 @@ mod imp {
     }
 
     pub fn listen(state_dir: &Path, handler: Handler) -> io::Result<PathBuf> {
-        let path = socket_path(state_dir);
+        listen_at(socket_path(state_dir), handler)
+    }
+
+    /// [`listen`] on the socket at `path`.
+    pub(super) fn listen_at(path: PathBuf, handler: Handler) -> io::Result<PathBuf> {
         if let Some(dir) = path.parent() {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         }
@@ -209,7 +213,11 @@ mod imp {
     }
 
     pub fn forward(state_dir: &Path, request: &Request) -> Result<(), String> {
-        let path = socket_path(state_dir);
+        forward_to(&socket_path(state_dir), request)
+    }
+
+    /// [`forward`] to the socket at `path`.
+    pub(super) fn forward_to(path: &Path, request: &Request) -> Result<(), String> {
         let deadline = Instant::now() + FORWARD_LIMIT;
         let stream = loop {
             match UnixStream::connect(&path) {
@@ -393,14 +401,13 @@ mod tests {
     #[test]
     fn a_forwarded_request_reaches_the_handler() {
         let dir = std::env::temp_dir().join(format!("brindle-instance-test-{}", std::process::id()));
-        // A private runtime directory for the socket.
-        let runtime = dir.join("run");
-        std::fs::create_dir_all(&runtime).unwrap();
-        // SAFETY: the only test that reads XDG_RUNTIME_DIR.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime) };
+        // A private socket, given by path: setting XDG_RUNTIME_DIR would
+        // change it for every test in this process, and the terminal
+        // server's scope decision reads it.
+        let socket = dir.join("run").join("instance.sock");
         let (tx, rx) = std::sync::mpsc::channel();
-        listen(
-            &dir,
+        imp::listen_at(
+            socket.clone(),
             Box::new(move |request: Request| {
                 let refuse = request.attach == Some(0);
                 tx.send(request).unwrap();
@@ -409,9 +416,9 @@ mod tests {
         )
         .unwrap();
         let request = Request { profile: Some("p".into()), ..Default::default() };
-        assert_eq!(forward(&dir, &request), Ok(()));
+        assert_eq!(imp::forward_to(&socket, &request), Ok(()));
         assert_eq!(rx.recv().unwrap(), request);
-        assert_eq!(forward(&dir, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
+        assert_eq!(imp::forward_to(&socket, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
