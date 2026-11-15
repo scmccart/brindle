@@ -56,6 +56,7 @@ fn unix() -> Vec<Case> {
         display("remote-ssh-split", remote::ssh_split),
         display("remote-ssh-network", remote::ssh_network),
         display("remote-ssh-connect-at-launch", remote::ssh_connect_at_launch),
+        display("remote-ssh-restored-closed", remote::ssh_restored_closed),
         display("remote-offline", remote::offline),
         display("colors-local", colors::local),
         display("colors-split-zone", colors::split_zone),

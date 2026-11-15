@@ -234,9 +234,9 @@ fn eager_change(old: &[Host], new: &[Host]) -> (Vec<Host>, Vec<Host>) {
 
 /// Hands `hook` the sessions `host`'s core lists once the process's
 /// connection to it is up: at once if it is, else on its first link
-/// (design.md decision 10). Until then the connection keeps trying. For a
-/// remote host: a local one would block here while connecting. Not on the
-/// UI thread.
+/// (design.md decision 10). Until then the connection keeps trying, unless
+/// the hook is withdrawn ([`stop_listing`]). For a remote host: a local one
+/// would block here while connecting. Not on the UI thread.
 pub fn when_listed(host: &Host, hook: ListingHook) {
     let mut hook = hook;
     // A connection that ended just now is replaced by the next `shared`.
@@ -254,6 +254,23 @@ pub fn when_listed(host: &Host, hook: ListingHook) {
         }
     }
     log::warn!("not listing {}'s sessions: its connection keeps ending", host.name());
+}
+
+/// Stops waiting for `host`'s first listing ([`when_listed`]): the hooks of
+/// the process's connection to it are dropped without a listing, so they no
+/// longer keep it trying (design.md decision 4). For the endpoint of a
+/// window's last tab that went, when no profile connects to it at launch:
+/// the launch then doesn't open its detached sessions as tabs. It never
+/// connects, and does nothing for this machine.
+pub fn stop_listing(host: &Host) {
+    if host.is_local() {
+        return;
+    }
+    if let Some(connection) = existing(host)
+        && connection.stop_listing()
+    {
+        log::info!("not waiting for {}'s sessions any more: no tab is on it", host.name());
+    }
 }
 
 /// The `client_token` of this process's connection to `host`. Each remote
@@ -582,7 +599,9 @@ pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
 }
 
 /// The core answered `HELLO` with an `ERROR`: it shares no protocol
-/// version with this Brindle. Retrying won't help.
+/// version with this Brindle. Retrying helps only once that core has exited
+/// (a relay then starts this build's), so only an eager relay connection
+/// retries it.
 #[derive(Debug)]
 pub struct Refused(String);
 

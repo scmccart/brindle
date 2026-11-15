@@ -91,6 +91,21 @@ pub fn launch_hosts(restored: &[Host], config: &Config) -> Vec<Host> {
     hosts
 }
 
+/// The remote endpoints that a window's tabs were on (`before`) and no
+/// longer are (`after`), except the eager ones (`eager`, [`eager_hosts`]),
+/// each once in `before`'s order. Once the last tab on such an endpoint
+/// goes, the launch stops waiting for its first listing (design.md decision
+/// 4), so the launch doesn't sweep it. This machine is never one.
+pub fn endpoints_without_tabs(before: &[Host], after: &[Host], eager: &[Host]) -> Vec<Host> {
+    let mut left: Vec<Host> = Vec::new();
+    for host in before {
+        if !host.is_local() && !after.contains(host) && !eager.contains(host) && !left.contains(host) {
+            left.push(host.clone());
+        }
+    }
+    left
+}
+
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
 /// launches, for a Brindle that doesn't own the session state, and where
 /// no terminal server runs (macOS).
@@ -328,6 +343,37 @@ mod tests {
         let (devbox, a8, b9) = (Host::of(&config.profiles[1]), Host::of(&config.profiles[2]), Host::of(&config.profiles[4]));
         assert_eq!(eager_hosts(&config), [devbox.clone(), a8.clone()]);
         assert_eq!(launch_hosts(&[b9.clone(), a8.clone()], &config), [b9, a8, devbox]);
+    }
+
+    /// 3.2: the endpoints a close leaves with no tab are those the window
+    /// had a tab on before and has none on after; an endpoint with another
+    /// tab left, an eager endpoint and this machine are never named.
+    #[test]
+    fn only_endpoints_left_with_no_tab_that_arent_eager_are_named() {
+        let config = profiles();
+        let (a8, b9) = (Host::of(&config.profiles[2]), Host::of(&config.profiles[3]));
+        let c3 = Host::Remote(crate::config::RemoteTarget::Ssh {
+            host: "C3".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        let local = Host::Local;
+        // The last tab on A8 went; B9 has another tab left.
+        let before = [local.clone(), a8.clone(), b9.clone(), b9.clone()];
+        assert_eq!(endpoints_without_tabs(&before, &[local.clone(), b9.clone()], &[]), [a8.clone()]);
+        // Two tabs on A8 before: the first close leaves one.
+        assert!(endpoints_without_tabs(&[a8.clone(), a8.clone()], &[a8.clone()], &[]).is_empty());
+        assert_eq!(endpoints_without_tabs(&[a8.clone(), a8.clone()], &[], &[]), [a8.clone()]);
+        // An eager endpoint keeps its listing.
+        assert!(endpoints_without_tabs(&[local.clone(), a8.clone()], &[local.clone()], std::slice::from_ref(&a8)).is_empty());
+        // This machine is never one, even with no tab left.
+        assert!(endpoints_without_tabs(std::slice::from_ref(&local), &[], &[]).is_empty());
+        // Several at once, in the window's order.
+        let gone = endpoints_without_tabs(&[c3.clone(), local.clone(), a8.clone(), b9.clone()], &[local], &[b9]);
+        assert_eq!(gone, [c3, a8]);
     }
 
     #[test]

@@ -19,6 +19,9 @@
 //!   is back it has the same session again, with what was typed meanwhile;
 //! - `remote-ssh-connect-at-launch`: a profile that connects at launch
 //!   attaches a session an earlier run left detached on its host;
+//! - `remote-ssh-restored-closed`: a restored SSH tab whose host now
+//!   refuses, closed while it connects, takes the launch's wait for that
+//!   host with it, so Brindle stops dialling it;
 //! - `remote-offline`: with its container stopped, and an SSH host that
 //!   refuses, "Attach Session…" lists each eager profile's endpoint offline.
 //!
@@ -31,7 +34,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -670,6 +673,176 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
         second.dump.screen
     );
     Ok(Outcome::Pass)
+}
+
+/// A restored SSH tab closed while its host refuses: a first run leaves a
+/// local tab and an SSH tab detached, and the SSH fixture is then stopped,
+/// so its port refuses. The restoring run shows the SSH zone connecting and
+/// closes its tab, the window's last on that host, which isn't one a profile
+/// connects to at launch: that withdraws the launch's wait for the host's
+/// sessions, so its connection ends, and Brindle dials it no
+/// more (no `ssh`, no failed attempt), and "Attach Session…" no longer
+/// lists it.
+pub fn ssh_restored_closed(ctx: &Ctx) -> Result<Outcome> {
+    const CHECKED: &str = "CLOSED-CHECKED";
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-restored-closed", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        // The local tab's session is the next run's too.
+        .keep_detached()
+        .action("new_tab_with_profile_2")
+        .wait_for(SSH_PROMPT)
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let tabs = &first.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
+    let docker = ssh.container.docker.clone();
+    poll(ctx.secs(1.0), 10.0, "the SSH tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    poll(ctx.secs(1.0), 10.0, "the local tab's session detached", || {
+        let local = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(matches!(local.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    ssh.container.stop()?;
+    let (host, port) = (ssh.host.clone(), ssh.port);
+    poll(ctx.secs(1.0), 10.0, "the stopped fixture's port refusing", || {
+        Ok(TcpStream::connect((host.as_str(), port)).is_err().then_some(()))
+    })?;
+
+    let endpoint = format!("root@{}:{}", ssh.host, ssh.port);
+    let checks = ctx.dir.join("checks.txt");
+    let closed = ClosedTab {
+        endpoint: endpoint.clone(),
+        log: ctx.dir.join("second.log"),
+        save: checks.clone(),
+        helper: ctx.helper.clone(),
+        server_dir: ctx.server_dir.clone(),
+        checked: CHECKED,
+        slow: ctx.secs(1.0),
+    };
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        // The checks take up to 25 s after the close, which the marker's
+        // wait (30 step intervals) must cover.
+        .step_interval(1.5)
+        // The restored SSH tab is the active one, as it was at the quit.
+        .wait_for(&format!("connecting to {endpoint}"))
+        .action("close_tab")
+        .wait_for(CHECKED)
+        .action("attach_session")
+        .call_at(1.0, move |brindle| closed.run(brindle))
+        .dump_at(40.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    ensure!(
+        second.dump.tabs.len() == 1,
+        "tabs: {:?}",
+        second.dump.tabs
+    );
+    ensure!(
+        fs::read_to_string(&checks).is_ok(),
+        "the closed tab's connection wasn't checked"
+    );
+    let palette = &second.dump.palette;
+    ensure!(!palette.is_empty(), "\"Attach Session…\" didn't open");
+    ensure!(
+        !palette.iter().any(|row| row.contains(&endpoint)),
+        "\"Attach Session…\" still lists {endpoint}: {palette:?}"
+    );
+    Ok(Outcome::Pass)
+}
+
+/// `remote-ssh-restored-closed`'s timeline: once the restored SSH tab has
+/// closed, withdrawing the launch's wait for its endpoint's sessions (the
+/// log says so), the endpoint's connection ends within 15 s, unused or at
+/// its next failed attempt, and its `ssh` is gone, and in the 10 s after
+/// that Brindle starts no `ssh` and fails no attempt. Then it marks the
+/// local tab with `checked`.
+struct ClosedTab {
+    /// The endpoint, as Brindle's log names it (`root@HOST:PORT`).
+    endpoint: String,
+    /// Brindle's log.
+    log: PathBuf,
+    /// Where the timings go, for the report.
+    save: PathBuf,
+    /// The case's terminal server, which the local tab runs in.
+    helper: PathBuf,
+    server_dir: PathBuf,
+    checked: &'static str,
+    slow: f64,
+}
+
+impl ClosedTab {
+    fn run(&self, brindle: u32) -> Result {
+        let slow = self.slow;
+        let withdrawn = format!("not waiting for {}'s sessions any more", self.endpoint);
+        poll(slow, 30.0, "the SSH tab closed, withdrawing the launch's wait", || {
+            Ok((logged(&self.log, &withdrawn) > 0).then_some(()))
+        })?;
+        let closed = Instant::now();
+        // It was dialling the stopped endpoint until then.
+        let failed = format!("can't connect to {}", self.endpoint);
+        ensure!(
+            logged(&self.log, &failed) > 0,
+            "no failed attempt on {} before the close",
+            self.endpoint
+        );
+        // With nothing waiting on it, the connection ends at its next
+        // failed attempt, which logs only the failure, or `Timings::idle`
+        // (5 s) later, unused, whichever comes first.
+        let at_close = logged(&self.log, &failed);
+        let unused = format!("closing the unused connection to {}", self.endpoint);
+        poll(slow, 15.0, "the connection ended and its ssh gone", || {
+            let ended = logged(&self.log, &unused) > 0 || logged(&self.log, &failed) > at_close;
+            Ok((ended && ssh_processes(brindle).is_empty()).then_some(()))
+        })?;
+        let ended = closed.elapsed();
+        let attempts = logged(&self.log, &failed);
+        // A refused `ssh` lives for milliseconds, which sampling can miss,
+        // but each attempt logs its failure.
+        let watch = Instant::now();
+        let mut started: Vec<u32> = Vec::new();
+        while watch.elapsed() < Duration::from_secs_f64(10.0 * slow) {
+            for pid in ssh_processes(brindle) {
+                if !started.contains(&pid) {
+                    started.push(pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let later = logged(&self.log, &failed) - attempts;
+        let text = format!(
+            "connection ended {:.1}s after the close\nfailed attempts {attempts} before, {later} after\n\
+             ssh after {started:?}\n",
+            ended.as_secs_f64()
+        );
+        fs::write(&self.save, text).map_err(|e| e.to_string())?;
+        ensure!(
+            started.is_empty(),
+            "Brindle started ssh {started:?} after the connection ended"
+        );
+        ensure!(
+            later == 0,
+            "Brindle dialled {} {later} more times after the connection ended",
+            self.endpoint
+        );
+        let local = poll(slow, 10.0, "the restored local tab", || {
+            Ok(local_sessions(&self.helper, &self.server_dir)?
+                .into_iter()
+                .find(|s| s.attached))
+        })?;
+        mark_tty(local.pid, self.checked)
+    }
 }
 
 /// Profiles that connect at launch to endpoints that can't be reached: a

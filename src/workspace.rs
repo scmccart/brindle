@@ -1003,13 +1003,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Removes tab `ix`, ending its terminals' programs.
+    /// Removes tab `ix`, ending its terminals' programs. When it was the
+    /// last tab on a remote endpoint that no profile connects to at launch,
+    /// the launch stops waiting for that endpoint's first listing
+    /// ([`crate::remote::local::stop_listing`]), so it doesn't sweep it.
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
+        #[cfg(any(target_os = "linux", windows))]
+        let before: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
         let tab = self.tabs.remove(ix);
         tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            let after: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
+            let eager = crate::reattach::eager_hosts(Self::settings(cx));
+            for host in crate::reattach::endpoints_without_tabs(&before, &after, &eager) {
+                crate::remote::local::stop_listing(&host);
+            }
+        }
         if self.tabs.is_empty() {
             // Nothing to restore for a window whose tabs all closed.
             let id = self.window_id;

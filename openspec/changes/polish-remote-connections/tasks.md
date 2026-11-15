@@ -46,7 +46,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
 
 ## 3. What keeps a relay connection trying (items 4, 5 and 6)
 
-- [ ] 3.1 Bound an unwritten `CLOSE` (design decision 4; decided question 1):
+- [x] 3.1 Bound an unwritten `CLOSE` (design decision 4; decided question 1):
   - add `Timings::close_limit` (5 min; tests shorten it);
   - keep the time the oldest unwritten `CLOSE` was queued;
   - stop counting the closes in `State::in_use` once the limit passes with no link up;
@@ -57,7 +57,7 @@ The tasks follow the answers to design.md's decided questions (each the recommen
   - a new test: with the endpoint down past a short limit, the connection ends, its dialling stops, and the reason names the sessions.
 
   No e2e case: 5 minutes is too long for one, and nothing new shows in the GUI. `remote-ssh-split` keeps checking that closing a tab ends its programs and then its `ssh`.
-- [ ] 3.2 Withdraw the launch's listing hook:
+- [x] 3.2 Withdraw the launch's listing hook:
   - add `local::stop_listing(host)`, which drops a connection's listing hooks;
   - have `Workspace` call it when the window's last tab on an endpoint that isn't eager goes, a tab closed or its last zone;
   - add a pure `reattach` function for the endpoints that lost their last tab: the tabs' hosts before and after, and the eager hosts.
@@ -71,13 +71,15 @@ The tasks follow the answers to design.md's decided questions (each the recommen
     - the SSH fixture is then stopped, so its port refuses;
     - a restoring second run shows the SSH zone connecting, then closes that tab;
     - within 15 s Brindle has no `ssh` child, and it starts none in the 10 s after that (`ssh_processes`).
-- [ ] 3.3 Retry a refused eager connection (decided question 2): `run_relay` ends on `Refused` only when the connection isn't eager. An eager one reports `Offline` with the refusal, fails the new tabs' waiting requests with it, and backs off up to the eager cap.
+
+  Done: the unit tests pass, and `remote-ssh-restored-closed` is written and builds. It needs Docker and Linux (`/proc`), so it is in the Linux list only (Windows' `-- --list` doesn't show it), and its run happens in 8.2.
+- [x] 3.3 Retry a refused eager connection (decided question 2): `run_relay` ends on `Refused` only when the connection isn't eager. An eager one reports `Offline` with the refusal, fails the new tabs' waiting requests with it, and backs off up to the eager cap.
 
   Verify with a `connection.rs` test whose fake core answers `HELLO` with an error and then with `WELCOME`: the eager connection reports `Offline(<refusal>)`, fails a spawn with it, and is `Connected` after the next attempt. `an_eager_relay_is_offline_until_its_first_link_and_a_lazy_one_ends` keeps checking that a connection that isn't eager ends.
 
   No e2e case: the fixtures can't make a server refuse this build without a second, incompatible helper build.
-- [ ] 3.4 Add `Hosts::apply_all(batch) -> bool` and use it in `main.rs`'s `watch_hosts`. Verify with a `src/remote/hosts.rs` test: a batch applies in order, and returns true when any report changed what the palette shows.
-- [ ] 3.5 Describe the close limit, the withdrawn listing hook and eager refusals in `connection.rs`'s module doc ("A relay's first connect", "A relay's lifetime") and in CLAUDE.md's "Brindle's client" and "Reattach" bullets. Verify that `grep -n "close_limit" CLAUDE.md src/remote/local/connection.rs` finds the module doc, `State::in_use`'s comment (today's "until it is written") and the CLAUDE.md bullet.
+- [x] 3.4 Add `Hosts::apply_all(batch) -> bool` and use it in `main.rs`'s `watch_hosts`. Verify with a `src/remote/hosts.rs` test: a batch applies in order, and returns true when any report changed what the palette shows.
+- [x] 3.5 Describe the close limit, the withdrawn listing hook and eager refusals in `connection.rs`'s module doc ("A relay's first connect", "A relay's lifetime") and in CLAUDE.md's "Brindle's client" and "Reattach" bullets. Verify that `grep -n "close_limit" CLAUDE.md src/remote/local/connection.rs` finds the module doc, `State::in_use`'s comment (today's "until it is written") and the CLAUDE.md bullet.
 
 ## 4. The command list keeps a named highlight (item 7, `brindle-ui`)
 

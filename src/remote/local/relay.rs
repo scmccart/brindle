@@ -12,8 +12,8 @@
 //!   `wait()`, and ending the link kills it by its pid only until that
 //!   `wait()` has returned.
 //! - **[`Timings`]:** heartbeats, the dead-link limit, the bootstrap limit,
-//!   the reconnect backoff and how long an unused connection is kept, which
-//!   tests shorten.
+//!   the reconnect backoff, how long an unused connection is kept and how
+//!   long an unwritten `CLOSE` keeps it trying, which tests shorten.
 //! - **The program's environment** ([`relay_env`], [`SpawnRequest::remote`]):
 //!   a remote `SPAWN` carries the relay's environment (`RELAY_HOST`, a fresh
 //!   login's) with the profile's ([`child_env`]) over it.
@@ -70,6 +70,10 @@ pub struct Timings {
     /// How long a connection that isn't eager is kept once nothing uses it,
     /// so closing a tab and opening another reuses it.
     pub idle: Duration,
+    /// How long, with no link up, a `CLOSE` not written yet keeps the
+    /// connection in use after it was queued; then it is given up, and its
+    /// program is left running (design decision 4).
+    pub close_limit: Duration,
 }
 
 impl Default for Timings {
@@ -82,6 +86,7 @@ impl Default for Timings {
             retry_cap: Duration::from_secs(30),
             eager_cap: Duration::from_secs(60),
             idle: Duration::from_secs(5),
+            close_limit: Duration::from_secs(5 * 60),
         }
     }
 }
