@@ -18,6 +18,43 @@ schema: spec-driven
 #       - Always state what is out of scope
 #     tasks:
 #       - Break tasks into chunks of max 2 hours
+rules:
+  design:
+    - >-
+      Map the change onto the layers in docs/architecture/README.md: what is
+      pure code (a function or a GPUI-free model), what is shell (an entity, a
+      thread, a loop handler), what is a platform seam, and which crate each
+      part goes in. Reject a design that puts a decision in a view, a thread
+      or a seam module, or that makes a crate reference point the wrong way.
+    - >-
+      Name the outcome and state types as closed enums, and say which invalid
+      states the types rule out. Say how each expected failure is shown on the
+      tab, session or endpoint it belongs to.
+    - >-
+      For a change to a wire message, a config key or a state file, say which
+      versions meet, why the change is additive or which new protocol version
+      carries it, and which transcript tests pin it (process R4-R6, R15).
+    - >-
+      For a change inside the terminal server, say what a core restart, a
+      Brindle crash and an upgrade each do to the new state (process R1-R3,
+      R12).
+    - >-
+      Cite the docs/architecture rules the design relies on or needs an
+      exception to, by short name and number. An exception is written into
+      its rule's doc with what ends it, never left as a silent gap.
+  tasks:
+    - >-
+      Order the work pure code first (with its unit tests), then the shared
+      crates, then the shell (server roles, client, entities), then UI and
+      end-to-end cases.
+    - >-
+      Put shared contracts (protocol messages and their transcripts, types
+      both sides use, platform seam items for every platform) in the first
+      group.
+    - >-
+      Give each behaviour its test in the layer docs/architecture/testing-architecture.md
+      names: a unit test, a transcript, a real-process test or a named e2e
+      case. List what only real keys or a pointer can show as a manual check.
 
 # Per-operation guidance (optional)
 # Add advisory guidance for how apply and archive work should be conducted.
@@ -30,3 +67,12 @@ schema: spec-driven
 #     archive:
 #       guidance:
 #         - Summarize the archive outcome before finishing
+operations:
+  apply:
+    guidance:
+      - >-
+        Follow the docs/architecture rules for the layer each task touches
+        (.claude/rules/ names them per path). If a task needs a forbidden
+        crate reference, a cfg outside its seam, or a change that fails
+        tests/architecture.rs, stop and raise a design issue instead of adding
+        it or loosening the test.
