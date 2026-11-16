@@ -12,8 +12,9 @@
 # writes the throwaway config, the launch doesn't hand itself to a Brindle
 # you already have running (the single-instance lock and its named pipe are
 # keyed by the state directory), and the sessions run in their own terminal
-# server, which is stopped (and the directory removed) when Brindle exits;
-# -Keep leaves both, so stop it yourself with brindle-remote stop.
+# server, which is stopped (and the directory removed) when Brindle exits.
+# -Keep keeps the directory, for its logs and config, but still stops the
+# server: the next run makes a new directory, so nothing would use it.
 #
 # The binary is $env:BRINDLE_BIN, else target\release\brindle.exe, else
 # target\debug\brindle.exe. BRINDLE_SERVER_HELPER is set to the
@@ -110,8 +111,8 @@ try {
 } finally {
     $env:BRINDLE_CONFIG = $previous.Config
     $env:BRINDLE_STATE_DIR = $previous.State
-    if ($haveHelper -and -not $Keep) {
-        # Stop this directory's server before it is removed; never one of yours.
+    if ($haveHelper) {
+        # Stop this directory's server, kept or not; never one of yours.
         try {
             $env:BRINDLE_SERVER_DIR = Join-Path $dir 'server'
             & $helper stop *> $null
