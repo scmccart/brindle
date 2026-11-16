@@ -53,7 +53,7 @@ While the menu is open, focus stays where `open_context_menu` puts it: on the ac
 ### 6. Tests
 
 - **Unit:** the item mapping (`TabMenuItem::of`), and `move_tab_at`'s effect on order and the active id, as pure helpers over a vector of ids.
-- **Windows e2e** (`windows-tab-menu-background`): two tabs with the first active. The case posts `WM_RBUTTONDOWN` and `WM_RBUTTONUP` to Brindle's own window at the second tab's face, as the caption probes post their messages (`cases/win.rs`). The dump must then show the `--- menu` line for the tab menu, the first tab active and focus on the terminal.
+- **Windows e2e** (`windows-tab-menu-background`): two tabs with the second active. The case posts `WM_RBUTTONDOWN` and `WM_RBUTTONUP` to Brindle's own window at the first tab's face, as the caption probes post their messages (`cases/win.rs`). The dump must then show the first tab's menu in its `--- menu` line, with the second tab still active. The first tab is the one clicked because its left edge is fixed, while the second's place depends on the first's title: on CI's elevated runner the console's title makes the first tab wider.
 - **Linux:** pointer presses can't be posted, so the right-click stays a manual check (CLAUDE.md's list, updated).
 
 ## Risks / Trade-offs

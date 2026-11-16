@@ -189,17 +189,20 @@ fn right_click(pid: u32, scale: f32, x: f32, y: f32) -> String {
 }
 
 /// Right-clicking a background tab opens its menu without activating it:
-/// with the first of two tabs active, a right-click on the second's face
-/// leaves the first active, with the tab menu open (Move Tab Right
-/// disabled, since the second tab is the last).
+/// with the second of two tabs active, a right-click on the first's face
+/// leaves the second active, with the first tab's menu open (Move Tab Left
+/// disabled, since it is the first). The first tab is the one clicked
+/// because its left edge is fixed (6 in) and it is at least 80 wide, while
+/// the second's place depends on the first's title (on an elevated runner
+/// the console host's title makes the first tab wider).
 fn tab_menu_background(ctx: &Ctx) -> Result<Outcome> {
-    let args = ["-p", "cmd", "--action", "new_tab", "--action", "prev_tab"];
+    let args = ["-p", "cmd", "--action", "new_tab"];
     let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
-    // The second tab's face: a `cmd` tab is 80 wide from 6 in, so the
-    // second spans about 86 to 166; the list's 36px start 6 down.
-    let (x, y) = (126.0, 6.0 + 18.0);
-    // After both steps (one interval apart, from about a second in).
+    // The first tab's face, 40 in from its left edge; the list's 36px
+    // start 6 down.
+    let (x, y) = (6.0 + 40.0, 6.0 + 18.0);
+    // After the step (from about a second in, one interval after start).
     let start = Instant::now();
     let after = Duration::from_secs_f64(ctx.secs(4.0));
     let probe = move |pid| if start.elapsed() < after { "waiting".into() } else { right_click(pid, scale, x, y) };
@@ -207,11 +210,11 @@ fn tab_menu_background(ctx: &Ctx) -> Result<Outcome> {
     let ran = run(ctx, "tab-menu", &args, &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
     ensure!(ran.during == "clicked", "never right-clicked: {}", ran.during);
     let active: Vec<bool> = ran.dump.tabs.iter().map(|(_, active)| *active).collect();
-    ensure!(active == [true, false], "tabs after the right-click: {:?}", ran.dump.tabs);
+    ensure!(active == [false, true], "tabs after the right-click: {:?}", ran.dump.tabs);
     let header = ran.dump.menu.first().ok_or("no menu open")?;
     ensure!(
-        header.starts_with("items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "),
-        "not the second tab's menu: {header}"
+        header.starts_with("items=Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab "),
+        "not the first tab's menu: {header}"
     );
     Ok(Outcome::Pass)
 }

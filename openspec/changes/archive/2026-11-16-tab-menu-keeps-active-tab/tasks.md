@@ -7,7 +7,7 @@
 
 ## 2. Windows e2e
 
-- [x] 2.1 Add `windows-tab-menu-background` to `tests/e2e/cases/win.rs`. Open two tabs with the first active, then post `WM_MOUSEMOVE`, `WM_RBUTTONDOWN` and `WM_RBUTTONUP` at the second tab's face, using the caption probe's DPI and coordinate handling. The dump must show the tab menu's `--- menu` line, the first tab active and `--- focus` on the terminal. Verify that it builds on Linux (`cargo build --tests`); it runs on CI's `windows-e2e`.
+- [x] 2.1 Add `windows-tab-menu-background` to `tests/e2e/cases/win.rs`. Open two tabs with the second active, then post `WM_MOUSEMOVE`, `WM_RBUTTONDOWN` and `WM_RBUTTONUP` at the first tab's face, using the caption probe's DPI and coordinate handling. The dump must show the first tab's menu in its `--- menu` line, with the second tab still active. Verify that it builds on Linux (`cargo build --tests`); it runs on CI's `windows-e2e`.
 
 ## 3. Docs and checks
 
