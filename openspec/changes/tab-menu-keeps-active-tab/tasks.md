@@ -14,4 +14,4 @@
 - [x] 3.1 Update CLAUDE.md:
   - the manual check line: right-click opens a background tab's menu without activating it;
   - the `picker.rs` paragraph: a right press on a tab face opens its menu without activating it, and items act on that tab.
-- [ ] 3.2 Run `cargo test --workspace --locked` and `cargo build --release --locked`, and check that both pass.
+- [x] 3.2 Run `cargo test --workspace --locked` and `cargo build --release --locked`, and check that both pass.
