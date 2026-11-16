@@ -320,6 +320,9 @@ pub struct Workspace {
     context_menu: Entity<ContextMenu>,
     /// The open context menu's entries and what its items run.
     context_menu_items: Option<ActionMenu>,
+    /// The tab (by id) whose menu is open in `context_menu`; `None` for a
+    /// zone header's menu. Its items act on that tab, not the active one.
+    context_menu_tab: Option<u64>,
     _context_menu_subscription: Subscription,
     /// Where the strip's tabs were laid out in the last frame, in window
     /// coordinates, for placing a tab menu opened from a key.
@@ -385,6 +388,7 @@ impl Workspace {
             _profile_menu_subscription: profile_menu_subscription,
             context_menu,
             context_menu_items: None,
+            context_menu_tab: None,
             _context_menu_subscription: context_menu_subscription,
             tab_bounds: Rc::default(),
             theme_preview: None,
@@ -1204,8 +1208,20 @@ impl Workspace {
         self.move_tab(1, cx);
     }
 
+    /// Moves tab `ix` one place (`delta` -1 or 1), without wrapping, as the
+    /// tab menu does; the active tab stays active wherever it ends up.
+    fn move_tab_at(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(to) = ix.checked_add_signed(delta) else { return };
+        self.move_tab_to(ix, to, cx);
+    }
+
     fn rename_tab(&mut self, _: &RenameTab, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(self.active) else { return };
+        self.rename_tab_at(self.active, window, cx);
+    }
+
+    /// Asks for a new title for tab `ix`, which it gets whatever moves meanwhile.
+    fn rename_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else { return };
         let tab_id = tab.id;
         let initial = tab.title.to_string();
         let this = cx.entity().downgrade();
@@ -1227,12 +1243,10 @@ impl Workspace {
     /// (after it when it came from the left, before it from the right), and
     /// the active tab stays active wherever it ends up.
     fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let Some(active_id) = self.tabs.get(self.active).map(|t| t.id) else { return };
-        if !reorder(&mut self.tabs, from, to) {
-            return;
+        if let Some(active) = reorder_keeping(&mut self.tabs, self.active, from, to, |t| t.id) {
+            self.active = active;
+            cx.notify();
         }
-        self.active = self.tabs.iter().position(|t| t.id == active_id).unwrap_or(0);
-        cx.notify();
     }
 
     /// Closing the window quits Brindle: its terminals' programs keep running.
@@ -1289,9 +1303,9 @@ impl Workspace {
     }
 
     /// Tab `ix`'s menu, at `at` (window coordinates), from the secondary
-    /// `press` on its face when one asked. The tab becomes the active one
-    /// and its terminal takes focus first, so the items, which run the tab
-    /// actions, act on it.
+    /// `press` on its face when one asked. The tab isn't activated: focus
+    /// stays with the active tab, and the items act on tab `ix` by its id
+    /// (`context_menu_selected`).
     fn open_tab_menu_at(
         &mut self,
         ix: usize,
@@ -1303,9 +1317,9 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
-        self.select(ix, cx);
         let menu = ActionMenu::new(tab_menu_rows(ix, self.tabs.len()), |action| tab_shortcut(action, cx));
         self.open_context_menu(menu, at, press, window, cx);
+        self.context_menu_tab = Some(self.tabs[ix].id);
     }
 
     /// Opens `menu` in the context menu slot at `at`, or at the pointer of
@@ -1332,14 +1346,27 @@ impl Workspace {
     }
 
     /// An item of the tab or zone menu was chosen. The menu has closed and
-    /// given focus back to the tab; its action runs from there, exactly as
-    /// its keybinding would (as the command palette runs one).
+    /// given focus back to the active tab. A tab menu's item acts on the
+    /// menu's tab (gone by now: nothing); a zone menu's action runs from the
+    /// focused zone, exactly as its keybinding would (as the command palette
+    /// runs one).
     fn context_menu_selected(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.context_menu_tab.take();
         let Some(action) = self.context_menu_items.take().and_then(|menu| menu.action(ix).map(|a| a.boxed_clone())) else {
             return;
         };
         self.focus_active_tab(window, cx);
         cx.notify();
+        if let Some(item) = tab.and_then(|_| TabMenuItem::of(&*action)) {
+            let Some(ix) = tab.and_then(|id| self.tabs.iter().position(|t| t.id == id)) else { return };
+            match item {
+                TabMenuItem::Rename => self.rename_tab_at(ix, window, cx),
+                TabMenuItem::MoveLeft => self.move_tab_at(ix, -1, cx),
+                TabMenuItem::MoveRight => self.move_tab_at(ix, 1, cx),
+                TabMenuItem::Close => self.close_tab_at(ix, window, cx),
+            }
+            return;
+        }
         window.dispatch_action(action, cx);
     }
 
@@ -1670,6 +1697,7 @@ impl Workspace {
         self._settings_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
+        self.context_menu_tab = None;
         self.end_previews(cx);
     }
 
@@ -2194,6 +2222,16 @@ fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
     true
 }
 
+/// [`reorder`], following the item at `active` by its id: its new index, or
+/// `None` when nothing moved.
+fn reorder_keeping<T>(items: &mut Vec<T>, active: usize, from: usize, to: usize, id: impl Fn(&T) -> u64) -> Option<usize> {
+    let active_id = id(items.get(active)?);
+    if !reorder(items, from, to) {
+        return None;
+    }
+    Some(items.iter().position(|item| id(item) == active_id).unwrap_or(0))
+}
+
 /// Whether a key pressed while the tab strip has focus sends focus back to
 /// the active tab's terminal: enter or escape with no modifier held. The
 /// tab list itself takes the arrows, home and end.
@@ -2309,6 +2347,33 @@ fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
 /// The menu of tab `ix` of `count`: Rename Tab, Move Tab Left (disabled on
 /// the first tab), Move Tab Right (disabled on the last), a separator and
 /// Close Tab.
+/// What a tab menu item does to the menu's tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabMenuItem {
+    Rename,
+    MoveLeft,
+    MoveRight,
+    Close,
+}
+
+impl TabMenuItem {
+    /// The item for one of [`tab_menu_rows`]' actions; `None` for any other.
+    fn of(action: &dyn Action) -> Option<Self> {
+        let any = action.as_any();
+        if any.is::<RenameTab>() {
+            Some(Self::Rename)
+        } else if any.is::<MoveTabLeft>() {
+            Some(Self::MoveLeft)
+        } else if any.is::<MoveTabRight>() {
+            Some(Self::MoveRight)
+        } else if any.is::<CloseTab>() {
+            Some(Self::Close)
+        } else {
+            None
+        }
+    }
+}
+
 fn tab_menu_rows(ix: usize, count: usize) -> Vec<ActionRow> {
     vec![
         ActionRow::item(RenameTab, true),
@@ -2861,6 +2926,41 @@ mod tests {
         let keymap = gpui::Keymap::new(default_bindings());
         let menu = ActionMenu::new(tab_menu_rows(ix, count), |action| tab_keys(&keymap, action));
         describe_menu(&menu.entries, None)
+    }
+
+    /// Each tab menu row's action maps to the item that acts on the menu's
+    /// tab; a zone menu's action to none, so it is dispatched.
+    #[test]
+    fn tab_menu_items_act_on_the_menus_tab() {
+        let items: Vec<_> = tab_menu_rows(1, 3)
+            .iter()
+            .filter_map(|row| match row {
+                ActionRow::Item { action, .. } => Some(TabMenuItem::of(&**action)),
+                ActionRow::Separator => None,
+            })
+            .collect();
+        use TabMenuItem::*;
+        assert_eq!(items, [Some(Rename), Some(MoveLeft), Some(MoveRight), Some(Close)]);
+        assert_eq!(TabMenuItem::of(&crate::actions::SplitZoneRight), None);
+    }
+
+    /// Moving a background tab from its menu keeps the active tab active,
+    /// and moving the active one moves it with it; nothing moves past an end.
+    #[test]
+    fn a_menu_move_keeps_the_active_tab() {
+        let moved = |active: usize, from: usize, to: usize| {
+            let mut ids = vec![10u64, 11, 12];
+            let active = reorder_keeping(&mut ids, active, from, to, |id| *id);
+            (ids, active)
+        };
+        // The third tab moves left while the first is active.
+        assert_eq!(moved(0, 2, 1), (vec![10, 12, 11], Some(0)));
+        // The second moves left past the active first one.
+        assert_eq!(moved(0, 1, 0), (vec![11, 10, 12], Some(1)));
+        // The active tab itself moves right.
+        assert_eq!(moved(1, 1, 2), (vec![10, 12, 11], Some(2)));
+        // Past the end: nothing.
+        assert_eq!(moved(0, 2, 3), (vec![10, 11, 12], None));
     }
 
     /// The spec's tab menu: Move Tab Left disabled on the first tab, Move

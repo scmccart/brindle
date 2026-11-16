@@ -23,6 +23,7 @@ pub fn all() -> Vec<Case> {
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
+        display("windows-tab-menu-background", tab_menu_background),
         display("windows-zones", zones),
         display("settings-fonts", super::fonts::settings_fonts),
         display("ui-font-config", super::fonts::ui_font_config),
@@ -70,40 +71,13 @@ pub fn all() -> Vec<Case> {
 /// tests read `hits` (the window may not be laid out yet), it stops before
 /// the double-click and press, so a probe that is polled changes nothing.
 fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str) -> String {
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+    use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClientRect, GetWindowRect, GetWindowThreadProcessId, HTCAPTION, HTMAXBUTTON, IsWindowVisible,
-        IsZoomed, SendMessageW, WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+        GetClientRect, GetWindowRect, HTCAPTION, HTMAXBUTTON, IsZoomed, SendMessageW, WM_MOUSEMOVE, WM_NCHITTEST,
+        WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
     };
-    use windows::core::BOOL;
 
-    struct Found {
-        pid: u32,
-        hwnd: Option<HWND>,
-    }
-    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
-        // SAFETY: `found` is the `Found` passed to EnumWindows below.
-        let found = unsafe { &mut *(found.0 as *mut Found) };
-        let mut pid = 0;
-        // SAFETY: plain queries about a window that exists.
-        unsafe {
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid == found.pid && IsWindowVisible(hwnd).as_bool() {
-                found.hwnd = Some(hwnd);
-                return BOOL(0);
-            }
-        }
-        BOOL(1)
-    }
-    // Physical pixels, as Brindle's window sees them: a DPI-unaware thread
-    // gets its window rectangles scaled down.
-    // SAFETY: changes only this thread's DPI awareness.
-    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    let mut found = Found { pid, hwnd: None };
-    // SAFETY: `found` outlives the enumeration.
-    unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
-    let Some(hwnd) = found.hwnd else { return "no window".into() };
+    let Some(hwnd) = brindle_window(pid) else { return "no window".into() };
     let pack = |x: i32, y: i32| LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
     // A point as the client coordinates WM_MOUSEMOVE takes and the screen
     // coordinates the caption messages take, from the window as it is now.
@@ -158,6 +132,91 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str) 
     send(WM_NCLBUTTONUP, HTMAXBUTTON, screen);
     out.push(format!("maximize={}", zoomed(false)));
     out.join(" ")
+}
+
+/// Brindle's visible window, by its pid, for messages to it. The thread is
+/// made per-monitor DPI aware first, so rectangles and positions are in the
+/// window's physical pixels (a DPI-unaware thread gets them scaled down).
+fn brindle_window(pid: u32) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    use windows::core::BOOL;
+
+    struct Found {
+        pid: u32,
+        hwnd: Option<HWND>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
+        // SAFETY: `found` is the `Found` passed to EnumWindows below.
+        let found = unsafe { &mut *(found.0 as *mut Found) };
+        let mut pid = 0;
+        // SAFETY: plain queries about a window that exists.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == found.pid && IsWindowVisible(hwnd).as_bool() {
+                found.hwnd = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    // SAFETY: changes only this thread's DPI awareness.
+    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let mut found = Found { pid, hwnd: None };
+    // SAFETY: `found` outlives the enumeration.
+    unsafe { EnumWindows(Some(each), LPARAM(&mut found as *mut Found as isize)) }.ok();
+    found.hwnd
+}
+
+/// Right-clicks client point (`x`, `y`), in logical pixels at `scale`, in
+/// Brindle's window: `WM_MOUSEMOVE`, `WM_RBUTTONDOWN` and `WM_RBUTTONUP` at
+/// the same point, messages to its own window as the caption probe sends.
+fn right_click(pid: u32, scale: f32, x: f32, y: f32) -> String {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
+
+    let Some(hwnd) = brindle_window(pid) else { return "no window".into() };
+    let (x, y) = ((x * scale) as i32, (y * scale) as i32);
+    let at = LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize));
+    // SAFETY: messages to Brindle's own window, with plain values.
+    let send = |msg, wparam: u32| unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam as usize)), Some(at)) };
+    send(WM_MOUSEMOVE, 0);
+    // MK_RBUTTON: the right button is down.
+    send(WM_RBUTTONDOWN, 0x0002);
+    send(WM_RBUTTONUP, 0);
+    "clicked".into()
+}
+
+/// Right-clicking a background tab opens its menu without activating it:
+/// with the second of two tabs active, a right-click on the first's face
+/// leaves the second active, with the first tab's menu open (Move Tab Left
+/// disabled, since it is the first). The first tab is the one clicked
+/// because its left edge is fixed (6 in) and it is at least 80 wide, while
+/// the second's place depends on the first's title (on an elevated runner
+/// the console host's title makes the first tab wider).
+fn tab_menu_background(ctx: &Ctx) -> Result<Outcome> {
+    let args = ["-p", "cmd", "--action", "new_tab"];
+    let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
+    let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
+    // The first tab's face, 40 in from its left edge; the list's 36px
+    // start 6 down.
+    let (x, y) = (6.0 + 40.0, 6.0 + 18.0);
+    // After the step (from about a second in, one interval after start).
+    let start = Instant::now();
+    let after = Duration::from_secs_f64(ctx.secs(4.0));
+    let probe = move |pid| if start.elapsed() < after { "waiting".into() } else { right_click(pid, scale, x, y) };
+    let clicked = |seen: &str| seen == "clicked";
+    let ran = run(ctx, "tab-menu", &args, &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
+    ensure!(ran.during == "clicked", "never right-clicked: {}", ran.during);
+    let active: Vec<bool> = ran.dump.tabs.iter().map(|(_, active)| *active).collect();
+    ensure!(active == [false, true], "tabs after the right-click: {:?}", ran.dump.tabs);
+    let header = ran.dump.menu.first().ok_or("no menu open")?;
+    ensure!(
+        header.starts_with("items=Rename Tab|[Move Tab Left]|Move Tab Right|-|Close Tab "),
+        "not the first tab's menu: {header}"
+    );
+    Ok(Outcome::Pass)
 }
 
 /// The tab strip acts as a native caption: the empty strip is the caption
