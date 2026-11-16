@@ -26,6 +26,14 @@ family = ["JetBrains Mono", "FiraCode Nerd Font Mono", "Hack Nerd Font Mono", "D
 size = 14
 line_height = 1.25
 
+# The window chrome's font: the tab strip, menus and dialogs. First installed
+# family wins; with none installed (or no [ui_font]), Brindle tries Inter,
+# Cantarell, Ubuntu Sans, Ubuntu, Noto Sans, DejaVu Sans, Liberation Sans and
+# Segoe UI, then the system's UI font. Both fonts can also be picked with a
+# live preview in the settings dialog's Fonts section (ctrl-shift-,).
+# [ui_font]
+# family = ["Inter"]
+
 [cursor]
 shape = "block"   # block | beam | underline
 blink = true

@@ -2,9 +2,9 @@
 
 ## 1. Config and resolution
 
-- [ ] 1.1 Add `UiFontConfig` and `Config::ui_font` (design decision 1), with the commented default config showing a `[ui_font]` example. Verify: `config.rs` tests that `[ui_font] family = [...]` parses, `ui_font.size` is an unknown-key error, and a config without it gets an empty list (the built-in list then applies through resolution).
-- [ ] 1.2 Resolve the UI family from the config (config list, built-in list, `.SystemUIFont`), as a pure function over the installed names. Verify: unit tests for an installed first choice, a missing one falling back, and an empty list.
-- [ ] 1.3 Add the preview override and accessors to `Settings` (design decision 2), and move every direct read of `config.font.line_height` and `ui_font_family` to them. Verify: `grep -rn "font.line_height\|ui_font_family" src` finds only `settings.rs` and the config.
+- [x] 1.1 Add `UiFontConfig` and `Config::ui_font` (design decision 1), with the commented default config showing a `[ui_font]` example. Verify: `config.rs` tests that `[ui_font] family = [...]` parses, `ui_font.size` is an unknown-key error, and a config without it gets an empty list (the built-in list then applies through resolution).
+- [x] 1.2 Resolve the UI family from the config (config list, built-in list, `.SystemUIFont`), as a pure function over the installed names. Verify: unit tests for an installed first choice, a missing one falling back, and an empty list.
+- [x] 1.3 Add the preview override and accessors to `Settings` (design decision 2), and move every direct read of `config.font.line_height` and `ui_font_family` to them. Verify: `grep -rn "font.line_height\|ui_font_family" src` finds only `settings.rs` and the config.
 
 ## 2. Writing fonts
 
@@ -14,7 +14,7 @@
 
 - [ ] 3.1 The installed-family list (design decision 3): a pure sort/filter/group function, unit-tested, plus the background monospace probe and its process global.
 - [ ] 3.1a `brindle_ui::Combobox` (design decision 4): Popover + Command, trigger styled as Select's, unit tests for its pure parts, a gallery entry and README listing in `ui/README.md`.
-- [ ] 3.1b `brindle_ui::UiFont` (design decision 8), set with the tokens, applied by brindle-ui's own roots and the workspace root.
+- [x] 3.1b `brindle_ui::UiFont` (design decision 8), set with the tokens, applied by brindle-ui's own roots and the workspace root.
 - [ ] 3.2 `FontsState` (design decision 5): reading, validation, preview, apply. Verify: unit tests for each settings-dialog scenario in the change's spec that the model decides (current values shown, size out of range, leave unapplied, choose a UI font, choose a listed fallback).
 - [ ] 3.3 The section in the view: `Section::Fonts` after Theme, its four fields, focus stops, footer, the `FontPreview` event, and the `--- settings` line (design decision 7). Update the existing section tests (`SECTIONS` labels, section cycling).
 - [ ] 3.4 The workspace side: set or clear the override on `FontPreview`, re-fit terminals, clear on reload and apply; print the `--- fonts` line.

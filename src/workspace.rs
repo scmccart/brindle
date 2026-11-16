@@ -20,7 +20,7 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
 };
@@ -2489,7 +2489,7 @@ impl Render for Workspace {
             .size_full()
             .overflow_hidden()
             .bg(theme.background.hsla())
-            .font_family(Settings::get(cx).ui_font_family.clone())
+            .font_family(cx.ui_font())
             .cursor(CursorStyle::Arrow)
             .when_some(match decorations {
                 Decorations::Client { tiling } => Some(tiling),

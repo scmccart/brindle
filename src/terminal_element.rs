@@ -44,7 +44,7 @@ pub fn cell_metrics(font_size_override: Option<f32>, window: &Window, cx: &App) 
         .advance(font_id, font_size, 'm')
         .map(|s| s.width)
         .unwrap_or(font_size * 0.6);
-    let line_height = (font_size * settings.config.font.line_height).round();
+    let line_height = (font_size * settings.line_height()).round();
     CellMetrics { font, font_size, cell_width, line_height }
 }
 
