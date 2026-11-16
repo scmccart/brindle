@@ -8,7 +8,7 @@
 
 ## 2. Writing fonts
 
-- [ ] 2.1 `config_edit::set_font_family` and `set_font_number` (design decision 6). Verify: unit tests for adding `[ui_font]` to a commented config, moving a fallback to the front, removing `family` with "Default" (and an emptied table), and comments kept.
+- [x] 2.1 `config_edit::set_font_family` and `set_font_number` (design decision 6). Verify: unit tests for adding `[ui_font]` to a commented config, moving a fallback to the front, removing `family` with "Default" (and an emptied table), and comments kept.
 
 ## 3. Settings dialog
 
