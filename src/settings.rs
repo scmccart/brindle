@@ -84,7 +84,7 @@ pub const SYSTEM_UI_FONT: &str = ".SystemUIFont";
 
 impl Settings {
     pub fn new(config: Config, config_error: Option<String>, cx: &App) -> Self {
-        let installed = cx.text_system().all_font_names();
+        let installed = installed_families(cx);
         let font_family = resolve_family(&config.font.family, &installed);
         log::info!("using font family {font_family:?}");
         let font = terminal_font(font_family, &installed);
@@ -203,6 +203,61 @@ impl Settings {
     }
 }
 
+/// The names `TextSystem::all_font_names` adds to the platform's list
+/// whether or not the platform has them: its fallback stack and
+/// `.SystemUIFont` (gpui 0.2.2, `text_system.rs`).
+const GPUI_ADDED_NAMES: &[&str] = &[
+    ".ZedMono",
+    ".ZedSans",
+    "Helvetica",
+    "Segoe UI",
+    "Ubuntu",
+    "Adwaita Sans",
+    "Cantarell",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Arial",
+    ".SystemUIFont",
+];
+
+/// The installed families: GPUI's list, keeping a name it adds itself
+/// ([`GPUI_ADDED_NAMES`], several of which are built-in UI families) only
+/// when the platform has that family.
+fn installed_families(cx: &App) -> Vec<String> {
+    let text_system = cx.text_system();
+    without_unverified(text_system.all_font_names(), |name| platform_has_family(text_system, name))
+}
+
+/// `names` without the [`GPUI_ADDED_NAMES`] that `has` says aren't
+/// installed.
+fn without_unverified(mut names: Vec<String>, has: impl Fn(&str) -> bool) -> Vec<String> {
+    names.retain(|name| !GPUI_ADDED_NAMES.contains(&name.as_str()) || has(name));
+    names
+}
+
+/// Whether DirectWrite's system font collection has `family`.
+#[cfg(windows)]
+fn platform_has_family(_: &gpui::TextSystem, family: &str) -> bool {
+    crate::win::has_font_family(family)
+}
+
+/// Whether the platform has `family`. GPUI's Linux text system fails to
+/// load a family it hasn't got, and `resolve_font` then resolves a
+/// fallback, so the resolved font is the family's own only when it is
+/// installed. GPUI's own names (`.ZedMono`) aren't families.
+#[cfg(not(windows))]
+fn platform_has_family(text_system: &gpui::TextSystem, family: &str) -> bool {
+    if family.starts_with('.') {
+        return false;
+    }
+    let resolve = std::panic::AssertUnwindSafe(|| {
+        let id = text_system.resolve_font(&gpui::font(family.to_string()));
+        text_system.get_font_for_id(id).is_some_and(|font| &*font.family == family)
+    });
+    // `resolve_font` panics when not even GPUI's fallbacks load.
+    std::panic::catch_unwind(resolve).unwrap_or(false)
+}
+
 /// The terminal font in `family`: no ligatures, and the installed glyph
 /// fallbacks.
 fn terminal_font(family: String, installed: &[String]) -> Font {
@@ -273,6 +328,30 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// GPUI lists its fallback stack's names (Cantarell, Segoe UI, …) on
+    /// every machine; only the ones the platform has are installed, so a
+    /// missing Cantarell neither wins the built-in UI list nor shows in a
+    /// family list.
+    #[test]
+    fn names_gpui_adds_count_only_when_the_platform_has_them() {
+        let listed = names(&[".SystemUIFont", "Arial", "Cantarell", "Consolas", "Noto Sans", "Segoe UI", ".ZedMono"]);
+        let has = |name: &str| ["Arial", "Segoe UI"].contains(&name);
+        let installed = without_unverified(listed, has);
+        assert_eq!(installed, names(&["Arial", "Consolas", "Segoe UI"]));
+        assert_eq!(resolve_ui_family(&[], &installed), "Segoe UI");
+        assert_eq!(resolve_ui_family(&names(&["Noto Sans", "Arial"]), &installed), "Arial");
+        // Nothing of the built-in list installed: the platform's UI font.
+        assert_eq!(resolve_ui_family(&[], &without_unverified(names(&["Cantarell", "Consolas"]), |_| false)), SYSTEM_UI_FONT);
+    }
+
+    /// Every Windows has Segoe UI; no machine has the made-up family.
+    #[cfg(windows)]
+    #[test]
+    fn directwrite_has_segoe_ui_and_not_a_made_up_family() {
+        assert!(crate::win::has_font_family("Segoe UI"));
+        assert!(!crate::win::has_font_family("Nonexistent Brindle Font"));
     }
 
     #[test]

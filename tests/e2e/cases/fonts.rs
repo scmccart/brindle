@@ -25,6 +25,12 @@ pub fn ui_font_config(ctx: &Ctx) -> Result<Outcome> {
     let fonts = out.dump.fonts()?;
     let (installed, builtin) = (fonts.terminal.clone(), fonts.ui.clone());
     ensure!(!builtin.is_empty() && builtin != MISSING, "UI font with no [ui_font]: {builtin:?}");
+    // Every Windows has Segoe UI and none of the Linux families before it
+    // in the built-in list (which GPUI lists whether or not they are
+    // installed).
+    if cfg!(windows) {
+        ensure!(builtin.starts_with("Segoe UI"), "UI font with no [ui_font] on Windows: {builtin:?}");
+    }
 
     let out = Run::new(ctx, "missing").config(&ui_font(&[MISSING])).run()?;
     let ui = &out.dump.fonts()?.ui;
