@@ -1,0 +1,74 @@
+# Brindle architecture
+
+These are the normative architecture docs for Brindle, a GPU-accelerated terminal emulator whose tabs run in a persistent terminal server. "Normative" means code review enforces each doc's **Rules** section, and reviewers cite rule numbers from these files by the short names below (`fcis R2`, `process R5`).
+
+`CLAUDE.md`'s "Architecture" section describes how the code works today. These docs say what a change must keep true. Behaviour is specified separately, in `openspec/specs/`.
+
+## Dependency rule
+
+```
+brindle (src/)  ─────────┬──▶ brindle-ui (ui/)                            ──▶ gpui
+                         ├──▶ brindle-term-core (term-core/)              ──▶ alacritty_terminal
+brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-protocol/)  ──▶ serde
+(remote-agent/)          │
+                         references point only rightward
+```
+
+- **`brindle`**, the app: GPUI entities, the server's client, config, the composition root (`main.rs`). It depends on all three shared crates and may add dependencies with care.
+- **`brindle-remote-agent`**, the `brindle-remote` helper: the terminal server's roles, the relay, the management commands. It depends on `brindle-term-core` and `brindle-remote-protocol`, never on `gpui` or `brindle-ui`.
+- **The two binaries never reference each other.** What both need goes in a shared crate.
+- **`brindle-ui`**: components and tokens on `gpui` alone. It knows nothing of terminals, config or the `ACTIONS` table.
+- **`brindle-term-core`**: the pure terminal state both sides share (parser, marks, status records, replay, emulator). No IO, no clock, no threads.
+- **`brindle-remote-protocol`**: frames, messages and versions (pure codecs), plus the small platform helpers both sides must agree on (server directory, endpoint names, access checks, scopes).
+- **The shared crates never reference each other**, and each has a closed list of dependencies (`ports R3`).
+
+## Read by layer
+
+| Touching | Read first |
+| --- | --- |
+| anything | this page, then [functional-core-imperative-shell.md](functional-core-imperative-shell.md) |
+| `term-core/**` | fcis, types |
+| `ui/**` | ports, fcis |
+| `remote-protocol/**` | process, types, railway |
+| `remote-agent/**` | process, ports, railway |
+| `src/remote/**`, `src/terminal/**`, `src/instance.rs`, `src/session.rs`, `src/config.rs` | process, railway, fcis |
+| the rest of `src/**` (views, overlays, settings) | fcis, types, ports |
+| `tests/**`, `remote-agent/tests/**`, any new kind of test, any flake | testing |
+| a `cfg(unix)`, `cfg(windows)` or `cfg(target_os)` anywhere | ports |
+
+## The docs
+
+| Doc | Cited as | One line |
+| --- | --- | --- |
+| [functional-core-imperative-shell.md](functional-core-imperative-shell.md) | `fcis` | Decisions are pure functions and GPUI-free models; entities, threads and loops only gather, call and apply. |
+| [railway-oriented-programming.md](railway-oriented-programming.md) | `railway` | Expected failures are values, shown where they happened; decoders never panic. |
+| [illegal-states-unrepresentable.md](illegal-states-unrepresentable.md) | `types` | Closed enums, stable identities, units kept apart, parsing at the boundary. |
+| [ports-and-adapters.md](ports-and-adapters.md) | `ports` | The crate boundaries, and one seam per platform concern. |
+| [process-architecture.md](process-architecture.md) | `process` | Holder and core, versioned protocols, readiness loops, upgrades, the UI thread. |
+| [testing-architecture.md](testing-architecture.md) | `testing` | Which layer a test belongs in, hermetic runs, and how flakes are fixed. |
+
+## Shared vocabulary
+
+- **Pure code / shell:** pure code computes a value from its arguments and does nothing else. The shell is everything that touches the world: GPUI entities and their `render`, threads, event-loop handlers, `main.rs`. These docs say "pure code", not "core", because of the next entry.
+- **Server core:** the terminal server's `serve` role (`remote-agent/src/server/core.rs`). In this repo "the core" always means that process, never the pure code.
+- **Holder:** the `hold` role, which owns the PTYs and pseudoconsoles and interprets nothing.
+- **Model:** a GPUI-free type that holds a view's state and decisions (`FontsState`, `SessionsModel`, `EditState`).
+- **Seam:** the one module, or the one per-platform module set, that owns a platform concern. Brindle's seams are `cfg`-selected modules with the same item names, not traits. A seam is this repo's port, and each platform's module its adapter.
+- **Outcome:** an enum a function returns when it can end in more than one way (`Listing`, `LinkState`, `access::Refusal`).
+- **Unit:** the thing a fault is confined to: a session, a tab, an endpoint, a connection.
+
+## Enforcement
+
+`tests/architecture.rs` runs with plain `cargo test` on every platform CI builds. It checks the crate boundaries from the manifests and a few source rules by text search; each doc's Enforcement section says which of its rules that covers. Everything else is held by review, through the `architecture-review` skill.
+
+## Scope of adoption
+
+These docs were adopted on 2026-11-16 by writing down what the code already does. The rules bind new and changed code. Code that predates them and falls short is brought into line when it is next changed, not in a sweep. The deviations known at adoption are below; none has an issue filed.
+
+## Exceptions in force
+
+| Doc rule | Exception | Approved in | Ends with |
+| --- | --- | --- | --- |
+| `railway R4` | About 90 existing functions return `Result<_, String>` (57 in `src/`, 36 in the other crates), such as `reattach::attach_target`. | adoption, 2026-11-16 | each is revisited when its error gains a second consumer or a branch on its text |
+| `railway R3`, `types R2` | Existing `_ =>` arms have not been audited for matches on Brindle's own enums. | adoption, 2026-11-16 | each is removed when its `match` is next changed |
+| `ports R4` | `cfg` attributes for a platform concern outside its seam module, in `src/workspace.rs`, `src/terminal/mod.rs`, `src/main.rs` and `src/remote/local.rs` among others. | adoption, 2026-11-16 | the `port-to-macos` change, which moves each behind its seam |

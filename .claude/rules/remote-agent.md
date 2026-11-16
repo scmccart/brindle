@@ -1,0 +1,22 @@
+---
+paths:
+  - "remote-agent/src/**"
+  - "remote-agent/build.rs"
+  - "remote-agent/Cargo.toml"
+---
+# brindle-remote-agent: the terminal server's roles, the relay, the CLI
+
+You are editing the `brindle-remote` helper, which holds the user's running programs. Read `docs/architecture/process-architecture.md` and `docs/architecture/ports-and-adapters.md` before non-trivial changes, then `railway-oriented-programming.md`.
+
+- The holder parses nothing and has no policy; what it stores is opaque bytes the server core owns. Don't add features to it (`process R1`).
+- Session state in the server core must survive a core restart: checkpoint it or send it with `SET_META`, or say what a restart does to it (`process R2`).
+- A call on outside data is confined per session; a panic breaks one emulator, not the server (`process R3`).
+- `server/core.rs`, `server/core/` and `server/holder.rs` name no `libc::`, `windows::` or `std::os::` item. What they need from the system is an item in `server/platform/{unix,windows}`, under the same name in both (`ports R5`).
+- Platform modules are thin; what to run and how to quote it is a pure helper tested on every platform, such as `conpty::cmdline::launch_line` (`ports R7`, `fcis R7`).
+- One thread per role on the readiness loop; handlers do IO through a source's owner; queues have marks; closes are graceful (`process R8`–`R10`).
+- Liveness is stamped on the reader thread, never where output is copied (`process R18`).
+- No `gpui`, no `anyhow`, no dependency beyond the two shared crates, `libc`, `windows` and `embed-resource` (`ports R3`).
+
+If the app needs something from here, move it to `brindle-remote-protocol` or `brindle-term-core`: the app never depends on this crate.
+
+Enforced by: `tests/architecture.rs` (`the_server_core_and_holder_name_no_platform_type`, `crates_below_the_app_name_only_their_allowed_dependencies`) and the real-role tests in `remote-agent/tests/`.

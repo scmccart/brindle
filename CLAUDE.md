@@ -126,6 +126,29 @@ BRINDLE_PERF=1 cargo test --test perf -- --self-test
 - `tests/common/` holds what both suites share (`Result`, `ensure!`).
 - Latency probes live in `src/latency.rs`. They are a GPUI global that exists only with `--latency-log` or `--latency-bench`. A probe completes on the paint whose grid includes output newer than the key, tracked by each `Terminal`'s `OutputMarker`, so repaints the key itself causes don't count.
 
+## Architecture rules
+
+`docs/architecture/` holds the normative rules, which review cites by short name and number (`fcis R2`, `process R5`). Its `README.md` has the dependency rule, a "read by layer" table and the exceptions in force. Read the **Rules** section of the docs for the layer you are changing before any non-trivial change. The "Architecture" section below describes how the code works today; those docs say what a change must keep true.
+
+Dependency rule: `brindle` and `brindle-remote-agent` → `brindle-ui`, `brindle-term-core`, `brindle-remote-protocol`. The two binaries never reference each other, the shared crates never reference each other, and each crate below the app has a closed dependency list. `tests/architecture.rs` checks this and a few source rules as part of plain `cargo test` (alone: `cargo test -p brindle --test architecture`). When it fails, change the code, or change the rule in its doc and the test in the same commit; never loosen the test alone.
+
+- `functional-core-imperative-shell.md` (`fcis`): decisions are pure functions and GPUI-free models; entities, threads and loops only gather, call and apply.
+- `railway-oriented-programming.md` (`railway`): expected failures are values, shown on the tab or endpoint that failed; decoders never panic.
+- `illegal-states-unrepresentable.md` (`types`): closed enums, stable identities, units kept apart, parsing at the boundary.
+- `ports-and-adapters.md` (`ports`): the crate boundaries, and one seam per platform concern.
+- `process-architecture.md` (`process`): holder and core, versioned protocols, readiness loops, upgrades, the UI thread.
+- `testing-architecture.md` (`testing`): which layer a test belongs in, hermetic runs, how flakes are fixed.
+
+The rules broken most often:
+- A decision written inside a view, a thread or a loop handler, or pure code that reads the clock or the environment (`fcis R1`–`R3`). Put it in a pure function or model that takes `now` and the values as arguments, with unit tests in the same file.
+- A `cfg(windows)`, `cfg(unix)` or `cfg(target_os)` outside the seam that owns the concern, or a platform type in the server core or holder (`ports R4`, `R5`).
+- A wire change that isn't additive, or a new message without a new negotiated version and transcript tests (`process R4`–`R6`).
+- A `_ =>` arm on one of Brindle's own enums, or a panic on bytes from outside the process (`railway R3`, `R5`).
+- Work on the UI thread, or IO in `render` or `prepaint` (`process R13`, `R14`).
+- A sleep, retry or longer timeout to make a test pass, or a GUI check as a one-off script (`testing R9`, `R13`).
+
+`.claude/rules/` holds a short path-scoped reminder per layer, and `openspec/config.yaml` carries the design and task rules that follow from these docs. Use the `architecture-review` skill to check a diff or a design against them.
+
 ## Architecture
 
 Data flows **terminal server session → `Terminal` (model) → `TerminalView` (input) → `TerminalElement` (paint)**, with `Workspace` owning the tabs of one window.
