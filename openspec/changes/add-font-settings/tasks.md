@@ -21,8 +21,8 @@
 
 ## 4. Checks and docs
 
-- [ ] 4.0 The e2e and perf dump parsers accept the `--- fonts` line, and their `--self-test`s cover it.
-- [ ] 4.1 e2e cases in `tests/e2e/`: `ui-font-config` (a config naming an installed UI family and a missing one; `--- fonts` shows the expected families) and `settings-fonts` (open the dialog, go to Fonts, change Size, see the grid's cell change in the dump before applying, apply, and find the size in the config file). Both are registered for Linux and in `tests/e2e/cases/win.rs`, with the UI family picked per platform from fonts the CI runners have. They run in CI's `e2e` and `windows-e2e` jobs.
+- [x] 4.0 The e2e and perf dump parsers accept the `--- fonts` line, and their `--self-test`s cover it.
+- [x] 4.1 e2e cases in `tests/e2e/`: `ui-font-config` (a config naming an installed UI family and a missing one; `--- fonts` shows the expected families) and `settings-fonts` (open the dialog, go to Fonts, change Size, see the grid's cell change in the dump before applying, apply, and find the size in the config file). Both are registered for Linux and in `tests/e2e/cases/win.rs`, with the UI family picked per platform from fonts the CI runners have. They run in CI's `e2e` and `windows-e2e` jobs.
 - [ ] 4.2 README.md's configuration section (`[ui_font]`, the Fonts section) and CLAUDE.md (`settings.rs` bullet, the dump lines).
 - [ ] 4.3 `cargo test --workspace --locked` and `cargo build --release --locked` pass on Windows; the CI jobs pass on the PR.
 - [ ] 4.4 Archive the change in the PR (`openspec archive add-font-settings`).

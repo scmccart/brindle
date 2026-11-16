@@ -24,6 +24,8 @@ pub fn all() -> Vec<Case> {
         display("windows-pwsh-integration", pwsh_integration),
         display("windows-caption", caption),
         display("windows-zones", zones),
+        display("settings-fonts", super::fonts::settings_fonts),
+        display("ui-font-config", super::fonts::ui_font_config),
         display("local-server-session", local_server::session),
         display("local-server-close", local_server::close),
         display("local-server-quit", local_server::quit),
