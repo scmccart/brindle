@@ -252,7 +252,7 @@ fn platform_has_family(text_system: &gpui::TextSystem, family: &str) -> bool {
     }
     let resolve = std::panic::AssertUnwindSafe(|| {
         let id = text_system.resolve_font(&gpui::font(family.to_string()));
-        text_system.get_font_for_id(id).is_some_and(|font| &*font.family == family)
+        text_system.get_font_for_id(id).is_some_and(|font| font.family == family)
     });
     // `resolve_font` panics when not even GPUI's fallbacks load.
     std::panic::catch_unwind(resolve).unwrap_or(false)
