@@ -171,6 +171,12 @@ impl Settings {
         self.preview.as_ref().map(|p| &p.fonts)
     }
 
+    /// The installed families, as GPUI listed them when the config was
+    /// loaded.
+    pub fn installed_fonts(&self) -> &[String] {
+        &self.installed
+    }
+
     /// Shows `preview`'s fonts in place of the config's, or, with `None` (or
     /// a preview that changes nothing), the config's again. The caller
     /// re-fits the grids (`cx.refresh_windows()`) and applies the UI font

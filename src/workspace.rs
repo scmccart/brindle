@@ -28,7 +28,7 @@ use crate::remote::Host;
 use crate::remote::hosts::{HostState, Hosts};
 use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState};
-use crate::settings::Settings;
+use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
 use crate::terminal::status::State;
@@ -1597,20 +1597,23 @@ impl Workspace {
             self.dismiss_overlay(window, cx);
             return;
         }
-        let config = Self::settings(cx);
+        let settings = Settings::get(cx);
+        let config = &settings.config;
         let model = settings_dialog::Model::new(
             Config::path(),
             config.theme.clone(),
             config.themes.clone(),
             config.profiles.clone(),
             config.default_profile.clone(),
-        );
+        )
+        .with_fonts((config.font.clone(), config.ui_font.clone()), settings.installed_fonts().to_vec());
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, _, cx| match event {
             SettingsEvent::Preview(theme) => this.set_theme_preview(Some(theme.clone()), cx),
             // Deferred by GPUI, so the reload sees this window idle.
             SettingsEvent::ProfilePreview(preview) => this.set_profile_preview(preview.clone(), cx),
+            SettingsEvent::FontPreview(preview) => this.set_font_preview(preview.clone(), cx),
             // Deferred, so the reload sees this window idle (as ReloadConfig).
             SettingsEvent::ConfigWritten(renames) => {
                 let renames = renames.clone();
@@ -1670,7 +1673,7 @@ impl Workspace {
         self.end_previews(cx);
     }
 
-    /// Stops the settings dialog's theme and profile previews.
+    /// Stops the settings dialog's theme, profile and font previews.
     fn end_previews(&mut self, cx: &mut Context<Self>) {
         if self.theme_preview.is_some() {
             self.set_theme_preview(None, cx);
@@ -1678,6 +1681,20 @@ impl Workspace {
         if self.profile_preview.is_some() {
             self.set_profile_preview(None, cx);
         }
+        if Settings::get(cx).font_preview().is_some() {
+            self.set_font_preview(None, cx);
+        }
+    }
+
+    /// Shows the settings dialog's fonts in place of the config's (or, with
+    /// `None`, the config's again): the terminal font's family, size and
+    /// line height on every tab, whose grids re-fit, and the UI font on the
+    /// chrome. A config reload replaces `Settings`, which ends it too.
+    pub fn set_font_preview(&mut self, preview: Option<FontPreview>, cx: &mut Context<Self>) {
+        cx.update_global::<Settings, _>(|settings, _| settings.set_font_preview(preview));
+        Settings::apply_ui_font(cx);
+        cx.refresh_windows();
+        cx.notify();
     }
 
     fn change_font_size(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
@@ -1846,6 +1863,7 @@ impl Workspace {
             if let Some(grid) = self.tabs.get(self.active).and_then(|t| t.active_grid(cx)) {
                 out.push_str(&grid.describe(scale));
             }
+            out.push_str(&describe_fonts(cx));
             let view = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
             if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
                 out.push_str(&format!("--- link {}\n", link.uri));
@@ -1858,6 +1876,8 @@ impl Workspace {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&terminal.screen_text());
+        } else {
+            out.push_str(&describe_fonts(cx));
         }
         if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
             out.push_str(&find);
@@ -2351,6 +2371,13 @@ fn profile_menu_trigger(focus: FocusHandle) -> impl Fn(bool, &mut Window, &mut A
                 Tooltip::new("New tab from profile…").shortcut_opt(shortcut(&OpenProfilePicker, &focus, window))
             })
     }
+}
+
+/// The fonts in effect, preview included, for `--dump-screen-after`:
+/// `--- fonts terminal="…" ui="…"`, the families GPUI is asked for.
+fn describe_fonts(cx: &App) -> String {
+    let settings = Settings::get(cx);
+    format!("--- fonts terminal={:?} ui={:?}\n", settings.font().family.to_string(), settings.ui_font_family().to_string())
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
