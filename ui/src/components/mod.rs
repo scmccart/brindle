@@ -33,6 +33,7 @@
 pub mod button;
 pub mod card;
 pub mod checkbox;
+pub mod combobox;
 pub mod command;
 pub mod context_menu;
 pub mod dialog;
@@ -61,6 +62,9 @@ use crate::style::ring_geometry;
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
+pub use combobox::{
+    Combobox, ComboboxEvent, TriggerKey, checked_groups, option_at, option_labelled, panel_width, trigger_key,
+};
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
 pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};

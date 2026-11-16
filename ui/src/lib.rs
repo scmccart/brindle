@@ -28,7 +28,7 @@ pub use style::{
     tab_drag_style, tab_list_style, tab_style, toggle_style, tooltip_style,
 };
 pub use text_input::{TextInput, TextInputEvent};
-pub use theme::{ActiveTheme, Tokens, UiTheme};
+pub use theme::{ActiveFont, ActiveTheme, Tokens, UiFont, UiTheme};
 
 /// Sets the crate up in the app: it registers the keystroke observer that
 /// tracks focus-visible modality (`primitives::focus_visible`), and nothing

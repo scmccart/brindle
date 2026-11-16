@@ -1,8 +1,10 @@
 //! The settings dialog: an overlay over the window with a list of sections.
-//! Its sections are "Profiles" (list, edit, reorder and delete profiles) and
+//! Its sections are "Profiles" (list, edit, reorder and delete profiles),
 //! "Theme" (pick a theme with a live preview on the tabs behind the dialog,
-//! and create, edit, rename or delete custom themes). Changes are written to
-//! the config file with `config_edit`.
+//! and create, edit, rename or delete custom themes) and "Fonts" (the
+//! terminal font's family, size and line height and the chrome's family,
+//! previewed as they change). Changes are written to the config file with
+//! `config_edit`.
 //!
 //! [`Model`] holds the state and all the logic and has no GPUI dependency,
 //! so it is unit-tested; [`SettingsDialog`] is the view around it.
@@ -18,8 +20,8 @@ use gpui::{
 };
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Dialog, Dismiss, FocusRing as _, FocusStops, Input, Select,
-    TextInput, TextInputEvent, Tokens,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Combobox, Dialog, Dismiss, FocusRing as _, FocusStops, Input,
+    Select, TextInput, TextInputEvent, Tokens,
 };
 
 use crate::actions::{
@@ -28,9 +30,12 @@ use crate::actions::{
 use crate::config_edit;
 use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
 
+mod fonts;
 mod profiles;
 
-use crate::config::Profile;
+use crate::config::{FontConfig, Profile, UiFontConfig};
+use crate::settings::FontPreview;
+use fonts::FontsState;
 use profiles::ProfilesState;
 
 /// The dialog's sections, in the order they are listed.
@@ -38,15 +43,17 @@ use profiles::ProfilesState;
 pub enum Section {
     Profiles,
     Theme,
+    Fonts,
 }
 
-const SECTIONS: [Section; 2] = [Section::Profiles, Section::Theme];
+const SECTIONS: [Section; 3] = [Section::Profiles, Section::Theme, Section::Fonts];
 
 impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::Profiles => "Profiles",
             Section::Theme => "Theme",
+            Section::Fonts => "Fonts",
         }
     }
 }
@@ -277,13 +284,16 @@ fn selection_foreground_field() -> usize {
     SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1
 }
 
-/// What kind of view a section shows: its list, an editor, or the delete confirmation. A change of section or kind moves
-/// focus to the new view's first control.
+/// What kind of view a section shows: its list, an editor, the delete
+/// confirmation, or a form (Fonts: fields always editable, applied
+/// together). A change of section or kind moves focus to the new view's
+/// first control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeKind {
     List,
     Editor,
     ConfirmDelete,
+    Form,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +312,9 @@ pub enum Outcome {
     Written,
     /// The config file changed and the dialog is done.
     Applied,
+    /// Nothing was written and the dialog is done (an Apply with nothing
+    /// changed).
+    Close,
 }
 
 pub struct Model {
@@ -319,6 +332,9 @@ pub struct Model {
     profiles: ProfilesState,
     /// Profiles to list (read-only) when the file can't be parsed.
     fallback_profiles: Vec<Profile>,
+    fonts: FontsState,
+    /// The fonts to show (read-only) when the file can't be parsed.
+    fallback_fonts: (FontConfig, UiFontConfig),
 }
 
 impl Model {
@@ -330,6 +346,8 @@ impl Model {
         fallback_default: Option<String>,
     ) -> Self {
         let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
+        let fallback_fonts = (FontConfig::default(), UiFontConfig::default());
+        let fonts = FontsState::new(&config_path, &fallback_fonts, Vec::new());
         let mut model = Self {
             config_path,
             entries: Vec::new(),
@@ -341,11 +359,23 @@ impl Model {
             section: Section::Profiles,
             profiles,
             fallback_profiles,
+            fonts,
+            fallback_fonts,
         };
         model.reload_entries();
         let active = model.active.clone();
         model.selected = model.selectable_index(&active).or_else(|| model.selectable_index("brindle-dark")).unwrap_or(0);
         model
+    }
+
+    /// The Fonts section's fonts: `fallback`, the loaded config's, shown
+    /// read-only when the file can't be parsed, and the `installed`
+    /// families (GPUI's names), which decide what a family field shows and
+    /// lists.
+    pub fn with_fonts(mut self, fallback: (FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
+        self.fonts = FontsState::new(&self.config_path, &fallback, installed);
+        self.fallback_fonts = fallback;
+        self
     }
 
     /// Rereads the custom themes from the config file.
@@ -385,6 +415,10 @@ impl Model {
     }
 
     pub fn move_selection(&mut self, forward: bool) {
+        if self.section == Section::Fonts {
+            // The form's fields are focus stops: the view moves focus.
+            return;
+        }
         if self.section == Section::Profiles {
             self.profiles.move_selection(forward);
             self.error = None;
@@ -426,10 +460,14 @@ impl Model {
                     self.select(ix);
                 }
             }
+            Section::Fonts => {}
         }
     }
 
     pub fn select(&mut self, ix: usize) {
+        if self.section == Section::Fonts {
+            return;
+        }
         if self.section == Section::Profiles {
             self.profiles.select(ix);
             self.error = None;
@@ -454,8 +492,25 @@ impl Model {
         }
     }
 
-    /// Enter: apply in the list, save in the editor, delete when confirming.
+    /// Enter: apply in the list, save in the editor, delete when confirming,
+    /// apply the Fonts form.
     pub fn confirm(&mut self) -> Outcome {
+        if self.section == Section::Fonts {
+            return match self.fonts.apply(&self.config_path) {
+                Ok(fonts::Done::Written) => {
+                    self.error = None;
+                    Outcome::Applied
+                }
+                Ok(fonts::Done::Nothing) => {
+                    self.error = None;
+                    Outcome::Close
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    Outcome::Nothing
+                }
+            };
+        }
         if self.section == Section::Profiles {
             let result = match &self.profiles.mode {
                 profiles::Mode::List => {
@@ -476,6 +531,9 @@ impl Model {
 
     /// Escape: `true` when the whole dialog should close (cancel).
     pub fn cancel(&mut self) -> bool {
+        if self.section == Section::Fonts {
+            return true;
+        }
         if self.section == Section::Profiles {
             self.error = None;
             return match self.profiles.mode {
@@ -515,6 +573,9 @@ impl Model {
 
     /// New: a copy of the selected theme under an unused name.
     pub fn start_new(&mut self) {
+        if self.section == Section::Fonts {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -534,6 +595,9 @@ impl Model {
 
     /// Edit: a custom theme in place; a built-in is copied first.
     pub fn start_edit(&mut self) {
+        if self.section == Section::Fonts {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let themes = self.theme_names();
@@ -601,6 +665,9 @@ impl Model {
 
     /// Delete: asks for confirmation, or explains why the theme can't go.
     pub fn request_delete(&mut self) {
+        if self.section == Section::Fonts {
+            return;
+        }
         if self.section == Section::Profiles {
             if matches!(self.profiles.mode, profiles::Mode::List) {
                 let result = self.profiles.request_delete().map(|()| profiles::Done::Nothing);
@@ -648,8 +715,12 @@ impl Model {
         Outcome::Written
     }
 
-    /// List shortcuts. In the editor, keys belong to the text inputs.
+    /// List shortcuts. In the editor and the Fonts form, keys belong to the
+    /// fields.
     pub fn key(&mut self, ks: &Keystroke) -> bool {
+        if self.section == Section::Fonts {
+            return false;
+        }
         if self.section == Section::Profiles {
             let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
             if !plain || !matches!(self.profiles.mode, profiles::Mode::List) {
@@ -729,6 +800,7 @@ impl Model {
                 profiles::Mode::Editor(_) => ModeKind::Editor,
                 profiles::Mode::ConfirmDelete => ModeKind::ConfirmDelete,
             },
+            Section::Fonts => ModeKind::Form,
         }
     }
 
@@ -738,7 +810,8 @@ impl Model {
 
     /// Switches section, refused while an editor has unsaved edits. Leaving
     /// Theme drops an unapplied preview: its selection goes back to the
-    /// active theme.
+    /// active theme. Leaving Fonts drops its unapplied changes; it has no
+    /// editor, so it never holds the section.
     pub fn select_section(&mut self, section: Section) -> bool {
         if section == self.section {
             return true;
@@ -746,6 +819,7 @@ impl Model {
         let dirty = match self.section {
             Section::Theme => matches!(&self.mode, Mode::Editor(e) if e.dirty()),
             Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
+            Section::Fonts => false,
         };
         if dirty {
             self.error = Some("Save or discard the edits first".into());
@@ -762,10 +836,13 @@ impl Model {
                     self.profiles.discard();
                 }
             }
+            Section::Fonts => self.fonts.reset(),
         }
-        if section == Section::Profiles {
-            // Pick up edits made elsewhere since the dialog opened.
-            self.profiles.reload(&self.config_path, &self.fallback_profiles, None);
+        // Pick up edits made elsewhere since the dialog opened.
+        match section {
+            Section::Profiles => self.profiles.reload(&self.config_path, &self.fallback_profiles, None),
+            Section::Fonts => self.fonts.reload(&self.config_path, &self.fallback_fonts),
+            Section::Theme => {}
         }
         self.section = section;
         self.error = None;
@@ -830,6 +907,15 @@ impl Model {
         self.profiles_done(result)
     }
 
+    /// The fonts the window should preview: the Fonts section's valid,
+    /// unapplied changes, while it is shown.
+    pub fn font_preview(&self) -> Option<FontPreview> {
+        if self.section != Section::Fonts {
+            return None;
+        }
+        self.fonts.preview()
+    }
+
     /// The edited profile's name and the settings its tabs should preview.
     pub fn profile_preview(&self) -> Option<(String, Profile)> {
         if self.section != Section::Profiles {
@@ -843,9 +929,20 @@ impl Model {
         self.profiles.take_renames()
     }
 
-    /// Debug description for `--dump-screen-after`. `field` names the
-    /// focused control, which an editor reports as its `field=`.
+    /// [`Model::describe_open`] with no family list open.
+    #[cfg(test)]
     pub fn describe(&self, field: &str) -> String {
+        self.describe_open(field, None)
+    }
+
+    /// Debug description for `--dump-screen-after`. `field` names the
+    /// focused control, which an editor reports as its `field=`; `open` is
+    /// an open family list's field, search and highlighted option, for the
+    /// Fonts section's line.
+    pub fn describe_open(&self, field: &str, open: Option<(fonts::FontField, String, Option<String>)>) -> String {
+        if self.section == Section::Fonts {
+            return self.fonts.describe(&self.error, field, open);
+        }
         if self.section == Section::Profiles {
             return self.profiles.describe(&self.error, field);
         }
@@ -884,6 +981,8 @@ pub enum SettingsEvent {
     /// The config file was written; reload it, with these profile renames
     /// (old, new) applied to open tabs.
     ConfigWritten(Vec<(String, String)>),
+    /// Show these fonts in the window instead of the config's, or stop.
+    FontPreview(Option<FontPreview>),
 }
 
 /// The dialog's buttons, each with its own focus handle. A button the
@@ -969,6 +1068,7 @@ impl Btn {
 /// The footer buttons of each view, in Tab order (left to right).
 fn footer_buttons(section: Section, kind: ModeKind) -> &'static [Btn] {
     match (section, kind) {
+        (Section::Fonts, _) | (_, ModeKind::Form) => &[Btn::Cancel, Btn::Apply],
         (_, ModeKind::ConfirmDelete) => &[Btn::Keep, Btn::ConfirmDelete],
         (_, ModeKind::Editor) => &[Btn::Discard, Btn::Save],
         (Section::Theme, ModeKind::List) => &[Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply],
@@ -1023,6 +1123,16 @@ pub struct SettingsDialog {
     connect_handle: FocusHandle,
     profile_list_scroll: ScrollHandle,
     profile_editor_scroll: ScrollHandle,
+    /// The Fonts section's text inputs and family comboboxes; empty unless
+    /// it is shown.
+    font_inputs: Vec<(fonts::FontField, Entity<TextInput>)>,
+    font_choices: Vec<(fonts::FontField, Entity<Combobox>)>,
+    _font_subscriptions: Vec<Subscription>,
+    /// The installed families a family list offers, read when the Fonts
+    /// section is first shown.
+    font_names: Vec<String>,
+    /// What the last font preview showed, to tell when it changes.
+    font_previewed: Option<FontPreview>,
     /// The section and kind of view focus was last placed for.
     placed_for: (Section, ModeKind),
     /// The focused handle an editor last scrolled into view.
@@ -1055,6 +1165,7 @@ impl FocusStops for SettingsDialog {
                 }
             }
             (Section::Profiles, ModeKind::Editor) => stops.extend(self.profile_field_stops(cx)),
+            (Section::Fonts, _) => stops.extend(self.font_field_stops(cx)),
             _ => {}
         }
         stops.extend(
@@ -1098,21 +1209,27 @@ impl SettingsDialog {
             connect_handle: cx.focus_handle(),
             profile_list_scroll: ScrollHandle::new(),
             profile_editor_scroll: ScrollHandle::new(),
+            font_inputs: Vec::new(),
+            font_choices: Vec::new(),
+            _font_subscriptions: Vec::new(),
+            font_names: Vec::new(),
+            font_previewed: None,
             placed_for,
             scrolled_to: None,
         }
     }
 
     /// The dialog's `--dump-screen-after` line, with the focused control
-    /// as an editor's `field=`.
+    /// as an editor's `field=`, and an open family list's search.
     pub fn describe(&self, window: &Window, cx: &App) -> String {
-        self.model.describe(self.focused_label(window, cx))
+        self.model.describe_open(self.focused_label(window, cx), self.open_font_list(cx))
     }
 
-    /// The editor input that has keyboard focus.
+    /// The editor input that has keyboard focus, or a Fonts field's (an
+    /// open family list's search included).
     pub fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
         let mut inputs = self.fields.iter().chain(self.profile_inputs.iter().map(|(_, i)| i));
-        inputs.find(|f| f.read(cx).is_focused(window)).cloned()
+        inputs.find(|f| f.read(cx).is_focused(window)).cloned().or_else(|| self.focused_font_input(window, cx))
     }
 
     /// The name of the focused control: an editor field's label, a
@@ -1136,6 +1253,9 @@ impl SettingsDialog {
             s.is_open() || s.focus_handle(cx).is_focused(window)
         };
         if let Some((field, _)) = self.profile_selects.iter().find(|(_, s)| select_focused(s)) {
+            return field.label();
+        }
+        if let Some(field) = self.focused_font_field(window, cx) {
             return field.label();
         }
         if self.default_handle.is_focused(window) {
@@ -1178,6 +1298,7 @@ impl SettingsDialog {
             (Section::Profiles, Btn::Up) => editable && profiles.selected > 0,
             (Section::Profiles, Btn::Down) => editable && profiles.selected + 1 < profiles.entries.len(),
             (Section::Profiles, Btn::Save) => matches!(profiles.editor_result(), Some(Ok(_))),
+            (Section::Fonts, Btn::Apply) => model.fonts.can_apply() && model.fonts.read_only.is_none(),
             _ => true,
         }
     }
@@ -1188,12 +1309,14 @@ impl SettingsDialog {
         match (self.model.section(), self.model.mode_kind()) {
             (Section::Theme, ModeKind::Editor) => self.fields.iter().map(|f| f.focus_handle(cx)).collect(),
             (Section::Profiles, ModeKind::Editor) => self.profile_field_stops(cx),
+            (Section::Fonts, _) => self.font_field_stops(cx),
             _ => Vec::new(),
         }
     }
 
-    /// Where focus goes when a view opens: a list, an editor's name, or
-    /// (asking to confirm a delete) the dialog itself.
+    /// Where focus goes when a view opens: a list, an editor's name, the
+    /// Fonts section's first field, or (asking to confirm a delete) the
+    /// dialog itself.
     fn default_focus(&self, cx: &App) -> FocusHandle {
         match self.model.mode_kind() {
             ModeKind::List => self.list_handle.clone(),
@@ -1201,9 +1324,10 @@ impl SettingsDialog {
         }
     }
 
-    /// Whether a select's menu is open; it holds focus while it is.
+    /// Whether a select's menu or a family list is open; it holds focus
+    /// while it is.
     fn menu_open(&self, cx: &App) -> bool {
-        self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open())
+        self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open()) || self.font_list_open(cx)
     }
 
     /// Moves focus to the new view's first control when the section or the
@@ -1250,6 +1374,7 @@ impl SettingsDialog {
                     self.profile_list_scroll.scroll_to_item(self.model.profiles.selected);
                 }
             }
+            Section::Fonts => {}
         }
         cx.notify();
     }
@@ -1316,12 +1441,18 @@ impl SettingsDialog {
             self.profile_previewed = shown;
             cx.emit(SettingsEvent::ProfilePreview(profile));
         }
+        let fonts = self.model.font_preview();
+        if fonts != self.font_previewed {
+            self.font_previewed = fonts.clone();
+            cx.emit(SettingsEvent::FontPreview(fonts));
+        }
     }
 
     /// Creates the inputs when the editor opens and drops them when it
     /// closes. Focus follows in `place_focus`.
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_profile_fields(window, cx);
+        self.sync_font_fields(window, cx);
         let Some(texts) = self.model.editor_fields() else {
             self.fields.clear();
             self._field_subscriptions.clear();
@@ -1354,6 +1485,7 @@ impl SettingsDialog {
                 cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
                 cx.emit(DismissEvent);
             }
+            Outcome::Close => cx.emit(DismissEvent),
         }
     }
 
@@ -1380,7 +1512,7 @@ impl SettingsDialog {
     }
 
     fn move_up_down(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.mode_kind() == ModeKind::Editor {
+        if matches!(self.model.mode_kind(), ModeKind::Editor | ModeKind::Form) {
             // Nothing to move: the key goes on, unhandled.
             cx.propagate();
             return;
@@ -1745,6 +1877,7 @@ impl Render for SettingsDialog {
                 self.render_editor(&editor, cx)
             }
             (Section::Theme, _) => self.render_list(window, cx),
+            (Section::Fonts, _) => self.render_fonts(cx),
         };
         let current = self.model.section();
         // The section list is a vertical tab list: one Tab stop whose
@@ -1973,13 +2106,15 @@ background = "nope"
         assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Theme);
         assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Fonts);
+        assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Profiles);
         assert!(model.next_section(false));
-        assert_eq!(model.section(), Section::Theme);
+        assert_eq!(model.section(), Section::Fonts);
         assert!(model.edge_section(false));
         assert_eq!(model.section(), Section::Profiles);
         assert!(model.edge_section(true));
-        assert_eq!(model.section(), Section::Theme);
+        assert_eq!(model.section(), Section::Fonts);
     }
 
     #[test]
@@ -2227,6 +2362,7 @@ background = "nope"
             assert_eq!(footer_buttons(section, ModeKind::ConfirmDelete), [Btn::Keep, Btn::ConfirmDelete]);
         }
         assert_eq!(footer_buttons(Section::Profiles, ModeKind::List).last(), Some(&Btn::Close));
+        assert_eq!(footer_buttons(Section::Fonts, ModeKind::Form), [Btn::Cancel, Btn::Apply]);
         // Ids are unique, so the shared handles never meet in one view.
         let ids: std::collections::HashSet<_> = BUTTONS.iter().map(|b| b.id()).collect();
         assert_eq!(ids.len(), BUTTONS.len());
@@ -2272,17 +2408,89 @@ background = "nope"
         let f = Fixture::new("section-order", CONFIG);
         let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
-        assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme"]);
+        assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme", "Fonts"]);
         assert!(model.in_list());
         assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Theme);
         // The theme list shows the active theme.
         assert_eq!(model.selected_entry().unwrap().name, "mine");
         assert!(model.next_section(true));
+        assert_eq!(model.section(), Section::Fonts);
+        assert_eq!(model.mode_kind(), ModeKind::Form);
+        assert!(model.next_section(true));
         assert_eq!(model.section(), Section::Profiles);
         assert!(model.next_section(false));
-        assert_eq!(model.section(), Section::Theme);
+        assert_eq!(model.section(), Section::Fonts);
         assert_eq!(f.text(), CONFIG);
+    }
+
+    fn fonts_model(f: &Fixture) -> Model {
+        let installed = ["Cascadia Mono", "Consolas", "Inter"].map(String::from).to_vec();
+        let mut model = f.opened("mine").with_fonts((FontConfig::default(), UiFontConfig::default()), installed);
+        assert!(model.select_section(Section::Fonts));
+        model
+    }
+
+    /// The spec's "Leave Fonts unapplied": the preview ends and the fields
+    /// go back to the file's values.
+    #[test]
+    fn leaving_fonts_drops_the_changes() {
+        let f = Fixture::new("fonts-leave", "[font]\nsize = 13\n");
+        let mut model = fonts_model(&f);
+        assert_eq!(model.font_preview(), None);
+        model.fonts.set_text(fonts::FontField::Size, "18");
+        assert_eq!(model.font_preview(), Some(FontPreview { size: Some(18.0), ..Default::default() }));
+        assert!(model.describe("Size").starts_with("--- settings section=Fonts mode=form "), "{}", model.describe(""));
+        // Nothing holds the section.
+        assert!(model.select_section(Section::Theme));
+        assert_eq!(model.font_preview(), None);
+        assert!(model.in_list());
+        assert!(model.select_section(Section::Fonts));
+        assert_eq!(model.fonts.size, "13");
+        assert_eq!(model.font_preview(), None);
+        assert_eq!(f.text(), "[font]\nsize = 13\n");
+        // Escape closes the dialog; the view ends the preview.
+        assert!(model.cancel());
+    }
+
+    /// Fonts are reread from the file each time the section is shown.
+    #[test]
+    fn entering_fonts_rereads_the_file() {
+        let f = Fixture::new("fonts-reread", "[font]\nsize = 13\n");
+        let mut model = fonts_model(&f);
+        model.select_section(Section::Theme);
+        std::fs::write(&f.path, "[font]\nsize = 15\n[ui_font]\nfamily = [\"Inter\"]\n").unwrap();
+        model.select_section(Section::Fonts);
+        assert_eq!(model.fonts.size, "15");
+        assert_eq!(model.fonts.ui, crate::settings::FamilyChoice::Family("Inter".into()));
+    }
+
+    /// Apply writes and closes; Apply with nothing changed closes without
+    /// writing; an invalid field keeps the dialog with the error.
+    #[test]
+    fn applying_fonts() {
+        let f = Fixture::new("fonts-apply", "# mine\n[font]\nsize = 13\n");
+        let mut model = fonts_model(&f);
+        assert_eq!(model.confirm(), Outcome::Close);
+        assert_eq!(f.text(), "# mine\n[font]\nsize = 13\n");
+        model.fonts.set_text(fonts::FontField::Size, "200");
+        assert_eq!(model.confirm(), Outcome::Nothing);
+        assert!(model.error.is_some());
+        assert_eq!(f.text(), "# mine\n[font]\nsize = 13\n");
+        model.fonts.set_text(fonts::FontField::Size, "20");
+        assert_eq!(model.confirm(), Outcome::Applied);
+        assert_eq!(model.error, None);
+        assert_eq!(f.text(), "# mine\n[font]\nsize = 20\n");
+        // The list keys do nothing in the form.
+        let before = model.describe("");
+        model.move_selection(true);
+        model.select_edge(true);
+        assert!(!model.key(&Keystroke::parse("n").unwrap()));
+        model.start_new();
+        model.start_edit();
+        model.request_delete();
+        assert_eq!(model.describe(""), before);
+        assert_eq!(model.mode_kind(), ModeKind::Form);
     }
 
     #[test]

@@ -180,7 +180,10 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
 }
 
 pub fn self_test_latency() -> Result {
-    let text = "noise\n--- latency samples=200 timeouts=2\n\
+    // A dump's lines may come first; its fonts line names families that
+    // could look like a stage (`output`).
+    let text = "noise\n--- grid origin=0,0 cell=8x16 scale=1\n--- fonts terminal=\"output\" ui=\"frame\"\n\
+                --- latency samples=200 timeouts=2\n\
                 output min=0.10 p50=0.40 p95=0.90 p99=1.50 max=3.00\n\
                 paint  min=1.00 p50=2.00 p95=3.00 p99=4.00 max=5.00\n\
                 frame  min=6.00 p50=7.00 p95=8.00 p99=9.00 max=10.00\n";

@@ -70,7 +70,7 @@ pub fn palette_run(ctx: &Ctx) -> Result<Outcome> {
 pub fn settings_tab(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "run")
         .action("open_settings")
-        .action("settings_section_prev")
+        .action("settings_section_next")
         .action("settings_new")
         .action("settings_next_field")
         .send("zz")

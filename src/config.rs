@@ -19,6 +19,8 @@ pub struct Config {
     /// Name of the profile used for new tabs and windows.
     pub default_profile: Option<String>,
     pub font: FontConfig,
+    /// The window chrome's font (tab strip, menus, dialogs).
+    pub ui_font: UiFontConfig,
     /// Name of the default theme (built-in or defined under `[themes]`).
     pub theme: String,
     pub scrollback_lines: usize,
@@ -53,6 +55,7 @@ impl Default for Config {
         Self {
             default_profile: None,
             font: FontConfig::default(),
+            ui_font: UiFontConfig::default(),
             theme: "brindle-dark".into(),
             scrollback_lines: 10_000,
             padding: 6.0,
@@ -70,7 +73,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct FontConfig {
     /// Font families in order of preference; the first one installed is used.
@@ -98,6 +101,17 @@ impl Default for FontConfig {
             line_height: 1.25,
         }
     }
+}
+
+/// `[ui_font]`: the chrome's font. Only a family list, like `[font]`'s: the
+/// first installed family wins, and an empty list (the default) leaves the
+/// choice to Brindle's built-in list (`settings::resolve_ui_family`). It has
+/// no size: the chrome's sizes are shadcn's, in rems.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiFontConfig {
+    /// Font families in order of preference; the first one installed is used.
+    pub family: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -430,6 +444,17 @@ mod tests {
         let config = Config::parse(DEFAULT_CONFIG).unwrap();
         assert!(!config.profiles.is_empty());
         assert_eq!(config.profiles[config.default_profile_index()].name, "Shell");
+    }
+
+    #[test]
+    fn ui_font_takes_a_family_list_and_nothing_else() {
+        let config = Config::parse("[ui_font]\nfamily = [\"Inter\", \"Segoe UI\"]").unwrap();
+        assert_eq!(config.ui_font.family, ["Inter", "Segoe UI"]);
+        let err = Config::parse("[ui_font]\nsize = 12").unwrap_err();
+        assert!(format!("{err:#}").contains("size"), "{err:#}");
+        // Without the table the list is empty, so the built-in list applies.
+        assert!(Config::parse("").unwrap().ui_font.family.is_empty());
+        assert!(Config::parse(DEFAULT_CONFIG).unwrap().ui_font.family.is_empty());
     }
 
     #[test]

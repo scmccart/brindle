@@ -35,7 +35,7 @@ use gpui::{
 
 use crate::components::Kbd;
 use crate::style::tooltip_style;
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveFont, ActiveTheme};
 
 /// What a tooltip shows: a label, and optionally a shortcut as keycaps.
 /// It also renders as an element, the tooltip's panel drawn in place (the
@@ -169,6 +169,9 @@ impl RenderOnce for Tooltip {
             .bg(style.background)
             .text_color(style.foreground)
             .text_size(style.text_size)
+            // Tooltips are roots of their own: they don't inherit the app's
+            // family.
+            .font_family(cx.ui_font())
             .font_weight(FontWeight::NORMAL)
             .whitespace_nowrap()
             .child(self.label)

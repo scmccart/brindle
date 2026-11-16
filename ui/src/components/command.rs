@@ -66,11 +66,14 @@ pub struct CommandItem {
     /// A disabled item is listed muted and can't be highlighted or
     /// confirmed.
     pub disabled: bool,
+    /// Drawn with a check at the right, as shadcn's combobox marks its
+    /// chosen value.
+    pub checked: bool,
 }
 
 impl CommandItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Self { label: label.into(), detail: None, shortcut: None, disabled: false }
+        Self { label: label.into(), detail: None, shortcut: None, disabled: false, checked: false }
     }
 
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
@@ -85,6 +88,11 @@ impl CommandItem {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
         self
     }
 }
@@ -558,7 +566,7 @@ impl Command {
                     return div().into_any_element();
                 };
                 let highlighted = self.rows.highlight() == Some(rank);
-                let disabled = item.disabled;
+                let (disabled, checked) = (item.disabled, item.checked);
                 let (label, detail, shortcut) = (item.label.clone(), item.detail.clone(), item.shortcut.clone());
                 div()
                     .id(("ui-command-item", item_ix))
@@ -600,6 +608,8 @@ impl Command {
                     .children(shortcut.map(|shortcut| {
                         div().flex_none().ml_auto().text_size(rems(0.75)).text_color(style.muted).child(shortcut)
                     }))
+                    // The combobox's `<Check className="ml-auto" />`.
+                    .when(checked, |d| d.child(div().flex_none().ml_auto().child(Icon::Check.size(rems(1.)))))
                     .into_any_element()
             }
         }
@@ -1082,6 +1092,8 @@ mod tests {
         assert_eq!(item.detail.as_ref().map(|s| s.as_ref()), Some("zones"));
         assert_eq!(item.shortcut.as_ref().map(|s| s.as_ref()), Some("ctrl-shift-r"));
         assert!(!item.disabled);
+        assert!(!item.checked);
+        assert!(CommandItem::new("Consolas").checked(true).checked);
         let group = CommandGroup::new("Panes", [item.clone()]);
         assert_eq!(group.heading.as_ref().map(|s| s.as_ref()), Some("Panes"));
         assert_eq!(group.items, [item]);
