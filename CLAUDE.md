@@ -103,7 +103,7 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/3   # every 3rd selected case, 
 
 ### Manual checks
 
-The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway.sh` (on Windows `scripts/run-throwaway.ps1`, which also sets a private `BRINDLE_SERVER_DIR` and `BRINDLE_SERVER_HELPER` (the `brindle-remote.exe` beside the binary), runs `brindle-remote stop` on exit unless `-Keep`, and takes `-Config FILE`, `-Keep` and `-BrindleArgs '-d','C:/Temp'`) to try them on a build without touching their config, saved session or terminal server (the shell script runs Brindle against a private config, state and server directory under `/tmp`, stops that server on exit, and takes `--config FILE`, `--keep` and `-- <brindle args>`; it opens a window, so it is theirs to run, not ours):
+The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway.sh` (on Windows `scripts/run-throwaway.ps1`, which also sets a private `BRINDLE_SERVER_DIR` and `BRINDLE_SERVER_HELPER` (the `brindle-remote.exe` beside the binary), runs `brindle-remote stop` on exit, `-Keep` included, and takes `-Config FILE`, `-Keep` and `-BrindleArgs '-d','C:/Temp'`) to try them on a build without touching their config, saved session or terminal server (the shell script runs Brindle against a private config, state and server directory under `/tmp`, stops that server on exit, and takes `--config FILE`, `--keep` and `-- <brindle args>`; it opens a window, so it is theirs to run, not ours):
 - IME composition: with IBus, ctrl-shift-u `e9` space gives `é`, in a terminal and in a palette;
 - wheel scrolling in local tabs;
 - dragging tabs to reorder them;
