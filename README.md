@@ -74,8 +74,9 @@ root's already has that name, Brindle runs nothing from it, leaves it alone and
 says so in the tab. It does not create or start containers.
 
 Official Windows archives include the static x86-64 Linux helper beside
-`brindle.exe`. For a Windows source build, build that helper in Docker and
-point Brindle at it:
+`brindle.exe`, and so does `scripts/install.ps1` (see "On Windows" below).
+To build that helper by hand for a Windows source build, build it in Docker
+and point Brindle at it:
 
 ```powershell
 docker run --rm -v "${PWD}:/src" -w /src rust:1.99.1 sh -c `
@@ -433,15 +434,15 @@ brindle --uninstall-desktop
 winget uninstall scmccart.brindle
 ```
 
-From a checkout, fetch the packaged ConPTY first, so the build embeds it, and
-put `brindle-remote.exe` (`cargo build --release` builds it) beside the
-installed `brindle.exe`, or point `BRINDLE_SERVER_HELPER` at it:
-
-```powershell
-scripts/fetch-conpty.ps1
-cargo install --locked --path .
-brindle --install-desktop
-```
+From a checkout, `scripts/install.ps1` does it all. It fetches the packaged
+ConPTY, builds `brindle.exe` and `brindle-remote.exe`, builds the matching
+Linux remote helper in Docker (Linux containers; `-RemoteAgent PATH` uses a
+helper you already have, which must be this version), and installs the three
+together in `%LOCALAPPDATA%\Programs\brindle` (`-Prefix DIR` picks another
+directory). It then adds that directory to your user `PATH` and creates the
+Start Menu shortcut. Re-run it to update. `scripts/uninstall.ps1` (with the
+same `-Prefix`) removes it all. Prefer it to `cargo install`, which leaves out
+the Linux helper, so remote profiles would upload a stale one or none.
 
 Releases aren't code-signed yet, so SmartScreen may stop the first start of a
 downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
