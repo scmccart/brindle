@@ -58,6 +58,7 @@ impl PaletteRow {
             detail: self.detail.clone(),
             shortcut: self.shortcut.clone(),
             disabled: self.disabled,
+            checked: false,
         }
     }
 }

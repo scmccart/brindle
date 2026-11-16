@@ -13,7 +13,7 @@
 ## 3. Settings dialog
 
 - [ ] 3.1 The installed-family list (design decision 3): a pure sort/filter/group function, unit-tested, plus the background monospace probe and its process global.
-- [ ] 3.1a `brindle_ui::Combobox` (design decision 4): Popover + Command, trigger styled as Select's, unit tests for its pure parts, a gallery entry and README listing in `ui/README.md`.
+- [x] 3.1a `brindle_ui::Combobox` (design decision 4): Popover + Command, trigger styled as Select's, unit tests for its pure parts, a gallery entry and README listing in `ui/README.md`.
 - [x] 3.1b `brindle_ui::UiFont` (design decision 8), set with the tokens, applied by brindle-ui's own roots and the workspace root.
 - [ ] 3.2 `FontsState` (design decision 5): reading, validation, preview, apply. Verify: unit tests for each settings-dialog scenario in the change's spec that the model decides (current values shown, size out of range, leave unapplied, choose a UI font, choose a listed fallback).
 - [ ] 3.3 The section in the view: `Section::Fonts` after Theme, its four fields, focus stops, footer, the `FontPreview` event, and the `--- settings` line (design decision 7). Update the existing section tests (`SECTIONS` labels, section cycling).
