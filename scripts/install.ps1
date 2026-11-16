@@ -61,7 +61,8 @@ try {
     }
     if (Get-Command docker -ErrorAction SilentlyContinue) {
         $dir = Split-Path -Parent $RemoteAgent
-        $said = docker run --rm -v "${dir}:/helper:ro" "rust:$rust" /helper/brindle-remote --version 2>&1
+        $leaf = Split-Path -Leaf $RemoteAgent
+        $said = docker run --rm -v "${dir}:/helper:ro" "rust:$rust" "/helper/$leaf" --version 2>&1
         if ($LASTEXITCODE -or "$said".Trim() -ne $version) {
             throw "install: $RemoteAgent prints '$said' for --version, not $version"
         }
