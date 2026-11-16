@@ -470,6 +470,105 @@ fn profile_name(table: &dyn TableLike) -> String {
     }
 }
 
+// ---- fonts --------------------------------------------------------------------
+
+/// The terminal font's table.
+pub const FONT_TABLE: &str = "font";
+/// The chrome font's table.
+pub const UI_FONT_TABLE: &str = "ui_font";
+
+/// `[<table>]` (`font` or `ui_font`), created when missing. A new
+/// `[ui_font]` is placed right after `[font]`.
+fn font_table_mut<'a>(doc: &'a mut DocumentMut, table: &str) -> &'a mut dyn TableLike {
+    if !doc.get(table).is_some_and(|i| i.is_table_like()) {
+        let mut new = Table::new();
+        if table == UI_FONT_TABLE
+            && let Some(position) = doc.get(FONT_TABLE).and_then(|i| i.as_table()).and_then(|t| t.position())
+        {
+            // Tables print in position order, and one of equal position
+            // after the tables before it in the document.
+            new.set_position(position);
+        }
+        doc.insert(table, Item::Table(new));
+    }
+    doc[table].as_table_like_mut().expect("font table")
+}
+
+/// Puts `family` first in `[<table>].family`, keeping the list's other
+/// entries after it (minus case-insensitive copies of `family`) as
+/// fallbacks, or, with `None` ("Default"), removes `family` so Brindle's
+/// built-in list applies. A table left empty goes too, unless it carries
+/// comments.
+pub fn set_font_family(doc: &mut DocumentMut, table: &str, family: Option<&str>) {
+    let Some(family) = family else {
+        let Some(t) = doc.get_mut(table).and_then(|i| i.as_table_like_mut()) else { return };
+        let Some(left) = remove_keeping_comments(t, "family") else { return };
+        let empty = t.is_empty();
+        let Some(t) = doc.get_mut(table).and_then(|i| i.as_table_mut()) else {
+            // Dotted keys or an inline table: no header to keep comments on.
+            if empty {
+                doc.remove(table);
+            }
+            return;
+        };
+        if !empty && left.is_empty() {
+            return;
+        }
+        // Comments with no key after them to go to are kept above the
+        // header; an empty table without comments goes.
+        let header = t.decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
+        if !empty || header.contains('#') || !left.is_empty() {
+            t.decor_mut().set_prefix(format!("{header}{left}"));
+        } else {
+            doc.remove(table);
+        }
+        return;
+    };
+    let t = font_table_mut(doc, table);
+    let mut list = Array::new();
+    list.push(family);
+    for other in t.get("family").and_then(|i| i.as_array()).into_iter().flat_map(|a| a.iter()) {
+        if let Some(other) = other.as_str().filter(|o| !o.eq_ignore_ascii_case(family)) {
+            list.push(other);
+        }
+    }
+    set_value(t, "family", Value::Array(list));
+}
+
+/// Sets `[font].<key>` (`size` or `line_height`), whole numbers without a
+/// fraction.
+pub fn set_font_number(doc: &mut DocumentMut, key: &str, value: f32) {
+    let value = if value.fract() == 0.0 && value.abs() < 1e9 {
+        Value::from(value as i64)
+    } else {
+        // The f32's shortest form, not its f64 widening (1.3, not 1.2999…).
+        Value::from(value.to_string().parse::<f64>().unwrap_or(value as f64))
+    };
+    set_value(font_table_mut(doc, FONT_TABLE), key, value);
+}
+
+/// Removes `key` from `table`, handing the comments above it to the next
+/// key in the table. Returns the comments no key took (empty when there
+/// were none, or a key took them), or `None` if `key` wasn't there.
+fn remove_keeping_comments(table: &mut dyn TableLike, key: &str) -> Option<String> {
+    let prefix = table.key(key)?.leaf_decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+    let next = keys.iter().skip_while(|k| *k != key).nth(1).cloned();
+    table.remove(key);
+    let comments: String = prefix.lines().filter(|l| l.trim_start().starts_with('#')).map(|l| format!("{l}\n")).collect();
+    if comments.is_empty() {
+        return Some(comments);
+    }
+    match next.and_then(|next| table.key_mut(&next)) {
+        Some(mut next) => {
+            let old = next.leaf_decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
+            next.leaf_decor_mut().set_prefix(format!("{comments}{old}"));
+            Some(String::new())
+        }
+        None => Some(comments),
+    }
+}
+
 /// Sets `key` to `value`, keeping the old value's surrounding whitespace and
 /// trailing comment.
 fn set_value(table: &mut dyn TableLike, key: &str, mut value: Value) {
@@ -954,5 +1053,92 @@ background = "nope"
         assert_eq!(names_of(&doc), ["Work", "Shell"]);
         move_profile(&mut doc, &ProfileRef { index: 0, name: Some("Work".into()) }, false).unwrap();
         assert_eq!(doc.to_string(), text);
+    }
+
+    #[test]
+    fn choosing_a_ui_font_adds_the_table_after_font_and_keeps_comments() {
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        set_font_family(&mut doc, UI_FONT_TABLE, Some("Inter"));
+        let text = doc.to_string();
+        let config = reparse(&doc);
+        assert_eq!(config.ui_font.family, ["Inter"]);
+        assert_eq!(config.font, crate::config::Config::parse(DEFAULT_CONFIG).unwrap().font);
+        assert!(text.contains("line_height = 1.25\n\n[ui_font]\nfamily = [\"Inter\"]\n"), "{text}");
+        // Every comment of the default config is still there.
+        for line in DEFAULT_CONFIG.lines().filter(|l| l.starts_with('#')) {
+            assert!(text.contains(line), "lost {line:?}");
+        }
+        // A config without [font] gets [ui_font] at its end.
+        let mut doc = parse(SAMPLE).unwrap();
+        set_font_family(&mut doc, UI_FONT_TABLE, Some("Inter"));
+        assert_eq!(doc.to_string(), format!("{SAMPLE}\n[ui_font]\nfamily = [\"Inter\"]\n"));
+    }
+
+    #[test]
+    fn choosing_a_listed_fallback_moves_it_to_the_front() {
+        let mut doc = parse("[font]\n# Mine.\nfamily = [\"JetBrains Mono\", \"Cascadia Mono\", \"Consolas\"] # in order\nsize = 13\n").unwrap();
+        set_font_family(&mut doc, FONT_TABLE, Some("consolas"));
+        assert_eq!(
+            doc.to_string(),
+            "[font]\n# Mine.\nfamily = [\"consolas\", \"JetBrains Mono\", \"Cascadia Mono\"] # in order\nsize = 13\n"
+        );
+        set_font_family(&mut doc, FONT_TABLE, Some("Cascadia Mono"));
+        assert_eq!(reparse(&doc).font.family, ["Cascadia Mono", "consolas", "JetBrains Mono"]);
+        // A family not in the list goes in front of all of it.
+        let mut doc = parse("[font]\nfamily = [\"JetBrains Mono\", \"Cascadia Mono\"]\n").unwrap();
+        set_font_family(&mut doc, FONT_TABLE, Some("Consolas"));
+        assert_eq!(reparse(&doc).font.family, ["Consolas", "JetBrains Mono", "Cascadia Mono"]);
+    }
+
+    #[test]
+    fn default_removes_family_and_an_emptied_table() {
+        // The comment above `family` goes to the next key.
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        set_font_family(&mut doc, FONT_TABLE, None);
+        let text = doc.to_string();
+        assert!(text.contains("[font]\n# First installed family wins.\nsize = 14\nline_height = 1.25\n"), "{text}");
+        assert_eq!(reparse(&doc).font.family, crate::config::FontConfig::default().family);
+
+        // An emptied table goes, with nothing else changed.
+        let mut doc = parse(SAMPLE).unwrap();
+        set_font_family(&mut doc, UI_FONT_TABLE, Some("Inter"));
+        set_font_family(&mut doc, UI_FONT_TABLE, None);
+        assert_eq!(doc.to_string(), SAMPLE);
+        // Nothing to remove: nothing changes.
+        set_font_family(&mut doc, UI_FONT_TABLE, None);
+        assert_eq!(doc.to_string(), SAMPLE);
+
+        // A table with comments stays, empty, and keeps them.
+        let mut doc = parse("theme = \"x\"\n\n# My chrome font.\n[ui_font]\nfamily = [\"Inter\"]\n").unwrap();
+        set_font_family(&mut doc, UI_FONT_TABLE, None);
+        assert_eq!(doc.to_string(), "theme = \"x\"\n\n# My chrome font.\n[ui_font]\n");
+        // A comment above the last key, with none after it to take it, goes
+        // above the header.
+        let mut doc = parse("[font]\nsize = 13\n# Mine.\nfamily = [\"Iosevka\"]\n").unwrap();
+        set_font_family(&mut doc, FONT_TABLE, None);
+        assert_eq!(doc.to_string(), "# Mine.\n[font]\nsize = 13\n");
+        // Dotted keys work too.
+        let mut doc = parse("ui_font.family = [\"Inter\"]\nfont.size = 13\n").unwrap();
+        set_font_family(&mut doc, UI_FONT_TABLE, None);
+        assert_eq!(doc.to_string(), "font.size = 13\n");
+    }
+
+    #[test]
+    fn font_numbers_keep_comments_and_drop_needless_fractions() {
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        set_font_number(&mut doc, "size", 20.0);
+        set_font_number(&mut doc, "line_height", 1.3);
+        let text = doc.to_string();
+        assert!(text.contains("size = 20\nline_height = 1.3\n"), "{text}");
+        assert_eq!(text, DEFAULT_CONFIG.replace("size = 14\nline_height = 1.25\n", "size = 20\nline_height = 1.3\n"));
+        let config = reparse(&doc);
+        assert_eq!((config.font.size, config.font.line_height), (20.0, 1.3));
+        // A trailing comment stays; a missing table is made.
+        let mut doc = parse("[font]\nsize = 13 # big enough\n").unwrap();
+        set_font_number(&mut doc, "size", 12.5);
+        assert_eq!(doc.to_string(), "[font]\nsize = 12.5 # big enough\n");
+        let mut doc = parse("theme = \"x\"\n").unwrap();
+        set_font_number(&mut doc, "line_height", 1.0);
+        assert_eq!(doc.to_string(), "theme = \"x\"\n\n[font]\nline_height = 1\n");
     }
 }

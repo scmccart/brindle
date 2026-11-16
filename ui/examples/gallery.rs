@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Command, CommandEvent, CommandGroup, CommandItem,
+    ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Combobox, ComboboxEvent, Command,
+    CommandEvent, CommandGroup, CommandItem,
     ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
     MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
@@ -120,6 +121,16 @@ fn command_groups() -> Vec<CommandGroup> {
 /// The shells the gallery's select offers: `zsh` is disabled.
 fn shells() -> Vec<SelectOption> {
     vec!["bash".into(), "fish".into(), "foot".into(), SelectOption::new("zsh").disabled(true), "nu".into()]
+}
+
+/// The combobox's options: font families, monospace ones first under their
+/// own heading, as the settings dialog lists them.
+fn families() -> Vec<CommandGroup> {
+    vec![
+        CommandGroup::unnamed(["Default"]),
+        CommandGroup::new("Monospace", ["Cascadia Mono", "Consolas", "DejaVu Sans Mono", "JetBrains Mono"]),
+        CommandGroup::new("Other", ["Arial", "Cantarell", "DejaVu Sans", "Inter", "Segoe UI", "Ubuntu"]),
+    ]
 }
 
 /// The context menu's entries: a tab's menu, as Brindle's (Move Tab Left
@@ -301,6 +312,9 @@ pub struct Gallery {
     shell_changes: Vec<usize>,
     editor: Entity<Select>,
     off: Entity<Select>,
+    family: Entity<Combobox>,
+    /// Every `ComboboxEvent::Changed` from `family`, in order.
+    family_changes: Vec<usize>,
     command: Entity<Command>,
     /// What the inline command list reported, in order.
     command_log: Vec<String>,
@@ -374,6 +388,11 @@ impl Gallery {
         let editor = cx.new(|cx| Select::new(["vim", "emacs", "nano"], None, cx).with_placeholder("Pick an editor…"));
         let off = cx.new(|cx| Select::new(["unavailable"], Some(0), cx));
         off.update(cx, |select, cx| select.set_disabled(true, window, cx));
+        let family = cx.new(|cx| {
+            Combobox::new(families(), Some(0), cx)
+                .with_search_placeholder("Search fonts…")
+                .with_empty_message("No font found.")
+        });
         let command = cx.new(|cx| Command::new(command_groups(), cx));
         // Focus starts on the gallery itself, inside its focus scope, so the
         // first Tab reaches the first control.
@@ -383,6 +402,11 @@ impl Gallery {
             cx.subscribe(&shell, |this, _, event: &SelectEvent, cx| {
                 let SelectEvent::Changed(ix) = *event;
                 this.shell_changes.push(ix);
+                cx.notify();
+            }),
+            cx.subscribe(&family, |this, _, event: &ComboboxEvent, cx| {
+                let ComboboxEvent::Changed(ix) = *event;
+                this.family_changes.push(ix);
                 cx.notify();
             }),
             cx.subscribe(&command, |this, command, event: &CommandEvent, cx| {
@@ -429,6 +453,8 @@ impl Gallery {
             shell_changes: Vec::new(),
             editor,
             off,
+            family,
+            family_changes: Vec::new(),
             command,
             command_log: Vec::new(),
             dialog: Overlay::modal(),
@@ -504,6 +530,7 @@ impl Gallery {
         self.command_dialog.close(window, cx);
         self.shell.update(cx, |select, cx| select.close(window, cx));
         self.editor.update(cx, |select, cx| select.close(window, cx));
+        self.family.update(cx, |combobox, cx| combobox.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.dropdown.update(cx, |menu, cx| menu.close(window, cx));
         self.long_dropdown.update(cx, |menu, cx| menu.close(window, cx));
@@ -649,6 +676,15 @@ impl Gallery {
                     .child(div().w(px(220.)).child(self.editor.clone()))
                     .child(div().w(px(160.)).child(self.off.clone())),
             )
+    }
+
+    fn combobox_section(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Combobox", cx))
+            .child(div().w(px(260.)).child(recorded(self.family.clone(), "family", &self.records)))
     }
 
     fn command_section(&self, cx: &mut Context<Self>) -> Div {
@@ -1261,6 +1297,12 @@ impl Gallery {
                 self.shell_changes.len(),
                 if self.shell_changes.len() == 1 { "" } else { "s" }
             ))
+            .child(format!(
+                "Combobox: {} ({} change{})",
+                self.family.read(cx).selected_label().map_or("—", |label| label.as_ref()),
+                self.family_changes.len(),
+                if self.family_changes.len() == 1 { "" } else { "s" }
+            ))
             .child(format!("Command: {}", self.command_log.last().map_or("—", String::as_str)))
             .child(format!("Menu: {}", self.menu_log.last().map_or("—", String::as_str)))
             .child(format!("Tabs: {}", self.tab_log.last().map_or("—", String::as_str)))
@@ -1313,6 +1355,7 @@ impl FocusStops for Gallery {
         let mut stops = named(&["theme", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog", "command-popover", "behind"]);
         stops.push(self.shell.focus_handle(cx));
         stops.push(self.editor.focus_handle(cx));
+        stops.push(self.family.focus_handle(cx));
         stops.extend(named(&["dropdown-trigger", "long-dropdown-trigger"]));
         stops.push(self.command.focus_handle(cx));
         for variant in ButtonVariant::ALL {
@@ -1345,6 +1388,7 @@ impl Render for Gallery {
             .child(self.header(cx))
             .child(self.overlays_section(cx))
             .child(self.selects_section(cx))
+            .child(self.combobox_section(cx))
             .child(self.menus_section(cx))
             .child(self.command_section(cx))
             .child(self.buttons_section(cx))

@@ -24,6 +24,9 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   clicking one takes you to its tab.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
+- **Fonts**: the terminal font's family, size and line height, and the family of
+  the tab strip, dialogs and menus, picked from your installed fonts in the
+  settings dialog with a live preview.
 
 ## Remote hosts and containers
 
@@ -74,8 +77,9 @@ root's already has that name, Brindle runs nothing from it, leaves it alone and
 says so in the tab. It does not create or start containers.
 
 Official Windows archives include the static x86-64 Linux helper beside
-`brindle.exe`. For a Windows source build, build that helper in Docker and
-point Brindle at it:
+`brindle.exe`, and so does `scripts/install.ps1` (see "On Windows" below).
+To build that helper by hand for a Windows source build, build it in Docker
+and point Brindle at it:
 
 ```powershell
 docker run --rm -v "${PWD}:/src" -w /src rust:1.99.1 sh -c `
@@ -433,15 +437,15 @@ brindle --uninstall-desktop
 winget uninstall scmccart.brindle
 ```
 
-From a checkout, fetch the packaged ConPTY first, so the build embeds it, and
-put `brindle-remote.exe` (`cargo build --release` builds it) beside the
-installed `brindle.exe`, or point `BRINDLE_SERVER_HELPER` at it:
-
-```powershell
-scripts/fetch-conpty.ps1
-cargo install --locked --path .
-brindle --install-desktop
-```
+From a checkout, `scripts/install.ps1` does it all. It fetches the packaged
+ConPTY, builds `brindle.exe` and `brindle-remote.exe`, builds the matching
+Linux remote helper in Docker (Linux containers; `-RemoteAgent PATH` uses a
+helper you already have, which must be this version), and installs the three
+together in `%LOCALAPPDATA%\Programs\brindle` (`-Prefix DIR` picks another
+directory). It then adds that directory to your user `PATH` and creates the
+Start Menu shortcut. Re-run it to update. `scripts/uninstall.ps1` (with the
+same `-Prefix`) removes it all. Prefer it to `cargo install`, which leaves out
+the Linux helper, so remote profiles would upload a stale one or none.
 
 Releases aren't code-signed yet, so SmartScreen may stop the first start of a
 downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
@@ -470,6 +474,19 @@ own instead, restoring nothing and recording nothing. Brindles with different
 On first launch Brindle writes a commented config to
 `~/.config/brindle/config.toml`. The file is reloaded automatically when it changes.
 
+Fonts are two tables. `[font]` is the terminal's: `family` (a list, the first
+installed one is used), `size` (4 to 96) and `line_height` (0.8 to 3.0).
+`[ui_font]` is the chrome's (the tab strip, zone headers, dialogs, menus and
+tooltips) and takes only `family`, a list too; without one installed, Brindle
+uses the first installed of Inter, Cantarell, Ubuntu Sans, Ubuntu, Noto Sans,
+DejaVu Sans, Liberation Sans, Segoe UI Variable Text and Segoe UI, else the
+system's UI font:
+
+```toml
+[ui_font]
+family = ["Inter", "Segoe UI"]
+```
+
 | Keys | Action |
 |---|---|
 | ctrl-shift-t / ctrl-shift-w | new / close tab |
@@ -489,7 +506,7 @@ On first launch Brindle writes a commented config to
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
-| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor) |
+| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor, fonts) |
 | ctrl-, | edit config |
 
 The `⌄` button at the end of the tab strip opens the profile menu: every profile
@@ -513,7 +530,7 @@ and `focus_tab_strip` to put keyboard focus on the tab strip, where left/right
 (wrapping), home and end switch tabs and enter or escape go back to the
 terminal.
 
-The settings dialog has two sections: Profiles and Theme. The section
+The settings dialog has three sections: Profiles, Theme and Fonts. The section
 list is the dialog's first Tab stop (shift-tab from where the dialog opens):
 there up/down change the section at once (wrapping) and home/end go to the
 first or last, then tab goes into the section. ctrl-tab and ctrl-pagedown
@@ -546,6 +563,18 @@ engine) works like a select: enter, space, up or down opens its menu, where
 up/down move, enter picks and escape closes the menu; left and right do nothing.
 Otherwise escape discards the editor's changes and goes back to the list. A
 click outside the dialog doesn't close it.
+
+The Fonts section has four fields, always editable: Terminal font, Size, Line
+height and UI font. A font field shows the first installed family of its
+config list, or "Default" for Brindle's own list; it opens like a select, onto a
+searchable list of your installed families (the terminal font's lists the
+monospace ones first, once Brindle has measured them): type to filter, up/down
+move, enter picks and escape closes the list. Every valid change shows in the
+window at once, a profile's own font size still winning on its tabs. Apply (or
+enter in Size or Line height) writes the changed values and closes the dialog:
+a chosen family goes to the front of that table's `family` list, keeping the
+others after it as fallbacks, and "Default" removes the list. Cancel, escape
+or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
 

@@ -632,6 +632,8 @@ pub struct Dump {
     /// The active terminal's `TermMode(...)` flags, as printed.
     pub mode: String,
     pub grid: Option<Grid>,
+    /// The families in effect, preview included (`--- fonts`).
+    pub fonts: Option<Fonts>,
     /// The link under the mouse while hover feedback shows (`--- link`).
     pub link: Option<String>,
     pub screen: Vec<String>,
@@ -672,6 +674,18 @@ pub struct Dump {
     pub wait_pending: Vec<String>,
 }
 
+/// `--- fonts terminal="DejaVu Sans Mono" ui="Inter"`
+#[derive(Debug, PartialEq)]
+pub struct Fonts {
+    pub terminal: String,
+    pub ui: String,
+}
+
+fn parse_fonts(rest: &str) -> Option<Fonts> {
+    let (terminal, ui) = rest.strip_prefix("terminal=")?.rsplit_once(" ui=")?;
+    Some(Fonts { terminal: unquote(terminal)?, ui: unquote(ui)? })
+}
+
 /// `--- input text="split" cursor=4 selection=4..4`
 #[derive(Debug, PartialEq)]
 pub struct Input {
@@ -707,6 +721,8 @@ impl Dump {
                 in_screen = true;
             } else if let Some(rest) = line.strip_prefix("--- grid ") {
                 dump.grid = parse_grid(rest);
+            } else if let Some(rest) = line.strip_prefix("--- fonts ") {
+                dump.fonts = parse_fonts(rest);
             } else if let Some(rest) = line.strip_prefix("--- link ") {
                 dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- selection ") {
@@ -779,6 +795,10 @@ impl Dump {
     pub fn grid(&self) -> Result<Grid> {
         self.grid.ok_or_else(|| "no grid line in the dump".to_string())
     }
+
+    pub fn fonts(&self) -> Result<&Fonts> {
+        self.fonts.as_ref().ok_or_else(|| "no fonts line in the dump".to_string())
+    }
 }
 
 /// Undoes the Rust `{:?}` quoting of a string (the escapes it produces
@@ -824,8 +844,11 @@ fn parse_grid(text: &str) -> Option<Grid> {
 pub fn self_test_dump() -> Result {
     let dump = Dump::parse(
         "--- tab 1 \"bash\" (active)\n--- tab 2 \"vi\"\n--- screen 56x32 mode TermMode(SHOW_CURSOR)\n\
-         --- grid origin=6,51.5 cell=8.4x18 scale=2\nhello   \n\nworld\n\n\n",
+         --- grid origin=6,51.5 cell=8.4x18 scale=2\n--- fonts terminal=\"DejaVu Sans Mono\" ui=\".SystemUIFont\"\n\
+         hello   \n\nworld\n\n\n",
     );
+    let fonts = Fonts { terminal: "DejaVu Sans Mono".into(), ui: ".SystemUIFont".into() };
+    ensure!(dump.fonts == Some(fonts), "fonts {:?}", dump.fonts);
     ensure!(dump.tabs == [("bash".into(), true), ("vi".into(), false)], "tabs {:?}", dump.tabs);
     ensure!(dump.size == Some((56, 32)), "size {:?}", dump.size);
     ensure!(dump.mode == "TermMode(SHOW_CURSOR)", "mode {:?}", dump.mode);
@@ -840,6 +863,11 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.link.as_deref() == Some("https://example.com/a"), "link {:?}", dump.link);
     ensure!(dump.screen == ["see https://example.com/a"], "screen with a link {:?}", dump.screen);
+    ensure!(dump.fonts.is_none(), "fonts {:?}", dump.fonts);
+    // With no terminal, the fonts line follows the tabs.
+    let dump = Dump::parse("--- tab 1 \"x\" (active)\n--- fonts terminal=\"Cascadia Mono\" ui=\"Segoe UI\"\n");
+    ensure!(dump.fonts().map(|f| f.ui.as_str()) == Ok("Segoe UI"), "fonts without a terminal {:?}", dump.fonts);
+    ensure!(dump.screen.is_empty(), "screen without a terminal {:?}", dump.screen);
     ensure!(dump.selection.is_none(), "selection {:?}", dump.selection);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- selection \"one\\ntwo \\\"q\\\" \\u{1b}\"\nhi\n",

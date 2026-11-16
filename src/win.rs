@@ -78,6 +78,25 @@ pub fn unregister_app_id() -> windows::core::Result<()> {
     }
 }
 
+/// Whether DirectWrite's system font collection (the one GPUI lists) has a
+/// family named `family`, in any of its localized names.
+pub fn has_font_family(family: &str) -> bool {
+    use windows::Win32::Graphics::DirectWrite::{DWRITE_FACTORY_TYPE_SHARED, DWriteCreateFactory, IDWriteFactory};
+    let found = || -> windows::core::Result<bool> {
+        // SAFETY: plain DirectWrite calls with valid out-pointers.
+        unsafe {
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let mut collection = None;
+            factory.GetSystemFontCollection(&mut collection, false)?;
+            let Some(collection) = collection else { return Ok(false) };
+            let (mut index, mut exists) = (0, windows::core::BOOL::default());
+            collection.FindFamilyName(&windows::core::HSTRING::from(family), &mut index, &mut exists)?;
+            Ok(exists.as_bool())
+        }
+    };
+    found().unwrap_or(false)
+}
+
 /// The window's HWND.
 pub fn hwnd(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};

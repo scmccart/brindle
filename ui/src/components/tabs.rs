@@ -64,7 +64,7 @@ use crate::style::{
     ButtonSize, ButtonVariant, TAB_DRAG_MAX_WIDTH, TAB_LINE_WIDTH, TabColors, TabWidth, tab_drag_style, tab_list_style,
     tab_style,
 };
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveFont, ActiveTheme};
 
 /// Where a key moves focus in a tab list: Radix's roving-focus intents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +206,8 @@ impl Render for DraggedTab {
             .bg(style.background)
             .text_color(style.foreground)
             .text_size(gpui::rems(0.875))
+            // A root of its own: it doesn't inherit the app's family.
+            .font_family(cx.ui_font())
             // gpui lays the dragged view out at its min-content size, where
             // wrapping text would break at every word: the label's unwrapped
             // copy sizes it and the cut text is laid over it.

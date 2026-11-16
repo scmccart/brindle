@@ -10,6 +10,7 @@ mod cards;
 mod colors;
 mod commands;
 mod dump;
+mod fonts;
 mod input;
 mod instance;
 mod links;
@@ -80,6 +81,8 @@ fn unix() -> Vec<Case> {
         display("settings-enter-on-button", settings::enter_on_button),
         display("settings-section-shortcuts", settings::section_shortcuts),
         display("settings-section-list", settings::section_list),
+        display("settings-fonts", fonts::settings_fonts),
+        display("ui-font-config", fonts::ui_font_config),
         display("multi-process-local", multi_window::second_process_local),
         display("input-palette", input::palette),
         display("input-palette-run", input::palette_run),

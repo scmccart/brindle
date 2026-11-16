@@ -256,15 +256,19 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// What an SSH host's `sh` runs for a relay: the cached helper, when it is
-/// there and says it is this version, else exit [`NOT_CACHED`]. It isn't a
-/// login shell, whose startup files could print into the framed stream. The
-/// path is a positional parameter, not a variable: a variable that the
-/// user's environment already had would be changed for the relay, and the
-/// relay's environment is its sessions'.
+/// there and says it is this version, else exit [`NOT_CACHED`]. A helper
+/// that is there but says something else (another build, or an exec error
+/// for another architecture) has what it said written to stderr, which the
+/// error after a deployment shows. It isn't a login shell, whose startup
+/// files could print into the framed stream. The path and the answer are
+/// positional parameters, not variables: a variable that the user's
+/// environment already had would be changed for the relay, and the relay's
+/// environment is its sessions'.
 fn ssh_launch_script(helper: &Helper) -> String {
     format!(
-        "set -- \"{path}\"; if test -x \"$1\" && test \"$(\"$1\" --version)\" = {version}; \
-         then exec \"$1\" relay; fi; exit {NOT_CACHED}",
+        "set -- \"{path}\"; if test -x \"$1\"; then set -- \"$1\" \"$(\"$1\" --version 2>&1)\"; \
+         if test \"$2\" = {version}; then exec \"$1\" relay; fi; \
+         echo \"$1 --version printed: $2\" >&2; fi; exit {NOT_CACHED}",
         path = helper.ssh_path(),
         version = helper.version,
     )
@@ -401,8 +405,9 @@ fn unlaunched(target: &RemoteTarget, unstarted: Unstarted) -> anyhow::Error {
 fn undeployed(target: &RemoteTarget, helper: &Helper, again: &Unstarted) -> anyhow::Error {
     let what = match target {
         RemoteTarget::Ssh { .. } => format!(
-            "the helper was uploaded, but running it on the host doesn't print version {}: \
-             it must be this Brindle's helper, built for the host's Linux",
+            "the helper {} was uploaded, but on the host it doesn't print version {}: \
+             replace it with this Brindle's Linux helper, built for the host's architecture",
+            helper.local.display(),
             helper.version
         ),
         RemoteTarget::Container { .. } => format!(
@@ -497,7 +502,7 @@ mod tests {
     /// The cache directory of [`helper`] in a container.
     const CACHE: &str = "/tmp/brindle-helper-1.2.3-abc123";
     /// The SSH launch script for [`helper`].
-    const SSH_LAUNCH: &str = r#"set -- "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote"; if test -x "$1" && test "$("$1" --version)" = 1.2.3; then exec "$1" relay; fi; exit 97"#;
+    const SSH_LAUNCH: &str = r#"set -- "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote"; if test -x "$1"; then set -- "$1" "$("$1" --version 2>&1)"; if test "$2" = 1.2.3; then exec "$1" relay; fi; echo "$1 --version printed: $2" >&2; fi; exit 97"#;
     /// The SSH upload script for [`helper`].
     const SSH_UPLOAD: &str = r#"umask 077; mkdir -p "$HOME/.cache/brindle/1.2.3-abc123" && tmp="$HOME/.cache/brindle/1.2.3-abc123/brindle-remote.tmp.$$" && cat > "$tmp" && chmod 700 "$tmp" && mv "$tmp" "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote""#;
 
@@ -803,10 +808,18 @@ mod tests {
 
     #[test]
     fn a_helper_that_still_is_not_there_after_deploying_is_an_error() {
-        let said = "sh: 1: /home/dev/.cache/brindle/1.2.3-abc123/brindle-remote: Exec format error";
+        let said = "/home/dev/.cache/brindle/1.2.3-abc123/brindle-remote --version printed: 1.2.2";
         let host = Scripted::new([Err(exited(NOT_CACHED, "")), Err(exited(NOT_CACHED, said))], [(0, "")]);
         let error = host.launch(&ssh_host()).unwrap_err().to_string();
-        assert!(error.starts_with("the helper was uploaded, but running it on the host doesn't print version 1.2.3"), "{error}");
+        // It names the local file that was uploaded, and what the host's copy said.
+        let local = PathBuf::from("helpers/brindle-remote-linux");
+        assert!(
+            error.starts_with(&format!(
+                "the helper {} was uploaded, but on the host it doesn't print version 1.2.3",
+                local.display()
+            )),
+            "{error}"
+        );
         assert!(error.ends_with(said), "{error}");
         // Deployed once, launched twice.
         assert_eq!(host.log().len(), 3);

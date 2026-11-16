@@ -491,6 +491,73 @@ mod tests {
         assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
+    /// `REPARENT` goes out again after a real reconnect: the core's
+    /// connection drops, Brindle connects again with its token, and the
+    /// (new) core's replay of the session is followed by the window it had.
+    #[test]
+    fn a_reparent_is_sent_again_after_the_link_drops_and_reconnects() {
+        let dir = temp_dir("reparent-reconnect");
+        let listener = Listener::bind(&dir);
+        let (tx, core) = mpsc::channel();
+        std::thread::spawn(move || {
+            let welcome = |stream: &mut Stream| {
+                let ToCore::Hello(_) = ToCore::decode(&Frame::read_from(stream).unwrap()).unwrap() else {
+                    panic!("not HELLO")
+                };
+                let welcome = Welcome {
+                    protocol: 1,
+                    core_version: "0.0.0".into(),
+                    core_build: "test".into(),
+                    pid: std::process::id(),
+                    holder_protocols: vec![2],
+                };
+                send(stream, ToClient::Welcome(welcome));
+            };
+            // The first core: starts session 7, takes its REPARENT, and goes.
+            let mut stream = listener.accept();
+            welcome(&mut stream);
+            loop {
+                let message = ToCore::decode(&Frame::read_from(&mut stream).unwrap()).unwrap();
+                if let ToCore::Spawn(spawn) = &message {
+                    send(&mut stream, ToClient::Spawned(Spawned { req: spawn.req, session: 7, pid: 4242, key: "k7".into() }));
+                }
+                let done = matches!(message, ToCore::Reparent(_));
+                tx.send((1, message)).unwrap();
+                if done {
+                    break;
+                }
+            }
+            drop(stream);
+            // The next core: replays the session it still has when asked.
+            let mut stream = listener.accept();
+            welcome(&mut stream);
+            while let Ok(frame) = Frame::read_from(&mut stream) {
+                let message = ToCore::decode(&frame).unwrap();
+                if let ToCore::List(list) = &message {
+                    send(&mut stream, ToClient::ReplayStart(client::ReplayStart { req: None, session: 7, pid: 4242 }));
+                    send(&mut stream, ToClient::ReplayEnd(client::SessionRef { session: 7 }));
+                    let info = client::SessionInfo { session: 7, attached: true, ..Default::default() };
+                    send(&mut stream, ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
+                }
+                if tx.send((2, message)).is_err() {
+                    break;
+                }
+            }
+        });
+        let (tab_tx, tab) = mpsc::channel();
+        let session = Session::start_with(connector(&dir), request(), Box::new(Recorder(tab_tx)));
+        session.reparent(0x1234);
+        let next = || core.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(matches!(next(), (1, ToCore::Spawn(_))));
+        let reparent = client::Reparent { session: 7, hwnd: 0x1234 };
+        assert_eq!(next(), (1, ToCore::Reparent(reparent.clone())));
+        assert!(matches!(next(), (2, ToCore::List(_))));
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "replay false");
+        assert_eq!(next(), (2, ToCore::Reparent(reparent)));
+        session.close();
+    }
+
     #[test]
     fn an_attach_gets_the_replay_then_live_output_and_queued_input() {
         let dir = temp_dir("attach");

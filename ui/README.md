@@ -21,7 +21,11 @@ rule, not a convenience.
   plus border, input, ring and the radius), held in the `UiTheme` global and
   read through `cx.ui_theme()` (`ActiveTheme`). `Tokens::neutral_light()` and
   `neutral_dark()` are shadcn's neutral sets. Mapping a terminal theme to
-  tokens is the app's job.
+  tokens is the app's job. Beside it, the `UiFont` global holds the chrome's
+  font family, read through `cx.ui_font()` (`ActiveFont`; GPUI's
+  `.SystemUIFont` while unset). The app sets it with the tokens
+  (`UiFont::set`) and on its own root; the crate's roots that GPUI draws
+  apart from the app's tree (tooltips, the dragged tab) apply it themselves.
 - **Styles** (`style.rs`): variants and sizes as enums, resolved by pure
   functions (`button_style`, `input_style`, …), the role `cva` plays in
   shadcn. Sizes are in rems, so everything follows the window's text size.
@@ -152,9 +156,18 @@ rule, not a convenience.
       border with no clipping. Refine its layout (`size_full`, `flex_1`)
       through `Styled`.
   - entities the owner creates, keeps and subscribes to: `Select`
-    (`SelectEvent::Changed`, only on a change) and `Command`
+    (`SelectEvent::Changed`, only on a change), `Combobox`
+    (`ComboboxEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`
-    (`TextInputEvent::Changed`). `Command::set_groups(groups, keep, cx)`
+    (`TextInputEvent::Changed`). `Combobox` is shadcn's combobox, a popover
+    holding a `Command`: a trigger drawn as a select's that opens, below it
+    and at least its width, a searchable list of options in
+    `CommandGroup`s with the chosen one highlighted and checked
+    (`CommandItem::checked`); enter or a click chooses, escape or an outside
+    press closes, and a character typed on the closed trigger opens it
+    searching for that character. `Combobox::set_groups(groups, selected,
+    cx)` replaces the options, and an open list keeps its search and
+    highlighted option. `Command::set_groups(groups, keep, cx)`
     replaces the items and leaves the filter text alone: with `keep: None`
     the first enabled match is highlighted and the list returns to the top,
     and with `keep: Some(ix)`, an index across the new groups, that item
@@ -463,6 +476,21 @@ at the available height and scrolls. The differences:
 - **No submenus, checkbox or radio items, labels, groups, `inset` or
   `destructive` items, and no open or close animation beyond the fade** (see
   "Only opening animates"). Missing features.
+
+Combobox (shadcn's is its Popover with a Command inside, a recipe rather
+than a component):
+
+- **The trigger is drawn as a select's**, with a down chevron. shadcn's
+  example uses an outline button with `ChevronsUpDown`. Reason: in a form
+  beside selects (the settings dialog), the two look alike; the crate has no
+  `ChevronsUpDown` icon.
+- **Choosing the chosen option again keeps it.** shadcn's example clears the
+  value on that. Reason: a field that must hold a value (a font family) has
+  no empty state.
+- **It opens like a select**: on the press, and on enter, space, up and down
+  key-downs; a typed character opens it searching. A Radix popover trigger
+  opens on its click only. Reason: as for `Select` (no click handler, so
+  gpui's keyboard click on key-up never reopens it).
 
 Command (shadcn's command is cmdk):
 

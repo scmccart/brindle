@@ -9,7 +9,7 @@
 //! Hover and pressed states aren't tokens. Components fade a token instead, as
 //! shadcn does (`bg-primary/90` is `primary.opacity(0.9)`).
 
-use gpui::{App, Global, Hsla, Rems, hsla, rems, rgb};
+use gpui::{App, Global, Hsla, Rems, SharedString, hsla, rems, rgb};
 
 /// One set of design tokens. Colours come in background/foreground pairs, as
 /// in shadcn/ui, plus the border, input and ring colours and the radius.
@@ -167,6 +167,43 @@ pub trait ActiveTheme {
 impl ActiveTheme for App {
     fn ui_theme(&self) -> &Tokens {
         &self.global::<UiTheme>().tokens
+    }
+}
+
+/// GPUI's name for the platform's UI font, its default text family.
+pub const SYSTEM_UI_FONT: &str = ".SystemUIFont";
+
+/// The family the chrome draws in, a GPUI global beside [`UiTheme`]. The app
+/// sets it with the tokens; the crate's roots that GPUI draws apart from the
+/// app's window tree (tooltips, the dragged tab) apply it, since they don't
+/// inherit the family the app sets on its root. Unset, it reads as the
+/// platform's UI font, GPUI's default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiFont {
+    pub family: SharedString,
+}
+
+impl Global for UiFont {}
+
+impl UiFont {
+    /// Makes `family` the chrome's and redraws every window.
+    pub fn set(family: impl Into<SharedString>, cx: &mut App) {
+        cx.set_global(UiFont { family: family.into() });
+        cx.refresh_windows();
+    }
+}
+
+/// Access to the chrome's family: `div().font_family(cx.ui_font())`.
+pub trait ActiveFont {
+    fn ui_font(&self) -> SharedString;
+}
+
+impl ActiveFont for App {
+    fn ui_font(&self) -> SharedString {
+        match self.try_global::<UiFont>() {
+            Some(font) => font.family.clone(),
+            None => SYSTEM_UI_FONT.into(),
+        }
     }
 }
 
