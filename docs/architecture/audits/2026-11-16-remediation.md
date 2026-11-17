@@ -13,7 +13,15 @@ These are rule and doc changes, not fixes. Each was put to the user with a recom
 | D1 | `ports R4` against `testing`'s platform pairs: exempt test code, or name the test support files as seams? | **Exempt test code.** `ports R4` binds production code; `#[cfg(test)]` modules, `tests/**` and `remote-agent/tests/**` are out of its scope, and the new check skips them. | `enforce-platform-seams` |
 | D2 | `process R13` against CLAUDE.md on the launch-time `running_sessions()` (`src/main.rs:863`). | **Move it off the UI thread**, as the instance listener (`main.rs:767`) already does; R13 stays as written; CLAUDE.md's Reattach section is rewritten. | `list-sessions-off-ui-thread` |
 | D3 | Does `fcis R8` cover pure helpers in the e2e and perf harnesses? | **No, product code only.** Harness helpers are held by the harnesses' `--self-test`; `fcis` and `testing` say so. | `keep-pure-modules-pure` |
-| D4 | Relay gate: `cfg(unix)` or `target_os = "linux"`? | **`target_os = "linux"`** in both `remote-agent/src/server/mod.rs` and `remote-agent/src/main.rs`; the docs name it. macOS refuses `relay` as Windows does. | `enforce-platform-seams` |
+| D4 | Relay gate: `cfg(unix)` or `target_os = "linux"`? | **`target_os = "linux"`** in both `remote-agent/src/server/mod.rs` and `remote-agent/src/main.rs` (`main.rs` already gates on Linux, so only `server/mod.rs` changes); the docs name it. macOS refuses `relay` as Windows does. | `enforce-platform-seams` |
+
+Three more came up while the changes were written, and were put to the user the same way; the recommendations were taken:
+
+| # | Question | Decision | Lands in |
+|---|---|---|---|
+| D5 | Moving `Path::is_file()` out of pure code needs a callback; `fcis R5` forbids "a callback that reaches the world". | **`fcis R5` and `R9` allow a probe:** a read-only `Fn(&Path) -> bool` about a path the function derived. A callback that acts, waits or reads an entity, a window or a process is not one. | `keep-pure-modules-pure` |
+| D6 | With D3, how much must a harness's `--self-test` cover? | **`testing R3`:** it MUST test the harness's parsers and SHOULD test its other pure helpers (about 25 have none today). | `keep-pure-modules-pure` |
+| D7 | A Windows server core parses OSC 7 and 9;9 directory reports as POSIX, so a Windows session's replay can lose its directory (found while writing change 5). | **Fix it in change 9:** the core's `Emulator` takes its platform's path style (change 5's `PathStyle`). | `bound-queues-and-contain-panics` |
 
 ## Re-checked
 
@@ -24,11 +32,12 @@ These are rule and doc changes, not fixes. Each was put to the user with a recom
 ### Finding 3 traced: reachable, narrower than stated
 
 - A new core **keeps** adopted sessions' ids (`core/holders.rs:368-423`: "ids continuing after the largest"), and accepts clients only after adopting the startup holders. So an id is reused only when **no holder that held it survives**: the holder crashed or was killed, or the host rebooted (a relay endpoint), and then some client spawned new sessions in the fresh core before this Brindle's reconnect listed.
-- The core gates `INPUT`, `RESIZE` and the rest on `session.attached == Some(client)` (`core/sessions.rs:801-815`), so keystrokes never reach another client's session.
+- The core gates `INPUT`, `RESIZE` and the rest on `session.attached == Some(client)` (`core/sessions.rs:801-815`), so keystrokes never reach **another client's** session. They can reach another session of **this** client: `Running::input`, `resize` and `close` (`connection.rs:1884-1892`) send by bare id even after the tab is shown lost, and a new tab this Brindle opens on the fresh core can be given the same id. Typing into the lost tab then reaches the new tab, and closing the lost tab ends the new tab's program. This needs no second client (found while writing change 2).
 - What can go wrong:
   1. **A lost tab isn't shown lost.** `kept` (`connection.rs:1220-1221`) takes every listed session that has *any* client (`SessionInfo.attached` is `!detached`, `core/manage.rs:45`). If another client holds the reused id, this tab's sink stays in `State.sessions`, frozen, with no "session lost" line.
   2. **A carried attach takes another session.** A non-recorded attach in flight when the link dropped is matched by bare id (`carried_attaches`, arm `(None, Some(_))` at `:1840-1844`): if the reused id is listed without a client, the `ATTACH` is sent again and the tab is fed the other session's replay.
-- **Plan:** fix it (change 2). It needs a second client on the same endpoint and a lost holder, so it is rare, but the result is a tab showing the wrong program or a dead tab that looks alive.
+  3. **A lost tab drives a new one** (above): its input, resize and close reach the session that now has its id.
+- **Plan:** fix it (change 2): every `Running` call and every match checks id and key. It needs a lost holder, so it is rare, but the result is a tab showing or driving the wrong program, or a dead tab that looks alive.
 
 ### Finding 4b traced: not reachable; kept as hardening
 
@@ -44,23 +53,25 @@ Order: defects (1–4), what stops new breaches (5–6), what unblocks other wor
 | # | Change | Findings / rules | Size | Depends on | Spec delta |
 |---|---|---|---|---|---|
 | 1 | `keep-session-file-on-serialize-error` | F1; `railway R1` | S | — | `session-restore` |
-| 2 | `carry-session-identity-and-host` | F3, F5; `types R3`, `R7`, `R8` | S–M | — | `remote-connections`, `configuration` |
+| 2 | `carry-session-identity-and-host` | F3, F5; `types R3`, `R7`, `R8` | S–M | — | `remote-connections`, `terminal-emulation`, `configuration` |
 | 3 | `bound-and-fuzz-outside-input` | F4; `railway R5`, `process R6` | S–M | — | none |
 | 4 | `isolate-test-runs` | F2, part of F11; `testing R4`, `ports R10` | S | — | none |
 | 5 | `enforce-platform-seams` | `ports R4` exception, D1, D4, `fcis R7` (term-core) | M | — | none (rule + check) |
 | 6 | `add-clippy-to-ci` | F7 (`never_loop`), enforcement gaps | S–M | — | none (check) |
-| 7 | `keep-pure-modules-pure` | F13 (`fcis R2`/`R3`/`R5`), D3, doc drift | M | 5 (architecture-test layout) | none (refactor + check) |
-| 8 | `list-sessions-off-ui-thread` | F8 (`process R13`/`R14`), D2 | M | — | `session-restore` |
-| 9 | `bound-queues-and-contain-panics` | F8 (`process R9`, `R3`, `R10`, `R15`) | M | — | `remote-connections`, `terminal-emulation` |
-| 10 | `test-platform-logic-everywhere` | F9; `fcis R7`, `ports R7` | M | 5 | none (refactor + tests) |
-| 11 | `deterministic-tests` | F11 rest; `testing R7`, `R8`, `R5`, `R3`, `R9` | M–L | 4 | none (tests + check) |
-| 12 | `surface-swallowed-failures` | F7; `railway R1`, `R6`, `R8` | M | 2 (key/listing types), 9 | `configuration`, `links`, `remote-connections` |
+| 7 | `keep-pure-modules-pure` | F13 (`fcis R2`/`R3`/`R5`), D3, D5, D6, doc drift | M | 5 (architecture-test layout) | none (refactor + check) |
+| 8 | `list-sessions-off-ui-thread` | F8 (`process R13`/`R14`), D2 | M | — | `session-restore`, `command-line` |
+| 9 | `bound-queues-and-contain-panics` | F8 (`process R9`, `R3`, `R10`, `R15`), D7 | M | 2, 5 | `remote-connections`, `terminal-emulation`, `terminal-server` |
+| 10 | `test-platform-logic-everywhere` | F9; `fcis R7`, `ports R7` | M | 5, 7 | none (refactor + tests) |
+| 11 | `deterministic-tests` | F11 rest; `testing R7`, `R8`, `R5`, `R3`, `R9` | M–L | 4, 5, 7 | none (tests + check) |
+| 12 | `surface-swallowed-failures` | F7; `railway R1`, `R6`, `R8` | L (seven groups) | 1, 2, 3, 4, 7, 8, 9, 10 | `configuration`, `links`, `remote-connections`, `profiles`, `settings-dialog`, `terminal-emulation`, `command-line`, `command-palette`, `session-restore` |
 | 13 | `extract-decisions-into-models` | F6, F10, F12; `fcis R1`/`R10`/`R8`, `types R1`/`R7`/`R3` | L (lands in passes) | 7, 12 | none (refactor + tests) |
 
 The overlap with changes in flight:
 - **`port-to-macos`** is what ends the `ports R4` exception. Change 5 narrows that exception to an explicit list whose "Ends with" stays `port-to-macos`, and D4 means macOS refuses `relay`; change 5 adds a note to `port-to-macos`'s design rather than editing its tasks.
 - **`add-blocks`** will rework `terminal_view.rs`/`terminal_element.rs`; change 13 leaves those two files' `fcis R1` entries to it (it must follow `fcis` anyway) and only adds the `fcis R8` tests they lack.
-- `add-pocket-client` and `update-dependencies` don't overlap.
+- **`update-dependencies`** touches `src/session.rs`: its `toml` 1.x bump may rename `toml::ser::Error`, which change 1 returns. Whichever lands second adjusts.
+- `add-pocket-client` doesn't overlap.
+- **Between these changes:** 2 and 9 both modify `remote-connections` "Sessions come back after a reconnect" and `terminal-emulation` "A session lost for good is reported in the tab"; 9 copies those requirements as 2 leaves them.
 
 ### 1. `keep-session-file-on-serialize-error`
 
@@ -73,8 +84,8 @@ The overlap with changes in flight:
 
 - **Closes:** F3 (b25 #13; with b25 #14 and #15, the key and size sentinels the fix reads), F5 (b07 #24); `types R3`, `R7`, `R8`.
 - **Scope:**
-  - `src/remote/local/connection.rs`: `State.sessions` keeps each shown session's key beside its sink; the after-loss prune (`:1217-1233`) keeps a sink only when the listing has its id **with its key**; `carried_attaches` (`:1812-1849`) requires the key for carried attaches too; `attached_by_replay` (`:1276-1290`) stays as is: a reconnect's replay comes only for sessions the core gives back to this client's token, and `REPLAY_START` carries no key, so adding one would be a protocol change this plan doesn't need. Key as `Option<SessionKey>` decoded at the boundary (b25 #14, `:207`, `:1822`, `:1879`) and listed size as `Option<(u16, u16)>` (b25 #15, `:1826`). Wire structs unchanged (`process R4`).
-  - `src/workspace.rs:1748-1752` `open_config`: launch the editor on `Host::Local` under a local profile whatever the default profile targets.
+  - `src/remote/local/connection.rs`: `State.sessions` keeps each shown session's key beside its sink; the after-loss prune (`:1217-1233`) keeps a sink only when the listing has its id **with its key**; `carried_attaches` (`:1812-1849`) requires the key for carried attaches too; `attached_by_replay` (`:1276-1290`) stays as is: a reconnect's replay comes only for sessions the core gives back to this client's token, and `REPLAY_START` carries no key, so adding one would be a protocol change this plan doesn't need. `Running::input`, `resize` and `close` act only while the session is shown with its key, so a lost tab never drives a session that reused its id. Key as `Option<SessionKey>` decoded at the boundary (b25 #14, `:207`, `:1822`, `:1879`) and listed size as `Option<(u16, u16)>` (b25 #15, `:1826`). Wire structs unchanged (`process R4`).
+  - `src/workspace.rs:1748-1752` `open_config` (and b07 #23, the same listed-size check): launch the editor on `Host::Local` under a local profile whatever the default profile targets.
 - **Behaviour:** yes. Delta on `remote-connections` "Sessions come back after a reconnect": a session whose id the endpoint now uses for another session (another key) is shown lost. Delta on `configuration` "Live reload" (ctrl-, opens the config): the editor always runs on this machine.
 - **Verify:** table tests for the prune and `carried_attaches` as pure functions over `State` (they have none today, b25 #8); a `fake::link` test for the reused-id case; a unit test that `open_config`'s request is local with a remote default profile; e2e `remote-*` unchanged.
 
@@ -84,9 +95,9 @@ The overlap with changes in flight:
 - **Scope:**
   - `remote-protocol/src/holder.rs:536-600` `Assembler`: cap open blobs (a constant, refused past it with the same error path as an over-long blob).
   - `ui/src/text_input.rs:277` `range_from_utf16`: order the range (hardening; see "Finding 4b traced").
-  - `remote-protocol/src/fuzz.rs`: targets for `skip_preamble` (`src/remote/local/link.rs`), `SessionMeta::from_value`, the `semver` parse used by upgrade, `parse_holder_lock`; a term-core fuzz test for the OSC 7, 133 and 7501 parsers.
-  - `remote-protocol/tests/transcripts.rs`: transcripts for `Exit.lost = Some(..)`, `Previous::Crash`, `ExitStatus { code: None }`; coverage checked per variant, not per message type; shipped fixtures refused if regenerated differently (`process R5`); module doc says protocols 1–3.
-- **Behaviour:** no user-visible change (a holder past the cap is a broken holder).
+  - `remote-protocol/src/fuzz.rs`: targets for `skip_preamble` (`remote-protocol/src/lib.rs:66`, called from `src/remote/local/relay.rs:173`), `SessionMeta::from_value`, the `semver` parse used by upgrade, `parse_holder_lock`; a `term-core/src/fuzz.rs` of its own for the OSC 7, 133 and 7501 parsers (term-core may not depend on remote-protocol, even as a dev-dependency).
+  - `remote-protocol/tests/transcripts.rs`: new fixtures (`client-session-lost`, `holder-adopt-after-crash`, never editing shipped ones) for `Exit.lost = Some(..)`, `Previous::Crash`, `ExitStatus { code: None }`; coverage checked per variant, not per message type; shipped fixtures refused if regenerated differently (`process R5`); module doc says protocols 1–3.
+- **Behaviour:** no user-visible change. A core whose holder sends too many blobs treats that holder as broken; a holder that receives too many from a core sends `ERROR` and keeps its sessions.
 - **Verify:** the fuzz tests and transcripts themselves; a unit test for the cap and for a reversed range.
 
 ### 4. `isolate-test-runs`
@@ -144,7 +155,7 @@ The overlap with changes in flight:
 
 ### 11. `deterministic-tests`
 
-- **Closes:** the rest of F11: `testing R7` sleeps (b16 ≈14, b17 `holder.rs:1449`, `manage.rs:184`, b18 #5, b25 #20–#21, b26 #9–#11, #13, b27 #23, #25, b28 #12–#13, b00 #12, b09 #10, b10 #15, b13 #7, b14 #3–#4, b33 #2–#8), `testing R8` (b16 ≈6, b18 #4, b21 `pipe.rs` 20 s bound, b14 #5, b25 #22–#23, b26 #12, b34 #4, b35 #6, b13 #8), `testing R5` (b33 #1 `notify.rs:37`, b34 #3, b35 #2–#5), `testing R3` silent skips (b12, b16, b17 ConPTY test; b36 #2 perf `--shard`), `testing R9` (b35 #7 `tabs.rs` `face_top` flake; b27 #24).
+- **Closes:** the rest of F11: `testing R7` sleeps (b16 ≈14, b17 `holder.rs:1449`, `manage.rs:184`, b18 #5, b25 #20–#21, b26 #9–#11, #13, b27 #25 (b27 #23 is change 4's), b28 #12–#13, b00 #12, b09 #10, b10 #15, b13 #7, b14 #3–#4, b33 #2–#8), `testing R8` (b16 ≈6, b18 #4, b21 `pipe.rs` 20 s bound, b14 #5, b25 #22–#23, b26 #12, b34 #4, b35 #6, b13 #8), `testing R5` (b33 #1 `notify.rs:37`, b34 #3, b35 #2–#5), `testing R3` silent skips (b12, b16, b17 ConPTY test; b36 #2 perf `--shard`), `testing R9` (b35 #7 `tabs.rs` `face_top` flake; b27 #24).
 - **Scope:** one `eventually(limit, condition)` helper per test crate; every e2e delay through `ctx.secs`; skips reported as skips; the `tabs.rs` flake reproduced and fixed with numbers (`testing R10`) or filed; `tests/architecture.rs` rejects `thread::sleep` in `remote-agent/tests/**` and `tests/e2e/cases/**` outside the named, scaled helper.
 - **Behaviour:** no.
 - **Verify:** `cargo test --workspace` looped in parallel (numbers in the PR); the e2e suite under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`; the new architecture test.
@@ -174,3 +185,21 @@ The overlap with changes in flight:
 
 - **SHOULD-only entries** (`types R10`/`R11`, `railway R9`, `ports R8`/`R11`, `fcis R9` beyond change 13): fixed when their files change, under the README's adoption policy.
 - **Design smells** beyond those folded in above (holder `catch_unwind`, latency samples, transcript coverage, silent skips, the scopes test, the relay gate): the other ~425 stay in `design-smells.md` as a backlog.
+
+## Adjusted while writing the changes
+
+Each change's design is the authority where it differs from the sections above. The differences:
+
+- **1:** `pending_write` returns a closed `PendingWrite`, and the log line moves to its caller (`record_session`), since a log call in the model breaks `fcis R3`; a lasting failure logs once. The real trigger is a working directory that isn't valid UTF-8.
+- **2:** every `Running` call checks id and key (see "Finding 3 traced"), with a local e2e case; b07 #23 folds in; b07 #20 (the sessions palette kills by bare id) stays in change 13, since `KILL` carries no key.
+- **3:** the shipped `holder-adopt` fixture is left alone; the gaps get new fixtures. Also fixes the "protocols 1 and 2" drift in `remote-protocol/src/lib.rs` and `relay.rs`, and the relay collision test that skips type 14.
+- **4:** `Endpoint` carries the variables its roles get, since `sys::start` passes the core neither `BRINDLE_SERVER_DIR` nor `BRINDLE_NO_SCOPE`; on Windows the agent's `environment_block` moves to `remote-protocol`. 7 `set_var` sites, not 8 (`src/main.rs:305` is production). Adds a guard that fails a case whose roles ran in a systemd scope.
+- **5:** the exception lists 17 files, not 24: sites only in tests drop out (`config_edit.rs`, `server/conn.rs`), `remote/client.rs` and `desktop.rs` are already seams, the relay module and both `build.rs` become named seams, and `src/zone_view.rs` (a `cfg(any(…))` m1 missed) is added. Lint-only `cfg_attr(…, allow(…))` is outside R4.
+- **6:** lint levels are crate-root `cfg_attr(not(test), warn(…))`, not `[workspace.lints]`, so integration tests aren't caught; an architecture test checks the roots carry them. `allow_attributes_without_reason` is left out: there are 37 reasonless `cfg_attr(…, allow(dead_code))`, which the audit's count of 5 missed. `unwrap_used`/`expect_used` find nothing today in the two crates' non-test code.
+- **7:** D5 and D6; adds b23's two `fcis R3` entries (`expand_tilde`, the launch token in `instance.rs`) and `session::record_zones`; closes b07 #11 (`shell_quote`), which leaves change 10. Items inside otherwise-shell modules (`pace::step`, `FontsState`) can't be text-checked and stay with review.
+- **8:** the listing waits up to 10 s (`HELLO_LIMIT`), not 2 s; the change keeps today's limits. `--latency-log` can't time first paint, so a debug log line is added. It also fixes two concurrent listings sharing a token (the core closes the first) and `--attach` blaming a missing session when the listing failed. Deltas on `session-restore` (two requirements) and `command-line`.
+- **9:** D7; the `process R15` entry is b23's, and `write_atomic` fits only the state file; b12's `R9`/`R10` entries and b26's starting-input smell fold in; the outgoing queue's marks are 4 MiB / 1 MiB; a holder fault answers `ERROR` and keeps the session; a sink panic detaches the session, since its screen can't be trusted.
+- **10:** `pipe_name` and `check` are b14 #1 (not b19/b21), the copy race and prune only b21 #3; b23's `instance.rs` entries added; `HRESULT` formatting shares one `hresult.rs`; a check keeps the new neutral modules free of platform `cfg`.
+- **11:** the 20 s `pipe.rs` bound is b14 #5 (plus b21's unscaled 20 s poll in `win.rs:955`); the silent skips are in b16 and b17 (`holder.rs:1492`), not b12; b34 #3's spawn goes with change 4, so `Run`'s and `win.rs`'s `+ 30.0` margins are scaled instead. Adds the `set_var`/`remove_var` check that changes 4 and 7 left to it, and one sentence to `testing R5` for offsets measured against the app's own unscaled limits (`palette-slow-host`). The `tabs.rs` `face_top` flake is looped 100 times headless, then fixed at its cause or filed.
+- **12:** the config entries are b23's, not b26's; `reconnect_local` is the local server, so its delta is on `terminal-emulation`; adds b05 `:558`, b23 `client.rs:61` and b26 #6 to the `R8` list (b01 #21 is change 8's). It is L, in seven groups that land separately; failures become a `tab_note` (term-core already has a `Notice`).
+- **13:** groups run `brindle-ui` first, since both views use its keyed events, and views last. Group 5's entries are b28 #6 and b26's `Phase` smell; b01 #10 is change 12's; b07 #20 closes only in part (`KILL` carries no key). Deferred and listed in its design: b01 #16 (the layout blob's format), b03 #16 (which `types R3` allows), b27 #18, and b01 #11 (which no change takes). b27 #10 (`state_dir`'s environment) is wanted by change 12's task 5.3 and handed here by change 7: whichever of 12 and 13 lands first makes it injectable.
