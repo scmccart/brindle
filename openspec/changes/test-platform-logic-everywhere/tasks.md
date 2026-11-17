@@ -61,7 +61,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-protocol server_dir::`;
   - on Windows, `the_copy_is_named_by_build_and_keeps_the_last_write_time`, `a_wrong_file_under_the_copys_name_is_replaced`, `racing_copies_end_with_one_valid_copy` and `pruning_skips_a_build_whose_helper_is_running` pass unchanged.
-- [ ] 1.7 Docs for this group (design §7):
+- [x] 1.7 Docs for this group (design §7):
   - `functional-core-imperative-shell.md`'s "Whole pure modules" table gains `remote-protocol/src/{access,hresult}.rs` (who may use a pipe, and an `HRESULT`'s Win32 code), and change 7's `PURE_MODULES` gains both;
   - `ports-and-adapters.md` R7's examples add `access::admit_client`.
 
@@ -186,7 +186,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent pty::`;
   - `cargo test --locked -p brindle-remote-agent --test holder` (Linux spawns, the login shell and the home fallback).
-- [ ] 2.9 Docs for this group (design §7):
+- [x] 2.9 Docs for this group (design §7):
   - the module docs of `server/platform/mod.rs`, `conpty/mod.rs` and `pty.rs` name the new modules and say each is pure and tested on every platform;
   - the "Whole pure modules" table gains `remote-agent/src/server/platform/{ready_arg,ensure_dir,pipe_state}.rs`, `remote-agent/src/conpty/{choice,hosts}.rs` and `remote-agent/src/pty/{program,stat}.rs`, and `PURE_MODULES` gains them;
   - `ports-and-adapters.md` R7's examples add `ready_arg::role_args` and `pty::program`;
@@ -234,7 +234,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle instance::`;
   - `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- instance` (headless).
-- [ ] 3.6 Docs for this group: `fcis`'s "Pure items in shell modules" table gains:
+- [x] 3.6 Docs for this group: `fcis`'s "Pure items in shell modules" table gains:
   - `desktop::without_verbatim_prefix`;
   - `notify::escape_markup`;
   - `instance::{socket_path_in, pipe_name_for}`;
@@ -246,7 +246,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
 
 ## 4. The never-gated check, with its docs in the same commit
 
-- [ ] 4.1 Write the planted tests first and watch them fail (`testing R13`):
+- [x] 4.1 Write the planted tests first and watch them fail (`testing R13`):
   - `a_gated_neutral_module_is_found`: a production `#[cfg(windows)] fn`, a `#[cfg(unix)] mod x;`, and an ancestor gated `cfg(windows)`;
   - `a_gated_neutral_item_is_found`: an item inside `#[cfg(windows)] mod imp {`, and one under `#[cfg(unix)]`;
   - `a_lint_only_cfg_attr_and_test_code_do_not_count`.

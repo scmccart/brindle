@@ -344,10 +344,7 @@ mod tests {
         // A token that can't be opened is refused, whatever the reason.
         let unreadable = admit_client(
             &own,
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "process 4: can't open it: access denied",
-            )),
+            Err(io::Error::other("process 4: can't open it: access denied")),
         )
         .unwrap_err();
         assert_eq!(unreadable.kind(), io::ErrorKind::PermissionDenied);

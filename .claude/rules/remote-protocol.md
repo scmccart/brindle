@@ -12,8 +12,8 @@ You are editing the protocols between Brindle, the server core, the holders and 
 - Decoders return `Err` on any input and never panic; frames and blobs have a bound (`railway R5`, `process R7`).
 - `client.rs`, `holder.rs`, `wire.rs`, `version.rs` and `relay.rs` are codecs only: no IO, clock or thread (`process R6`).
 - Errors are `io::Result` with a meaningful kind or a small enum (`NegotiationError`, `access::Refusal`); no `anyhow` (`railway R2`).
-- Dependencies are `serde`, `serde_json` and `windows` only (`ports R3`). Pure helpers that read Windows names are tested on Linux too, so no `Path` on Windows paths (`fcis R7`).
+- Dependencies are `serde`, `serde_json` and `windows` only (`ports R3`). Pure helpers that read Windows names are tested on Linux too, so no `Path` on Windows paths (`fcis R7`). The decisions behind `win.rs` and the Windows server's pipes are in ungated modules: `access.rs` (who may use a pipe: `admit_client`, `Dacl`), `hresult.rs` (an `HRESULT`'s Win32 code) and `server_dir.rs` (pipe names, holder sockets, helper copies); none of them is platform-gated.
 
 If a change needs session logic or terminal state, it belongs in `remote-agent/` or `term-core/`; this crate only says how the bytes look and where the server's directory, pipes and access checks are.
 
-Enforced by: `tests/architecture.rs` (`the_wire_modules_do_no_io`, `crates_below_the_app_name_only_their_allowed_dependencies`), the transcript tests and `fuzz.rs`.
+Enforced by: `tests/architecture.rs` (`the_wire_modules_do_no_io`, `the_neutral_code_is_never_gated`, `crates_below_the_app_name_only_their_allowed_dependencies`), the transcript tests and `fuzz.rs`.
