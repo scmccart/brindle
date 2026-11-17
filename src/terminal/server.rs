@@ -65,7 +65,12 @@ impl Sink {
         let mut parser = self.parser.lock();
         let mut term = self.term.lock_unfair();
         let own = GridSize { cols: term.columns() as u16, rows: term.screen_lines() as u16, ..GridSize::default() };
-        let size = self.replay_size.take().filter(|s| s.cols > 0 && s.rows > 0 && (s.cols, s.rows) != (own.cols, own.rows));
+        let size = self
+            .replay_size
+            .take()
+            .filter(|s| s.cols > 0 && s.rows > 0)
+            .map(GridSize::clamped)
+            .filter(|s| (s.cols, s.rows) != (own.cols, own.rows));
         if let Some(size) = size {
             self.marks.lock().resize(&mut *term, size);
         }
@@ -229,6 +234,19 @@ mod tests {
         let prompt = text.lines().position(|line| line.starts_with('$')).expect("the prompt is on screen");
         assert_eq!(term.grid().cursor.point.line.0 as usize, prompt, "{text}");
         assert_eq!(term.grid().cursor.point.column.0, 2);
+    }
+
+    /// A listed size of one column is fed as `MIN_COLS`, so a double-width
+    /// character in the replay can't reach alacritty's 1-column panic.
+    #[test]
+    fn a_replay_listed_one_column_wide_is_fed_at_min_cols() {
+        let (sink, _rx, _) = sink();
+        let mut sink = sink.replayed_at(GridSize { cols: 1, rows: 5, ..GridSize::default() });
+        sink.replay(true);
+        sink.output("\x1bc😀😀漢".as_bytes());
+        sink.replay(false);
+        let term = sink.term.lock();
+        assert_eq!((term.columns(), term.screen_lines()), (80, 24));
     }
 
     /// 7.1: a recorded session's replay is fed at the size its listing

@@ -1,5 +1,5 @@
-//! Transcript tests that pin client protocols 1 and 2, the relay link and H1
-//! on the wire.
+//! Transcript tests that pin client protocols 1–3, the relay link and H1 on
+//! the wire.
 //!
 //! Each fixture in `tests/fixtures/` is one connection's frames in order, as
 //! hex text: `<sender> <type> <length> <payload>` per frame, with a comment
@@ -10,13 +10,18 @@
 //!   compares it with the messages below.
 //! - `encoding_the_messages_reproduces_the_fixtures` encodes the messages
 //!   and compares the result with each fixture, byte for byte.
+//! - `every_message_variant_and_form_appears_in_a_transcript` checks that
+//!   every variant of the five message enums, and the nested forms named in
+//!   [`expected_forms`], is in some transcript.
 //!
-//! A change to any message's encoding fails both. When the change is meant
-//! (a new protocol version, not an edit of version 1 or H1), regenerate the
-//! fixtures with `BRINDLE_REGEN_FIXTURES=1 cargo test -p
-//! brindle-remote-protocol --test transcripts` and review the diff.
+//! A change to any message's encoding fails the first two. A fixture that
+//! has shipped is frozen (process R5): a new message, field or form gets a
+//! new transcript, and the old fixtures keep passing byte for byte.
+//! `BRINDLE_REGEN_FIXTURES=1 cargo test -p brindle-remote-protocol --test
+//! transcripts` writes only fixtures that don't exist yet; it never rewrites
+//! one. To rework a fixture that never shipped, delete it and regenerate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Once;
@@ -26,6 +31,78 @@ use brindle_remote_protocol::client::{self, KillTarget, Policy, VersionRange};
 use brindle_remote_protocol::holder::{self, Previous};
 use brindle_remote_protocol::relay;
 use serde_json::json;
+
+/// Declares an enum's forms: a function naming the form of a value, from a
+/// match over every variant with no `_ =>` arm (railway R3), and the list
+/// of every name. A new variant fails to compile here until it is named,
+/// and once named it must appear in a transcript.
+macro_rules! forms {
+    ($name:ident, $all:ident, $ty:ty, $prefix:literal: $($variant:ident),+ $(,)?) => {
+        fn $name(value: &$ty) -> &'static str {
+            type Enum = $ty;
+            match value {
+                $(Enum::$variant { .. } => concat!($prefix, stringify!($variant)),)+
+            }
+        }
+        const $all: &[&str] = &[$(concat!($prefix, stringify!($variant))),+];
+    };
+}
+
+forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
+    Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
+    Reparent, SetLayout);
+forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
+    Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
+    Process);
+forms!(to_holder_form, TO_HOLDER_FORMS, holder::ToHolder, "holder::ToHolder::":
+    Hello, Spawn, Input, Resize, Hangup, CheckpointBegin, CheckpointChunk, CheckpointEnd, Drain,
+    Goodbye, Reparent, Pause, Resume, SetMeta);
+forms!(holder_to_core_form, HOLDER_TO_CORE_FORMS, holder::ToCore, "holder::ToCore::":
+    Welcome, Output, Spawned, SpawnFailed, Exited, Error, CheckpointBegin, CheckpointChunk,
+    CheckpointEnd, TailBegin, TailChunk, TailEnd);
+forms!(relay_form, RELAY_FORMS, relay::RelayMessage, "relay::RelayMessage::":
+    Host, Heartbeat, Error);
+forms!(policy_form, POLICY_FORMS, Policy, "client::Policy::": Kill, Detach);
+forms!(kill_target_form, KILL_TARGET_FORMS, KillTarget, "client::KillTarget::": Session, All);
+forms!(previous_form, PREVIOUS_FORMS, Previous, "holder::Previous::": None, Handover, Crash);
+
+/// Whether an `EXIT` says the server lost its session.
+fn lost_form(exit: &client::Exit) -> &'static str {
+    match exit.lost {
+        None => "client::Exit.lost=None",
+        Some(_) => "client::Exit.lost=Some",
+    }
+}
+const LOST_FORMS: &[&str] = &["client::Exit.lost=None", "client::Exit.lost=Some"];
+
+/// Whether a held session that exited was ended by a signal.
+fn exit_status_form(status: &holder::ExitStatus) -> &'static str {
+    match status.code {
+        Some(_) => "holder::ExitStatus.code=Some",
+        None => "holder::ExitStatus.code=None",
+    }
+}
+const EXIT_STATUS_FORMS: &[&str] = &[
+    "holder::ExitStatus.code=Some",
+    "holder::ExitStatus.code=None",
+];
+
+/// Every form some transcript must have.
+fn expected_forms() -> Vec<&'static str> {
+    [
+        TO_CORE_FORMS,
+        TO_CLIENT_FORMS,
+        TO_HOLDER_FORMS,
+        HOLDER_TO_CORE_FORMS,
+        RELAY_FORMS,
+        POLICY_FORMS,
+        KILL_TARGET_FORMS,
+        PREVIOUS_FORMS,
+        LOST_FORMS,
+        EXIT_STATUS_FORMS,
+    ]
+    .concat()
+}
 
 /// One frame of a transcript, with its sender.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +145,54 @@ impl Step {
             Self::Relay(m) => format!("Relay{m:?}"),
         };
         debug.split('(').next().unwrap().to_string()
+    }
+
+    /// The step's variant, such as `client::ToClient::Data`, and the nested
+    /// forms it carries (see [`expected_forms`]).
+    fn forms(&self) -> Vec<&'static str> {
+        match self {
+            Self::Client(message) => {
+                let mut forms = vec![to_core_form(message)];
+                if let client::ToCore::Spawn(spawn) = message {
+                    forms.push(policy_form(&spawn.policy));
+                }
+                if let client::ToCore::Kill(kill) = message {
+                    forms.push(kill_target_form(&kill.target));
+                }
+                forms
+            }
+            Self::CoreToClient(message) => {
+                let mut forms = vec![to_client_form(message)];
+                if let client::ToClient::Exit(exit) = message {
+                    forms.push(lost_form(exit));
+                }
+                if let client::ToClient::Sessions(sessions) = message {
+                    forms.extend(
+                        sessions
+                            .sessions
+                            .iter()
+                            .map(|info| policy_form(&info.policy)),
+                    );
+                }
+                forms
+            }
+            Self::CoreToHolder(message) => vec![to_holder_form(message)],
+            Self::Holder(message) => {
+                let mut forms = vec![holder_to_core_form(message)];
+                if let holder::ToCore::Welcome(welcome) = message {
+                    forms.push(previous_form(&welcome.previous));
+                    forms.extend(
+                        welcome
+                            .sessions
+                            .iter()
+                            .filter_map(|held| held.exit.as_ref())
+                            .map(exit_status_form),
+                    );
+                }
+                forms
+            }
+            Self::Relay(message) => vec![relay_form(message)],
+        }
     }
 }
 
@@ -225,12 +350,22 @@ fn parse(transcript: &Transcript, text: &str) -> Vec<Step> {
 
 static REGENERATE: Once = Once::new();
 
+/// Why a fixture that differs from its transcript can't just be rewritten.
+const FROZEN: &str = "shipped fixtures are frozen (process R5): add a new transcript instead, \
+     or, if this fixture never shipped, delete it and regenerate with BRINDLE_REGEN_FIXTURES=1";
+
+/// Every transcript and its fixture's text. With `BRINDLE_REGEN_FIXTURES=1`,
+/// the fixtures that don't exist yet are written first; an existing one is
+/// never rewritten.
 fn read_fixtures() -> Vec<(Transcript, String)> {
     let transcripts = transcripts();
     REGENERATE.call_once(|| {
         if std::env::var_os("BRINDLE_REGEN_FIXTURES").is_some_and(|v| v == "1") {
             for transcript in &transcripts {
                 let path = fixture_path(transcript.name);
+                if path.exists() {
+                    continue;
+                }
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, render(transcript)).unwrap();
             }
@@ -283,50 +418,34 @@ fn encoding_the_messages_reproduces_the_fixtures() {
             assert_eq!(
                 got,
                 want,
-                "{} frame {}: encoding changed",
+                "{} frame {}: encoding changed; {FROZEN}",
                 transcript.name,
                 index + 1
             );
         }
-        assert_eq!(rendered, text, "{}: fixture is stale", transcript.name);
+        assert_eq!(
+            rendered, text,
+            "{}: the fixture differs from its transcript; {FROZEN}",
+            transcript.name
+        );
     }
 }
 
 #[test]
-fn every_message_type_appears_in_a_transcript() {
-    let mut seen: BTreeMap<(&str, u8), ()> = BTreeMap::new();
-    for transcript in transcripts() {
-        for step in &transcript.steps {
-            let kind = match step {
-                Step::Client(_) | Step::CoreToClient(_) => "client",
-                Step::CoreToHolder(_) | Step::Holder(_) => "holder",
-                Step::Relay(_) => "relay",
-            };
-            seen.insert((kind, step.encode().msg_type), ());
-        }
-    }
-    let client_types =
-        (client::MSG_DATA..=client::MSG_SET_LAYOUT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
-    for msg_type in client_types {
-        assert!(
-            seen.contains_key(&("client", msg_type)),
-            "client type {msg_type}"
-        );
-    }
-    for msg_type in relay::MSG_RELAY_HOST..=relay::MSG_RELAY_ERROR {
-        assert!(
-            seen.contains_key(&("relay", msg_type)),
-            "relay type {msg_type:#x}"
-        );
-    }
-    let holder_types =
-        (holder::MSG_HELLO..=holder::MSG_SET_META).chain(holder::MSG_WELCOME..=holder::MSG_TAIL_END);
-    for msg_type in holder_types {
-        assert!(
-            seen.contains_key(&("holder", msg_type)),
-            "holder type {msg_type}"
-        );
-    }
+fn every_message_variant_and_form_appears_in_a_transcript() {
+    let seen: BTreeSet<&str> = transcripts()
+        .iter()
+        .flat_map(|transcript| transcript.steps.iter().flat_map(Step::forms))
+        .collect();
+    let missing: Vec<&str> = expected_forms()
+        .into_iter()
+        .filter(|form| !seen.contains(form))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "no transcript has {}",
+        missing.join(", ")
+    );
 }
 
 // The transcripts.
@@ -1196,6 +1315,67 @@ fn transcripts() -> Vec<Transcript> {
                     }),
                 })),
             ],
+        },
+        Transcript {
+            name: "client-session-lost",
+            protocol: Protocol::Client,
+            about: "A session the server lost (its holder ended) ends with an EXIT that says why and has no code.",
+            steps: vec![
+                hello(TOKEN),
+                welcome(),
+                spawn(1, "/bin/bash", Policy::Detach),
+                spawned(1, 1, 5000),
+                output(1, b"$ "),
+                s(client::ToClient::Exit(client::Exit {
+                    session: 1,
+                    code: None,
+                    lost: Some("its holder ended".into()),
+                })),
+            ],
+        },
+        Transcript {
+            name: "holder-adopt-after-crash",
+            protocol: Protocol::Holder,
+            about: "A core adopts a holder whose last core crashed: one session still running and one a signal ended, each with its checkpoint and tail.",
+            steps: [
+                vec![
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 2,
+                        core_build: "b1d0".into(),
+                        instance: 3,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 2,
+                        build: "b1d0".into(),
+                        pid: 4243,
+                        previous: Previous::Crash,
+                        sessions: vec![
+                            holder::HeldSession {
+                                session: 1,
+                                pid: 5000,
+                                cols: 80,
+                                rows: 24,
+                                exit: None,
+                                meta: meta("detach", "bash -l"),
+                                truncated: false,
+                            },
+                            holder::HeldSession {
+                                session: 2,
+                                pid: 5002,
+                                cols: 80,
+                                rows: 24,
+                                exit: Some(holder::ExitStatus { code: None }),
+                                meta: meta("kill", "sleep 1000"),
+                                truncated: false,
+                            },
+                        ],
+                    })),
+                ],
+                adopted(1, CHECKPOINT, b"ls\r\nnotes.md\r\n$ ", 16),
+                adopted(2, b"\x1bc$ sleep 1000\r\n", b"", 16),
+            ]
+            .concat(),
         },
     ]
 }

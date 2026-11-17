@@ -3,7 +3,7 @@
 //! Each frame has a five-byte header followed by an opaque payload:
 //! `message_type: u8` and `payload_length: u32` (big endian). The terminal
 //! server's protocols carry their own message numbers in it: [`client`]
-//! (client ↔ core, protocols 1 and 2) and [`holder`] (core ↔ holder, H1).
+//! (client ↔ core, protocols 1–3) and [`holder`] (core ↔ holder, H1).
 //! [`relay`] adds the frames of the link between Brindle and a
 //! `brindle-remote relay`, which pipes the client protocol, after the
 //! [`FRAME_STREAM_MARKER`].
@@ -62,7 +62,8 @@ pub const MAX_PREAMBLE_NOISE: usize = 64 * 1024;
 /// marker is consumed and the frame stream starts exactly where `reader` is
 /// left; call it on an unbuffered reader or on the buffered reader used for
 /// all later reads. Fails when the stream ends or more than
-/// [`MAX_PREAMBLE_NOISE`] bytes pass before the marker appears.
+/// [`MAX_PREAMBLE_NOISE`] bytes pass before the marker appears, so it never
+/// reads more than that bound plus the marker.
 pub fn skip_preamble(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut seen: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
@@ -80,7 +81,8 @@ pub fn skip_preamble(reader: &mut impl Read) -> io::Result<Vec<u8>> {
                     seen.truncate(seen.len() - FRAME_STREAM_MARKER.len());
                     return Ok(seen);
                 }
-                if seen.len() > MAX_PREAMBLE_NOISE + FRAME_STREAM_MARKER.len() {
+                // A marker ending later would follow more noise than allowed.
+                if seen.len() >= MAX_PREAMBLE_NOISE + FRAME_STREAM_MARKER.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         preamble_message(
@@ -265,6 +267,34 @@ mod tests {
         let flood = vec![b'x'; MAX_PREAMBLE_NOISE + 4096];
         let error = skip_preamble(&mut Cursor::new(flood)).unwrap_err();
         assert!(error.to_string().contains("64 KiB"), "{error}");
+    }
+
+    #[test]
+    fn a_marker_after_one_byte_more_than_the_noise_limit_is_refused_within_the_bound() {
+        let bound = MAX_PREAMBLE_NOISE + FRAME_STREAM_MARKER.len();
+        let after = |noise: usize| {
+            let mut bytes = vec![b'x'; noise];
+            bytes.extend_from_slice(FRAME_STREAM_MARKER);
+            bytes.push(7);
+            Cursor::new(bytes)
+        };
+        let mut reader = after(MAX_PREAMBLE_NOISE);
+        assert_eq!(
+            skip_preamble(&mut reader).unwrap().len(),
+            MAX_PREAMBLE_NOISE
+        );
+        assert_eq!(reader.position() as usize, bound);
+
+        let mut reader = after(MAX_PREAMBLE_NOISE + 1);
+        let error = skip_preamble(&mut reader).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert_eq!(reader.position() as usize, bound, "read past the bound");
+
+        // Exactly the bound's worth with no marker is too much noise, not
+        // an early end.
+        let mut reader = Cursor::new(vec![b'x'; bound]);
+        let error = skip_preamble(&mut reader).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 
     #[test]

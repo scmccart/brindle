@@ -27,6 +27,7 @@ The fix is small and has no dependencies. Landing it before the larger changes m
   - `status::parse`, whose reports must survive `Record::encode` and a second parse unchanged.
 
   `shell_integration.rs` adds a fuzz test of `reported_dir` in both path styles and of `parse_osc133`.
+- **Minimum grid width:** `alacritty_terminal` 0.26 panics (`grid/mod.rs:439`) when a 1-column grid is fed a double-width character, which the emulator fuzz test found. No grid Brindle creates or resizes is narrower than `MIN_COLS = 10` columns: `term-core`'s `emulator::MIN_COLS`, used by the server emulators' `size()`, the client's `Terminal::resize` (through `GridSize::clamped`) and replay size, `fit_grid`, and the split check (`can_split_zone`). The wire is unchanged: a listed or requested size is clamped where it is used. The fuzz generator is not narrowed.
 - **Transcripts:** two new fixtures and three harness changes:
   - fixture `client-session-lost` (protocol 1: an `EXIT` with `lost`);
   - fixture `holder-adopt-after-crash` (H1: `previous: crash`, and a held session ended by a signal);
@@ -48,9 +49,8 @@ None.
 
 ### Modified Capabilities
 
-None. No requirement in `openspec/specs/` changes, so `.openspec.yaml` sets `skip_specs: true`:
-- `terminal-server` "Failures stay small" and "Protocol versions" hold as written;
-- `text-input` "Input methods" is unchanged, because no platform sends a reversed range.
+- `zones`: "Minimum size for splitting" counts 10 columns instead of 2 (`MIN_COLS`), and gains the scenario that a pane narrower than 10 columns is laid out as 10 wide.
+- The other specs hold as written: `terminal-server` "Failures stay small" and "Protocol versions", and `text-input` "Input methods" (no platform sends a reversed range).
 
 ## Impact
 

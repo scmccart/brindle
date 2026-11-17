@@ -1,10 +1,10 @@
 //! The link between Brindle and a `brindle-remote relay` on a remote host.
 //!
 //! The relay pipes the client protocol ([`crate::client`]) between its stdio
-//! and its host's core, so the link carries protocol 1 and 2 frames as they
-//! are. It adds three frame types of its own, on numbers in a high range that
-//! no other protocol uses, and handles them itself rather than passing them
-//! on:
+//! and its host's core, so the link carries the frames of client protocols
+//! 1–3 as they are. It adds three frame types of its own, on numbers in a
+//! high range that no other protocol uses, and handles them itself rather
+//! than passing them on:
 //!
 //! | type | name              | direction        | payload                                                         |
 //! |-----:|-------------------|------------------|-----------------------------------------------------------------|
@@ -156,9 +156,10 @@ mod tests {
     #[test]
     fn relay_numbers_collide_with_no_other_protocol() {
         let relay = [MSG_RELAY_HOST, MSG_RELAY_HEARTBEAT, MSG_RELAY_ERROR];
-        // Everything the client protocol uses: 1-13 and 32-41 (`PROCESS`).
-        let client_numbers =
-            (client::MSG_DATA..=client::MSG_REPARENT).chain(client::MSG_WELCOME..=client::MSG_PROCESS);
+        // Everything the client protocol uses: 1-14 (`SET_LAYOUT`) and 32-41
+        // (`PROCESS`).
+        let client_numbers = (client::MSG_DATA..=client::MSG_SET_LAYOUT)
+            .chain(client::MSG_WELCOME..=client::MSG_PROCESS);
         for number in client_numbers {
             assert!(!relay.contains(&number), "type {number:#x} is used twice");
             assert!(!is_relay_type(number));

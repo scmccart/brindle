@@ -104,7 +104,7 @@ Protocols: client protocol versions 1–3 and core↔holder H1 at version 2, bot
 ## Enforcement
 
 - `tests/architecture.rs`: `the_wire_modules_do_no_io` (R6's codec half) and `the_server_core_and_holder_name_no_platform_type` (R8).
-- Transcript tests in `remote-protocol/` pin every message in both directions (R5, R6), and `fuzz.rs` covers the decoders (R6, R7).
+- Transcript tests in `remote-protocol/tests/transcripts.rs` pin every message in both directions (R5, R6). `every_message_variant_and_form_appears_in_a_transcript` checks coverage per message variant and nested form (each enum's variants, `Exit.lost`, `ExitStatus.code`), and `BRINDLE_REGEN_FIXTURES=1` writes only missing fixtures, never rewriting an existing one (R5). `fuzz.rs` covers the decoders (R6, R7).
 - `remote-agent/tests/{holder,core,upgrade,manage,relay,launch}.rs` run the real roles: start races (R11), crash and adopt (R2), reconnect and replay, backpressure (R9), upgrade, drain and refused check (R12), fault injection (R3).
 - CI's `test` job checks R21 (`cargo metadata`), and both platforms compile the platform module sets.
 - R1, R13, R14 and R16–R20 rely on review; the e2e `local-server-*` cases catch some regressions of R13, R16 and R17.

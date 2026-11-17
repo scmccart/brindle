@@ -22,6 +22,7 @@ use crate::actions::*;
 use crate::config::{Config, Profile};
 use crate::remote::Host;
 use crate::settings::Settings;
+use crate::terminal::MIN_COLS;
 use crate::terminal::process::Snapshot;
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
@@ -252,8 +253,8 @@ impl ZoneTree {
 
 /// Whether a zone card of outer pixel size `zone_size` (its border, and its
 /// header bar when `has_header` is true, included) can be split in half
-/// along `axis` while fitting, in each resulting card, a minimum 2x2
-/// terminal grid with its padding, the card's border and a header bar, with
+/// along `axis` while fitting, in each resulting card, a minimum
+/// [`MIN_COLS`] x 2 terminal grid with its padding, the card's border and a header bar, with
 /// the [`ZONE_GAP`] between the two cards.
 pub fn can_split_zone(
     zone_size: Size<Pixels>,
@@ -264,7 +265,7 @@ pub fn can_split_zone(
     line_height: Pixels,
 ) -> bool {
     let border = f32::from(brindle_ui::CARD_BORDER) * 2.0;
-    let min_term_w = f32::from(cell_width) * 2.0 + f32::from(padding) * 2.0;
+    let min_term_w = f32::from(cell_width) * f32::from(MIN_COLS) + f32::from(padding) * 2.0;
     let min_term_h = f32::from(line_height) * 2.0 + f32::from(padding) * 2.0;
     let min_zone_w = min_term_w + border;
     // Every card of a split tab has a header, whether or not this one has
@@ -1211,23 +1212,24 @@ mod tests {
         // The split math counts the card's real border and header.
         assert_eq!(px(ZONE_HEADER_HEIGHT), brindle_ui::CARD_HEADER_HEIGHT);
         assert_eq!(brindle_ui::CARD_BORDER, px(1.0));
-        // Min terminal is 2*8 + 2*4 = 24px wide, 2*16 + 2*4 = 40px high.
+        // Min terminal is 10*8 + 2*4 = 88px wide (MIN_COLS columns), 2*16 + 2*4 = 40px high.
         // With the card's 1px border and its header (28px), each zone card
-        // needs >= 26px wide and >= 70px high.
-        // Horizontal split needs width >= 2 * 26 + 6 (gap) = 58px, height >= 70px.
-        // Vertical split needs width >= 26px, height >= 2 * 70 + 6 = 146px.
-        assert!(can_split_zone(size(px(58.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
-        assert!(!can_split_zone(size(px(57.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
-        assert!(!can_split_zone(size(px(100.0), px(69.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        // needs >= 90px wide and >= 70px high.
+        // Horizontal split needs width >= 2 * 90 + 6 (gap) = 186px, height >= 70px.
+        // Vertical split needs width >= 90px, height >= 2 * 70 + 6 = 146px.
+        assert_eq!(MIN_COLS, 10);
+        assert!(can_split_zone(size(px(186.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(185.0), px(70.0)), false, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(300.0), px(69.0)), false, SplitAxis::Horizontal, pad, cw, lh));
 
-        assert!(can_split_zone(size(px(26.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
-        assert!(!can_split_zone(size(px(26.0), px(145.0)), true, SplitAxis::Vertical, pad, cw, lh));
-        assert!(!can_split_zone(size(px(25.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(can_split_zone(size(px(90.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(!can_split_zone(size(px(90.0), px(145.0)), true, SplitAxis::Vertical, pad, cw, lh));
+        assert!(!can_split_zone(size(px(89.0), px(146.0)), true, SplitAxis::Vertical, pad, cw, lh));
 
         // The spec's "Card chrome counts": a zone exactly as wide as two
-        // minimum grids plus their padding (2 * 24), but not the gap and the
+        // minimum grids plus their padding (2 * 88), but not the gap and the
         // borders, can't split right; the same tall enough can't split down.
-        assert!(!can_split_zone(size(px(48.0), px(500.0)), true, SplitAxis::Horizontal, pad, cw, lh));
+        assert!(!can_split_zone(size(px(176.0), px(500.0)), true, SplitAxis::Horizontal, pad, cw, lh));
         assert!(!can_split_zone(size(px(500.0), px(2.0 * (40.0 + 28.0))), true, SplitAxis::Vertical, pad, cw, lh));
 
         // describe_zone_tree is empty for 1 zone and prints normalized rects for 2+ zones.

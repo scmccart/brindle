@@ -21,6 +21,7 @@ pub mod search;
 #[cfg(any(target_os = "linux", windows))]
 mod server;
 // Moved to `brindle-term-core`, which the server core shares.
+pub use brindle_term_core::emulator::MIN_COLS;
 pub use brindle_term_core::{shell_integration, status};
 
 use std::borrow::Cow;
@@ -158,6 +159,16 @@ pub struct GridSize {
 impl Default for GridSize {
     fn default() -> Self {
         Self { cols: 80, rows: 24, cell_width: 8, cell_height: 16 }
+    }
+}
+
+impl GridSize {
+    /// This size with at least [`MIN_COLS`] columns, the narrowest grid the
+    /// client and the server's emulators make. Where a size comes from
+    /// outside the term (a layout, a listing), it goes through here before
+    /// it is used.
+    pub fn clamped(self) -> Self {
+        Self { cols: self.cols.max(MIN_COLS), ..self }
     }
 }
 
@@ -718,7 +729,11 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, size: GridSize) {
-        if size == self.size || size.cols == 0 || size.rows == 0 {
+        if size.cols == 0 || size.rows == 0 {
+            return;
+        }
+        let size = size.clamped();
+        if size == self.size {
             return;
         }
         self.size = size;
@@ -1322,6 +1337,14 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    #[test]
+    fn a_grid_size_narrower_than_min_cols_is_clamped_and_its_rows_kept() {
+        let narrow = GridSize { cols: 1, rows: 7, cell_width: 9, cell_height: 18 };
+        assert_eq!(narrow.clamped(), GridSize { cols: MIN_COLS, rows: 7, cell_width: 9, cell_height: 18 });
+        let wide = GridSize { cols: 120, ..narrow };
+        assert_eq!(wide.clamped(), wide);
+    }
 
     /// 6.1/6.2: what a new terminal runs follows the host it opens on, not
     /// what its profile targets. A remote host's session is left to it (the
