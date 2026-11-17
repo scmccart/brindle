@@ -428,6 +428,10 @@ impl Element for TerminalElement {
             let (line, col) = cursor_cell;
             let cb = cell_bounds(line, col.min(cols.saturating_sub(1)), if cursor_is_wide { 2 } else { 1 });
             let thickness = px((f32::from(cell_width) / 8.0).max(1.0).round());
+            #[allow(
+                clippy::wildcard_enum_match_arm,
+                reason = "foreign enum: alacritty's CursorShape, whose other shapes fill the cell"
+            )]
             let b = match cursor_shape {
                 CursorShape::Beam => Bounds::new(cb.origin, size(thickness * 2.0, cb.size.height)),
                 CursorShape::Underline => Bounds::new(

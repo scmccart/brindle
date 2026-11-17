@@ -425,6 +425,10 @@ impl TerminalView {
         mode.intersects(TermMode::MOUSE_MODE) && !modifiers.shift
     }
 
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign enum: gpui::MouseButton, of which left and middle act here"
+    )]
     pub fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         let Some(layout) = self.layout.get() else { return };

@@ -139,7 +139,7 @@ impl Field {
             Field::SshIdentity => "default key",
             Field::SshArgs => "shell words, e.g. -J bastion",
             Field::Container => "name or id",
-            _ => "",
+            Field::Name | Field::Theme | Field::Default | Field::Remote | Field::Engine | Field::ConnectAtLaunch => "",
         }
     }
 
@@ -350,6 +350,10 @@ impl ProfileEditor {
 
     /// The option choice field `field` shows, as an index into its options
     /// (`theme_choices`, [`REMOTE_KINDS`], [`ENGINES`]).
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: `Field` has 17 variants and only the three select fields have options"
+    )]
     pub fn choice_index(&self, field: Field) -> Option<usize> {
         match field {
             Field::Theme => self.theme_choices.iter().position(|t| *t == self.values.theme),
@@ -361,6 +365,10 @@ impl ProfileEditor {
 
     /// Chooses option `ix` of choice field `field`, as its select does. An
     /// index out of range changes nothing.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: `Field` has 17 variants and only the three select fields have options"
+    )]
     pub fn choose(&mut self, field: Field, ix: usize) {
         match field {
             Field::Theme => {
@@ -510,6 +518,10 @@ impl ProfileEditor {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value, the Profiles section's mode, held by the open dialog; boxing the editor adds an indirection to every field read"
+)]
 pub enum Mode {
     List,
     Editor(ProfileEditor),
@@ -694,14 +706,14 @@ impl ProfilesState {
     pub fn editor(&self) -> Option<&ProfileEditor> {
         match &self.mode {
             Mode::Editor(editor) => Some(editor),
-            _ => None,
+            Mode::List | Mode::ConfirmDelete => None,
         }
     }
 
     pub fn editor_mut(&mut self) -> Option<&mut ProfileEditor> {
         match &mut self.mode {
             Mode::Editor(editor) => Some(editor),
-            _ => None,
+            Mode::List | Mode::ConfirmDelete => None,
         }
     }
 
@@ -902,6 +914,10 @@ impl SettingsDialog {
     }
 
     /// The options of select field `field`, in the editor's order.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: `Field` has 17 variants and only the three select fields have options"
+    )]
     fn choice_labels(&self, editor: &ProfileEditor, field: Field) -> Vec<SharedString> {
         match field {
             Field::Theme => {
@@ -932,6 +948,10 @@ impl SettingsDialog {
 
     /// The focus handle of a shown profile field, `None` for the default
     /// checkbox while it can't be changed (it takes no focus then).
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: every field but the two switches and the selects is a text input"
+    )]
     fn profile_field_handle(&self, editor: &ProfileEditor, field: Field, cx: &App) -> Option<FocusHandle> {
         match field {
             Field::Default => (!editor.default_locked()).then(|| self.default_handle.clone()),
@@ -1020,7 +1040,7 @@ impl SettingsDialog {
                 let editor = editor.clone();
                 self.render_profile_editor(&editor, cx)
             }
-            _ => self.render_profile_list(window, cx),
+            Mode::List | Mode::ConfirmDelete => self.render_profile_list(window, cx),
         }
     }
 
@@ -1166,6 +1186,10 @@ impl SettingsDialog {
 
         let row = |this: &Self, field: Field, cx: &mut Context<Self>| -> AnyElement {
             let error = error_for(field);
+            #[allow(
+                clippy::wildcard_enum_match_arm,
+                reason = "railway R3 exception: every field but the two switches and the selects is a text input"
+            )]
             let control: AnyElement = match field {
                 f if SELECT_FIELDS.contains(&f) => {
                     this.choice_slot(Choice::Profile(f)).flex_1().min_w_0().into_any_element()
@@ -1422,7 +1446,7 @@ theme = "gone"
         assert!(state.entries[1].profile.is_err());
         state.select(1);
         assert!(state.start_edit(&themes()).unwrap_err().contains("can't be read"));
-        assert!(edit(&mut state, "Work").dirty() == false);
+        assert!(!edit(&mut state, "Work").dirty());
         // A file that isn't TOML lists the loaded profiles, read-only.
         let f = Fixture::new("broken", "[oops\n");
         let mut state = ProfilesState::new(&f.path, &[Profile { name: "Loaded".into(), ..Default::default() }], None);

@@ -245,7 +245,7 @@ impl FontsState {
     pub fn choice(&self, field: FontField) -> &FamilyChoice {
         match field {
             FontField::Ui => &self.ui,
-            _ => &self.terminal,
+            FontField::Terminal | FontField::Size | FontField::LineHeight => &self.terminal,
         }
     }
 

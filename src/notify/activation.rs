@@ -150,6 +150,10 @@ fn settle(attached: Result<Attached, String>, cx: &mut App) {
 }
 
 /// GPUI's `wl_display` and the window's `wl_surface`, on Wayland.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enums: raw_window_handle's RawDisplayHandle and RawWindowHandle, of which only Wayland's counts"
+)]
 fn wayland_pointers(window: &Window) -> anyhow::Result<Option<(*mut c_void, *mut c_void)>> {
     // GPUI's X11 windows panic when asked for their raw handles
     // (`unimplemented!`), so only ask on the backend GPUI picked for Wayland.

@@ -134,7 +134,7 @@ impl Session {
     pub fn pid(&self) -> Option<u32> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some(running.pid()),
-            _ => None,
+            Phase::Starting { .. } | Phase::Gone => None,
         }
     }
 
@@ -154,7 +154,7 @@ impl Session {
     pub fn foreground(&self) -> Option<Foreground> {
         match &*self.phase.lock() {
             Phase::Running(running) => running.foreground(),
-            _ => None,
+            Phase::Starting { .. } | Phase::Gone => None,
         }
     }
 
@@ -197,7 +197,6 @@ impl Session {
     /// (`REPARENT`), now or as soon as it starts or attaches, and again
     /// after each reconnect's replay. Only a Windows core takes it, so a
     /// remote session (on a relay connection) never sends it.
-
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn reparent(&self, hwnd: u64) {
         match &mut *self.phase.lock() {

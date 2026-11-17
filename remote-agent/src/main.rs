@@ -1,3 +1,7 @@
+// railway R3, types R2: no `_ =>` on one of Brindle's own enums. Non-test
+// code only; `docs/architecture/README.md` lists the exceptions.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
+
 mod conpty;
 #[cfg(target_os = "linux")]
 mod liveness;

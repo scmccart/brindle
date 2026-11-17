@@ -118,7 +118,7 @@ pub fn peer_allowed(own: &Principal, peer: &Principal, side: Side) -> Result<(),
     match side {
         Side::Server if peer < own => Err(Refusal::LowerIntegrity { own, peer }),
         Side::Client if peer != own => Err(Refusal::OtherIntegrity { own, peer }),
-        _ => Ok(()),
+        Side::Server | Side::Client => Ok(()),
     }
 }
 

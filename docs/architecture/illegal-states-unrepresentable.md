@@ -80,7 +80,7 @@ A removed config key stays as a field that is parsed, warned about and ignored (
 
 ## Enforcement
 
-- The compiler holds R2 wherever the wildcard is absent, and R1 and R8 once the enum exists.
+- The compiler holds R2 wherever the wildcard is absent, and R1 and R8 once the enum exists. In non-test code `clippy::wildcard_enum_match_arm` (CI, `-D warnings`) also reports every wildcard on an enum; one on a Brindle enum that stays carries `railway R3 exception` in its `reason` (`docs/architecture/README.md`).
 - `openspec/specs/` scenarios and the e2e suite hold several instances (restore by id and key, `RowKey` across a kill).
 - No rule here has a check in `tests/architecture.rs`. All of them rely on review.
 

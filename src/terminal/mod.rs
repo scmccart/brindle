@@ -399,7 +399,10 @@ impl Terminal {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private, built only by the constructors below from values each already has (the term, the listener and its event channel, parser, marks and backend); a parameter struct would be built just to be unpacked here"
+    )]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
         listener: Listener,
@@ -471,7 +474,10 @@ impl Terminal {
     /// A terminal whose session `request` starts on `host`, in the
     /// background ([`crate::remote::local::Session::start`]).
     #[cfg(any(target_os = "linux", windows))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private, called by `spawn` with what it already holds; a parameter struct would be a one-use type"
+    )]
     fn start_session(
         host: &Host,
         request: crate::remote::local::SpawnRequest,
@@ -699,6 +705,10 @@ impl Terminal {
         }
     }
 
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign enum: alacritty_terminal::event::Event, of which the rest need no action here"
+    )]
     fn handle_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
         match event {
             AlacEvent::Wakeup => {
@@ -1111,7 +1121,7 @@ impl Terminal {
     ) -> Option<(crate::remote::protocol::SessionId, Option<crate::remote::SessionKey>)> {
         match &self.backend {
             Backend::Server { session, .. } if !self.exited => session.id_and_key(),
-            _ => None,
+            Backend::Server { .. } | Backend::Remote => None,
         }
     }
 
@@ -1270,7 +1280,7 @@ fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
     match event {
         TerminalEvent::Bell | TerminalEvent::Notify(_) => None,
         TerminalEvent::Status(Some(_)) => Some(TerminalEvent::Status(None)),
-        other => Some(other),
+        other @ (TerminalEvent::TitleChanged | TerminalEvent::Exited | TerminalEvent::Status(_)) => Some(other),
     }
 }
 

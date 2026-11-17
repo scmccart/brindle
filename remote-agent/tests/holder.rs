@@ -269,7 +269,7 @@ fn a_new_holder_is_detached_and_welcomes_its_first_core() {
     assert_ne!(parent(welcome.pid), Some(std::process::id()));
     // It is the first holder of its build, and listens where that one does.
     let place = Endpoints::of(&dir.path).unwrap().holder(&welcome.build, 0);
-    assert_eq!(dir.holder_endpoints(), [place.endpoint.clone()]);
+    assert_eq!(dir.holder_endpoints(), std::slice::from_ref(&place.endpoint));
     assert!(place.lock.exists() && place.log.exists());
     #[cfg(unix)]
     {

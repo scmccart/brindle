@@ -625,7 +625,7 @@ pub fn core_messages(dir: &TempDir) -> Vec<String> {
 pub fn core_logged(dir: &TempDir, session: SessionId, decision: Decision) -> usize {
     let wanted = decision.message(session);
     let found = eventually(TIMEOUT, || {
-        core_messages(dir).iter().any(|message| *message == wanted)
+        core_messages(dir).contains(&wanted)
     });
     let messages = core_messages(dir);
     match messages.iter().position(|message| *message == wanted) {

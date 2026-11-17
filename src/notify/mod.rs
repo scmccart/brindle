@@ -304,7 +304,7 @@ impl Notifier {
         let target = Target { window: request.window, tab: request.tab, source: request.source };
         let replaces = match request.source {
             Source::Bell => self.bell_ids.get(&request.tab).copied().unwrap_or(0),
-            _ => 0,
+            Source::Osc9 | Source::Osc777 | Source::Osc7501 => 0,
         };
         match &mut self.sink {
             Sink::Log { writer, next_id } => {

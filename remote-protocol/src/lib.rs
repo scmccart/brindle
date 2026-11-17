@@ -8,6 +8,12 @@
 //! `brindle-remote relay`, which pipes the client protocol, after the
 //! [`FRAME_STREAM_MARKER`].
 
+// railway R3, types R2: no `_ =>` on one of Brindle's own enums. railway R5,
+// R9: a decoder never panics on bytes from outside, and non-test code has no
+// `unwrap` or `expect`. Non-test code only.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod access;
 pub mod build_id;
 pub mod client;

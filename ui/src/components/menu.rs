@@ -269,7 +269,7 @@ pub fn menu_item_release(
     };
     match over {
         ReleaseOver::Option(ix) if counts => MenuRelease::Pick(ix),
-        _ => MenuRelease::Stay,
+        ReleaseOver::Option(_) | ReleaseOver::Menu | ReleaseOver::Outside => MenuRelease::Stay,
     }
 }
 

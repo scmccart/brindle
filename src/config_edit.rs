@@ -222,6 +222,10 @@ impl<'a> Profiles<'a> {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enum: toml_edit::Item, of which only the two profile shapes count"
+)]
 fn profiles_mut(doc: &mut DocumentMut) -> Option<Profiles<'_>> {
     match doc.get_mut("profiles")? {
         Item::ArrayOfTables(a) => Some(Profiles::Tables(a)),
@@ -750,7 +754,11 @@ background = "nope"
         let path = dir.join("config.toml");
         let text = "theme = \"x\"\n[broken\n";
         std::fs::write(&path, text).unwrap();
-        let err = save(&path, |doc| Ok(set_global_theme(doc, "y"))).unwrap_err();
+        let err = save(&path, |doc| {
+            set_global_theme(doc, "y");
+            Ok(())
+        })
+        .unwrap_err();
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert!(!dir.join("config.toml.tmp").exists());
@@ -760,7 +768,11 @@ background = "nope"
     fn save_starts_from_the_default_config() {
         let dir = temp_dir("missing");
         let path = dir.join("sub/config.toml");
-        save(&path, |doc| Ok(set_global_theme(doc, "gruvbox-dark"))).unwrap();
+        save(&path, |doc| {
+            set_global_theme(doc, "gruvbox-dark");
+            Ok(())
+        })
+        .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, DEFAULT_CONFIG.replace("theme = \"brindle-dark\"", "theme = \"gruvbox-dark\""));
     }
@@ -771,7 +783,11 @@ background = "nope"
         let path = dir.join("config.toml");
         let text = "theme = \"x\n";
         std::fs::write(&path, text).unwrap();
-        let err = save(&path, |doc| Ok(set_global_theme(doc, "y"))).unwrap_err();
+        let err = save(&path, |doc| {
+            set_global_theme(doc, "y");
+            Ok(())
+        })
+        .unwrap_err();
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
@@ -785,7 +801,11 @@ background = "nope"
         let link = dir.join("config.toml");
         std::fs::write(&target, "theme = \"a\"\n").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        save(&link, |doc| Ok(set_global_theme(doc, "b"))).unwrap();
+        save(&link, |doc| {
+            set_global_theme(doc, "b");
+            Ok(())
+        })
+        .unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "theme = \"b\"\n");
     }

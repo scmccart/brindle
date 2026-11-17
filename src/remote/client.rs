@@ -65,10 +65,7 @@ fn await_stderr(rx: &mpsc::Receiver<String>) -> String {
 fn drain_stderr(mut stderr: impl Read) -> String {
     let mut retained = Vec::new();
     let mut buffer = [0u8; 4096];
-    loop {
-        let Ok(read) = stderr.read(&mut buffer) else {
-            break;
-        };
+    while let Ok(read) = stderr.read(&mut buffer) {
         if read == 0 {
             break;
         }
@@ -1718,7 +1715,7 @@ mod tests {
             }
 
             /// Runs to the end of the session.
-            fn to_end(&mut self, limit: Duration) -> End {
+            fn run_to_end(&mut self, limit: Duration) -> End {
                 self.until(limit, |_| false)
             }
 
@@ -1742,7 +1739,7 @@ mod tests {
         fn scenario_clean_exit(profile: &Profile, rounds: usize) -> Scenario {
             for round in 0..rounds {
                 let mut tab = Tab::start(profile, &["sh", "-c", "printf READY; exit 0"], None);
-                match tab.to_end(Duration::from_secs(60)) {
+                match tab.run_to_end(Duration::from_secs(60)) {
                     End::Exited(_) if tab.output.contains("READY") => {}
                     end => return Err(format!("round {round}: {end:?}; output {:?}", tab.output)),
                 }
@@ -1753,7 +1750,7 @@ mod tests {
         /// A tab on a container that isn't there fails, saying so.
         fn scenario_missing_container() -> Scenario {
             let mut tab = Tab::start(&container_profile("brindle-no-such-container-xyz"), &["sh"], None);
-            match tab.to_end(Duration::from_secs(60)) {
+            match tab.run_to_end(Duration::from_secs(60)) {
                 End::Failed(error) if error.to_lowercase().contains("no such container") => Ok(()),
                 end => Err(format!("{end:?}; output {:?}", tab.output)),
             }
@@ -1787,7 +1784,7 @@ mod tests {
                 return Err(format!("no foreground program: {:?}", tab.session.foreground()));
             }
             tab.input("exit\n");
-            match tab.to_end(Duration::from_secs(20)) {
+            match tab.run_to_end(Duration::from_secs(20)) {
                 End::Exited(_) => Ok(()),
                 end => Err(format!("{end:?}; output ends {:?}", tab.tail())),
             }
@@ -2005,12 +2002,13 @@ mod tests {
             }
         }
 
+        /// Commands that were started, each as its words.
+        type CommandLines = Vec<Vec<String>>;
+
         /// Launches the relay with the real commands, returning each launch
         /// and each deployment command that was started. Every process of a
         /// launch is one of the two.
-        fn counted_launch(
-            target: &RemoteTarget,
-        ) -> std::result::Result<(Vec<Vec<String>>, Vec<Vec<String>>), String> {
+        fn counted_launch(target: &RemoteTarget) -> std::result::Result<(CommandLines, CommandLines), String> {
             let helper = Helper::of(static_helper()).map_err(|e| format!("{e:#}"))?;
             let never = AtomicBool::new(false);
             let counted = Counted { commands: Commands { cancel: &never }, ran: RefCell::default() };

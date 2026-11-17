@@ -314,10 +314,10 @@ impl Config {
     /// prevents the terminal from starting.
     pub fn load_or_default() -> (Self, Option<String>) {
         let path = Self::path();
-        if !path.exists() {
-            if let Err(err) = write_default(&path) {
-                log::warn!("could not write default config to {}: {err:#}", path.display());
-            }
+        if !path.exists()
+            && let Err(err) = write_default(&path)
+        {
+            log::warn!("could not write default config to {}: {err:#}", path.display());
         }
         match Self::load(&path) {
             Ok(config) => (config, None),

@@ -80,10 +80,9 @@ pub fn until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option
     if eventually(timeout, || {
         found = probe();
         found.is_some()
-    }) {
-        if let Some(value) = found {
-            return value;
-        }
+    }) && let Some(value) = found
+    {
+        return value;
     }
     panic!("never: {what} (within {:?})", limit(timeout));
 }

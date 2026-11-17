@@ -326,6 +326,10 @@ pub enum Listing {
 
 /// What a sessions palette row stands for, by row across the groups.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one row per detached session in an open palette, a handful at most; boxing `SessionInfo` adds an allocation per row"
+)]
 pub enum SessionRow {
     /// A detached session of `host`'s core: enter attaches it, and
     /// `picker_kill` ends it, both on `host`'s connection.

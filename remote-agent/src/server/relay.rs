@@ -460,6 +460,10 @@ fn modified(path: impl AsRef<Path>) -> Option<std::time::SystemTime> {
 }
 
 /// Says `HELLO` with a token that owns nothing, and reads the answer.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: any answer to HELLO but `Welcome` or `Error` is reported as a failure"
+)]
 fn hello(mut stream: UnixStream) -> Result<Probe, String> {
     let talk = |error: io::Error| format!("can't talk to the core: {error}");
     stream.set_read_timeout(Some(HELLO_LIMIT)).map_err(talk)?;
@@ -593,7 +597,7 @@ fn decide_scope(current: scope::Outcome, lingers: bool) -> ScopeChoice {
     } = current;
     let decision = match decision {
         scope::Decision::Scope(_) if !lingers => scope::Decision::Plain("the user doesn't linger"),
-        decision => decision,
+        scope::Decision::Scope(_) | scope::Decision::Plain(_) => decision,
     };
     let note = match &decision {
         scope::Decision::Scope(_) => None,

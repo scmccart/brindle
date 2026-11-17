@@ -172,6 +172,10 @@ pub enum TriggerPress {
 /// press asks for an enabled trigger's menu when the list has
 /// `on_context_menu` (`has_menu`). `None`: the press bubbles on, as on a
 /// disabled trigger.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enum: gpui::MouseButton, of which three buttons act"
+)]
 pub fn trigger_press(button: MouseButton, disabled: bool, closes: bool, has_menu: bool) -> Option<TriggerPress> {
     match button {
         MouseButton::Left if !disabled => Some(TriggerPress::Activate),

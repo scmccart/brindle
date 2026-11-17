@@ -170,7 +170,7 @@ fn main() {
             let outcome = (case.run)(&ctx);
             match common::server::stop(&ctx.helper, &ctx.server_dir, &ctx.dir) {
                 // A server left running fails a case that passed.
-                Err(why) if !matches!(outcome, Err(_)) => Err(why),
+                Err(why) if outcome.is_ok() => Err(why),
                 Err(why) => {
                     println!("         {why}");
                     outcome
@@ -207,9 +207,12 @@ fn usage(why: &str) -> ! {
     std::process::exit(2);
 }
 
+/// One of the harness's own unit tests.
+type SelfTest = fn() -> Result;
+
 /// The harness's own unit tests (`--self-test`); there is no libtest here.
 fn self_test() -> i32 {
-    let tests: &[(&str, fn() -> Result)] = &[
+    let tests: &[(&str, SelfTest)] = &[
         ("shards", common::self_test_shard),
         ("scaled waits", wait::self_test),
         ("dump after the last step", brindle::self_test_dump_after_last_step),

@@ -2567,3 +2567,71 @@ mod tests {
         Vec::<String>::new()
     );
 }
+
+/// The lints a crate root must switch on, as `(root file, lints)`: the
+/// wildcard lint on every crate, and the panicking-call lints on the two
+/// crates that decode what comes from outside the process.
+const ROOT_LINTS: [(&str, &[&str]); 5] = [
+    ("src/main.rs", &["clippy::wildcard_enum_match_arm"]),
+    ("remote-agent/src/main.rs", &["clippy::wildcard_enum_match_arm"]),
+    (
+        "remote-protocol/src/lib.rs",
+        &["clippy::wildcard_enum_match_arm", "clippy::unwrap_used", "clippy::expect_used"],
+    ),
+    (
+        "term-core/src/lib.rs",
+        &["clippy::wildcard_enum_match_arm", "clippy::unwrap_used", "clippy::expect_used"],
+    ),
+    ("ui/src/lib.rs", &["clippy::wildcard_enum_match_arm"]),
+];
+
+/// The lints of `wanted` that `root_text` doesn't switch on in a
+/// `#![cfg_attr(not(test), warn(…))]` line. A text search: the lint is what
+/// finds a violation, this only notices that a root stopped asking.
+fn lints_missing_from(root_text: &str, wanted: &[&str]) -> Vec<String> {
+    let attributes: Vec<&str> = root_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#![cfg_attr(not(test), warn("))
+        .collect();
+    wanted
+        .iter()
+        .filter(|lint| !attributes.iter().any(|line| line.contains(*lint)))
+        .map(|lint| lint.to_string())
+        .collect()
+}
+
+/// railway R3, R5, R9, types R2: clippy holds them in non-test code, so a
+/// root that loses its attribute stops being checked without a failure.
+#[test]
+fn the_crate_roots_enable_the_restriction_lints() {
+    assert_eq!(ROOT_LINTS.len(), CRATES.len(), "every crate's root is listed");
+    let mut found = Vec::new();
+    for (file, wanted) in ROOT_LINTS {
+        let path = root().join(file);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for lint in lints_missing_from(&text, wanted) {
+            found.push(format!("{file}: no `#![cfg_attr(not(test), warn({lint}))]`"));
+        }
+    }
+    assert_none(
+        found,
+        "the crate roots switch on the lints that hold railway R3, R5 and R9 and types R2 \
+         (docs/architecture/railway-oriented-programming.md, Enforcement)",
+    );
+}
+
+/// The search itself: a root with the attribute passes, one without it is
+/// reported.
+#[test]
+fn a_root_without_the_lint_is_reported() {
+    let lint = ["clippy::wildcard_enum_match_arm"];
+    let with = "//! docs\n#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]\nmod a;\n";
+    let without = "//! docs\n#![warn(clippy::wildcard_enum_match_arm)]\nmod a;\n";
+    let also = "#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]\n";
+    assert!(lints_missing_from(with, &lint).is_empty());
+    assert_eq!(lints_missing_from(without, &lint), ["clippy::wildcard_enum_match_arm"]);
+    assert_eq!(lints_missing_from("mod a;\n", &lint), ["clippy::wildcard_enum_match_arm"]);
+    assert!(lints_missing_from(also, &["clippy::unwrap_used", "clippy::expect_used"]).is_empty());
+    assert_eq!(lints_missing_from(also, &lint), ["clippy::wildcard_enum_match_arm"]);
+}

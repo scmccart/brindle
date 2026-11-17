@@ -100,9 +100,15 @@ pub struct ActivateTab(pub usize);
 #[action(namespace = brindle, no_json)]
 pub struct NewTabWithProfile(pub usize);
 
+/// Builds the action of a table entry.
+type ActionBuilder = fn() -> Box<dyn Action>;
+
+/// Builds the action of a numbered entry from its 1-based number.
+type NumberedBuilder = fn(usize) -> Box<dyn Action>;
+
 /// Every bindable action without a parameter: config name, command palette
 /// label (`None` keeps it out of the palette) and constructor.
-const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
+const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("new_tab", Some("New Tab"), || Box::new(NewTab)),
     ("close_tab", Some("Close Tab"), || Box::new(CloseTab)),
     ("next_tab", Some("Next Tab"), || Box::new(NextTab)),
@@ -224,7 +230,7 @@ const ACTIONS: &[(&str, Option<&str>, fn() -> Box<dyn Action>)] = &[
 ];
 
 /// Actions taking a 1-based number, written as `<prefix><N>`.
-const NUMBERED_ACTIONS: &[(&str, fn(usize) -> Box<dyn Action>)] = &[
+const NUMBERED_ACTIONS: &[(&str, NumberedBuilder)] = &[
     ("activate_tab_", |n| Box::new(ActivateTab(n))),
     ("new_tab_with_profile_", |n| Box::new(NewTabWithProfile(n))),
 ];
@@ -545,7 +551,7 @@ mod tests {
         let matched = default_bindings()
             .iter()
             .filter(|b| b.action().partial_eq(&OpenSettings))
-            .map(|b| (format!("{:?}", b.keystrokes()), b.match_keystrokes(&[typed.clone()])))
+            .map(|b| (format!("{:?}", b.keystrokes()), b.match_keystrokes(std::slice::from_ref(&typed))))
             .collect::<Vec<_>>();
         assert!(matched.iter().any(|(_, m)| *m == Some(false)), "{matched:#?}");
     }

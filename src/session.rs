@@ -179,6 +179,10 @@ pub fn record_zones(tree: &ZoneTree, active: ZoneId, leaves: &HashMap<ZoneId, Zo
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per tab, read from or written to the state file once; boxing `Local`'s fields changes nothing the file shows"
+)]
 pub enum TabState {
     /// A local tab: rerun the profile in `cwd` (or
     /// `zones` when split into 2+ zones).
@@ -396,10 +400,14 @@ pub enum RestoredZoneNode {
     },
 }
 
+/// The leaves of a restored split: each zone with its directory and its
+/// recorded session.
+pub type RestoredLeaves = Vec<(ZoneId, PathBuf, Option<ServerSession>)>;
+
 impl RestoredZoneNode {
     /// Converts this resolved node into a `(ZoneTree, leaves, active_id)`:
     /// each leaf with its directory and its recorded session.
-    pub fn into_tree(self) -> (ZoneTree, Vec<(ZoneId, PathBuf, Option<ServerSession>)>, ZoneId) {
+    pub fn into_tree(self) -> (ZoneTree, RestoredLeaves, ZoneId) {
         let mut next_id = 1u64;
         let mut leaves = Vec::new();
         let mut active_id = None;
@@ -589,7 +597,7 @@ pub fn drop_lost_zones(mut window: WindowState, alive: impl Fn(&ServerSession) -
                 }
             }
             TabState::Local { zones: None, ref session, .. } if lost(session) => continue,
-            tab => tab,
+            tab @ (TabState::Local { .. } | TabState::Skipped) => tab,
         };
         if ix <= window.active {
             active = Some(tabs.len());
@@ -635,6 +643,10 @@ impl ZoneNodeState {
 
 /// One tab as seen when taking a snapshot.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per tab, built when the state is recorded and dropped after it is written"
+)]
 pub enum SnapshotTab {
     Local {
         profile: String,

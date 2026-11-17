@@ -31,6 +31,10 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 pub struct Titles(Arc<Mutex<Option<String>>>);
 
 impl EventListener for Titles {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign enum: alacritty_terminal::event::Event, of which only the titles matter here"
+    )]
     fn send_event(&self, event: Event) {
         match event {
             Event::Title(title) => *self.0.lock() = Some(title),

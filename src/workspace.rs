@@ -1024,7 +1024,7 @@ impl Workspace {
                 let Some(notice) = notice else { return };
                 (notice.source, notice.title.as_str(), notice.body.as_str())
             }
-            _ => return,
+            TerminalEvent::TitleChanged | TerminalEvent::Exited => return,
         };
         if !notify::policy::wanted(&Self::settings(cx).notifications, source, visible) {
             return;

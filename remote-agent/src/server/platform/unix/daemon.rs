@@ -106,6 +106,10 @@ impl ReadyPipe {
     ///
     /// Each call reads once, and the loop calls again while there is more
     /// to read or the end to see.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign enum: std::io::ErrorKind, whose other kinds all mean the end can't be read"
+    )]
     pub fn read(&mut self) -> Option<bool> {
         let mut buffer = [0u8; 16];
         let read = unsafe {

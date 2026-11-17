@@ -4,6 +4,10 @@
 //! or the app's actions table. Apps call [`init`] once at startup and chain
 //! [`default_bindings`] into their own keybindings.
 
+// railway R3, types R2: no `_ =>` on one of Brindle's own enums. Non-test
+// code only; `docs/architecture/README.md` lists the exceptions.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
+
 use gpui::App;
 
 pub mod actions;

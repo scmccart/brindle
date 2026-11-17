@@ -123,10 +123,7 @@ impl Scanner {
         while i < bytes.len() {
             if self.state == State::Ground {
                 // Fast path: nothing interesting happens until an ESC.
-                match bytes[i..].iter().position(|&b| b == ESC) {
-                    Some(p) => i += p,
-                    None => return None,
-                }
+                i += bytes[i..].iter().position(|&b| b == ESC)?;
             }
             if let Some(split) = self.byte(bytes[i]) {
                 return Some((i, split));
@@ -188,7 +185,7 @@ impl Scanner {
             State::EscapeIntermediate => {
                 self.state = match b {
                     ESC => State::Escape,
-                    0x20..=0x2f | 0x00..=0x1f => State::EscapeIntermediate,
+                    0x00..=0x2f => State::EscapeIntermediate,
                     _ => State::Ground,
                 };
                 None
@@ -1063,7 +1060,7 @@ mod tests {
 
     impl Harness {
         fn new(style: PathStyle, cols: u16, rows: u16, history: usize) -> Self {
-            let size = GridSize { cols, rows, ..Default::default() };
+            let size = GridSize { cols, rows };
             let config = term::Config { scrolling_history: history, ..Default::default() };
             let term = Term::new(config, &size, VoidListener);
             Harness { term, parser: Parser::new(style), marks: Mutex::default() }
@@ -1098,7 +1095,7 @@ mod tests {
         }
 
         fn resize(&mut self, cols: u16, rows: u16) {
-            let size = GridSize { cols, rows, ..Default::default() };
+            let size = GridSize { cols, rows };
             self.marks.lock().resize(&mut self.term, size);
         }
     }
