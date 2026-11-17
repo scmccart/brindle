@@ -1,10 +1,12 @@
 //! Who may use a Windows terminal server's pipes: the rule both ends apply
-//! to the process at the other end, and the security descriptors the pipes
-//! and the server directory are created with.
+//! to the process at the other end ([`peer_allowed`], and the server's
+//! [`admit_client`]), the security descriptors the pipes and the server
+//! directory are created with, and what a DACL read back from one must
+//! hold ([`Dacl::allows_only`]).
 //!
-//! Everything here works on values (a SID string, an integrity RID), so it
-//! is tested on every platform; [`crate::win`] reads those values from
-//! tokens.
+//! Everything here works on values (a SID string, an integrity RID, the
+//! entries of a DACL), so it is tested on every platform; `crate::win`
+//! reads those values from tokens and security descriptors.
 
 use std::fmt;
 use std::io;
@@ -117,6 +119,59 @@ pub fn peer_allowed(own: &Principal, peer: &Principal, side: Side) -> Result<(),
         Side::Server if peer < own => Err(Refusal::LowerIntegrity { own, peer }),
         Side::Client if peer != own => Err(Refusal::OtherIntegrity { own, peer }),
         _ => Ok(()),
+    }
+}
+
+/// The server's check of a client that connected, before anything is read:
+/// accepted only when it runs as `own`'s user and not below its integrity
+/// level. `client` is who it runs as, or why that can't be told, which
+/// refuses it too. Every refusal is `PermissionDenied`.
+pub fn admit_client(own: &Principal, client: io::Result<Principal>) -> io::Result<()> {
+    let refused = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
+    let client = client.map_err(|error| {
+        refused(format!(
+            "refused a connection whose user can't be told: {error}"
+        ))
+    })?;
+    peer_allowed(own, &client, Side::Server)
+        .map_err(|refusal| refused(format!("refused a connection: {refusal}")))
+}
+
+/// SYSTEM's SID, the one entry beside the user's in the server's DACLs.
+pub const SYSTEM_SID: &str = "S-1-5-18";
+
+/// One access-allowed entry of a DACL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ace {
+    /// The trustee, as a SID string.
+    pub sid: String,
+    /// The access mask.
+    pub mask: u32,
+    /// The entry's flags (inheritance).
+    pub flags: u8,
+}
+
+/// An object's discretionary ACL, as read back from it (`crate::win`'s
+/// `Dacl::of_handle` and `Dacl::of_path` on Windows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dacl {
+    /// Whether the DACL is protected from inheriting its parent's entries.
+    pub protected: bool,
+    /// The access-allowed entries, in order.
+    pub allowed: Vec<Ace>,
+    /// How many entries are of another kind (deny, and so on).
+    pub others: usize,
+}
+
+impl Dacl {
+    /// Whether the DACL is protected and allows exactly `sids`, each once,
+    /// with no other entries.
+    pub fn allows_only(&self, sids: &[&str]) -> bool {
+        let mut found: Vec<&str> = self.allowed.iter().map(|ace| ace.sid.as_str()).collect();
+        let mut wanted = sids.to_vec();
+        found.sort_unstable();
+        wanted.sort_unstable();
+        self.protected && self.others == 0 && found == wanted
     }
 }
 
@@ -258,6 +313,85 @@ mod tests {
             names,
             ["untrusted", "low", "medium", "0x2100", "high", "system"]
         );
+    }
+
+    #[test]
+    fn the_client_must_be_the_same_user_at_no_lower_integrity() {
+        let own = principal(SIDS[0], Integrity::MEDIUM);
+        admit_client(&own, Ok(own.clone())).unwrap();
+        // A client above the server is the server's to accept; the client
+        // itself refuses a server at another level.
+        admit_client(&own, Ok(principal(SIDS[0], Integrity::HIGH))).unwrap();
+
+        let other_user =
+            admit_client(&own, Ok(principal(SIDS[1], Integrity::MEDIUM))).unwrap_err();
+        assert_eq!(other_user.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            other_user.to_string(),
+            "refused a connection: it runs as another user \
+             (S-1-5-21-1-2-3-1002, not S-1-5-21-1-2-3-1001)"
+        );
+
+        let lower = admit_client(&own, Ok(principal(SIDS[0], Integrity::LOW))).unwrap_err();
+        assert_eq!(lower.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            lower.to_string(),
+            "refused a connection: the client runs at low integrity, below this server's medium"
+        );
+        let elevated = principal(SIDS[0], Integrity::HIGH);
+        assert!(admit_client(&elevated, Ok(own.clone())).is_err());
+
+        // A token that can't be opened is refused, whatever the reason.
+        let unreadable = admit_client(
+            &own,
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "process 4: can't open it: access denied",
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(unreadable.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            unreadable.to_string(),
+            "refused a connection whose user can't be told: process 4: can't open it: access denied"
+        );
+        let gone = admit_client(&own, Err(io::ErrorKind::NotFound.into())).unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    fn ace(sid: &str) -> Ace {
+        Ace {
+            sid: sid.to_string(),
+            mask: 0x1f_01ff,
+            flags: 0,
+        }
+    }
+
+    fn dacl(protected: bool, sids: &[&str], others: usize) -> Dacl {
+        Dacl {
+            protected,
+            allowed: sids.iter().map(|sid| ace(sid)).collect(),
+            others,
+        }
+    }
+
+    #[test]
+    fn a_dacl_allows_only_the_named_sids() {
+        let wanted = [SIDS[0], SYSTEM_SID];
+        // In any order.
+        assert!(dacl(true, &[SYSTEM_SID, SIDS[0]], 0).allows_only(&wanted));
+        assert!(dacl(true, &[SIDS[0], SYSTEM_SID], 0).allows_only(&wanted));
+
+        let refused = [
+            ("unprotected", dacl(false, &[SIDS[0], SYSTEM_SID], 0)),
+            ("another kind of entry", dacl(true, &[SIDS[0], SYSTEM_SID], 1)),
+            ("an extra SID", dacl(true, &[SIDS[0], SYSTEM_SID, SIDS[1]], 0)),
+            ("a missing SID", dacl(true, &[SIDS[0]], 0)),
+            ("a duplicated SID", dacl(true, &[SIDS[0], SIDS[0], SYSTEM_SID], 0)),
+        ];
+        for (case, dacl) in refused {
+            assert!(!dacl.allows_only(&wanted), "{case}: {dacl:?}");
+        }
     }
 
     #[test]

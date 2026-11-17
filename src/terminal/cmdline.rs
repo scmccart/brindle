@@ -2,7 +2,7 @@
 //! program, the config editor's command and the merged environment, plus
 //! program names and console titles. The holder builds the command line
 //! itself (`remote-agent/src/conpty/cmdline.rs`). It also builds the Unix
-//! config editor's command.
+//! config editor's command and the Unix default program.
 //!
 //! Pure, so they are tested on every platform.
 
@@ -70,6 +70,14 @@ pub fn windows_default_program(
     }
     let program = comspec.filter(|c| !c.trim().is_empty()).unwrap_or("cmd.exe");
     (program.to_string(), Vec::new())
+}
+
+/// The program a Unix tab runs when its profile names none, with the
+/// profile's `args`: `shell` (`$SHELL`) as given, an empty one included,
+/// else `/bin/sh`.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn unix_default_program(shell: Option<String>, args: &[String]) -> (String, Vec<String>) {
+    (shell.unwrap_or_else(|| "/bin/sh".into()), args.to_vec())
 }
 
 /// The variables for a child: `overrides` (the profile's, which win) and
@@ -191,6 +199,15 @@ mod tests {
         assert_eq!(default_with(&["a"], &none, Some(" ")), ("cmd.exe".to_string(), vec![]));
         assert_eq!(default_with(&["a"], &none, None), ("cmd.exe".to_string(), vec![]));
         assert_eq!(default_with(&[], &[("a", "pwsh.exe")], None), ("cmd.exe".to_string(), vec![]));
+    }
+
+    #[test]
+    fn the_default_program_is_shell_as_given_else_bin_sh() {
+        let args = ["-l".to_string()];
+        assert_eq!(unix_default_program(Some("/usr/bin/fish".into()), &args), ("/usr/bin/fish".to_string(), args.to_vec()));
+        assert_eq!(unix_default_program(None, &args), ("/bin/sh".to_string(), args.to_vec()));
+        // An empty `$SHELL` is passed on as it is, as before.
+        assert_eq!(unix_default_program(Some(String::new()), &[]), (String::new(), Vec::new()));
     }
 
     #[test]

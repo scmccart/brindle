@@ -31,6 +31,7 @@ use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, Snapshot
 use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
+use crate::terminal::shell_integration::PathStyle;
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
@@ -2265,18 +2266,30 @@ fn parse_manual_title(text: &str) -> Option<String> {
 }
 
 /// The program's own title: its OSC title, unless that is empty or blank,
-/// or on Windows a title the console built from a program's path
-/// (`cmdline::is_console_title`). When there is none, a zone's title needs
-/// the foreground process's name ([`terminal_automatic_title`]).
-pub(crate) fn program_title(osc_title: Option<&str>) -> Option<&str> {
-    osc_title.filter(|t| !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t)))
+/// or, where programs' paths are Windows paths (`style`), a title the
+/// console built from a program's path (`cmdline::is_console_title`). When
+/// there is none, a zone's title needs the foreground process's name
+/// ([`terminal_automatic_title`]). Callers pass
+/// [`process::LOCAL_PATH_STYLE`](crate::terminal::process::LOCAL_PATH_STYLE).
+pub(crate) fn program_title(osc_title: Option<&str>, style: PathStyle) -> Option<&str> {
+    // A console host's default title is a Windows program's path.
+    let console_titles = match style {
+        PathStyle::Windows => true,
+        PathStyle::Posix => false,
+    };
+    osc_title.filter(|t| !t.trim().is_empty() && !(console_titles && crate::terminal::cmdline::is_console_title(t)))
 }
 
 /// Automatic title for a zone: the program's own title ([`program_title`]),
 /// else the foreground process's name (`process_name`, which the caller
 /// looks up only when there is no program title), else the profile name.
-pub(crate) fn terminal_automatic_title(osc_title: Option<&str>, profile_name: &str, process_name: Option<String>) -> String {
-    match program_title(osc_title) {
+pub(crate) fn terminal_automatic_title(
+    osc_title: Option<&str>,
+    profile_name: &str,
+    style: PathStyle,
+    process_name: Option<String>,
+) -> String {
+    match program_title(osc_title, style) {
         Some(title) => title.to_string(),
         None => process_name.unwrap_or_else(|| profile_name.to_string()),
     }
@@ -3142,17 +3155,17 @@ mod tests {
         assert_eq!(renamed("Work", &[]), None);
     }
 
-    /// The program's own title is its OSC title when that has text; on
-    /// Windows, a title the console built from a program's path isn't one.
+    /// The program's own title is its OSC title when that has text, with
+    /// either path style.
     #[test]
     fn a_programs_own_title_is_not_empty_or_blank() {
-        assert_eq!(program_title(Some("vim: Cargo.toml")), Some("vim: Cargo.toml"));
-        assert_eq!(program_title(Some("  padded  ")), Some("  padded  "));
-        assert_eq!(program_title(Some("")), None);
-        assert_eq!(program_title(Some(" \t ")), None);
-        assert_eq!(program_title(None), None);
-        let console = r"C:\WINDOWS\system32\cmd.exe";
-        assert_eq!(program_title(Some(console)), (!cfg!(windows)).then_some(console));
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            assert_eq!(program_title(Some("vim: Cargo.toml"), style), Some("vim: Cargo.toml"), "{style:?}");
+            assert_eq!(program_title(Some("  padded  "), style), Some("  padded  "), "{style:?}");
+            assert_eq!(program_title(Some(""), style), None, "{style:?}");
+            assert_eq!(program_title(Some(" \t "), style), None, "{style:?}");
+            assert_eq!(program_title(None, style), None, "{style:?}");
+        }
     }
 
     /// A zone's automatic title: the program's own title, else the
@@ -3160,11 +3173,13 @@ mod tests {
     #[test]
     fn the_automatic_title_is_the_programs_then_the_process_then_the_profile() {
         let htop = || Some("htop".to_string());
-        assert_eq!(terminal_automatic_title(Some("vim: Cargo.toml"), "Shell", htop()), "vim: Cargo.toml");
-        assert_eq!(terminal_automatic_title(None, "Shell", htop()), "htop");
-        assert_eq!(terminal_automatic_title(Some("  "), "Shell", htop()), "htop");
-        assert_eq!(terminal_automatic_title(None, "Shell", None), "Shell");
-        assert_eq!(terminal_automatic_title(Some(""), "Shell", None), "Shell");
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            assert_eq!(terminal_automatic_title(Some("vim: Cargo.toml"), "Shell", style, htop()), "vim: Cargo.toml");
+            assert_eq!(terminal_automatic_title(None, "Shell", style, htop()), "htop");
+            assert_eq!(terminal_automatic_title(Some("  "), "Shell", style, htop()), "htop");
+            assert_eq!(terminal_automatic_title(None, "Shell", style, None), "Shell");
+            assert_eq!(terminal_automatic_title(Some(""), "Shell", style, None), "Shell");
+        }
     }
 
     #[test]
@@ -3192,5 +3207,19 @@ mod tests {
         assert_eq!(manual, None);
         assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), "bash"));
         assert_eq!(displayed.as_ref(), "bash");
+    }
+
+    #[test]
+    fn a_console_title_is_dropped_only_for_windows_paths() {
+        let console = r"C:\WINDOWS\system32\cmd.exe - python";
+        // A console host's title names no program: the foreground process
+        // stands in for it, else the profile.
+        assert_eq!(program_title(Some(console), PathStyle::Windows), None);
+        assert_eq!(terminal_automatic_title(Some(console), "Shell", PathStyle::Windows, Some("python".into())), "python");
+        assert_eq!(terminal_automatic_title(Some(console), "Shell", PathStyle::Windows, None), "Shell");
+        // Where programs' paths aren't Windows paths, the same text is the
+        // program's own title.
+        assert_eq!(program_title(Some(console), PathStyle::Posix), Some(console));
+        assert_eq!(terminal_automatic_title(Some(console), "Shell", PathStyle::Posix, Some("python".into())), console);
     }
 }

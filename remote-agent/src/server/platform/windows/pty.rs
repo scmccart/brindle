@@ -48,7 +48,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use brindle_remote_protocol::{server_dir, win};
+use brindle_remote_protocol::{hresult, server_dir, win};
 use brindle_term_core::shell_integration::PathStyle;
 use windows::Win32::Foundation::{
     FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
@@ -73,8 +73,9 @@ use windows::core::PCWSTR;
 
 use super::event_loop::{ExitWatch, Source, Waker, os_error, win32};
 use super::pipe::Pipe;
-use crate::conpty::cmdline::launch_line;
-use crate::conpty::{Process, Pseudoconsole};
+use crate::conpty::cmdline::{self, launch_line};
+use crate::conpty::hosts::{self, HostSeen, Listed};
+use crate::conpty::{Process, Pseudoconsole, choice};
 use crate::pty::PtyCommand;
 
 /// How the programs on these pseudoconsoles spell the directories they
@@ -84,10 +85,6 @@ pub const PATH_STYLE: PathStyle = PathStyle::Windows;
 
 /// Each pipe's own buffers.
 const PIPE_BUFFER: u32 = 64 * 1024;
-
-/// What the session's environment sets `BRINDLE_CONPTY` to for the ConPTY
-/// built into Windows.
-const INBOX: &str = "inbox";
 
 /// The exit code of a process the holder terminated.
 const KILLED: u32 = 1;
@@ -259,24 +256,24 @@ impl Group {
     }
 
     /// The session's console host, if it still runs: the one the root
-    /// process is on, or was on when it exited.
+    /// process is on, or was on when it exited. Whether it is the session's
+    /// is [`hosts::is_session_host`]'s.
     fn host(&self) -> Option<Host> {
         let pid = crate::conpty::console_host(self.root.handle())?;
         let process = open_process(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+        // It exits once nothing is on it.
         // SAFETY: the handle is open.
-        if unsafe { WaitForSingleObject(raw(process.as_handle()), 0) } == WAIT_OBJECT_0 {
-            // It exits once nothing is on it.
-            return None;
-        }
-        // The host starts before the root does. A process that took its
-        // pid later started after the root had connected to it.
-        let started = start_time(process.as_handle()).ok()?;
-        if started >= start_time(self.root.handle()).ok()? {
+        let exited = unsafe { WaitForSingleObject(raw(process.as_handle()), 0) } == WAIT_OBJECT_0;
+        let host_started = start_time(process.as_handle()).ok();
+        let root_started = start_time(self.root.handle()).ok();
+        if !hosts::is_session_host(exited, host_started, root_started) {
             return None;
         }
         Some(Host {
-            pid,
-            started,
+            seen: HostSeen {
+                pid,
+                started: host_started?,
+            },
             _process: process,
         })
     }
@@ -285,37 +282,37 @@ impl Group {
 /// A session's console host, held open while its programs are ended, so
 /// that its pid stays its own.
 struct Host {
-    pid: u32,
-    started: u64,
+    seen: HostSeen,
     _process: OwnedHandle,
 }
 
 impl Host {
-    /// Terminates every process on this console host.
+    /// Terminates every process on this console host. Which ones are is
+    /// [`hosts`]'s.
     fn end_its_programs(&self) {
         let Ok(processes) = processes() else {
             return;
         };
+        let snapshot: Vec<Listed> = processes
+            .iter()
+            .map(|entry| Listed {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+            })
+            .collect();
         let own = std::process::id();
-        // Only a host of this process's: a root that moved to another
-        // console names that one's.
-        let ours = |entry: &PROCESSENTRY32W| {
-            entry.th32ProcessID == self.pid && entry.th32ParentProcessID == own
-        };
-        if !processes.iter().any(ours) {
+        if !hosts::is_ours(&snapshot, self.seen.pid, own) {
             return;
         }
         let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-        let others = processes.iter().map(|entry| entry.th32ProcessID);
-        for pid in others.filter(|&pid| pid != own && pid != self.pid) {
+        for pid in hosts::candidates(&snapshot, self.seen.pid, own) {
             // Asked and terminated through one handle, so it is one process.
             let Some(process) = open_process(pid, access) else {
                 continue;
             };
-            let on_it = crate::conpty::console_host(process.as_handle()) == Some(self.pid);
-            // A process that was on an earlier host with this pid started
-            // before this one.
-            if on_it && start_time(process.as_handle()).is_ok_and(|started| started >= self.started) {
+            let on = crate::conpty::console_host(process.as_handle());
+            let started = start_time(process.as_handle()).ok();
+            if hosts::ends(on, started, &self.seen) {
                 // SAFETY: the handle is open and may terminate the process.
                 let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
             }
@@ -378,9 +375,12 @@ pub fn foreground(_pid: u32) -> Option<crate::pty::Foreground> {
 /// An error of [`crate::conpty`] with its Win32 code. Those carry it as an
 /// `HRESULT`, which `io::Error` can't tell the kind of.
 fn plain(error: io::Error) -> io::Error {
-    match error.raw_os_error().map(|code| code as u32) {
-        Some(code) if code & 0xffff_0000 == 0x8007_0000 => os_error(code & 0xffff),
-        _ => error,
+    match error
+        .raw_os_error()
+        .and_then(|code| hresult::win32_code(code as u32))
+    {
+        Some(code) => os_error(code),
+        None => error,
     }
 }
 
@@ -399,44 +399,26 @@ fn start_time(process: BorrowedHandle<'_>) -> io::Result<u64> {
     Ok(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
 }
 
-/// The program `request` runs: its command, or else the session's command
-/// interpreter. Brindle always names the program.
+/// The program `request` runs ([`cmdline::program`]): its command, or else
+/// the session's command interpreter.
 pub fn program_name(request: &PtyCommand) -> OsString {
-    let program = request.command.or_else(|| {
-        let own = |name: &str| name.eq_ignore_ascii_case("COMSPEC");
-        request
-            .env
-            .iter()
-            .find(|(name, value)| own(name) && !value.is_empty())
-            .map(|(_, value)| value.as_str())
-    });
-    program.unwrap_or("cmd.exe").into()
+    cmdline::program(request.command, request.env).into()
 }
 
-/// The program's environment: the request's when it is exact, else this
-/// process's with the request's over it, by name whatever the case.
+/// The program's environment ([`cmdline::environment`]): the request's when
+/// it is exact, else this process's UTF-8 variables with the request's over
+/// them, by name whatever the case.
 fn environment(request: &PtyCommand) -> Vec<(String, String)> {
-    let given = request
-        .env
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()));
-    if request.exact_env {
-        return given.collect();
-    }
-    let set = |name: &str| request.env.keys().any(|set| set.eq_ignore_ascii_case(name));
-    std::env::vars_os()
+    let own = std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(name, _)| !set(name))
-        .chain(given)
-        .collect()
+        .collect();
+    cmdline::environment(request.env, request.exact_env, own)
 }
 
-/// Whether the session asks for the ConPTY built into Windows.
+/// Whether the session asks for the ConPTY built into Windows
+/// ([`choice::wants_inbox`]).
 fn wants_inbox(request: &PtyCommand) -> bool {
-    request
-        .env
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("BRINDLE_CONPTY") && value == INBOX)
+    choice::wants_inbox(request.env)
 }
 
 /// A one-way pipe of this process's own: the holder's overlapped end, with
@@ -1309,34 +1291,5 @@ mod tests {
         assert_eq!(owner(console_window), 0);
         session.program.group().kill();
         session.finish();
-    }
-
-    #[test]
-    fn the_program_is_the_command_or_the_command_interpreter() {
-        fn request<'a>(
-            command: Option<&'a str>,
-            env: &'a BTreeMap<String, String>,
-        ) -> PtyCommand<'a> {
-            PtyCommand {
-                command,
-                args: &[],
-                cwd: None,
-                env,
-                cols: 80,
-                rows: 24,
-                cell_width: 0,
-                cell_height: 0,
-                exact_env: true,
-            }
-        }
-        let mut env = BTreeMap::new();
-        assert_eq!(program_name(&request(Some("pwsh.exe"), &env)), "pwsh.exe");
-        assert_eq!(program_name(&request(None, &env)), "cmd.exe");
-        env.insert("ComSpec".to_string(), r"C:\Windows\System32\cmd.exe".to_string());
-        env.insert("brindle_conpty".to_string(), "inbox".to_string());
-        assert_eq!(program_name(&request(None, &env)), r"C:\Windows\System32\cmd.exe");
-        assert!(wants_inbox(&request(None, &env)));
-        env.insert("brindle_conpty".to_string(), "Inbox".to_string());
-        assert!(!wants_inbox(&request(None, &env)));
     }
 }

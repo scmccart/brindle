@@ -99,7 +99,7 @@ impl Endpoints {
     /// kind of file holders are found by.
     #[cfg(not(windows))]
     fn shown(&self, name: &str) -> Option<Holder> {
-        let stem = name.strip_suffix(".sock")?;
+        let stem = server_dir::holder_socket_stem(name)?;
         Some(Holder {
             endpoint: self.dir.join(name),
             lock: self.dir.join(format!("{stem}.lock")),

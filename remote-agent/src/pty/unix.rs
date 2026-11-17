@@ -2,7 +2,7 @@
 //! working directory, resizing, signalling and the `/proc` queries.
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -10,6 +10,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use super::program::{
+    default_term, expand_home, home_from_env, passwd_shell, shell_from_env, start_dir,
+};
+use super::stat::{STAT_PGRP, STAT_TPGID, parse_stat_field};
 use super::{Foreground, PtyCommand};
 
 pub struct SpawnedPty {
@@ -52,8 +56,8 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
             command.arg0(login);
         }
     }
-    if !request.exact_env && !request.env.contains_key("TERM") {
-        command.env("TERM", "xterm-256color");
+    if let Some(term) = default_term(request.exact_env, request.env) {
+        command.env("TERM", term);
     }
     command
         .stdin(Stdio::from(File::from(slave_stdin)))
@@ -124,27 +128,23 @@ fn command_for(request: &PtyCommand, program: OsString) -> Command {
     if let Some(cwd) = request.cwd {
         // A directory that does not exist here (a path inherited from a
         // different host, or since deleted) starts the session in $HOME.
-        let wanted = expand_remote_cwd(cwd, request.env);
-        if wanted.is_dir() {
-            command.current_dir(wanted);
-        } else if let Some(home) = home_dir(request.env).filter(|home| home.is_dir()) {
-            command.current_dir(home);
+        let home = home_dir(request.env);
+        let wanted = expand_home(cwd, home.as_deref());
+        if let Some(dir) = start_dir(&wanted, home.as_deref(), |path| path.is_dir()) {
+            command.current_dir(dir);
         }
     }
     command
 }
 
+/// The home directory: the environment's ([`home_from_env`]), else the
+/// passwd entry's, which is read only then.
 pub fn home_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    env.get("HOME")
-        .filter(|home| !home.is_empty())
-        .map(OsStr::new)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| passwd_entry().map(|(_, home)| home))
+    home_from_env(
+        env.get("HOME").map(String::as_str),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .or_else(|| passwd_entry().map(|(_, home)| home))
 }
 
 /// The login shell and home directory of the current user from the passwd
@@ -199,30 +199,18 @@ fn passwd_field(field: *const libc::c_char) -> Option<OsString> {
     Some(OsString::from_vec(bytes))
 }
 
-pub fn expand_remote_cwd(cwd: &str, env: &BTreeMap<String, String>) -> PathBuf {
-    let home = || home_dir(env);
-    if cwd == "~" {
-        return home().unwrap_or_else(|| PathBuf::from(cwd));
-    }
-    if let Some(rest) = cwd.strip_prefix("~/")
-        && let Some(home) = home()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(cwd)
-}
-
+/// The login shell: the environment's ([`shell_from_env`]), else the passwd
+/// entry's, which is read only then ([`passwd_shell`]).
 fn default_shell(env: &BTreeMap<String, String>) -> OsString {
-    env.get("SHELL")
-        .filter(|shell| !shell.is_empty())
-        .map(|shell| OsString::from(shell.as_str()))
-        .or_else(|| std::env::var_os("SHELL").filter(|shell| !shell.is_empty()))
-        .or_else(|| {
-            passwd_entry()
-                .map(|(shell, _)| shell)
-                .filter(|shell| !shell.is_empty() && PathBuf::from(shell).exists())
+    shell_from_env(
+        env.get("SHELL").map(String::as_str),
+        std::env::var_os("SHELL").as_deref(),
+    )
+    .unwrap_or_else(|| {
+        passwd_shell(passwd_entry().map(|(shell, _)| shell), |path| {
+            path.exists()
         })
-        .unwrap_or_else(|| OsString::from("/bin/sh"))
+    })
 }
 
 fn open_pty(winsize: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
@@ -353,21 +341,10 @@ fn describe(pid: libc::pid_t, fallback: libc::pid_t) -> Foreground {
     Foreground { name, cwd }
 }
 
-/// `/proc/<pid>/stat`'s fields after the command, counted from 0: state,
-/// ppid, pgrp, session, tty_nr, tpgid (fields 3 to 8 in proc(5)).
-const STAT_PGRP: usize = 2;
-const STAT_TPGID: usize = 5;
-
+/// A numeric field of `/proc/<pid>/stat` ([`parse_stat_field`]).
 fn stat_field(pid: libc::pid_t, field: usize) -> Option<libc::pid_t> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat_field(&stat, field)
-}
-
-/// A numeric field of a `/proc/<pid>/stat` line, counted from the one
-/// after the command, which may itself hold spaces and parentheses.
-fn parse_stat_field(stat: &str, field: usize) -> Option<libc::pid_t> {
-    let fields = stat.get(stat.rfind(')')? + 1..)?;
-    fields.split_whitespace().nth(field)?.parse().ok()
 }
 
 fn find_process_in_group(group: libc::pid_t) -> Option<libc::pid_t> {
@@ -409,18 +386,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stat_fields_count_from_after_the_command() {
-        // A command with spaces and parentheses of its own.
-        let stat = "4242 (my (odd) cmd) S 1 4240 4240 34816 4250 4194560 101 0 0 0";
-        assert_eq!(parse_stat_field(stat, STAT_PGRP), Some(4240));
-        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(4250));
-        // No controlling terminal.
-        let stat = "7 (kthreadd) S 2 0 0 0 -1 2129984 0 0";
-        assert_eq!(parse_stat_field(stat, STAT_TPGID), Some(-1));
-        assert_eq!(parse_stat_field("garbage", STAT_TPGID), None);
-    }
-
-    #[test]
     fn a_process_without_a_terminal_is_its_own_foreground() {
         let pid = std::process::id() as libc::pid_t;
         let own = foreground_process(pid);
@@ -432,19 +397,5 @@ mod tests {
             let cwd = std::env::current_dir().unwrap();
             assert_eq!(foreground_process(pid).cwd.map(PathBuf::from), Some(cwd));
         }
-    }
-
-    #[test]
-    fn cwd_tilde_uses_remote_environment_home() {
-        let env = [("HOME".to_string(), "/home/remote".to_string())].into();
-        assert_eq!(expand_remote_cwd("~", &env), PathBuf::from("/home/remote"));
-        assert_eq!(
-            expand_remote_cwd("~/src tree", &env),
-            PathBuf::from("/home/remote/src tree")
-        );
-        assert_eq!(
-            expand_remote_cwd("/srv/app", &env),
-            PathBuf::from("/srv/app")
-        );
     }
 }

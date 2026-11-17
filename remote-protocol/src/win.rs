@@ -36,7 +36,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{BOOL, HSTRING, PWSTR};
 
-pub use crate::access::{Integrity, Principal, Refusal, Side, dir_sddl, peer_allowed, pipe_sddl};
+pub use crate::access::{
+    Ace, Dacl, Integrity, Principal, Refusal, SYSTEM_SID, Side, dir_sddl, peer_allowed, pipe_sddl,
+};
+use crate::server_dir::{self, EntryKind, ImageRemoval, LostRename, PruneDir};
 
 /// `ACCESS_ALLOWED_ACE_TYPE`: the only entry type [`Dacl`] reads a SID from.
 const ACCESS_ALLOWED: u8 = 0;
@@ -48,11 +51,9 @@ fn context(what: impl std::fmt::Display, error: io::Error) -> io::Error {
 /// The `windows` crate's error as an OS error, so its `kind()` is the usual
 /// one: the crate's own conversion keeps the HRESULT, which std doesn't know.
 fn os(error: windows::core::Error) -> io::Error {
-    let code = error.code().0 as u32;
-    if code >> 16 == 0x8007 {
-        io::Error::from_raw_os_error((code & 0xffff) as i32)
-    } else {
-        io::Error::other(error)
+    match crate::hresult::win32_code(error.code().0 as u32) {
+        Some(code) => io::Error::from_raw_os_error(code as i32),
+        None => io::Error::other(error),
     }
 }
 
@@ -318,39 +319,9 @@ pub fn protect_dir(path: &Path) -> io::Result<()> {
     })
 }
 
-/// One access-allowed entry of a DACL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ace {
-    /// The trustee, as a SID string.
-    pub sid: String,
-    /// The access mask.
-    pub mask: u32,
-    /// The entry's flags (inheritance).
-    pub flags: u8,
-}
-
-/// An object's discretionary ACL, as read back from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dacl {
-    /// Whether the DACL is protected from inheriting its parent's entries.
-    pub protected: bool,
-    /// The access-allowed entries, in order.
-    pub allowed: Vec<Ace>,
-    /// How many entries are of another kind (deny, and so on).
-    pub others: usize,
-}
-
+/// Reading a [`Dacl`] back from an object; what it must hold is
+/// [`Dacl::allows_only`]'s, in [`crate::access`].
 impl Dacl {
-    /// Whether the DACL is protected and allows exactly `sids`, each once,
-    /// with no other entries.
-    pub fn allows_only(&self, sids: &[&str]) -> bool {
-        let mut found: Vec<&str> = self.allowed.iter().map(|ace| ace.sid.as_str()).collect();
-        let mut wanted = sids.to_vec();
-        found.sort_unstable();
-        wanted.sort_unstable();
-        self.protected && self.others == 0 && found == wanted
-    }
-
     /// Reads the descriptor `GetSecurityInfo` or its named form returned.
     fn read(descriptor: PSECURITY_DESCRIPTOR, dacl: *const ACL) -> io::Result<Self> {
         let _free = Local(descriptor.0);
@@ -507,16 +478,15 @@ pub fn ensure_helper_copy(installed: &Path, copies: &Path) -> io::Result<PathBuf
     let build = std::fs::read(installed)
         .map(|bytes| crate::build_id::of_binary(&bytes))
         .map_err(|error| context(installed.display(), error))?;
-    let copy = crate::server_dir::helper_copy(copies, &build);
-    if build_of(&copy).as_deref() == Some(&build) {
+    let copy = server_dir::helper_copy(copies, &build);
+    if server_dir::is_current(build_of(&copy).as_deref(), &build) {
         return Ok(copy);
     }
     let dir = copy.parent().expect("the copy is in its build's directory");
     std::fs::create_dir_all(dir).map_err(|error| context(dir.display(), error))?;
-    let temp = dir.join(format!(
-        "brindle-remote.exe.{}-{}.tmp",
+    let temp = dir.join(server_dir::copy_temp_name(
         std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT.fetch_add(1, Ordering::Relaxed),
     ));
     let placed = place_copy(installed, &temp, &copy, &build);
     if placed.is_err() {
@@ -530,7 +500,7 @@ pub fn ensure_helper_copy(installed: &Path, copies: &Path) -> io::Result<PathBuf
 fn place_copy(installed: &Path, temp: &Path, copy: &Path, build: &str) -> io::Result<()> {
     // `CopyFileExW`, which keeps the last-write time as `CopyFileW` does.
     std::fs::copy(installed, temp).map_err(|error| context(temp.display(), error))?;
-    if build_of(temp).as_deref() != Some(build) {
+    if !server_dir::is_current(build_of(temp).as_deref(), build) {
         return Err(io::Error::other(format!(
             "{} changed while it was copied",
             installed.display()
@@ -549,15 +519,13 @@ fn place_copy(installed: &Path, temp: &Path, copy: &Path, build: &str) -> io::Re
     let Err(error) = renamed else {
         return Ok(());
     };
-    if build_of(copy).as_deref() == Some(build) {
-        // Another process won the rename with the same build.
-        return std::fs::remove_file(temp);
+    match server_dir::after_lost_rename(build_of(copy).as_deref(), build, copy.exists()) {
+        LostRename::UseWinner => std::fs::remove_file(temp),
+        LostRename::Replace => {
+            std::fs::rename(temp, copy).map_err(|error| context(copy.display(), error))
+        }
+        LostRename::Fail => Err(context(copy.display(), os(error))),
     }
-    if copy.exists() {
-        // Something else is under the copy's name: replace it.
-        return std::fs::rename(temp, copy).map_err(|error| context(copy.display(), error));
-    }
-    Err(context(copy.display(), os(error)))
 }
 
 /// Removes every build's directory under `copies` except `keep`'s, where it
@@ -568,23 +536,30 @@ pub fn prune_helper_copies(copies: &Path, keep: &str) {
     let Ok(entries) = std::fs::read_dir(copies) else {
         return;
     };
-    for entry in entries.flatten() {
-        if entry.file_name() == keep || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let dir = entry.path();
+    let entries = entries
+        .flatten()
+        .map(|entry| {
+            let kind = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                EntryKind::Dir
+            } else {
+                EntryKind::Other
+            };
+            (entry.file_name(), kind)
+        })
+        .collect();
+    for name in server_dir::pruned_builds(entries, keep) {
+        let dir = copies.join(name);
         // The image first: while it runs, the directory is left whole.
-        match std::fs::remove_file(dir.join("brindle-remote.exe")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => continue,
+        let removal = match std::fs::remove_file(dir.join("brindle-remote.exe")) {
+            Ok(()) => ImageRemoval::Removed,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ImageRemoval::Missing,
+            Err(_) => ImageRemoval::Failed,
+        };
+        if server_dir::after_image_removal(removal) == PruneDir::Remove {
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-/// SYSTEM's SID, the one entry beside the user's in the server's DACLs.
-pub const SYSTEM_SID: &str = "S-1-5-18";
 
 #[cfg(test)]
 mod tests {

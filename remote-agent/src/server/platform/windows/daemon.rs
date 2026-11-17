@@ -69,16 +69,13 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
+use super::super::ready_arg::{self, ReadyArg};
 use super::event_loop::{Source, os_error, win32};
 use super::pipe::Pipe;
 use crate::conpty::cmdline::command_line;
 
 /// The command that starts a role and exits.
 const LAUNCH: &str = "launch";
-/// The argument before the ready pipe's handle.
-const READY_FLAG: &str = "--ready-handle";
-/// Stands for the ready pipe's handle in a role's arguments.
-const READY_PLACEHOLDER: &str = "{ready_handle}";
 /// What a detached role is created with, plus `CREATE_BREAKAWAY_FROM_JOB`
 /// where the job allows it. `CREATE_NO_WINDOW` means nothing beside
 /// `DETACHED_PROCESS`, and is there in case that one is ever dropped.
@@ -127,7 +124,10 @@ impl Ready {
         let handle = pipe_handle(value).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{READY_FLAG} {value} is not an open pipe handle"),
+                format!(
+                    "{} {value} is not an open pipe handle",
+                    ReadyArg::Handle.flag()
+                ),
             )
         })?;
         set_inherited(handle, false)?;
@@ -146,29 +146,16 @@ impl Ready {
 /// `--ready-handle N`, or nothing for a role that stays in the foreground.
 /// Nothing else is accepted.
 pub fn ready_from_args(role: &str, args: &[String]) -> Result<Option<Ready>, String> {
-    parse_ready_handle(role, args)?
+    ready_arg::parse_handle(role, args)?
         .map(Ready::from_handle)
         .transpose()
         .map_err(|error| error.to_string())
 }
 
-fn parse_ready_handle(role: &str, args: &[String]) -> Result<Option<usize>, String> {
-    match args {
-        [] => Ok(None),
-        [flag, handle] if flag == READY_FLAG => handle
-            .parse::<usize>()
-            .ok()
-            .filter(|handle| *handle != 0)
-            .map(Some)
-            .ok_or_else(|| format!("{role}: {READY_FLAG} needs a handle number, not {handle:?}")),
-        _ => Err(format!("usage: brindle-remote {role} [{READY_FLAG} N]")),
-    }
-}
-
 /// The arguments that start `role` detached with [`start_role`]:
 /// `<role> --ready-handle {ready_handle}`.
 pub fn role_args(role: &str) -> Vec<String> {
-    vec![role.into(), READY_FLAG.into(), READY_PLACEHOLDER.into()]
+    ready_arg::role_args(ReadyArg::Handle, role)
 }
 
 /// The read end of a started role's ready pipe.
@@ -306,7 +293,7 @@ fn start(program: &Program, args: &[String], env: &[(&str, &OsStr)]) -> io::Resu
         .arg(LAUNCH)
         .args(
             args.iter()
-                .map(|arg| arg.replace(READY_PLACEHOLDER, &number)),
+                .map(|arg| arg.replace(ReadyArg::Handle.placeholder(), &number)),
         )
         .envs(env.iter().copied())
         .stdin(Stdio::null())
@@ -333,7 +320,8 @@ pub fn launch(args: &[String]) -> Result<(), String> {
 fn launch_from(program: &Program, args: &[String]) -> Result<(), String> {
     let Some(role) = args.first() else {
         return Err(format!(
-            "usage: brindle-remote {LAUNCH} <role> [{READY_FLAG} N]"
+            "usage: brindle-remote {LAUNCH} <role> [{} N]",
+            ReadyArg::Handle.flag()
         ));
     };
     let ready = inherited_ready(args)?;
@@ -356,14 +344,15 @@ fn launch_from(program: &Program, args: &[String]) -> Result<(), String> {
 /// The ready pipe's handle in a role's arguments, which this process must
 /// have inherited.
 fn inherited_ready(args: &[String]) -> Result<Option<HANDLE>, String> {
-    let Some(flag) = args.iter().position(|arg| arg == READY_FLAG) else {
+    let flag = ReadyArg::Handle.flag();
+    let Some(at) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
     };
-    args.get(flag + 1)
+    args.get(at + 1)
         .and_then(|value| value.parse::<usize>().ok())
         .and_then(pipe_handle)
         .map(Some)
-        .ok_or_else(|| format!("{LAUNCH}: {READY_FLAG} needs the handle of an inherited pipe"))
+        .ok_or_else(|| format!("{LAUNCH}: {flag} needs the handle of an inherited pipe"))
 }
 
 /// This process's stdout or stderr, when a detached role can write to it:
@@ -899,23 +888,6 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-    }
-
-    #[test]
-    fn ready_handle_arguments() {
-        assert_eq!(parse_ready_handle("hold", &[]), Ok(None));
-        assert_eq!(
-            parse_ready_handle("hold", &args(&["--ready-handle", "1234"])),
-            Ok(Some(1234))
-        );
-        assert!(parse_ready_handle("hold", &args(&["--ready-handle", "0"])).is_err());
-        assert!(parse_ready_handle("hold", &args(&["--ready-handle", "-4"])).is_err());
-        assert!(parse_ready_handle("hold", &args(&["--ready-handle"])).is_err());
-        assert!(parse_ready_handle("hold", &args(&["--ready-fd", "3"])).is_err());
-        assert_eq!(
-            role_args("hold"),
-            args(&["hold", "--ready-handle", "{ready_handle}"])
-        );
     }
 
     #[test]

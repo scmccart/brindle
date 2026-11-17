@@ -416,6 +416,13 @@ fn toast_xml(title: &str, body: &str) -> String {
     )
 }
 
+/// A notification body escaped for servers with `body-markup`, which read
+/// it as a small subset of HTML (the D-Bus sink, `dbus`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// The PNG toasts show for Brindle (the AUMID's `IconUri`), written to
 /// `%LOCALAPPDATA%rindle` when the file there differs.
 #[cfg(windows)]
@@ -480,6 +487,12 @@ mod tests {
         let (commands, queued) = std::sync::mpsc::channel();
         drop(queued);
         futures::executor::block_on(LogWriter(commands).flush());
+    }
+
+    #[test]
+    fn markup_is_escaped() {
+        assert_eq!(escape_markup("a < b && c > d"), "a &lt; b &amp;&amp; c &gt; d");
+        assert_eq!(escape_markup("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;");
     }
 
     #[test]

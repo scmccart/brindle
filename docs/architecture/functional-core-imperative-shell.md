@@ -69,7 +69,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
-| `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment |
+| `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment, the Unix default program |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
