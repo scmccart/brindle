@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 
 use super::connection::{Abandon, Running, Sink};
 use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
+use crate::remote::SessionKey;
 use crate::remote::protocol::SessionId;
 
 /// How a tab let its session go.
@@ -63,7 +64,7 @@ pub struct Session {
     abandon: Arc<Abandon>,
     /// The session an attach asked for, which it stands for until it is
     /// answered: a tab recorded while its endpoint is offline keeps it.
-    requested: Option<(SessionId, String)>,
+    requested: Option<(SessionId, Option<SessionKey>)>,
 }
 
 impl Session {
@@ -131,12 +132,12 @@ impl Session {
         }
     }
 
-    /// The session's id and key, once it exists (the key is empty from a
-    /// core that predates keys). An attach reports the session it asked
-    /// for until it is answered; only a pending spawn reports none.
-    pub fn id_and_key(&self) -> Option<(SessionId, String)> {
+    /// The session's id and key, once it exists (no key from a core that
+    /// predates keys). An attach reports the session it asked for until it
+    /// is answered; only a pending spawn reports none.
+    pub fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)> {
         match &*self.phase.lock() {
-            Phase::Running(running) => Some((running.id(), running.key().to_string())),
+            Phase::Running(running) => Some((running.id(), running.key().cloned())),
             Phase::Starting { .. } => self.requested.clone(),
             Phase::Gone => None,
         }
@@ -291,7 +292,7 @@ mod tests {
 
     use super::*;
     use crate::remote::local::sys::Listener;
-    use crate::remote::local::{Endpoint, Stream, connect};
+    use crate::remote::local::{Attaching, Endpoint, Stream, connect};
     use crate::remote::protocol::Frame;
     use crate::remote::protocol::client::{self, Spawned, ToClient, ToCore, Welcome};
 
@@ -431,7 +432,11 @@ mod tests {
     }
 
     fn attach_request(session: SessionId) -> AttachRequest {
-        AttachRequest { session, key: format!("k{session}"), cols: 120, rows: 40, recorded: false }
+        AttachRequest {
+            session,
+            key: SessionKey::from_wire(&format!("k{session}")),
+            when: Attaching::Now { cols: 120, rows: 40 },
+        }
     }
 
     /// Answers `ATTACH` of session 5 with a replay, then live output.
@@ -536,7 +541,7 @@ mod tests {
                 if let ToCore::List(list) = &message {
                     send(&mut stream, ToClient::ReplayStart(client::ReplayStart { req: None, session: 7, pid: 4242 }));
                     send(&mut stream, ToClient::ReplayEnd(client::SessionRef { session: 7 }));
-                    let info = client::SessionInfo { session: 7, attached: true, ..Default::default() };
+                    let info = client::SessionInfo { session: 7, key: "k7".into(), attached: true, ..Default::default() };
                     send(&mut stream, ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
                 }
                 if tx.send((2, message)).is_err() {
@@ -578,7 +583,7 @@ mod tests {
         let ToCore::Data(data) = recv(&core) else { panic!("not DATA") };
         assert_eq!((data.session, data.bytes.as_slice()), (5, &b"typed early"[..]));
         assert_eq!(session.pid(), Some(99));
-        assert_eq!(session.id_and_key(), Some((5, "k5".to_string())));
+        assert_eq!(session.id_and_key(), Some((5, SessionKey::from_wire("k5"))));
 
         session.detach_with(None);
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == 5));
@@ -716,6 +721,8 @@ mod tests {
         while ended.pid().is_none() {
             std::thread::sleep(Duration::from_millis(10));
         }
+        // This core predates keys: the session has none.
+        assert_eq!(ended.id_and_key(), Some((id, None)));
         ended.close();
         ended.detach_with(None);
         assert!(matches!(recv(&core), ToCore::Close(close) if close.session == id));
@@ -986,10 +993,10 @@ mod tests {
                 wait.recv().ok();
                 anyhow::bail!("can't connect to A8: offline")
             },
-            AttachRequest { recorded: true, ..attach_request(5) },
+            AttachRequest { when: Attaching::Recorded, ..attach_request(5) },
             Box::new(Recorder(tx)),
         );
-        assert_eq!(session.id_and_key(), Some((5, "k5".to_string())));
+        assert_eq!(session.id_and_key(), Some((5, SessionKey::from_wire("k5"))));
         assert_eq!(session.pid(), None);
 
         let (spawn_tx, _spawn_tab) = mpsc::channel();

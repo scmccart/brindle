@@ -639,25 +639,37 @@ impl Workspace {
             .unwrap_or_else(|| Self::settings(cx).theme(None))
     }
 
-    /// The active directory only has meaning to a profile on the same host
+    /// The active directory only has meaning to a new tab on the same host
     /// or container as the active tab ([`same_endpoint`]).
-    fn active_cwd_for(&self, profile: &Profile, cx: &App) -> Option<PathBuf> {
+    fn active_cwd_for(&self, host: &Host, cx: &App) -> Option<PathBuf> {
         let tab = self.tabs.get(self.active)?;
-        if !same_endpoint(&tab.host, profile) {
+        if !same_endpoint(&tab.host, host) {
             return None;
         }
         tab.active_terminal(cx)?.read(cx).working_directory()
     }
 
-    /// Opens a tab for the request.
+    /// Opens a tab for the request on its profile's endpoint.
     pub fn launch(&mut self, request: LaunchRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = Self::settings(cx).profiles.get(request.profile).map(Host::of) else {
+            log::warn!("no profile #{}", request.profile + 1);
+            return;
+        };
+        self.launch_on(request, host, window, cx);
+    }
+
+    /// Opens a tab for the request on `host`, which runs its session and,
+    /// from now on, its splits: the profile's endpoint for an ordinary
+    /// launch ([`Workspace::launch`]), this machine for the config editor
+    /// ([`config_editor_launch`]).
+    fn launch_on(&mut self, request: LaunchRequest, host: Host, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let Some(profile) = config.profiles.get(request.profile).cloned() else {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
         let requested_cwd = request.cwd.filter(|cwd| {
-            if profile.remote.is_none() {
+            if host.is_local() {
                 return true;
             }
             let cwd = cwd.to_string_lossy();
@@ -668,11 +680,9 @@ impl Workspace {
         let cwd = requested_cwd.or_else(|| {
             // New tabs follow the current directory only on the same endpoint,
             // unless the destination profile pins one.
-            if profile.cwd.is_none() { self.active_cwd_for(&profile, cx) } else { None }
+            if profile.cwd.is_none() { self.active_cwd_for(&host, cx) } else { None }
         });
 
-        // The tab is on the profile's endpoint from now on.
-        let host = Host::of(&profile);
         let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
@@ -786,11 +796,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
         // At the session's own size, so attaching resizes nothing; a core
-        // that predates sizes in `LIST` reports 0.
+        // that predates sizes lists none, and the default grid stands in.
+        let listed = crate::remote::ListedSession::of(info);
         let default = crate::terminal::GridSize::default();
-        let (cols, rows) = if info.cols > 0 && info.rows > 0 { (info.cols, info.rows) } else { (default.cols, default.rows) };
-        let request =
-            crate::remote::local::AttachRequest { session: info.session, key: info.key.clone(), cols, rows, recorded: false };
+        let (cols, rows) = listed.size.unwrap_or((default.cols, default.rows));
+        let request = crate::remote::local::AttachRequest {
+            session: listed.session,
+            key: listed.key,
+            when: crate::remote::local::Attaching::Now { cols, rows },
+        };
         let what = crate::reattach::label(info);
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
@@ -815,10 +829,8 @@ impl Workspace {
                 self.restored_sessions.push((host.clone(), recorded.clone()));
                 let request = crate::remote::local::AttachRequest {
                     session: recorded.id,
-                    key: recorded.key.clone(),
-                    cols: 0,
-                    rows: 0,
-                    recorded: true,
+                    key: crate::remote::SessionKey::from_wire(&recorded.key),
+                    when: crate::remote::local::Attaching::Recorded,
                 };
                 let what = host.name();
                 return cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx));
@@ -1746,9 +1758,9 @@ impl Workspace {
     }
 
     fn open_config(&mut self, _: &OpenConfig, window: &mut Window, cx: &mut Context<Self>) {
-        let command = editor_command(&Config::path().to_string_lossy());
-        let profile = Self::settings(cx).default_profile_index();
-        self.launch(LaunchRequest { profile, command: Some(command), cwd: None }, window, cx);
+        let editor = editor_command(&Config::path().to_string_lossy());
+        let (request, host) = config_editor_launch(Self::settings(cx), editor);
+        self.launch_on(request, host, window, cx);
     }
 
     /// The theme a tab with `profile` shows: the preview for tabs that
@@ -2285,10 +2297,22 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
     renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
 }
 
-/// Whether a directory from a terminal on `host` means anything to a new
-/// tab of `profile`: only on the same endpoint.
-fn same_endpoint(host: &Host, profile: &Profile) -> bool {
-    *host == Host::of(profile)
+/// Whether a directory from a terminal on `tab` means anything to a new tab
+/// on `host`: only on the same endpoint.
+fn same_endpoint(tab: &Host, host: &Host) -> bool {
+    tab == host
+}
+
+/// The config editor's tab: `editor` runs on this machine, where the config
+/// file is, whatever endpoint the default profile targets. The tab takes
+/// the default profile when it is a local one, else the first local one,
+/// else the default one, whose theme and font then apply to a tab that
+/// still runs here.
+fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (LaunchRequest, Host) {
+    let default = config.default_profile_index();
+    let local = |index: &usize| config.profiles.get(*index).is_some_and(|profile| Host::of(profile).is_local());
+    let profile = Some(default).filter(local).or_else(|| (0..config.profiles.len()).find(local)).unwrap_or(default);
+    (LaunchRequest { profile, command: Some(editor), cwd: None }, Host::Local)
 }
 
 /// A tab's profile once the config is reloaded: the config's profile of
@@ -2686,15 +2710,97 @@ mod tests {
     use super::*;
     use gpui::size;
 
-    fn ssh_host(host: &str) -> Host {
-        Host::Remote(crate::config::RemoteTarget::Ssh {
+    fn ssh_target(host: &str) -> crate::config::RemoteTarget {
+        crate::config::RemoteTarget::Ssh {
             host: host.into(),
             user: None,
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
             connect_at_launch: false,
-        })
+        }
+    }
+
+    fn ssh_host(host: &str) -> Host {
+        Host::Remote(ssh_target(host))
+    }
+
+    /// A profile on SSH host `remote`, or on this machine without one,
+    /// whose directory exists on no machine.
+    #[cfg(any(target_os = "linux", windows))]
+    fn profile_on(name: &str, remote: Option<&str>) -> Profile {
+        Profile { name: name.into(), remote: remote.map(ssh_target), cwd: Some("/brindle-nowhere".into()), ..Default::default() }
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn config_with(profiles: Vec<Profile>, default: &str) -> Config {
+        let mut config = Config::default();
+        config.profiles = profiles;
+        config.default_profile = Some(default.into());
+        config
+    }
+
+    /// An editor command as `editor_command` makes one, without reading the
+    /// environment.
+    #[cfg(any(target_os = "linux", windows))]
+    fn editor() -> (String, Vec<String>) {
+        ("/bin/sh".into(), vec!["-c".into(), "vi '/home/me/.config/brindle/config.toml'".into()])
+    }
+
+    /// The profile of the config editor's tab under `config`, once checked
+    /// that the tab runs here and asks this machine's server for the editor
+    /// itself. A remote endpoint's request (`SpawnRequest::remote`) would
+    /// name the endpoint in its `doing` and keep the profile's directory
+    /// unchecked.
+    #[cfg(any(target_os = "linux", windows))]
+    fn editor_tab(config: &Config) -> usize {
+        let (request, host) = config_editor_launch(config, editor());
+        assert_eq!(host, Host::Local);
+        assert_eq!(request.command, Some(editor()));
+        assert_eq!(request.cwd, None);
+        let profile = &config.profiles[request.profile];
+        let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config);
+        assert_eq!((spawn.command, spawn.args), editor());
+        assert_eq!(doing, "start \"/bin/sh\"");
+        assert_eq!(spawn.cwd, None, "no such directory on this machine");
+        request.profile
+    }
+
+    /// 4.2: a local default profile is the editor tab's.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_config_editor_takes_a_local_default_profile() {
+        let config = config_with(
+            vec![profile_on("Away", Some("A8")), profile_on("Shell", None), profile_on("Work", None)],
+            "Work",
+        );
+        assert_eq!(editor_tab(&config), 2);
+    }
+
+    /// 4.2: the spec's scenario. The default profile targets `A8`, so the
+    /// tab takes the first local profile, and nothing starts on `A8`.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_config_editor_runs_here_under_the_first_local_profile_when_the_default_is_remote() {
+        let config = config_with(
+            vec![
+                profile_on("Away", Some("A8")),
+                profile_on("Box", Some("B9")),
+                profile_on("Shell", None),
+                profile_on("Work", None),
+            ],
+            "Away",
+        );
+        assert_eq!(editor_tab(&config), 2);
+    }
+
+    /// 4.2: with no local profile, the tab keeps the default profile's
+    /// settings but still runs here.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn the_config_editor_runs_here_under_the_default_when_no_profile_is_local() {
+        let config = config_with(vec![profile_on("A8", Some("A8")), profile_on("Away", Some("B9"))], "Away");
+        assert_eq!(editor_tab(&config), 1);
     }
 
     /// 5.3: the sessions palette lists this machine first, then the
@@ -2790,14 +2896,14 @@ mod tests {
         let (request, doing) = split(&reloaded, &tab_host);
         assert_eq!(doing, "start \"htop\" on old-host");
         assert_eq!(request.cwd.as_deref(), Some("/var/log/brindle-nowhere"), "the old host's directory, unchecked");
-        assert!(same_endpoint(&tab_host, &before));
-        assert!(!same_endpoint(&tab_host, &reloaded));
+        assert!(same_endpoint(&tab_host, &Host::of(&before)));
+        assert!(!same_endpoint(&tab_host, &Host::of(&reloaded)));
 
         // A local tab whose profile now names a remote still splits here.
         let (request, doing) = split(&reloaded, &Host::Local);
         assert_eq!(doing, "start \"htop\"");
         assert_eq!(request.cwd, None, "no such directory on this machine");
-        assert!(!same_endpoint(&Host::Local, &reloaded));
+        assert!(!same_endpoint(&Host::Local, &Host::of(&reloaded)));
 
         // A profile the config dropped leaves the tab its own.
         assert!(reloaded_profile(&before, &Config::default()).is_none());

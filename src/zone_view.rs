@@ -595,6 +595,8 @@ impl ZoneTreeView {
         {
             let zone = self.zones.get(&id)?;
             let (id, key) = zone.content.as_terminal_view().read(cx).terminal.read(cx).server_session()?;
+            // The state file's form: an empty key for none.
+            let key = key.map(crate::remote::SessionKey::into_string).unwrap_or_default();
             Some(crate::session::ServerSession { id, key })
         }
         #[cfg(not(any(target_os = "linux", windows)))]

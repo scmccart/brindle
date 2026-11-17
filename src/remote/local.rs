@@ -43,7 +43,9 @@ mod sys;
 mod sys;
 mod upgrade;
 
-pub use connection::{AttachRequest, Connection, Foreground, ListingHook, Report, SessionSink, SpawnRequest};
+pub use connection::{
+    AttachRequest, Attaching, Connection, Foreground, ListingHook, Report, SessionSink, SpawnRequest,
+};
 pub use super::Host;
 /// What `remote::client`'s tests of the relay's launch against real
 /// endpoints start for themselves.
