@@ -443,8 +443,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_exe_paths_are_the_link_then_the_file_behind_it() {
-        let dir = std::env::temp_dir().join(format!("brindle-exe-paths-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::TempDir::new("exe-paths");
         let (real, links) = (dir.join("real"), dir.join("links"));
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir_all(&links).unwrap();
@@ -454,7 +453,6 @@ mod tests {
         let real = dunce::canonicalize(&real).unwrap();
         let paths = exe_paths(&link);
         let alone = exe_paths(&real.join("brindle"));
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(paths, [link, real.join("brindle")]);
         assert_eq!(alone, [real.join("brindle")]);
     }

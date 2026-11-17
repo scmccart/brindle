@@ -945,15 +945,15 @@ mod tests {
 
         child.kill().unwrap();
         child.wait().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            prune_helper_copies(&copies, "kept");
-            if !running.parent().unwrap().exists() {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "the copy stayed");
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        // The dead process's image is released soon after its exit, not at
+        // it; the limit is scaled.
+        assert!(
+            crate::test_support::eventually(std::time::Duration::from_secs(20), || {
+                prune_helper_copies(&copies, "kept");
+                !running.parent().unwrap().exists()
+            }),
+            "the copy stayed"
+        );
         assert_eq!(names(&copies), ["a-file", "kept"]);
 
         // No directory at all is nothing to prune.

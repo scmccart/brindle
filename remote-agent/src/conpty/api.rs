@@ -211,15 +211,11 @@ pub(super) fn wide(text: &OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "brindle-remote-conpty-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh directory for one test, removed when it ends.
+    fn scratch(name: &str) -> TempDir {
+        TempDir::new(&format!("remote-conpty-{name}"))
     }
 
     const FILES: (&[u8], &[u8]) = (b"dll bytes", b"host bytes");
@@ -231,8 +227,8 @@ mod tests {
         std::fs::write(exe.join(HOST), FILES.1).unwrap();
         let extract = scratch("extract-unused");
         assert_eq!(
-            shipped_dir(Some(&exe), Some(&extract), FILES),
-            Ok(exe.clone())
+            shipped_dir(Some(exe.path()), Some(extract.path()), FILES),
+            Ok(exe.to_path_buf())
         );
         assert!(!extract.join(DLL).exists(), "nothing extracted");
     }
@@ -244,8 +240,8 @@ mod tests {
         std::fs::write(exe.join(HOST), FILES.1).unwrap();
         let extract = scratch("extract-planted");
         assert_eq!(
-            shipped_dir(Some(&exe), Some(&extract), FILES),
-            Ok(extract.clone())
+            shipped_dir(Some(exe.path()), Some(extract.path()), FILES),
+            Ok(extract.to_path_buf())
         );
         assert_eq!(std::fs::read(extract.join(DLL)).unwrap(), FILES.0);
         assert_eq!(std::fs::read(extract.join(HOST)).unwrap(), FILES.1);
@@ -257,8 +253,8 @@ mod tests {
         std::fs::write(extract.join(DLL), b"old").unwrap();
         std::fs::write(extract.join(HOST), FILES.1).unwrap();
         assert_eq!(
-            shipped_dir(None, Some(&extract), FILES),
-            Ok(extract.clone())
+            shipped_dir(None, Some(extract.path()), FILES),
+            Ok(extract.to_path_buf())
         );
         assert_eq!(std::fs::read(extract.join(DLL)).unwrap(), FILES.0);
     }

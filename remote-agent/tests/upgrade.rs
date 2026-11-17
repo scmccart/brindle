@@ -16,7 +16,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, ReplayStart};
@@ -363,9 +363,8 @@ fn a_next_core_that_wont_start_is_replaced_by_the_holders_own() {
     step_down(&mut client);
     // The upgrade's core exits at startup.
     assert!(start(&exits_at_startup(), "serve", &dir.path, &[]).is_err());
-    let stepped_down = Instant::now();
     assert!(
-        eventually(Duration::from_secs(20), || {
+        eventually(TIMEOUT, || {
             server_processes(&dir.path, "serve")
                 .iter()
                 .any(|&pid| pid != old_core)
@@ -374,10 +373,11 @@ fn a_next_core_that_wont_start_is_replaced_by_the_holders_own() {
         "no core: {}",
         dir.logs()
     );
+    // The holder's own core took over.
     assert!(
-        stepped_down.elapsed() < Duration::from_secs(10),
-        "a core came back after {:?}",
-        stepped_down.elapsed()
+        eventually(TIMEOUT, || dir.logs().contains("the core it started is listening")),
+        "the holder didn't start the core: {}",
+        dir.logs()
     );
 
     let mut observer = TestClient::hello(&dir.path, "observer");

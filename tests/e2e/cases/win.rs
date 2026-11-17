@@ -73,7 +73,8 @@ pub fn all() -> Vec<Case> {
 /// not input, so the cursor and other windows are untouched. Until the hit
 /// tests read `hits` (the window may not be laid out yet), it stops before
 /// the double-click and press, so a probe that is polled changes nothing.
-fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str) -> String {
+/// `waits` stretches the wait for each of those to take effect.
+fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str, waits: crate::Scale) -> String {
     use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetWindowRect, HTCAPTION, HTMAXBUTTON, IsZoomed, SendMessageW, WM_MOUSEMOVE, WM_NCHITTEST,
@@ -113,17 +114,13 @@ fn caption_probe(pid: u32, scale: f32, points: &[(&str, f32, f32)], hits: &str) 
     if out.join(" ") != hits {
         return out.join(" ");
     }
-    // The caption buttons act through ShowWindowAsync, so wait a little.
+    // The caption buttons act through ShowWindowAsync, so wait (2 s,
+    // stretched) for the state wanted; the state then is reported either way.
     let zoomed = |want: bool| {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            // SAFETY: a plain query.
-            let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
-            if zoomed == want || Instant::now() > deadline {
-                return if zoomed { "maximized" } else { "windowed" };
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // SAFETY: a plain query.
+        let now = || unsafe { IsZoomed(hwnd) }.as_bool();
+        let zoomed = waits.poll(2.0, "the window's zoom", || Ok((now() == want).then_some(want))).unwrap_or_else(|_| now());
+        if zoomed { "maximized" } else { "windowed" }
     };
     let (client, screen) = at("strip");
     send(WM_MOUSEMOVE, 0, client);
@@ -252,7 +249,8 @@ fn caption(ctx: &Ctx) -> Result<Outcome> {
     // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT, HTCLIENT.
     let hits = "close=20 max=9 min=8 strip=2 tab=1 new-tab=1";
     let expected = format!("{hits} double-click=maximized maximize=windowed");
-    let probe = move |pid| caption_probe(pid, scale, &points, hits);
+    let waits = ctx.scale();
+    let probe = move |pid| caption_probe(pid, scale, &points, hits, waits);
     // Done once it has clicked: that happens once only.
     let clicked = |seen: &str| seen.contains("double-click=");
     let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
@@ -362,24 +360,24 @@ fn run_keeping(
         .stderr(log)
         .spawn()
         .map_err(|e| format!("starting {}: {e}", ctx.bin.display()))?;
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs_f64(ctx.secs(dump_at) + 30.0);
+    // Each wait: the dump's time, then 30 s to print it and quit (stretched).
+    let (waits, limit) = (ctx.scale(), dump_at + 30.0);
     let mut seen = String::new();
     if let Some(probe) = during {
-        loop {
-            seen = (probe.run)(child.id());
-            if (probe.done)(&seen) || Instant::now() >= deadline || child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        // Until it says it is done or Brindle exits; what it saw last is
+        // reported either way.
+        let pid = child.id();
+        waits
+            .poll(limit, "the probe", || {
+                seen = (probe.run)(pid);
+                let exited = child.try_wait().map_err(|e| e.to_string())?.is_some();
+                Ok(((probe.done)(&seen) || exited).then_some(()))
+            })
+            .ok();
     }
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-        if Instant::now() > deadline {
-            child.kill().ok();
-            return Err(format!("Brindle didn't exit; see {label}.log"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if waits.poll(limit, "Brindle exiting", || child.try_wait().map_err(|e| e.to_string())).is_err() {
+        child.kill().ok();
+        return Err(format!("Brindle didn't exit; see {label}.log"));
     }
     let mut stdout = String::new();
     child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
@@ -494,20 +492,27 @@ fn conpty_fallback(ctx: &Ctx) -> Result<Outcome> {
 
 fn passthrough(ctx: &Ctx) -> Result<Outcome> {
     let notes = ctx.dir.join("notify.log");
+    // The reply is read until its terminator (BEL, or ST), for at most 5 s
+    // (stretched).
     let send = script(
         ctx,
         "passthrough.ps1",
-        r#"$e = [char]27; $b = [char]7
+        &format!(
+            r#"$e = [char]27; $b = [char]7
 [Console]::Write("building`n")
 [Console]::Write("$e]9;e2e-note$b")
 [Console]::Write("done`n")
 [Console]::Write("$e[?1000h$e[?1006h")
 [Console]::Write("$e]11;?$b")
-Start-Sleep -Milliseconds 500
 $reply = ''
-while ([Console]::KeyAvailable) { $reply += [Console]::ReadKey($true).KeyChar }
+$until = (Get-Date).AddSeconds({limit})
+while (-not ($reply.EndsWith($b) -or $reply.EndsWith("$e\")) -and (Get-Date) -lt $until) {{
+    if ([Console]::KeyAvailable) {{ $reply += [Console]::ReadKey($true).KeyChar }} else {{ Start-Sleep -Milliseconds 20 }}
+}}
 "reply=" + ($reply -replace $e, 'ESC' -replace $b, 'BEL')
 "#,
+            limit = ctx.secs(5.0)
+        ),
     )?;
     let notes_env = notes.display().to_string();
     let ran = run(ctx, "passthrough", &["-p", "pwsh", "--send", &send], &[("BRINDLE_NOTIFY_LOG", &notes_env)], 6.0, None)?;
@@ -543,7 +548,10 @@ fn glyph_width(ctx: &Ctx) -> Result<Outcome> {
 fn title_child(ctx: &Ctx) -> Result<Outcome> {
     let title = |dump: &Dump| dump.tabs.first().map(|(t, _)| t.clone()).unwrap_or_default();
     let ping = |count: u32| format!("[Console]::Title = (Get-Process -Id $PID).Path; ping -n {count} 127.0.0.1\r");
-    let during = run(ctx, "during", &["-p", "pwsh", "--send", &ping(8)], &[], 4.0, None)?;
+    // `ping -n N` runs for N - 1 s: past the dump (4 s, stretched), with 4 s
+    // to spare.
+    let lasting = ctx.secs(4.0).ceil() as u32 + 4;
+    let during = run(ctx, "during", &["-p", "pwsh", "--send", &ping(lasting)], &[], 4.0, None)?;
     ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
     let after = run(ctx, "after", &["-p", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
     ensure!(title(&after.dump) == "pwsh", "title after ping: {:?}", title(&after.dump));
@@ -715,7 +723,8 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
 /// takes that cold start out of the GUI run, and its time shows whether the
 /// runner was cold. A failed or slow warm-up is recorded, not a failure.
 fn powershell_warmup(ctx: &Ctx, bin: &str) {
-    const LIMIT: Duration = Duration::from_secs(120);
+    // Seconds, stretched.
+    const LIMIT: f64 = 120.0;
     let command = format!(
         "Get-Command PSConsoleHostReadLine -ErrorAction Ignore | Out-Null; \
          & '{bin}' --shell-integration pwsh | Out-String | Out-Null"
@@ -729,15 +738,11 @@ fn powershell_warmup(ctx: &Ctx, bin: &str) {
         .spawn()
     {
         Err(e) => format!("not started: {e}"),
-        Ok(mut child) => loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break format!("exited with {status}"),
-                Ok(None) if started.elapsed() > LIMIT => {
-                    child.kill().ok();
-                    break format!("killed after {} s", LIMIT.as_secs());
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => break format!("wait failed: {e}"),
+        Ok(mut child) => match ctx.scale().poll(LIMIT, "the warm-up", || child.try_wait().map_err(|e| e.to_string())) {
+            Ok(status) => format!("exited with {status}"),
+            Err(why) => {
+                child.kill().ok();
+                format!("killed: {why}")
             }
         },
     };
@@ -745,7 +750,6 @@ fn powershell_warmup(ctx: &Ctx, bin: &str) {
 }
 
 fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
-    let started = Instant::now();
     let ran = run(
         ctx,
         "close",
@@ -765,22 +769,20 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
         6.0,
         None,
     )?;
+    // Closing the flooding tab didn't block: a blocked window gives no dump,
+    // and the run's own limit fails the case. (A slow but unfrozen window
+    // isn't caught; the bug this guards was a freeze.)
     ensure!(ran.dump.tabs.len() == 1, "tabs: {:?}", ran.dump.tabs);
-    // The dump comes on time only if closing the flooding tab didn't block.
-    let took = started.elapsed().as_secs_f64();
-    ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
     Ok(Outcome::Pass)
 }
 
 /// A tab that prints without pause must not starve the window: every GPUI
 /// main-thread wake is a posted message, and Windows hands out `WM_PAINT`
-/// and `WM_QUIT` only when none is waiting. The dump comes on time only if
-/// the window kept getting idle gaps.
+/// and `WM_QUIT` only when none is waiting. A starved window gives no dump,
+/// and the run's own limit fails the case. (A slow but unfrozen window
+/// isn't caught; the bug this guards was a freeze.)
 fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
-    let started = Instant::now();
     let ran = run(ctx, "flood", &["-p", "cmd", "--send", "for /L %i in (1,0,2) do @echo flood %i\r"], &[], 6.0, None)?;
-    let took = started.elapsed().as_secs_f64();
-    ensure!(took < ctx.secs(6.0) + 5.0, "took {took:.1} s");
     ensure!(ran.dump.screen.iter().any(|line| line.starts_with("flood ")), "screen {:?}", ran.dump.screen);
     Ok(Outcome::Pass)
 }

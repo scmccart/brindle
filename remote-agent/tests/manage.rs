@@ -55,6 +55,46 @@ fn directories() -> [String; 2] {
     [root, temp.trim_end_matches('\\').into()]
 }
 
+/// The seconds a `list` duration column (an age, a time detached) shows:
+/// digits, each followed by its unit (`s`, `m`, `h` or `d`), as in `3s`,
+/// `2m05s` or `1h02m`. `None` for anything else, `-` included.
+fn duration_column(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut digits = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        let count: u64 = digits.parse().ok()?;
+        digits.clear();
+        total = total.checked_add(count.checked_mul(unit)?)?;
+    }
+    digits.is_empty().then_some(total)
+}
+
+#[test]
+fn duration_columns_are_digits_and_units() {
+    assert_eq!(duration_column("3s"), Some(3));
+    assert_eq!(duration_column("2m5s"), Some(125));
+    assert_eq!(duration_column("2m05s"), Some(125));
+    assert_eq!(duration_column("1h"), Some(3600));
+    assert_eq!(duration_column("1h02m"), Some(3720));
+    for rejected in ["-", "x", "", "5", "s", "3s4", "1y"] {
+        assert_eq!(duration_column(rejected), None, "{rejected:?}");
+    }
+}
+
 #[test]
 fn with_no_server_running_nothing_is_printed_and_nothing_starts() {
     let dir = TempDir::new("cli-none");
@@ -82,6 +122,7 @@ fn with_no_server_running_nothing_is_printed_and_nothing_starts() {
 
 #[test]
 fn list_shows_one_line_per_session() {
+    let began = std::time::Instant::now();
     let (dir, mut client) = core("cli-list");
     let [first_dir, second_dir] = directories();
     let mut attached = programs::echoer();
@@ -118,15 +159,17 @@ fn list_shows_one_line_per_session() {
         .map(|line| line.split('\t').map(String::from).collect())
         .collect();
     // The age (column 7) and the time detached (column 5) depend on the
-    // clock: a few seconds at most.
+    // clock: durations, no longer than this test has run.
+    let ran = began.elapsed().as_secs() + 1;
+    let within = |column: &str| duration_column(column).is_some_and(|secs| secs <= ran);
     let mut detached_for = Vec::new();
     for line in &mut lines {
         let age = line.remove(6);
-        assert!(age.ends_with('s') && !age.contains('m'), "{age}");
+        assert!(within(&age), "age {age:?}, after {ran}s");
         detached_for.push(line.remove(4));
     }
     assert_eq!(detached_for[0], "-", "attached");
-    assert!(detached_for[1].ends_with('s') && !detached_for[1].contains('m'), "{detached_for:?}");
+    assert!(within(&detached_for[1]), "{detached_for:?}, after {ran}s");
     let line = |session: u32, pid: u32, state: &str, owner: &str, policy: &str, command: &str, cwd: &str| {
         [&*session.to_string(), &*pid.to_string(), state, owner, policy, &title(session), command, cwd]
             .map(String::from)
@@ -181,18 +224,28 @@ fn list_shows_whether_a_detached_sessions_owner_may_come_back() {
         "{:?}",
         listed()
     );
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    let lines = listed();
+    // Both have been detached for a second, in the text and in the JSON.
+    let listed_json = || -> Vec<Value> {
+        let output = succeeded(cli(&dir.path, &["list", "--json"]));
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let (lines, sessions) = until("both sessions listed as detached for a second", TIMEOUT, || {
+        let lines = listed();
+        let sessions = listed_json();
+        let text_ticked = lines.iter().all(|line| line[4] != "0s");
+        let json_ticked = sessions
+            .iter()
+            .all(|info| info["detached_secs"].as_u64().is_some_and(|secs| secs >= 1));
+        (text_ticked && json_ticked).then_some((lines, sessions))
+    });
     let line = |session: u32| lines.iter().find(|line| line[0] == session.to_string()).unwrap();
     assert_eq!(line(dropped)[3], "owned", "{lines:?}");
     assert_eq!(line(released)[3], "unowned", "{lines:?}");
     for session in [dropped, released] {
         let detached = &line(session)[4];
-        assert!(detached.ends_with('s') && detached != "0s", "{lines:?}");
+        assert!(duration_column(detached).is_some_and(|secs| secs >= 1), "{lines:?}");
     }
 
-    let output = succeeded(cli(&dir.path, &["list", "--json"]));
-    let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
     let json = |session: u32| {
         sessions
             .iter()

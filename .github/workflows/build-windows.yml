@@ -57,7 +57,17 @@ jobs:
       # Every workspace crate is a default member, so this builds brindle.exe
       # and the terminal server helper, brindle-remote.exe.
       - run: cargo build --release --locked
+      # Tests that skip for want of a capability record it in
+      # target/tmp/skipped.log; start it empty, and print it after the run.
+      - name: Clear the skipped-tests log
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue target/tmp/skipped.log
       - run: cargo test --locked --workspace
+      - name: Tests skipped for want of a capability
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path target/tmp/skipped.log) { Get-Content target/tmp/skipped.log } else { "none" }
       - name: e2e harness self-test
         run: cargo test --locked -p brindle --test e2e -- --self-test
         env:

@@ -30,7 +30,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    CreateEventW, GetProcessIoCounters, GetProcessTimes, INFINITE, IO_COUNTERS, OpenProcess,
+    PROCESS_ACCESS_RIGHTS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, SetEvent,
     TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
@@ -517,6 +518,37 @@ pub fn working_set_kib(pid: u32) -> u64 {
     // SAFETY: the handle is open, and `counters` has `size` bytes.
     unsafe { GetProcessMemoryInfo(raw(&process), &mut counters, size) }.unwrap();
     counters.WorkingSetSize as u64 / 1024
+}
+
+/// How many bytes `pid` has written (`IO_COUNTERS::WriteTransferCount`,
+/// console and pipe writes included), `None` once it is gone. The count
+/// stands still while the process stays blocked in a write.
+pub fn bytes_written(pid: u32) -> Option<u64> {
+    let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut counters = IO_COUNTERS::default();
+    // SAFETY: the handle is open, and `counters` is writable.
+    unsafe { GetProcessIoCounters(raw(&process), &mut counters) }.ok()?;
+    Some(counters.WriteTransferCount)
+}
+
+/// How long [`stays_blocked`] watches a writer write nothing.
+pub const BLOCKED_FOR: Duration = Duration::from_millis(250);
+
+/// Waits until `pid` is blocked for good on output nobody takes: it wrote
+/// nothing for [`BLOCKED_FOR`]. Returns `false` if it ends instead, or isn't
+/// blocked within [`TIMEOUT`]. Windows has no context-switch count per
+/// process, so the bytes it wrote stand in for Linux's switches.
+pub fn stays_blocked(pid: u32) -> bool {
+    let mut quiet = super::Quiet::new(BLOCKED_FOR);
+    let mut ended = false;
+    let blocked = super::eventually(TIMEOUT, || {
+        if !alive(pid) {
+            ended = true;
+            return true;
+        }
+        quiet.observe(bytes_written(pid))
+    });
+    blocked && !ended
 }
 
 /// A hidden top-level window of this thread's, destroyed on drop.

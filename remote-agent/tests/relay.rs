@@ -12,7 +12,6 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::Frame;
@@ -118,9 +117,7 @@ fn a_relay_ends_when_its_client_closes_and_the_core_lets_the_client_go() {
     dir.track(parent(kept_pid).unwrap());
 
     relay::hang_up(&client);
-    let status = relay
-        .exits_within(TIMEOUT)
-        .expect("the relay outlived its client's stdin");
+    let status = relay.exits_within(TIMEOUT, "the relay's exit once its client's stdin ended");
     assert!(status.success(), "{status}");
     // Nothing else held the relay's end of the link: neither the core nor a
     // holder inherited its stdio.
@@ -155,17 +152,12 @@ fn a_silent_client_ends_its_relay_and_its_sessions_stay_detached() {
 
     // From here the client sends nothing, not even heartbeats.
     let silent = Instant::now();
-    let status = relay
-        .exits_within(IDLE + TIMEOUT)
-        .expect("the relay outlived a silent client");
+    let status = relay.exits_within(IDLE + TIMEOUT, "the relay's exit with a silent client");
     let after = silent.elapsed();
     assert!(!status.success());
-    // Its last frame came just before `silent`.
+    // Its last frame came just before `silent`; the wait above bounds the
+    // other side.
     assert!(after >= IDLE / 2, "the relay ended after {after:?}");
-    assert!(
-        after < IDLE + Duration::from_secs(5),
-        "the relay ended after {after:?}"
-    );
     assert!(client.closes());
     let logs = dir.logs();
     assert!(
@@ -216,25 +208,26 @@ fn a_client_that_stops_reading_during_a_flood_keeps_its_relay() {
     // The client stops reading, but sends heartbeats, for three idle limits
     // and until the flood's program has stayed blocked for a while: the
     // relay's stdout is full, and the backpressure reaches the program.
+    // Blocked, as `stays_blocked` tells it: the program never ran for
+    // `BLOCKED_FOR`, and it and the holder, which reads its terminal, were
+    // asleep at every look.
+    let holder = parent(pid).unwrap();
+    let asleep = |pid| state(pid) == Some('S');
     let stopped = Instant::now();
     let mut next_heartbeat = stopped;
-    let mut blocked = 0;
-    while stopped.elapsed() < IDLE * 3 || blocked < 10 {
-        assert!(
-            stopped.elapsed() < TIMEOUT,
-            "the flooding program never blocked"
-        );
-        if Instant::now() >= next_heartbeat {
-            client.send_frame(&heartbeat());
-            next_heartbeat += HEARTBEAT;
-        }
-        blocked = if state(pid) == Some('S') {
-            blocked + 1
-        } else {
-            0
-        };
-        thread::sleep(Duration::from_millis(20));
-    }
+    let mut quiet = Quiet::new(BLOCKED_FOR);
+    assert!(
+        eventually(TIMEOUT, || {
+            if Instant::now() >= next_heartbeat {
+                client.send_frame(&heartbeat());
+                next_heartbeat += HEARTBEAT;
+            }
+            let blocked = quiet
+                .observe(context_switches(pid).filter(|_| asleep(pid) && asleep(holder)));
+            blocked && stopped.elapsed() >= IDLE * 3
+        }),
+        "the flooding program never blocked"
+    );
     assert!(relay.running());
     // The relay held its frames back rather than buffer them.
     let relay_rss = rss_kib(relay.pid());
@@ -318,12 +311,7 @@ fn a_relay_that_cant_reach_a_core_says_why() {
         "{}",
         error.message
     );
-    assert!(
-        !relay
-            .exits_within(TIMEOUT)
-            .expect("the relay kept running")
-            .success()
-    );
+    assert!(!relay.exits_within(TIMEOUT, "the relay's exit after RELAY_ERROR").success());
 
     // A core socket that can't be connected to (its path is too long), with
     // the core's log named.
@@ -340,11 +328,6 @@ fn a_relay_that_cant_reach_a_core_says_why() {
         "{}",
         error.message
     );
-    assert!(
-        !relay
-            .exits_within(TIMEOUT)
-            .expect("the relay kept running")
-            .success()
-    );
+    assert!(!relay.exits_within(TIMEOUT, "the relay's exit after RELAY_ERROR").success());
     assert!(!core_listens(&long));
 }

@@ -4,11 +4,10 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use crate::brindle::{Run, state_dir};
 use crate::common::server::{Isolation, isolate};
-use crate::{Ctx, Outcome, Result, ensure};
+use crate::{Ctx, Outcome, Result, Scale, ensure};
 
 /// A later launch from `cwd`, sharing the case's state directory.
 #[derive(Clone)]
@@ -21,7 +20,7 @@ struct Launcher {
     /// there, never on the user's desktop.
     display: String,
     log: PathBuf,
-    limit: f64,
+    scale: Scale,
 }
 
 impl Launcher {
@@ -33,13 +32,13 @@ impl Launcher {
             server_dir: ctx.server_dir.clone(),
             display: ctx.display.clone(),
             log: ctx.dir.join("launches.log"),
-            limit: ctx.secs(8.0),
+            scale: ctx.scale(),
         }
     }
 
     /// Runs `brindle ARGS` in `cwd` and waits for it to exit, which it must
-    /// do with status 0 within the limit. It passes no debug option, so it
-    /// hands itself to the running Brindle.
+    /// do with status 0 within 8 s (stretched). It passes no debug option,
+    /// so it hands itself to the running Brindle.
     fn launch(&self, cwd: &std::path::Path, args: &[&str]) -> Result {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).map_err(|e| e.to_string())?;
         let mut command = Command::new(&self.bin);
@@ -60,17 +59,17 @@ impl Launcher {
             .stderr(log)
             .spawn()
             .map_err(|e| format!("launching {args:?}: {e}"))?;
-        let deadline = Instant::now() + Duration::from_secs_f64(self.limit);
-        loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        let exited = self.scale.poll(8.0, &format!("brindle {args:?} exiting"), || child.try_wait().map_err(|e| e.to_string()));
+        match exited {
+            Ok(status) => {
                 ensure!(status.success(), "brindle {args:?} exited with {status}");
-                return Ok(());
+                Ok(())
             }
-            if Instant::now() > deadline {
+            Err(why) => {
                 child.kill().ok();
-                return Err(format!("brindle {args:?} didn't exit: it opened a Brindle of its own?"));
+                child.wait().ok();
+                Err(format!("{why}: it opened a Brindle of its own?"))
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }

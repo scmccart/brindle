@@ -13,8 +13,10 @@
 //! Cases open Brindle windows under Xwayland (`BRINDLE_E2E_DISPLAY`, default
 //! `:0`; on Windows, on the desktop), so ask before running them on
 //! someone's desktop. They never send synthetic input. `BRINDLE_E2E_BIN` picks the binary (default: this
-//! build's), `BRINDLE_E2E_SLOW` stretches every delay. Each case leaves its
-//! config, dumps, captures and transcripts in `target/tmp/e2e/<case>/`.
+//! build's), `BRINDLE_E2E_SLOW` stretches every delay and every wait's limit
+//! (the cases wait through `wait.rs`'s [`Scale`], never a fixed sleep). Each
+//! case leaves its config, dumps, captures and transcripts in
+//! `target/tmp/e2e/<case>/`.
 
 mod brindle;
 #[path = "../common/mod.rs"]
@@ -22,16 +24,19 @@ mod common;
 mod capture;
 mod cases;
 mod query;
+mod wait;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(windows)]
 use common::server::under;
 use common::server::{Suite, check_helper, end_roles, helper, helper_name, private_dir, server_processes};
 #[cfg(windows)]
 use common::winproc;
+use common::{Selection, take_shard};
 pub use common::Result;
+pub use wait::Scale;
 
 pub enum Outcome {
     Pass,
@@ -60,23 +65,28 @@ pub struct Ctx {
     /// system temp directory, not `dir`, because a holder's socket path must
     /// fit in `sun_path` (108 bytes); on Windows it is `dir`'s `server`.
     pub server_dir: PathBuf,
-    slow: f64,
+    scale: Scale,
 }
 
 impl Ctx {
     /// `secs`, stretched by `BRINDLE_E2E_SLOW`.
     pub fn secs(&self, secs: f64) -> f64 {
-        secs * self.slow
+        self.scale.secs(secs)
+    }
+
+    /// The case's waits, stretched by `BRINDLE_E2E_SLOW` ([`wait`]).
+    pub fn scale(&self) -> Scale {
+        self.scale
     }
 
     /// Brindle's arguments that stretch its step spacing the same way. None
     /// at the normal speed, so `BRINDLE_E2E_BIN` can name an older build.
     pub fn step_interval(&self) -> Vec<String> {
-        if self.slow == 1.0 { Vec::new() } else { vec!["--step-interval".to_string(), self.secs(1.0).to_string()] }
-    }
-
-    pub fn sleep(&self, secs: f64) {
-        std::thread::sleep(Duration::from_secs_f64(self.secs(secs)));
+        if self.scale == Scale::new(1.0) {
+            Vec::new()
+        } else {
+            vec!["--step-interval".to_string(), self.secs(1.0).to_string()]
+        }
     }
 
     /// Writes a file into the case's directory.
@@ -101,23 +111,9 @@ fn main() {
         }
         return;
     }
-    let mut filters: Vec<&String> = Vec::new();
-    let mut shard = None;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        if arg == "--shard" {
-            match it.next().map(|v| parse_shard(v)) {
-                Some(Ok(s)) => shard = Some(s),
-                Some(Err(why)) => usage(&why),
-                None => usage("--shard needs K/N"),
-            }
-        } else if !arg.starts_with("--") {
-            filters.push(arg);
-        }
-    }
-    let mut selected: Vec<&Case> =
-        cases.iter().filter(|c| filters.is_empty() || filters.iter().any(|f| c.name.contains(f.as_str()))).collect();
-    if let Some((k, n)) = shard {
+    let selection = Selection::parse(&args).unwrap_or_else(|why| usage(&why));
+    let mut selected: Vec<&Case> = selection.matching(cases.iter().collect(), |case| case.name);
+    if let Some((k, n)) = selection.shard {
         let total = selected.len();
         selected = take_shard(selected, k, n);
         println!("e2e: shard {k}/{n}, {} of {total} cases", selected.len());
@@ -169,7 +165,7 @@ fn main() {
                 helper: helper.clone(),
                 display: display.clone(),
                 server_dir,
-                slow,
+                scale: Scale::new(slow),
             };
             let outcome = (case.run)(&ctx);
             match common::server::stop(&ctx.helper, &ctx.server_dir, &ctx.dir) {
@@ -211,37 +207,12 @@ fn usage(why: &str) -> ! {
     std::process::exit(2);
 }
 
-/// `K/N` for `--shard`: shard K (1-based) of N.
-fn parse_shard(value: &str) -> std::result::Result<(usize, usize), String> {
-    let bad = || format!("--shard needs K/N with 1 <= K <= N, got {value:?}");
-    let (k, n) = value.split_once('/').ok_or_else(bad)?;
-    let (k, n): (usize, usize) = (k.parse().map_err(|_| bad())?, n.parse().map_err(|_| bad())?);
-    if n == 0 || k == 0 || k > n {
-        return Err(bad());
-    }
-    Ok((k, n))
-}
-
-/// Every Nth item from the Kth: round-robin, so each area of the suite (its
-/// cases are registered by area) spreads across the shards.
-fn take_shard<T>(items: Vec<T>, k: usize, n: usize) -> Vec<T> {
-    items.into_iter().enumerate().filter(|(i, _)| i % n == k - 1).map(|(_, item)| item).collect()
-}
-
-fn self_test_shard() -> Result {
-    let shards: Vec<Vec<usize>> = (1..=3).map(|k| take_shard((0..10).collect(), k, 3)).collect();
-    ensure!(shards == [vec![0, 3, 6, 9], vec![1, 4, 7], vec![2, 5, 8]], "10 cases in 3 shards: {shards:?}");
-    ensure!(parse_shard("2/4") == Ok((2, 4)), "2/4");
-    for bad in ["0/4", "5/4", "1/0", "x", "1/", "/4", "-1/4"] {
-        ensure!(parse_shard(bad).is_err(), "{bad:?} accepted");
-    }
-    Ok(())
-}
-
 /// The harness's own unit tests (`--self-test`); there is no libtest here.
 fn self_test() -> i32 {
     let tests: &[(&str, fn() -> Result)] = &[
-        ("shards", self_test_shard),
+        ("shards", common::self_test_shard),
+        ("scaled waits", wait::self_test),
+        ("dump after the last step", brindle::self_test_dump_after_last_step),
         ("dump parsing", brindle::self_test_dump),
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),

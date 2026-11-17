@@ -69,13 +69,18 @@ impl Image {
         self.pixels(r).filter(|p| p.near(color, 24)).count()
     }
 
-    /// The most common color in `r`.
+    /// The most common color in `r`, or `None` when `r` is empty or two
+    /// colors tie for it: a tie has no answer, and picking one would follow
+    /// the map's iteration order, which changes from run to run.
     pub fn dominant(&self, r: PxRect) -> Option<Rgb> {
         let mut counts: HashMap<Rgb, usize> = HashMap::new();
         for p in self.pixels(r) {
             *counts.entry(p).or_default() += 1;
         }
-        counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c)
+        let most = counts.values().copied().max()?;
+        let mut leaders = counts.into_iter().filter(|&(_, n)| n == most).map(|(c, _)| c);
+        let leader = leaders.next();
+        if leaders.next().is_some() { None } else { leader }
     }
 
     /// The colors in `r`, most common first, for failure messages.
@@ -428,5 +433,16 @@ pub fn self_test_scan() -> Result {
     ensure!(none == Changes { count: 0, bbox: None, color: None }, "no change: {none:?}");
     let outside = ringed.changes(&cards, PxRect { x0: 10, y0: 0, x1: 30, y1: 20 }, 16)?;
     ensure!(outside.count == 0, "a change outside the region: {outside:?}");
+
+    // A face's 1px top border over its fill: two rows from the edge tie,
+    // which has no dominant colour (it used to follow the map's order), and
+    // a third row of fill decides it.
+    let face = image(&|_, y| (y == 9).then_some(LINE));
+    let band = |rows: u32| PxRect { x0: 4, y0: 9, x1: 26, y1: 9 + rows };
+    for _ in 0..20 {
+        ensure!(face.dominant(band(2)).is_none(), "a tie gave {:?}", face.dominant(band(2)));
+    }
+    ensure!(face.dominant(band(3)) == Some(BG), "two rows of fill in three: {:?}", face.dominant(band(3)));
+    ensure!(face.dominant(PxRect { x0: 4, y0: 9, x1: 4, y1: 12 }).is_none(), "an empty rectangle");
     Ok(())
 }

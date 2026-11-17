@@ -291,8 +291,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn opener_gets_the_uri_as_one_argument_on_windows() {
-        let dir = std::env::temp_dir().join(format!("brindle-opener-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TempDir::new("opener-test-windows");
         let out = dir.join("opened");
         let script = dir.join("record.cmd");
         // `%1` is the first argument as given (quotes and all), `%2` the second.
@@ -305,14 +304,12 @@ mod tests {
         assert_eq!(recorded.trim_end(), format!("\"{uri}\"|"));
 
         assert!(open_with(script.display().to_string(), "-rf".into()).is_none());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn opener_gets_the_uri_as_one_argument() {
-        let dir = std::env::temp_dir().join(format!("brindle-opener-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TempDir::new("opener-test");
         let out = dir.join("opened");
         let script = dir.join("record");
         crate::test_support::write_executable(
@@ -325,6 +322,5 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out).unwrap(), format!("1|{uri}"));
 
         assert!(open_with(script.display().to_string(), "-rf".into()).is_none());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -27,6 +27,8 @@ mod wire;
 
 #[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod test_support;
 
 /// Re-exported for the helper's `--json` output, so it needs no dependency
 /// of its own.

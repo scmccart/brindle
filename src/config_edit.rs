@@ -739,11 +739,9 @@ background = "nope"
         assert_eq!(copy.cursor_text, Some(tokyo.background));
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("brindle-config-edit-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh directory for one test, removed when it ends.
+    fn temp_dir(name: &str) -> crate::test_support::TempDir {
+        crate::test_support::TempDir::new(&format!("config-edit-{name}"))
     }
 
     #[test]
@@ -756,7 +754,6 @@ background = "nope"
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         assert!(!dir.join("config.toml.tmp").exists());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -766,7 +763,6 @@ background = "nope"
         save(&path, |doc| Ok(set_global_theme(doc, "gruvbox-dark"))).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, DEFAULT_CONFIG.replace("theme = \"brindle-dark\"", "theme = \"gruvbox-dark\""));
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -778,7 +774,6 @@ background = "nope"
         let err = save(&path, |doc| Ok(set_global_theme(doc, "y"))).unwrap_err();
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     // Windows needs Developer Mode or elevation to create symlinks.
@@ -793,7 +788,6 @@ background = "nope"
         save(&link, |doc| Ok(set_global_theme(doc, "b"))).unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "theme = \"b\"\n");
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -803,7 +797,6 @@ background = "nope"
         std::fs::write(&path, SAMPLE).unwrap();
         assert!(save(&path, |doc| delete_theme(doc, "mine")).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     // ---- profiles ----

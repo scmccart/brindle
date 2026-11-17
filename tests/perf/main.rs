@@ -6,9 +6,14 @@
 //! cargo build --release
 //! BRINDLE_PERF=1 cargo test --test perf                 # every case
 //! BRINDLE_PERF=1 cargo test --test perf -- latency      # cases matching "latency"
-//! BRINDLE_PERF=1 cargo test --test perf -- --list
+//! BRINDLE_PERF=1 cargo test --test perf -- --list       # the cases selected
+//! BRINDLE_PERF=1 cargo test --test perf -- --shard 1/2  # every 2nd case from the 1st
 //! BRINDLE_PERF=1 cargo test --test perf -- --self-test  # the harness's own tests
 //! ```
+//!
+//! `--shard K/N` takes every Nth case from the Kth, after the filters, as
+//! the e2e suite's does, so the cases can be spread over CI jobs; `--list`
+//! prints the cases the filters and shard select.
 //!
 //! Cases open Brindle windows under Xwayland (`BRINDLE_PERF_DISPLAY`,
 //! default `:0`), so ask before running them on someone's desktop. They
@@ -36,6 +41,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+use common::Selection;
 use common::server::{Suite, helper_name, private_dir};
 pub use common::Result;
 use report::{LatencyResult, Summary, ThroughputResult};
@@ -122,15 +128,17 @@ fn main() {
         std::process::exit(self_test());
     }
     let cases = cases();
+    let selection = Selection::parse(&args).unwrap_or_else(|why| usage(&why));
+    let selected: Vec<&Case> = selection.select(cases.iter().collect(), |case| case.name);
     if args.iter().any(|a| a == "--list") {
-        for case in &cases {
+        for case in &selected {
             println!("{}", case.name);
         }
         return;
     }
-    let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let selected: Vec<&Case> =
-        cases.iter().filter(|c| filters.is_empty() || filters.iter().any(|f| c.name.contains(f.as_str()))).collect();
+    if let Some((k, n)) = selection.shard {
+        println!("perf: shard {k}/{n}, {} case(s)", selected.len());
+    }
 
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let target_dir = tmp.parent().expect("target/tmp has a parent").to_path_buf();
@@ -247,10 +255,17 @@ fn main() {
     }
 }
 
+fn usage(why: &str) -> ! {
+    eprintln!("perf: {why}");
+    eprintln!("usage: BRINDLE_PERF=1 cargo test --test perf -- [FILTER…] [--shard K/N] [--list | --self-test]");
+    std::process::exit(2);
+}
+
 /// The harness's own unit tests (`--self-test`); there is no libtest here.
 fn self_test() -> i32 {
     type Test = (&'static str, fn() -> Result);
     let tests: &[Test] = &[
+        ("shards", common::self_test_shard),
         ("latency parsing", report::self_test_latency),
         ("dat parsing", report::self_test_dat),
         ("report rendering", report::self_test_render),

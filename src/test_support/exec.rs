@@ -1,4 +1,4 @@
-//! Helpers shared by this crate's unit tests.
+//! Executable files that a test can run at once.
 
 use std::fs::File;
 use std::io;
@@ -81,8 +81,7 @@ fn read_lease(_: &File) -> io::Result<()> {
 
 #[test]
 fn an_executable_is_ready_only_once_its_writers_are_gone() {
-    let dir = std::env::temp_dir().join(format!("brindle-test-support-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = super::TempDir::new("test-support-exec");
     let path = dir.join("script");
     // Stands in for the copy of the writer's fd that a forked child holds.
     let writer = File::create(&path).unwrap();
@@ -100,5 +99,4 @@ fn an_executable_is_ready_only_once_its_writers_are_gone() {
     } else {
         eprintln!("not checked: no read leases in {} ({refused})", dir.display());
     }
-    std::fs::remove_dir_all(&dir).ok();
 }

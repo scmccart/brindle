@@ -129,15 +129,23 @@ impl Strip {
         self.rect(left + 6.0, FACE_TOP + 5.0, 60.0, FACE_HEIGHT - 10.0)
     }
 
-    /// Two rows just inside the top of tab `ix`'s face, where a line
-    /// marking the active tab would run into it. They start 1px below the
-    /// face's top edge: which device row the edge falls on varied by one
-    /// between runs (the strip's origin is derived from the dump's logical
-    /// pixels; the exact cause was not chased), and a band that began on
-    /// the edge read what lies round the face in two of seven runs.
+    /// Three rows from the top edge of tab `ix`'s face, where a line
+    /// marking the active tab would run. The active face is raised and has
+    /// a 1px border (the chrome's `border` token) on its top row, so the
+    /// face's colour is two rows of three here and the border one.
+    ///
+    /// This band used to be two rows from the edge, and failed 63 times in
+    /// 100 headless runs (`deterministic-tests` task 5.7): every run had the
+    /// same grid origin (13,55 at scale 1) and the same edge row, so the
+    /// strip's position was never off; the two rows held 56 border and 56
+    /// face pixels, and `Image::dominant` broke the tie in `HashMap` order.
+    /// It then started 1px below the edge, which missed a 1px line on the
+    /// edge itself. Now a tie gives no dominant colour, and the band's
+    /// third row decides it; the replayed check passed on all 135 captures
+    /// those runs left.
     fn face_top(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
-        self.rect(left + 8.0, FACE_TOP + 1.0, 56.0, 2.0)
+        self.rect(left + 8.0, FACE_TOP, 56.0, 3.0)
     }
 
     /// The list's bottom padding under tab `ix`'s face.
