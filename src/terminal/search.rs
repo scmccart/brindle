@@ -5,6 +5,8 @@
 //! Matches are numbered and stepped from the newest output (the bottom) up,
 //! because a terminal's history is searched backwards.
 
+use std::sync::Arc;
+
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::term::Term;
@@ -171,6 +173,49 @@ pub fn viewport_position(point: Point, display_offset: usize, screen_lines: usiz
     (row >= 0 && (row as usize) < screen_lines).then_some((row as usize, point.column.0))
 }
 
+/// The view that matches were found in: how far it is scrolled back, and
+/// the grid's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewKey {
+    pub display_offset: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// The view `term` shows now.
+pub fn view_key<T>(term: &Term<T>) -> ViewKey {
+    ViewKey { display_offset: term.grid().display_offset(), cols: term.columns(), rows: term.screen_lines() }
+}
+
+/// The matches in view ([`visible_matches`]), with the view they were found
+/// in, so `prepaint` draws them without a scan.
+#[derive(Clone, Debug)]
+pub struct VisibleMatches {
+    pub key: ViewKey,
+    pub matches: Arc<[Match]>,
+}
+
+/// What the cache holds for the view `prepaint` is about to draw
+/// ([`cached`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cached {
+    /// The matches in this view.
+    Fresh(Arc<[Match]>),
+    /// Matches found in another view: the view moved or was resized since.
+    Stale,
+    /// Nothing searched yet.
+    Empty,
+}
+
+/// Whether `visible` holds the matches for the view `now`.
+pub fn cached(visible: Option<&VisibleMatches>, now: ViewKey) -> Cached {
+    match visible {
+        None => Cached::Empty,
+        Some(visible) if visible.key == now => Cached::Fresh(visible.matches.clone()),
+        Some(_) => Cached::Stale,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +238,31 @@ mod tests {
 
     fn text_at<T>(term: &Term<T>, m: &Match) -> String {
         term.bounds_to_string(*m.start(), *m.end())
+    }
+
+    #[test]
+    fn cached_matches_are_fresh_only_for_the_view_they_were_found_in() {
+        let key = ViewKey { display_offset: 0, cols: 80, rows: 24 };
+        let matches: Arc<[Match]> = vec![Point::new(Line(3), Column(0))..=Point::new(Line(3), Column(4))].into();
+        let visible = VisibleMatches { key, matches: matches.clone() };
+        assert_eq!(cached(Some(&visible), key), Cached::Fresh(matches));
+        for moved in [
+            ViewKey { display_offset: 5, ..key },
+            ViewKey { cols: 100, ..key },
+            ViewKey { rows: 30, ..key },
+        ] {
+            assert_eq!(cached(Some(&visible), moved), Cached::Stale, "{moved:?}");
+        }
+        assert_eq!(cached(None, key), Cached::Empty, "nothing searched yet");
+    }
+
+    #[test]
+    fn the_view_key_follows_scrolling_and_the_grid_size() {
+        let text: String = (1..=20).map(|i| format!("row {i}\n")).collect();
+        let mut t = term_with(30, 5, &text);
+        assert_eq!(view_key(&t), ViewKey { display_offset: 0, cols: 30, rows: 5 });
+        t.scroll_display(Scroll::Delta(3));
+        assert_eq!(view_key(&t), ViewKey { display_offset: 3, cols: 30, rows: 5 });
     }
 
     #[test]

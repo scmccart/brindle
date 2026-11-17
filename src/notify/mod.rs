@@ -4,8 +4,10 @@
 //! [`Notifier`] is a GPUI global. It rate-limits, then hands each
 //! notification to a sink: on Linux a D-Bus worker on the background
 //! executor (`dbus`), on Windows a toast worker thread (`toast`), or, when
-//! `BRINDLE_NOTIFY_LOG` is set, a file that tests read. It remembers which window and tab each notification came
-//! from, so a click can show that tab.
+//! `BRINDLE_NOTIFY_LOG` is set, a file that tests read, appended by a
+//! `notify-log` writer thread that quitting waits for ([`LogWriter`]). It
+//! remembers which window and tab each notification came from, so a click
+//! can show that tab.
 
 #[cfg(target_os = "linux")]
 pub mod activation;
@@ -22,12 +24,15 @@ mod toast;
 /// get the foreground, which Brindle doesn't do.)
 #[cfg(windows)]
 pub mod activation {
-    use gpui::Window;
+    use gpui::{App, Window};
     use windows::Win32::UI::WindowsAndMessaging::{
         FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx, IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
 
-    pub fn raise(window: &mut Window, _token: Option<&str>) {
+    /// Nothing to prepare: Windows raises with no token.
+    pub fn prepare(_window: &Window, _cx: &mut App) {}
+
+    pub fn raise(window: &mut Window, _token: Option<&str>, _cx: &mut App) {
         let Some(hwnd) = crate::win::hwnd(window) else { return };
         // SAFETY: plain window-manager calls on Brindle's own window.
         unsafe {
@@ -52,9 +57,12 @@ pub mod activation {
 /// Raising a window elsewhere: plain activation, with no tokens.
 #[cfg(not(any(target_os = "linux", windows)))]
 pub mod activation {
-    use gpui::Window;
+    use gpui::{App, Window};
 
-    pub fn raise(window: &mut Window, _token: Option<&str>) {
+    /// Nothing to prepare: no tokens here.
+    pub fn prepare(_window: &Window, _cx: &mut App) {}
+
+    pub fn raise(window: &mut Window, _token: Option<&str>, _cx: &mut App) {
         window.activate_window();
     }
 }
@@ -125,8 +133,74 @@ pub(crate) enum Reply {
     Closed { id: u32 },
 }
 
+/// What the `notify-log` thread is asked to do, in order.
+enum LogCommand {
+    /// Append this line to the file.
+    Line(String),
+    /// Answer once every line sent before has been written.
+    Flush(futures::channel::oneshot::Sender<()>),
+}
+
+/// The `BRINDLE_NOTIFY_LOG` file's writer: a `notify-log` thread that
+/// appends each line, so the UI thread never touches the file. Its queue is
+/// bounded by the notification rate limits (`policy.rs`, `process R9`).
+/// When the thread couldn't start, lines are dropped (warned once, at
+/// [`LogWriter::start`]).
+#[derive(Clone)]
+struct LogWriter(std::sync::mpsc::Sender<LogCommand>);
+
+impl LogWriter {
+    fn start(path: PathBuf) -> Self {
+        let (commands, queued) = std::sync::mpsc::channel();
+        let shown = path.display().to_string();
+        let spawned = std::thread::Builder::new().name("notify-log".into()).spawn(move || {
+            for command in queued {
+                match command {
+                    LogCommand::Line(line) => append(&path, &line),
+                    LogCommand::Flush(done) => {
+                        done.send(()).ok();
+                    }
+                }
+            }
+        });
+        // A thread that didn't start dropped the receiving end with it, so
+        // sends fail and lines are dropped.
+        if let Err(err) = spawned {
+            log::warn!("no notify-log thread ({err}): not writing notifications to {shown}");
+        }
+        LogWriter(commands)
+    }
+
+    fn write(&self, line: String) {
+        self.0.send(LogCommand::Line(line)).ok();
+    }
+
+    /// Resolves once every line written before it is in the file, or at
+    /// once when the thread is gone.
+    fn flush(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let (done, flushed) = futures::channel::oneshot::channel();
+        // A closed channel drops `done` with the command: `flushed` ends.
+        self.0.send(LogCommand::Flush(done)).ok();
+        async move {
+            flushed.await.ok();
+        }
+    }
+}
+
+/// Appends `line` to the file at `path`, creating it.
+fn append(path: &std::path::Path, line: &str) {
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+    if let Err(err) = written {
+        log::warn!("writing {}: {err}", path.display());
+    }
+}
+
 enum Sink {
-    Log { path: PathBuf, next_id: u32 },
+    Log { writer: LogWriter, next_id: u32 },
     #[cfg(target_os = "linux")]
     Bus(UnboundedSender<Command>),
     #[cfg(windows)]
@@ -155,12 +229,20 @@ pub struct Notifier {
 impl Global for Notifier {}
 
 impl Notifier {
-    /// Installs the global and, unless notifications go to a log file,
-    /// starts the platform's sink (on Linux a D-Bus worker, which connects
-    /// on first use).
+    /// Installs the global and starts its sink: the log file's writer
+    /// thread, which a quit waits for, or the platform's sink (on Linux a
+    /// D-Bus worker, which connects on first use).
     pub fn init(cx: &mut App) {
         let sink = match std::env::var_os(LOG_ENV).filter(|p| !p.is_empty()) {
-            Some(path) => Sink::Log { path: PathBuf::from(path), next_id: 1 },
+            Some(path) => {
+                let writer = LogWriter::start(PathBuf::from(path));
+                // Every line sent before the quit is in the file by the
+                // time Brindle exits, `--dump-screen-after`'s included
+                // (`process R16`: in the quit path, not a drop).
+                let flusher = writer.clone();
+                cx.on_app_quit(move |_| flusher.flush()).detach();
+                Sink::Log { writer, next_id: 1 }
+            }
             #[cfg(windows)]
             None => {
                 let (reply_tx, mut replies) = unbounded();
@@ -225,17 +307,8 @@ impl Notifier {
             _ => 0,
         };
         match &mut self.sink {
-            Sink::Log { path, next_id } => {
-                // Written right away: `--dump-screen-after` may quit next.
-                let line = log_line(request.source, &request.summary, &request.body);
-                let written = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&*path)
-                    .and_then(|mut file| file.write_all(line.as_bytes()));
-                if let Err(err) = written {
-                    log::warn!("writing {}: {err}", path.display());
-                }
+            Sink::Log { writer, next_id } => {
+                writer.write(log_line(request.source, &request.summary, &request.body));
                 let id = if replaces != 0 { replaces } else { std::mem::replace(next_id, *next_id + 1) };
                 self.remember(id, target);
             }
@@ -321,7 +394,7 @@ impl Notifier {
     fn show(target: Target, token: Option<String>, cx: &mut App) {
         let shown = target.window.update(cx, |workspace, window, cx| {
             workspace.show_tab(target.tab, window, cx);
-            activation::raise(window, token.as_deref());
+            activation::raise(window, token.as_deref(), cx);
         });
         if shown.is_err() {
             log::debug!("a notification was clicked after its window closed");
@@ -380,6 +453,33 @@ mod tests {
             "<toast><visual><binding template=\"ToastGeneric\"><text>make &lt;all&gt; &amp; &quot;go&quot;</text>\
              <text>it&apos;s &lt;/text&gt;&lt;text&gt;done</text></binding></visual></toast>"
         );
+    }
+
+    #[test]
+    fn the_log_writer_appends_in_order_and_a_flush_waits_for_it() {
+        struct Removed(PathBuf);
+        impl Drop for Removed {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("brindle-notify-log-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let _removed = Removed(dir.clone());
+        let path = dir.join("notify.log");
+        let writer = LogWriter::start(path.clone());
+        writer.write(log_line(Source::Osc9, "sh", "one"));
+        writer.write(log_line(Source::Osc777, "t — sh", "two"));
+        futures::executor::block_on(writer.flush());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "osc9\tsh\tone\nosc777\tt — sh\ttwo\n");
+    }
+
+    #[test]
+    fn a_flush_ends_when_the_log_thread_is_gone() {
+        let (commands, queued) = std::sync::mpsc::channel();
+        drop(queued);
+        futures::executor::block_on(LogWriter(commands).flush());
     }
 
     #[test]

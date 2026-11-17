@@ -7,9 +7,12 @@
 //! box-drawing / block characters are drawn as rectangles so borders and
 //! TUI frames join seamlessly regardless of line height.
 
+use std::sync::Arc;
+
 use alacritty_terminal::index::Point as GridPoint;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::Match;
 use alacritty_terminal::vte::ansi::{self, CursorShape, NamedColor, Rgb};
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
@@ -23,6 +26,7 @@ use brindle_term_core::emulator::MIN_COLS;
 
 use crate::latency::Latency;
 use crate::settings::Settings;
+use crate::terminal::search;
 use crate::terminal::{DIM_FACTOR, GridSize, resolve_color};
 use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Color;
@@ -178,9 +182,10 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Frame {
-        // Search matches in view; bounded by the viewport, like the cell loop.
-        let highlights = self.view.update(cx, |view, cx| view.find_highlights(cx));
         let view = self.view.read(cx);
+        // Search matches in view, found when the query, the output or the
+        // view changed: no scan here (`process R14`).
+        let highlights = view.find_highlights();
         let CellMetrics { font: base_font, font_size, cell_width, line_height } =
             cell_metrics(view.font_size_override, window, cx);
         let padding = px(Settings::get(cx).config.padding);
@@ -227,10 +232,18 @@ impl Element for TerminalElement {
         let selection_fg = theme.selection_foreground.map(Rgb::from);
         let (match_bg, match_fg) = theme.search_match();
         let (focused_bg, focused_fg) = theme.search_focused_match();
-        let (matches, focused_match) = match &highlights {
-            Some(h) => (h.matches.as_slice(), h.focused.as_ref()),
-            None => (&[][..], None),
+        // Matches found in another view (a resize just now, or output that
+        // moved a scrolled-back view before its notify) would land on the
+        // wrong rows: none are drawn this frame, and the view finds them
+        // for this one and draws again.
+        let cached = highlights.as_ref().map(|h| search::cached(h.visible.as_ref(), search::view_key(&term)));
+        let (fresh, stale_matches): (Option<Arc<[Match]>>, bool) = match cached {
+            Some(search::Cached::Fresh(matches)) => (Some(matches), false),
+            Some(search::Cached::Stale) => (None, true),
+            Some(search::Cached::Empty) | None => (None, false),
         };
+        let matches: &[Match] = fresh.as_deref().unwrap_or_default();
+        let focused_match = highlights.as_ref().and_then(|h| h.focused.as_ref());
         // Matches are in order, like the cells: walk them with an index.
         let mut next_match = 0;
         let mouse_mode = content.mode.intersects(TermMode::MOUSE_MODE);
@@ -502,6 +515,12 @@ impl Element for TerminalElement {
             rows,
             cursor: Some(cursor_cell_bounds),
         }));
+
+        if stale_matches {
+            // Deferred: no entity is updated while painting.
+            let view = self.view.clone();
+            cx.defer(move |cx| view.update(cx, |view, cx| view.find_view_moved(cx)));
+        }
 
         Frame {
             hitbox,

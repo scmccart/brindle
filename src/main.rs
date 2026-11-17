@@ -29,19 +29,21 @@ mod win;
 mod workspace;
 mod zone_view;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    App, AppContext as _, Application, BorrowAppContext as _, Bounds, Keystroke, WindowBackgroundAppearance,
+    App, AppContext as _, Application, BorrowAppContext as _, Bounds, Global, Keystroke, WindowBackgroundAppearance,
     WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
 
 use crate::actions::{Quit, ReloadConfig};
 use crate::config::Config;
 use crate::latency::Latency;
+use crate::reattach::Listing;
 use crate::remote::hosts::Hosts;
+use crate::remote::protocol::client::SessionInfo;
 use crate::settings::Settings;
 use crate::session::{PendingWrite, SessionStore, WindowState};
 use crate::workspace::{Launch, LaunchRequest, Workspace};
@@ -410,14 +412,54 @@ pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Wo
     }
 }
 
-fn reload_config(cx: &mut App) {
-    reload_config_renaming(cx, &[]);
+/// The queue of config reloads ([`request_config_reload`]), which one
+/// worker task takes in request order ([`start_config_reloads`],
+/// design.md decision 4).
+struct ConfigReloads(futures::channel::mpsc::UnboundedSender<Vec<(String, String)>>);
+
+impl Global for ConfigReloads {}
+
+/// Asks for the config file to be read again and applied to every window,
+/// after the reloads asked for before. `renames` are profiles renamed in
+/// the settings dialog, whose open tabs follow the new name. It returns at
+/// once: the worker reads the file off the UI thread, and applies it
+/// outside any window's update, so a window's own handler can ask.
+pub(crate) fn request_config_reload(renames: Vec<(String, String)>, cx: &mut App) {
+    if let Some(reloads) = cx.try_global::<ConfigReloads>() {
+        reloads.0.unbounded_send(renames).ok();
+    }
 }
 
-/// Reloads the config into every window. `renames` are profiles renamed in
-/// the settings dialog, whose open tabs follow the new name.
-pub(crate) fn reload_config_renaming(cx: &mut App, renames: &[(String, String)]) {
-    let (config, error) = Config::load_or_default();
+/// Starts the config reload worker: one foreground task that takes a
+/// request with whatever else is queued by then, reads the file once on the
+/// background executor, and applies it. One worker keeps reloads in order,
+/// so a slow read never lands after a newer one, and the queue holds at
+/// most what came during one read (`process R9`).
+fn start_config_reloads(cx: &mut App) {
+    use futures::StreamExt as _;
+
+    let (requests, mut queued) = futures::channel::mpsc::unbounded::<Vec<(String, String)>>();
+    cx.set_global(ConfigReloads(requests));
+    cx.spawn(async move |cx| {
+        while let Some(first) = queued.next().await {
+            let mut batch = vec![first];
+            while let Ok(Some(more)) = queued.try_next() {
+                batch.push(more);
+            }
+            let renames = merge_renames(batch);
+            let (config, error) = cx.background_executor().spawn(async { Config::load_or_default() }).await;
+            if cx.update(|cx| apply_config(config, error, &renames, cx)).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Applies a config read from the file to every window. `renames` are
+/// profiles renamed in the settings dialog, whose open tabs follow the new
+/// name.
+fn apply_config(config: Config, error: Option<String>, renames: &[(String, String)], cx: &mut App) {
     let zoom = Settings::get(cx).zoom;
     let mut settings = Settings::new(config, error, cx);
     settings.zoom = zoom;
@@ -497,17 +539,18 @@ fn config_mtime() -> Option<SystemTime> {
     std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
 }
 
-/// Reloads the config whenever the file changes on disk.
+/// Reloads the config whenever the file changes on disk: stats it once a
+/// second on the background executor.
 fn watch_config(cx: &mut App) {
     cx.spawn(async move |cx| {
-        let mut last = config_mtime();
+        let mut last = cx.background_executor().spawn(async { config_mtime() }).await;
         loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
-            let now = config_mtime();
+            let now = cx.background_executor().spawn(async { config_mtime() }).await;
             if now != last {
                 last = now;
                 log::info!("config changed, reloading");
-                if cx.update(reload_config).is_err() {
+                if cx.update(|cx| request_config_reload(Vec::new(), cx)).is_err() {
                     break;
                 }
             }
@@ -520,8 +563,9 @@ fn watch_config(cx: &mut App) {
 /// the UI thread.
 struct Forwarded {
     request: instance::Request,
-    /// For `--attach`: the server's sessions, listed on the socket's thread.
-    listing: Option<Option<Vec<remote::protocol::client::SessionInfo>>>,
+    /// For `--attach`: the server's sessions, listed on the socket's thread;
+    /// [`Listing::Skipped`] otherwise.
+    listing: Listing,
     reply: std::sync::mpsc::Sender<Result<(), String>>,
 }
 
@@ -536,10 +580,10 @@ fn take_launches(
         while let Some(Forwarded { request, listing, reply }) = requests.next().await {
             let result = window
                 .update(cx, |ws, window, cx| {
-                    if let Some(launch) = forwarded_launch(&request, listing, &Settings::get(cx).config) {
+                    if let Some(launch) = forwarded_launch(&request, &listing, &Settings::get(cx).config) {
                         ws.open(launch, window, cx);
                     }
-                    notify::activation::raise(window, request.activation_token.as_deref());
+                    notify::activation::raise(window, request.activation_token.as_deref(), cx);
                 })
                 .map_err(|_| "Brindle's window is gone".to_string());
             reply.send(result).ok();
@@ -550,17 +594,9 @@ fn take_launches(
 
 /// What a later launch's request opens: nothing for a plain launch, which
 /// only raises the window.
-fn forwarded_launch(
-    request: &instance::Request,
-    listing: Option<Option<Vec<remote::protocol::client::SessionInfo>>>,
-    config: &Config,
-) -> Option<Launch> {
+fn forwarded_launch(request: &instance::Request, listing: &Listing, config: &Config) -> Option<Launch> {
     if let Some(session) = request.attach {
-        let target = match listing.flatten() {
-            Some(listing) => reattach::attach_target(session, &listing),
-            None => Err("Brindle could not list the terminal server's sessions".into()),
-        };
-        return Some(Launch::Attach { session, target });
+        return Some(Launch::Attach { session, target: listing.attach_target(session) });
     }
     if request.profile.is_none() && request.cwd.is_none() && request.command.is_none() {
         return None;
@@ -578,19 +614,188 @@ fn forwarded_launch(
     Some(Launch::Request(LaunchRequest { profile, command, cwd }))
 }
 
+/// What a launch opens ([`startup_launch`]).
+struct Startup {
+    /// What the [`reattach::Detached`] global starts with: the restored
+    /// zones take theirs from it, and the rest open as tabs.
+    detached: Vec<SessionInfo>,
+    /// The window's first content.
+    first: Launch,
+    /// The tab opened after it, active: the asked tab, behind a restore.
+    then: Option<Launch>,
+}
+
+/// What a launch opens, given this machine's `listing`, the `recorded`
+/// window (the state file's windows merged), whether it `restoring`, its
+/// `--attach` session, the tab it `asked` for (`-p`/`-d`/`-e`) and the
+/// `profile` a default tab opens with (design.md decision 3).
+///
+/// When restoring, `detached` is the listed sessions that are detached and
+/// aren't `--attach`'s. The restore is `recorded` without the zones whose
+/// session isn't among them; when the listing failed (or was skipped)
+/// nothing tells a lost zone from a live one, so every zone is kept and
+/// nothing is detached. The asked tab is `--attach`'s, else the request.
+/// It comes after a restore, and without one it is the window's first
+/// content, else a default-profile tab is.
+fn startup_launch(
+    listing: &Listing,
+    recorded: Option<WindowState>,
+    restoring: bool,
+    attach: Option<u32>,
+    asked: Option<LaunchRequest>,
+    profile: usize,
+) -> Startup {
+    let detached: Vec<SessionInfo> = match listing {
+        Listing::Listed(sessions) if restoring => {
+            sessions.iter().filter(|s| !s.attached && Some(s.session) != attach).cloned().collect()
+        }
+        Listing::Listed(_) | Listing::Failed(_) | Listing::Skipped => Vec::new(),
+    };
+    let restored = if restoring {
+        match listing {
+            Listing::Listed(_) => {
+                // A local copy: the global is the shell's to set.
+                let alive = reattach::Detached::new(detached.clone());
+                recorded.and_then(|window| session::drop_lost_zones(window, |recorded| alive.has(recorded)))
+            }
+            Listing::Failed(_) | Listing::Skipped => recorded,
+        }
+    } else {
+        None
+    };
+    let asked = match attach {
+        Some(session) => Some(Launch::Attach { session, target: listing.attach_target(session) }),
+        None => asked.map(Launch::Request),
+    };
+    match restored {
+        Some(window) => Startup { detached, first: Launch::Restore(window), then: asked },
+        None => Startup {
+            detached,
+            first: asked.unwrap_or_else(|| Launch::Request(LaunchRequest::profile(profile))),
+            then: None,
+        },
+    }
+}
+
+/// `BRINDLE_TEST_LAUNCH_LISTING` (debug builds only, `process R20`): what
+/// the e2e cases make the launch's listing do.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestListing {
+    /// Wait this long, then list.
+    Delay(Duration),
+    /// Fail without listing.
+    Fail,
+}
+
+/// The test switch's value: `fail`, or a whole number of milliseconds to
+/// wait; anything else, or nothing, leaves the listing alone.
+#[cfg(debug_assertions)]
+fn test_listing(value: Option<&str>) -> Option<TestListing> {
+    match value? {
+        "fail" => Some(TestListing::Fail),
+        millis if !millis.is_empty() && millis.bytes().all(|b| b.is_ascii_digit()) => {
+            millis.parse().ok().map(|millis| TestListing::Delay(Duration::from_millis(millis)))
+        }
+        _ => None,
+    }
+}
+
+/// The rename lists of the config reloads taken in one turn, as one list
+/// in request order: a profile renamed `a`→`b`, then `b`→`c`, stays two
+/// steps, applied in turn.
+fn merge_renames(batch: Vec<Vec<(String, String)>>) -> Vec<(String, String)> {
+    batch.into_iter().flatten().collect()
+}
+
 /// The running terminal server's sessions, attached or not: none when no
-/// server runs (none is started), `None` when listing fails (logged).
-fn running_sessions() -> Option<Vec<remote::protocol::client::SessionInfo>> {
+/// server runs (none is started), [`Listing::Failed`] when listing fails
+/// (logged). It blocks (see `remote::local::running_sessions`), so it runs
+/// on the `launch-list` thread and the instance listener's, never the UI
+/// thread.
+fn running_sessions() -> Listing {
     #[cfg(any(target_os = "linux", windows))]
     match remote::local::running_sessions(Duration::from_secs(2)) {
-        Ok(sessions) => Some(sessions),
+        Ok(sessions) => Listing::Listed(sessions),
         Err(why) => {
             log::warn!("not attaching detached sessions: {why:#}");
-            None
+            Listing::Failed(format!("{why:#}"))
         }
     }
     #[cfg(not(any(target_os = "linux", windows)))]
-    Some(Vec::new())
+    Listing::Listed(Vec::new())
+}
+
+/// What a launch reads before its window opens ([`read_launch`]).
+struct LaunchReads {
+    listing: Listing,
+    /// The state file's windows merged into one, when restoring; `None`
+    /// when it is missing, unusable (logged) or has no tabs.
+    recorded: Option<WindowState>,
+}
+
+/// The launch's blocking reads, on the `launch-list` thread: this machine's
+/// sessions when the launch restores or attaches, and the recorded window
+/// when it restores.
+fn read_launch(restoring: bool, attach: bool, state_dir: &Path) -> LaunchReads {
+    let listing = if restoring || attach { launch_listing() } else { Listing::Skipped };
+    let recorded = if restoring { recorded_window(state_dir) } else { None };
+    LaunchReads { listing, recorded }
+}
+
+/// [`running_sessions`], slowed or failed by `BRINDLE_TEST_LAUNCH_LISTING`
+/// in debug builds.
+fn launch_listing() -> Listing {
+    #[cfg(debug_assertions)]
+    match test_listing(std::env::var("BRINDLE_TEST_LAUNCH_LISTING").ok().as_deref()) {
+        Some(TestListing::Fail) => {
+            let why = "BRINDLE_TEST_LAUNCH_LISTING=fail";
+            log::warn!("not attaching detached sessions: {why}");
+            return Listing::Failed(why.into());
+        }
+        // The fault injector's delay, not a wait for a condition.
+        Some(TestListing::Delay(delay)) => std::thread::sleep(delay),
+        None => {}
+    }
+    running_sessions()
+}
+
+/// The windows recorded in `state_dir`, merged into the one window Brindle
+/// has; `None` when the state file is missing, unusable (logged) or has no
+/// tabs.
+fn recorded_window(state_dir: &Path) -> Option<WindowState> {
+    match session::load(state_dir) {
+        Ok(state) => session::merge_windows(state?.windows),
+        Err(why) => {
+            log::warn!("{why}");
+            None
+        }
+    }
+}
+
+/// Runs [`read_launch`] on a thread named `launch-list` and answers on the
+/// returned channel. When no thread can be started, the reads run here, on
+/// the main thread before GPUI starts, where nothing waits on them yet
+/// (design.md decision 1).
+fn start_launch_reads(
+    restoring: bool,
+    attach: bool,
+    state_dir: &Path,
+) -> futures::channel::oneshot::Receiver<LaunchReads> {
+    let (answer, answered) = futures::channel::oneshot::channel();
+    let dir = state_dir.to_path_buf();
+    let spawned = std::thread::Builder::new().name("launch-list".into()).spawn(move || {
+        answer.send(read_launch(restoring, attach, &dir)).ok();
+    });
+    match spawned {
+        Ok(_) => answered,
+        Err(error) => {
+            log::warn!("no launch-list thread ({error}): listing sessions before the window can start");
+            let (answer, answered) = futures::channel::oneshot::channel();
+            answer.send(read_launch(restoring, attach, state_dir)).ok();
+            answered
+        }
+    }
 }
 
 /// For a restoring launch: connects, on background threads, to the remote
@@ -634,26 +839,6 @@ fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     let _ = (window, cx);
-}
-
-/// The recorded windows, merged into the one window Brindle has, without
-/// the zones whose sessions are gone (when `listed`: the `Detached` global
-/// holds the launch's listing); `None` when the state file is missing,
-/// unusable (logged) or leaves nothing to restore.
-fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
-    let state = match session::load(&session::state_dir()) {
-        Ok(state) => state?,
-        Err(why) => {
-            log::warn!("{why}");
-            return None;
-        }
-    };
-    let window = session::merge_windows(state.windows)?;
-    if !listed {
-        return Some(window);
-    }
-    let detached = cx.global::<reattach::Detached>();
-    session::drop_lost_zones(window, |recorded| detached.has(recorded))
 }
 
 /// Writes the session state when it changes (off the UI thread), and sends
@@ -729,6 +914,7 @@ fn record_session(cx: &mut App) {
 }
 
 fn main() {
+    let started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
         .init();
     let args = parse_args();
@@ -778,7 +964,7 @@ fn main() {
     if lock.is_some() {
         let handler = move |request: instance::Request| {
             // Listed here, off the UI thread.
-            let listing = request.attach.map(|_| running_sessions());
+            let listing = request.attach.map_or(Listing::Skipped, |_| running_sessions());
             let (reply, answer) = std::sync::mpsc::channel();
             forwarded
                 .unbounded_send(Forwarded { request, listing, reply })
@@ -795,13 +981,21 @@ fn main() {
             Err(err) => log::warn!("later launches can't reach this Brindle: {err}"),
         }
     }
+    // The Brindle that owns the session state restores it and attaches the
+    // server's detached sessions (restored zones take theirs, the rest
+    // become tabs), unless `--no-restore`. What that needs is read on a
+    // thread of its own while GPUI starts, so the UI thread never waits on
+    // the terminal server or the state file (`process R13`).
+    let restoring = !args.no_restore && lock.is_some();
+    let reads = start_launch_reads(restoring, args.attach.is_some(), &state_dir);
+    // A plain value, read before any event loop exists.
+    let (config, error) = Config::load_or_default();
 
     // Before any window: windows, shortcuts and toasts share one identity.
     #[cfg(windows)]
     win::set_app_id();
 
     Application::new().run(move |cx: &mut App| {
-        let (config, error) = Config::load_or_default();
         let settings = Settings::new(config, error, cx);
         let profile = match &args.profile {
             Some(name) => settings.config.profile_index(name).unwrap_or_else(|| {
@@ -839,11 +1033,11 @@ fn main() {
             .detach();
         }
 
-        // Deferred, like ReloadConfig: the prompt opens in a window.
         cx.on_action(|_: &Quit, cx| cx.quit());
-        // Global listeners run inside the dispatching window's update, where
-        // `reload_config` couldn't update that window; defer until it's back.
-        cx.on_action(|_: &ReloadConfig, cx| cx.defer(reload_config));
+        // Global listeners run inside the dispatching window's update, which
+        // a reload couldn't update; the worker applies it after that.
+        start_config_reloads(cx);
+        cx.on_action(|_: &ReloadConfig, cx| request_config_reload(Vec::new(), cx));
         cx.on_window_closed(|cx| {
             let live: Vec<u64> = cx.windows().iter().map(|w| w.window_id().as_u64()).collect();
             cx.update_global(|store: &mut SessionStore, _| store.prune(&live));
@@ -869,124 +1063,69 @@ fn main() {
         }
         #[cfg(not(unix))]
         let _ = socket;
-        // The Brindle that owns the session state restores it and attaches
-        // the server's detached sessions (restored zones take theirs, the
-        // rest become tabs), unless `--no-restore`. Then it opens what the
-        // launch asked for as the active tab.
-        let restoring = !args.no_restore && cx.update_global(|store: &mut SessionStore, _| store.is_owner());
-        let listed = if restoring || args.attach.is_some() { running_sessions() } else { Some(Vec::new()) };
-        let detached = listed
-            .iter()
-            .flatten()
-            .filter(|s| restoring && !s.attached && Some(s.session) != args.attach)
-            .cloned()
-            .collect();
-        cx.set_global(reattach::Detached::new(detached));
-        // Without a listing, nothing tells a lost zone from a live one, so
-        // none is dropped.
-        let restored = if restoring { restorable_window(listed.is_some(), cx) } else { None };
-        let request = match args.attach {
-            Some(session) => Some(Launch::Attach { session, target: reattach::attach_target(session, listed.as_deref().unwrap_or_default()) }),
-            None if args.asks_for_a_tab() => {
-                Some(Launch::Request(LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() }))
-            }
-            None => None,
-        };
-        let (first, request) = match restored {
-            Some(state) => {
-                log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(&session::state_dir()).display());
-                (Launch::Restore(state), request)
-            }
-            None => (request.unwrap_or_else(|| Launch::Request(LaunchRequest::profile(profile))), None),
-        };
+        // What the launch asked for opens as the active tab.
+        let asked = args
+            .asks_for_a_tab()
+            .then(|| LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() });
+        // Before the wait: the endpoints of profiles that connect at launch
+        // start connecting while this machine's listing runs.
         watch_hosts(cx);
-        let Some(window) = open_window(first, cx) else {
-            cx.quit();
-            return;
-        };
-        let rest = cx.update_global(|detached: &mut reattach::Detached, _| detached.take_rest());
-        if !rest.is_empty() {
-            log::info!("attaching {} detached session(s)", rest.len());
-            window.update(cx, |ws, window, cx| ws.attach_detached(rest, window, cx)).ok();
-        }
-        if let Some(request) = request {
-            window.update(cx, |ws, window, cx| ws.open(request, window, cx)).ok();
-        }
-        if restoring {
-            sweep_launch_hosts(window, cx);
-        }
-        watch_config(cx);
-        record_session(cx);
-        take_launches(window, requests, cx);
-
-        let steps = args.steps.clone();
-        let latency_bench = args.latency_bench;
-        let interval = Duration::from_secs_f64(args.step_interval.unwrap_or(1.0));
-        let waits = WaitLog::default();
-        let step_waits = waits.clone();
+        // The window opens once the launch's reads have answered or failed,
+        // with what the launch opens for that answer (design.md decision 2).
         cx.spawn(async move |cx| {
-            cx.background_executor().timer(interval / 2).await;
-            for step in steps {
-                cx.background_executor().timer(interval).await;
-                if let Step::WaitFor(text) = &step {
-                    wait_for_text(window, text, wait_for_limit(interval), &step_waits, cx).await;
-                    continue;
+            let reads = match reads.await {
+                Ok(reads) => reads,
+                Err(futures::channel::oneshot::Canceled) => {
+                    let why = "the launch's listing thread ended without an answer";
+                    log::error!("{why}; not attaching detached sessions");
+                    // Read again, so a bug in the listing can't cost the
+                    // saved tabs, which the next record would overwrite.
+                    let recorded = if restoring {
+                        let dir = state_dir.clone();
+                        cx.background_executor().spawn(async move { recorded_window(&dir) }).await
+                    } else {
+                        None
+                    };
+                    LaunchReads { listing: Listing::Failed(why.into()), recorded }
                 }
-                if let Step::Key(key) = &step {
-                    // Not inside the workspace's update: the key's actions
-                    // update it themselves.
-                    let key = key.clone();
-                    cx.update_window(window.into(), move |_, window, cx| match Keystroke::parse(&key) {
-                        Ok(keystroke) => {
-                            window.dispatch_keystroke(keystroke, cx);
-                        }
-                        Err(err) => log::error!("--key: bad keystroke {key:?}: {err:?}"),
-                    })
-                    .ok();
-                    continue;
+            };
+            let answered = started.elapsed();
+            cx.update(|cx| {
+                let startup = startup_launch(&reads.listing, reads.recorded, restoring, args.attach, asked, profile);
+                cx.set_global(reattach::Detached::new(startup.detached));
+                if let Launch::Restore(state) = &startup.first {
+                    log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(&state_dir).display());
                 }
-                window
-                    .update(cx, |ws, window, cx| match &step {
-                        Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
-                        Step::Find(text) => ws.find_in_active(text, window, cx),
-                        Step::Action(name) => match actions::action_by_name(name) {
-                            Some(action) => window.dispatch_action(action, cx),
-                            None => log::error!("--action: unknown action {name:?}"),
-                        },
-                        Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
-                        Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
-                        Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
-                        Step::WaitFor(_) | Step::Key(_) => {}
-                    })
-                    .ok();
-            }
-            if let Some(samples) = latency_bench {
-                latency_bench_run(window, samples, cx).await;
-                cx.update(|cx| {
-                    console_output();
-                    print!("{}", Latency::summary(cx));
+                let Some(window) = open_window(startup.first, cx) else {
                     cx.quit();
-                })
-                .ok();
-            }
+                    return;
+                };
+                // Raises with an activation token need an attachment to the
+                // display, made off the UI thread from now on.
+                window.update(cx, |_, window, cx| notify::activation::prepare(window, cx)).ok();
+                log::debug!(
+                    "launch: the listing answered {answered:?} and the window opened {:?} after the start",
+                    started.elapsed()
+                );
+                let rest = cx.update_global(|detached: &mut reattach::Detached, _| detached.take_rest());
+                if !rest.is_empty() {
+                    log::info!("attaching {} detached session(s)", rest.len());
+                    window.update(cx, |ws, window, cx| ws.attach_detached(rest, window, cx)).ok();
+                }
+                if let Some(request) = startup.then {
+                    window.update(cx, |ws, window, cx| ws.open(request, window, cx)).ok();
+                }
+                if restoring {
+                    sweep_launch_hosts(window, cx);
+                }
+                watch_config(cx);
+                record_session(cx);
+                take_launches(window, requests, cx);
+                run_debug_steps(window, &args, cx);
+            })
+            .ok();
         })
         .detach();
-        if let Some(secs) = args.dump_after {
-            cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
-                console_output();
-                window
-                    .update(cx, |ws, window, cx| {
-                        // The wait lines come last, after the focus line, so
-                        // a dump that shows an unexpected screen says which
-                        // wait failed.
-                        print!("{}{}", ws.dump_active_screen(window, cx), waits.describe());
-                    })
-                    .ok();
-                cx.update(|cx| cx.quit()).ok();
-            })
-            .detach();
-        }
     });
     // Every way out of `run` has detached (or closed) the tabs' sessions:
     // the quit (`record_session`'s quit handler) or the window's close
@@ -997,6 +1136,79 @@ fn main() {
     #[cfg(any(target_os = "linux", windows))]
     if !remote::local::flush(remote::local::QUIT_FLUSH) {
         log::info!("quitting before every terminal server connection had written what its tabs sent");
+    }
+}
+
+/// The debug steps (`--send`, `--action`, `--key`, …, `--latency-bench`)
+/// and the `--dump-screen-after` timer, counted from the window's opening.
+fn run_debug_steps(window: gpui::WindowHandle<Workspace>, args: &Args, cx: &mut App) {
+    let steps = args.steps.clone();
+    let latency_bench = args.latency_bench;
+    let interval = Duration::from_secs_f64(args.step_interval.unwrap_or(1.0));
+    let waits = WaitLog::default();
+    let step_waits = waits.clone();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(interval / 2).await;
+        for step in steps {
+            cx.background_executor().timer(interval).await;
+            if let Step::WaitFor(text) = &step {
+                wait_for_text(window, text, wait_for_limit(interval), &step_waits, cx).await;
+                continue;
+            }
+            if let Step::Key(key) = &step {
+                // Not inside the workspace's update: the key's actions
+                // update it themselves.
+                let key = key.clone();
+                cx.update_window(window.into(), move |_, window, cx| match Keystroke::parse(&key) {
+                    Ok(keystroke) => {
+                        window.dispatch_keystroke(keystroke, cx);
+                    }
+                    Err(err) => log::error!("--key: bad keystroke {key:?}: {err:?}"),
+                })
+                .ok();
+                continue;
+            }
+            window
+                .update(cx, |ws, window, cx| match &step {
+                    Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
+                    Step::Find(text) => ws.find_in_active(text, window, cx),
+                    Step::Action(name) => match actions::action_by_name(name) {
+                        Some(action) => window.dispatch_action(action, cx),
+                        None => log::error!("--action: unknown action {name:?}"),
+                    },
+                    Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
+                    Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
+                    Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
+                    Step::WaitFor(_) | Step::Key(_) => {}
+                })
+                .ok();
+        }
+        if let Some(samples) = latency_bench {
+            latency_bench_run(window, samples, cx).await;
+            cx.update(|cx| {
+                console_output();
+                print!("{}", Latency::summary(cx));
+                cx.quit();
+            })
+            .ok();
+        }
+    })
+    .detach();
+    if let Some(secs) = args.dump_after {
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_secs_f64(secs)).await;
+            console_output();
+            window
+                .update(cx, |ws, window, cx| {
+                    // The wait lines come last, after the focus line, so
+                    // a dump that shows an unexpected screen says which
+                    // wait failed.
+                    print!("{}{}", ws.dump_active_screen(window, cx), waits.describe());
+                })
+                .ok();
+            cx.update(|cx| cx.quit()).ok();
+        })
+        .detach();
     }
 }
 
@@ -1161,7 +1373,7 @@ mod tests {
     #[test]
     fn forwarded_requests_open_tabs() {
         let config = Config::parse("default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap();
-        let request = |r: instance::Request| forwarded_launch(&r, None, &config);
+        let request = |r: instance::Request| forwarded_launch(&r, &Listing::Skipped, &config);
         assert!(request(instance::Request { launch_dir: Some("/x".into()), ..Default::default() }).is_none(), "a plain launch only raises");
         let Some(Launch::Request(tab)) = request(instance::Request {
             command: Some(vec!["htop".into()]),
@@ -1182,6 +1394,169 @@ mod tests {
         else {
             panic!("--attach without a listing says why")
         };
+    }
+
+    #[test]
+    fn forwarded_attach_says_why_listing_failed() {
+        let config = Config::parse("[[profiles]]\nname = \"a\"\n").unwrap();
+        let attach = instance::Request { attach: Some(7), ..Default::default() };
+        let opened = |listing: &Listing| forwarded_launch(&attach, listing, &config).map(opens);
+        assert_eq!(
+            opened(&Listing::Failed("timed out".into())),
+            Some(Opens::Attach(7, Err("Brindle could not list the terminal server's sessions: timed out".into())))
+        );
+        assert_eq!(
+            opened(&Listing::Listed(vec![listed(7, "g", false)])),
+            Some(Opens::Attach(7, Ok(listed(7, "g", false))))
+        );
+        assert_eq!(
+            opened(&Listing::Listed(Vec::new())),
+            Some(Opens::Attach(7, Err("the terminal server has no session 7".into()))),
+            "only a listing that answered says the session doesn't exist"
+        );
+    }
+
+    /// A [`Launch`] as a value to compare.
+    #[derive(Debug, PartialEq)]
+    enum Opens {
+        Tab(usize, Option<(String, Vec<String>)>, Option<PathBuf>),
+        Restore(WindowState),
+        Attach(u32, Result<SessionInfo, String>),
+    }
+
+    fn opens(launch: Launch) -> Opens {
+        match launch {
+            Launch::Request(LaunchRequest { profile, command, cwd }) => Opens::Tab(profile, command, cwd),
+            Launch::Restore(window) => Opens::Restore(window),
+            Launch::Attach { session, target } => Opens::Attach(session, target),
+        }
+    }
+
+    /// What [`startup_launch`] gives, as values to compare.
+    fn startup(
+        listing: &Listing,
+        recorded: Option<WindowState>,
+        restoring: bool,
+        attach: Option<u32>,
+        asked: Option<LaunchRequest>,
+    ) -> (Vec<u32>, Opens, Option<Opens>) {
+        let startup = startup_launch(listing, recorded, restoring, attach, asked, 2);
+        (startup.detached.iter().map(|s| s.session).collect(), opens(startup.first), startup.then.map(opens))
+    }
+
+    fn listed(session: u32, key: &str, attached: bool) -> SessionInfo {
+        SessionInfo { session, key: key.into(), attached, ..Default::default() }
+    }
+
+    /// A local tab that recorded session `id` with `key`.
+    fn tab(id: u32, key: &str) -> session::TabState {
+        session::TabState::Local {
+            profile: "Shell".into(),
+            remote: None,
+            cwd: Some(PathBuf::from(format!("/t{id}"))),
+            title: None,
+            zones: None,
+            session: Some(session::ServerSession { id, key: key.into() }),
+        }
+    }
+
+    fn window(tabs: Vec<session::TabState>) -> WindowState {
+        WindowState { width: Some(800.0), height: Some(600.0), maximized: false, active: 0, tabs }
+    }
+
+    fn htop() -> LaunchRequest {
+        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None }
+    }
+
+    #[test]
+    fn a_listing_restores_live_zones_and_sweeps_the_rest() {
+        let listing = Listing::Listed(vec![
+            listed(1, "a", false),
+            listed(2, "new", false),
+            listed(3, "c", true),
+            listed(4, "d", false),
+        ]);
+        // Zone 1's session is detached; zone 2's id was reused by another
+        // session; zone 3's is shown by another Brindle.
+        let recorded = window(vec![tab(1, "a"), tab(2, "old"), tab(3, "c")]);
+        let (detached, first, then) = startup(&listing, Some(recorded), true, None, None);
+        assert_eq!(first, Opens::Restore(window(vec![tab(1, "a")])), "only the live zone is restored");
+        assert_eq!(detached, [1, 2, 4], "every detached session, the restored zone's included, and no attached one");
+        assert_eq!(then, None);
+    }
+
+    #[test]
+    fn a_failed_listing_keeps_every_zone_and_sweeps_nothing() {
+        let recorded = window(vec![tab(1, "a"), tab(2, "b")]);
+        for listing in [Listing::Failed("refused".into()), Listing::Skipped] {
+            let (detached, first, then) = startup(&listing, Some(recorded.clone()), true, None, Some(htop()));
+            assert_eq!(first, Opens::Restore(recorded.clone()), "{listing:?}: nothing tells a lost zone from a live one");
+            assert!(detached.is_empty(), "{listing:?}");
+            assert_eq!(then, Some(Opens::Tab(1, Some(("htop".into(), vec![])), None)), "{listing:?}");
+        }
+    }
+
+    #[test]
+    fn a_launch_that_restores_nothing_opens_the_asked_tab_or_a_default_one() {
+        // `--no-restore`, or a Brindle that doesn't own the state.
+        let (detached, first, then) = startup(&Listing::Skipped, None, false, None, Some(htop()));
+        assert_eq!((detached.is_empty(), first, then), (true, Opens::Tab(1, Some(("htop".into(), vec![])), None), None));
+        let (_, first, then) = startup(&Listing::Skipped, None, false, None, None);
+        assert_eq!((first, then), (Opens::Tab(2, None, None), None), "the default profile's tab");
+        // Not restoring: a recorded window is never opened.
+        let (_, first, _) = startup(&Listing::Skipped, Some(window(vec![tab(1, "a")])), false, None, None);
+        assert_eq!(first, Opens::Tab(2, None, None));
+        // No state file: the asked tab, and the detached sessions still
+        // open after it.
+        let listing = Listing::Listed(vec![listed(5, "e", false)]);
+        let (detached, first, then) = startup(&listing, None, true, None, Some(htop()));
+        assert_eq!((detached, first, then), (vec![5], Opens::Tab(1, Some(("htop".into(), vec![])), None), None));
+        // Every recorded zone lost.
+        let (_, first, then) = startup(&Listing::Listed(Vec::new()), Some(window(vec![tab(1, "a")])), true, None, None);
+        assert_eq!((first, then), (Opens::Tab(2, None, None), None));
+    }
+
+    #[test]
+    fn attach_opens_after_the_restored_tabs_and_is_not_swept() {
+        let listing = Listing::Listed(vec![listed(1, "a", false), listed(7, "g", false), listed(8, "h", false)]);
+        let (detached, first, then) = startup(&listing, Some(window(vec![tab(1, "a")])), true, Some(7), Some(htop()));
+        assert_eq!(first, Opens::Restore(window(vec![tab(1, "a")])));
+        assert_eq!(then, Some(Opens::Attach(7, Ok(listed(7, "g", false)))), "--attach wins over -p/-d/-e");
+        assert_eq!(detached, [1, 8], "--attach's session isn't swept into a tab of its own");
+        // `--no-restore --attach 7`: the attached session is the window's.
+        let (detached, first, then) = startup(&listing, None, false, Some(7), None);
+        assert_eq!((detached.is_empty(), first, then), (true, Opens::Attach(7, Ok(listed(7, "g", false))), None));
+    }
+
+    #[test]
+    fn attach_without_a_listing_says_why() {
+        let failed = Listing::Failed("timed out".into());
+        let why = "Brindle could not list the terminal server's sessions: timed out";
+        let (_, first, then) = startup(&failed, None, false, Some(7), None);
+        assert_eq!((first, then), (Opens::Attach(7, Err(why.into())), None));
+        let recorded = window(vec![tab(1, "a")]);
+        let (detached, first, then) = startup(&failed, Some(recorded.clone()), true, Some(7), None);
+        assert_eq!((detached.is_empty(), first, then), (true, Opens::Restore(recorded), Some(Opens::Attach(7, Err(why.into())))));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_launch_listing_switch_reads_fail_and_a_delay() {
+        assert_eq!(test_listing(Some("fail")), Some(TestListing::Fail));
+        assert_eq!(test_listing(Some("3000")), Some(TestListing::Delay(Duration::from_secs(3))));
+        assert_eq!(test_listing(Some("0")), Some(TestListing::Delay(Duration::ZERO)));
+        for other in ["", "FAIL", "1.5", "-1", "+5", " 300", "3s", "99999999999999999999999"] {
+            assert_eq!(test_listing(Some(other)), None, "{other:?}");
+        }
+        assert_eq!(test_listing(None), None, "unset");
+    }
+
+    #[test]
+    fn reload_renames_keep_their_order() {
+        let pair = |from: &str, to: &str| (from.to_string(), to.to_string());
+        let merged = merge_renames(vec![vec![pair("a", "b")], Vec::new(), vec![pair("b", "c"), pair("x", "y")]]);
+        assert_eq!(merged, [pair("a", "b"), pair("b", "c"), pair("x", "y")], "two steps, in request order");
+        assert!(merge_renames(Vec::new()).is_empty());
     }
 
     #[cfg(any(target_os = "linux", windows))]

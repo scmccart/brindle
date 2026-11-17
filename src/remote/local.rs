@@ -384,22 +384,34 @@ fn forget(map: &Mutex<HashMap<Host, Slot>>, host: &Host, ended: usize) {
     }
 }
 
+/// The client token of this process's `n`th listing connection
+/// ([`running_sessions_at`]): never the process's own token, and never
+/// another listing's, since the core closes a connection whose token a newer
+/// one says (`take_over`). A launch's listing and a forwarded `--attach`'s
+/// can run at once.
+fn list_token(client: &str, n: u64) -> String {
+    format!("{client}-list-{n}")
+}
+
 /// The sessions of this process's environment's core, if it is already
 /// running ([`running_sessions_at`]): none when no core is listening (it
-/// never starts one). It runs once, before any window opens.
+/// never starts one). It blocks, so its callers run it off the UI thread: the
+/// launch's `launch-list` thread and the instance listener's (`process R13`).
 pub fn running_sessions(limit: Duration) -> Result<Vec<client::SessionInfo>> {
     running_sessions_at(&Endpoint::from_env()?, limit)
 }
 
 /// The sessions of `endpoint`'s core that is already running, attached or
 /// not, for a launch to attach: none when no core is listening (it never
-/// starts one). It blocks, for about `limit` at most past the `HELLO`.
+/// starts one). It blocks: on Windows up to `limit` for a busy pipe, then up
+/// to `HELLO_LIMIT` for the `HELLO`, then about `limit` per read.
 pub fn running_sessions_at(endpoint: &Endpoint, limit: Duration) -> Result<Vec<client::SessionInfo>> {
+    static LISTINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(stream) = try_connect_within(endpoint, limit)? else {
         return Ok(Vec::new());
     };
     // A token of its own: this connection owns nothing and gets no replays.
-    let token = format!("{}-list", client_token());
+    let token = list_token(client_token(), LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let Connected { mut stream, .. } = hello(stream, &token)?;
     stream.set_read_timeout(Some(limit))?;
     stream.set_write_timeout(Some(limit))?;
@@ -700,6 +712,19 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    /// Two listings at once (the launch's and a forwarded `--attach`'s)
+    /// never say one token, which would make the core close the first, and
+    /// neither says the process's own, which owns its tabs' sessions.
+    #[test]
+    fn each_listing_has_a_token_of_its_own() {
+        let client = "brindle-42-00ff";
+        let (first, second) = (list_token(client, 0), list_token(client, 1));
+        assert_ne!(first, second);
+        assert_ne!(first, client);
+        assert_ne!(second, client);
+        assert_eq!(first, "brindle-42-00ff-list-0");
     }
 
     /// A connected pair: the client's end, and the stand-in core's.

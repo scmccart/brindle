@@ -114,9 +114,78 @@ impl RateLimiter {
     }
 }
 
+/// How far the attachment to GPUI's Wayland display, which raises a window
+/// with an activation token, has got (`activation.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, target_os = "linux")),
+    expect(dead_code, reason = "only Wayland activation (`activation.rs`, Linux) waits for an attachment")
+)]
+pub enum AttachState {
+    /// Not Wayland, or not prepared yet.
+    Unused,
+    /// Being made on the background executor.
+    Pending,
+    /// Made: a raise can carry a token.
+    Ready,
+    /// Making it failed (logged once).
+    Failed,
+}
+
+/// How a window is raised ([`raise_plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, target_os = "linux")),
+    expect(dead_code, reason = "only Wayland activation (`activation.rs`, Linux) waits for an attachment")
+)]
+pub enum RaisePlan {
+    /// Activate the window's surface with the token at once.
+    WithToken,
+    /// Keep the window and its token until the attachment is made or has
+    /// failed, then raise it.
+    AfterAttach,
+    /// GPUI's own `activate_window`.
+    Plain,
+}
+
+/// How to raise a window, given the attachment's `state` and whether the
+/// raise `has_token`: with the token once attached, after the attachment
+/// while it is being made, else plainly.
+#[cfg_attr(
+    not(any(test, target_os = "linux")),
+    expect(dead_code, reason = "only Wayland activation (`activation.rs`, Linux) waits for an attachment")
+)]
+pub fn raise_plan(state: AttachState, has_token: bool) -> RaisePlan {
+    match (state, has_token) {
+        (AttachState::Ready, true) => RaisePlan::WithToken,
+        (AttachState::Pending, true) => RaisePlan::AfterAttach,
+        (AttachState::Unused | AttachState::Failed, _) | (AttachState::Ready | AttachState::Pending, false) => {
+            RaisePlan::Plain
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_raise_waits_for_a_pending_attachment_only_with_a_token() {
+        use AttachState::{Failed, Pending, Ready, Unused};
+        let table = [
+            (Unused, false, RaisePlan::Plain),
+            (Unused, true, RaisePlan::Plain),
+            (Pending, false, RaisePlan::Plain),
+            (Pending, true, RaisePlan::AfterAttach),
+            (Ready, false, RaisePlan::Plain),
+            (Ready, true, RaisePlan::WithToken),
+            (Failed, false, RaisePlan::Plain),
+            (Failed, true, RaisePlan::Plain),
+        ];
+        for (state, has_token, plan) in table {
+            assert_eq!(raise_plan(state, has_token), plan, "{state:?}, token: {has_token}");
+        }
+    }
 
     fn config(when: NotifyWhen) -> NotificationConfig {
         NotificationConfig { when, ..Default::default() }

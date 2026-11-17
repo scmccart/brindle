@@ -1,7 +1,8 @@
 //! The detached terminal server sessions a launch attaches (Linux and
-//! Windows): this machine's, listed once before any window opens, then
-//! taken by the restored zones whose recorded session they are, and the rest
-//! opened as tabs of the first window, oldest first. Each remote endpoint
+//! Windows): this machine's, listed once before any window opens, off the
+//! UI thread ([`Listing`]), then taken by the restored zones whose recorded
+//! session they are, and the rest opened as tabs of the first window,
+//! oldest first. Each remote endpoint
 //! the launch connects to does the same once it first answers, with the
 //! tabs at the end ([`sweep`], design.md decision 10). Either way a session
 //! whose owner may still come back is left alone ([`sweepable`], decision
@@ -180,6 +181,34 @@ impl Detached {
         let mut rest: Vec<SessionInfo> = std::mem::take(&mut self.sessions).into_iter().filter(sweepable).collect();
         rest.sort_by_key(|s| (s.started, s.session));
         rest
+    }
+}
+
+/// What listing this machine's terminal server gave a launch, or a later
+/// launch's `--attach` (design.md decision 3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Listing {
+    /// Not asked: the launch neither restores nor attaches.
+    Skipped,
+    /// Every session, attached or not; empty when no server runs (none is
+    /// started).
+    Listed(Vec<SessionInfo>),
+    /// The listing failed, for this cause (as `running_sessions` reports
+    /// it): nothing tells a lost session from a live one.
+    Failed(String),
+}
+
+impl Listing {
+    /// The session `brindle --attach ID` opens, or the message its tab
+    /// shows instead: [`attach_target`] over the listed sessions, else why
+    /// there is no listing to look in.
+    pub fn attach_target(&self, id: u32) -> Result<SessionInfo, String> {
+        const UNLISTED: &str = "Brindle could not list the terminal server's sessions";
+        match self {
+            Listing::Listed(sessions) => attach_target(id, sessions),
+            Listing::Failed(why) => Err(format!("{UNLISTED}: {why}")),
+            Listing::Skipped => Err(UNLISTED.into()),
+        }
     }
 }
 
@@ -519,6 +548,34 @@ mod tests {
         assert_eq!(attach_target(2, &sessions), Err("session 2 is shown by another Brindle".into()));
         assert_eq!(attach_target(99, &sessions), Err("the terminal server has no session 99".into()));
         assert_eq!(attach_target(1, &[]), Err("the terminal server has no session 1".into()));
+    }
+
+    #[test]
+    fn listed_sessions_give_the_attach_target() {
+        let mut shown = info(2, "b", 0);
+        shown.attached = true;
+        let listing = Listing::Listed(vec![info(1, "a", 0), shown]);
+        assert_eq!(listing.attach_target(1).map(|s| s.key), Ok("a".into()), "a detached id");
+        assert_eq!(listing.attach_target(2), Err("session 2 is shown by another Brindle".into()), "an attached id");
+        assert_eq!(listing.attach_target(99), Err("the terminal server has no session 99".into()), "a missing id");
+        assert_eq!(Listing::Listed(Vec::new()).attach_target(1), Err("the terminal server has no session 1".into()));
+    }
+
+    #[test]
+    fn a_failed_listing_names_its_cause_for_attach() {
+        assert_eq!(
+            Listing::Failed("timed out".into()).attach_target(7),
+            Err("Brindle could not list the terminal server's sessions: timed out".into())
+        );
+        assert_eq!(
+            Listing::Skipped.attach_target(7),
+            Err("Brindle could not list the terminal server's sessions".into()),
+            "no listing, no cause"
+        );
+        for listing in [Listing::Failed("x".into()), Listing::Skipped] {
+            let why = listing.attach_target(7).unwrap_err();
+            assert!(!why.contains("has no session"), "never says the session doesn't exist: {why}");
+        }
     }
 
     #[test]

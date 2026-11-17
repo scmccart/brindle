@@ -27,6 +27,31 @@ pub fn osc_local(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// Notifications sent right before Brindle quits are in the log once it has
+/// exited: the only tab's `-e` program sends two and exits, so its tab and
+/// the window close, and Brindle quits with no dump. The log's writer
+/// thread is flushed in the quit path, so this checks no timing.
+pub fn log_at_exit(ctx: &Ctx) -> Result<Outcome> {
+    let log = ctx.dir.join("notify.log");
+    Run::new(ctx, "run")
+        .config("\n[notifications]\nwhen = \"always\"\n")
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .expect_exit()
+        .dump_at(20.0)
+        .command(&["sh", "-c", r"printf '\033]9;one\a\033]777;notify;t;two\a'"])
+        .run()?;
+    let got = notifications(ctx);
+    ensure!(
+        got.len() == 2
+            && got[0].starts_with("osc9\t")
+            && got[0].ends_with("\tone")
+            && got[1].starts_with("osc777\tt")
+            && got[1].ends_with("\ttwo"),
+        "notifications {got:?}, expected the OSC 9 for `one`, then the OSC 777 for `two`"
+    );
+    Ok(Outcome::Pass)
+}
+
 /// A bell storm and an OSC 777 from a tab that isn't active (the default
 /// `when = "unfocused"`): one bell notification and one OSC 777, both
 /// naming the tab. The command waits until a second tab has opened in

@@ -714,6 +714,38 @@ pub fn reattach_closed_tab(ctx: &Ctx) -> Result<Outcome> {
 /// `--no-restore` leaves the detached sessions alone, and the next launch
 /// attaches them after the tabs it restores.
 pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
+    left_by_no_restore(ctx)?;
+    let third = Run::new(ctx, "third").keep_detached().restore().action("next_tab").dump_at(later(5.0)).run()?;
+    ensure!(third.dump.tabs.len() == 2 && third.dump.tabs[1].1, "tabs: {:?}", third.dump.tabs);
+    screen_has(&third, "left-2")?;
+    Ok(Outcome::Pass)
+}
+
+/// A launch whose listing of the server takes 3 s
+/// (`BRINDLE_TEST_LAUNCH_LISTING`) opens what one answered at once opens:
+/// the recorded tab, active, then the session a `--no-restore` launch left
+/// detached, as in `local-server-reattach-no-restore`. The switch works in
+/// debug builds only, so this needs one (`BRINDLE_E2E_BIN` unset): against
+/// a release build it can't tell whether the listing was slow.
+pub fn reattach_slow_listing(ctx: &Ctx) -> Result<Outcome> {
+    left_by_no_restore(ctx)?;
+    let delay = ((ctx.secs(3.0) * 1000.0).round() as u64).to_string();
+    let third = Run::new(ctx, "third")
+        .keep_detached()
+        .restore()
+        .env("BRINDLE_TEST_LAUNCH_LISTING", &delay)
+        .action("next_tab")
+        .dump_at(later(5.0))
+        .run()?;
+    ensure!(third.dump.tabs.len() == 2 && third.dump.tabs[1].1, "tabs: {:?}", third.dump.tabs);
+    screen_has(&third, "left-2")?;
+    Ok(Outcome::Pass)
+}
+
+/// A restoring launch leaves a tab showing `left-2` recorded and its
+/// session detached; then a `--no-restore` launch leaves its own tab's
+/// session detached, which no record names, and records only that tab.
+fn left_by_no_restore(ctx: &Ctx) -> Result {
     let srv = Server::of(ctx);
     Run::new(ctx, "first")
         .keep_detached()
@@ -738,9 +770,53 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(5.0))
         .run()?;
     ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    Ok(())
+}
+
+/// A launch whose listing of the server fails
+/// (`BRINDLE_TEST_LAUNCH_LISTING=fail`) restores the recorded tab with a
+/// new shell in its recorded directory and leaves the recorded session
+/// detached; the next launch that lists opens that session as a tab after
+/// the restored one; and `--attach` says the server couldn't be listed,
+/// not that the session doesn't exist. Needs a debug build, as
+/// `local-server-reattach-slow-listing` does.
+pub fn reattach_failed_listing(ctx: &Ctx) -> Result<Outcome> {
+    let srv = Server::of(ctx);
+    Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .prompt()
+        .send("cd /tmp; echo first=$$\r")
+        .dump_at(later(4.0))
+        .run()?;
+    let first = detached_pids(&srv, 10.0, 1)?[0];
+
+    let second = Run::new(ctx, "second")
+        .keep_detached()
+        .restore()
+        .env("BRINDLE_TEST_LAUNCH_LISTING", "fail")
+        .send("echo second=$$; pwd\r")
+        .dump_at(later(4.0))
+        .run()?;
+    let shell = shown_pid(&second, "second=")?;
+    ensure!(shell != first, "BRINDLE_TEST_LAUNCH_LISTING had no effect: is BRINDLE_E2E_BIN a release build?");
+    ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
+    ensure!(second.dump.screen.iter().any(|l| l == "/tmp"), "the new shell isn't in /tmp: {:?}", second.dump.screen);
+    // The recorded session, and now the second run's shell.
+    let detached = detached_pids(&srv, 10.0, 2)?;
+    ensure!(detached.contains(&first), "the recorded session {first} isn't detached: {detached:?}");
+
     let third = Run::new(ctx, "third").keep_detached().restore().action("next_tab").dump_at(later(5.0)).run()?;
     ensure!(third.dump.tabs.len() == 2 && third.dump.tabs[1].1, "tabs: {:?}", third.dump.tabs);
-    screen_has(&third, "left-2")?;
+    screen_has(&third, &format!("first={first}"))?;
+
+    let attach = Run::new(ctx, "attach")
+        .env("BRINDLE_TEST_LAUNCH_LISTING", "fail")
+        .arg("--attach")
+        .arg("1")
+        .dump_at(later(4.0))
+        .run()?;
+    screen_has(&attach, "could not list the terminal server's sessions")?;
     Ok(Outcome::Pass)
 }
 
