@@ -3,7 +3,7 @@
 //! `exec` process (design decision 2).
 //!
 //! - **[`Dial`]** starts a relay and reads up to its frame marker. The
-//!   production one ([`dial`]) runs the endpoint's launch command, which is
+//!   production one ([`dial_with`]) runs the endpoint's launch command, which is
 //!   the cached helper's `relay` or an exit with 97; on that [`Unstarted`]
 //!   the helper is deployed and the launch run again
 //!   ([`client::launch`](crate::remote::client::launch)).
@@ -34,7 +34,7 @@ use parking_lot::{Condvar, Mutex};
 use super::link::{Link, Wire};
 use super::{SpawnRequest, sys};
 use crate::config::{Profile, RemoteTarget};
-use crate::remote::client;
+use crate::remote::client::{self, HelperLookup};
 pub use crate::remote::client::Unstarted;
 use crate::remote::protocol::client::Policy;
 use crate::remote::protocol::{Frame, HEARTBEAT_INTERVAL, skip_preamble};
@@ -115,6 +115,8 @@ pub trait Dial: Send + Sync {
 struct Deployed {
     name: String,
     target: RemoteTarget,
+    /// The helper deployed, looked up at each launch.
+    helper: HelperLookup,
 }
 
 impl Dial for Deployed {
@@ -123,14 +125,16 @@ impl Dial for Deployed {
     }
 
     fn launch(&self) -> Result<Link> {
-        client::launch(&self.target, |command| start(command, MARKER_LIMIT))
+        client::launch(&self.target, &self.helper, |command| start(command, MARKER_LIMIT))
     }
 }
 
 /// The relay at `target`: this build's `brindle-remote relay` from the
-/// endpoint's cache, deployed there first when it is missing.
-pub fn dial(name: String, target: &RemoteTarget) -> Arc<dyn Dial> {
-    Arc::new(Deployed { name, target: target.clone() })
+/// endpoint's cache, deployed there first when it is missing. The helper
+/// deployed is the one `helper` finds: production's is
+/// [`client::default_helper`], and tests pass their own.
+pub fn dial_with(name: String, target: &RemoteTarget, helper: HelperLookup) -> Arc<dyn Dial> {
+    Arc::new(Deployed { name, target: target.clone(), helper })
 }
 
 /// Runs `command` as a relay's process and reads its stdout up to the frame

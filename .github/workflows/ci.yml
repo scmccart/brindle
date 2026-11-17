@@ -97,6 +97,10 @@ jobs:
             exit 1
           fi
       - run: cargo test --locked --workspace
+        env:
+          # The runner is disposable, so the scopes test may start scopes in
+          # its user's systemd manager (it skips where there is none).
+          BRINDLE_SCOPE_TEST: "1"
       - name: e2e harness self-test
         run: BRINDLE_E2E=1 cargo test --locked -p brindle --test e2e -- --self-test
       - name: perf harness self-test

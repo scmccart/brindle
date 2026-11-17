@@ -21,7 +21,9 @@
 //! - `BRINDLE_PERF_BASELINE=<run dir>` shows changes against an earlier run.
 //!
 //! Each run is kept in `target/tmp/perf/<UTC time>/` (`latest` links to the
-//! newest), with `summary.toml` and every case's logs and raw data.
+//! newest), with `summary.toml` and every case's logs and raw data. Each
+//! case runs in a terminal server of its own (`tests/common/server.rs`),
+//! which needs `brindle-remote` beside the release binary.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -34,6 +36,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+use common::server::{Suite, helper_name, private_dir};
 pub use common::Result;
 use report::{LatencyResult, Summary, ThroughputResult};
 
@@ -53,7 +56,13 @@ pub struct Ctx {
     /// Scratch and artifact directory for this case.
     pub dir: PathBuf,
     pub bin: PathBuf,
+    /// The terminal server helper Brindle runs (`BRINDLE_REMOTE_AGENT`,
+    /// else `brindle-remote` beside `bin`).
+    pub helper: PathBuf,
     pub display: String,
+    /// The case's own terminal server directory (`BRINDLE_SERVER_DIR`), so
+    /// its tab never runs in the user's server.
+    pub server_dir: PathBuf,
     pub samples: usize,
     target_dir: PathBuf,
     vtebench: std::rc::Rc<OnceCell<std::result::Result<vtebench::Vtebench, String>>>,
@@ -98,6 +107,8 @@ fn environment(bin: &std::path::Path, display: &str) -> Vec<(String, String)> {
         ("git".into(), format!("{head}{}", if dirty { "-dirty" } else { "" })),
         ("cpu_governor".into(), governor),
         ("display".into(), format!("X11 {display} (session: {session})")),
+        // Runs before this note was kept used the user's own server.
+        ("server".into(), "private per case".into()),
     ]
 }
 
@@ -133,6 +144,12 @@ fn main() {
     if cfg!(not(target_os = "linux")) {
         println!("perf: the cases need X11, so they run on Linux only");
         return;
+    }
+    // The case's local tab runs in a terminal server of its own.
+    let helper = common::server::helper(&bin);
+    if let Err(why) = common::server::check_helper(&helper, &target_dir.join("release").join(helper_name())) {
+        println!("perf: {why}");
+        std::process::exit(1);
     }
     let display = std::env::var("BRINDLE_PERF_DISPLAY").unwrap_or_else(|_| ":0".into());
     #[cfg(target_os = "linux")]
@@ -172,19 +189,32 @@ fn main() {
 
     let vtebench_cell = std::rc::Rc::new(OnceCell::new());
     let mut failed = 0;
-    for case in selected {
+    for (n, case) in selected.into_iter().enumerate() {
         let started = Instant::now();
         let dir = run_dir.join(case.name);
         std::fs::create_dir_all(&dir).expect("case directory");
         let ctx = Ctx {
+            server_dir: private_dir(Suite::Perf, &dir, n),
             dir,
             bin: bin.clone(),
+            helper: helper.clone(),
             display: display.clone(),
             samples,
             target_dir: target_dir.clone(),
             vtebench: vtebench_cell.clone(),
         };
         let outcome = (case.run)(&ctx);
+        // A run that left a role running, or ran one in the user's systemd
+        // manager, isn't one to compare: it fails, so its numbers stay out
+        // of the summary.
+        let outcome = match common::server::stop(&ctx.helper, &ctx.server_dir, &ctx.dir) {
+            Err(why) if outcome.is_ok() => Err(why),
+            Err(why) => {
+                println!("         {why}");
+                outcome
+            }
+            Ok(()) => outcome,
+        };
         let took = started.elapsed().as_secs_f64();
         match outcome {
             Ok(Measured::Latency(result)) => {
@@ -224,6 +254,7 @@ fn self_test() -> i32 {
         ("latency parsing", report::self_test_latency),
         ("dat parsing", report::self_test_dat),
         ("report rendering", report::self_test_render),
+        ("server helpers", common::server::self_test),
     ];
     let mut failed = 0;
     for (name, test) in tests {

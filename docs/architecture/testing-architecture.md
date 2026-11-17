@@ -97,7 +97,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 ## Enforcement
 
 - `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets` (R3), and `platform_cfgs_stay_in_their_seams`, which holds `ports R4` in production code and leaves test code's platform pairs alone.
-- The e2e harness itself holds R4: it refuses a missing or stale `brindle-remote`, gives each case private directories, and fails a case that leaves a `serve` or `hold` running.
+- Both harnesses hold R4 through `tests/common/server.rs`, which gives each case private directories and a hermetic environment, refuses a missing or stale `brindle-remote`, and fails a case that leaves a `serve` or `hold` running or ran one in a systemd scope.
 - CI runs `cargo test --workspace` and both harness self-tests on every push for Linux and Windows, and the e2e suite in three advisory shards that upload `target/tmp/e2e/` on failure.
 - R1, R2, R5–R17 otherwise rely on review. No lint keeps `std::thread::sleep` or `Instant::now` out of unit tests.
 

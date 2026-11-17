@@ -306,30 +306,50 @@ pub fn load(dir: &Path) -> Result<Option<State>, String> {
     }
 }
 
-static WRITE_GENERATION: AtomicU64 = AtomicU64::new(0);
-static WRITE_LOCK: Mutex<u64> = Mutex::new(0);
-
-/// A ticket ordering writes: a write is skipped if a newer one has already
-/// landed, so a slow background write can't replace the final one on quit.
-pub fn next_generation() -> u64 {
-    WRITE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+/// One state directory's `session.toml`, written in ticket order: a write
+/// is skipped when a newer ticket has landed, so a slow background write
+/// can't replace the final one on quit. The order is this value's own, so
+/// two directories' writes never skip each other's.
+#[derive(Debug)]
+pub struct StateFile {
+    dir: PathBuf,
+    issued: AtomicU64,
+    /// The ticket of the last write that landed; `None` before the first.
+    landed: Mutex<Option<u64>>,
 }
 
-/// Replaces `dir/session.toml` with `text` in one step (temp file + rename),
-/// readable only by the user.
-pub fn write_atomic(dir: &Path, text: &str, generation: u64) -> std::io::Result<()> {
-    let mut last = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if generation < *last {
-        return Ok(());
+impl StateFile {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir, issued: AtomicU64::new(0), landed: Mutex::new(None) }
     }
-    private_dir().create(dir)?;
-    let tmp = dir.join(format!("{FILE_NAME}.tmp"));
-    let mut file = private_file().truncate(true).open(&tmp)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, state_path(dir))?;
-    *last = generation;
-    Ok(())
+
+    /// The next ticket, newer than every one issued before it.
+    pub fn ticket(&self) -> u64 {
+        self.issued.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Replaces the file with `text` in one step (temp file + rename),
+    /// readable only by the user, unless a write with a newer ticket than
+    /// `ticket` has landed already.
+    pub fn write(&self, text: &str, ticket: u64) -> std::io::Result<()> {
+        let mut landed = self.landed.lock().unwrap_or_else(|e| e.into_inner());
+        if landed.is_some_and(|landed| ticket < landed) {
+            return Ok(());
+        }
+        private_dir().create(&self.dir)?;
+        let tmp = self.dir.join(format!("{FILE_NAME}.tmp"));
+        let mut file = private_file().truncate(true).open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, self.path())?;
+        *landed = Some(ticket);
+        Ok(())
+    }
+
+    /// The state file's path, for messages.
+    pub fn path(&self) -> PathBuf {
+        state_path(&self.dir)
+    }
 }
 
 /// Exclusive ownership of the state directory, held while this lives.
@@ -832,8 +852,10 @@ mod tests {
     #[test]
     fn atomic_write_and_load() {
         let dir = tmp_dir("write");
+        let file = StateFile::new(dir.clone());
+        assert_eq!(file.path(), state_path(&dir));
         assert_eq!(load(&dir), Ok(None));
-        write_atomic(&dir, &sample().to_text().expect("serializes"), next_generation()).unwrap();
+        file.write(&sample().to_text().expect("serializes"), file.ticket()).unwrap();
         assert_eq!(load(&dir), Ok(Some(sample())));
         assert!(!dir.join("session.toml.tmp").exists());
         #[cfg(unix)]
@@ -843,17 +865,33 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         // An older write that lands late doesn't replace a newer one.
-        let old = next_generation();
-        let new = next_generation();
-        write_atomic(&dir, "version = 1\n", new).unwrap();
-        write_atomic(&dir, &sample().to_text().expect("serializes"), old).unwrap();
+        let old = file.ticket();
+        let new = file.ticket();
+        file.write("version = 1\n", new).unwrap();
+        file.write(&sample().to_text().expect("serializes"), old).unwrap();
         assert_eq!(std::fs::read_to_string(state_path(&dir)).unwrap(), "version = 1\n");
         // A state with no windows is a normal launch, not an error.
-        write_atomic(&dir, "version = 1\nwindows = []\n", next_generation()).unwrap();
+        file.write("version = 1\nwindows = []\n", file.ticket()).unwrap();
         assert_eq!(load(&dir), Ok(None));
         std::fs::write(state_path(&dir), "garbage").unwrap();
         assert!(load(&dir).unwrap_err().contains("ignoring session state"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tickets order the writes of one directory only: a newer write to
+    /// another directory doesn't make this one's older ticket stale.
+    #[test]
+    fn a_newer_write_elsewhere_does_not_skip_this_directorys_write() {
+        let (a, b) = (tmp_dir("ordered-a"), tmp_dir("ordered-b"));
+        let (file_a, file_b) = (StateFile::new(a.clone()), StateFile::new(b.clone()));
+        let first = file_a.ticket();
+        // `b`'s landed ticket is a higher number than `first`.
+        file_b.ticket();
+        file_b.write("version = 1\n", file_b.ticket()).unwrap();
+        file_a.write(&sample().to_text().expect("serializes"), first).unwrap();
+        assert_eq!(load(&a), Ok(Some(sample())));
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
@@ -955,7 +993,8 @@ mod tests {
                     [[windows]]\n[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"work\"\nsession = \"work\"\n";
         assert!(State::parse(only).unwrap().windows.is_empty());
         let dir = tmp_dir("only-tmux");
-        write_atomic(&dir, only, next_generation()).unwrap();
+        let file = StateFile::new(dir.clone());
+        file.write(only, file.ticket()).unwrap();
         assert_eq!(load(&dir), Ok(None));
         std::fs::remove_dir_all(&dir).ok();
     }

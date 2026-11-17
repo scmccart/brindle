@@ -25,7 +25,11 @@
 
 #[cfg_attr(
     not(windows),
-    allow(dead_code, reason = "only the Windows holder's pty starts programs with it")
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "only the Windows holder's pty starts programs with it"
+    )
 )]
 pub mod cmdline;
 

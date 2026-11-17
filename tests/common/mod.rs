@@ -3,6 +3,10 @@
 
 #![allow(dead_code)]
 
+pub mod server;
+#[cfg(windows)]
+pub mod winproc;
+
 pub type Result<T = ()> = std::result::Result<T, String>;
 
 /// Lines with trailing spaces and trailing empty lines removed.

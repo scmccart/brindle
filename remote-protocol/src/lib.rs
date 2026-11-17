@@ -12,6 +12,7 @@ pub mod access;
 pub mod build_id;
 pub mod client;
 pub mod endpoint;
+pub mod environment;
 pub mod holder;
 pub mod ready;
 pub mod relay;

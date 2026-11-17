@@ -30,7 +30,8 @@ use windows::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_TERMINATE, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
@@ -41,7 +42,9 @@ pub use super::pipe::{Stream, address, connect};
 #[cfg(test)]
 pub use super::pipe::Listener;
 use super::{Endpoint, Start};
+use crate::remote::protocol::environment::environment_block;
 use crate::remote::protocol::win;
+use crate::terminal::cmdline::merge_environment;
 
 /// How long the trampoline may take to exit, and its stderr to end, once
 /// the core has signalled. Both happen before the signal, bar a core that
@@ -56,9 +59,11 @@ fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
     text.encode_wide().chain([0]).collect()
 }
 
-/// Runs the per-build copy of the helper as `launch serve --ready-handle N`
-/// and waits up to `limit` for the core's ready byte.
+/// Runs the per-build copy of the helper as `launch serve --ready-handle N`,
+/// with the endpoint's role variables over this process's environment, and
+/// waits up to `limit` for the core's ready byte.
 pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
+    let environment = role_environment(endpoint)?;
     let copy = win::ensure_helper_copy(&endpoint.helper, &endpoint.copies).with_context(|| {
         format!(
             "terminal server didn't start: can't copy {} to {}",
@@ -74,7 +79,8 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
     let (stderr_read, stderr_write) = io::pipe().context("starting the terminal server: pipe")?;
     let ready_handle = HANDLE(ready_write.as_raw_handle());
     let line = format!("\"{}\" launch serve --ready-handle {}", copy.display(), ready_handle.0 as usize);
-    let process = create(&copy, &line, ready_handle, HANDLE(stderr_write.as_raw_handle()))
+    let stderr_handle = HANDLE(stderr_write.as_raw_handle());
+    let process = create(&copy, &line, environment.as_deref(), ready_handle, stderr_handle)
         .with_context(|| format!("terminal server didn't start: can't run {}", copy.display()))?;
     // Only the trampoline and the core hold the write ends now.
     drop((ready_write, stderr_write));
@@ -179,10 +185,40 @@ impl Drop for HandleList<'_> {
     }
 }
 
+/// The trampoline's environment block, which it passes on to the core:
+/// `None` when the endpoint sets no variables, so it inherits this
+/// process's environment; else this process's UTF-8 variables with the
+/// endpoint's over them. A role variable that isn't Unicode is an error, not
+/// dropped: without it the core would serve another directory.
+fn role_environment(endpoint: &Endpoint) -> Result<Option<Vec<u16>>> {
+    if endpoint.role_env.is_empty() {
+        return Ok(None);
+    }
+    let inherited: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    for (name, value) in &endpoint.role_env {
+        let value = value
+            .to_str()
+            .with_context(|| format!("terminal server didn't start: {name} isn't valid Unicode: {value:?}"))?;
+        overrides.push((name.to_string(), value.to_string()));
+    }
+    let merged = merge_environment(inherited, overrides);
+    Ok(Some(environment_block(merged.iter().map(|(name, value)| (name.as_str(), value.as_str())))))
+}
+
 /// Creates the process `image` with the command line `line`, no window, no
-/// stdin or stdout, `stderr` as its stderr, and Brindle's environment and
-/// directory. It inherits `ready` and `stderr` and no other handle.
-fn create(image: &Path, line: &str, ready: HANDLE, stderr: HANDLE) -> io::Result<OwnedHandle> {
+/// stdin or stdout, `stderr` as its stderr, Brindle's directory, and
+/// `environment` (a block of UTF-16 entries) or else Brindle's environment.
+/// It inherits `ready` and `stderr` and no other handle.
+fn create(
+    image: &Path,
+    line: &str,
+    environment: Option<&[u16]>,
+    ready: HANDLE,
+    stderr: HANDLE,
+) -> io::Result<OwnedHandle> {
     let handles = [ready, stderr];
     // A listed handle must be inheritable. Until this process closes them,
     // right after the create, another thread's `Command` could pass them on
@@ -201,8 +237,14 @@ fn create(image: &Path, line: &str, ready: HANDLE, stderr: HANDLE) -> io::Result
     // The call may write to the line.
     let mut line = wide(line.as_ref());
     let mut info = PROCESS_INFORMATION::default();
+    // The helper is a console program, and Brindle has no console.
+    let mut flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
+    if environment.is_some() {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
     // SAFETY: every pointer is valid for the call, the line is writable,
-    // and the startup info is the extended one, as the flags say.
+    // the startup info is the extended one and the environment block UTF-16,
+    // as the flags say.
     let created = unsafe {
         CreateProcessW(
             PCWSTR(image.as_ptr()),
@@ -210,9 +252,8 @@ fn create(image: &Path, line: &str, ready: HANDLE, stderr: HANDLE) -> io::Result
             None,
             None,
             true,
-            // The helper is a console program, and Brindle has no console.
-            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-            None,
+            flags,
+            environment.map(|block| block.as_ptr().cast()),
             PCWSTR::null(),
             &startup.StartupInfo,
             &mut info,
