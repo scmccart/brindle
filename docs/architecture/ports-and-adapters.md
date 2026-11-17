@@ -35,19 +35,23 @@ use crate::server::platform::{Loop, Source, Listener, Pty};
 
 | Concern | Its one home |
 | --- | --- |
-| the terminal server's OS layer (loop, pipes and sockets, locks, detached start, PTYs) | `remote-agent/src/server/platform/{unix,windows}` |
-| PTYs and pseudoconsoles | `remote-agent/src/pty/`, `remote-agent/src/conpty/` |
+| the terminal server's OS layer (loop, pipes and sockets, locks, detached start, PTYs) | `remote-agent/src/server/platform/` (`mod.rs` and its `unix` and `windows` sets) |
+| PTYs and pseudoconsoles | `remote-agent/src/pty.rs`, `remote-agent/src/pty/`, `remote-agent/src/conpty/` |
 | the server directory, endpoint names, access checks, scopes | `remote-protocol/src/{server_dir,endpoint,access,scope,win}.rs` |
 | the app's connection to a server | `src/remote/local/{unix,windows,pipe}.rs` |
 | a remote endpoint's transport (OpenSSH, Docker and Podman exec) | `src/remote/client.rs` |
-| a local program's name and directory | `src/terminal/process.rs` |
+| a local program's name and directory, and the path style its directory reports use (`LOCAL_PATH_STYLE`) | `src/terminal/process.rs` |
 | the primary selection | `src/primary.rs` |
 | desktop notifications and window activation | `src/notify/{dbus,toast,activation}.rs` |
 | launcher registration | `src/desktop.rs` |
 | opening links | `src/terminal/links.rs` |
 | small Windows helpers | `src/win.rs` |
+| the relay, which runs on Linux only (declared under `target_os = "linux"`; every other platform refuses `relay`) | `remote-agent/src/server/relay.rs`, `remote-agent/src/liveness.rs` |
+| resources compiled into the Windows executables (icon, version, manifest; `embed-resource` exists only on a Windows build host) | `build.rs`, `remote-agent/build.rs` |
 | the UI toolkit | `gpui`, used by `brindle` and `brindle-ui` only |
 | the emulator | `alacritty_terminal`, wrapped by `brindle-term-core` |
+
+`tests/architecture.rs`'s `SEAMS` lists the same paths, and changes with this table in the same commit.
 
 The composition root is `src/main.rs`: it takes the instance lock and handles `--install-desktop` before GPUI starts, then sets the GPUI globals (`Settings`, `Notifier`, `Hosts`, `Detached`) before the window opens.
 
@@ -56,8 +60,11 @@ The composition root is `src/main.rs`: it takes the instance lock and handles `-
 - **R1.** Crate references MUST follow the dependency rule in [README.md](README.md#dependency-rule): `brindle` and `brindle-remote-agent` depend on the shared crates, never on each other; `brindle-ui`, `brindle-term-core` and `brindle-remote-protocol` never depend on each other or on a binary's crate. A new crate gets its place in that rule and in `tests/architecture.rs` in the same change.
 - **R2.** `brindle-ui` MUST depend on `gpui` alone and do no IO of its own. It knows nothing of terminals, config, themes' sources or the `ACTIONS` table, and it binds no keys itself. Mapping the app's concepts onto it is the app's job.
 - **R3.** Each crate below the app MUST name only the dependencies on its closed list in `tests/architecture.rs` (`ui`: `gpui`; `term-core`: `alacritty_terminal`, `base64`, `parking_lot`; `remote-protocol`: `serde`, `serde_json`, `windows`; `remote-agent`: the two shared crates, `libc`, `windows`, `embed-resource`). Adding one is a deliberate change to that list and this rule, and still obeys `CLAUDE.md`'s `Cargo.lock` rule.
-- **R4.** A platform concern MUST have one seam, and code outside it MUST NOT carry a `cfg` for that concern. Put a new platform difference in the narrowest module that owns the concern, or add an item to both sets of a per-platform module set. Never start a second, parallel seam for a concern that has one.
-  - Exception (predates adoption, 2026-11-16): `cfg` attributes outside a seam in `src/workspace.rs`, `src/terminal/mod.rs`, `src/main.rs`, `src/remote/local.rs` and a few others. Ends with the `port-to-macos` change.
+- **R4.** A platform concern MUST have one seam, and production code outside it MUST NOT carry a platform `cfg` for that concern. Put a new platform difference in the narrowest module that owns the concern, or add an item to both sets of a per-platform module set. Never start a second, parallel seam for a concern that has one.
+  - **Production code** is each workspace crate's `src/` tree, plus `build.rs` and `remote-agent/build.rs`. Test code is outside this rule and may pair platforms (`testing`'s "Platform pairs"): `#[cfg(test)]` items and the files of modules declared under one, `tests/**`, `remote-agent/tests/**` and the other crates' `tests/`, and examples (`ui/examples/`).
+  - **A platform `cfg`** is a `cfg(…)` or `cfg_attr(…)` attribute, outer or inner, or a `cfg!(…)`, whose predicate names `unix`, `windows`, `target_os` or `target_family`. For `cfg_attr`, only its first argument is the predicate. A test-only predicate (`test`, or `all(…)` with a test-only argument; not `not(test)` or `any(test, …)`) makes its item test code.
+  - **Not a platform difference:** a seam's module declaration, which is a platform `cfg` on `mod NAME;` (among any other attributes, `#[path]` included) whose file is a seam in the table above, as in `#[cfg(unix)] mod unix;`; and a lint-only `cfg_attr`, every attribute of which is `allow`, `expect`, `warn` or `deny`, such as `allow(dead_code)` on a pure helper that only one platform's seam calls (`fcis R7`).
+  - Exception: the production files on [README.md](README.md#exceptions-in-force)'s `ports R4` row, and no others. `tests/architecture.rs` holds the same list. It only shrinks, and ends with the `port-to-macos` change.
 - **R5.** A per-platform module set MUST export the same item names on every platform, and the code above it MUST name no platform type. The server core (`server/core.rs`, `server/core/`) and the holder (`server/holder.rs`) name no `libc::`, `windows::` or `std::os::` item outside their tests.
 - **R6.** A seam is for platform, never for logic. Don't add a trait, a module or an indirection around a decision to make it mockable: a decision is a pure function, called and tested directly (`fcis R1`).
 - **R7.** Seam code MUST be thin: it translates handles, bytes and calls. A decision it needs (what to run, the environment, the quoting, a name) comes from a pure helper that is tested on every platform (`cmdline::launch_line`, `windows_default_program`, `merge_environment`, `server_dir::resolve`).
@@ -84,10 +91,11 @@ The composition root is `src/main.rs`: it takes the instance lock and handles `-
 
 - R1: `the_workspace_is_the_five_crates_these_rules_cover`, `the_app_and_the_helper_build_on_the_shared_crates`, `no_crate_names_a_forbidden_dependency`.
 - R2 and R3: `crates_below_the_app_name_only_their_allowed_dependencies`, `brindle_ui_does_no_io_of_its_own`.
+- R4: `platform_cfgs_stay_in_their_seams` (every platform `cfg` in production code is in a seam or an excepted file), `every_excepted_file_still_has_a_platform_cfg` (the exception only shrinks), `every_seam_and_excepted_path_exists` and `the_ports_r4_exception_matches_the_readme`. The scanner is a text reader with tests of its own: `a_platform_cfg_outside_a_seam_is_found`, `what_is_not_a_platform_cfg_is_not_found`, `literals_and_comments_are_not_code_to_the_scanner`, `a_test_only_predicate_needs_test_to_hold` and `a_declared_module_resolves_as_rustc_resolves_it`. A `cfg` a macro produces is beyond it, and stays a review matter.
 - R5: `the_server_core_and_holder_name_no_platform_type`. CI compiles both platforms, which holds the "same item names" half.
 - R12: `no_crate_names_a_forbidden_dependency` (the dependency half; copying is a review matter).
 
-R4, R6–R11 and R13 rely on review.
+R6–R11 and R13 rely on review.
 
 ## PR checklist
 

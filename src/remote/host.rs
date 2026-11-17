@@ -5,6 +5,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::config::{Profile, RemoteTarget};
+use crate::terminal::shell_integration::PathStyle;
 
 /// An endpoint the process keeps one connection to (`remote::local::shared`).
 ///
@@ -54,6 +55,16 @@ impl Host {
 
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local)
+    }
+
+    /// The path style of the directory reports a session here sends: `local`,
+    /// this machine's, for a local session, and POSIX on a remote endpoint,
+    /// which is Linux (the relay runs nowhere else).
+    pub fn path_style(&self, local: PathStyle) -> PathStyle {
+        match self {
+            Self::Local => local,
+            Self::Remote(_) => PathStyle::Posix,
+        }
     }
 
     fn identity(&self) -> Identity<'_> {
@@ -223,6 +234,24 @@ mod tests {
             assert_eq!(Host::Remote(eager(target.clone())), Host::Remote(target.clone()));
             assert_eq!(Host::of(&on).target(), Some(&target), "the endpoint alone");
             assert!(!Host::of(&on).target().unwrap().connects_at_launch());
+        }
+    }
+
+    #[test]
+    fn a_local_host_takes_this_machines_path_style() {
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            assert_eq!(Host::Local.path_style(style), style);
+        }
+    }
+
+    #[test]
+    fn a_remote_host_reports_posix_paths() {
+        let container =
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
+        for host in [Host::Remote(ssh(Some("dev"), Some(22))), Host::Remote(container)] {
+            for local in [PathStyle::Posix, PathStyle::Windows] {
+                assert_eq!(host.path_style(local), PathStyle::Posix, "{host:?} from {local:?}");
+            }
         }
     }
 

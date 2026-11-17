@@ -156,6 +156,7 @@ mod tests {
 
     use super::*;
     use crate::notify::osc::Found;
+    use crate::terminal::shell_integration::PathStyle;
     use crate::terminal::{GridSize, OutputMarker};
 
     fn sink() -> (Sink, futures::channel::mpsc::UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
@@ -165,7 +166,7 @@ mod tests {
         let term = Term::new(term::Config::default(), &GridSize::default(), listener.clone());
         let sink = Sink::new(
             Arc::new(FairMutex::new(term)),
-            Arc::new(Mutex::new(Parser::new())),
+            Arc::new(Mutex::new(Parser::new(PathStyle::Posix))),
             Arc::new(Mutex::new(Marks::default())),
             listener,
             "start \"sh\"".into(),

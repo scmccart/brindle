@@ -1,5 +1,6 @@
 //! Process info for tab titles and new-tab directories: which process is in
-//! the foreground on a tab's PTY, its name, and its working directory.
+//! the foreground on a tab's PTY, its name, and its working directory, and
+//! the path style its directory reports use ([`LOCAL_PATH_STYLE`]).
 //!
 //! Linux reads `/proc`. Windows has no foreground process group, so a
 //! tab's process name is its program's most recently started descendant,
@@ -7,6 +8,18 @@
 //! between tabs. Neither platform reads another process's directory there.
 
 use std::path::PathBuf;
+
+use super::shell_integration::PathStyle;
+
+/// How a program on this machine spells the directories it reports (OSC 7,
+/// 9;9). [`crate::remote::Host::path_style`] picks it for a local session.
+#[cfg(windows)]
+pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Windows;
+
+/// How a program on this machine spells the directories it reports (OSC 7,
+/// 9;9). [`crate::remote::Host::path_style`] picks it for a local session.
+#[cfg(not(windows))]
+pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Posix;
 
 /// A process in a [`Snapshot`].
 #[derive(Clone, Debug, PartialEq)]

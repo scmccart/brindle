@@ -14,5 +14,5 @@ pub mod dir;
 pub mod event_loop;
 pub mod holder;
 pub mod platform;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod relay;

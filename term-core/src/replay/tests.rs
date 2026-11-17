@@ -14,7 +14,7 @@ use alacritty_terminal::vte::ansi::{CursorStyle, Rgb};
 use parking_lot::Mutex;
 
 use super::*;
-use crate::shell_integration::{Marks, Parser};
+use crate::shell_integration::{Marks, Parser, PathStyle};
 use crate::status::{self, Record, Records, State};
 
 struct Size {
@@ -63,7 +63,7 @@ impl Session {
         let config = term::Config { scrolling_history: history, ..Default::default() };
         Session {
             term: Term::new(config, &Size { cols, rows }, titles.clone()),
-            parser: Parser::posix(),
+            parser: Parser::new(PathStyle::Posix),
             marks: Mutex::new(Marks::default()),
             records: Records::default(),
             titles,

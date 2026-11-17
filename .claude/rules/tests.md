@@ -15,6 +15,7 @@ You are editing a test harness or its cases. Read `docs/architecture/testing-arc
 - Assert the rule, not a count that depends on timing; expected colours come from the `e2e` theme (`testing R6`, `R8`).
 - A flake is fixed at its cause, with failures over N runs before and after. No retry, skip or longer wait on passing runs (`testing R9`, `R10`).
 - A GUI check is a named case in `tests/e2e/cases/`, never a one-off script (`testing R13`). The perf suite reports numbers and never fails (`testing R14`).
+- Test code may pair platforms with `cfg(unix)` and `cfg(windows)` (`testing`'s "Platform pairs"): `ports R4` binds production code only.
 - `tests/architecture.rs` encodes `docs/architecture` rules: change a list there only together with the rule in its doc, never to make a change compile.
 
 If a rule can only be reached through an e2e case, it probably lives in a view; move it into a pure function or model and unit-test it there (`testing R1`).

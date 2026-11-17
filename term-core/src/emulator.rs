@@ -18,7 +18,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::osc::{self, Found};
 use crate::replay;
-use crate::shell_integration::{Marks, Parser};
+use crate::shell_integration::{Marks, Parser, PathStyle};
 use crate::status::Records;
 
 /// The scrollback a session gets when its `SPAWN` names none: Brindle's
@@ -78,13 +78,17 @@ pub struct Emulator {
 impl Emulator {
     /// An emulator of `cols` (at least [`MIN_COLS`]) × `rows` (at least 1)
     /// keeping `scrollback` lines of history; 0 means [`DEFAULT_SCROLLBACK`].
+    ///
+    /// It reads directory reports in [`PathStyle::Posix`] on every platform,
+    /// as the server always has: a Windows core's replays keep OSC 7's
+    /// `/C:/…` reports but drop `9;9` ones until the shell reports again.
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
         let titles = Titles::default();
         let scrolling_history = if scrollback == 0 { DEFAULT_SCROLLBACK } else { scrollback };
         let config = term::Config { scrolling_history, ..Default::default() };
         Self {
             term: Term::new(config, &size(cols, rows), titles.clone()),
-            parser: Parser::posix(),
+            parser: Parser::new(PathStyle::Posix),
             marks: Mutex::new(Marks::default()),
             records: Records::default(),
             scanner: osc::Scanner::new(),
@@ -234,5 +238,14 @@ mod tests {
         assert!(emulator.records().get("").is_none());
         emulator.resize(30, 5);
         assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (30, 5));
+    }
+
+    #[test]
+    fn the_emulator_reads_directory_reports_as_posix() {
+        let mut emulator = Emulator::new(20, 4, 0);
+        emulator.feed(b"\x1b]7;file://h/home/u\x1b\\");
+        let render = emulator.render();
+        let needle = b"\x1b]7;file:///home/u\x1b\\";
+        assert!(render.windows(needle.len()).any(|w| w == needle), "{:?}", String::from_utf8_lossy(&render));
     }
 }
