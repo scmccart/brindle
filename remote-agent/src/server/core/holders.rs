@@ -414,6 +414,7 @@ impl<L: EventLoop> Core<L> {
         // Every listed session's checkpoint and tail follow.
         holder.adopting = welcome.sessions.iter().map(|held| held.session).collect();
         let mut adopted_any = false;
+        let now = Instant::now();
         for held in welcome.sessions {
             let id = held.session;
             if self.sessions.contains_key(&id) {
@@ -421,13 +422,13 @@ impl<L: EventLoop> Core<L> {
                 continue;
             }
             self.next_session = self.next_session.max(id.saturating_add(1));
-            self.sessions.insert(id, Session::adopted(token, held));
+            self.sessions.insert(id, Session::adopted(token, held, now));
             adopted_any = true;
         }
         // A holder found after startup gives its sessions' owners the same
         // grace period (startup's starts once clients are accepted).
         if adopted_any && self.accepting {
-            let until = Instant::now() + RECONNECT_GRACE;
+            let until = now + RECONNECT_GRACE;
             self.grace_until = Some(self.grace_until.map_or(until, |grace| grace.max(until)));
         }
         self.holder_adopted(token);

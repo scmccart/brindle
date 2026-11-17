@@ -161,7 +161,8 @@ pub(crate) fn shared_with(host: &Host, helper: &HelperLookup) -> Result<Arc<Conn
                     }
                 }) as Report
             });
-            Connection::relay_with(dial, &host_token(host), relay::Timings::default(), eager, report)
+            let token = host_token(client_token(), host);
+            Connection::relay_with(dial, &token, relay::Timings::default(), eager, report)
         }
     })
 }
@@ -285,19 +286,20 @@ pub fn stop_listing(host: &Host) {
     }
 }
 
-/// The `client_token` of this process's connection to `host`. Each remote
-/// endpoint gets one of its own, the same for every reconnect: a core takes
-/// a connection's sessions over from any other client with its token, and
-/// two endpoints can be one core (`ssh localhost` beside local tabs, or two
-/// aliases of one machine), which would otherwise take each other over.
-fn host_token(host: &Host) -> String {
+/// The `client_token` of a connection to `host`, from the process's own
+/// token `base` ([`client_token`]). Each remote endpoint gets one of its
+/// own, the same for every reconnect: a core takes a connection's sessions
+/// over from any other client with its token, and two endpoints can be one
+/// core (`ssh localhost` beside local tabs, or two aliases of one machine),
+/// which would otherwise take each other over.
+fn host_token(base: &str, host: &Host) -> String {
     use std::hash::{BuildHasher as _, BuildHasherDefault, DefaultHasher};
 
     match host {
-        Host::Local => client_token().to_string(),
+        Host::Local => base.to_string(),
         Host::Remote(_) => {
             let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(host);
-            format!("{}-{hash:016x}", client_token())
+            format!("{base}-{hash:016x}")
         }
     }
 }
@@ -1196,11 +1198,11 @@ mod tests {
                 connect_at_launch: false,
             })
         };
-        assert_eq!(host_token(&Host::Local), client_token());
-        let (a8, localhost) = (host_token(&ssh("A8")), host_token(&ssh("localhost")));
-        assert_eq!(host_token(&ssh("A8")), a8, "stable for reconnects");
+        assert_eq!(host_token("t", &Host::Local), "t");
+        let (a8, localhost) = (host_token("t", &ssh("A8")), host_token("t", &ssh("localhost")));
+        assert_eq!(host_token("t", &ssh("A8")), a8, "stable for reconnects");
         assert_ne!(a8, localhost);
-        assert!(a8.starts_with(client_token()) && a8 != client_token(), "{a8}");
+        assert!(a8.starts_with("t-") && a8.len() == "t-".len() + 16, "{a8}");
     }
 
     #[test]

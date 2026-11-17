@@ -61,12 +61,17 @@ fn exe_paths(exe: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// The first of `names` that is a file beside `exe` (see `exe_paths`).
-fn beside_exe(exe: &Path, names: &[&str]) -> Option<PathBuf> {
-    exe_paths(exe)
-        .into_iter()
+/// The first of `names` that is a file beside one of `exes` (see
+/// `exe_paths`), trying every name beside each executable path in turn.
+/// `is_file` is the probe (the shell passes `Path::is_file`).
+fn beside_exe(
+    exes: &[PathBuf],
+    names: &[&str],
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    exes.iter()
         .flat_map(|exe| names.iter().map(move |name| exe.with_file_name(name)))
-        .find(|path| path.is_file())
+        .find(|path| is_file(path))
 }
 
 /// The `brindle-remote` helper, for remote tabs and for the local terminal
@@ -74,18 +79,31 @@ fn beside_exe(exe: &Path, names: &[&str]) -> Option<PathBuf> {
 /// `None` when there is none; each caller says how to fix that.
 pub(crate) fn find_helper() -> Result<Option<PathBuf>> {
     let exe = std::env::current_exe().context("locating Brindle executable")?;
-    find_helper_in(std::env::var_os("BRINDLE_REMOTE_AGENT"), &exe)
+    find_helper_in(
+        std::env::var_os("BRINDLE_REMOTE_AGENT"),
+        &exe_paths(&exe),
+        &|path: &Path| path.is_file(),
+    )
 }
 
-fn find_helper_in(variable: Option<OsString>, exe: &Path) -> Result<Option<PathBuf>> {
+/// [`find_helper`]'s choice, from the variable's value, Brindle's executable
+/// paths (`exe_paths`) and the probe for a file.
+fn find_helper_in(
+    variable: Option<OsString>,
+    exes: &[PathBuf],
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>> {
     if let Some(path) = variable.filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
-        if path.is_file() {
+        if is_file(&path) {
             return Ok(Some(path));
         }
-        bail!("BRINDLE_REMOTE_AGENT does not name a file: {}", path.display());
+        bail!(
+            "BRINDLE_REMOTE_AGENT does not name a file: {}",
+            path.display()
+        );
     }
-    Ok(beside_exe(exe, &HELPER_NAMES))
+    Ok(beside_exe(exes, &HELPER_NAMES, is_file))
 }
 
 /// The helper the local terminal server runs: `BRINDLE_SERVER_HELPER`, then on
@@ -98,28 +116,35 @@ pub(crate) fn find_server_helper() -> Result<Option<PathBuf>> {
     find_server_helper_in(
         std::env::var_os("BRINDLE_SERVER_HELPER"),
         std::env::var_os("BRINDLE_REMOTE_AGENT"),
-        &exe,
+        &exe_paths(&exe),
         cfg!(windows),
+        &|path: &Path| path.is_file(),
     )
 }
 
+/// [`find_server_helper`]'s choice, from the variables' values, Brindle's
+/// executable paths (`exe_paths`), the platform and the probe for a file.
 fn find_server_helper_in(
     server_variable: Option<OsString>,
     remote_variable: Option<OsString>,
-    exe: &Path,
+    exes: &[PathBuf],
     windows: bool,
+    is_file: &dyn Fn(&Path) -> bool,
 ) -> Result<Option<PathBuf>> {
     if let Some(path) = server_variable.filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
-        if path.is_file() {
+        if is_file(&path) {
             return Ok(Some(path));
         }
-        bail!("BRINDLE_SERVER_HELPER does not name a file: {}", path.display());
+        bail!(
+            "BRINDLE_SERVER_HELPER does not name a file: {}",
+            path.display()
+        );
     }
     if windows {
-        return Ok(beside_exe(exe, &["brindle-remote.exe"]));
+        return Ok(beside_exe(exes, &["brindle-remote.exe"], is_file));
     }
-    find_helper_in(remote_variable, exe)
+    find_helper_in(remote_variable, exes, is_file)
 }
 
 /// Waits for `child` to exit, killing it if `cancel` is set or `timeout`
@@ -272,64 +297,113 @@ mod tests {
         );
     }
 
+    /// A probe that answers yes for `files` alone.
+    fn only(files: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |path| files.iter().any(|file| file == path)
+    }
+
     #[test]
     fn the_helper_is_the_variable_or_beside_brindle() {
-        let dir = std::env::temp_dir().join(format!("brindle-find-helper-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("brindle");
-        assert_eq!(find_helper_in(None, &exe).unwrap(), None);
-        std::fs::write(dir.join("brindle-remote"), b"").unwrap();
-        assert_eq!(find_helper_in(None, &exe).unwrap(), Some(dir.join("brindle-remote")));
-        assert_eq!(find_helper_in(Some("".into()), &exe).unwrap(), Some(dir.join("brindle-remote")));
-        std::fs::write(dir.join("brindle-remote-linux-x86_64"), b"").unwrap();
-        assert_eq!(find_helper_in(None, &exe).unwrap(), Some(dir.join("brindle-remote-linux-x86_64")));
-        let named = dir.join("elsewhere");
-        let error = find_helper_in(Some(named.clone().into()), &exe).unwrap_err();
-        assert!(error.to_string().contains("does not name a file"), "{error}");
-        std::fs::write(&named, b"").unwrap();
-        assert_eq!(find_helper_in(Some(named.clone().into()), &exe).unwrap(), Some(named));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = PathBuf::from("/opt/brindle");
+        let exes = [dir.join("brindle")];
+        let find = |variable: Option<&str>, files: &[PathBuf]| {
+            find_helper_in(variable.map(Into::into), &exes, &only(files))
+        };
+        let (helper, archive) = (
+            dir.join("brindle-remote"),
+            dir.join("brindle-remote-linux-x86_64"),
+        );
+        assert_eq!(find(None, &[]).unwrap(), None);
+        assert_eq!(find(None, &[helper.clone()]).unwrap(), Some(helper.clone()));
+        // An empty variable counts as unset.
+        assert_eq!(
+            find(Some(""), &[helper.clone()]).unwrap(),
+            Some(helper.clone())
+        );
+        // The archive's name comes before the installed one.
+        assert_eq!(
+            find(None, &[helper.clone(), archive.clone()]).unwrap(),
+            Some(archive)
+        );
+        // The variable's path is used when it is a file, and is an error naming
+        // the variable when it isn't, whatever sits beside Brindle.
+        let named = PathBuf::from("/elsewhere/helper");
+        let error = find(Some("/elsewhere/helper"), &[helper.clone()]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("BRINDLE_REMOTE_AGENT does not name a file"),
+            "{error}"
+        );
+        assert_eq!(
+            find(Some("/elsewhere/helper"), &[named.clone(), helper]).unwrap(),
+            Some(named)
+        );
     }
 
     #[test]
     fn the_server_helper_order_holds_on_both_platforms() {
-        let dir = std::env::temp_dir().join(format!("brindle-server-helper-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("brindle");
-        let remote = dir.join("linux-helper");
-        let server = dir.join("server-helper");
-        let find = |s: Option<&Path>, r: Option<&Path>, windows| {
-            find_server_helper_in(s.map(Into::into), r.map(Into::into), &exe, windows)
+        let dir = PathBuf::from("/opt/brindle");
+        let exes = [dir.join("brindle")];
+        let (remote, server) = (
+            PathBuf::from("/x/linux-helper"),
+            PathBuf::from("/x/server-helper"),
+        );
+        let (helper, exe_helper) = (dir.join("brindle-remote"), dir.join("brindle-remote.exe"));
+        let find = |s: Option<&Path>, r: Option<&Path>, windows, files: &[PathBuf]| {
+            find_server_helper_in(
+                s.map(Into::into),
+                r.map(Into::into),
+                &exes,
+                windows,
+                &only(files),
+            )
         };
         for windows in [false, true] {
-            assert_eq!(find(None, None, windows).unwrap(), None);
+            assert_eq!(find(None, None, windows, &[]).unwrap(), None);
         }
-        // Beside the exe: Linux names, or brindle-remote.exe on Windows.
-        std::fs::write(dir.join("brindle-remote"), b"").unwrap();
-        assert_eq!(find(None, None, false).unwrap(), Some(dir.join("brindle-remote")));
-        assert_eq!(find(None, None, true).unwrap(), None);
-        std::fs::write(dir.join("brindle-remote.exe"), b"").unwrap();
-        assert_eq!(find(None, None, true).unwrap(), Some(dir.join("brindle-remote.exe")));
+        // Beside the exe: Linux names, and on Windows only brindle-remote.exe.
+        assert_eq!(
+            find(None, None, false, &[helper.clone()]).unwrap(),
+            Some(helper.clone())
+        );
+        assert_eq!(find(None, None, true, &[helper.clone()]).unwrap(), None);
+        let beside = [helper.clone(), exe_helper.clone()];
+        assert_eq!(
+            find(None, None, true, &beside).unwrap(),
+            Some(exe_helper.clone())
+        );
         // BRINDLE_REMOTE_AGENT: honoured on Linux, ignored on Windows.
-        std::fs::write(&remote, b"").unwrap();
-        assert_eq!(find(None, Some(&remote), false).unwrap(), Some(remote.clone()));
-        assert_eq!(find(None, Some(&remote), true).unwrap(), Some(dir.join("brindle-remote.exe")));
+        let with_remote = [helper.clone(), exe_helper.clone(), remote.clone()];
+        assert_eq!(
+            find(None, Some(&remote), false, &with_remote).unwrap(),
+            Some(remote.clone())
+        );
+        assert_eq!(
+            find(None, Some(&remote), true, &with_remote).unwrap(),
+            Some(exe_helper.clone())
+        );
         // BRINDLE_SERVER_HELPER wins on both; empty counts as unset.
-        std::fs::write(&server, b"").unwrap();
+        let all = [helper, exe_helper, remote.clone(), server.clone()];
         for windows in [false, true] {
-            assert_eq!(find(Some(&server), Some(&remote), windows).unwrap(), Some(server.clone()));
             assert_eq!(
-                find(Some(Path::new("")), None, windows).unwrap().is_some(),
-                true
+                find(Some(&server), Some(&remote), windows, &all).unwrap(),
+                Some(server.clone())
             );
-            let missing = dir.join("missing");
-            let error = find(Some(&missing), Some(&remote), windows).unwrap_err();
             assert!(
-                error.to_string().contains("BRINDLE_SERVER_HELPER does not name a file"),
+                find(Some(Path::new("")), None, windows, &all)
+                    .unwrap()
+                    .is_some()
+            );
+            let error =
+                find(Some(Path::new("/x/missing")), Some(&remote), windows, &all).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("BRINDLE_SERVER_HELPER does not name a file"),
                 "{error}"
             );
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A WinGet-style install: Brindle started through a link to `brindle`
@@ -337,35 +411,48 @@ mod tests {
     /// the link's directory has one too.
     #[test]
     fn helpers_are_found_beside_the_file_behind_a_link() {
-        let dir = std::env::temp_dir().join(format!("brindle-helper-link-{}", std::process::id()));
+        let (links, real) = (PathBuf::from("/links"), PathBuf::from("/real"));
+        let exes = [links.join("brindle"), real.join("brindle")];
+        let helper = |files: &[PathBuf]| find_helper_in(None, &exes, &only(files)).unwrap();
+        let server = |windows, files: &[PathBuf]| {
+            find_server_helper_in(None, None, &exes, windows, &only(files)).unwrap()
+        };
+        let names = [
+            "brindle-remote-linux-x86_64",
+            "brindle-remote",
+            "brindle-remote.exe",
+        ];
+        let behind: Vec<PathBuf> = names.iter().map(|name| real.join(name)).collect();
+        let linux = real.join("brindle-remote-linux-x86_64");
+        assert_eq!(helper(&behind), Some(linux.clone()));
+        assert_eq!(server(true, &behind), Some(real.join("brindle-remote.exe")));
+        assert_eq!(server(false, &behind), Some(linux));
+        // Beside the link comes first, whichever name it has there.
+        let mut both = behind.clone();
+        both.push(links.join("brindle-remote"));
+        both.push(links.join("brindle-remote.exe"));
+        assert_eq!(helper(&both), Some(links.join("brindle-remote")));
+        assert_eq!(server(true, &both), Some(links.join("brindle-remote.exe")));
+    }
+
+    /// The shell's own resolution: the link as started, then the file behind
+    /// it, and only the one path when the file is no link.
+    #[cfg(unix)]
+    #[test]
+    fn the_exe_paths_are_the_link_then_the_file_behind_it() {
+        let dir = std::env::temp_dir().join(format!("brindle-exe-paths-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         let (real, links) = (dir.join("real"), dir.join("links"));
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir_all(&links).unwrap();
         std::fs::write(real.join("brindle"), b"").unwrap();
         let link = links.join("brindle");
-        #[cfg(unix)]
-        let made = std::os::unix::fs::symlink(real.join("brindle"), &link);
-        #[cfg(windows)]
-        let made = std::os::windows::fs::symlink_file(real.join("brindle"), &link);
-        if let Err(error) = made {
-            // Windows creates symlinks only elevated or in developer mode.
-            eprintln!("skipped: can't create a symlink here: {error}");
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
+        std::os::unix::fs::symlink(real.join("brindle"), &link).unwrap();
         let real = dunce::canonicalize(&real).unwrap();
-        assert_eq!(find_helper_in(None, &link).unwrap(), None);
-        for name in ["brindle-remote-linux-x86_64", "brindle-remote", "brindle-remote.exe"] {
-            std::fs::write(real.join(name), b"").unwrap();
-        }
-        let linux = real.join("brindle-remote-linux-x86_64");
-        assert_eq!(find_helper_in(None, &link).unwrap(), Some(linux.clone()));
-        let server = |windows| find_server_helper_in(None, None, &link, windows).unwrap();
-        assert_eq!(server(true), Some(real.join("brindle-remote.exe")));
-        assert_eq!(server(false), Some(linux));
-        // Beside the link comes first.
-        std::fs::write(links.join("brindle-remote.exe"), b"").unwrap();
-        assert_eq!(server(true), Some(links.join("brindle-remote.exe")));
+        let paths = exe_paths(&link);
+        let alone = exe_paths(&real.join("brindle"));
         std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(paths, [link, real.join("brindle")]);
+        assert_eq!(alone, [real.join("brindle")]);
     }
 }

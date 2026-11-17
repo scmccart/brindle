@@ -215,7 +215,7 @@ pub fn start_role_as(
         .map(|arg| arg.replace(READY_PLACEHOLDER, &READY_FD.to_string()).into())
         .collect();
     let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
-    let mut command = scope::command(decision, role, &program, &args);
+    let mut command = scope::command(decision, &scope::new_unit_name(role), &program, &args);
     command.envs(env.iter().copied());
     configure(&mut command);
     let (child, ready) = spawn_with_ready_pipe(&mut command, READY_FD)?;

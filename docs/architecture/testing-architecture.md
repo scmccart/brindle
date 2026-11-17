@@ -55,6 +55,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 | A change to | Ships with |
 | --- | --- |
 | a pure function or model | unit tests in its file |
+| a pure helper in a harness (`tests/e2e/`, `tests/perf/`) | its `--self-test` |
 | a wire message or field | a transcript test; older fixtures unchanged; the decoder in `fuzz.rs` |
 | holder, core or relay behaviour | a real-process test in `remote-agent/tests/` |
 | anything visible in the window | a named e2e case in `tests/e2e/cases/` |
@@ -66,7 +67,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 
 - **R1.** A test MUST sit in the layer that answers its question, and pure code MUST be tested directly: values in, assertions on the value out, no window, server, fake or sleep. If a rule can only be reached through the e2e suite, it lives in the wrong place (`fcis R1`).
 - **R2.** The app MUST be driven through its own debug hooks (`--send`, `--action`, `--key`, `--modality`, `--wait-for`, `--dump-screen-after`), never through synthetic OS input (XTest, xdotool, `SendInput`): injected input goes to whatever window has focus. A check that needs a new observation adds a line to the dump.
-- **R3.** An expensive suite MUST be an opt-in `harness = false` target with its own runner: an environment variable to enable it, name filters, `--list`, a `--self-test` for the harness's own parsers, and `--shard K/N` taken round-robin after filters. Not libtest `#[ignore]`.
+- **R3.** An expensive suite MUST be an opt-in `harness = false` target with its own runner: an environment variable to enable it, name filters, `--list`, a `--self-test` that tests the harness's own parsers, and `--shard K/N` taken round-robin after filters. Not libtest `#[ignore]`. The `--self-test` SHOULD also test the harness's other pure helpers, since `fcis R8` binds production code and doesn't reach harness code.
 - **R4.** Every run MUST be hermetic: each case has its own config, state directory and server directory, touches nothing of the user's (their config, saved session, running `brindle-remote`) or another case's, keeps its artifacts in its own directory, and cleans up the processes it started. A process still running at the end fails the case.
 - **R5.** Windows MUST NOT open on the user's desktop without asking first. Headless runs go through `scripts/with-xvfb` (a private Xvfb, openbox, lavapipe, `C.UTF-8`, a private session bus). Every delay scales with one factor (`BRINDLE_E2E_SLOW`), the app's own step interval included.
 - **R6.** Expected values MUST come from fixtures the test controls: colours from the `e2e` theme in the generated config, never a built-in theme; content the case typed itself.
@@ -96,7 +97,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 
 ## Enforcement
 
-- `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets` (R3), and `platform_cfgs_stay_in_their_seams`, which holds `ports R4` in production code and leaves test code's platform pairs alone.
+- `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets` and `each_opt_in_runner_has_its_variable_list_and_self_test` (R3: each runner names its `BRINDLE_<SUITE>` variable, `--list` and `--self-test` in code, with `a_runner_without_a_self_test_is_found` testing the search; `--shard` isn't checked yet, since perf has none), and `platform_cfgs_stay_in_their_seams`, which holds `ports R4` in production code and leaves test code's platform pairs alone.
 - Both harnesses hold R4 through `tests/common/server.rs`, which gives each case private directories and a hermetic environment, refuses a missing or stale `brindle-remote`, and fails a case that leaves a `serve` or `hold` running or ran one in a systemd scope.
 - CI runs `cargo test --workspace` and both harness self-tests on every push for Linux and Windows, and the e2e suite in three advisory shards that upload `target/tmp/e2e/` on failure.
 - R1, R2, R5–R17 otherwise rely on review. No lint keeps `std::thread::sleep` or `Instant::now` out of unit tests.

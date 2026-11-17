@@ -1200,9 +1200,10 @@ pub(crate) fn spawn_request(
         Some(program) => (program.clone(), profile.args.clone()),
         None => default_program(&profile.args),
     });
+    let home = dirs::home_dir();
     let working_directory = cwd_override
-        .or_else(|| profile.working_directory())
-        .or_else(dirs::home_dir)
+        .or_else(|| profile.working_directory(home.as_deref()))
+        .or(home)
         .filter(|dir| dir.is_dir());
     let doing = format!("start {program:?}");
     let request = crate::remote::local::SpawnRequest {
@@ -1243,7 +1244,11 @@ fn default_program(args: &[String]) -> (String, Vec<String>) {
 fn default_program(args: &[String]) -> (String, Vec<String>) {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let comspec = std::env::var("COMSPEC").ok();
-    let (program, mut own) = cmdline::windows_default_program(std::env::split_paths(&path), comspec.as_deref());
+    let (program, mut own) = cmdline::windows_default_program(
+        std::env::split_paths(&path),
+        comspec.as_deref(),
+        |path: &std::path::Path| path.is_file(),
+    );
     own.extend_from_slice(args);
     (program, own)
 }

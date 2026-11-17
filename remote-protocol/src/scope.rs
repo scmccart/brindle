@@ -95,14 +95,13 @@ pub fn current() -> Decision {
     current_outcome().decision
 }
 
-/// The command that runs `program args` for `role` (`serve` or `hold`):
-/// through `systemd-run` in a `brindle-<role>-<random>` scope for
-/// [`Decision::Scope`], else directly.
+/// The command that runs `program args`: through `systemd-run` in the scope
+/// `unit` (a [`unit_name`]) for [`Decision::Scope`], else directly.
 ///
 /// `systemd-run --scope` execs the program itself, so a `/proc/self/exe`
 /// program would name `systemd-run`: callers pass `/proc/<own pid>/exe`
 /// instead, which still names their binary after an install replaced it.
-pub fn command(decision: &Decision, role: &str, program: &OsStr, args: &[OsString]) -> Command {
+pub fn command(decision: &Decision, unit: &str, program: &OsStr, args: &[OsString]) -> Command {
     match decision {
         Decision::Plain(_) => {
             let mut command = Command::new(program);
@@ -113,7 +112,7 @@ pub fn command(decision: &Decision, role: &str, program: &OsStr, args: &[OsStrin
             let mut command = Command::new(systemd_run);
             command
                 .args(["--user", "--scope", "--collect", "--quiet"])
-                .arg(format!("--unit={}", unit_name(role)))
+                .arg(format!("--unit={unit}"))
                 .arg("--")
                 .arg(program)
                 .args(args);
@@ -122,14 +121,20 @@ pub fn command(decision: &Decision, role: &str, program: &OsStr, args: &[OsStrin
     }
 }
 
-/// `brindle-<role>-<pid><nanoseconds>` in hex, unique enough for units that
-/// are collected once their processes are gone.
-fn unit_name(role: &str) -> String {
+/// `brindle-<role>-<pid><nanoseconds>` in hex for `role` (`serve` or
+/// `hold`), unique enough for units that are collected once their processes
+/// are gone. `subsec_nanos` is the clock's nanoseconds within its second.
+pub fn unit_name(role: &str, pid: u32, subsec_nanos: u32) -> String {
+    format!("brindle-{role}-{pid:x}{subsec_nanos:08x}")
+}
+
+/// [`unit_name`] for this process now: reads the clock and the pid.
+pub fn new_unit_name(role: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.subsec_nanos())
         .unwrap_or_default();
-    format!("brindle-{role}-{:x}{nanos:08x}", std::process::id())
+    unit_name(role, std::process::id(), nanos)
 }
 
 #[cfg(test)]
@@ -201,21 +206,27 @@ mod tests {
     }
 
     #[test]
+    fn unit_names_are_the_role_pid_and_nanoseconds_in_hex() {
+        assert_eq!(unit_name("serve", 0x4d2, 0x2a), "brindle-serve-4d20000002a");
+        assert_eq!(unit_name("hold", 0x1, 0x3b9a_c9ff), "brindle-hold-13b9ac9ff");
+    }
+
+    #[test]
     fn a_scoped_command_wraps_the_program() {
         let args = [OsString::from("serve"), OsString::from("--ready-fd"), OsString::from("3")];
         let scoped = command(
             &Decision::Scope(PathBuf::from("/usr/bin/systemd-run")),
-            "serve",
+            "brindle-serve-4d20000002a",
             OsStr::new("/opt/brindle-remote"),
             &args,
         );
         assert_eq!(scoped.get_program(), "/usr/bin/systemd-run");
         let got: Vec<_> = scoped.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
         assert_eq!(&got[..4], ["--user", "--scope", "--collect", "--quiet"]);
-        assert!(got[4].starts_with("--unit=brindle-serve-"), "{}", got[4]);
+        assert_eq!(got[4], "--unit=brindle-serve-4d20000002a");
         assert_eq!(&got[5..], ["--", "/opt/brindle-remote", "serve", "--ready-fd", "3"]);
 
-        let plain = command(&Decision::Plain("test"), "hold", OsStr::new("/opt/x"), &args);
+        let plain = command(&Decision::Plain("test"), "brindle-hold-1", OsStr::new("/opt/x"), &args);
         assert_eq!(plain.get_program(), "/opt/x");
         assert_eq!(plain.get_args().collect::<Vec<_>>(), ["serve", "--ready-fd", "3"]);
     }

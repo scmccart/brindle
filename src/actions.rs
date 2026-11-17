@@ -247,13 +247,10 @@ pub fn action_names() -> impl Iterator<Item = String> {
 }
 
 /// The command palette's entries, as (label, action) in table order: every
-/// labelled action for which `available` holds.
-pub fn palette_commands(mut available: impl FnMut(&dyn Action) -> bool) -> Vec<(&'static str, Box<dyn Action>)> {
-    ACTIONS
-        .iter()
-        .filter_map(|(_, label, build)| Some(((*label)?, build())))
-        .filter(|(_, action)| available(&**action))
-        .collect()
+/// labelled action (the hidden ones, such as the menus' openers, have no
+/// label). The workspace keeps those available from the focused tab.
+pub fn palette_commands() -> Vec<(&'static str, Box<dyn Action>)> {
+    ACTIONS.iter().filter_map(|(_, label, build)| Some(((*label)?, build()))).collect()
 }
 
 /// An action's label as a menu item shows it: its command palette label.
@@ -491,7 +488,7 @@ mod tests {
             let action = action_by_name(name).unwrap_or_else(|| panic!("{name} does not resolve"));
             assert!(action.partial_eq(&*build()), "{name}");
         }
-        assert!(palette_commands(|_| true).iter().all(|(_, a)| !a.partial_eq(&OpenCommandPalette) && !a.partial_eq(&NoAction)));
+        assert!(palette_commands().iter().all(|(_, a)| !a.partial_eq(&OpenCommandPalette) && !a.partial_eq(&NoAction)));
     }
 
     /// The tab and zone menus' hidden openers resolve by name and stay out
@@ -501,7 +498,7 @@ mod tests {
         for (name, action) in [("open_tab_menu", &OpenTabMenu as &dyn Action), ("open_zone_menu", &OpenZoneMenu)] {
             assert!(action_by_name(name).is_some_and(|a| a.partial_eq(action)), "{name}");
             assert!(action_names().any(|n| n == name), "{name} isn't listed");
-            assert!(palette_commands(|_| true).iter().all(|(_, a)| !a.partial_eq(action)), "{name} is in the palette");
+            assert!(palette_commands().iter().all(|(_, a)| !a.partial_eq(action)), "{name} is in the palette");
             assert_eq!(menu_label(action), None, "{name}");
         }
         assert_eq!(menu_label(&RenameTab), Some("Rename Tab"));
@@ -610,9 +607,17 @@ mod tests {
         }
     }
 
+    /// The palette's commands are every labelled action in table order; the
+    /// workspace keeps those available from the focused tab, in that order.
     #[test]
     fn palette_lists_only_available_actions() {
         use std::any::TypeId;
+        let commands = palette_commands();
+        let labelled: Vec<&str> = ACTIONS.iter().filter_map(|(_, label, _)| *label).collect();
+        assert_eq!(commands.iter().map(|(l, _)| *l).collect::<Vec<_>>(), labelled);
+        assert!(commands.iter().any(|(l, _)| *l == "Split Zone Right"));
+        assert!(commands.iter().all(|(l, _)| !l.starts_with("tmux")));
+
         // As if focus were in a local terminal: workspace + terminal handlers,
         // a global listener, and ActivateTab (no_json) on the workspace.
         let available = [
@@ -622,11 +627,12 @@ mod tests {
             TypeId::of::<OpenCommandPalette>(),
             TypeId::of::<NoAction>(),
         ];
-        let labels: Vec<&str> =
-            palette_commands(|a| available.contains(&a.as_any().type_id())).into_iter().map(|(l, _)| l).collect();
+        let labels: Vec<&str> = commands
+            .into_iter()
+            .filter(|(_, a)| available.contains(&a.as_any().type_id()))
+            .map(|(l, _)| l)
+            .collect();
         assert_eq!(labels, ["Go to Last Tab", "Clear Scrollback", "Reload Config"]);
-        assert!(palette_commands(|_| true).iter().any(|(l, _)| *l == "Split Zone Right"));
-        assert!(palette_commands(|_| true).iter().all(|(l, _)| !l.starts_with("tmux")));
     }
 
     /// ctrl-shift-d has no default binding anywhere, so it reaches the

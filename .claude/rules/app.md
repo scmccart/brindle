@@ -17,4 +17,4 @@ You are editing the app crate: GPUI entities, the server's client, config, and t
 
 If the code is terminal state both sides need, it belongs in `term-core/`; a wire type, in `remote-protocol/`; a reusable component, in `ui/`. The app never depends on `brindle-remote-agent`.
 
-Enforced by: `tests/architecture.rs` for the crate references and for platform `cfg`s (`platform_cfgs_stay_in_their_seams`); the rest by review (`architecture-review` skill) and the e2e suite.
+Enforced by: `tests/architecture.rs` for the crate references, for platform `cfg`s (`platform_cfgs_stay_in_their_seams`) and for the whole pure modules in `fcis`'s first table, which read no clock, environment, file, process, thread or mutable static (`the_pure_modules_read_nothing_ambient`; a new whole pure module joins that table and `PURE_MODULES` together); the rest, the pure items in shell modules included, by review (`architecture-review` skill) and the e2e suite.

@@ -52,14 +52,13 @@ impl Request {
     pub fn decode(line: &str) -> Result<Self, String> {
         serde_json::from_str(line.trim_end()).map_err(|e| format!("bad request: {e}"))
     }
+}
 
-    /// The activation token this process was started with, if any.
-    pub fn launch_token() -> Option<String> {
-        ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
-            .iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .find(|token| !token.is_empty())
-    }
+/// The activation token a launch was started with, from the values of
+/// `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID`: the first that is set
+/// and not empty.
+pub fn launch_token(xdg: Option<String>, startup_id: Option<String>) -> Option<String> {
+    [xdg, startup_id].into_iter().flatten().find(|token| !token.is_empty())
 }
 
 /// FNV-1a, so every Brindle version names the same directory's socket the
@@ -375,6 +374,18 @@ mod tests {
         assert_eq!(Request::default().encode(), "{}\n");
         assert_eq!(Request::decode("{\"future\": 1}\n"), Ok(Request::default()));
         assert!(Request::decode("nope").is_err());
+    }
+
+    #[test]
+    fn the_launch_token_is_the_first_one_set() {
+        let some = |token: &str| Some(token.to_string());
+        assert_eq!(launch_token(some("xdg"), some("startup")), some("xdg"));
+        assert_eq!(launch_token(None, some("startup")), some("startup"));
+        // An empty one counts as unset.
+        assert_eq!(launch_token(some(""), some("startup")), some("startup"));
+        assert_eq!(launch_token(some("xdg"), some("")), some("xdg"));
+        assert_eq!(launch_token(some(""), some("")), None);
+        assert_eq!(launch_token(None, None), None);
     }
 
     #[test]

@@ -239,16 +239,20 @@ impl Args {
             command: self.command.as_ref().map(|(program, args)| std::iter::once(program.clone()).chain(args.iter().cloned()).collect()),
             attach: self.attach,
             launch_dir: here,
-            activation_token: instance::Request::launch_token(),
+            activation_token: instance::launch_token(
+                std::env::var("XDG_ACTIVATION_TOKEN").ok(),
+                std::env::var("DESKTOP_STARTUP_ID").ok(),
+            ),
         }
     }
 }
 
 fn parse_args() -> Args {
-    parse_args_from(std::env::args().skip(1))
+    parse_args_from(std::env::args().skip(1), dirs::home_dir().as_deref())
 }
 
-fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
+/// The arguments, with a leading `~` in a path expanded to `home`.
+fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Args {
     let mut args = Args::default();
     let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
     while let Some(arg) = it.next() {
@@ -301,7 +305,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
                 }
             }
             "-p" | "--profile" => args.profile = it.next(),
-            "-d" | "--working-directory" => args.cwd = it.next().map(|d| config::expand_tilde(&d)),
+            "-d" | "--working-directory" => args.cwd = it.next().map(|d| config::expand_tilde(&d, home)),
             "--config" => {
                 if let Some(path) = it.next() {
                     // SAFETY: single-threaded at this point.
@@ -337,7 +341,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
             },
             "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
             "--latency-log" => match it.next() {
-                Some(path) => args.latency_log = Some(config::expand_tilde(&path)),
+                Some(path) => args.latency_log = Some(config::expand_tilde(&path, home)),
                 None => usage_error("--latency-log needs a file"),
             },
             "--latency-bench" => match it.next().and_then(|n| n.parse().ok()) {
@@ -347,7 +351,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Args {
             "--install-desktop" => install_desktop = true,
             "--uninstall-desktop" => uninstall_desktop = true,
             "--prefix" => match it.next() {
-                Some(dir) => prefix = Some(config::expand_tilde(&dir)),
+                Some(dir) => prefix = Some(config::expand_tilde(&dir, home)),
                 None => usage_error("--prefix needs a directory"),
             },
             other => usage_error(&format!("unknown argument {other:?}")),
@@ -379,7 +383,9 @@ fn unescape(s: &str) -> String {
     s.replace("\\r", "\r").replace("\\n", "\n").replace("\\e", "\x1b").replace("\\t", "\t")
 }
 
-pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Workspace>> {
+/// Opens Brindle's window on what `launch` asks for. `origin` is this
+/// Brindle's id in its tabs' layouts ([`layout::origin_id`]).
+pub fn open_window(launch: Launch, origin: gpui::SharedString, cx: &mut App) -> Option<gpui::WindowHandle<Workspace>> {
     let (mut width, mut height, mut maximized) = (1000.0, 660.0, false);
     if let Launch::Restore(state) = &launch {
         width = state.width.unwrap_or(width).max(session::MIN_SIZE.0);
@@ -400,7 +406,7 @@ pub fn open_window(launch: Launch, cx: &mut App) -> Option<gpui::WindowHandle<Wo
         app_id: Some("brindle".into()),
         ..Default::default()
     };
-    match cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(launch, window, cx))) {
+    match cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(launch, origin, window, cx))) {
         Ok(handle) => {
             cx.activate(true);
             Some(handle)
@@ -461,7 +467,7 @@ fn start_config_reloads(cx: &mut App) {
 /// name.
 fn apply_config(config: Config, error: Option<String>, renames: &[(String, String)], cx: &mut App) {
     let zoom = Settings::get(cx).zoom;
-    let mut settings = Settings::new(config, error, cx);
+    let mut settings = Settings::from_platform(config, error, cx);
     settings.zoom = zoom;
     cx.set_global(settings);
     Settings::apply_ui_theme(cx);
@@ -996,7 +1002,11 @@ fn main() {
     win::set_app_id();
 
     Application::new().run(move |cx: &mut App| {
-        let settings = Settings::new(config, error, cx);
+        // This Brindle's id in its tabs' layouts, made once: its pid and
+        // when it started.
+        let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        let origin: gpui::SharedString = layout::origin_id(std::process::id(), since_epoch).into();
+        let settings = Settings::from_platform(config, error, cx);
         let profile = match &args.profile {
             Some(name) => settings.config.profile_index(name).unwrap_or_else(|| {
                 log::warn!("no profile named {name:?}");
@@ -1096,7 +1106,7 @@ fn main() {
                 if let Launch::Restore(state) = &startup.first {
                     log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(&state_dir).display());
                 }
-                let Some(window) = open_window(startup.first, cx) else {
+                let Some(window) = open_window(startup.first, origin, cx) else {
                     cx.quit();
                     return;
                 };
@@ -1298,7 +1308,15 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Args {
-        parse_args_from(args.iter().map(|s| s.to_string()))
+        parse_args_from(args.iter().map(|s| s.to_string()), Some(Path::new("/home/u")))
+    }
+
+    #[test]
+    fn a_tilde_in_a_path_argument_is_the_home_directory() {
+        assert_eq!(parse(&["-d", "~/src"]).cwd, Some(PathBuf::from("/home/u/src")));
+        assert_eq!(parse(&["-d", "~"]).cwd, Some(PathBuf::from("/home/u")));
+        assert_eq!(parse(&["--latency-log", "~/l.tsv"]).latency_log, Some(PathBuf::from("/home/u/l.tsv")));
+        assert_eq!(parse(&["-d", "/srv"]).cwd, Some(PathBuf::from("/srv")));
     }
 
     #[test]

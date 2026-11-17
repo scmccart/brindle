@@ -7,6 +7,7 @@
 //! holding `session.lock` reads or writes it, so a second Brindle never
 //! duplicates the first one's tabs.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -97,41 +98,26 @@ impl ZoneNodeState {
 
     /// Builds a `ZoneNodeState` from a `ZoneTree`, returning `None` for a
     /// single-zone tree (which is recorded in the top-level `cwd` and
-    /// `session` alone). `leaf_of` gives a zone's directory and session.
-    pub fn from_tree(
-        tree: &ZoneTree,
-        active: ZoneId,
-        leaf_of: &mut impl FnMut(ZoneId) -> (Option<PathBuf>, Option<ServerSession>),
-    ) -> Option<Self> {
-        if matches!(tree, ZoneTree::Leaf(_)) {
-            return None;
+    /// `session` alone). `leaves` gives each zone's directory and session;
+    /// a zone it leaves out isn't recorded, as in [`record_zones`].
+    pub fn from_tree(tree: &ZoneTree, active: ZoneId, leaves: &HashMap<ZoneId, ZoneRecord>) -> Option<Self> {
+        match tree {
+            ZoneTree::Leaf(_) => None,
+            ZoneTree::Split { .. } => Self::record_node(tree, active, leaves),
         }
-        Some(Self::build_node(tree, active, leaf_of))
     }
 
-    fn build_node(
-        tree: &ZoneTree,
-        active: ZoneId,
-        leaf_of: &mut impl FnMut(ZoneId) -> (Option<PathBuf>, Option<ServerSession>),
-    ) -> Self {
-        Self::record_node(tree, active, &mut |id| Some(leaf_of(id))).expect("every leaf is recorded")
-    }
-
-    /// `tree` as recorded, without the leaves `leaf_of` leaves out: a
-    /// split's other side takes a left-out leaf's place. `None` when no
-    /// leaf is recorded.
-    fn record_node(
-        tree: &ZoneTree,
-        active: ZoneId,
-        leaf_of: &mut impl FnMut(ZoneId) -> Option<(Option<PathBuf>, Option<ServerSession>)>,
-    ) -> Option<Self> {
+    /// `tree` as recorded, without the leaves `leaves` leaves out: a split's
+    /// other side takes a left-out leaf's place. `None` when no leaf is
+    /// recorded.
+    fn record_node(tree: &ZoneTree, active: ZoneId, leaves: &HashMap<ZoneId, ZoneRecord>) -> Option<Self> {
         match tree {
             ZoneTree::Leaf(id) => {
-                let (cwd, session) = leaf_of(*id)?;
+                let ZoneRecord { cwd, session } = leaves.get(id)?.clone();
                 Some(Self { session, ..Self::leaf(cwd, *id == active) })
             }
             ZoneTree::Split { axis, first, second } => {
-                match (Self::record_node(first, active, leaf_of), Self::record_node(second, active, leaf_of)) {
+                match (Self::record_node(first, active, leaves), Self::record_node(second, active, leaves)) {
                     (Some(first), Some(second)) => Some(Self::split(*axis, first, second)),
                     (one, other) => one.or(other),
                 }
@@ -155,6 +141,14 @@ impl ZoneNodeState {
     }
 }
 
+/// What session restore records of one zone, which its view gathers: its
+/// directory and its terminal server session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZoneRecord {
+    pub cwd: Option<PathBuf>,
+    pub session: Option<ServerSession>,
+}
+
 /// What a tab records of its zones ([`record_zones`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedZones {
@@ -167,17 +161,13 @@ pub struct RecordedZones {
 }
 
 /// What a tab records of its zone `tree`: each zone's directory and session
-/// from `leaf_of`, which gives `None` for a zone that only shows a message
+/// from `leaves`, which has no entry for a zone that only shows a message
 /// (an attach that failed, design.md decision 10). Such a zone isn't
 /// recorded: a split's other side takes its place, the first zone left is
 /// active when the active one went, and a tab with no zone left isn't
 /// recorded (`None`).
-pub fn record_zones(
-    tree: &ZoneTree,
-    active: ZoneId,
-    leaf_of: &mut impl FnMut(ZoneId) -> Option<(Option<PathBuf>, Option<ServerSession>)>,
-) -> Option<RecordedZones> {
-    let mut node = ZoneNodeState::record_node(tree, active, leaf_of)?;
+pub fn record_zones(tree: &ZoneTree, active: ZoneId, leaves: &HashMap<ZoneId, ZoneRecord>) -> Option<RecordedZones> {
+    let mut node = ZoneNodeState::record_node(tree, active, leaves)?;
     if node.split.is_none() {
         return Some(RecordedZones { cwd: node.cwd, zones: None, session: node.session });
     }
@@ -457,12 +447,17 @@ pub enum RestoredTab {
         zones: Option<RestoredZoneNode>,
         /// A single-zone tab's recorded session, attached when still detached.
         session: Option<ServerSession>,
+        /// The recorded profile's name when the config has no such profile
+        /// any more (the tab took the default one), for the shell to report.
+        missing_profile: Option<String>,
     },
 }
 
 /// A recorded directory on `host`, else `profile`'s own when the profile
 /// runs there, else home (a remote endpoint's default, the empty path).
-fn resolve_cwd(cwd: Option<&Path>, host: &Host, profile: &Profile, home: &Path) -> PathBuf {
+/// `is_dir` is the probe for a local directory (the shell passes
+/// `Path::is_dir`).
+fn resolve_cwd(cwd: Option<&Path>, host: &Host, profile: &Profile, home: &Path, is_dir: &dyn Fn(&Path) -> bool) -> PathBuf {
     // The profile's directory is a path on its own endpoint.
     let own = (Host::of(profile) == *host).then_some(profile);
     if !host.is_local() {
@@ -471,22 +466,28 @@ fn resolve_cwd(cwd: Option<&Path>, host: &Host, profile: &Profile, home: &Path) 
             .or_else(|| own.and_then(|p| p.cwd.as_deref()).map(PathBuf::from))
             .unwrap_or_default();
     }
-    cwd.filter(|d| d.is_dir())
+    cwd.filter(|d| is_dir(d))
         .map(Path::to_path_buf)
-        .or_else(|| own.and_then(Profile::working_directory).filter(|d| d.is_dir()))
+        .or_else(|| own.and_then(|p| p.working_directory(Some(home))).filter(|d| is_dir(d)))
         .unwrap_or_else(|| home.to_path_buf())
 }
 
-fn resolve_zone_node(node: &ZoneNodeState, host: &Host, profile: &Profile, home: &Path) -> RestoredZoneNode {
+fn resolve_zone_node(
+    node: &ZoneNodeState,
+    host: &Host,
+    profile: &Profile,
+    home: &Path,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> RestoredZoneNode {
     if let (Some(axis), Some(first), Some(second)) = (node.split, node.first.as_deref(), node.second.as_deref()) {
         RestoredZoneNode::Split {
             axis,
-            first: Box::new(resolve_zone_node(first, host, profile, home)),
-            second: Box::new(resolve_zone_node(second, host, profile, home)),
+            first: Box::new(resolve_zone_node(first, host, profile, home, is_dir)),
+            second: Box::new(resolve_zone_node(second, host, profile, home, is_dir)),
         }
     } else {
         RestoredZoneNode::Leaf {
-            cwd: resolve_cwd(node.cwd.as_deref(), host, profile, home),
+            cwd: resolve_cwd(node.cwd.as_deref(), host, profile, home, is_dir),
             active: node.active,
             session: node.session.clone(),
         }
@@ -494,8 +495,10 @@ fn resolve_zone_node(node: &ZoneNodeState, host: &Host, profile: &Profile, home:
 }
 
 /// Resolves a recorded tab against the current config: an unknown profile
-/// becomes the default one, and a vanished directory the profile's own (or
-/// home). `None` for an entry that isn't restored (parsing drops those).
+/// becomes the default one (and is named in `missing_profile`), and a
+/// vanished directory the profile's own (or `home`). `is_dir` is the probe
+/// for whether a local directory is still there. `None` for an entry that
+/// isn't restored (parsing drops those).
 ///
 /// A tab whose zones recorded terminal server sessions stays on the
 /// endpoint it recorded, whatever its profile targets now, so they can be
@@ -503,7 +506,12 @@ fn resolve_zone_node(node: &ZoneNodeState, host: &Host, profile: &Profile, home:
 /// split of the tab would. A tab with no session record follows its
 /// profile, and keeps its directories only when that is still the same
 /// endpoint (the "Remote endpoint identity" requirement).
-pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> Option<RestoredTab> {
+pub fn resolve_tab(
+    tab: &TabState,
+    config: &Config,
+    home: &Path,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> Option<RestoredTab> {
     let (name, recorded_remote, cwd, title, zones, session) = match tab {
         TabState::Local { profile, remote, cwd, title, zones, session } => (
             profile,
@@ -518,23 +526,22 @@ pub fn resolve_tab(tab: &TabState, config: &Config, home: &Path) -> Option<Resto
         ),
         TabState::Skipped => return None,
     };
-    if config.profile_index(name).is_none() {
-        log::warn!("session restore: no profile named {name:?}, using the default profile");
-    }
-    let index = config.profile_index(name).unwrap_or_else(|| config.default_profile_index());
+    let found = config.profile_index(name);
+    let missing_profile = found.is_none().then(|| name.clone());
+    let index = found.unwrap_or_else(|| config.default_profile_index());
     let profile = &config.profiles[index];
     let recorded = recorded_remote.cloned().map_or(Host::Local, Host::Remote);
     let has_session = session.is_some() || zones.is_some_and(ZoneNodeState::has_session);
     let host = if has_session { recorded.clone() } else { Host::of(profile) };
     let same_endpoint = host == recorded;
-    let cwd = resolve_cwd(cwd.filter(|_| same_endpoint), &host, profile, home);
+    let cwd = resolve_cwd(cwd.filter(|_| same_endpoint), &host, profile, home, is_dir);
     let zones = zones
         .filter(|_| same_endpoint)
-        .map(|z| resolve_zone_node(z, &host, profile, home))
+        .map(|z| resolve_zone_node(z, &host, profile, home, is_dir))
         .filter(|z| matches!(z, RestoredZoneNode::Split { .. }));
     // Only with a record, which keeps the tab on its endpoint.
     let session = session.cloned();
-    Some(RestoredTab::Local { profile: index, host, cwd, title, zones, session })
+    Some(RestoredTab::Local { profile: index, host, cwd, title, zones, session, missing_profile })
 }
 
 /// The recorded windows as the one window Brindle has: every window's tabs
@@ -930,13 +937,28 @@ mod tests {
         .unwrap()
     }
 
+    /// A probe that answers yes for `dirs` alone: the directories that exist.
+    fn only<'a>(dirs: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+        move |dir| dirs.iter().any(|d| Path::new(d) == dir)
+    }
+
+    /// No directory exists: every lookup falls back.
+    fn none_exist(_: &Path) -> bool {
+        false
+    }
+
+    fn local_tab(profile: &str, cwd: Option<&str>) -> TabState {
+        TabState::Local { profile: profile.into(), remote: None, cwd: cwd.map(PathBuf::from), title: None, zones: None, session: None }
+    }
+
     #[test]
     fn resolve_fallbacks() {
         let config = config();
         let home = Path::new("/home/nobody");
-        let local = |profile: &str, cwd: Option<&str>| TabState::Local { profile: profile.into(), remote: None, cwd: cwd.map(PathBuf::from), title: None, zones: None, session: None };
-        let tmp = std::env::temp_dir();
-        let tmp = tmp.to_str().unwrap();
+        let work = "/srv/work";
+        let existing = [work, "/"];
+        let is_dir = only(&existing);
+        let resolve = |tab: &TabState| resolve_tab(tab, &config, home, &is_dir);
         let restored = |profile, cwd: &str, title: Option<&str>| {
             Some(RestoredTab::Local {
                 profile,
@@ -945,27 +967,47 @@ mod tests {
                 title: title.map(Into::into),
                 zones: None,
                 session: None,
+                missing_profile: None,
             })
         };
         // Recorded directory kept.
-        assert_eq!(resolve_tab(&local("Shell", Some(tmp)), &config, home), restored(0, tmp, None));
-        // Missing profile: the default one.
-        assert_eq!(resolve_tab(&local("Gone", Some(tmp)), &config, home), restored(0, tmp, None));
+        assert_eq!(resolve(&local_tab("Shell", Some(work))), restored(0, work, None));
         // Deleted directory: home, or the profile's own directory.
-        let gone = "/nonexistent/brindle-dir";
-        assert_eq!(resolve_tab(&local("Shell", Some(gone)), &config, home), restored(0, "/home/nobody", None));
-        assert_eq!(resolve_tab(&local("shell", None), &config, home), restored(0, "/home/nobody", None));
-        assert_eq!(resolve_tab(&local("Pinned", Some(gone)), &config, home), restored(1, "/", None));
+        let gone = "/srv/gone";
+        assert_eq!(resolve(&local_tab("Shell", Some(gone))), restored(0, "/home/nobody", None));
+        assert_eq!(resolve(&local_tab("shell", None)), restored(0, "/home/nobody", None));
+        assert_eq!(resolve(&local_tab("Pinned", Some(gone))), restored(1, "/", None));
+        // The profile's own directory gone too: home.
+        assert_eq!(resolve_tab(&local_tab("Pinned", Some(gone)), &config, home, &none_exist), restored(1, "/home/nobody", None));
         // Recorded manual title is preserved for local tabs (and trimmed/ignored if empty).
         assert_eq!(
-            resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("server".into()), zones: None, session: None }, &config, home),
-            restored(0, tmp, Some("server"))
+            resolve(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(work.into()), title: Some("server".into()), zones: None, session: None }),
+            restored(0, work, Some("server"))
         );
         assert_eq!(
-            resolve_tab(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(tmp.into()), title: Some("  ".into()), zones: None, session: None }, &config, home),
-            restored(0, tmp, None)
+            resolve(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(work.into()), title: Some("  ".into()), zones: None, session: None }),
+            restored(0, work, None)
         );
-        assert_eq!(resolve_tab(&TabState::Skipped, &config, home), None);
+        assert_eq!(resolve(&TabState::Skipped), None);
+    }
+
+    #[test]
+    fn a_missing_profile_is_named_on_the_restored_tab() {
+        let config = config();
+        let home = Path::new("/home/nobody");
+        let Some(RestoredTab::Local { profile, cwd, missing_profile, .. }) =
+            resolve_tab(&local_tab("Gone", Some("/srv/work")), &config, home, &only(&["/srv/work"]))
+        else {
+            panic!("not local")
+        };
+        // The default profile takes its place, in the recorded directory.
+        assert_eq!((profile, cwd, missing_profile), (0, PathBuf::from("/srv/work"), Some("Gone".to_string())));
+        // A profile found under another case isn't missing.
+        let Some(RestoredTab::Local { profile, missing_profile, .. }) = resolve_tab(&local_tab("pinned", None), &config, home, &none_exist)
+        else {
+            panic!("not local")
+        };
+        assert_eq!((profile, missing_profile), (1, None));
     }
 
     #[test]
@@ -1028,8 +1070,9 @@ mod tests {
             "[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"R\"\nremote = { type = \"ssh\", host = \"h\" }\n",
         )
         .unwrap();
-        let home = Path::new("/");
-        let Some(RestoredTab::Local { session: kept, host, .. }) = resolve_tab(&state.windows[0].tabs[0], &config, home)
+        let home = Path::new("/home/u");
+        let Some(RestoredTab::Local { session: kept, host, .. }) =
+            resolve_tab(&state.windows[0].tabs[0], &config, home, &none_exist)
         else {
             panic!("not local")
         };
@@ -1043,7 +1086,7 @@ mod tests {
             zones: None,
             session: Some(session.clone()),
         };
-        let Some(RestoredTab::Local { session: kept, host, .. }) = resolve_tab(&remote, &config, home) else {
+        let Some(RestoredTab::Local { session: kept, host, .. }) = resolve_tab(&remote, &config, home, &none_exist) else {
             panic!("not local")
         };
         assert_eq!((kept, host), (Some(session), Host::Remote(target)));
@@ -1080,7 +1123,8 @@ mod tests {
         let old = Host::Remote(ssh("old-host"));
 
         // A single zone: the profile now points to new-host.
-        let Some(RestoredTab::Local { profile, host, cwd, session, .. }) = resolve_tab(&tab("Remote", None, s(7)), &moved, home)
+        let Some(RestoredTab::Local { profile, host, cwd, session, .. }) =
+            resolve_tab(&tab("Remote", None, s(7)), &moved, home, &none_exist)
         else {
             panic!("not local")
         };
@@ -1088,7 +1132,7 @@ mod tests {
 
         // A split, under a profile that is gone (the default is local).
         let Some(RestoredTab::Local { profile, host, zones, .. }) =
-            resolve_tab(&tab("Gone", Some(split.clone()), None), &moved, home)
+            resolve_tab(&tab("Gone", Some(split.clone()), None), &moved, home, &none_exist)
         else {
             panic!("not local")
         };
@@ -1100,7 +1144,7 @@ mod tests {
         // No record: the profile's endpoint, its directory, no zones.
         let unrecorded = ZoneNodeState::split(SplitAxis::Vertical, leaf("/srv/a", None, true), leaf("/srv/b", None, false));
         let Some(RestoredTab::Local { host, cwd, zones, session, .. }) =
-            resolve_tab(&tab("Remote", Some(unrecorded), None), &moved, home)
+            resolve_tab(&tab("Remote", Some(unrecorded), None), &moved, home, &none_exist)
         else {
             panic!("not local")
         };
@@ -1117,12 +1161,10 @@ mod tests {
         tree.split(z1, SplitAxis::Horizontal, z2);
         tree.split(z2, SplitAxis::Vertical, z3);
         let session = |id: u32| Some(ServerSession { id, key: format!("k{id}") });
-        // Zone 2, the active one, failed to attach.
-        let mut leaf_of = |id: ZoneId| match id {
-            ZoneId(2) => None,
-            ZoneId(n) => Some((Some(PathBuf::from(format!("/d{n}"))), session(n as u32))),
-        };
-        let recorded = record_zones(&tree, z2, &mut leaf_of).unwrap();
+        let record = |n: u64, session| (ZoneId(n), ZoneRecord { cwd: Some(PathBuf::from(format!("/d{n}"))), session });
+        // Zone 2, the active one, failed to attach: it has no entry.
+        let leaves: HashMap<ZoneId, ZoneRecord> = [record(1, session(1)), record(3, session(3))].into();
+        let recorded = record_zones(&tree, z2, &leaves).unwrap();
         let first = ZoneNodeState { session: session(1), ..ZoneNodeState::leaf(Some("/d1".into()), true) };
         let third = ZoneNodeState { session: session(3), ..ZoneNodeState::leaf(Some("/d3".into()), false) };
         assert_eq!(recorded.zones, Some(ZoneNodeState::split(SplitAxis::Horizontal, first, third)));
@@ -1131,16 +1173,16 @@ mod tests {
         // One zone left: recorded as a single-zone tab, with its session.
         let mut two = ZoneTree::new(z1);
         two.split(z1, SplitAxis::Vertical, z2);
-        let recorded = record_zones(&two, z1, &mut leaf_of).unwrap();
+        let recorded = record_zones(&two, z1, &leaves).unwrap();
         assert_eq!(recorded, RecordedZones { cwd: Some("/d1".into()), zones: None, session: session(1) });
 
         // Every zone failed: nothing is recorded.
-        assert_eq!(record_zones(&ZoneTree::new(z2), z2, &mut leaf_of), None);
-        assert_eq!(record_zones(&two, z1, &mut |_| None), None);
+        assert_eq!(record_zones(&ZoneTree::new(z2), z2, &leaves), None);
+        assert_eq!(record_zones(&two, z1, &HashMap::new()), None);
         // Nothing left out: the same as `from_tree`.
-        let all = record_zones(&tree, z3, &mut |id| Some((Some(PathBuf::from(format!("/d{}", id.0))), None))).unwrap();
-        let built = ZoneNodeState::from_tree(&tree, z3, &mut |id| (Some(PathBuf::from(format!("/d{}", id.0))), None));
-        assert_eq!(all.zones, built);
+        let every: HashMap<ZoneId, ZoneRecord> = [record(1, None), record(2, None), record(3, None)].into();
+        let all = record_zones(&tree, z3, &every).unwrap();
+        assert_eq!(all.zones, ZoneNodeState::from_tree(&tree, z3, &every));
         assert_eq!(all.cwd, Some("/d3".into()));
     }
 
@@ -1159,7 +1201,7 @@ mod tests {
             session: None,
         };
         assert_eq!(
-            resolve_tab(&tab, &config, Path::new("/local/home")),
+            resolve_tab(&tab, &config, Path::new("/local/home"), &none_exist),
             Some(RestoredTab::Local {
                 profile: 0,
                 host: Host::Remote(ssh("new-host")),
@@ -1167,6 +1209,7 @@ mod tests {
                 title: None,
                 zones: None,
                 session: None,
+                missing_profile: None,
             })
         );
     }
@@ -1374,27 +1417,26 @@ mod tests {
         let z2 = ZoneId(2);
         let z3 = ZoneId(3);
 
+        let record = |id, cwd: &str, session| (id, ZoneRecord { cwd: Some(cwd.into()), session });
+
         // Single-zone tree produces None so session.toml is unchanged.
         let single = ZoneTree::new(z1);
-        assert_eq!(ZoneNodeState::from_tree(&single, z1, &mut |_| (Some("/tmp".into()), None)), None);
+        assert_eq!(ZoneNodeState::from_tree(&single, z1, &[record(z1, "/srv", None)].into()), None);
 
         // 2-zone and nested 3-zone trees round-trip through TOML.
         let mut two = ZoneTree::new(z1);
         two.split(z1, SplitAxis::Horizontal, z2);
-        let two_state = ZoneNodeState::from_tree(&two, z2, &mut |id| match id {
-            ZoneId(1) => (Some("/a".into()), Some(ServerSession { id: 1, key: "k1".into() })),
-            _ => (Some("/b".into()), None),
-        })
-        .unwrap();
+        let leaves = [record(z1, "/a", Some(ServerSession { id: 1, key: "k1".into() })), record(z2, "/b", None)];
+        let two_state = ZoneNodeState::from_tree(&two, z2, &leaves.into()).unwrap();
 
         let mut three = two.clone();
         three.split(z2, SplitAxis::Vertical, z3);
-        let three_state = ZoneNodeState::from_tree(&three, z3, &mut |id| match id {
-            ZoneId(1) => (Some("/a".into()), None),
-            ZoneId(2) => (Some("/b".into()), Some(ServerSession { id: 7, key: "k7".into() })),
-            _ => (Some("/c".into()), None),
-        })
-        .unwrap();
+        let leaves = [
+            record(z1, "/a", None),
+            record(z2, "/b", Some(ServerSession { id: 7, key: "k7".into() })),
+            record(z3, "/c", None),
+        ];
+        let three_state = ZoneNodeState::from_tree(&three, z3, &leaves.into()).unwrap();
 
         let state = State::new(vec![WindowState {
             width: Some(800.0),
@@ -1426,8 +1468,8 @@ mod tests {
         // Resolving a zone tree applies directory fallbacks per zone and reconstructs ZoneTree.
         let config = config();
         let home = Path::new("/home/nobody");
-        let tmp = std::env::temp_dir();
-        let gone = PathBuf::from("/nonexistent/brindle-zone-dir");
+        let tmp = PathBuf::from("/srv/work");
+        let gone = PathBuf::from("/srv/gone");
         let mixed = ZoneNodeState::split(
             SplitAxis::Horizontal,
             ZoneNodeState::leaf(Some(tmp.clone()), false),
@@ -1445,7 +1487,9 @@ mod tests {
             zones: Some(mixed),
             session: None,
         };
-        let Some(RestoredTab::Local { profile, cwd, title, zones, .. }) = resolve_tab(&tab, &config, home) else {
+        let Some(RestoredTab::Local { profile, cwd, title, zones, .. }) =
+            resolve_tab(&tab, &config, home, &only(&["/srv/work"]))
+        else {
             panic!("expected RestoredTab::Local");
         };
         assert_eq!(profile, 0);
