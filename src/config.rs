@@ -435,13 +435,90 @@ fn write_default(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, DEFAULT_CONFIG)?;
+    write_replacing(path, DEFAULT_CONFIG)?;
     Ok(())
+}
+
+/// Writes `text` to `path` in one step, so a reader (another Brindle, a
+/// reload) finds the old file or the new one, never part of it: into
+/// `<name>.<pid>.tmp` beside it (the pid keeps two processes' writes apart),
+/// synced to disk, then renamed over it. The temp file is removed when a
+/// step fails. `path` is replaced, not written through: a caller that keeps
+/// a symlink resolves it first.
+pub fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{} names no file", path.display())));
+    };
+    let mut temp_name = name.to_os_string();
+    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let temp = path.with_file_name(temp_name);
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    let replaced = written.and_then(|()| std::fs::rename(&temp, path));
+    if replaced.is_err() {
+        std::fs::remove_file(&temp).ok();
+    }
+    replaced
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty directory of this test's own.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("brindle-config-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_replaced_file_has_the_new_text_and_no_temp_file_is_left() {
+        let dir = temp_dir("replace");
+        let path = dir.join("config.toml");
+        write_replacing(&path, "theme = \"one\"\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme = \"one\"\n");
+        write_replacing(&path, "theme = \"two\"\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme = \"two\"\n");
+        assert_eq!(files_in(&dir), ["config.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename that fails (the target is a directory) leaves the target as
+    /// it was and no temp file.
+    #[test]
+    fn a_failed_replace_leaves_no_temp_file() {
+        let dir = temp_dir("replace-fails");
+        let path = dir.join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_replacing(&path, "theme = \"one\"\n").is_err());
+        assert!(path.is_dir());
+        assert_eq!(files_in(&dir), ["config.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_default_creates_the_directory_and_the_default_config() {
+        let dir = temp_dir("default");
+        let path = dir.join("brindle").join("config.toml");
+        write_default(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
+        assert_eq!(files_in(&dir.join("brindle")), ["config.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn default_config_file_parses() {

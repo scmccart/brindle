@@ -12,6 +12,7 @@
 //!   [`Terminal::feed`]; it has no program, so input goes nowhere.
 
 pub mod cmdline;
+pub mod events;
 pub mod keys;
 pub mod links;
 pub mod mouse;
@@ -37,11 +38,12 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
-use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::StreamExt as _;
 use gpui::{ClipboardItem, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
+use self::events::{EventGate, Merge, Recovered};
 use self::pace::Pace;
 use self::shell_integration::{Marks, Parser};
 
@@ -71,46 +73,58 @@ pub enum ChannelEvent {
     /// a title may show.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Foreground,
+    /// A merged event's marker: its latest value, if it has one, is in the
+    /// gate's slot ([`events::EventGate`]).
+    Merged(Merge),
+    /// Brindle's emulator failed on the session's output, saying this: the
+    /// session was let go, detached, and the tab can't show it any more.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Broken(String),
+    /// Input was refused, the first time since input was last taken: too
+    /// much of the tab's earlier input still waits to reach its session.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    InputRefused,
 }
 
-/// One update's worth of [`ChannelEvent`]s, with its `Wakeup`s and title
-/// changes counted once each. A flood sends a `Wakeup` per read, and a
-/// program can retitle the console for every command (cmd does, in a
-/// loop); each `TitleChanged` can cost process snapshots, when the title is
-/// a console one and the tab falls back to the foreground process's name.
-struct Batch {
-    /// The other events, in order.
-    rest: Vec<ChannelEvent>,
-    woke: bool,
-    /// The last title change: `Some(None)` is a reset.
-    title: Option<Option<String>>,
+/// Where a terminal's events go: through its [`EventGate`] onto the
+/// channel its event task drains, on whichever thread produced them (the
+/// connection's reader while it parses, or the UI thread).
+#[derive(Clone)]
+pub struct Listener {
+    tx: UnboundedSender<ChannelEvent>,
+    output: Arc<OutputMarker>,
+    /// A leaf lock: taken last, with the parser and term locks held when
+    /// alacritty sends mid-parse, and nothing taken under it.
+    gate: Arc<Mutex<EventGate>>,
 }
 
-impl Batch {
-    fn coalesce(events: Vec<ChannelEvent>) -> Self {
-        let mut batch = Self { rest: Vec::with_capacity(events.len()), woke: false, title: None };
-        for event in events {
-            match event {
-                ChannelEvent::Alac(AlacEvent::Wakeup) => batch.woke = true,
-                ChannelEvent::Alac(AlacEvent::Title(title)) => batch.title = Some(Some(title)),
-                ChannelEvent::Alac(AlacEvent::ResetTitle) => batch.title = Some(None),
-                other => batch.rest.push(other),
-            }
+impl Listener {
+    /// A listener, and the channel its events arrive on.
+    fn channel() -> (Self, UnboundedReceiver<ChannelEvent>) {
+        let (tx, rx) = unbounded();
+        let listener = Self { tx, output: Arc::default(), gate: Arc::default() };
+        (listener, rx)
+    }
+
+    /// Queues `event` for the UI thread as the gate says: a merged one's
+    /// marker only when none waits, a side one dropped past the gate's
+    /// marks. The channel is unbounded; the gate is what bounds it.
+    pub fn send(&self, event: ChannelEvent) {
+        let mut gate = self.gate.lock();
+        if let Some(event) = gate.pass(event) {
+            // Under the gate's lock, so the channel's order is the gate's.
+            self.tx.unbounded_send(event).ok();
         }
-        batch
     }
 }
-
-#[derive(Clone)]
-pub struct Listener(UnboundedSender<ChannelEvent>, Arc<OutputMarker>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: AlacEvent) {
         if matches!(event, AlacEvent::Wakeup) {
             // On the thread that parsed new output, right after it did.
-            self.1.advance(Instant::now());
+            self.output.advance(Instant::now());
         }
-        self.0.unbounded_send(ChannelEvent::Alac(event)).ok();
+        self.send(ChannelEvent::Alac(event));
     }
 }
 
@@ -244,7 +258,13 @@ impl Closing {
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
+    /// What `term` was made with, for the one that replaces it when
+    /// Brindle's emulator fails ([`Terminal::broken`]).
+    term_config: term::Config,
     backend: Backend,
+    /// The term's listener: the UI thread's own events (a refused input's
+    /// line) go through it too.
+    listener: Listener,
     output: Arc<OutputMarker>,
     /// The vte processor and OSC 133 scanner. Locked before `term`; a server
     /// session's reader thread uses it too (see `server.rs`).
@@ -295,42 +315,26 @@ fn term_config(config: &Config) -> term::Config {
 }
 
 impl Terminal {
-    fn spawn_events(
-        rx: futures::channel::mpsc::UnboundedReceiver<ChannelEvent>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
+    /// Drains the terminal's events in chunks, paced ([`pace`]), and applies
+    /// them in order. The gate learns once per chunk what was taken, before
+    /// its markers read their slots, so a value put after that has a marker
+    /// of its own.
+    fn spawn_events(rx: UnboundedReceiver<ChannelEvent>, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut rx = rx.ready_chunks(1024);
             let mut pace = Pace::default();
-            while let Some(events) = rx.next().await {
+            while let Some(chunk) = rx.next().await {
                 pace.wait(cx).await;
                 let alive = this.update(cx, |this, cx| {
-                    // Titles and wakeups count once per update, as in one batch.
-                    let (mut title, mut woke) = (None, false);
-                    pace::drain(&mut rx, events, |events| {
-                        let batch = Batch::coalesce(events);
-                        for event in batch.rest {
-                            match event {
-                                ChannelEvent::Alac(event) => this.handle_event(event, cx),
-                                ChannelEvent::Osc(found) => this.handle_found(found, cx),
-                                ChannelEvent::Replay(active) => this.replaying = active,
-                                ChannelEvent::Lost => this.mark_lost(cx),
-                                ChannelEvent::Failed => {
-                                    this.failed = true;
-                                    this.mark_lost(cx);
-                                }
-                                ChannelEvent::Foreground => cx.emit(TerminalEvent::TitleChanged),
-                            }
+                    pace::drain(&mut rx, chunk, |chunk| {
+                        let recovered = this.listener.gate.lock().took(chunk.iter().map(events::kind_of));
+                        for event in chunk {
+                            this.apply(event, cx);
                         }
-                        title = batch.title.or(title.take());
-                        woke |= batch.woke;
+                        if let Some(recovered) = recovered {
+                            this.recovered(recovered, cx);
+                        }
                     });
-                    if let Some(title) = title {
-                        this.set_title(title, cx);
-                    }
-                    if woke {
-                        this.handle_event(AlacEvent::Wakeup, cx);
-                    }
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -341,11 +345,65 @@ impl Terminal {
         })
     }
 
+    /// Acts on one event from the channel.
+    fn apply(&mut self, event: ChannelEvent, cx: &mut Context<Self>) {
+        match event {
+            ChannelEvent::Alac(event) => self.handle_event(event, cx),
+            ChannelEvent::Osc(found) => self.handle_found(found, cx),
+            ChannelEvent::Merged(merge) => self.merged(merge, cx),
+            // Never queued as itself: the gate turns it into its marker.
+            ChannelEvent::Foreground => self.merged(Merge::Foreground, cx),
+            ChannelEvent::Replay(active) => self.replaying = active,
+            ChannelEvent::Lost => self.mark_lost(cx),
+            ChannelEvent::Failed => {
+                self.failed = true;
+                self.mark_lost(cx);
+            }
+            ChannelEvent::Broken(reason) => self.broken(&reason, cx),
+            ChannelEvent::InputRefused => self.show(INPUT_REFUSED, cx),
+        }
+    }
+
+    /// A merged event's marker: its slot's latest value, if any.
+    fn merged(&mut self, merge: Merge, cx: &mut Context<Self>) {
+        match merge {
+            Merge::Wakeup => self.handle_event(AlacEvent::Wakeup, cx),
+            Merge::Title => {
+                let title = self.listener.gate.lock().take_title();
+                if let Some(title) = title {
+                    self.set_title(title, cx);
+                }
+            }
+            Merge::Foreground => cx.emit(TerminalEvent::TitleChanged),
+            Merge::Clipboard(ty) => {
+                let text = self.listener.gate.lock().take_clipboard(ty);
+                if let Some(text) = text {
+                    self.store_clipboard(ty, text, cx);
+                }
+            }
+        }
+    }
+
+    /// The gate dropped side events while the UI thread was behind, and is
+    /// back under its marks. A dropped status report leaves the records
+    /// stale, so they start over and the tab's dot is recomputed.
+    fn recovered(&mut self, recovered: Recovered, cx: &mut Context<Self>) {
+        let Recovered { dropped, statuses } = recovered;
+        log::warn!(
+            "a terminal's events came faster than the window took them: {dropped} were dropped{}",
+            if statuses { ", status reports among them, so its status starts over" } else { "" }
+        );
+        if statuses {
+            self.status.reset();
+            cx.emit(TerminalEvent::Status(None));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         term: Arc<FairMutex<Term<Listener>>>,
-        output: Arc<OutputMarker>,
-        rx: futures::channel::mpsc::UnboundedReceiver<ChannelEvent>,
+        listener: Listener,
+        rx: UnboundedReceiver<ChannelEvent>,
         backend: Backend,
         parser: Arc<Mutex<Parser>>,
         marks: Arc<Mutex<Marks>>,
@@ -357,8 +415,10 @@ impl Terminal {
         Self {
             _events: Self::spawn_events(rx, cx),
             term,
+            term_config: term_config(config),
             backend,
-            output,
+            output: listener.output.clone(),
+            listener,
             parser,
             marks,
             size,
@@ -421,17 +481,15 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (tx, rx) = unbounded();
-        let output = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, output.clone());
+        let (listener, rx) = Listener::channel();
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, doing);
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
         let session = crate::remote::local::Session::start(host.clone(), request, Box::new(sink));
         let backend = Backend::Server { session, closing, host: host.clone() };
-        Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx)
+        Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx)
     }
 
     /// Attaches a detached session of `host`'s terminal server: its replay,
@@ -451,9 +509,7 @@ impl Terminal {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (tx, rx) = unbounded();
-        let output = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, output.clone());
+        let (listener, rx) = Listener::channel();
         // The session's size: the replay is rendered at it, and the first
         // layout resizes the session only if the window's grid differs. A
         // recorded session's comes with its listing.
@@ -476,27 +532,26 @@ impl Terminal {
         } else {
             format!("attach session {} ({what})", request.session)
         };
-        let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, doing);
+        let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
         if !recorded {
             sink = sink.replayed_at(size);
         }
         let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
         let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
         let theme = config.profile_theme(profile);
-        let mut this = Self::new(term, output, rx, backend, parser, marks, size, theme, config, cx);
+        let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
         this.attaching = true;
         this
     }
 
     /// A read-only terminal showing `text` (used to report errors in a tab).
     pub fn message(text: &str, theme: Theme, config: &Config, cx: &mut Context<Self>) -> Self {
-        let (tx, rx) = unbounded();
-        let output = Arc::new(OutputMarker::default());
+        let (listener, rx) = Listener::channel();
         let size = GridSize::default();
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(Parser::new(process::LOCAL_PATH_STYLE)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        let mut this = Self::new(term, output, rx, Backend::Remote, parser, marks, size, theme, config, cx);
+        let mut this = Self::new(term, listener, rx, Backend::Remote, parser, marks, size, theme, config, cx);
         this.feed(text.as_bytes(), cx);
         this
     }
@@ -653,13 +708,7 @@ impl Terminal {
             }
             AlacEvent::Title(title) => self.set_title(Some(title), cx),
             AlacEvent::ResetTitle => self.set_title(None, cx),
-            AlacEvent::ClipboardStore(kind, text) => {
-                let item = ClipboardItem::new_string(text);
-                match kind {
-                    ClipboardType::Clipboard => cx.write_to_clipboard(item),
-                    ClipboardType::Selection => crate::primary::write_primary(cx, item),
-                }
-            }
+            AlacEvent::ClipboardStore(kind, text) => self.store_clipboard(kind, text, cx),
             // Only sent when the config allows OSC 52 reads (see `term_config`).
             AlacEvent::ClipboardLoad(kind, format) => {
                 let item = match kind {
@@ -677,7 +726,61 @@ impl Terminal {
             AlacEvent::TextAreaSizeRequest(format) => self.write(format(self.size.into()).into_bytes()),
             AlacEvent::Bell => self.emit_from_output(TerminalEvent::Bell, cx),
             AlacEvent::Exit | AlacEvent::ChildExit(_) => self.mark_exited(cx),
-            _ => {}
+            // Never queued: the gate ignores them (`events::kind_of`).
+            AlacEvent::MouseCursorDirty | AlacEvent::CursorBlinkingChange => {}
+        }
+    }
+
+    /// A program's clipboard write (OSC 52).
+    fn store_clipboard(&mut self, kind: ClipboardType, text: String, cx: &mut Context<Self>) {
+        let item = ClipboardItem::new_string(text);
+        match kind {
+            ClipboardType::Clipboard => cx.write_to_clipboard(item),
+            ClipboardType::Selection => crate::primary::write_primary(cx, item),
+        }
+    }
+
+    /// Writes Brindle's own `text` into the terminal as output is written,
+    /// under parser → term → marks, so it lands between the program's reads.
+    fn show(&mut self, text: &str, cx: &mut Context<Self>) {
+        {
+            let mut parser = self.parser.lock();
+            let mut term = self.term.lock_unfair();
+            parser.advance(&mut *term, &self.marks, text.as_bytes());
+        }
+        cx.notify();
+    }
+
+    /// Brindle's emulator failed on the session's output, which the
+    /// connection let go, detached: the program runs on, but this tab
+    /// can't show it. A panic in the middle of a `Term` update can leave
+    /// its grid inconsistent, and painting it could end Brindle, so the
+    /// emulator's state is replaced, not kept as a lost tab's last screen
+    /// is. The tab stays open, saying why and how to get the session back,
+    /// and counts as ended: nothing records it, and closing it sends
+    /// nothing.
+    fn broken(&mut self, reason: &str, cx: &mut Context<Self>) {
+        let (fresh_parser, fresh_term) =
+            (self.fresh_parser(), Term::new(self.term_config.clone(), &self.size, self.listener.clone()));
+        {
+            let mut parser = self.parser.lock();
+            let mut term = self.term.lock_unfair();
+            *parser = fresh_parser;
+            *term = fresh_term;
+            *self.marks.lock() = Marks::default();
+        }
+        self.status.reset();
+        cx.emit(TerminalEvent::Status(None));
+        self.show(&broken_line(reason), cx);
+        self.mark_lost(cx);
+    }
+
+    /// A parser like the one the terminal was made with.
+    fn fresh_parser(&self) -> Parser {
+        match &self.backend {
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { host, .. } => parser_for(host),
+            Backend::Remote => Parser::new(process::LOCAL_PATH_STYLE),
         }
     }
 
@@ -688,8 +791,11 @@ impl Terminal {
     }
 
     /// Writes raw bytes to the program: input, and the replies the emulator
-    /// generates (device, color and size reports). A message terminal has
-    /// no program, so they go nowhere.
+    /// generates (device, color and size reports), all counted against the
+    /// session's input budget. The first refusal of a crossing puts a line
+    /// in the tab (through the event task, as this has no context); later
+    /// ones add nothing. A message terminal has no program, so they go
+    /// nowhere.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let bytes = bytes.into();
         if bytes.is_empty() {
@@ -697,7 +803,13 @@ impl Terminal {
         }
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, .. } => session.input(&bytes),
+            Backend::Server { session, .. } => {
+                use crate::remote::budget::{Delivery, Refusal};
+                match session.input(&bytes) {
+                    Delivery::Refused(Refusal::First) => self.listener.send(ChannelEvent::InputRefused),
+                    Delivery::Queued | Delivery::Refused(Refusal::Again) | Delivery::Discarded => {}
+                }
+            }
             Backend::Remote => {}
         }
     }
@@ -1165,6 +1277,20 @@ fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
 /// How far dim text and dim palette colors fade towards the background.
 pub const DIM_FACTOR: f32 = 0.4;
 
+/// What a tab says, once per crossing of its input budget, when input is
+/// refused ([`crate::remote::budget`]).
+const INPUT_REFUSED: &str =
+    "\r\n\x1b[2minput not sent: 4 MiB of earlier input is still waiting to reach this session\x1b[22m\r\n";
+
+/// What a tab whose emulator failed says in place of its screen.
+fn broken_line(reason: &str) -> String {
+    format!(
+        "\x1b[31mBrindle can't show this session any more:\x1b[0m {}\r\n\
+         It keeps running, detached: attach it again from Attach Session…\r\n",
+        reason.replace('\n', "\r\n")
+    )
+}
+
 /// What a new terminal of `profile` on `host` asks that host's server to
 /// run, and what starting it is called in an error. A remote host's
 /// session is left to it: its login shell when the profile names no
@@ -1390,33 +1516,30 @@ mod tests {
         assert_eq!(command.policy, Policy::Kill);
     }
 
+    /// What reaches the event task through a listener: its waiting merged
+    /// events once each, the latest title in the gate's slot.
     #[test]
-    fn batch_counts_wakeups_and_titles_once() {
-        let title = |t: &str| ChannelEvent::Alac(AlacEvent::Title(t.into()));
-        let events = vec![
-            ChannelEvent::Alac(AlacEvent::Wakeup),
-            title("one"),
-            ChannelEvent::Alac(AlacEvent::Bell),
-            ChannelEvent::Alac(AlacEvent::Wakeup),
-            title("two"),
-            ChannelEvent::Replay(true),
-        ];
-        let batch = Batch::coalesce(events);
-        assert!(batch.woke);
-        assert_eq!(batch.title, Some(Some("two".to_string())));
-        assert!(matches!(batch.rest[..], [ChannelEvent::Alac(AlacEvent::Bell), ChannelEvent::Replay(true)]));
-    }
-
-    #[test]
-    fn batch_keeps_the_last_title_change() {
-        let batch = Batch::coalesce(vec![
-            ChannelEvent::Alac(AlacEvent::Title("x".into())),
-            ChannelEvent::Alac(AlacEvent::ResetTitle),
-        ]);
-        assert_eq!(batch.title, Some(None));
-        let quiet = Batch::coalesce(vec![ChannelEvent::Alac(AlacEvent::Bell)]);
-        assert!(!quiet.woke);
-        assert_eq!(quiet.title, None);
+    fn a_listener_queues_wakeups_and_titles_once_until_they_are_taken() {
+        let (listener, mut rx) = Listener::channel();
+        listener.send_event(AlacEvent::Wakeup);
+        listener.send_event(AlacEvent::Title("one".into()));
+        listener.send_event(AlacEvent::Bell);
+        listener.send_event(AlacEvent::Wakeup);
+        listener.send_event(AlacEvent::Title("two".into()));
+        listener.send(ChannelEvent::Replay(true));
+        let queued: Vec<ChannelEvent> = std::iter::from_fn(|| rx.try_next().ok().flatten()).collect();
+        assert!(matches!(
+            queued[..],
+            [
+                ChannelEvent::Merged(Merge::Wakeup),
+                ChannelEvent::Merged(Merge::Title),
+                ChannelEvent::Alac(AlacEvent::Bell),
+                ChannelEvent::Replay(true)
+            ]
+        ));
+        let mut gate = listener.gate.lock();
+        assert_eq!(gate.took(queued.iter().map(events::kind_of)), None);
+        assert_eq!(gate.take_title(), Some(Some("two".to_string())));
     }
 
     #[test]
@@ -1434,9 +1557,8 @@ mod tests {
 
     #[test]
     fn only_output_advances_the_marker() {
-        let (tx, _rx) = unbounded();
-        let marker = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, marker.clone());
+        let (listener, _rx) = Listener::channel();
+        let marker = listener.output.clone();
         let before = Instant::now();
         listener.send_event(AlacEvent::Bell);
         listener.send_event(AlacEvent::Title("t".into()));

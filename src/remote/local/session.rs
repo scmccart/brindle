@@ -15,9 +15,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use parking_lot::Mutex;
 
-use super::connection::{Abandon, Running, Sink};
+use super::connection::{Abandon, Budget, Running, Sink};
 use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
 use crate::remote::SessionKey;
+use crate::remote::budget::{Delivery, Offer};
 use crate::remote::protocol::SessionId;
 
 /// How a tab let its session go.
@@ -65,6 +66,10 @@ pub struct Session {
     /// The session an attach asked for, which it stands for until it is
     /// answered: a tab recorded while its endpoint is offline keeps it.
     requested: Option<(SessionId, Option<SessionKey>)>,
+    /// What bounds the input waiting to reach the session, across its
+    /// phases: input held while it starts counts, and the [`Running`] it
+    /// becomes counts against the same budget (`process R9`).
+    budget: Budget,
 }
 
 impl Session {
@@ -110,17 +115,18 @@ impl Session {
         };
         let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
         let abandon = Arc::new(Abandon::default());
+        let budget = Budget::default();
         let sink: Sink = Arc::new(Mutex::new(sink));
-        let (starting, abandoning) = (phase.clone(), abandon.clone());
+        let (starting, abandoning, counting) = (phase.clone(), abandon.clone(), budget.clone());
         let failing = sink.clone();
         let spawned = std::thread::Builder::new()
             .name("server-spawn".into())
-            .spawn(move || run(connect, start, sink, &starting, &abandoning));
+            .spawn(move || run(connect, start, sink, &starting, &abandoning, counting));
         if let Err(error) = spawned {
             *phase.lock() = Phase::Gone;
             failing.lock().failed(&anyhow::Error::from(error).context("starting a thread"));
         }
-        Self { phase, abandon, requested }
+        Self { phase, abandon, requested, budget }
     }
 
     /// The program's pid, once the session exists. It is a process of the
@@ -152,12 +158,31 @@ impl Session {
         }
     }
 
-    pub fn input(&self, bytes: &[u8]) {
+    /// Input for the program: held while the session starts, sent once it
+    /// runs, either way while its budget takes it. A session the tab let go,
+    /// or that never started, discards it.
+    pub fn input(&self, bytes: &[u8]) -> Delivery {
         match &mut *self.phase.lock() {
-            Phase::Starting { input, left: None, .. } => input.push(bytes.to_vec()),
+            Phase::Starting { input, left: None, .. } => {
+                // Lock order: the phase, then the budget.
+                let offer = self.budget.lock().offer(bytes.len());
+                match offer {
+                    Offer::Take => {
+                        input.push(bytes.to_vec());
+                        Delivery::Queued
+                    }
+                    Offer::Refuse(refusal) => Delivery::Refused(refusal),
+                }
+            }
             Phase::Running(running) => running.input(bytes),
-            Phase::Starting { .. } | Phase::Gone => {}
+            Phase::Starting { .. } | Phase::Gone => Delivery::Discarded,
         }
+    }
+
+    /// How many bytes of the session's input wait.
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.budget.lock().waiting()
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
@@ -211,7 +236,8 @@ impl Session {
         match &mut *phase {
             Phase::Starting { left, input, .. } => {
                 *left = Some(how);
-                input.clear();
+                let held: usize = input.drain(..).map(|bytes| bytes.len()).sum();
+                self.budget.lock().handled(held);
                 // A request still waiting for the connection is withdrawn.
                 self.abandon.abandon();
             }
@@ -235,6 +261,7 @@ fn run(
     sink: Sink,
     phase: &Mutex<Phase>,
     abandon: &Abandon,
+    budget: Budget,
 ) {
     let left = || matches!(&*phase.lock(), Phase::Starting { left: Some(_), .. });
     let started = connect().and_then(|connection| {
@@ -250,7 +277,7 @@ fn run(
     });
     let mut phase = phase.lock();
     let running = match started {
-        Ok(running) => running,
+        Ok(running) => running.with_budget(budget),
         Err(_) if matches!(&*phase, Phase::Starting { left: Some(_), .. }) => {
             *phase = Phase::Gone;
             return;
@@ -277,8 +304,9 @@ fn run(
     if let Some(hwnd) = parent {
         running.reparent(hwnd);
     }
+    // Counted when it was held: not offered again.
     for bytes in input {
-        running.input(&bytes);
+        running.held_input(&bytes);
     }
     *phase = Phase::Running(running);
 }
@@ -294,6 +322,7 @@ mod tests {
     use crate::remote::local::sys::Listener;
     use crate::remote::local::{Attaching, Endpoint, Stream, connect};
     use crate::remote::protocol::Frame;
+    use crate::remote::budget::Refusal;
     use crate::remote::protocol::client::{self, Spawned, ToClient, ToCore, Welcome};
 
     /// What the tab saw.
@@ -317,6 +346,9 @@ mod tests {
         }
         fn foreground(&mut self) {
             self.0.send("foreground".into()).ok();
+        }
+        fn broken(&mut self, reason: &str) {
+            self.0.send(format!("broken {reason}")).ok();
         }
     }
 
@@ -933,6 +965,85 @@ mod tests {
             assert!(Instant::now() < deadline, "never");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A session starting on a core that answers `SPAWN` with session 7,
+    /// held in `Starting` until `release` is sent to.
+    fn held_start(tag: &str) -> (PathBuf, mpsc::Receiver<ToCore>, Session, mpsc::Sender<()>) {
+        let dir = temp_dir(tag);
+        let core = scripted_core(&dir, |message, stream| {
+            if let ToCore::Spawn(spawn) = message {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: 7, pid: 4242, key: "k7".into() }));
+            }
+        });
+        let (release, wait) = mpsc::channel::<()>();
+        let connect = connector(&dir);
+        let (tx, _tab) = mpsc::channel();
+        let session = Session::start_with(
+            move || {
+                wait.recv().ok();
+                connect()
+            },
+            request(),
+            Box::new(Recorder(tx)),
+        );
+        (dir, core, session, release)
+    }
+
+    /// The next `total` bytes of input the core gets, in order.
+    fn input_received(core: &mpsc::Receiver<ToCore>, total: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while bytes.len() < total {
+            let ToCore::Data(data) = recv(core) else { panic!("not DATA") };
+            bytes.extend(data.bytes);
+        }
+        bytes
+    }
+
+    /// 5.1: input held while the session starts is counted once: the
+    /// handoff sends it without offering it again, so once it is written
+    /// nothing waits.
+    #[test]
+    fn input_held_while_starting_counts_once_across_the_handoff() {
+        let (dir, core, session, release) = held_start("budget-handoff");
+        let held = vec![b'a'; 3 << 20];
+        assert_eq!(session.input(&held), Delivery::Queued);
+        assert_eq!(session.waiting(), held.len());
+        release.send(()).unwrap();
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        assert_eq!(input_received(&core, held.len()), held);
+        eventually(|| session.waiting() == 0);
+        session.close();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 5.1: input while the session starts is refused past the high mark,
+    /// and only what was taken goes out once it has started.
+    #[test]
+    fn input_while_starting_is_refused_past_the_high_mark() {
+        let (dir, core, session, release) = held_start("budget-starting");
+        let held = vec![b'a'; 4 << 20];
+        assert_eq!(session.input(&held), Delivery::Queued);
+        assert_eq!(session.input(b"x"), Delivery::Refused(Refusal::First));
+        assert_eq!(session.input(b"y"), Delivery::Refused(Refusal::Again));
+        release.send(()).unwrap();
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        assert_eq!(input_received(&core, held.len()), held);
+        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "nothing refused is written");
+        session.close();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tab closed while its session starts frees the input it held.
+    #[test]
+    fn input_held_by_a_tab_closed_while_starting_is_freed() {
+        let (dir, _core, session, release) = held_start("budget-left");
+        assert_eq!(session.input(&[b'a'; 1024]), Delivery::Queued);
+        session.close();
+        assert_eq!(session.waiting(), 0);
+        assert_eq!(session.input(b"late"), Delivery::Discarded);
+        drop(release);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

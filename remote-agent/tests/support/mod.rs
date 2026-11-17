@@ -41,6 +41,7 @@ use brindle_term_core::alacritty_terminal::grid::Dimensions;
 use brindle_term_core::alacritty_terminal::index::{Column, Line};
 use brindle_term_core::alacritty_terminal::term::cell::Cell;
 pub use brindle_term_core::emulator::Emulator;
+use brindle_term_core::shell_integration::PathStyle;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
 /// Long enough for a loaded CI machine; tests poll, so passing ones are fast.
@@ -107,13 +108,54 @@ impl Drop for TempDir {
 /// Starts a holder from the built binary. A core it starts on its own (once
 /// a test's core has gone) only prints the version.
 pub fn start_holder(dir: &Path) {
-    start(
-        Path::new(BIN),
-        "hold",
-        dir,
-        &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")],
-    )
-    .unwrap();
+    start_holder_with(dir, &[]);
+}
+
+/// [`start_holder`], with `env` set for the holder too (a fault switch,
+/// say).
+pub fn start_holder_with(dir: &Path, env: &[(&str, &str)]) {
+    let mut env = env.to_vec();
+    env.push(("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version"));
+    start(Path::new(BIN), "hold", dir, &env).unwrap();
+}
+
+/// What a refused peer sends after its opening: 64 KiB past what a server
+/// reads from a connection in one turn (1 MiB, `conn.rs`'s `READ_BUDGET`),
+/// so some of it is still unread when the server refuses, whenever the
+/// server wakes.
+const UNREAD: usize = 1024 * 1024 + 64 * 1024;
+
+/// Connects to `endpoint`, sends `opening`, which the server refuses, then
+/// [`UNREAD`] bytes it never handles, and returns the frame it answers with,
+/// checking that the end of the connection follows: a refused peer reads
+/// the server's `ERROR`, then the end, not a reset (`process R10`).
+///
+/// The bytes go out on a thread of their own, while this one reads. Where
+/// the server can read them to the end ([`REFUSED_WRITES_ARRIVE`]), their
+/// write must succeed too: a server that closed after reading at most a
+/// turn's worth fails it.
+pub fn refused(endpoint: &Path, opening: &Frame) -> Frame {
+    use std::io::Write as _;
+
+    let mut stream = connect(endpoint).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    opening.write_to(&mut stream).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let rest = thread::spawn(move || writer.write_all(&vec![0u8; UNREAD]));
+    let answer = match Frame::read_from_or_eof(&mut stream) {
+        Ok(Some(frame)) => frame,
+        other => panic!("expected the server's answer, got {other:?}"),
+    };
+    let end = Frame::read_from_or_eof(&mut stream);
+    let written = rest.join().unwrap();
+    match end {
+        Ok(None) => {}
+        other => panic!("expected the end after the answer, got {other:?}"),
+    }
+    if REFUSED_WRITES_ARRIVE {
+        written.expect("the server stopped reading before the end of what was sent");
+    }
+    answer
 }
 
 /// A blob per session, as WELCOME's followers deliver them.
@@ -1088,9 +1130,11 @@ pub fn check_lines(output: &[u8], lines: usize) {
     }
 }
 
-/// A fresh emulator of `cols` × `rows`, fed `bytes` (a replay, say).
+/// A fresh emulator of `cols` × `rows`, fed `bytes` (a replay, say). It
+/// reads directory reports as POSIX paths; the tests compare its screen,
+/// which the path style doesn't change.
 pub fn replayed(bytes: &[u8], cols: u16, rows: u16, scrollback: usize) -> Emulator {
-    let mut screen = Emulator::new(cols, rows, scrollback);
+    let mut screen = Emulator::new(cols, rows, scrollback, PathStyle::Posix);
     screen.feed(bytes);
     screen
 }

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget};
+use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget, write_replacing};
 use crate::theme::{BUILTIN_THEMES, Theme};
 
 pub fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -30,14 +30,7 @@ pub fn save(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(), Strin
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     }
-    let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, doc.to_string()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        std::fs::remove_file(&tmp).ok();
-        format!("replacing {}: {e}", path.display())
-    })
+    write_replacing(&path, &doc.to_string()).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// Sets the top-level `theme`.

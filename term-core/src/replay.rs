@@ -725,14 +725,18 @@ fn place_cursor(out: &mut Out, grid: &Grid<Cell>, cursor: &Cursor<Cell>, row_bas
 }
 
 /// A `file://` URI's host-less part for a reported directory: Windows paths
-/// (`C:\src`) become `/C:/src`; bytes outside the unreserved set and `/`
-/// are percent-encoded.
+/// (`C:\src`) become `/C:/src`, the drive's colon kept as `file:///C:/src`
+/// spells it; other bytes outside the unreserved set and `/` are
+/// percent-encoded.
 fn dir_uri(dir: &str) -> String {
-    let path = match dir.as_bytes() {
-        [drive, b':', ..] if drive.is_ascii_alphabetic() => format!("/{}", dir.replace('\\', "/")),
-        _ => dir.to_string(),
+    let (mut out, path) = match dir.as_bytes() {
+        // The drive letter and its colon are ASCII, so `2` is a boundary.
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => {
+            (format!("/{}", &dir[..2]), dir[2..].replace('\\', "/"))
+        }
+        _ => (String::new(), dir.to_string()),
     };
-    let mut out = String::with_capacity(path.len());
+    out.reserve(path.len());
     for b in path.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'_' | b'~') {
             out.push(b as char);

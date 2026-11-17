@@ -786,6 +786,52 @@ fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
     assert!(contains(&replay, b"fine"));
 }
 
+#[test]
+fn a_client_refused_for_its_first_message_reads_the_error_then_the_end() {
+    let (dir, mut client) = core("refuse-first");
+    let opening = client::ToCore::List(client::Request { req: 1 })
+        .encode()
+        .unwrap();
+    let answer = refused(&core_endpoint(&dir.path), &opening);
+    match ToClient::decode(&answer).unwrap() {
+        ToClient::Error(error) => {
+            assert_eq!((error.req, error.session), (None, None));
+            assert!(error.message.contains("HELLO"), "{}", error.message);
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    // The core goes on serving its other client.
+    let (session, _) = client.spawn(programs::echoer());
+    say(&mut client, session, "after");
+}
+
+#[test]
+fn a_client_refused_for_its_versions_reads_the_error_then_the_end() {
+    let (dir, mut client) = core("refuse-versions");
+    let opening = client::ToCore::Hello(client::Hello {
+        min: 900,
+        max: 901,
+        client_version: "test".into(),
+        client_token: "refused".into(),
+        ..Default::default()
+    })
+    .encode()
+    .unwrap();
+    let answer = refused(&core_endpoint(&dir.path), &opening);
+    match ToClient::decode(&answer).unwrap() {
+        ToClient::Error(error) => {
+            assert!(
+                error.message.contains("no common protocol version"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    let (session, _) = client.spawn(programs::echoer());
+    say(&mut client, session, "after");
+}
+
 // 5.3
 
 /// Spawns `bytes` as a detached fixture session and detaches from it.
@@ -2127,6 +2173,40 @@ mod on_windows {
         assert!(rows(&screen).iter().any(|row| row.ends_with("Quit frame 2")));
         let logs = dir.logs();
         assert!(!logs.contains("truncated"), "{logs}");
+    }
+
+    #[test]
+    fn a_detached_sessions_9_9_directory_is_replayed_on_attach_and_after_a_core_restart() {
+        // How a replay reports the directory: as OSC 7, which Brindle reads.
+        const REPORTED: &[u8] = b"\x1b]7;file:///C:/src\x1b\\";
+        let mut dir = TempDir::new("replay-9-9");
+        start_core(&dir.path, &[SUPERVISED]).unwrap();
+        let mut client = TestClient::hello(&dir.path, "first");
+        // Detaching checkpoints it: what the next core starts from.
+        let (session, pid, _) = detached_printer(
+            &dir,
+            &mut client,
+            b"\x1b]9;9;C:\\src\x1b\\in-src\r\n",
+            b"in-src",
+        );
+        dir.track(parent(pid).unwrap());
+
+        let (_, replay) = client.attach(session, 80, 24).unwrap();
+        assert!(
+            contains(&replay, REPORTED),
+            "{:?}",
+            String::from_utf8_lossy(&replay)
+        );
+
+        kill_core_and_wait_for_another(&dir, &mut client);
+        let mut other = TestClient::hello(&dir.path, "other");
+        let (start, replay) = other.attach(session, 80, 24).unwrap();
+        assert_eq!(start.pid, pid);
+        assert!(
+            contains(&replay, REPORTED),
+            "{:?}",
+            String::from_utf8_lossy(&replay)
+        );
     }
 
     #[test]

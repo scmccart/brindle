@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use brindle_remote_protocol::{server_dir, win};
+use brindle_term_core::shell_integration::PathStyle;
 use windows::Win32::Foundation::{
     FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
@@ -75,6 +76,11 @@ use super::pipe::Pipe;
 use crate::conpty::cmdline::launch_line;
 use crate::conpty::{Process, Pseudoconsole};
 use crate::pty::PtyCommand;
+
+/// How the programs on these pseudoconsoles spell the directories they
+/// report (OSC 9;9's `C:\src`, OSC 7's `/C:/src`), for the core's
+/// emulators.
+pub const PATH_STYLE: PathStyle = PathStyle::Windows;
 
 /// Each pipe's own buffers.
 const PIPE_BUFFER: u32 = 64 * 1024;

@@ -64,6 +64,11 @@ fn event() -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(event.0) })
 }
 
+/// Whether everything a refused peer sent reaches the server: no, since a
+/// pipe can't half-close, so the server's end closes for both directions
+/// once its `ERROR` has gone out, and a write still under way fails.
+pub const REFUSED_WRITES_ARRIVE: bool = false;
+
 /// What the clones of a [`Stream`] share.
 struct Pipe {
     handle: OwnedHandle,

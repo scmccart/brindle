@@ -96,9 +96,16 @@
 //! The reader holds the state lock only to look a sink up; each sink has
 //! its own lock, taken without the state lock, so parsing never waits on
 //! the map and closing a tab never waits on parsing.
+//!
+//! Every call into a sink goes through [`Connection::deliver`], which
+//! confines a panic to its session (`process R3`): Brindle's emulator
+//! failing on one session's output detaches that session, which keeps
+//! running, and tells its sink it is broken, while the reader carries on
+//! for the endpoint's other sessions.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::time::{Duration, Instant};
@@ -109,6 +116,7 @@ use parking_lot::{Condvar, Mutex};
 use super::link::{Link, Wire};
 use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
+use crate::remote::budget::{Delivery, InputBudget, Offer};
 use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
     Detach, SessionRef, SetLayout, ToClient, ToCore,
@@ -131,6 +139,26 @@ const RECONNECT_POLL: Duration = Duration::from_millis(100);
 const INPUT_CHUNK: usize = 64 * 1024;
 /// The reader's buffer.
 const READ_BUFFER: usize = 64 * 1024;
+
+/// A session's input budget, shared by its handle and the writer.
+pub type Budget = Arc<Mutex<InputBudget>>;
+
+/// A message for the writer. A `DATA` frame of a session's input carries
+/// its budget and length, which the writer frees once it has written the
+/// frame or skipped it (`process R9`); nothing else counts.
+struct Outgoing {
+    message: ToCore,
+    backlog: Option<(Budget, usize)>,
+}
+
+impl Outgoing {
+    /// The writer is done with it: its input no longer waits.
+    fn handled(&self) {
+        if let Some((budget, len)) = &self.backlog {
+            budget.lock().handled(*len);
+        }
+    }
+}
 
 /// Where a relay connection tells its changes of state: its id (each
 /// connection's own, increasing) and its new state. Called with the state
@@ -157,6 +185,10 @@ pub trait SessionSink: Send {
     /// The size the core listed a recorded session at, which its replay is
     /// rendered at; told before its `ATTACH` goes out.
     fn replay_size(&mut self, _cols: u16, _rows: u16) {}
+    /// An earlier call into this sink panicked, saying `reason`
+    /// ([`Connection::deliver`]): the session was let go, detached, and the
+    /// sink gets nothing more.
+    fn broken(&mut self, reason: &str);
 }
 
 /// What a launch does with the first listing of an endpoint's sessions
@@ -176,6 +208,24 @@ pub struct Foreground {
 }
 
 pub type Sink = Arc<Mutex<Box<dyn SessionSink>>>;
+
+/// What became of a call into a session's sink ([`Connection::deliver`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Delivered {
+    Done,
+    /// It panicked, saying this: the sink was told it is broken, and its
+    /// session, if still shown, let go.
+    Panicked(String),
+}
+
+/// What a caught panic said: its message, or "no message".
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into())
+}
 
 /// What a new session runs.
 pub struct SpawnRequest {
@@ -410,9 +460,9 @@ impl State {
 
     /// After a lost link, keeps showing only the sessions the core still
     /// has for this client: `listed` with their keys ([`ListedSession::is`])
-    /// and a client. The others' sinks are taken out and given back, with
-    /// their windows and foreground programs gone.
-    fn keep_listed(&mut self, listed: &[ListedSession]) -> Vec<Sink> {
+    /// and a client. The others' sinks are taken out and given back with
+    /// their ids, their windows and foreground programs gone.
+    fn keep_listed(&mut self, listed: &[ListedSession]) -> Vec<(SessionId, Sink)> {
         let gone: Vec<SessionId> = self
             .sessions
             .iter()
@@ -421,7 +471,9 @@ impl State {
             })
             .map(|(&session, _)| session)
             .collect();
-        gone.into_iter().filter_map(|session| self.sessions.remove(&session)).map(|shown| shown.sink).collect()
+        gone.into_iter()
+            .filter_map(|session| Some((session, self.sessions.remove(&session)?.sink)))
+            .collect()
     }
 
     /// Something needs the connection: a session it shows, a request
@@ -547,7 +599,7 @@ pub struct Connection {
     /// Wakes a relay's pause between attempts: a request hurries it, or the
     /// connection ended.
     wake: Condvar,
-    outgoing: mpsc::Sender<ToCore>,
+    outgoing: mpsc::Sender<Outgoing>,
     /// How many messages went to the writer, counted before each is queued
     /// ([`Connection::flush`] waits for [`Slot::handled`] to catch up).
     sent: AtomicU64,
@@ -605,7 +657,7 @@ impl Abandon {
 }
 
 impl Connection {
-    fn new(transport: Transport, token: &str) -> (Arc<Self>, mpsc::Receiver<ToCore>) {
+    fn new(transport: Transport, token: &str) -> (Arc<Self>, mpsc::Receiver<Outgoing>) {
         Self::made(transport, token, false, None)
     }
 
@@ -614,7 +666,7 @@ impl Connection {
         token: &str,
         eager: bool,
         report: Option<Report>,
-    ) -> (Arc<Self>, mpsc::Receiver<ToCore>) {
+    ) -> (Arc<Self>, mpsc::Receiver<Outgoing>) {
         let (outgoing, queue) = mpsc::channel();
         let this = Arc::new(Self {
             state: Mutex::new(State::default()),
@@ -797,8 +849,16 @@ impl Connection {
     }
 
     fn send(&self, message: ToCore) {
+        self.queue(Outgoing { message, backlog: None });
+    }
+
+    /// Queues `outgoing` for the writer. One the writer can't take any more
+    /// (the connection ended) frees its input at once.
+    fn queue(&self, outgoing: Outgoing) {
         self.sent.fetch_add(1, Ordering::AcqRel);
-        self.outgoing.send(message).ok();
+        if let Err(mpsc::SendError(outgoing)) = self.outgoing.send(outgoing) {
+            outgoing.handled();
+        }
     }
 
     /// Waits until the writer is done with every message sent before the
@@ -941,7 +1001,7 @@ impl Connection {
             (Waiting::Spawn { sink, reply }, message)
         })?;
         let Started { session, pid, key } = started;
-        Ok(Running { id: session, pid, key, conn: self.clone(), layout: Mutex::default() })
+        Ok(Running::new(session, pid, key, self.clone()))
     }
 
     /// Attaches a detached session, whose replay and then live output go to
@@ -951,7 +1011,7 @@ impl Connection {
         let (session, key) = (request.session, request.key.clone());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let pid = self.ask("attach the session", abandon, None, |req, reply| request.waiting(req, sink, reply))?;
-        Ok(Running { id: session, pid, key, conn: self.clone(), layout: Mutex::default() })
+        Ok(Running::new(session, pid, key, self.clone()))
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
@@ -1221,7 +1281,7 @@ impl Connection {
         match message {
             ToClient::Data(Data { session, bytes }) => {
                 if let Some(sink) = self.sink(session) {
-                    sink.lock().output(&bytes);
+                    self.deliver(session, &sink, |sink| sink.output(&bytes));
                 }
             }
             ToClient::Spawned(spawned) => {
@@ -1232,7 +1292,7 @@ impl Connection {
                         let displaced = state.show(session, Shown::new(sink, key.clone()));
                         drop(state);
                         reply.try_send(Ok(Started { session, pid, key })).ok();
-                        displaced_lost(session, displaced);
+                        self.displaced_lost(session, displaced);
                     }
                     other => {
                         // Its spawner gave up: nobody shows this session.
@@ -1277,8 +1337,8 @@ impl Connection {
                     Some(Waiting::Attach { sink, reply, key, .. }) => {
                         let displaced = state.show(session, Shown::new(sink.clone(), key));
                         drop(state);
-                        displaced_lost(session, displaced);
-                        sink.lock().replay(true);
+                        self.displaced_lost(session, displaced);
+                        self.deliver(session, &sink, |sink| sink.replay(true));
                         reply.try_send(Ok(pid)).ok();
                     }
                     other => {
@@ -1296,19 +1356,19 @@ impl Connection {
                 // Its session and window go with it.
                 let shown = self.state.lock().sessions.remove(&exit.session);
                 if let Some(Shown { sink, .. }) = shown {
-                    match exit.lost {
-                        Some(reason) => sink.lock().lost(&format!("the terminal server lost it: {reason}")),
-                        None => sink.lock().exited(exit.code),
-                    }
+                    self.deliver(exit.session, &sink, |sink| match exit.lost {
+                        Some(reason) => sink.lost(&format!("the terminal server lost it: {reason}")),
+                        None => sink.exited(exit.code),
+                    });
                 }
             }
             ToClient::ReplayStart(start) => {
                 let session = start.session;
                 if let Some(sink) = self.sink(session) {
-                    sink.lock().replay(true);
+                    self.deliver(session, &sink, |sink| sink.replay(true));
                 } else if let Some((sink, reply, displaced)) = self.attached_by_replay(session) {
-                    displaced_lost(session, displaced);
-                    sink.lock().replay(true);
+                    self.displaced_lost(session, displaced);
+                    self.deliver(session, &sink, |sink| sink.replay(true));
                     reply.try_send(Ok(start.pid)).ok();
                 } else {
                     // Not one of this process's tabs (any more): it stays
@@ -1319,7 +1379,8 @@ impl Connection {
             }
             ToClient::ReplayEnd(end) => {
                 if let Some(sink) = self.sink(end.session) {
-                    sink.lock().replay(false);
+                    // A broken one is no longer shown, so has no window.
+                    self.deliver(end.session, &sink, |sink| sink.replay(false));
                 }
                 // The core that replayed may be a new one, which doesn't
                 // know the session's window.
@@ -1343,16 +1404,24 @@ impl Connection {
                     let decided = carried_attaches(&mut state.requests, &listed, &name);
                     (lost, decided, std::mem::take(&mut state.on_listing))
                 };
-                for sink in lost {
-                    sink.lock().lost(NO_LONGER_LISTED);
+                for (session, sink) in lost {
+                    self.deliver(session, &sink, |sink| sink.lost(NO_LONGER_LISTED));
                 }
                 for (pending, reason) in decided.gone {
                     pending.waiting.fail(reason);
                 }
                 for (attach, recorded) in decided.again {
                     // Told before the ATTACH goes out, so before its replay.
-                    if let Some((sink, (cols, rows))) = recorded {
-                        sink.lock().replay_size(cols, rows);
+                    if let Some((sink, (cols, rows))) = recorded
+                        && let Delivered::Panicked(reason) =
+                            self.deliver(attach.session, &sink, |sink| sink.replay_size(cols, rows))
+                    {
+                        // Its tab can't show it: it stays detached.
+                        let pending = self.state.lock().requests.remove(&attach.req);
+                        if let Some(pending) = pending {
+                            pending.waiting.fail(format!("Brindle can't show session {}: {reason}", attach.session));
+                        }
+                        continue;
                     }
                     self.send(ToCore::Attach(attach));
                 }
@@ -1371,7 +1440,7 @@ impl Connection {
                     (previous.map(|previous| previous.name) != Some(foreground.name)).then(|| shown.sink.clone())
                 };
                 if let Some(sink) = renamed {
-                    sink.lock().foreground();
+                    self.deliver(process.session, &sink, |sink| sink.foreground());
                 }
             }
             ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
@@ -1380,6 +1449,48 @@ impl Connection {
 
     fn sink(&self, session: SessionId) -> Option<Sink> {
         self.state.lock().sessions.get(&session).map(|shown| shown.sink.clone())
+    }
+
+    /// Calls `call` on `session`'s sink, confining a panic to that session
+    /// (`process R3`): the reader serves every session on the endpoint, and
+    /// Brindle's emulator failing on one session's output must not stop it
+    /// for the rest. After a panic, a session still shown with this sink
+    /// stops being shown and is detached: its program is fine, only
+    /// Brindle's view of it failed, so it keeps running for the user to
+    /// attach again (not at once: the replay may carry the same bytes).
+    /// Then the sink is told it is broken, under a guard of its own. A sink
+    /// no longer shown (its session exited, was lost, or isn't shown yet)
+    /// is only told. Called without the state lock.
+    fn deliver(&self, session: SessionId, sink: &Sink, call: impl FnOnce(&mut dyn SessionSink)) -> Delivered {
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| call(&mut **sink.lock()))) else {
+            return Delivered::Done;
+        };
+        let reason = panic_text(&*payload);
+        log::error!("Brindle can't show session {session} on {} any more ({reason}): detaching it", self.name());
+        {
+            let mut state = self.state.lock();
+            let key = state.sessions.get(&session).filter(|shown| Arc::ptr_eq(&shown.sink, sink)).map(|shown| shown.key.clone());
+            if let Some(key) = key
+                && state.forget(session, key.as_ref()).is_some()
+            {
+                // Under the state lock, as a handle's messages are.
+                self.send(ToCore::Detach(Detach { session, layout: None }));
+            }
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.lock().broken(&reason))) {
+            log::error!("telling session {session}'s tab that it can't be shown failed too: {}", panic_text(&*payload));
+        }
+        Delivered::Panicked(reason)
+    }
+
+    /// Tells the tab of an entry another session displaced from its id
+    /// `session` that its session is lost.
+    fn displaced_lost(&self, session: SessionId, displaced: Option<Shown>) {
+        if let Some(Shown { sink, key, .. }) = displaced {
+            let key = key.as_ref().map_or("none", SessionKey::as_str);
+            log::warn!("session {session} (key {key}) is lost: the terminal server gave its id to another session");
+            self.deliver(session, &sink, |sink| sink.lost(NO_LONGER_LISTED));
+        }
     }
 
     /// A replay without a `req` (a reconnect's) of a session an attach
@@ -1443,10 +1554,11 @@ impl Connection {
 
     /// A relay link was lost: each of the endpoint's terminals says so.
     fn lost_link(&self, name: &str) {
-        let sinks: Vec<Sink> = self.state.lock().sessions.values().map(|shown| shown.sink.clone()).collect();
+        let sinks: Vec<(SessionId, Sink)> =
+            self.state.lock().sessions.iter().map(|(&session, shown)| (session, shown.sink.clone())).collect();
         let line = lost_line(name);
-        for sink in sinks {
-            sink.lock().output(line.as_bytes());
+        for (session, sink) in sinks {
+            self.deliver(session, &sink, |sink| sink.output(line.as_bytes()));
         }
     }
 
@@ -1472,14 +1584,14 @@ impl Connection {
             // Attaches carried over a lost link aren't told: their tabs say
             // the link was lost.
             let first = !state.connected;
-            let told: Vec<Sink> = state
+            let told: Vec<(SessionId, Sink)> = state
                 .requests
                 .values_mut()
                 .filter(|_| first)
                 .filter_map(|pending| match &pending.waiting {
-                    Waiting::Attach { sink, .. } if !pending.told => {
+                    Waiting::Attach { sink, attach, .. } if !pending.told => {
                         pending.told = true;
-                        Some(sink.clone())
+                        Some((attach.session, sink.clone()))
                     }
                     _ => None,
                 })
@@ -1498,8 +1610,8 @@ impl Connection {
             pending.waiting.fail(message.to_string());
         }
         let line = retrying_line(message);
-        for sink in told {
-            sink.lock().output(line.as_bytes());
+        for (session, sink) in told {
+            self.deliver(session, &sink, |sink| sink.output(line.as_bytes()));
         }
         keep
     }
@@ -1643,8 +1755,8 @@ impl Connection {
         for pending in requests.into_values() {
             pending.waiting.fail(reason.to_string());
         }
-        for shown in sessions.into_values() {
-            shown.sink.lock().lost(reason);
+        for (session, shown) in sessions {
+            self.deliver(session, &shown.sink, |sink| sink.lost(reason));
         }
         if let Some(hook) = hook {
             hook();
@@ -1653,20 +1765,20 @@ impl Connection {
 
     /// Sends queued messages in order, and on a relay a heartbeat after
     /// [`Timings::heartbeat`] without a write.
-    fn write_loop(&self, queue: mpsc::Receiver<ToCore>) {
+    fn write_loop(&self, queue: mpsc::Receiver<Outgoing>) {
         let heartbeat = match &self.transport {
             Transport::Relay { timings, .. } => Some(timings.heartbeat),
             Transport::Local(_) => None,
         };
         let mut last = Instant::now();
         loop {
-            let message = match heartbeat {
+            let outgoing = match heartbeat {
                 None => match queue.recv() {
-                    Ok(message) => message,
+                    Ok(outgoing) => outgoing,
                     Err(_) => return,
                 },
                 Some(after) => match queue.recv_timeout(after.saturating_sub(last.elapsed())) {
-                    Ok(message) => message,
+                    Ok(outgoing) => outgoing,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if !self.heartbeat() {
                             return;
@@ -1677,7 +1789,10 @@ impl Connection {
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 },
             };
-            let open = self.write(&message);
+            let open = self.write(&outgoing.message);
+            // Written, skipped, or never to be written: its input no longer
+            // waits.
+            outgoing.handled();
             self.slot.lock().handled += 1;
             self.slot_ready.notify_all();
             if !open {
@@ -1905,17 +2020,6 @@ fn encode(message: &ToCore, host: Option<&RelayHost>) -> io::Result<Frame> {
 /// reconnect's listing lacks it with its key, or another session took its id.
 const NO_LONGER_LISTED: &str = "the terminal server no longer has this session";
 
-/// Tells the tab of an entry another session displaced from its id
-/// `session` that its session is lost. Not under the state lock: a sink
-/// takes its own.
-fn displaced_lost(session: SessionId, displaced: Option<Shown>) {
-    if let Some(Shown { sink, key, .. }) = displaced {
-        let key = key.as_ref().map_or("none", SessionKey::as_str);
-        log::warn!("session {session} (key {key}) is lost: the terminal server gave its id to another session");
-        sink.lock().lost(NO_LONGER_LISTED);
-    }
-}
-
 /// What a relay's loss writes into each of its terminals: one dim line.
 fn lost_line(name: &str) -> String {
     format!("\r\n\x1b[2mconnection to {name} lost; reconnecting…\x1b[22m\r\n")
@@ -2012,9 +2116,22 @@ pub struct Running {
     /// The layout last sent with `SET_LAYOUT`, so an unchanged one isn't
     /// sent again.
     layout: Mutex<Option<serde_json::Value>>,
+    /// What bounds the session's waiting input; the [`super::Session`]'s
+    /// own once it hands over ([`Running::with_budget`]).
+    budget: Budget,
 }
 
 impl Running {
+    fn new(id: SessionId, pid: u32, key: Option<SessionKey>, conn: Arc<Connection>) -> Self {
+        Self { id, pid, key, conn, layout: Mutex::default(), budget: Budget::default() }
+    }
+
+    /// The handle, counting its input against `budget`, which input held
+    /// while the session started was already counted in.
+    pub(super) fn with_budget(self, budget: Budget) -> Self {
+        Self { budget, ..self }
+    }
+
     /// The program's pid.
     pub fn pid(&self) -> u32 {
         self.pid
@@ -2042,11 +2159,49 @@ impl Running {
         }
     }
 
-    pub fn input(&self, bytes: &[u8]) {
-        let session = self.id;
-        self.send_while_shown(
-            bytes.chunks(INPUT_CHUNK).map(|chunk| ToCore::Data(Data { session, bytes: chunk.to_vec() })),
-        );
+    /// Sends input for the program while the connection shows the session
+    /// and its budget takes it; a call is taken or refused whole. A session
+    /// no longer shown discards it, uncounted.
+    pub fn input(&self, bytes: &[u8]) -> Delivery {
+        let state = self.conn.state.lock();
+        if !state.shows(self.id, self.key.as_ref()) {
+            return Delivery::Discarded;
+        }
+        let offer = self.budget.lock().offer(bytes.len());
+        match offer {
+            Offer::Take => {
+                self.queue_input(bytes);
+                Delivery::Queued
+            }
+            Offer::Refuse(refusal) => Delivery::Refused(refusal),
+        }
+    }
+
+    /// Sends input held while the session started, which its budget took
+    /// then: it isn't offered again. If the session is no longer shown, it
+    /// is only freed.
+    pub(super) fn held_input(&self, bytes: &[u8]) {
+        let state = self.conn.state.lock();
+        if state.shows(self.id, self.key.as_ref()) {
+            self.queue_input(bytes);
+        } else {
+            self.budget.lock().handled(bytes.len());
+        }
+    }
+
+    /// Queues taken input as `DATA` frames, each counted until the writer
+    /// is done with it. Called under the state lock.
+    fn queue_input(&self, bytes: &[u8]) {
+        for chunk in bytes.chunks(INPUT_CHUNK) {
+            let message = ToCore::Data(Data { session: self.id, bytes: chunk.to_vec() });
+            self.conn.queue(Outgoing { message, backlog: Some((self.budget.clone(), chunk.len())) });
+        }
+    }
+
+    /// How many bytes of the session's input wait to be written.
+    #[cfg(test)]
+    pub fn waiting(&self) -> usize {
+        self.budget.lock().waiting()
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
@@ -2377,11 +2532,51 @@ pub(super) mod fake {
         fn replay_size(&mut self, cols: u16, rows: u16) {
             self.0.send(format!("size {cols}x{rows}")).ok();
         }
+        fn broken(&mut self, reason: &str) {
+            self.0.send(format!("broken {reason}")).ok();
+        }
     }
 
     pub fn sink() -> (Sink, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel();
         (Arc::new(Mutex::new(Box::new(Recorder(tx)))), rx)
+    }
+
+    /// A terminal whose emulator fails on output holding its marker, as
+    /// `BRINDLE_TEST_SINK_PANIC` makes a real one fail; it records the rest.
+    pub struct Failing {
+        seen: Recorder,
+        marker: &'static str,
+    }
+
+    impl SessionSink for Failing {
+        fn output(&mut self, bytes: &[u8]) {
+            if String::from_utf8_lossy(bytes).contains(self.marker) {
+                panic!("the emulator failed on {}", self.marker);
+            }
+            self.seen.output(bytes);
+        }
+        fn replay(&mut self, active: bool) {
+            self.seen.replay(active);
+        }
+        fn exited(&mut self, code: Option<i32>) {
+            self.seen.exited(code);
+        }
+        fn lost(&mut self, reason: &str) {
+            self.seen.lost(reason);
+        }
+        fn failed(&mut self, error: &anyhow::Error) {
+            self.seen.failed(error);
+        }
+        fn broken(&mut self, reason: &str) {
+            self.seen.broken(reason);
+        }
+    }
+
+    /// A [`Failing`] sink, failing on output that holds `marker`.
+    pub fn failing_sink(marker: &'static str) -> (Sink, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel();
+        (Arc::new(Mutex::new(Box::new(Failing { seen: Recorder(tx), marker }))), rx)
     }
 }
 
@@ -2391,8 +2586,11 @@ mod tests {
 
     use super::fake::{self, Plan};
     use super::*;
+    use crate::remote::budget::Refusal;
     use crate::remote::protocol::client::Spawned;
     use crate::remote::protocol::relay::RelayError;
+
+    const MIB: usize = 1 << 20;
 
     fn seen(rx: &mpsc::Receiver<String>) -> String {
         rx.recv_timeout(Duration::from_secs(10)).expect("an event")
@@ -2984,6 +3182,221 @@ mod tests {
         assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
         quiet(&lost_tab);
         quiet(&fresh_tab);
+    }
+
+    /// What [`fake::failing_sink`]s fail on, as `BRINDLE_TEST_SINK_PANIC`
+    /// would name it.
+    const MARKER: &str = "brindle-test-sink-panic";
+
+    /// Two sessions on a steady relay, the first one's sink failing on
+    /// [`MARKER`], and the core's `DATA` for it carrying the marker: its
+    /// tab has been told it is broken and the session detached.
+    #[allow(clippy::type_complexity)]
+    fn broken_by_data() -> (Arc<Connection>, Plan, fake::Far, Running, mpsc::Receiver<String>, Running, mpsc::Receiver<String>)
+    {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (failing_sink, failing_tab) = fake::failing_sink(MARKER);
+        let (fine_sink, fine_tab) = fake::sink();
+        let failing = connection.spawn(spawn_request(&[]), failing_sink, None).unwrap();
+        let fine = connection.spawn(spawn_request(&[]), fine_sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+
+        let bytes = format!("before {MARKER} after").into_bytes();
+        far.out.send(ToClient::Data(Data { session: failing.id(), bytes }));
+        assert_eq!(seen(&failing_tab), format!("broken the emulator failed on {MARKER}"));
+        assert_eq!(far.next(), ToCore::Detach(Detach { session: failing.id(), layout: None }));
+        (connection, plan, far, failing, failing_tab, fine, fine_tab)
+    }
+
+    /// 4.1: a sink that panics on `DATA` is told it is broken and its
+    /// session detached: the program runs on, only Brindle's view of it
+    /// failed. The reader carries on, so the endpoint's other session still
+    /// gets its output, and the broken one gets nothing more.
+    #[test]
+    fn a_sink_that_panics_is_told_broken_and_its_session_detached() {
+        let (connection, _plan, far, failing, failing_tab, fine, fine_tab) = broken_by_data();
+        assert!(!connection.state.lock().shows(failing.id(), failing.key()));
+        assert!(connection.state.lock().shows(fine.id(), fine.key()));
+
+        far.out.send(ToClient::Data(Data { session: failing.id(), bytes: b"more".to_vec() }));
+        far.out.send(ToClient::Data(Data { session: fine.id(), bytes: b"later".to_vec() }));
+        assert_eq!(seen(&fine_tab), "output later");
+        quiet(&failing_tab);
+        assert!(!connection.is_dead());
+    }
+
+    /// 4.1: a sink that panics on the lost line, written while the link is
+    /// down, is detached once a link is up again: the writer holds the
+    /// `DETACH` like any other message, and it goes out after the `LIST`.
+    /// The other session is kept, and takes input.
+    #[test]
+    fn a_sink_that_panics_while_the_link_is_down_is_detached_after_the_reconnect() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (failing_sink, failing_tab) = fake::failing_sink("connection to A8 lost");
+        let (fine_sink, fine_tab) = fake::sink();
+        let failing = connection.spawn(spawn_request(&[]), failing_sink, None).unwrap();
+        let fine = connection.spawn(spawn_request(&[]), fine_sink, None).unwrap();
+        first.next();
+        first.next();
+
+        first.out.cut();
+        assert_eq!(seen(&failing_tab), "broken the emulator failed on connection to A8 lost");
+        assert!(seen(&fine_tab).contains("connection to A8 lost"));
+
+        let (failing_id, fine_id) = (failing.id(), fine.id());
+        let (link, second) = fake::link(&[], listing_attached(vec![failing_id, fine_id]));
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(second.next(), ToCore::Detach(Detach { session: failing_id, layout: None }));
+        quiet(&fine_tab);
+        quiet(&failing_tab);
+        fine.input(b"ls\r");
+        assert!(matches!(second.next(), ToCore::Data(data) if data.session == fine_id && data.bytes == b"ls\r"));
+    }
+
+    /// 4.1: once its sink broke, a session's handle acts on nothing: its
+    /// input, resize, close and detach write nothing, while the other
+    /// session's close still goes out.
+    #[test]
+    fn a_broken_sessions_running_handle_writes_nothing() {
+        let (_connection, _plan, far, failing, failing_tab, fine, _fine_tab) = broken_by_data();
+        failing.input(b"typed\r");
+        failing.resize(100, 30, 8, 16);
+        failing.close();
+        failing.detach(None);
+        fine.close();
+        assert_eq!(far.next(), ToCore::Close(SessionRef { session: fine.id() }));
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        quiet(&failing_tab);
+    }
+
+    /// Answers `LIST` with `sessions`, each with its key and a client, as a
+    /// core does for a client that came back within its linger.
+    fn listing_attached(sessions: Vec<SessionId>) -> impl FnMut(&ToCore, &fake::Out) + Send + 'static {
+        move |message, out| {
+            if let ToCore::List(list) = message {
+                let sessions = sessions
+                    .iter()
+                    .map(|&session| SessionInfo {
+                        session,
+                        key: format!("k{session}"),
+                        attached: true,
+                        ..Default::default()
+                    })
+                    .collect();
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions }));
+            }
+        }
+    }
+
+    /// The next `total` bytes of input the far end gets for `session`, in
+    /// order; anything else first is a failure.
+    fn written(far: &fake::Far, session: SessionId, total: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while bytes.len() < total {
+            match far.next() {
+                ToCore::Data(data) if data.session == session => bytes.extend(data.bytes),
+                other => panic!("not its DATA: {other:?}"),
+            }
+        }
+        bytes
+    }
+
+    /// A session spawned on a steady relay whose link was then cut: its
+    /// tab has the lost line, so the link is down for what comes next.
+    fn spawned_then_cut() -> (Arc<Connection>, Plan, Running, mpsc::Receiver<String>) {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        assert!(seen(&tab).contains("connection to A8 lost"));
+        (connection, plan, running, tab)
+    }
+
+    /// 5.1: while the link is down, a session's input waits up to the high
+    /// mark; past it, input is refused (the crossing's first refusal is
+    /// `First`, the rest `Again`), and nothing refused is written once the
+    /// link is back.
+    #[test]
+    fn input_past_four_mib_is_refused_while_the_link_is_down() {
+        let (_connection, plan, running, _tab) = spawned_then_cut();
+        let held = vec![b'a'; 4 * MIB];
+        assert_eq!(running.input(&held), Delivery::Queued);
+        assert_eq!(running.input(b"refused"), Delivery::Refused(Refusal::First));
+        assert_eq!(running.input(b"refused again"), Delivery::Refused(Refusal::Again));
+
+        let (link, far) = fake::link(&[], listing_attached(vec![running.id()]));
+        plan.link(link);
+        assert!(matches!(far.next(), ToCore::List(_)));
+        assert_eq!(written(&far, running.id(), held.len()), held);
+        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err(), "nothing refused is written");
+    }
+
+    /// 5.1: input held while the link is down goes out in order once it is
+    /// back, and the writer frees what it wrote: input is taken again.
+    #[test]
+    fn held_input_is_written_in_order_after_the_reconnect_and_frees_the_budget() {
+        let (_connection, plan, running, _tab) = spawned_then_cut();
+        let (first, second) = (vec![b'a'; 2 * MIB], vec![b'b'; 2 * MIB]);
+        assert_eq!(running.input(&first), Delivery::Queued);
+        assert_eq!(running.input(&second), Delivery::Queued);
+        assert_eq!(running.input(b"c"), Delivery::Refused(Refusal::First));
+        assert_eq!(running.waiting(), 4 * MIB);
+
+        let (link, far) = fake::link(&[], listing_attached(vec![running.id()]));
+        plan.link(link);
+        assert!(matches!(far.next(), ToCore::List(_)));
+        assert_eq!(written(&far, running.id(), 4 * MIB), [first, second].concat());
+        // Each frame is freed once the writer is done with it, just after
+        // the far end has it.
+        eventually("the written input is freed", || running.waiting() == 0);
+        assert_eq!(running.input(b"d"), Delivery::Queued);
+        assert_eq!(written(&far, running.id(), 1), b"d");
+    }
+
+    /// 5.1: a call is taken whole while less than the high mark waits, so
+    /// a paste bigger than the mark into a connected tab is written whole.
+    #[test]
+    fn a_paste_past_the_high_mark_on_a_live_link_is_written_whole() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        let paste: Vec<u8> = (0..6 * MIB).map(|at| (at % 251) as u8).collect();
+        assert_eq!(running.input(&paste), Delivery::Queued);
+        assert_eq!(written(&far, running.id(), paste.len()), paste);
+        eventually("the paste is freed", || running.waiting() == 0);
+    }
+
+    /// 5.1: only input counts against the budget: past the high mark, a
+    /// resize and a detach still go out, behind the input queued first.
+    #[test]
+    fn resize_and_detach_are_never_refused() {
+        let (_connection, plan, running, _tab) = spawned_then_cut();
+        let held = vec![b'a'; 4 * MIB];
+        assert_eq!(running.input(&held), Delivery::Queued);
+        assert_eq!(running.input(b"x"), Delivery::Refused(Refusal::First));
+        running.resize(100, 30, 8, 16);
+        running.detach(None);
+        // No longer the tab's: neither counted nor sent.
+        assert_eq!(running.input(b"y"), Delivery::Discarded);
+
+        let (link, far) = fake::link(&[], listing_attached(vec![running.id()]));
+        plan.link(link);
+        assert!(matches!(far.next(), ToCore::List(_)));
+        assert_eq!(written(&far, running.id(), held.len()), held);
+        assert!(matches!(far.next(), ToCore::Resize(resize) if (resize.cols, resize.rows) == (100, 30)));
+        assert_eq!(far.next(), ToCore::Detach(Detach { session: running.id(), layout: None }));
     }
 
     /// A core that predates keys gives a session none, and lists it with
@@ -3808,8 +4221,9 @@ mod tests {
         ids
     }
 
-    /// Whether `sinks` are `expected`, in any order.
-    fn same_sinks(mut sinks: Vec<Sink>, expected: &[&Sink]) -> bool {
+    /// Whether the sinks taken out are `expected`, in any order.
+    fn same_sinks(taken: Vec<(SessionId, Sink)>, expected: &[&Sink]) -> bool {
+        let mut sinks: Vec<Sink> = taken.into_iter().map(|(_, sink)| sink).collect();
         sinks.len() == expected.len()
             && expected.iter().all(|wanted| {
                 let found = sinks.iter().position(|sink| Arc::ptr_eq(sink, wanted));

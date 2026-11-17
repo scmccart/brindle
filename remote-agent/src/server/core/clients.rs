@@ -25,8 +25,9 @@ const MAX_PENDING: usize = 64;
 /// turn can read and feed a megabyte of a holder's output, and the client
 /// would otherwise get none of it until the core had fed all of it.
 const EAGER_FLUSH: usize = 64 * 1024;
-/// How long a refused client gets to read its `ERROR`.
-const REFUSAL_FLUSH_LIMIT: Duration = Duration::from_secs(1);
+/// How long a refused client gets to read its `ERROR` and the end
+/// ([`refuse`]).
+const REFUSAL_CLOSE_LIMIT: Duration = Duration::from_secs(1);
 
 /// A connection that hasn't sent `HELLO` yet.
 pub(super) struct Pending {
@@ -127,7 +128,7 @@ impl<L: EventLoop> Core<L> {
                             &mut conn,
                             error(None, None, "the first message must be HELLO"),
                         );
-                        let _ = conn.flush_for(REFUSAL_FLUSH_LIMIT);
+                        refuse(&mut conn);
                         self.drop_source(token);
                     }
                 }
@@ -152,7 +153,7 @@ impl<L: EventLoop> Core<L> {
                     refusal.message
                 );
                 queue(&mut conn, ToClient::Error(refusal));
-                let _ = conn.flush_for(REFUSAL_FLUSH_LIMIT);
+                refuse(&mut conn);
                 self.drop_source(token);
                 return;
             }
@@ -402,5 +403,15 @@ fn queue(conn: &mut Conn, message: ToClient) {
     match message.encode() {
         Ok(frame) => conn.queue(&frame),
         Err(error) => log!("can't encode a message: {error}"),
+    }
+}
+
+/// Closes a refused connection gracefully, within [`REFUSAL_CLOSE_LIMIT`]:
+/// the client reads its `ERROR`, then the end, even with bytes of its own
+/// still unread, which closing at once would turn into a reset
+/// (`process R10`).
+fn refuse(conn: &mut Conn) {
+    if let Err(error) = conn.close_for(REFUSAL_CLOSE_LIMIT) {
+        log!("a refused client didn't close in time: {error}");
     }
 }

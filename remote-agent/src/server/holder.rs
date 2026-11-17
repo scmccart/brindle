@@ -17,10 +17,23 @@
 //!   checkpoint and tail follow. A core that is gone is dropped only once
 //!   what it had sent is handled, even when a write to it is what failed
 //!   (up to [`DEAD_CORE_READ_LIMIT`]).
-//! - **Backpressure:** past [`CORE_QUEUE_HIGH`] queued to the core, it stops
-//!   reading PTYs, and it doesn't read a session the core has paused. With
-//!   no core, it reads a session until its tail is full, so the program
-//!   blocks instead of losing output.
+//! - **Backpressure:** from [`CORE_QUEUE_HIGH`] queued to the core until
+//!   less than [`CORE_QUEUE_LOW`] is, it doesn't read PTYs, and it doesn't
+//!   read a session the core has paused (`read_limit`). With no core, it
+//!   reads a session until its tail is full, so the program blocks instead
+//!   of losing output. Input past `INPUT_QUEUE_LIMIT` (4 MiB) waiting for
+//!   one session is dropped with an `ERROR`: lossy by design, since
+//!   Brindle's own budget in front of it is the same size.
+//! - **Faults:** each message from the core is handled under
+//!   `catch_unwind` (`Holder::guarded`). A failure is answered for its unit
+//!   (`unit_of`): `SPAWN_FAILED` for a `SPAWN`, else an `ERROR` for the
+//!   message's session, or for the holder. The sessions and the core
+//!   connection carry on. In debug builds `BRINDLE_TEST_HOLDER_PANIC` names
+//!   a marker that makes `SPAWN` (in an argument) and `INPUT` (in its
+//!   bytes) fail, for the tests.
+//! - **Refusals:** a connection whose first message isn't `HELLO`, or whose
+//!   `HELLO` shares no version, gets an `ERROR` and a graceful close within
+//!   `REFUSAL_CLOSE_LIMIT` (1 s), so it reads the error and then the end.
 //! - **Supervision:** with sessions but no core for [`CORE_GRACE`], it
 //!   starts `serve` from its own binary (which survives the file being
 //!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`].
@@ -30,8 +43,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
@@ -47,13 +62,16 @@ use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
 use super::platform::listen::{self, Identity, Listener};
 use super::platform::lock::Lock;
 use super::platform::pty::{self, Group, Program, Pty};
-use super::{build_id, daemon, dir};
+use super::{build_id, daemon, dir, fault};
 use crate::pty::{
     GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
 };
 
-/// Past this much queued to the core, the holder stops reading PTYs.
+/// From this much queued to the core, the holder stops reading PTYs...
 pub const CORE_QUEUE_HIGH: usize = 8 * 1024 * 1024;
+/// ...until less than this is: a quarter, so reading resumes while the core
+/// still has plenty queued, and doesn't starve between turns.
+pub const CORE_QUEUE_LOW: usize = 2 * 1024 * 1024;
 /// With sessions but no core for this long, the holder starts one.
 pub const CORE_GRACE: Duration = Duration::from_secs(3);
 /// The first retry delay after starting a core that didn't connect...
@@ -70,6 +88,8 @@ const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
 pub const DEAD_CORE_READ_LIMIT: usize = 16 * 1024 * 1024;
 /// A connection must send `HELLO` within this long.
 const HELLO_LIMIT: Duration = Duration::from_secs(5);
+/// How long a refused connection gets to read its `ERROR` and the end.
+const REFUSAL_CLOSE_LIMIT: Duration = Duration::from_secs(1);
 const MAX_PENDING: usize = 16;
 /// How long an exiting holder waits for the core to take its last messages
 /// (a flood's output, then `EXITED`) and close the connection.
@@ -246,6 +266,10 @@ struct Core {
     token: Token,
     interest: Interest,
     instance: u64,
+    /// Its queue went past [`CORE_QUEUE_HIGH`] and hasn't been under
+    /// [`CORE_QUEUE_LOW`] since ([`core_backlog`]). A new core's connection
+    /// starts empty, so under.
+    over: bool,
     checkpoints: Assembler,
     /// It sent `GOODBYE { handover: true }`.
     handover: bool,
@@ -453,7 +477,7 @@ impl<L: EventLoop> Holder<L> {
                                 message: "the first message must be HELLO".into(),
                             }),
                         );
-                        let _ = conn.flush();
+                        refuse(&mut conn);
                         self.drop_source(token);
                     }
                 }
@@ -474,7 +498,7 @@ impl<L: EventLoop> Holder<L> {
             Err(error) => {
                 log!("refused a core: {}", error.message);
                 queue(&mut conn, ToCore::Error(error));
-                let _ = conn.flush_for(Duration::from_secs(1));
+                refuse(&mut conn);
                 self.drop_source(token);
                 return;
             }
@@ -498,6 +522,7 @@ impl<L: EventLoop> Holder<L> {
             token,
             interest: Interest::READABLE,
             instance: hello.instance,
+            over: false,
             checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
             handover: false,
             goodbye: false,
@@ -612,8 +637,63 @@ impl<L: EventLoop> Holder<L> {
                 }
             };
             match ToHolder::decode(&frame) {
-                Ok(message) => self.handle(message),
+                Ok(message) => self.guarded(message),
                 Err(error) => self.send_error(None, error.to_string()),
+            }
+        }
+    }
+
+    /// Handles a message from the core under `catch_unwind`: a failure ends
+    /// that message only ([`Holder::fault`]), never the holder, its other
+    /// sessions or the core connection (`process R3`).
+    fn guarded(&mut self, message: ToHolder) {
+        let unit = unit_of(&message);
+        let kind = name_of(&message);
+        // A `SPAWN` that fails after making its session hangs that one up,
+        // never one that had its id already.
+        let id_was_free = matches!(unit, Unit::Spawn(id) if !self.sessions.contains_key(&id));
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.handle(message))) {
+            self.fault(unit, kind, id_was_free, &fault::describe(&*payload));
+        }
+    }
+
+    /// Answers a failure while handling a `kind` message for `unit`, after
+    /// the unwind dropped what the handler had made. The session it was for
+    /// keeps running: its state is byte buffers that a half-run handler
+    /// can't leave worse than ending the user's program would.
+    fn fault(&mut self, unit: Unit, kind: &str, id_was_free: bool, what: &str) {
+        match unit {
+            Unit::Spawn(id) => {
+                log!("session {id}: the holder failed handling {kind}: {what}");
+                if id_was_free && self.sessions.contains_key(&id) {
+                    self.hang_up(id);
+                }
+                self.send(ToCore::SpawnFailed(SpawnFailed {
+                    session: id,
+                    message: format!("the holder failed while starting it: {what}"),
+                }));
+            }
+            Unit::Session(id) => {
+                let message = format!("the holder failed handling {kind}: {what}");
+                log!("session {id}: {message}");
+                self.send_error(Some(id), message);
+            }
+            Unit::Checkpoint(id) => {
+                // The stored checkpoint and tail stay: the next core
+                // rebuilds from the last whole one.
+                let message = format!("the holder failed handling {kind}: {what}");
+                log!("session {id}: {message}");
+                if let Some(core) = self.core.as_mut() {
+                    core.checkpoints.abandon(id);
+                }
+                self.send_error(Some(id), message);
+            }
+            Unit::Holder => {
+                // The connection stays: dropping it would make the core
+                // count every session lost.
+                let message = format!("the holder failed handling {kind}: {what}");
+                log!("{message}");
+                self.send_error(None, message);
             }
         }
     }
@@ -745,6 +825,9 @@ impl<L: EventLoop> Holder<L> {
                 message,
             }));
         }
+        for arg in &spawn.args {
+            inject_fault(arg.as_bytes());
+        }
         let request = PtyCommand {
             command: spawn.command.as_deref(),
             args: &spawn.args,
@@ -816,6 +899,7 @@ impl<L: EventLoop> Holder<L> {
     }
 
     fn input(&mut self, data: Data) {
+        inject_fault(&data.bytes);
         let Some(session) = self.sessions.get_mut(&data.session) else {
             return self.send_error(Some(data.session), no_session(data.session));
         };
@@ -871,13 +955,18 @@ impl<L: EventLoop> Holder<L> {
             if session.output_closed {
                 break;
             }
-            let limit = match &self.core {
-                Some(core) if core.conn.queued() >= CORE_QUEUE_HIGH || session.paused => break,
-                Some(_) => buffer.len(),
+            let dest = match self.core.as_mut() {
+                Some(core) => {
+                    core.over = core_backlog(core.over, core.conn.queued());
+                    Dest::Core { over: core.over }
+                }
                 // Nothing is lost while the core is away: the program
                 // blocks once its tail is full.
-                None => session.tail.room().min(buffer.len()),
+                None => Dest::Tail {
+                    room: session.tail.room(),
+                },
             };
+            let limit = read_limit(dest, session.paused, buffer.len());
             if limit == 0 {
                 break;
             }
@@ -1083,16 +1172,21 @@ impl<L: EventLoop> Holder<L> {
 
     fn update_interests(&mut self) {
         self.flush_core();
-        let queued = self.core.as_ref().map(|core| core.conn.queued());
+        let core_over = self.core.as_mut().map(|core| {
+            core.over = core_backlog(core.over, core.conn.queued());
+            core.over
+        });
         for session in self.sessions.values_mut() {
             if session.pty.is_none() {
                 continue;
             }
-            let readable = !session.output_closed
-                && match queued {
-                    Some(queued) => queued < CORE_QUEUE_HIGH && !session.paused,
-                    None => session.tail.room() > 0,
-                };
+            let dest = match core_over {
+                Some(over) => Dest::Core { over },
+                None => Dest::Tail {
+                    room: session.tail.room(),
+                },
+            };
+            let readable = !session.output_closed && read_limit(dest, session.paused, 1) > 0;
             let want = Interest {
                 readable,
                 writable: !session.input.is_empty(),
@@ -1164,6 +1258,110 @@ fn queue(conn: &mut Conn, message: ToCore) {
     }
 }
 
+/// Closes a refused connection gracefully, within [`REFUSAL_CLOSE_LIMIT`]:
+/// the peer reads its `ERROR`, then the end, even with bytes of its own
+/// still unread, which closing at once would turn into a reset.
+fn refuse(conn: &mut Conn) {
+    if let Err(error) = conn.close_for(REFUSAL_CLOSE_LIMIT) {
+        log!("a refused connection didn't close in time: {error}");
+    }
+}
+
+/// Whether the core's queue is over its marks, given whether it was: it
+/// goes over at [`CORE_QUEUE_HIGH`] and stays over until it is under
+/// [`CORE_QUEUE_LOW`]. (Brindle's `QueueMarks` rule; the helper can't share
+/// the app's code.)
+fn core_backlog(over: bool, queued: usize) -> bool {
+    match over {
+        true => queued >= CORE_QUEUE_LOW,
+        false => queued >= CORE_QUEUE_HIGH,
+    }
+}
+
+/// Where a session's output goes when the holder reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dest {
+    /// To the connected core, whose queue is or isn't over its marks.
+    Core { over: bool },
+    /// Into the tail only, which has `room` bytes left: there is no core.
+    Tail { room: usize },
+}
+
+/// How much of a session's output to read now, in reads of at most `chunk`
+/// bytes: nothing for a core whose queue is over its marks or that paused
+/// the session, at most the tail's room without a core. Past those, the
+/// program blocks on its output instead of losing it.
+fn read_limit(dest: Dest, paused: bool, chunk: usize) -> usize {
+    match dest {
+        Dest::Core { over } if over || paused => 0,
+        Dest::Core { .. } => chunk,
+        // Only a core pauses, and the pause goes with it.
+        Dest::Tail { room } => room.min(chunk),
+    }
+}
+
+/// What a message from the core is about: the unit a fault while handling
+/// it is confined to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    /// Starting this session.
+    Spawn(SessionId),
+    /// A running session.
+    Session(SessionId),
+    /// A checkpoint being assembled for this session.
+    Checkpoint(SessionId),
+    /// The holder or the connection.
+    Holder,
+}
+
+fn unit_of(message: &ToHolder) -> Unit {
+    match message {
+        ToHolder::Spawn(spawn) => Unit::Spawn(spawn.session),
+        ToHolder::Input(data) => Unit::Session(data.session),
+        ToHolder::Resize(resize) => Unit::Session(resize.session),
+        ToHolder::Hangup(target) | ToHolder::Pause(target) | ToHolder::Resume(target) => {
+            Unit::Session(target.session)
+        }
+        ToHolder::Reparent(reparent) => Unit::Session(reparent.session),
+        ToHolder::SetMeta(update) => Unit::Session(update.session),
+        ToHolder::CheckpointBegin(begin) => Unit::Checkpoint(begin.session),
+        ToHolder::CheckpointChunk(chunk) => Unit::Checkpoint(chunk.session),
+        ToHolder::CheckpointEnd(end) => Unit::Checkpoint(end.session),
+        ToHolder::Hello(_) | ToHolder::Drain(_) | ToHolder::Goodbye(_) => Unit::Holder,
+    }
+}
+
+/// A message's name, as the protocol's table gives it.
+fn name_of(message: &ToHolder) -> &'static str {
+    match message {
+        ToHolder::Hello(_) => "HELLO",
+        ToHolder::Spawn(_) => "SPAWN",
+        ToHolder::Input(_) => "INPUT",
+        ToHolder::Resize(_) => "RESIZE",
+        ToHolder::Hangup(_) => "HANGUP",
+        ToHolder::CheckpointBegin(_) => "CHECKPOINT_BEGIN",
+        ToHolder::CheckpointChunk(_) => "CHECKPOINT_CHUNK",
+        ToHolder::CheckpointEnd(_) => "CHECKPOINT_END",
+        ToHolder::Drain(_) => "DRAIN",
+        ToHolder::Goodbye(_) => "GOODBYE",
+        ToHolder::Reparent(_) => "REPARENT",
+        ToHolder::Pause(_) => "PAUSE",
+        ToHolder::Resume(_) => "RESUME",
+        ToHolder::SetMeta(_) => "SET_META",
+    }
+}
+
+/// Panics, in a debug build, when `bytes` hold `BRINDLE_TEST_HOLDER_PANIC`'s
+/// marker: a fault the tests inject.
+fn inject_fault(bytes: &[u8]) {
+    static MARKER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    if let Some(marker) = fault::marker("BRINDLE_TEST_HOLDER_PANIC", &MARKER)
+        && fault::holds(bytes, marker)
+    {
+        panic!("BRINDLE_TEST_HOLDER_PANIC matched");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1419,137 @@ mod tests {
         tail.cover(5);
         assert!(!tail.truncated);
         assert_eq!(tail.to_vec().len(), Tail::LIMIT - 5);
+    }
+
+    #[test]
+    fn core_backlog_resumes_only_under_the_low_mark() {
+        assert!(!core_backlog(false, 0));
+        assert!(!core_backlog(false, CORE_QUEUE_HIGH - 1));
+        // Over at the high mark.
+        assert!(core_backlog(false, CORE_QUEUE_HIGH));
+        // Over, it stays over down to the low mark itself...
+        assert!(core_backlog(true, CORE_QUEUE_HIGH - 1));
+        assert!(core_backlog(true, CORE_QUEUE_LOW));
+        // ...and resumes under it.
+        assert!(!core_backlog(true, CORE_QUEUE_LOW - 1));
+        // Under, the low mark alone doesn't stop it.
+        assert!(!core_backlog(false, CORE_QUEUE_LOW));
+    }
+
+    #[test]
+    fn read_limit_is_zero_for_a_core_over_its_mark_or_a_paused_session() {
+        let chunk = 4096;
+        assert_eq!(read_limit(Dest::Core { over: false }, false, chunk), chunk);
+        assert_eq!(read_limit(Dest::Core { over: true }, false, chunk), 0);
+        assert_eq!(read_limit(Dest::Core { over: false }, true, chunk), 0);
+        assert_eq!(read_limit(Dest::Core { over: true }, true, chunk), 0);
+    }
+
+    #[test]
+    fn read_limit_without_a_core_is_the_tails_room() {
+        let chunk = 4096;
+        assert_eq!(read_limit(Dest::Tail { room: 100 }, false, chunk), 100);
+        let roomy = Dest::Tail { room: 1 << 20 };
+        assert_eq!(read_limit(roomy, false, chunk), chunk);
+        assert_eq!(read_limit(Dest::Tail { room: 0 }, false, chunk), 0);
+        // A pause is the core's, so it means nothing without one.
+        assert_eq!(read_limit(Dest::Tail { room: 100 }, true, chunk), 100);
+    }
+
+    #[test]
+    fn every_message_has_its_unit() {
+        use brindle_remote_protocol::holder::{
+            BlobBegin, CheckpointEnd, Drain, Goodbye, Reparent, Resize, SessionRef, SetMeta,
+        };
+
+        let data = |session| Data {
+            session,
+            bytes: Vec::new(),
+        };
+        let target = |session| SessionRef { session };
+        let spawn = Spawn {
+            session: 1,
+            command: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
+            cell_w: 0,
+            cell_h: 0,
+            meta: Default::default(),
+        };
+        let cases = [
+            (ToHolder::Spawn(spawn), Unit::Spawn(1), "SPAWN"),
+            (ToHolder::Input(data(2)), Unit::Session(2), "INPUT"),
+            (
+                ToHolder::Resize(Resize {
+                    session: 3,
+                    cols: 80,
+                    rows: 24,
+                    cell_w: 0,
+                    cell_h: 0,
+                }),
+                Unit::Session(3),
+                "RESIZE",
+            ),
+            (ToHolder::Hangup(target(4)), Unit::Session(4), "HANGUP"),
+            (
+                ToHolder::Reparent(Reparent {
+                    session: 5,
+                    hwnd: 1,
+                }),
+                Unit::Session(5),
+                "REPARENT",
+            ),
+            (ToHolder::Pause(target(6)), Unit::Session(6), "PAUSE"),
+            (ToHolder::Resume(target(7)), Unit::Session(7), "RESUME"),
+            (
+                ToHolder::SetMeta(SetMeta {
+                    session: 8,
+                    meta: Default::default(),
+                }),
+                Unit::Session(8),
+                "SET_META",
+            ),
+            (
+                ToHolder::CheckpointBegin(BlobBegin { session: 9, len: 0 }),
+                Unit::Checkpoint(9),
+                "CHECKPOINT_BEGIN",
+            ),
+            (
+                ToHolder::CheckpointChunk(data(10)),
+                Unit::Checkpoint(10),
+                "CHECKPOINT_CHUNK",
+            ),
+            (
+                ToHolder::CheckpointEnd(CheckpointEnd {
+                    session: 11,
+                    covers: 0,
+                }),
+                Unit::Checkpoint(11),
+                "CHECKPOINT_END",
+            ),
+            (
+                ToHolder::Hello(Hello {
+                    min: 1,
+                    max: 2,
+                    core_build: String::new(),
+                    instance: 1,
+                }),
+                Unit::Holder,
+                "HELLO",
+            ),
+            (ToHolder::Drain(Drain {}), Unit::Holder, "DRAIN"),
+            (
+                ToHolder::Goodbye(Goodbye { handover: true }),
+                Unit::Holder,
+                "GOODBYE",
+            ),
+        ];
+        for (message, unit, name) in &cases {
+            assert_eq!((unit_of(message), name_of(message)), (*unit, *name));
+        }
     }
 
     #[test]

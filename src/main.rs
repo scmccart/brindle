@@ -13,6 +13,7 @@ mod layout;
 mod notify;
 mod picker;
 mod primary;
+mod queue_marks;
 mod reattach;
 mod remote;
 mod session;
