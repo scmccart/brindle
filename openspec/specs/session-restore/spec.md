@@ -33,7 +33,7 @@ A state file that cannot be read, is not valid, or has a format version Brindle 
 - **THEN** it is ignored with a log line, and a normal launch happens
 
 ### Requirement: State file location and writes
-The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and in `%LOCALAPPDATA%\brindle\` on Windows. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits.
+The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and in `%LOCALAPPDATA%\brindle\` on Windows. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits. A state that can't be serialized SHALL NOT be written: the file SHALL keep what it last held, with one log line naming the problem.
 
 #### Scenario: Crash after a change
 - **WHEN** the user opens a tab, waits a few seconds, and Brindle is then killed
@@ -50,6 +50,18 @@ The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is
 #### Scenario: Directory comes back on Windows
 - **WHEN** a Windows tab's PowerShell, with Brindle's integration script loaded, was in `C:\src` when Brindle quit
 - **THEN** after a plain launch that tab's shell starts in `C:\src`
+
+#### Scenario: A state that can't be serialized keeps the file
+- **WHEN** a tab's shell changes into a directory whose name isn't valid UTF-8, so the recorded state can't be serialized, and stays there for a minute
+- **THEN** `session.toml` still holds what was last written, not an empty file, and the log has one line naming the problem, not one per check
+
+#### Scenario: Quitting while the state can't be serialized
+- **WHEN** Brindle quits while a tab's directory still can't be serialized
+- **THEN** the quit leaves `session.toml` as it was last written, and the next plain launch restores from that file
+
+#### Scenario: Writes resume once the state serializes
+- **WHEN** a tab's shell has been in a directory whose name isn't valid UTF-8 and then changes to `/tmp`
+- **THEN** within a few seconds `session.toml` is written with the current windows and tabs, that tab recorded in `/tmp`
 
 ### Requirement: One process owns the state
 Only one Brindle process at a time SHALL own the session state: the instance, which records and restores it and reattaches detached sessions. A launch while an instance runs SHALL hand its request to the instance, as defined by "A launch goes to the running Brindle" in `command-line`, and exit. A launch with debug options (`--send`, `--action`, `--dump-screen-after`, `--latency-log`, `--latency-bench`) while an instance runs SHALL instead run on its own, and SHALL neither restore, reattach, nor write the state file, and SHALL log that it doesn't.
