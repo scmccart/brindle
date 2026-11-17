@@ -32,7 +32,7 @@ A zone created by splitting SHALL run the tab's profile and start in the working
 - **THEN** the new zone starts in `/tmp`
 
 ### Requirement: Minimum size for splitting
-Splitting the active zone SHALL do nothing when the active zone's current bounds cannot fit two minimum 2-column by 2-row terminal grids together with the gap between the new cards, each card's border and each card's header bar. Shrinking the window or restoring a saved session SHALL NOT remove existing zones when zones become smaller than this threshold.
+Splitting the active zone SHALL do nothing when the active zone's current bounds cannot fit two minimum 10-column by 2-row terminal grids together with the gap between the new cards, each card's border and each card's header bar. No terminal grid Brindle creates or resizes SHALL be narrower than 10 columns, so a pane narrower than that is laid out as 10 columns wide. Shrinking the window or restoring a saved session SHALL NOT remove existing zones when zones become smaller than this threshold.
 
 #### Scenario: Split rejected when zone is too small
 - **WHEN** a zone is too narrow to fit two minimum terminal grids side by side and the user runs `Split Zone Right`
@@ -45,6 +45,10 @@ Splitting the active zone SHALL do nothing when the active zone's current bounds
 #### Scenario: Card chrome counts
 - **WHEN** a zone is exactly as wide as two minimum grids plus their padding, but not the gap and the borders
 - **THEN** `Split Zone Right` does nothing
+
+#### Scenario: A pane narrower than 10 columns is laid out as 10 columns wide
+- **WHEN** a terminal's pane is only 4 columns wide
+- **THEN** its grid, and the PTY size it reports, are 10 columns wide
 
 ### Requirement: Single-zone tabs hide zone chrome
 While a local tab contains only one zone, it SHALL NOT show a zone header bar, and the terminal SHALL fill its card, which fills the tab content area inside the card margin.
