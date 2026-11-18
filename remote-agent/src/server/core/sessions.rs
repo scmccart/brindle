@@ -1,6 +1,12 @@
 //! The core's sessions: spawning through a holder, their I/O between the
 //! client and the holder, the close policies, hang-ups and exits.
 //!
+//! - **State:** each session's program has a [`Life`] (starting, running,
+//!   hung up, or exited with the exit kept for its owner), its I/O an
+//!   [`Ownership`] (attached to a client, lingering, awaiting its owner
+//!   after an adoption, or detached, each with since when), and an adopted
+//!   one's emulator a [`Rebuild`]. What each event does to them is decided
+//!   in [`super::policy`].
 //! - **`kill`** sessions end on `CLOSE`, `KILL` and `STOP`, and when their
 //!   owner is gone: its connection ended, or, for sessions a new core
 //!   adopted, it didn't come back within [`super::RECONNECT_GRACE`].
@@ -40,16 +46,18 @@
 //!   session's emulator is rebuilt from the holder's checkpoint and tail
 //!   (the tail alone, after `ESC c`, when it was truncated).
 
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{
-    self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
+    self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, SessionInfo, Spawned, ToClient,
 };
 use brindle_remote_protocol::holder::{self as h1, HeldSession, MetaFault, SessionMeta, ToHolder};
 use brindle_remote_protocol::{RequestId, SessionId};
 
-use super::clients::error;
+use super::clients::{ClientToken, error};
 use super::holders::WaitingSpawn;
+use super::policy::{self, ExitFate, Fate, GraceFate, SessionView};
 use super::screen::Screen;
 use super::{Core, log};
 use crate::pty::Foreground;
@@ -79,32 +87,187 @@ fn is_due(since: u64, behind: bool) -> bool {
     since > after
 }
 
+/// Where a session's program is in its life (`types R1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Life {
+    /// The client's `SPAWN`, until the holder reports the program. It is
+    /// sent again if the holder goes away first (an empty holder exits, and
+    /// may not have read it). With `hung_up`, its holder was told to hang
+    /// it up (`KILL`, `STOP`, its `kill` client gone): it ends as soon as
+    /// it starts, and its `SPAWNED` still answers the request.
+    Starting { spawn: client::Spawn, hung_up: bool },
+    /// Its program runs as `pid`.
+    Running { pid: NonZeroU32 },
+    /// Its holder was told to hang it up; its `EXITED` follows.
+    HungUp { pid: NonZeroU32 },
+    /// Its program exited (`code` is `None` for a signal or a lost
+    /// holder), and the exit is kept until its owner hears of it: an owner
+    /// away, or a client still waiting for its replay. `pid` is what its
+    /// program's was, for that replay.
+    ExitedAwaitingOwner {
+        code: Option<i32>,
+        pid: Option<NonZeroU32>,
+    },
+}
+
+impl Life {
+    /// Started from `spawn`, waiting for the holder to report the program.
+    fn starting(spawn: client::Spawn) -> Self {
+        Self::Starting {
+            spawn,
+            hung_up: false,
+        }
+    }
+
+    /// Its program's pid, once the holder reported it.
+    pub(super) fn pid(&self) -> Option<NonZeroU32> {
+        match self {
+            Self::Starting { .. } => None,
+            Self::Running { pid } | Self::HungUp { pid } => Some(*pid),
+            Self::ExitedAwaitingOwner { pid, .. } => *pid,
+        }
+    }
+
+    pub(super) fn is_starting(&self) -> bool {
+        match self {
+            Self::Starting { .. } => true,
+            Self::Running { .. } | Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+        }
+    }
+
+    /// Its program runs (hung up or not): it started, and hasn't exited.
+    /// `LIST` shows these.
+    pub(super) fn is_running(&self) -> bool {
+        match self {
+            Self::Running { .. } | Self::HungUp { .. } => true,
+            Self::Starting { .. } | Self::ExitedAwaitingOwner { .. } => false,
+        }
+    }
+
+    /// Its holder was told to hang it up.
+    pub(super) fn is_hung_up(&self) -> bool {
+        match self {
+            Self::Starting { hung_up, .. } => *hung_up,
+            Self::HungUp { .. } => true,
+            Self::Running { .. } | Self::ExitedAwaitingOwner { .. } => false,
+        }
+    }
+
+    /// Its program runs and isn't being hung up: it is checkpointed, and
+    /// its foreground program reported.
+    pub(super) fn is_live(&self) -> bool {
+        match self {
+            Self::Running { .. } => true,
+            Self::Starting { .. } | Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+        }
+    }
+
+    /// Its program exited with `code`: the exit is kept for its owner.
+    fn exited(&mut self, code: Option<i32>) {
+        *self = Self::ExitedAwaitingOwner {
+            code,
+            pid: self.pid(),
+        };
+    }
+
+    /// Asks for a hang-up: whether its holder is to be told, which it is
+    /// once, and only while its program may still run.
+    fn hang_up(&mut self) -> bool {
+        match self {
+            Self::Starting { hung_up, .. } => !std::mem::replace(hung_up, true),
+            Self::Running { pid } => {
+                *self = Self::HungUp { pid: *pid };
+                true
+            }
+            Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+        }
+    }
+}
+
+/// Who a session's I/O goes to, and since when it has had none (`types R1`).
+/// Its owner, the token a returning client is matched by, is
+/// [`Session::owner`] beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ownership {
+    /// Its I/O goes to this client.
+    Attached(Token),
+    /// A `kill` session whose client's connection ended, waiting `until`
+    /// for the client to come back (its `HELLO`'s `linger_secs`). No
+    /// client `since`.
+    Lingering { until: Instant, since: Instant },
+    /// Adopted, and its owner hasn't come back yet. No client `since` its
+    /// adoption: when its client left before that, no core knows.
+    AwaitingOwner { since: Instant },
+    /// No client `since` its last one left.
+    Detached { since: Instant },
+}
+
+impl Ownership {
+    /// The client its I/O goes to.
+    pub(super) fn client(&self) -> Option<Token> {
+        match self {
+            Self::Attached(client) => Some(*client),
+            Self::Lingering { .. } | Self::AwaitingOwner { .. } | Self::Detached { .. } => None,
+        }
+    }
+
+    /// Since when it has had no client; `None` while a client has it.
+    pub(super) fn detached_since(&self) -> Option<Instant> {
+        match self {
+            Self::Attached(_) => None,
+            Self::Lingering { since, .. }
+            | Self::AwaitingOwner { since }
+            | Self::Detached { since } => Some(*since),
+        }
+    }
+
+    /// Its owner may still come back for it: a lingering session, or one
+    /// adopted whose owner hasn't come back yet.
+    pub(super) fn owner_may_return(&self) -> bool {
+        match self {
+            Self::Lingering { .. } | Self::AwaitingOwner { .. } => true,
+            Self::Attached(_) | Self::Detached { .. } => false,
+        }
+    }
+
+    /// No owner is waited for any more: it stays without a client since
+    /// when it had one last.
+    fn stop_waiting(&mut self) {
+        match *self {
+            Self::Lingering { since, .. } | Self::AwaitingOwner { since } => {
+                *self = Self::Detached { since };
+            }
+            Self::Attached(_) | Self::Detached { .. } => {}
+        }
+    }
+}
+
+/// Whether an adopted session's emulator is rebuilt from its holder's
+/// checkpoint and tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rebuild {
+    Ready,
+    /// Not until its tail comes, which was `truncated` or not.
+    Pending { truncated: bool },
+}
+
 pub(super) struct Session {
     /// The holder it runs under.
     pub(super) holder: Token,
-    /// The program's pid; 0 until the holder reports it.
-    pub(super) pid: u32,
+    pub(super) life: Life,
+    /// What it was started with, kept in its holder through `SET_META`
+    /// ([`Session::stored_meta`]). Its `owner` is always empty here: the
+    /// owner is [`Session::owner`].
     pub(super) meta: SessionMeta,
+    /// The client token whose `HELLO` gets it back ([`policy::returning`]);
+    /// `None` for a session that was let go, which no reconnect gets back.
+    pub(super) owner: Option<ClientToken>,
     pub(super) cols: u16,
     pub(super) rows: u16,
-    /// The client its I/O goes to.
-    pub(super) attached: Option<Token>,
-    /// The client's `SPAWN`, until the holder reports the program. It is
-    /// sent again if the holder goes away first (an empty holder exits, and
-    /// may not have read it).
-    spawning: Option<client::Spawn>,
+    pub(super) ownership: Ownership,
     /// Its holder was told to stop reading it, because its client is behind.
     paused: bool,
-    /// Its holder was told to hang it up.
-    hung_up: bool,
-    /// Adopted, and its owner hasn't come back yet.
-    pub(super) awaiting_owner: bool,
-    /// Its program exited while its owner was away (`None` for a signal);
-    /// kept so the owner hears of it when it comes back.
-    exited: Option<Option<i32>>,
-    /// Adopted, and its emulator isn't rebuilt from the holder's checkpoint
-    /// and tail yet: whether the tail was truncated.
-    rebuilding: Option<bool>,
+    rebuild: Rebuild,
     /// Where its last `SET_META` ends in its holder's connection (a count
     /// of bytes written: [`Core::holder_has`]), until the holder's socket
     /// has taken that much.
@@ -114,14 +277,6 @@ pub(super) struct Session {
     pending_replay: Option<PendingReplay>,
     /// Its emulator, fed with all of its output.
     pub(super) screen: Screen,
-    /// A `kill` session whose client's connection ended, and which waits
-    /// until then for the client to come back (its `HELLO`'s
-    /// `linger_secs`).
-    linger_until: Option<Instant>,
-    /// Since when it has had no client: since its last client left, or
-    /// since it was adopted (when its client left before that, no core
-    /// knows). `None` while a client has it.
-    pub(super) detached_since: Option<Instant>,
     /// It had output or input since the core last looked at its foreground
     /// program, or was just started or attached ([`super::process`]).
     pub(super) active: bool,
@@ -138,17 +293,61 @@ struct PendingReplay {
 }
 
 impl Session {
-    /// Its program runs: it isn't starting, and didn't exit while its owner
-    /// was away.
-    pub(super) fn is_running(&self) -> bool {
-        self.spawning.is_none() && self.exited.is_none()
-    }
-
     /// Whether its client may be told of its foreground program now: its
     /// program runs and isn't being hung up, and the client has its
     /// `SPAWNED` or its replay already.
     pub(super) fn reportable(&self) -> bool {
-        self.is_running() && !self.hung_up && self.pending_replay.is_none()
+        self.life.is_live() && self.pending_replay.is_none()
+    }
+
+    /// Its meta as its holder keeps it, with its owner's token (empty for
+    /// none, `types R9`).
+    pub(super) fn stored_meta(&self) -> SessionMeta {
+        SessionMeta {
+            owner: self
+                .owner
+                .as_ref()
+                .map(|owner| owner.as_str().to_string())
+                .unwrap_or_default(),
+            ..self.meta.clone()
+        }
+    }
+
+    /// What `LIST` says of it, as session `id`, at `now`. Only a session
+    /// with no client says whether it may still come back for its owner
+    /// (`owned`), for how long it has had none, and the layout its last
+    /// client detached it with.
+    pub(super) fn info(&self, id: SessionId, now: Instant) -> SessionInfo {
+        let detached = self.ownership.client().is_none();
+        SessionInfo {
+            session: id,
+            pid: self.life.pid().map_or(0, NonZeroU32::get),
+            attached: !detached,
+            command: self.meta.command.clone(),
+            cwd: self.meta.cwd.clone(),
+            policy: self.meta.policy,
+            cols: self.cols,
+            rows: self.rows,
+            key: self.meta.key.clone(),
+            title: self.screen.title(),
+            started: self.meta.started,
+            profile: self.meta.profile.clone(),
+            owned: detached && self.owner.is_some(),
+            detached_secs: self
+                .ownership
+                .detached_since()
+                .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
+            layout: self.meta.layout.clone().filter(|_| detached),
+        }
+    }
+
+    /// What [`policy::attach_refusal`] and [`policy::returning`] read.
+    pub(super) fn view(&self) -> SessionView<'_> {
+        SessionView {
+            life: &self.life,
+            ownership: &self.ownership,
+            owner: self.owner.as_ref(),
+        }
     }
 
     /// Output or input at `now`: the next look at its foreground program
@@ -167,35 +366,93 @@ impl Session {
 
     /// A session reported in a holder's `WELCOME`, adopted at `now`. It has
     /// no client until its owner comes back. One that exited while no core
-    /// was connected is gone from the holder already. A malformed meta is
-    /// repaired ([`adopt_meta`]): then the `core.log` line that says so
-    /// comes with it, and the core stores the repaired meta.
-    pub(super) fn adopted(holder: Token, held: HeldSession, now: Instant) -> (Self, Option<String>) {
-        let (meta, repaired) =
+    /// was connected is gone from the holder already, and its exit is kept
+    /// for its owner. A malformed meta is repaired ([`adopt_meta`]): then
+    /// the `core.log` line that says so comes with it, and the core stores
+    /// the repaired meta. A running session with no pid (0, which no
+    /// holder reports) isn't adopted: the `Err` is the line that says so.
+    pub(super) fn adopted(
+        holder: Token,
+        held: HeldSession,
+        now: Instant,
+    ) -> Result<(Self, Option<String>), String> {
+        let pid = NonZeroU32::new(held.pid);
+        let life = match (held.exit, pid) {
+            (Some(exit), pid) => Life::ExitedAwaitingOwner {
+                code: exit.code,
+                pid,
+            },
+            (None, Some(pid)) => Life::Running { pid },
+            (None, None) => {
+                return Err(format!(
+                    "session {}: its holder reports it running with no pid; not adopted",
+                    held.session
+                ));
+            }
+        };
+        let (mut meta, repaired) =
             adopt_meta(held.session, SessionMeta::from_value(&held.meta), session_key);
+        let owner = ClientToken::from_wire(&std::mem::take(&mut meta.owner));
         let session = Self {
             holder,
-            pid: held.pid,
+            life,
             screen: Screen::new(held.cols, held.rows, meta.scrollback),
             meta,
+            owner,
             cols: held.cols,
             rows: held.rows,
-            attached: None,
-            spawning: None,
+            ownership: Ownership::AwaitingOwner { since: now },
             paused: false,
-            hung_up: false,
-            awaiting_owner: true,
-            exited: held.exit.map(|exit| exit.code),
-            rebuilding: Some(held.truncated),
+            rebuild: Rebuild::Pending {
+                truncated: held.truncated,
+            },
             storing: None,
             pending_replay: None,
-            linger_until: None,
-            detached_since: Some(now),
             active: false,
             active_at: now,
             foreground: None,
         };
-        (session, repaired)
+        Ok((session, repaired))
+    }
+
+    /// A session the core sends its holder a `SPAWN` for at `now`, for
+    /// `client`, which owns it (if its `HELLO` named a token). The spawn's
+    /// answer goes to that client.
+    fn spawning(
+        holder: Token,
+        client: Token,
+        owner: Option<ClientToken>,
+        spawn: client::Spawn,
+        now: Instant,
+    ) -> Self {
+        let meta = SessionMeta {
+            command: command_line(&spawn),
+            cwd: spawn.cwd.clone(),
+            key: session_key(),
+            layout: None,
+            owner: String::new(),
+            policy: spawn.policy,
+            profile: spawn.profile.clone(),
+            scrollback: spawn.scrollback,
+            started: unix_now(),
+        };
+        Self {
+            holder,
+            screen: Screen::new(spawn.cols, spawn.rows, spawn.scrollback),
+            meta,
+            owner,
+            cols: spawn.cols,
+            rows: spawn.rows,
+            ownership: Ownership::Attached(client),
+            life: Life::starting(spawn),
+            paused: false,
+            rebuild: Rebuild::Ready,
+            storing: None,
+            pending_replay: None,
+            active: false,
+            active_at: now,
+            foreground: None,
+        }
     }
 }
 
@@ -251,7 +508,6 @@ fn kept_layout(
     })
 }
 
-/// The command line `list` shows; empty for the login shell.
 /// A new session's key: 128 random bits as hex, from `/dev/urandom`. If
 /// that can't be read, the time, pid and a counter stand in: unique enough
 /// for telling one host's sessions apart.
@@ -279,6 +535,7 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// The command line `list` shows; empty for the login shell.
 fn command_line(spawn: &client::Spawn) -> String {
     match &spawn.command {
         Some(command) => std::iter::once(command.as_str())
@@ -286,6 +543,18 @@ fn command_line(spawn: &client::Spawn) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         None => String::new(),
+    }
+}
+
+/// The first free session id from `next` on, and the `next` after it: ids
+/// wrap past `u32::MAX` to 1, and skip 0 (never an id) and those `taken`.
+fn free_id(mut next: SessionId, taken: impl Fn(SessionId) -> bool) -> (SessionId, SessionId) {
+    loop {
+        let id = next;
+        next = next.checked_add(1).unwrap_or(1);
+        if id != 0 && !taken(id) {
+            return (id, next);
+        }
     }
 }
 
@@ -315,70 +584,32 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn allocate_id(&mut self) -> SessionId {
-        loop {
-            let id = self.next_session;
-            self.next_session = self.next_session.checked_add(1).unwrap_or(1);
-            let taken = self.sessions.contains_key(&id)
-                || self.waiting.iter().any(|waiting| waiting.id == id);
-            if id != 0 && !taken {
-                return id;
-            }
-        }
+        let (id, next) = free_id(self.next_session, |id| {
+            self.sessions.contains_key(&id) || self.waiting.iter().any(|waiting| waiting.id == id)
+        });
+        self.next_session = next;
+        id
     }
 
     pub(super) fn send_spawn(&mut self, holder: Token, waiting: WaitingSpawn) {
         let WaitingSpawn { client, id, spawn } = waiting;
-        let screen = Screen::new(spawn.cols, spawn.rows, spawn.scrollback);
-        let meta = SessionMeta {
-            command: command_line(&spawn),
-            cwd: spawn.cwd.clone(),
-            key: session_key(),
-            layout: None,
-            owner: self.client_token(client).unwrap_or_default().to_string(),
-            policy: spawn.policy,
-            profile: spawn.profile.clone(),
-            scrollback: spawn.scrollback,
-            started: unix_now(),
-        };
+        let owner = self.client_token(client).cloned();
+        let session = Session::spawning(holder, client, owner, spawn.clone(), Instant::now());
         let message = ToHolder::Spawn(h1::Spawn {
             session: id,
-            command: spawn.command.clone(),
-            args: spawn.args.clone(),
-            cwd: spawn.cwd.clone(),
-            env: spawn.env.clone(),
+            command: spawn.command,
+            args: spawn.args,
+            cwd: spawn.cwd,
+            env: spawn.env,
             cols: spawn.cols,
             rows: spawn.rows,
             cell_w: spawn.cell_w,
             cell_h: spawn.cell_h,
-            meta: meta.to_value(),
+            meta: session.stored_meta().to_value(),
         });
         // The session first: a `SPAWN` that can't be sent fails it, to its
         // client, as the holder's `SPAWN_FAILED` would.
-        self.sessions.insert(
-            id,
-            Session {
-                holder,
-                pid: 0,
-                meta,
-                cols: spawn.cols,
-                rows: spawn.rows,
-                attached: Some(client),
-                spawning: Some(spawn),
-                paused: false,
-                hung_up: false,
-                awaiting_owner: false,
-                exited: None,
-                rebuilding: None,
-                storing: None,
-                pending_replay: None,
-                screen,
-                linger_until: None,
-                detached_since: None,
-                active: false,
-                active_at: Instant::now(),
-                foreground: None,
-            },
-        );
+        self.sessions.insert(id, session);
         self.send_holder(holder, message);
     }
 
@@ -396,15 +627,34 @@ impl<L: EventLoop> Core<L> {
         session
     }
 
+    /// The holder reports the session's program as `pid`. A session still
+    /// starting runs from now on (or is hung up, if it was told to be
+    /// meanwhile), and its client's `SPAWN` is answered. A pid of 0, which
+    /// no holder reports, is logged and ignored.
     pub(super) fn session_spawned(&mut self, holder: Token, id: SessionId, pid: u32) {
         let now = Instant::now();
+        let Some(reported) = NonZeroU32::new(pid) else {
+            return log!("holder {holder} reported session {id}'s program as pid 0; ignored");
+        };
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
-        session.pid = pid;
         session.tell_foreground(now);
-        let req = session.spawning.take().map(|spawn| spawn.req);
-        let client = session.attached;
+        let (life, req) = match &session.life {
+            Life::Starting {
+                spawn,
+                hung_up: false,
+            } => (Life::Running { pid: reported }, Some(spawn.req)),
+            Life::Starting {
+                spawn,
+                hung_up: true,
+            } => (Life::HungUp { pid: reported }, Some(spawn.req)),
+            Life::Running { .. } => (Life::Running { pid: reported }, None),
+            Life::HungUp { .. } => (Life::HungUp { pid: reported }, None),
+            exited @ Life::ExitedAwaitingOwner { .. } => (exited.clone(), None),
+        };
+        session.life = life;
+        let client = session.ownership.client();
         let key = session.meta.key.clone();
         log!("session {id}: pid {pid} ({:?})", session.meta.command);
         if let (Some(client), Some(req)) = (client, req) {
@@ -427,9 +677,12 @@ impl<L: EventLoop> Core<L> {
         if self.holder_session(holder, id).is_none() {
             return;
         }
-        let session = self.sessions.remove(&id).expect("the session");
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
         log!("session {id}: {message}");
-        if let (Some(client), Some(spawn)) = (session.attached, session.spawning) {
+        if let (Some(client), Life::Starting { spawn, .. }) = (session.ownership.client(), session.life)
+        {
             self.send_client(client, error(Some(spawn.req), None, message));
         }
     }
@@ -440,11 +693,16 @@ impl<L: EventLoop> Core<L> {
         if self.holder_session(holder, id).is_none() {
             return;
         }
-        let session = self.sessions.get_mut(&id).expect("the session");
-        if let Some(spawn) = session.spawning.take() {
-            let client = session.attached;
-            self.sessions.remove(&id);
-            if let Some(client) = client {
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        if session.life.is_starting() {
+            let Some(session) = self.sessions.remove(&id) else {
+                return;
+            };
+            if let (Some(client), Life::Starting { spawn, .. }) =
+                (session.ownership.client(), session.life)
+            {
                 self.waiting.push(WaitingSpawn { client, id, spawn });
             }
             return;
@@ -453,7 +711,7 @@ impl<L: EventLoop> Core<L> {
         // program exited, so it can keep the tab open and say why. One
         // still waiting for its replay gets that first (it answers its
         // `ATTACH`), and an `EXIT` kept for it ends the session there.
-        if let Some(client) = session.attached {
+        if let Some(client) = session.ownership.client() {
             log!("session {id}: lost with its holder");
             self.send_waiting_replay(id);
             if self.sessions.remove(&id).is_none() {
@@ -481,7 +739,7 @@ impl<L: EventLoop> Core<L> {
         session.screen.feed(id, &bytes);
         session.mark_active(now);
         // A client still waiting for its replay gets this output in it.
-        if let Some(client) = session.attached
+        if let Some(client) = session.ownership.client()
             && session.pending_replay.is_none()
         {
             self.send_client(client, ToClient::Data(Data { session: id, bytes }));
@@ -492,7 +750,7 @@ impl<L: EventLoop> Core<L> {
     /// from it, unless the tail was truncated (and so doesn't follow it).
     pub(super) fn session_checkpoint(&mut self, holder: Token, id: SessionId, bytes: &[u8]) {
         if let Some(session) = self.holder_session(holder, id)
-            && session.rebuilding == Some(false)
+            && session.rebuild == (Rebuild::Pending { truncated: false })
         {
             session.screen.restore(id, bytes);
         }
@@ -504,9 +762,10 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
-        let Some(truncated) = session.rebuilding.take() else {
+        let Rebuild::Pending { truncated } = session.rebuild else {
             return;
         };
+        session.rebuild = Rebuild::Ready;
         if truncated {
             log!(
                 "session {id}: its tail was truncated; rebuilt from the last {} bytes only",
@@ -516,23 +775,23 @@ impl<L: EventLoop> Core<L> {
         }
         session.screen.restore(id, bytes);
         session.screen.since_checkpoint = bytes.len() as u64;
-        if let (Some(client), Some(pending)) = (session.attached, session.pending_replay.take()) {
+        if let (Some(client), Some(pending)) =
+            (session.ownership.client(), session.pending_replay.take())
+        {
             self.replay(client, id, pending.req, pending.size);
         }
     }
 
     /// Sends the session's holder a checkpoint of its screen, covering the
-    /// output fed since the last one.
+    /// output fed since the last one: only for a session whose program runs
+    /// and isn't being hung up, once its emulator is rebuilt.
     pub(super) fn checkpoint(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if session.rebuilding.is_some()
-            || session.spawning.is_some()
-            || session.hung_up
-            || session.exited.is_some()
-        {
-            return;
+        match (session.rebuild, session.life.is_live()) {
+            (Rebuild::Ready, true) => {}
+            (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => return,
         }
         let bytes = session.screen.render(id);
         let covers = std::mem::take(&mut session.screen.since_checkpoint);
@@ -581,45 +840,38 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         log!("session {id}: exited ({code:?})");
-        let owner_may_return = session.awaiting_owner || session.linger_until.is_some();
-        if owner_may_return && session.attached.is_none() && !session.hung_up {
-            session.exited = Some(code);
-            return;
+        match policy::exit_fate(&session.ownership, &session.life) {
+            ExitFate::KeepForOwner => return session.life.exited(code),
+            ExitFate::Report => {}
         }
         // A client still waiting for its replay gets it now, then the
         // `EXIT`: the replay answers its `ATTACH`.
         if session.pending_replay.is_some() {
-            session.exited = Some(code);
+            session.life.exited(code);
             return self.send_waiting_replay(id);
         }
-        let session = self.sessions.remove(&id).expect("the session");
-        if let Some(client) = session.attached {
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
+        if let Some(client) = session.ownership.client() {
             self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
     }
 
     /// A returning owner (`HELLO` with the session's `client_token`) gets
-    /// back every session of its own that has no client, each after its
-    /// replay (`REPLAY_START` without a `req`). One that exited meanwhile
-    /// gets just its `EXIT`. A session still starting isn't given back:
-    /// its `SPAWN`'s answer went to a connection that is gone, so the
-    /// client doesn't know it.
+    /// back every session of its own that has no client
+    /// ([`policy::returning`]), each after its replay (`REPLAY_START`
+    /// without a `req`). One that exited meanwhile gets just its `EXIT`.
     pub(super) fn reattach(&mut self, client: Token) {
-        let Some(token) = self.client_token(client).map(str::to_string) else {
+        let Some(token) = self.client_token(client) else {
             return;
         };
-        let returning: Vec<SessionId> = self
+        let sessions: Vec<(SessionId, SessionView<'_>)> = self
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                session.attached.is_none()
-                    && session.spawning.is_none()
-                    && !session.hung_up
-                    && !session.meta.owner.is_empty()
-                    && session.meta.owner == token
-            })
-            .map(|(&id, _)| id)
+            .map(|(&id, session)| (id, session.view()))
             .collect();
+        let returning = policy::returning(&sessions, token);
         if !returning.is_empty() {
             log!(
                 "client {client} is back for {} session(s): {returning:?}",
@@ -627,63 +879,77 @@ impl<L: EventLoop> Core<L> {
             );
         }
         for id in returning {
-            let session = self.sessions.get_mut(&id).expect("the session");
-            session.awaiting_owner = false;
-            if let Some(code) = session.exited {
-                self.sessions.remove(&id);
-                self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
+            let Some(session) = self.sessions.get(&id) else {
                 continue;
+            };
+            match session.life {
+                Life::ExitedAwaitingOwner { code, .. } => {
+                    self.sessions.remove(&id);
+                    self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
+                }
+                Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
+                    self.replay(client, id, None, None);
+                }
             }
-            self.replay(client, id, None, None);
         }
     }
 
-    /// The reconnect grace period is over: adopted `kill` sessions whose
-    /// owners didn't come back are hung up.
+    /// The reconnect grace period is over: adopted sessions whose owners
+    /// didn't come back meet their [`policy::grace_fate`].
     pub(super) fn end_grace(&mut self) {
         let orphans: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.awaiting_owner)
+            .filter(|(_, session)| match session.ownership {
+                Ownership::AwaitingOwner { .. } => true,
+                Ownership::Attached(_) | Ownership::Lingering { .. } | Ownership::Detached { .. } => {
+                    false
+                }
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in orphans {
-            let session = self.sessions.get_mut(&id).expect("the session");
-            session.awaiting_owner = false;
-            if session.exited.is_some() {
-                self.sessions.remove(&id);
-            } else if session.meta.policy == Policy::Kill {
-                log!("session {id}: its owner didn't come back; hanging up");
-                self.hang_up(id);
-            } else {
-                log!("session {id}: detached; its owner didn't come back");
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            session.ownership.stop_waiting();
+            match policy::grace_fate(session.meta.policy, &session.life) {
+                GraceFate::Forget => {
+                    self.sessions.remove(&id);
+                }
+                GraceFate::HangUp => {
+                    log!("session {id}: its owner didn't come back; hanging up");
+                    self.hang_up(id);
+                }
+                GraceFate::LeaveDetached => {
+                    log!("session {id}: detached; its owner didn't come back");
+                }
             }
         }
     }
 
-    /// The client's connection ended: its `detach` sessions keep running
-    /// without a client, and its `kill` sessions are hung up, or, when it
-    /// asked for a `linger` (`HELLO`'s `linger_secs`), wait that long for it
-    /// to come back. A `kill` session still starting is hung up even then:
-    /// its client never learns of it.
-    pub(super) fn client_gone(&mut self, client: Token, linger: Duration) {
+    /// The client's connection ended at `now`: each of its sessions meets
+    /// its [`policy::gone_fate`].
+    pub(super) fn client_gone(&mut self, client: Token, linger: Duration, now: Instant) {
         for id in self.sessions_of(client) {
-            self.detach_session(id);
-            let session = &self.sessions[&id];
-            let (policy, starting) = (session.meta.policy, session.spawning.is_some());
-            match policy {
-                Policy::Kill if linger.is_zero() || starting => self.hang_up(id),
-                Policy::Kill => {
+            self.detach_session(id, now);
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            match policy::gone_fate(session.meta.policy, session.life.is_starting(), linger) {
+                Fate::HangUp => self.hang_up(id),
+                Fate::Linger(linger) => {
                     log!(
                         "session {id}: its client left; it waits {}s for it",
                         linger.as_secs()
                     );
-                    if let Some(session) = self.sessions.get_mut(&id) {
-                        session.linger_until = Some(Instant::now() + linger);
-                    }
+                    session.ownership = Ownership::Lingering {
+                        until: now + linger,
+                        since: now,
+                    };
                     self.checkpoint(id);
                 }
-                Policy::Detach => {
+                Fate::Keep => {
                     log!("session {id}: detached");
                     self.checkpoint(id);
                 }
@@ -692,14 +958,18 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// The client was replaced by a newer connection with its token
-    /// ([`Core::take_over`]): its sessions lose their client but keep their
-    /// owner, whatever their policy, so [`Core::reattach`] gives them to the
-    /// new connection. A session still starting is hung up, as its `SPAWN`
-    /// failed with the old connection.
-    pub(super) fn client_replaced(&mut self, client: Token) {
+    /// ([`Core::take_over`]) at `now`: its sessions lose their client but
+    /// keep their owner, whatever their policy, so [`Core::reattach`] gives
+    /// them to the new connection. A session still starting is hung up, as
+    /// its `SPAWN` failed with the old connection.
+    pub(super) fn client_replaced(&mut self, client: Token, now: Instant) {
         for id in self.sessions_of(client) {
-            self.detach_session(id);
-            if self.sessions[&id].spawning.is_some() {
+            self.detach_session(id, now);
+            if self
+                .sessions
+                .get(&id)
+                .is_some_and(|session| session.life.is_starting())
+            {
                 log!("session {id}: its client was replaced before it started; hanging up");
                 self.hang_up(id);
             }
@@ -712,17 +982,27 @@ impl<L: EventLoop> Core<L> {
         let expired: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.linger_until.is_some_and(|until| now >= until))
+            .filter(|(_, session)| match session.ownership {
+                Ownership::Lingering { until, .. } => now >= until,
+                Ownership::Attached(_)
+                | Ownership::AwaitingOwner { .. }
+                | Ownership::Detached { .. } => false,
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in expired {
-            let session = self.sessions.get_mut(&id).expect("the session");
-            session.linger_until = None;
-            if session.exited.is_some() {
-                self.sessions.remove(&id);
-            } else {
-                log!("session {id}: its client didn't come back in time; hanging up");
-                self.hang_up(id);
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            session.ownership.stop_waiting();
+            match session.life {
+                Life::ExitedAwaitingOwner { .. } => {
+                    self.sessions.remove(&id);
+                }
+                Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
+                    log!("session {id}: its client didn't come back in time; hanging up");
+                    self.hang_up(id);
+                }
             }
         }
     }
@@ -765,37 +1045,36 @@ impl<L: EventLoop> Core<L> {
 
     /// Hangs a session up, or forgets one that already exited.
     fn end_session(&mut self, id: SessionId) {
-        if self
-            .sessions
-            .get(&id)
-            .is_some_and(|session| session.exited.is_some())
-        {
-            self.sessions.remove(&id);
-        } else {
-            self.hang_up(id);
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        match session.life {
+            Life::ExitedAwaitingOwner { .. } => {
+                self.sessions.remove(&id);
+            }
+            Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => self.hang_up(id),
         }
     }
 
-    /// Asks the holder to hang the session up; its `EXITED` follows.
+    /// Asks the holder to hang the session up, once; its `EXITED` follows.
+    /// A session whose program exited has nothing to hang up.
     pub(super) fn hang_up(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if session.hung_up {
+        if !session.life.hang_up() {
             return;
         }
-        session.hung_up = true;
         let holder = session.holder;
         self.send_holder(holder, ToHolder::Hangup(h1::SessionRef { session: id }));
     }
 
-    /// The session loses its client, and isn't paused for it any more. A
-    /// replay still waiting for that client is dropped.
-    pub(super) fn detach_session(&mut self, id: SessionId) {
+    /// The session loses its client at `now`, and isn't paused for it any
+    /// more. A replay still waiting for that client is dropped.
+    pub(super) fn detach_session(&mut self, id: SessionId, now: Instant) {
         if let Some(session) = self.sessions.get_mut(&id) {
-            session.attached = None;
+            session.ownership = Ownership::Detached { since: now };
             session.pending_replay = None;
-            session.detached_since = Some(Instant::now());
         }
         self.set_paused(id, false);
     }
@@ -803,7 +1082,7 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn sessions_of(&self, client: Token) -> Vec<SessionId> {
         self.sessions
             .iter()
-            .filter(|(_, session)| session.attached == Some(client))
+            .filter(|(_, session)| session.ownership.client() == Some(client))
             .map(|(&id, _)| id)
             .collect()
     }
@@ -841,7 +1120,7 @@ impl<L: EventLoop> Core<L> {
         if self
             .sessions
             .get(&id)
-            .is_some_and(|session| session.attached == Some(client))
+            .is_some_and(|session| session.ownership.client() == Some(client))
         {
             return self.sessions.get_mut(&id);
         }
@@ -926,30 +1205,25 @@ impl<L: EventLoop> Core<L> {
     /// waits until the holder's socket has the change (`store_meta`).
     pub(super) fn client_attach(&mut self, client: Token, attach: client::Attach) {
         let id = attach.session;
-        let refusal = match self.sessions.get(&id) {
-            None => Some(format!("no session {id}")),
-            Some(session) if session.attached == Some(client) => {
-                Some(format!("session {id} is already attached to this client"))
-            }
-            Some(session) if session.attached.is_some() => {
-                Some(format!("session {id} is attached to another client"))
-            }
-            Some(session) if session.hung_up => Some(format!("session {id} is ending")),
-            Some(_) => None,
-        };
-        if let Some(message) = refusal {
+        let session = self.sessions.get(&id).map(Session::view);
+        if let Some(refusal) = policy::attach_refusal(id, session, client) {
+            let message = refusal.to_string();
             return self.send_client(client, error(Some(attach.req), Some(id), message));
         }
         log!("session {id}: attached to client {client}");
-        let token = self.client_token(client).map(str::to_string);
-        let session = self.sessions.get_mut(&id).expect("the session");
+        // Its owner becomes the client's token, or none when its `HELLO`
+        // named none.
+        let owner = self.clients.get(&client).map(|entry| entry.token.clone());
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         // An attached session's layout is its client's window: the one it
         // was detached with no longer says where it is.
         let mut changed = session.meta.layout.take().is_some();
-        if let Some(token) = token
-            && session.meta.owner != token
+        if let Some(owner) = owner
+            && session.owner != owner
         {
-            session.meta.owner = token;
+            session.owner = owner;
             changed = true;
         }
         if changed {
@@ -979,11 +1253,11 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        session.meta.owner.clear();
+        session.owner = None;
         session.meta.policy = Policy::Detach;
         session.meta.layout = kept_layout(id, detach.layout);
         self.store_meta(id);
-        self.detach_session(id);
+        self.detach_session(id, Instant::now());
         self.checkpoint(id);
     }
 
@@ -1021,7 +1295,7 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         let holder = session.holder;
-        let meta = session.meta.to_value();
+        let meta = session.stored_meta().to_value();
         match self.holders.get(&holder).and_then(|holder| holder.protocol()) {
             Some(protocol) if protocol >= 2 => {
                 // One that couldn't be sent leaves `storing` as it was: no
@@ -1058,9 +1332,9 @@ impl<L: EventLoop> Core<L> {
             };
             session.storing = None;
             // One that also waits for the rebuild goes out after its tail.
-            if session.rebuilding.is_none()
+            if session.rebuild == Rebuild::Ready
                 && let (Some(client), Some(pending)) =
-                    (session.attached, session.pending_replay.take())
+                    (session.ownership.client(), session.pending_replay.take())
             {
                 self.replay(client, id, pending.req, pending.size);
             }
@@ -1075,7 +1349,9 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.storing = None;
-        if let (Some(client), Some(pending)) = (session.attached, session.pending_replay.take()) {
+        if let (Some(client), Some(pending)) =
+            (session.ownership.client(), session.pending_replay.take())
+        {
             self.replay(client, id, pending.req, pending.size);
         }
     }
@@ -1098,17 +1374,17 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        session.awaiting_owner = false;
-        session.linger_until = None;
-        session.attached = Some(client);
-        session.detached_since = None;
+        session.ownership = Ownership::Attached(client);
         session.tell_foreground(now);
-        if session.rebuilding.is_some() || session.storing.is_some() {
+        if session.rebuild != Rebuild::Ready || session.storing.is_some() {
             session.pending_replay = Some(PendingReplay { req, size });
             return;
         }
-        let pid = session.pid;
-        let exited = session.exited;
+        let pid = session.life.pid().map_or(0, NonZeroU32::get);
+        let exited = match session.life {
+            Life::ExitedAwaitingOwner { code, .. } => Some(code),
+            Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => None,
+        };
         // Rendered whole, in this turn of the loop: output read after it
         // is fed and forwarded after it, so nothing is lost or reordered.
         let bytes = session.screen.render(id);
@@ -1263,28 +1539,270 @@ mod tests {
         assert_eq!(meta.key, "other");
     }
 
+    fn pid(pid: u32) -> NonZeroU32 {
+        NonZeroU32::new(pid).unwrap()
+    }
+
+    fn adopted(held: HeldSession, now: Instant) -> Session {
+        let (session, repaired) = Session::adopted(7, held, now).unwrap();
+        assert_eq!(repaired, None);
+        session
+    }
+
     #[test]
     fn an_adopted_session_is_detached_and_active_since_now() {
         let now = Instant::now();
-        let (session, repaired) = Session::adopted(7, held(true), now);
-        assert_eq!(repaired, None);
-        assert_eq!((session.holder, session.pid, session.cols, session.rows), (7, 42, 80, 24));
-        assert_eq!((session.meta.key.as_str(), session.meta.owner.as_str()), ("k1", "tok"));
+        let session = adopted(held(true), now);
+        assert_eq!((session.holder, session.cols, session.rows), (7, 80, 24));
+        assert_eq!(session.life, Life::Running { pid: pid(42) });
+        // Its owner is taken out of its meta, and put back for its holder.
+        assert_eq!(session.owner.as_ref().map(ClientToken::as_str), Some("tok"));
+        assert_eq!((session.meta.key.as_str(), session.meta.owner.as_str()), ("k1", ""));
+        assert_eq!(session.stored_meta().owner, "tok");
         // No client until its owner comes back, and detached since now.
-        assert_eq!(session.attached, None);
-        assert!(session.awaiting_owner);
-        assert_eq!(session.detached_since, Some(now));
+        assert_eq!(session.ownership, Ownership::AwaitingOwner { since: now });
+        assert_eq!(session.ownership.client(), None);
+        assert_eq!(session.ownership.detached_since(), Some(now));
         // Not active, as of now: its first output marks it.
         assert!(!session.active);
         assert_eq!(session.active_at, now);
-        assert_eq!(session.rebuilding, Some(true));
-        assert!(session.is_running());
+        assert_eq!(session.rebuild, Rebuild::Pending { truncated: true });
+        assert!(session.life.is_running());
+    }
+
+    #[test]
+    fn an_adopted_session_that_exited_keeps_its_exit_and_one_with_no_pid_is_refused() {
+        let now = Instant::now();
+        let exited = HeldSession {
+            exit: Some(h1::ExitStatus { code: Some(3) }),
+            ..held(false)
+        };
+        let session = adopted(exited, now);
+        assert_eq!(
+            session.life,
+            Life::ExitedAwaitingOwner { code: Some(3), pid: Some(pid(42)) }
+        );
+        assert!(!session.life.is_running());
+
+        let refused = Session::adopted(7, HeldSession { pid: 0, ..held(false) }, now);
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("session 3: its holder reports it running with no pid; not adopted")
+        );
+        // An exited one needs none.
+        let exited = HeldSession { pid: 0, exit: Some(h1::ExitStatus { code: None }), ..held(false) };
+        assert_eq!(adopted(exited, now).life, Life::ExitedAwaitingOwner { code: None, pid: None });
+    }
+
+    #[test]
+    fn a_meta_with_no_owner_adopts_a_session_no_reconnect_gets_back() {
+        let meta = SessionMeta { key: "k1".into(), scrollback: 100, ..SessionMeta::default() };
+        let held = HeldSession { meta: meta.to_value(), ..held(false) };
+        let session = adopted(held, Instant::now());
+        assert_eq!(session.owner, None);
+        assert_eq!(session.stored_meta().owner, "");
+    }
+
+    fn spawn(policy: Policy) -> client::Spawn {
+        client::Spawn {
+            req: 1,
+            command: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
+            cell_w: 0,
+            cell_h: 0,
+            scrollback: 100,
+            policy,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn each_life_answers_its_questions() {
+        // (life, pid, starting, running, hung up, live)
+        let cases = [
+            (Life::starting(spawn(Policy::Kill)), None, true, false, false, false),
+            (
+                Life::Starting { spawn: spawn(Policy::Kill), hung_up: true },
+                None,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (Life::Running { pid: pid(9) }, Some(pid(9)), false, true, false, true),
+            (Life::HungUp { pid: pid(9) }, Some(pid(9)), false, true, true, false),
+            (
+                Life::ExitedAwaitingOwner { code: Some(0), pid: Some(pid(9)) },
+                Some(pid(9)),
+                false,
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (life, pid, starting, running, hung_up, live) in cases {
+            let answers = (
+                life.pid(),
+                life.is_starting(),
+                life.is_running(),
+                life.is_hung_up(),
+                life.is_live(),
+            );
+            assert_eq!(answers, (pid, starting, running, hung_up, live), "{life:?}");
+        }
+    }
+
+    #[test]
+    fn a_hang_up_is_sent_once_and_never_for_an_exit() {
+        let mut starting = Life::starting(spawn(Policy::Kill));
+        assert!(starting.hang_up());
+        assert!(!starting.hang_up());
+        assert!(starting.is_starting() && starting.is_hung_up());
+
+        let mut running = Life::Running { pid: pid(9) };
+        assert!(running.hang_up());
+        assert_eq!(running, Life::HungUp { pid: pid(9) });
+        assert!(!running.hang_up());
+
+        let mut exited = Life::ExitedAwaitingOwner { code: None, pid: None };
+        assert!(!exited.hang_up());
+
+        // An exit keeps the pid its program had.
+        running.exited(Some(1));
+        assert_eq!(running, Life::ExitedAwaitingOwner { code: Some(1), pid: Some(pid(9)) });
+        let mut starting = Life::starting(spawn(Policy::Kill));
+        starting.exited(None);
+        assert_eq!(starting, Life::ExitedAwaitingOwner { code: None, pid: None });
+    }
+
+    #[test]
+    fn an_ownership_says_its_client_and_since_when_it_has_none() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        // (ownership, client, detached since, owner may return)
+        let cases = [
+            (Ownership::Attached(4), Some(4), None, false),
+            (Ownership::Lingering { until: t1, since: t0 }, None, Some(t0), true),
+            (Ownership::AwaitingOwner { since: t0 }, None, Some(t0), true),
+            (Ownership::Detached { since: t0 }, None, Some(t0), false),
+        ];
+        for (ownership, client, since, may_return) in cases {
+            let answers = (ownership.client(), ownership.detached_since(), ownership.owner_may_return());
+            assert_eq!(answers, (client, since, may_return), "{ownership:?}");
+
+            // Once no owner is waited for, it is detached since the same
+            // time; an attached one stays attached.
+            let mut stopped = ownership;
+            stopped.stop_waiting();
+            let expected = match ownership {
+                Ownership::Attached(_) => ownership,
+                Ownership::Lingering { .. }
+                | Ownership::AwaitingOwner { .. }
+                | Ownership::Detached { .. } => Ownership::Detached { since: t0 },
+            };
+            assert_eq!(stopped, expected);
+        }
+    }
+
+    #[test]
+    fn a_listed_session_shows_its_owner_and_layout_only_while_detached() {
+        let t0 = Instant::now();
+        let layout = brindle_remote_protocol::serde_json::json!({ "tab": 1 });
+        let meta = SessionMeta {
+            command: "bash".into(),
+            key: "k1".into(),
+            owner: "tok".into(),
+            layout: Some(layout.clone()),
+            policy: Policy::Kill,
+            profile: Some("work".into()),
+            scrollback: 100,
+            started: 1_700_000_000,
+            ..SessionMeta::default()
+        };
+        let held = HeldSession { meta: meta.to_value(), ..held(false) };
+        let mut session = adopted(held, t0);
+        let info = session.info(3, t0 + Duration::from_secs(5));
+        assert_eq!(
+            info,
+            SessionInfo {
+                session: 3,
+                pid: 42,
+                attached: false,
+                command: "bash".into(),
+                cwd: None,
+                policy: Policy::Kill,
+                cols: 80,
+                rows: 24,
+                key: "k1".into(),
+                title: session.screen.title(),
+                started: 1_700_000_000,
+                profile: Some("work".into()),
+                owned: true,
+                detached_secs: 5,
+                layout: Some(layout),
+            }
+        );
+
+        session.ownership = Ownership::Attached(9);
+        let info = session.info(3, t0 + Duration::from_secs(5));
+        assert_eq!((info.attached, info.owned, info.detached_secs), (true, false, 0));
+        assert_eq!(info.layout, None);
+
+        // A session let go has no owner to come back.
+        session.ownership = Ownership::Detached { since: t0 };
+        session.owner = None;
+        let info = session.info(3, t0);
+        assert_eq!((info.attached, info.owned, info.detached_secs), (false, false, 0));
+    }
+
+    #[test]
+    fn a_layout_is_kept_up_to_the_limit() {
+        use brindle_remote_protocol::serde_json::Value;
+        assert_eq!(kept_layout(3, None), None);
+        // A JSON string is its text and two quotes.
+        let at_limit = Value::String("x".repeat(client::MAX_LAYOUT - 2));
+        assert_eq!(kept_layout(3, Some(at_limit.clone())), Some(at_limit));
+        let over = Value::String("x".repeat(client::MAX_LAYOUT - 1));
+        assert_eq!(kept_layout(3, Some(over)), None);
+    }
+
+    #[test]
+    fn the_listed_command_line_is_the_command_and_its_arguments() {
+        let login = spawn(Policy::Kill);
+        assert_eq!(command_line(&login), "");
+        // Arguments with no command are the login shell's: not shown.
+        let args = client::Spawn { args: vec!["-l".into()], ..spawn(Policy::Kill) };
+        assert_eq!(command_line(&args), "");
+        let vim = client::Spawn {
+            command: Some("vim".into()),
+            args: vec!["a b".into(), "-R".into()],
+            ..spawn(Policy::Kill)
+        };
+        assert_eq!(command_line(&vim), "vim a b -R");
+        let bare = client::Spawn { command: Some("top".into()), ..spawn(Policy::Kill) };
+        assert_eq!(command_line(&bare), "top");
+    }
+
+    #[test]
+    fn session_ids_skip_the_taken_and_zero_and_wrap_to_one() {
+        let none = |_: SessionId| false;
+        assert_eq!(free_id(1, none), (1, 2));
+        assert_eq!(free_id(5, |id| id == 5 || id == 6), (7, 8));
+        // Past the largest id they wrap, and 0 is never one.
+        assert_eq!(free_id(SessionId::MAX, none), (SessionId::MAX, 1));
+        assert_eq!(free_id(0, none), (1, 2));
+        assert_eq!(free_id(SessionId::MAX, |id| id == SessionId::MAX), (1, 2));
+        assert_eq!(free_id(SessionId::MAX, |id| id == SessionId::MAX || id == 1), (2, 3));
     }
 
     #[test]
     fn marking_activity_records_the_given_instant() {
         let adopted_at = Instant::now();
-        let (mut session, _) = Session::adopted(7, held(false), adopted_at);
+        let mut session = adopted(held(false), adopted_at);
         let later = adopted_at + Duration::from_secs(5);
         session.mark_active(later);
         assert!(session.active);
@@ -1299,6 +1817,6 @@ mod tests {
         assert_eq!(session.active_at, latest);
         assert_eq!(session.foreground, None);
         // It doesn't touch when its client left.
-        assert_eq!(session.detached_since, Some(adopted_at));
+        assert_eq!(session.ownership.detached_since(), Some(adopted_at));
     }
 }

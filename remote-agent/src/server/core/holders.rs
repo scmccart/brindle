@@ -15,8 +15,9 @@ use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHo
 use brindle_remote_protocol::ready::ReadyRead;
 
 use super::clients::error;
+use super::policy::{self, Adoption, HolderView, Placement, Stage};
 use super::sessions::Session;
-use super::{ADOPT_LIMIT, Core, RECONNECT_GRACE, Source, log};
+use super::{ADOPT_LIMIT, Core, Source, log};
 use crate::server::conn::Conn;
 use crate::server::daemon::{self, ReadyPipe};
 use crate::server::event_loop::{EventLoop, Interest, Token};
@@ -33,27 +34,46 @@ const CONNECT_RETRY_LIMIT: Duration = Duration::from_secs(1);
 pub(super) struct Holder {
     pub(super) conn: Conn,
     pub(super) interest: Interest,
-    /// Where it listens, and its lock file.
+    /// Where it listens, its lock file, and the build their names give.
     place: Place,
-    /// Its files name the core's own build.
-    own_build: bool,
     /// Found at startup: clients wait until it is adopted.
     initial: bool,
     /// From its `WELCOME`.
     welcome: Option<Welcomed>,
-    /// Sessions whose checkpoint and tail are still to come.
-    adopting: HashSet<SessionId>,
-    /// Of another build: told to `DRAIN`, so it takes no new sessions and
-    /// exits after its last one.
-    draining: bool,
     checkpoints: Assembler,
     tails: Assembler,
 }
 
+/// What a holder's `WELCOME` told the core, and how far its adoption got.
 struct Welcomed {
     protocol: u32,
     build: String,
     pid: u32,
+    /// Sessions whose checkpoint and tail are still to come.
+    adopting: HashSet<SessionId>,
+    /// Whether it takes new sessions, or drains ([`policy::adoption`]).
+    adoption: Adoption,
+}
+
+/// A holder is adopted once it has welcomed the core and every session it
+/// listed has its checkpoint and tail.
+fn is_adopted(welcome: Option<&Welcomed>) -> bool {
+    welcome.is_some_and(|welcome| welcome.adopting.is_empty())
+}
+
+/// A holder's entry in `SERVER_STATUS`, once it has welcomed the core.
+fn status(welcome: Option<&Welcomed>, sessions: u32) -> Option<client::HolderStatus> {
+    let welcome = welcome?;
+    Some(client::HolderStatus {
+        pid: welcome.pid,
+        build: welcome.build.clone(),
+        protocol: welcome.protocol,
+        sessions,
+        draining: match welcome.adoption {
+            Adoption::Keep => false,
+            Adoption::Drain => true,
+        },
+    })
 }
 
 impl Holder {
@@ -63,19 +83,35 @@ impl Holder {
     }
 
     fn is_adopted(&self) -> bool {
-        self.welcome.is_some() && self.adopting.is_empty()
+        is_adopted(self.welcome.as_ref())
     }
 
     /// Its entry in `SERVER_STATUS`, once it has welcomed the core.
     pub(super) fn status(&self, sessions: u32) -> Option<client::HolderStatus> {
-        let welcome = self.welcome.as_ref()?;
-        Some(client::HolderStatus {
-            pid: welcome.pid,
-            build: welcome.build.clone(),
-            protocol: welcome.protocol,
-            sessions,
-            draining: self.draining,
-        })
+        status(self.welcome.as_ref(), sessions)
+    }
+
+    fn draining(&self) -> bool {
+        self.welcome
+            .as_ref()
+            .is_some_and(|welcome| welcome.adoption == Adoption::Drain)
+    }
+
+    /// What [`policy::placement`] reads of it.
+    fn view(&self) -> HolderView<'_> {
+        let stage = match &self.welcome {
+            None => Stage::Connected,
+            Some(welcome) if welcome.adopting.is_empty() => Stage::Adopted {
+                build: &welcome.build,
+            },
+            Some(welcome) => Stage::Adopting {
+                build: &welcome.build,
+            },
+        };
+        HolderView {
+            named: self.place.build.as_deref(),
+            stage,
+        }
     }
 }
 
@@ -195,19 +231,14 @@ impl<L: EventLoop> Core<L> {
         let token = self.token();
         self.ev.register(&conn.source(), token, Interest::READABLE)?;
         self.sources.insert(token, Source::Holder);
-        let name = place.lock.file_name().unwrap_or_default().to_string_lossy();
-        let own_build = name.starts_with(&format!("holder-{}-", self.build));
         self.holders.insert(
             token,
             Holder {
                 conn,
                 interest: Interest::READABLE,
                 place,
-                own_build,
                 initial,
                 welcome: None,
-                adopting: HashSet::new(),
-                draining: false,
                 checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
                 tails: Assembler::new(h1::TAIL_LIMIT),
             },
@@ -316,7 +347,7 @@ impl<L: EventLoop> Core<L> {
                     .sessions
                     .get(&session)
                     .filter(|held| held.holder == token)
-                    .and_then(|held| held.attached);
+                    .and_then(|held| held.ownership.client());
                 if let Some(client) = client {
                     self.send_client(client, error(None, Some(session), why));
                 }
@@ -358,7 +389,7 @@ impl<L: EventLoop> Core<L> {
                     .session
                     .and_then(|id| self.sessions.get(&id))
                     .filter(|session| session.holder == token)
-                    .and_then(|session| session.attached);
+                    .and_then(|session| session.ownership.client());
                 match client {
                     Some(client) => self.send_client(
                         client,
@@ -410,36 +441,36 @@ impl<L: EventLoop> Core<L> {
             welcome.previous,
             welcome.sessions.len()
         );
-        holder.own_build = welcome.build == self.build;
         if welcome.previous == h1::Previous::Handover {
             log!(
                 "upgrade: took holder {} over from a core that stepped down",
                 holder.place.endpoint.display()
             );
         }
-        let drain = !holder.own_build;
-        if drain {
-            log!(
+        let adoption = policy::adoption(&welcome.build, &self.build);
+        match adoption {
+            Adoption::Keep => {}
+            Adoption::Drain => log!(
                 "drain: holder {} is of build {}, not {}; it takes no new sessions and exits after its last one",
                 holder.place.endpoint.display(),
                 welcome.build,
                 self.build
-            );
-            holder.draining = true;
+            ),
         }
         holder.welcome = Some(Welcomed {
             protocol: welcome.protocol,
             build: welcome.build,
             pid: welcome.pid,
+            // Every listed session's checkpoint and tail follow.
+            adopting: welcome.sessions.iter().map(|held| held.session).collect(),
+            adoption,
         });
-        if drain {
-            self.send_holder(token, ToHolder::Drain(h1::Drain {}));
+        match adoption {
+            Adoption::Keep => {}
+            Adoption::Drain => {
+                self.send_holder(token, ToHolder::Drain(h1::Drain {}));
+            }
         }
-        let Some(holder) = self.holders.get_mut(&token) else {
-            return;
-        };
-        // Every listed session's checkpoint and tail follow.
-        holder.adopting = welcome.sessions.iter().map(|held| held.session).collect();
         let mut adopted_any = false;
         let now = Instant::now();
         for held in welcome.sessions {
@@ -449,7 +480,13 @@ impl<L: EventLoop> Core<L> {
                 continue;
             }
             self.next_session = self.next_session.max(id.saturating_add(1));
-            let (session, repaired) = Session::adopted(token, held, now);
+            let (session, repaired) = match Session::adopted(token, held, now) {
+                Ok(adopted) => adopted,
+                Err(line) => {
+                    log!("{line}");
+                    continue;
+                }
+            };
             self.sessions.insert(id, session);
             // The next core reads the repaired meta.
             if let Some(line) = repaired {
@@ -460,9 +497,8 @@ impl<L: EventLoop> Core<L> {
         }
         // A holder found after startup gives its sessions' owners the same
         // grace period (startup's starts once clients are accepted).
-        if adopted_any && self.accepting {
-            let until = now + RECONNECT_GRACE;
-            self.grace_until = Some(self.grace_until.map_or(until, |grace| grace.max(until)));
+        if adopted_any {
+            self.lifecycle.holder_adopted(now);
         }
         self.holder_adopted(token);
     }
@@ -490,7 +526,9 @@ impl<L: EventLoop> Core<L> {
         match kind {
             Blob::Checkpoint => self.session_checkpoint(token, id, &bytes),
             Blob::Tail => {
-                holder.adopting.remove(&id);
+                if let Some(welcome) = &mut holder.welcome {
+                    welcome.adopting.remove(&id);
+                }
                 self.session_tail(token, id, &bytes);
                 self.holder_adopted(token);
             }
@@ -516,7 +554,7 @@ impl<L: EventLoop> Core<L> {
             .filter(|(_, session)| session.holder == token)
             .map(|(&id, _)| id)
             .collect();
-        if holder.draining && lost.is_empty() {
+        if holder.draining() && lost.is_empty() {
             log!(
                 "drain: holder {} (pid {:?}) ended its last session and exited",
                 holder.place.endpoint.display(),
@@ -543,39 +581,40 @@ impl<L: EventLoop> Core<L> {
         self.place_waiting();
     }
 
-    /// An adopted holder of the core's build to start sessions on.
-    fn spawn_holder(&self) -> Option<Token> {
-        self.holders
+    /// The holders in token order, and what [`policy::placement`] reads of
+    /// each.
+    fn holder_views(&self) -> (Vec<Token>, Vec<HolderView<'_>>) {
+        let mut holders: Vec<(Token, &Holder)> = self
+            .holders
             .iter()
-            .filter(|(_, holder)| {
-                holder.is_adopted()
-                    && holder
-                        .welcome
-                        .as_ref()
-                        .is_some_and(|welcome| welcome.build == self.build)
-            })
-            .map(|(&token, _)| token)
-            .min()
+            .map(|(&token, holder)| (token, holder))
+            .collect();
+        holders.sort_by_key(|&(token, _)| token);
+        holders
+            .into_iter()
+            .map(|(token, holder)| (token, holder.view()))
+            .unzip()
     }
 
     /// Sends waiting spawns to a holder of the core's build, starting one if
-    /// there is none.
+    /// there is none ([`policy::placement`]).
     pub(super) fn place_waiting(&mut self) {
         if self.waiting.is_empty() {
             return;
         }
-        if let Some(holder) = self.spawn_holder() {
-            for waiting in std::mem::take(&mut self.waiting) {
-                self.send_spawn(holder, waiting);
+        let (tokens, views) = self.holder_views();
+        let placement = policy::placement(&views, &self.build, self.holder_start.is_some());
+        match placement {
+            Placement::Spawn(index) => {
+                let Some(&holder) = tokens.get(index) else {
+                    return;
+                };
+                for waiting in std::mem::take(&mut self.waiting) {
+                    self.send_spawn(holder, waiting);
+                }
             }
-            return;
-        }
-        let coming = self
-            .holders
-            .values()
-            .any(|holder| holder.own_build && holder.welcome.is_none());
-        if !coming && self.holder_start.is_none() {
-            self.start_holder();
+            Placement::Start => self.start_holder(),
+            Placement::Wait => {}
         }
     }
 
@@ -637,11 +676,8 @@ impl<L: EventLoop> Core<L> {
             return self.fail_waiting(&format!("{why}; see its log in the server directory"));
         }
         self.discover(false);
-        let coming = self
-            .holders
-            .values()
-            .any(|holder| holder.own_build && !holder.is_adopted());
-        if !coming && self.spawn_holder().is_none() {
+        let (_, views) = self.holder_views();
+        if !policy::holder_reached(&views, &self.build) {
             self.fail_waiting("the started holder couldn't be reached");
         }
     }
@@ -788,5 +824,41 @@ mod tests {
         });
         let error = meta.encode().unwrap_err();
         assert!(matches!(unsent(&meta, &error), Unsent::Meta { session: 5, .. }));
+    }
+
+    fn welcomed(adopting: &[SessionId], adoption: Adoption) -> Welcomed {
+        Welcomed {
+            protocol: 2,
+            build: "b0".into(),
+            pid: 77,
+            adopting: adopting.iter().copied().collect(),
+            adoption,
+        }
+    }
+
+    #[test]
+    fn a_holder_is_adopted_once_every_listed_session_has_its_tail() {
+        assert!(!is_adopted(None));
+        assert!(!is_adopted(Some(&welcomed(&[3, 4], Adoption::Keep))));
+        assert!(is_adopted(Some(&welcomed(&[], Adoption::Keep))));
+        assert!(is_adopted(Some(&welcomed(&[], Adoption::Drain))));
+    }
+
+    #[test]
+    fn a_holders_status_comes_from_its_welcome() {
+        assert_eq!(status(None, 0), None);
+        let keep = status(Some(&welcomed(&[3], Adoption::Keep)), 2);
+        assert_eq!(
+            keep,
+            Some(client::HolderStatus {
+                pid: 77,
+                build: "b0".into(),
+                protocol: 2,
+                sessions: 2,
+                draining: false,
+            })
+        );
+        let drain = status(Some(&welcomed(&[], Adoption::Drain)), 0);
+        assert_eq!(drain.map(|status| status.draining), Some(true));
     }
 }

@@ -61,12 +61,12 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 3. Server roles
 
-- [ ] 3.1 Add the pure `core/policy.rs` `Lifecycle`:
+- [x] 3.1 Add the pure `core/policy.rs` `Lifecycle`:
   - `Lifecycle { phase, grace_until, idle_since }`, with `tick(now, Seen) -> Tick` and `should_exit(now, Ending)`;
   - table tests over startup adoption, grace, idle, stop and step-down.
 
   Then `Core::tick` and `should_exit` only gather and apply. Verify with `cargo test --locked -p brindle-remote-agent server::core::policy::` and `--test core` (b10 #5).
-- [ ] 3.2 Add the rest of `policy.rs`, each with table tests:
+- [x] 3.2 Add the rest of `policy.rs`, each with table tests:
   - `client_options` and `holder_protocols` (b10 #6);
   - `queue_mark` (b10 #7, which takes change 9's constants);
   - `placement` and `adoption` (b11 #4);
@@ -75,22 +75,22 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
   - `look` and `foreground_changed` (b11 #9).
 
   Verify that their handlers call them, and with `cargo test --locked -p brindle-remote-agent`.
-- [ ] 3.3 Make the core session's state the enums: `Life`, `Ownership`, `Option<ClientToken>` for the owner, and `Rebuild`:
+- [x] 3.3 Make the core session's state the enums: `Life`, `Ownership`, `Option<ClientToken>` for the owner, and `Rebuild`:
   - the flags, the pid sentinel and the owner sentinel go;
   - `SET_META` still writes `owner` as a string.
 
   Verify with unit tests of the enums' predicates, with `Session::info` (b11 #8), and with `--test core` and `--test upgrade` unchanged (b11 #13, #14, #17).
-- [ ] 3.4 Add `ClientToken::from_wire`, decoded once in `welcome`, `enum Peer` for `close_peers` and `forget_peer`, and `endpoint::Holder.build`, parsed once. Verify with unit tests in `remote-protocol`'s `endpoint.rs` and the core's `clients.rs`, and with `--test core` (b10 #10, #11, b11 #18).
-- [ ] 3.5 Make `check::refusal_reason` pure, with tests. Verify with `--test manage` (b10 #8).
-- [ ] 3.6 Add the tests that are missing: `kept_layout`, `command_line`, `allocate_id`'s wrap and skip of 0, and `holders.rs`'s `is_adopted` and `status`. Verify with `cargo test --locked -p brindle-remote-agent server::core::` (b11 #10).
-- [ ] 3.7 Add the pure `holder/policy.rs`:
+- [x] 3.4 Add `ClientToken::from_wire`, decoded once in `welcome`, `enum Peer` for `close_peers` and `forget_peer`, and `endpoint::Holder.build`, parsed once. Verify with unit tests in `remote-protocol`'s `endpoint.rs` and the core's `clients.rs`, and with `--test core` (b10 #10, #11, b11 #18).
+- [x] 3.5 Make `check::refusal_reason` pure, with tests. Verify with `--test manage` (b10 #8).
+- [x] 3.6 Add the tests that are missing: `kept_layout`, `command_line`, `allocate_id`'s wrap and skip of 0, and `holders.rs`'s `is_adopted` and `status`. Verify with `cargo test --locked -p brindle-remote-agent server::core::` (b11 #10).
+- [x] 3.7 Add the pure `holder/policy.rs`:
   - `spawn_refusal`, whose `Display` gives today's texts;
   - `drained` with `Output`;
   - `CoreStart::step`, taking over the backoff.
 
   Table tests for each. Verify with `cargo test --locked -p brindle-remote-agent server::holder::` and `--test holder` (b12 `holder.rs:731-741`, `:1000-1005`, `:1044-1050`).
-- [ ] 3.8 The holder's `Farewell { Staying, Goodbye, Handover }` and its session `Life`/`Output`. `held.exit` is written only on `Life::Finished`. Verify with `--test holder` and `--test upgrade` unchanged, on Linux and on the Windows CI job (b12 `holder.rs:224-254`).
-- [ ] 3.9 Add `core/policy.rs` and `holder/policy.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name `Lifecycle`, `Life` and `Ownership` in `CLAUDE.md`'s core paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
+- [x] 3.8 The holder's `Farewell { Staying, Goodbye, Handover }` and its session `Life`/`Output`. `held.exit` is written only on `Life::Finished`. Verify with `--test holder` and `--test upgrade` unchanged, on Linux and on the Windows CI job (b12 `holder.rs:224-254`).
+- [x] 3.9 Add `core/policy.rs` and `holder/policy.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name `Lifecycle`, `Life` and `Ownership` in `CLAUDE.md`'s core paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
 
 ## 4. Brindle's client
 

@@ -55,6 +55,7 @@
 mod clients;
 mod holders;
 mod manage;
+mod policy;
 mod process;
 mod screen;
 mod sessions;
@@ -71,7 +72,8 @@ use brindle_remote_protocol::{RequestId, SessionId};
 
 use self::clients::{Client, Pending};
 use self::holders::{Holder, HolderStart, WaitingSpawn};
-use self::sessions::Session;
+use self::policy::{Accept, Ending, Lifecycle, Seen};
+use self::sessions::{Ownership, Session};
 use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
 use super::platform::listen::{self, Identity, Listener};
 use super::platform::lock::Lock;
@@ -271,6 +273,13 @@ struct Answer {
     req: RequestId,
 }
 
+/// A connection the core closes as it exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Peer {
+    Holder(Token),
+    Client(Token),
+}
+
 pub(super) struct Core<L: EventLoop> {
     ev: L,
     dir: PathBuf,
@@ -278,8 +287,9 @@ pub(super) struct Core<L: EventLoop> {
     _lock: Lock,
     /// Closed when the core exits, before its last messages go out.
     listener: Option<Listener>,
-    /// Clients are accepted once the startup adoption is done.
-    accepting: bool,
+    /// When clients are accepted (once the startup adoption is done), the
+    /// grace period of adopted sessions' owners, and the idle time.
+    lifecycle: Lifecycle,
     build: String,
     instance: u64,
     started: Instant,
@@ -295,11 +305,8 @@ pub(super) struct Core<L: EventLoop> {
     waiting: Vec<WaitingSpawn>,
     sessions: BTreeMap<SessionId, Session>,
     next_session: SessionId,
-    /// While the owners of adopted sessions may still come back.
-    grace_until: Option<Instant>,
     /// When the core next looks at the sessions' foreground programs.
     next_look: Instant,
-    idle_since: Option<Instant>,
     /// Answered once every session has ended.
     stopping: Option<Answer>,
     /// Answered once the holders have their checkpoints and `GOODBYE`.
@@ -329,7 +336,7 @@ impl<L: EventLoop> Core<L> {
             paths,
             _lock: lock,
             listener: Some(listener),
-            accepting: false,
+            lifecycle: Lifecycle::new(),
             build,
             instance: random_instance(),
             started: Instant::now(),
@@ -343,9 +350,7 @@ impl<L: EventLoop> Core<L> {
             waiting: Vec::new(),
             sessions: BTreeMap::new(),
             next_session: 1,
-            grace_until: None,
             next_look: Instant::now() + process::PROCESS_LOOK,
-            idle_since: None,
             stopping: None,
             stepping_down: None,
         })
@@ -431,7 +436,7 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn update_interests(&mut self) {
-        let listener = if self.accepting {
+        let listener = if self.lifecycle.accepting() {
             Interest::READABLE
         } else {
             Interest::NONE
@@ -462,47 +467,60 @@ impl<L: EventLoop> Core<L> {
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
     }
 
+    /// The timers: what the turn gathers goes to the [`Lifecycle`], whose
+    /// answer it applies (`fcis R2`).
     fn tick(&mut self, now: Instant) {
         self.expire_pending(now);
-        if !self.accepting && self.startup_adopted(now) {
-            self.accepting = true;
-            if self.sessions.values().any(|session| session.awaiting_owner) {
-                self.grace_until = Some(now + RECONNECT_GRACE);
-                log!(
-                    "adopted {} session(s); their owners have {}s to come back",
-                    self.sessions.len(),
-                    RECONNECT_GRACE.as_secs()
-                );
-            }
-        }
-        if self.grace_until.is_some_and(|until| now >= until) {
-            self.grace_until = None;
-            self.end_grace();
-        }
         self.end_lingering(now);
         if now >= self.next_look {
             self.next_look = now + process::PROCESS_LOOK;
             self.look_at_processes(now);
         }
         self.check_holder_start(now);
-        let idle = self.sessions.is_empty()
-            && self.clients.is_empty()
-            && self.pending.is_empty()
-            && self.waiting.is_empty()
-            && self.holder_start.is_none();
-        if !idle {
-            self.idle_since = None;
-        } else if self.idle_since.is_none() {
-            self.idle_since = Some(now);
+        let seen = Seen {
+            startup_adopted: self.startup_adopted(now),
+            awaiting_owner: self
+                .sessions
+                .values()
+                .any(|session| match session.ownership {
+                    Ownership::AwaitingOwner { .. } => true,
+                    Ownership::Attached(_)
+                    | Ownership::Lingering { .. }
+                    | Ownership::Detached { .. } => false,
+                }),
+            busy: !(self.sessions.is_empty()
+                && self.clients.is_empty()
+                && self.pending.is_empty()
+                && self.waiting.is_empty()
+                && self.holder_start.is_none()),
+        };
+        let tick = self.lifecycle.tick(now, seen);
+        match tick.accept {
+            Accept::Now { grace: true } => log!(
+                "adopted {} session(s); their owners have {}s to come back",
+                self.sessions.len(),
+                RECONNECT_GRACE.as_secs()
+            ),
+            Accept::Now { grace: false } | Accept::No => {}
+        }
+        if tick.end_grace {
+            self.end_grace();
+        }
+    }
+
+    /// What is ending the core, for [`Lifecycle::should_exit`].
+    fn ending(&self) -> Ending {
+        match (&self.stepping_down, &self.stopping) {
+            (Some(_), _) => Ending::SteppingDown,
+            (None, Some(_)) => Ending::Stopping {
+                sessions_left: !self.sessions.is_empty(),
+            },
+            (None, None) => Ending::No,
         }
     }
 
     fn should_exit(&self, now: Instant) -> bool {
-        if self.stepping_down.is_some() || (self.stopping.is_some() && self.sessions.is_empty()) {
-            return true;
-        }
-        self.idle_since
-            .is_some_and(|since| now.duration_since(since) >= UNUSED_LIMIT)
+        self.lifecycle.should_exit(now, self.ending())
     }
 
     /// Closes these holders' and clients' connections gracefully, all at
@@ -512,43 +530,37 @@ impl<L: EventLoop> Core<L> {
     /// read yet. Holders' output and exits still go to their clients
     /// meanwhile. Each closed connection is dropped; the result lists those
     /// that failed or ran out of time.
-    fn close_peers(
-        &mut self,
-        holders: &[Token],
-        clients: &[Token],
-        limit: Duration,
-    ) -> Vec<(Token, io::Error)> {
+    fn close_peers(&mut self, peers: Vec<Peer>, limit: Duration) -> Vec<(Peer, io::Error)> {
         let deadline = Instant::now() + limit;
-        let mut open: Vec<(Token, bool)> = holders
-            .iter()
-            .map(|&token| (token, true))
-            .chain(clients.iter().map(|&token| (token, false)))
-            .collect();
+        let mut open = peers;
         let mut failed = Vec::new();
         loop {
             let mut still = Vec::new();
-            for (token, holder) in open {
-                let step = if holder {
-                    let Some(entry) = self.holders.get_mut(&token) else {
-                        continue;
-                    };
-                    let step = entry.conn.close_step();
-                    self.closing_holder_frames(token);
-                    step
-                } else {
-                    let Some(entry) = self.clients.get_mut(&token) else {
-                        continue;
-                    };
-                    let step = entry.conn.close_step();
-                    entry.conn.discard_input();
-                    step
+            for peer in open {
+                let step = match peer {
+                    Peer::Holder(token) => {
+                        let Some(entry) = self.holders.get_mut(&token) else {
+                            continue;
+                        };
+                        let step = entry.conn.close_step();
+                        self.closing_holder_frames(token);
+                        step
+                    }
+                    Peer::Client(token) => {
+                        let Some(entry) = self.clients.get_mut(&token) else {
+                            continue;
+                        };
+                        let step = entry.conn.close_step();
+                        entry.conn.discard_input();
+                        step
+                    }
                 };
                 match step {
-                    Ok(false) => still.push((token, holder)),
-                    Ok(true) => self.forget_peer(token, holder),
+                    Ok(false) => still.push(peer),
+                    Ok(true) => self.forget_peer(peer),
                     Err(error) => {
-                        failed.push((token, error));
-                        self.forget_peer(token, holder);
+                        failed.push((peer, error));
+                        self.forget_peer(peer);
                     }
                 }
             }
@@ -557,35 +569,36 @@ impl<L: EventLoop> Core<L> {
                 return failed;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let conns: Vec<&conn::Conn> = open
+            let conns: Vec<(Peer, &conn::Conn)> = open
                 .iter()
-                .filter_map(|&(token, holder)| {
-                    if holder {
-                        self.holders.get(&token).map(|entry| &entry.conn)
-                    } else {
-                        self.clients.get(&token).map(|entry| &entry.conn)
-                    }
+                .filter_map(|&peer| {
+                    let conn = match peer {
+                        Peer::Holder(token) => self.holders.get(&token).map(|entry| &entry.conn),
+                        Peer::Client(token) => self.clients.get(&token).map(|entry| &entry.conn),
+                    };
+                    conn.map(|conn| (peer, conn))
                 })
                 .collect();
             if remaining.is_zero() {
-                failed.extend(
-                    open.iter()
-                        .zip(&conns)
-                        .map(|(&(token, _), conn)| (token, conn.unfinished())),
-                );
+                failed.extend(conns.iter().map(|&(peer, conn)| (peer, conn.unfinished())));
                 return failed;
             }
+            let conns: Vec<&conn::Conn> = conns.into_iter().map(|(_, conn)| conn).collect();
             conn::wait(&conns, remaining);
         }
     }
 
     /// Drops a peer's connection while the core exits.
-    fn forget_peer(&mut self, token: Token, holder: bool) {
-        self.drop_source(token);
-        if holder {
-            self.holders.remove(&token);
-        } else {
-            self.clients.remove(&token);
+    fn forget_peer(&mut self, peer: Peer) {
+        match peer {
+            Peer::Holder(token) => {
+                self.drop_source(token);
+                self.holders.remove(&token);
+            }
+            Peer::Client(token) => {
+                self.drop_source(token);
+                self.clients.remove(&token);
+            }
         }
     }
 
@@ -602,8 +615,8 @@ impl<L: EventLoop> Core<L> {
             // client hears OK, so the core it starts next finds them. What
             // the holders sent before their GOODBYE still reaches the
             // clients.
-            let holders: Vec<Token> = self.holders.keys().copied().collect();
-            for (_, error) in self.close_peers(&holders, &[], STEP_DOWN_FLUSH_LIMIT) {
+            let holders: Vec<Peer> = self.holders.keys().copied().map(Peer::Holder).collect();
+            for (_, error) in self.close_peers(holders, STEP_DOWN_FLUSH_LIMIT) {
                 log!("a holder didn't take its checkpoints: {error}");
             }
         }
@@ -611,11 +624,15 @@ impl<L: EventLoop> Core<L> {
         if let Some(answer) = stopped.as_ref().or(stepped_down.as_ref()) {
             self.send_client(answer.client, ToClient::Ok(Request { req: answer.req }));
         }
-        let holders: Vec<Token> = self.holders.keys().copied().collect();
-        let clients: Vec<Token> = self.clients.keys().copied().collect();
-        for (token, error) in self.close_peers(&holders, &clients, EXIT_FLUSH_LIMIT) {
-            if holders.contains(&token) {
-                log!("holder {token} didn't take its last messages: {error}");
+        let peers: Vec<Peer> = (self.holders.keys().copied().map(Peer::Holder))
+            .chain(self.clients.keys().copied().map(Peer::Client))
+            .collect();
+        for (peer, error) in self.close_peers(peers, EXIT_FLUSH_LIMIT) {
+            match peer {
+                Peer::Holder(token) => {
+                    log!("holder {token} didn't take its last messages: {error}");
+                }
+                Peer::Client(_) => {}
             }
         }
         if stepped_down.is_some() {
@@ -853,7 +870,7 @@ mod tests {
                 for message in blobs {
                     test.holder().send(message.encode());
                 }
-                test.turn_until("accepting clients", |test| test.core.accepting);
+                test.turn_until("accepting clients", |test| test.core.lifecycle.accepting());
 
                 // B connects.
                 test.client.send(
@@ -901,7 +918,7 @@ mod tests {
                     .encode(),
                 );
                 test.turn_until("the ATTACH is handled", |test| {
-                    test.core.sessions[&SESSION].attached.is_some()
+                    test.core.sessions[&SESSION].ownership.client().is_some()
                 });
                 test.holder().send(
                     h1::ToCore::Output(h1::Data {

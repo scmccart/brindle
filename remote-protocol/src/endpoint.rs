@@ -27,6 +27,10 @@ use crate::server_dir;
 /// A holder's endpoint and its files in the server directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holder {
+    /// The build its files name, parsed once from their name (`types R6`);
+    /// `None` for a Linux socket whose name says none (`holder-odd.sock`),
+    /// which is still shown.
+    pub build: Option<String>,
     /// Where it listens.
     pub endpoint: PathBuf,
     /// `holder-<build>-<n>.lock`, which it holds for its whole life.
@@ -72,6 +76,7 @@ impl Endpoints {
     pub fn holder(&self, build: &str, n: u32) -> Holder {
         let file = |extension: &str| self.dir.join(format!("holder-{build}-{n}.{extension}"));
         Holder {
+            build: Some(build.to_string()),
             #[cfg(not(windows))]
             endpoint: file("sock"),
             #[cfg(windows)]
@@ -101,6 +106,7 @@ impl Endpoints {
     fn shown(&self, name: &str) -> Option<Holder> {
         let stem = server_dir::holder_socket_stem(name)?;
         Some(Holder {
+            build: server_dir::parse_holder_stem(stem).map(|(build, _)| build),
             endpoint: self.dir.join(name),
             lock: self.dir.join(format!("{stem}.lock")),
             log: self.dir.join(format!("{stem}.log")),
@@ -154,6 +160,7 @@ mod tests {
         let temp = TempDir::new("names");
         let endpoints = Endpoints::of(&temp.0).unwrap();
         let holder = endpoints.holder("0.3.1-abc", 2);
+        assert_eq!(holder.build.as_deref(), Some("0.3.1-abc"));
         assert_eq!(holder.lock, temp.0.join("holder-0.3.1-abc-2.lock"));
         assert_eq!(holder.log, temp.0.join("holder-0.3.1-abc-2.log"));
         assert_ne!(holder.endpoint, endpoints.holder("0.3.1-abc", 3).endpoint);
@@ -190,6 +197,9 @@ mod tests {
         assert_eq!(found[1], endpoints.holder("b1", 1));
         assert_eq!(found[2].endpoint, temp.0.join("holder-odd.sock"));
         assert_eq!(found[2].lock, temp.0.join("holder-odd.lock"));
+        // Each says the build its name gives, read once here.
+        let builds: Vec<Option<&str>> = found.iter().map(|found| found.build.as_deref()).collect();
+        assert_eq!(builds, [Some("b1"), Some("b1"), None]);
 
         remove(&holder.endpoint).unwrap();
         assert_eq!(endpoints.holders().unwrap().len(), 2);

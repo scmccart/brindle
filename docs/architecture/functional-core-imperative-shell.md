@@ -77,6 +77,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `remote-protocol/src/{client,holder,wire,version,relay,upgrade}.rs` | encoding, decoding, version negotiation, whether a build is newer |
 | `remote-protocol/src/{access,hresult}.rs` | who may use a pipe, and an `HRESULT`'s Win32 code |
 | `remote-agent/src/conpty/cmdline.rs` | launch-line quoting, the program and environment a session starts with |
+| `remote-agent/src/server/{core,holder}/policy.rs` | the server core's `Lifecycle` (when it accepts clients, the reconnect grace, when it exits), what a `HELLO` gets, the queue marks, where spawns go and which holders drain, what a client's leaving, an exit and the grace period's end do to a session, which attaches are refused, which sessions a returning owner gets back, which foreground programs are looked at; the holder's spawn refusals, when an exited session is drained, when it starts a core |
 | `remote-agent/src/server/platform/{ready_arg,ensure_dir,pipe_state,wait}.rs`, `remote-agent/src/conpty/{choice,hosts}.rs`, `remote-agent/src/pty/{program,stat}.rs` | beside a platform seam: a role's ready argument, whether the server directory is used, made or refused, a pipe's read and write states, a Win32 wait's timeout in milliseconds, which ConPTY is loaded, which processes a console's hang-up ends, a Linux session's shell, home, start directory and `TERM`, and `/proc` stat fields |
 
 ### Pure items in shell modules (held by review)
