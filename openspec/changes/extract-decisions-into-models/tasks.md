@@ -90,7 +90,7 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
   Table tests for each. Verify with `cargo test --locked -p brindle-remote-agent server::holder::` and `--test holder` (b12 `holder.rs:731-741`, `:1000-1005`, `:1044-1050`).
 - [x] 3.8 The holder's `Farewell { Staying, Goodbye, Handover }` and its session `Life`/`Output`. `held.exit` is written only on `Life::Finished`. Verify with `--test holder` and `--test upgrade` unchanged, on Linux and on the Windows CI job (b12 `holder.rs:224-254`).
-- [ ] 3.9 Add `core/policy.rs` and `holder/policy.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name `Lifecycle`, `Life` and `Ownership` in `CLAUDE.md`'s core paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
+- [x] 3.9 Add `core/policy.rs` and `holder/policy.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name `Lifecycle`, `Life` and `Ownership` in `CLAUDE.md`'s core paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
 
 ## 4. Brindle's client
 
