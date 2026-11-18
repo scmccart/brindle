@@ -416,7 +416,7 @@ mod tests {
 
     fn request() -> SpawnRequest {
         SpawnRequest {
-            command: "sh".into(),
+            command: Some("sh".into()),
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),

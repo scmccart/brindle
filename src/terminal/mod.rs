@@ -473,7 +473,15 @@ impl Terminal {
             // Brindle. Everything else keeps running when Brindle goes away
             // without closing it.
             let closing = Closing::new(command_override.is_some());
-            let (request, doing) = spawn_request(profile, host, command_override, cwd_override, config);
+            let (request, doing) = spawn_request(
+                profile,
+                host,
+                command_override,
+                cwd_override,
+                config,
+                dirs::home_dir(),
+                std::path::Path::is_dir,
+            );
             Self::start_session(host, request, doing, closing, theme, config, cx)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -1410,9 +1418,10 @@ fn broken_line(reason: &str) -> String {
 /// command, a directory as given (its holder expands `~` and falls back to
 /// home), and its own environment under the profile's
 /// ([`SpawnRequest::remote`](crate::remote::local::SpawnRequest::remote)).
-/// This machine's is resolved here: the program, a directory that exists,
-/// and Brindle's own environment under the profile's. Which one depends on
-/// `host` alone, not on what the profile targets.
+/// This machine's is resolved here: the program, a directory that exists
+/// (by `is_dir`: the asked one, else the profile's with `~` as `home`, else
+/// `home`), and Brindle's own environment under the profile's. Which one
+/// depends on `host` alone, not on what the profile targets.
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn spawn_request(
     profile: &Profile,
@@ -1420,6 +1429,8 @@ pub(crate) fn spawn_request(
     command_override: Option<(String, Vec<String>)>,
     cwd_override: Option<std::path::PathBuf>,
     config: &Config,
+    home: Option<std::path::PathBuf>,
+    is_dir: impl Fn(&std::path::Path) -> bool,
 ) -> (crate::remote::local::SpawnRequest, String) {
     let policy = Closing::new(command_override.is_some()).policy();
     let size = GridSize::default();
@@ -1427,9 +1438,9 @@ pub(crate) fn spawn_request(
     if !host.is_local() {
         let request =
             crate::remote::local::SpawnRequest::remote(profile, command_override, cwd_override, size, scrollback, policy);
-        let doing = match request.command.as_str() {
-            "" => format!("open a shell on {}", host.name()),
-            command => format!("start {command:?} on {}", host.name()),
+        let doing = match &request.command {
+            None => format!("open a shell on {}", host.name()),
+            Some(command) => format!("start {command:?} on {}", host.name()),
         };
         return (request, doing);
     }
@@ -1439,14 +1450,14 @@ pub(crate) fn spawn_request(
         Some(program) => (program.clone(), profile.args.clone()),
         None => default_program(&profile.args),
     });
-    let home = dirs::home_dir();
     let working_directory = cwd_override
         .or_else(|| profile.working_directory(home.as_deref()))
         .or(home)
-        .filter(|dir| dir.is_dir());
+        .filter(|dir| is_dir(dir));
     let doing = format!("start {program:?}");
     let request = crate::remote::local::SpawnRequest {
-        command: program,
+        // A profile's empty `command` is none.
+        command: Some(program).filter(|program| !program.is_empty()),
         args,
         cwd: working_directory.map(|dir| dir.to_string_lossy().into_owned()),
         env: server_env(std::env::vars_os(), profile),
@@ -1601,32 +1612,56 @@ mod tests {
         use crate::config::RemoteTarget;
         use crate::remote::protocol::client::Policy;
 
+        use std::path::{Path, PathBuf};
+
         let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false };
         let profile = Profile {
             name: "htop".into(),
             command: Some("htop".into()),
-            cwd: Some("/var/log/brindle-nowhere".into()),
+            cwd: Some("/srv/logs".into()),
             remote: Some(a8.clone()),
             ..Default::default()
         };
         let config = Config::default();
+        let remote_host = Host::Remote(a8);
+        // Which directories this machine has, as `is_dir` says.
+        let request = |profile: &Profile, host: &Host, command, cwd, here: &[&str]| {
+            let home = Some(PathBuf::from("/home/me"));
+            spawn_request(profile, host, command, cwd, &config, home, |dir: &Path| here.iter().any(|here| dir == Path::new(here)))
+        };
 
-        let (remote, doing) = spawn_request(&profile, &Host::Remote(a8.clone()), None, None, &config);
-        assert_eq!((remote.command.as_str(), doing.as_str()), ("htop", "start \"htop\" on A8"));
-        assert_eq!(remote.cwd.as_deref(), Some("/var/log/brindle-nowhere"));
+        let (remote, doing) = request(&profile, &remote_host, None, None, &[]);
+        assert_eq!((remote.command.as_deref(), doing.as_str()), (Some("htop"), "start \"htop\" on A8"));
+        assert_eq!(remote.cwd.as_deref(), Some("/srv/logs"));
         assert_eq!(remote.policy, Policy::Detach);
 
-        let (local, doing) = spawn_request(&profile, &Host::Local, None, None, &config);
-        assert_eq!((local.command.as_str(), doing.as_str()), ("htop", "start \"htop\""));
-        assert_eq!(local.cwd, None);
+        let (local, doing) = request(&profile, &Host::Local, None, None, &["/home/me"]);
+        assert_eq!((local.command.as_deref(), doing.as_str()), (Some("htop"), "start \"htop\""));
+        assert_eq!(local.cwd, None, "the profile's directory isn't here, and home isn't tried");
         assert_eq!(local.policy, Policy::Detach);
+        let (local, _) = request(&profile, &Host::Local, None, None, &["/srv/logs"]);
+        assert_eq!(local.cwd.as_deref(), Some("/srv/logs"));
+        let (split, _) = request(&profile, &Host::Local, None, Some("/srv/old".into()), &["/srv/old", "/srv/logs"]);
+        assert_eq!(split.cwd.as_deref(), Some("/srv/old"), "the asked directory wins");
+
+        // A local profile's `~` is this machine's home, and with no
+        // directory it starts in home, if there is one.
+        let local_profile = Profile { cwd: Some("~/src".into()), remote: None, ..profile.clone() };
+        let (local, _) = request(&local_profile, &Host::Local, None, None, &["/home/me/src"]);
+        assert_eq!(local.cwd.as_deref().map(Path::new), Some(Path::new("/home/me/src")));
+        let no_dir = Profile { cwd: None, ..local_profile };
+        assert_eq!(request(&no_dir, &Host::Local, None, None, &["/home/me"]).0.cwd.as_deref(), Some("/home/me"));
+        assert_eq!(request(&no_dir, &Host::Local, None, None, &[]).0.cwd, None);
 
         let shell = Profile { command: None, ..profile.clone() };
-        let (_, doing) = spawn_request(&shell, &Host::Remote(a8.clone()), None, None, &config);
+        let (_, doing) = request(&shell, &remote_host, None, None, &[]);
         assert_eq!(doing, "open a shell on A8");
+        let empty = Profile { command: Some(String::new()), ..profile.clone() };
+        let (empty, doing) = request(&empty, &remote_host, None, None, &[]);
+        assert_eq!((empty.command, doing.as_str()), (None, "open a shell on A8"));
 
-        let (command, _) = spawn_request(&profile, &Host::Remote(a8), Some(("top".into(), vec!["-b".into()])), None, &config);
-        assert_eq!((command.command.as_str(), command.args.as_slice()), ("top", ["-b".to_string()].as_slice()));
+        let (command, _) = request(&profile, &remote_host, Some(("top".into(), vec!["-b".into()])), None, &[]);
+        assert_eq!((command.command.as_deref(), command.args.as_slice()), (Some("top"), ["-b".to_string()].as_slice()));
         assert_eq!(command.policy, Policy::Kill);
     }
 

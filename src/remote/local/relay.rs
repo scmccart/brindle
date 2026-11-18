@@ -450,10 +450,11 @@ pub fn relay_env(host: &BTreeMap<String, String>, own: &BTreeMap<String, String>
 
 impl SpawnRequest {
     /// What a remote profile's session runs, for a relay connection: the
-    /// profile's command, or none (the endpoint's login shell); its
-    /// directory as given, or none (the holder expands `~` and falls back to
-    /// home for a directory that isn't there); and [`child_env`] as the
-    /// environment, which the connection puts over the endpoint's.
+    /// profile's command, or none (the endpoint's login shell, as for an
+    /// empty one); its directory as given, or none (the holder expands `~`
+    /// and falls back to home for a directory that isn't there); and
+    /// [`child_env`] as the environment, which the connection puts over the
+    /// endpoint's.
     ///
     /// [`child_env`]: crate::terminal::child_env
     pub fn remote(
@@ -464,7 +465,11 @@ impl SpawnRequest {
         scrollback: u32,
         policy: Policy,
     ) -> Self {
-        let (command, args) = command.unwrap_or_else(|| (profile.command.clone().unwrap_or_default(), profile.args.clone()));
+        let (command, args) = match command {
+            Some((program, args)) => (Some(program), args),
+            None => (profile.command.clone(), profile.args.clone()),
+        };
+        let command = command.filter(|command| !command.is_empty());
         let cwd = cwd
             .map(|dir| dir.to_string_lossy().into_owned())
             .or_else(|| profile.cwd.clone())
@@ -551,7 +556,7 @@ mod tests {
         let size = GridSize::default();
         let request = SpawnRequest::remote(&profile(), None, None, size, 1000, Policy::Detach);
         // No command: the holder runs the login shell.
-        assert_eq!(request.command, "");
+        assert_eq!(request.command, None);
         assert!(request.args.is_empty());
         assert_eq!(request.cwd, None);
         assert_eq!(request.env, crate::terminal::child_env(&profile()).into_iter().collect());
@@ -565,15 +570,19 @@ mod tests {
         with_dir.command = Some("htop".into());
         with_dir.args = vec!["-d".into(), "10".into()];
         let request = SpawnRequest::remote(&with_dir, None, None, size, 0, Policy::Detach);
-        assert_eq!((request.command.as_str(), request.args.as_slice()), ("htop", &["-d".to_string(), "10".to_string()][..]));
+        assert_eq!((request.command.as_deref(), request.args.as_slice()), (Some("htop"), &["-d".to_string(), "10".to_string()][..]));
         assert_eq!(request.cwd.as_deref(), Some("~/src"));
+
+        // An empty command is none.
+        let empty = Profile { command: Some(String::new()), ..profile() };
+        assert_eq!(SpawnRequest::remote(&empty, None, None, size, 0, Policy::Detach).command, None);
 
         // A split's directory wins, unchecked: it needn't exist here.
         let missing = PathBuf::from("/srv/old");
         let command = Some(("tail".to_string(), vec!["-f".to_string(), "syslog".to_string()]));
         let request = SpawnRequest::remote(&with_dir, command, Some(missing), size, 0, Policy::Kill);
         assert_eq!(request.cwd.as_deref(), Some("/srv/old"));
-        assert_eq!(request.command, "tail");
+        assert_eq!(request.command.as_deref(), Some("tail"));
         assert_eq!(request.policy, Policy::Kill);
     }
 
