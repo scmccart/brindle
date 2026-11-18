@@ -9,19 +9,19 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 1. brindle-ui: items by key, absence as Option, pure helpers
 
-- [ ] 1.1 Add `ItemKey` (`ui/src/components/mod.rs`), and a `key` on `CommandItem`, `SelectOption` and `MenuItem` that defaults to the label. Verify with a unit test that `new(label)` keys by the label and `.key(…)` overrides it.
-- [ ] 1.2 Key `Select`: the selection is a key, `set_options` keeps it only if an option has it, and `SelectEvent::Changed(ItemKey)`. Verify with unit tests `a_refresh_keeps_the_selection_by_key` and `a_refresh_without_the_key_clears_it` (b40 #1).
-- [ ] 1.3 Key `Combobox` and `Command`'s keep:
+- [x] 1.1 Add `ItemKey` (`ui/src/components/mod.rs`), and a `key` on `CommandItem`, `SelectOption` and `MenuItem` that defaults to the label. Verify with a unit test that `new(label)` keys by the label and `.key(…)` overrides it.
+- [x] 1.2 Key `Select`: the selection is a key, `set_options` keeps it only if an option has it, and `SelectEvent::Changed(ItemKey)`. Verify with unit tests `a_refresh_keeps_the_selection_by_key` and `a_refresh_without_the_key_clears_it` (b40 #1).
+- [x] 1.3 Key `Combobox` and `Command`'s keep:
   - `ComboboxEvent::Changed(ItemKey)`;
   - `Command::set_groups(.., keep: Option<ItemKey>)`;
   - the pure `CommandRows::scroll_after -> Scroll { Top, Keep { reveal } }`.
 
   Verify with unit tests for the kept highlight and for each `Scroll` (b39 #2, #3, #4).
-- [ ] 1.4 `MenuEvent::Selected(ItemKey)` for `Menu` and `DropdownMenu`. `MenuEntry::label() -> Option<&str>`, and typeahead skips `None`. Verify with unit tests of typeahead over a separator and of the selected key (b40 #2, #3).
-- [ ] 1.5 `TabList`'s drag carries the trigger's `ElementId`: `TabMove { from: ElementId, to }`, and `can_drop` compares ids. Verify with a unit test of the drop target's index computation (b41 #1).
-- [ ] 1.6 `Combobox::panel` places only for a measured trigger, `panel_width(Option<Pixels>, min)`, and the overlay's depth is `Option<usize>`. Verify with unit tests of `panel_width(None, min)` and of an overlay missing from the stack (b39 #5, b42's smell).
-- [ ] 1.7 `Overlay`'s `kind: OverlayKind { Modal, NonModal { blocks_outside } }`. Verify that the gallery and the app build, and with a unit test that a modal overlay blocks outside (b42 #2).
-- [ ] 1.8 The pure helpers, each with a table test:
+- [x] 1.4 `MenuEvent::Selected(ItemKey)` for `Menu` and `DropdownMenu`. `MenuEntry::label() -> Option<&str>`, and typeahead skips `None`. Verify with unit tests of typeahead over a separator and of the selected key (b40 #2, #3).
+- [x] 1.5 `TabList`'s drag carries the trigger's `ElementId`: `TabMove { from: ElementId, to }`, and `can_drop` compares ids. Verify with a unit test of the drop target's index computation (b41 #1).
+- [x] 1.6 `Combobox::panel` places only for a measured trigger, `panel_width(Option<Pixels>, min)`, and the overlay's depth is `Option<usize>`. Verify with unit tests of `panel_width(None, min)` and of an overlay missing from the stack (b39 #5, b42's smell).
+- [x] 1.7 `Overlay`'s `kind: OverlayKind { Modal, NonModal { blocks_outside } }`. Verify that the gallery and the app build, and with a unit test that a modal overlay blocks outside (b42 #2).
+- [x] 1.8 The pure helpers, each with a table test:
   - `LayerStack::prune` and `is_empty` (b41 #2);
   - `overlay::dismiss_target` (b42 #3);
   - `menu::page_key` and `menu::release_over` (b40 #5, #6);
@@ -30,15 +30,15 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
   - `text_input::hit_for_y` and `EditState::press` (b43 #3).
 
   Verify with `cargo test --locked -p brindle-ui`.
-- [ ] 1.9 Add the tests that are missing: `click_key` (taking the click's kind as a value if needed), `interaction`, and `tab_drag_style_comes_from_the_tokens`. Verify with `cargo test --locked -p brindle-ui components::` (b39 #1, b40 #4, b42 #1).
-- [ ] 1.10 Add `style::DEFAULT_REM` and `rems_at_default`, with a unit test.
-- [ ] 1.11 Move the owners onto the keyed events, each mapping the key back to today's index:
+- [x] 1.9 Add the tests that are missing: `click_key` (taking the click's kind as a value if needed), `interaction`, and `tab_drag_style_comes_from_the_tokens`. Verify with `cargo test --locked -p brindle-ui components::` (b39 #1, b40 #4, b42 #1).
+- [x] 1.10 Add `style::DEFAULT_REM` and `rems_at_default`, with a unit test.
+- [x] 1.11 Move the owners onto the keyed events, each mapping the key back to today's index:
   - the gallery;
   - `settings_dialog`'s selects and `fonts.rs`'s combobox;
   - `workspace.rs`'s profile menu, context menu and `TabMove`.
 
   Verify that `cargo test --workspace --locked` passes and that the e2e cases for the palette, menus, tabs and settings pass, run as `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- palette menu tab settings`.
-- [ ] 1.12 Update `ui/README.md`'s component notes on keys, and `CLAUDE.md`'s `brindle-ui` paragraph. Verify that both name `ItemKey`.
+- [x] 1.12 Update `ui/README.md`'s component notes on keys, and `CLAUDE.md`'s `brindle-ui` paragraph. Verify that both name `ItemKey`.
 - [ ] 1.13 Manual checks for the user, on `scripts/run-throwaway.sh`:
   - dragging tabs to reorder them;
   - the profile menu's press, drag onto an item and release;
