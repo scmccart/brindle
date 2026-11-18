@@ -755,6 +755,20 @@ pub fn menu_style(t: &Tokens) -> MenuStyle {
 /// shadcn's `h-0.5` line.
 pub const TAB_LINE_WIDTH: Pixels = px(2.);
 
+/// The root font size the crate's pixel constants assume: the browser
+/// default shadcn's rems are written against, and gpui's default
+/// `rem_size`.
+pub const DEFAULT_REM: Pixels = px(DEFAULT_REM_PX);
+
+const DEFAULT_REM_PX: f32 = 16.;
+
+/// `rems` in pixels at [`DEFAULT_REM`], for a constant an owner needs in
+/// pixels without a window's rem size (a title bar's height, say). A
+/// window whose rem size differs draws rems at its own size.
+pub const fn rems_at_default(rems: Rems) -> Pixels {
+    px(rems.0 * DEFAULT_REM_PX)
+}
+
 /// A list's height, shadcn's `h-9`.
 pub const TAB_LIST_HEIGHT: Rems = Rems(2.25);
 
@@ -1050,6 +1064,19 @@ mod tests {
     fn field_height_is_shadcns_h_9() {
         // `h_9` is 2.25rem, 36px at the 16px root.
         assert_eq!(FIELD_HEIGHT, rems(2.25).to_pixels(px(16.)));
+    }
+
+    /// The named conversion agrees with gpui's at the default root, and is
+    /// usable in a constant.
+    #[test]
+    fn rems_at_the_default_root() {
+        const TAB_LIST_PX: Pixels = rems_at_default(TAB_LIST_HEIGHT);
+        assert_eq!(DEFAULT_REM, px(16.));
+        assert_eq!(TAB_LIST_PX, px(36.));
+        assert_eq!(FIELD_HEIGHT, rems_at_default(rems(2.25)));
+        for r in [0., 0.25, 0.875, 1., 2.25, 10.] {
+            assert_eq!(rems_at_default(rems(r)), rems(r).to_pixels(DEFAULT_REM), "{r}rem");
+        }
     }
 
     type Pick = fn(&Tokens) -> Hsla;
@@ -1609,6 +1636,23 @@ mod tests {
         t.background = hsla(0.1, 0.3, 0.95, 1.);
         let s = tooltip_style(&t);
         assert_eq!((s.background, s.foreground), (t.foreground, t.background));
+    }
+
+    /// b42 #1: a dragged tab's preview takes the page colours, the primary
+    /// border and the md radius, from whatever tokens are active.
+    #[test]
+    fn tab_drag_style_comes_from_the_tokens() {
+        for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            let s = tab_drag_style(&t);
+            assert_eq!((s.background, s.foreground, s.border), (t.background, t.foreground, t.primary));
+            assert_eq!(s.radius, t.radius_md());
+        }
+        // Tokens of the app's own, not the built-in ones.
+        let mut custom = Tokens::neutral_dark();
+        custom.background = hsla(0.6, 0.3, 0.1, 1.);
+        custom.primary = hsla(0.1, 0.8, 0.5, 1.);
+        let s = tab_drag_style(&custom);
+        assert_eq!((s.background, s.border), (custom.background, custom.primary));
     }
 
     /// A menu is a popover-coloured panel with an accent highlight, muted

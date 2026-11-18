@@ -913,8 +913,8 @@ use crate::actions::{
     SettingsSectionPrev,
 };
 use brindle_ui::{
-    ActiveTheme as _, ButtonVariant, Checkbox, FIELD_HEIGHT, Input, Select, SelectEvent, Switch, TextInput,
-    TextInputEvent,
+    ActiveTheme as _, ButtonVariant, Checkbox, FIELD_HEIGHT, Input, Select, SelectEvent, SelectOption, Switch, TextInput,
+    TextInputEvent, option_keyed,
 };
 
 /// The fields shown as a select rather than text.
@@ -954,12 +954,21 @@ impl SettingsDialog {
             self.profile_inputs.push((field, input));
         }
         for field in SELECT_FIELDS {
-            let labels = self.choice_labels(&editor, field);
+            // Each option is keyed by its index (labels can repeat), and the
+            // chosen key is found again at it.
+            let options: Vec<SelectOption> = self
+                .choice_labels(&editor, field)
+                .into_iter()
+                .enumerate()
+                .map(|(ix, label)| SelectOption::new(label).key(ix.to_string()))
+                .collect();
             let selected = editor.choice_index(field);
-            let select = cx.new(|cx| Select::new(labels, selected, cx));
-            let changed = cx.subscribe_in(&select, window, move |this, _, event: &SelectEvent, window, cx| {
-                let SelectEvent::Changed(ix) = *event;
-                this.apply_choice(Choice::Profile(field), ix, window, cx);
+            let select = cx.new(|cx| Select::new(options, selected, cx));
+            let changed = cx.subscribe_in(&select, window, move |this, select, event: &SelectEvent, window, cx| {
+                let SelectEvent::Changed(key) = event;
+                if let Some(ix) = option_keyed(select.read(cx).options(), key) {
+                    this.apply_choice(Choice::Profile(field), ix, window, cx);
+                }
             });
             self._profile_subscriptions.push(changed);
             self.profile_selects.push((field, select));

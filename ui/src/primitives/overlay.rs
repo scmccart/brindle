@@ -30,8 +30,9 @@
 //!
 //! An outside press on a non-modal view still reaches what it lands on (a
 //! popover's), unless the slot blocks the pointer outside its view
-//! ([`Overlay::block_outside_pointer`], a select's menu): a transparent cover
-//! beneath the view then takes the press, which only asks the view to close.
+//! ([`OverlayKind::NonModal`] with `blocks_outside`, a select's menu): a
+//! transparent cover beneath the view then takes the press, which only asks
+//! the view to close.
 //! Outside presses are found by position, not by what the press hit, so
 //! the cover changes none of the rules above.
 //!
@@ -71,17 +72,50 @@ pub fn enter_animation_id(opens: u64) -> ElementId {
     ("ui-layer-enter", opens).into()
 }
 
+/// What kind of layer a slot opens, which decides how it covers the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayKind {
+    /// A dialog: a backdrop over the window blocks the pointer, and the view
+    /// is centred over it.
+    Modal,
+    /// A popover: the view blocks the pointer within its own bounds, and
+    /// also outside them while open when `blocks_outside` is set, as
+    /// Radix's select content does (`disableOutsidePointerEvents`): a
+    /// transparent cover over the window, just beneath the view, takes
+    /// every press, release and hover outside it. An outside press still
+    /// requests dismissal (it is outside the view), but reaches nothing
+    /// beneath, and the view's own outside-release handlers still run. The
+    /// view stays where it is placed, unlike a modal one; no backdrop is
+    /// drawn.
+    NonModal { blocks_outside: bool },
+}
+
+impl OverlayKind {
+    pub fn is_modal(self) -> bool {
+        match self {
+            OverlayKind::Modal => true,
+            OverlayKind::NonModal { .. } => false,
+        }
+    }
+
+    /// Whether the open layer keeps the pointer from what is outside its
+    /// view: a modal one always does, with its backdrop.
+    pub fn blocks_outside(self) -> bool {
+        match self {
+            OverlayKind::Modal => true,
+            OverlayKind::NonModal { blocks_outside } => blocks_outside,
+        }
+    }
+}
+
 /// The slot an owner keeps for one overlay view. Its view's `focus_handle`
 /// must be tracked in the view's tree (`track_focus`), as GPUI's own focus
 /// needs: the dismiss request from a press is dispatched to it.
 pub struct Overlay<V: ManagedView + FocusStops> {
-    modal: bool,
+    kind: OverlayKind,
     /// Whether a press outside the view requests its dismissal (the
     /// default). A slot that holds work in progress turns it off.
     outside_press_dismisses: bool,
-    /// Whether a non-modal view blocks the pointer outside itself while
-    /// open (a select's menu), with a transparent cover over the window.
-    blocks_outside: bool,
     /// How many times the slot has opened, which keys the entry animation.
     opens: u64,
     open: Option<Open<V>>,
@@ -96,10 +130,15 @@ struct Open<V> {
 }
 
 impl<V: ManagedView + FocusStops> Overlay<V> {
+    /// A slot for a view of `kind`.
+    pub fn new(kind: OverlayKind) -> Self {
+        Self { kind, outside_press_dismisses: true, opens: 0, open: None }
+    }
+
     /// A slot for a modal view: it covers the window with a backdrop that
     /// blocks the pointer, and centres the view over it.
     pub fn modal() -> Self {
-        Self { modal: true, outside_press_dismisses: true, blocks_outside: false, opens: 0, open: None }
+        Self::new(OverlayKind::Modal)
     }
 
     /// Makes a press outside the view, on a modal slot's backdrop, request
@@ -126,26 +165,18 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     }
 
     /// A slot for a non-modal view (a popover): it blocks the pointer only
-    /// within its own bounds.
+    /// within its own bounds. One that blocks it outside too (a select's
+    /// menu) is `Overlay::new(OverlayKind::NonModal { blocks_outside: true })`.
     pub fn non_modal() -> Self {
-        Self { modal: false, outside_press_dismisses: true, blocks_outside: false, opens: 0, open: None }
+        Self::new(OverlayKind::NonModal { blocks_outside: false })
     }
 
-    /// Makes a non-modal slot block the pointer outside its view while
-    /// open, as Radix's select content does (`disableOutsidePointerEvents`):
-    /// a transparent cover over the window, just beneath the view, takes
-    /// every press, release and hover outside it. An outside press still
-    /// requests dismissal (it is outside the view), but reaches nothing
-    /// beneath, and the view's own outside-release handlers still run.
-    /// The view stays where it is placed, unlike a modal one; no backdrop
-    /// is drawn.
-    pub fn block_outside_pointer(mut self) -> Self {
-        self.blocks_outside = true;
-        self
+    pub fn kind(&self) -> OverlayKind {
+        self.kind
     }
 
     pub fn is_modal(&self) -> bool {
-        self.modal
+        self.kind.is_modal()
     }
 
     pub fn is_open(&self) -> bool {
@@ -175,7 +206,7 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         self.close(window, cx);
         let restore = window.focused(cx).map(|handle| handle.downgrade());
         let own = view.focus_handle(cx);
-        let layer = layer::push(window, self.modal, own.downgrade(), cx);
+        let layer = layer::push(window, self.kind.is_modal(), own.downgrade(), cx);
         let target = {
             let v = view.read(cx);
             initial_focus(v.initial_focus(cx), &v.stops(cx), own)
@@ -228,9 +259,7 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
     ) -> Option<AnyElement> {
         let open = self.open.as_ref()?;
         let id = open.layer;
-        let stack = layer::stack(window, cx);
-        let depth = stack.and_then(|stack| stack.depth(id)).unwrap_or(0);
-        let lifted = stack.is_some_and(|stack| wrap_in_deferred(stack, id));
+        let lift = layer::stack(window, cx).and_then(|stack| deferred_priority(stack, id));
         let view = open.view.clone();
         let panel = div()
             .key_context("UiLayer")
@@ -257,9 +286,11 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                         return;
                     }
                     let own = view.focus_handle(cx);
-                    let target = match window.focused(cx) {
-                        Some(focused) if own.contains(&focused, window) => focused,
-                        _ => own,
+                    let focused = window.focused(cx);
+                    let inside = focused.as_ref().is_some_and(|focused| own.contains(focused, window));
+                    let target = match (dismiss_target(inside), focused) {
+                        (DismissTarget::Focused, Some(focused)) => focused,
+                        (DismissTarget::Focused, None) | (DismissTarget::Own, _) => own,
                     };
                     window.defer(cx, move |window, cx| target.dispatch_action(&Dismiss, window, cx));
                 }
@@ -270,47 +301,76 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
         // with its backdrop, a non-modal one by itself.
         let enter = Animation::new(ENTER_DURATION).with_easing(ease_in_out);
         let enter_id = enter_animation_id(self.opens);
-        let element = if self.modal {
-            let size = window.viewport_size();
-            // Absolute at the window's origin, so the backdrop covers the
-            // window from wherever in the tree it is rendered.
-            anchored()
-                .position(Point::default())
-                .child(
-                    div()
-                        .w(size.width)
-                        .h(size.height)
-                        .occlude()
-                        .bg(backdrop())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(panel)
-                        .with_animation(enter_id, enter, |backdrop, delta| backdrop.opacity(delta)),
-                )
-                .into_any_element()
-        } else {
-            let placed = place(panel.with_animation(enter_id, enter, |panel, delta| panel.opacity(delta)).into_any_element());
-            if self.blocks_outside {
-                // The cover first, so the panel paints (and hit-tests) above
-                // it. A press on it, with any button, is pointer input; its
-                // default (moving focus) is prevented, so focus stays in the
-                // view until the dismissal gives it back. Both are out of
-                // flow.
+        let element = match self.kind {
+            OverlayKind::Modal => {
                 let size = window.viewport_size();
-                let cover = anchored().position(Point::default()).child(
-                    div().w(size.width).h(size.height).occlude().on_any_mouse_down(|_, window, cx| {
-                        set_modality(window, Modality::Pointer, cx);
-                        window.prevent_default();
-                    }),
-                );
-                div().absolute().child(cover).child(placed).into_any_element()
-            } else {
-                placed
+                // Absolute at the window's origin, so the backdrop covers the
+                // window from wherever in the tree it is rendered.
+                anchored()
+                    .position(Point::default())
+                    .child(
+                        div()
+                            .w(size.width)
+                            .h(size.height)
+                            .occlude()
+                            .bg(backdrop())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(panel)
+                            .with_animation(enter_id, enter, |backdrop, delta| backdrop.opacity(delta)),
+                    )
+                    .into_any_element()
+            }
+            OverlayKind::NonModal { blocks_outside } => {
+                let placed = place(panel.with_animation(enter_id, enter, |panel, delta| panel.opacity(delta)).into_any_element());
+                if blocks_outside {
+                    // The cover first, so the panel paints (and hit-tests) above
+                    // it. A press on it, with any button, is pointer input; its
+                    // default (moving focus) is prevented, so focus stays in the
+                    // view until the dismissal gives it back. Both are out of
+                    // flow.
+                    let size = window.viewport_size();
+                    let cover = anchored().position(Point::default()).child(
+                        div().w(size.width).h(size.height).occlude().on_any_mouse_down(|_, window, cx| {
+                            set_modality(window, Modality::Pointer, cx);
+                            window.prevent_default();
+                        }),
+                    );
+                    div().absolute().child(cover).child(placed).into_any_element()
+                } else {
+                    placed
+                }
             }
         };
-        Some(if lifted { deferred(element).with_priority(depth).into_any_element() } else { element })
+        Some(match lift {
+            Some(priority) => deferred(element).with_priority(priority).into_any_element(),
+            None => element,
+        })
     }
+}
+
+/// The paint priority layer `id` of `stack` is deferred at, its depth, or
+/// `None` when it renders inline ([`wrap_in_deferred`]): a layer not in the
+/// stack is never lifted, so it has no depth to be drawn at.
+pub fn deferred_priority(stack: &LayerStack, id: LayerId) -> Option<usize> {
+    if wrap_in_deferred(stack, id) { stack.depth(id) } else { None }
+}
+
+/// Which handle an outside press's dismiss request goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DismissTarget {
+    /// What has focus inside the view, so a view's own `Dismiss` handler
+    /// below its root (a command list's) gets the request.
+    Focused,
+    /// The view's own handle.
+    Own,
+}
+
+/// Where an outside press sends the dismiss request: to the focused handle
+/// when focus is inside the view (`focused_inside`), else to the view's own.
+pub fn dismiss_target(focused_inside: bool) -> DismissTarget {
+    if focused_inside { DismissTarget::Focused } else { DismissTarget::Own }
 }
 
 /// Whether the layer `id` of `stack` renders through `deferred`, which lifts
@@ -467,6 +527,46 @@ mod tests {
         assert!(wrap_in_deferred(&stack, menu));
         // A layer that isn't open renders inline.
         assert!(!wrap_in_deferred(&stack, popover));
+    }
+
+    /// b42 #2: the kind says what blocks the pointer outside the view: a
+    /// modal layer always does, a non-modal one only when its slot asks.
+    #[test]
+    fn a_modal_overlay_blocks_outside() {
+        let cases = [
+            (OverlayKind::Modal, true, true),
+            (OverlayKind::NonModal { blocks_outside: true }, false, true),
+            (OverlayKind::NonModal { blocks_outside: false }, false, false),
+        ];
+        for (kind, modal, blocks) in cases {
+            assert_eq!((kind.is_modal(), kind.blocks_outside()), (modal, blocks), "{kind:?}");
+        }
+    }
+
+    /// b42: a lifted layer is deferred at its depth; one that renders
+    /// inline, or isn't in the stack at all, has no priority, and is drawn
+    /// unlifted at the base.
+    #[test]
+    fn an_overlay_missing_from_the_stack_is_not_lifted() {
+        let mut stack = LayerStack::new();
+        let dialog = stack.push(true);
+        let menu = stack.push(false);
+        let nested = stack.push(false);
+        assert_eq!(deferred_priority(&stack, dialog), None);
+        assert_eq!(deferred_priority(&stack, menu), Some(1));
+        assert_eq!(deferred_priority(&stack, nested), None);
+        stack.remove(menu);
+        assert_eq!(deferred_priority(&stack, menu), None);
+        assert_eq!(deferred_priority(&stack, nested), Some(1));
+        assert_eq!(deferred_priority(&LayerStack::new(), menu), None);
+    }
+
+    /// b42 #3: an outside press asks what has focus inside the view, so a
+    /// handler below the view's root sees it, and else the view itself.
+    #[test]
+    fn an_outside_press_asks_the_focus_inside_the_view() {
+        assert_eq!(dismiss_target(true), DismissTarget::Focused);
+        assert_eq!(dismiss_target(false), DismissTarget::Own);
     }
 
     /// Each opening gets its own animation id, so the fade replays even

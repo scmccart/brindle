@@ -289,9 +289,10 @@ impl Clone for ActionRow {
 }
 
 /// A menu of actions: its entries, each item labelled from the `ACTIONS`
-/// table ([`menu_label`]) with the keys bound to its action, and, by entry
-/// index (separators counted, as `MenuEvent::Selected` counts), the action
-/// each item runs.
+/// table ([`menu_label`]) and keyed by that label, with the keys bound to
+/// its action, and, by entry index (separators counted, as
+/// `brindle_ui::entry_keyed` finds the key of a `MenuEvent::Selected`), the
+/// action each item runs.
 pub struct ActionMenu {
     pub entries: Vec<brindle_ui::MenuEntry>,
     pub actions: Vec<Option<Box<dyn Action>>>,
@@ -556,8 +557,8 @@ mod tests {
             vec![ActionRow::item(RenameTab, true), ActionRow::Separator, ActionRow::item(CloseTab, false)],
             |action| action.partial_eq(&RenameTab).then(|| "ctrl-shift-r".into()),
         );
-        let labels: Vec<&str> = menu.entries.iter().map(|e| e.label()).collect();
-        assert_eq!(labels, ["Rename Tab", "", "Close Tab"]);
+        let labels: Vec<Option<&str>> = menu.entries.iter().map(|e| e.label()).collect();
+        assert_eq!(labels, [Some("Rename Tab"), None, Some("Close Tab")]);
         assert_eq!(menu.entries[0].item().and_then(|i| i.shortcut.clone()), Some("ctrl-shift-r".into()));
         assert!(menu.entries[2].item().is_some_and(|i| i.disabled && i.shortcut.is_none()));
         assert!(menu.action(0).is_some_and(|a| a.partial_eq(&RenameTab)));

@@ -91,6 +91,7 @@ impl LayerStack {
         self.layers.len()
     }
 
+    /// Whether no layer is open: the registry then drops the window's stack.
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
@@ -98,6 +99,15 @@ impl LayerStack {
     /// The layers, bottom first.
     pub fn layers(&self) -> &[LayerEntry] {
         &self.layers
+    }
+
+    /// Closes every layer `live` says is gone (its overlay was dropped
+    /// without closing), keeping the others in order. Returns the closed
+    /// ones, bottom first, for the caller to forget too.
+    pub fn prune(&mut self, live: impl Fn(LayerId) -> bool) -> Vec<LayerId> {
+        let dead: Vec<LayerId> = self.layers.iter().map(|layer| layer.id).filter(|&id| !live(id)).collect();
+        self.layers.retain(|layer| !dead.contains(&layer.id));
+        dead
     }
 }
 
@@ -113,16 +123,12 @@ struct WindowLayers {
 }
 
 impl WindowLayers {
+    /// Closes the layers whose view's handle no longer upgrades
+    /// ([`LayerStack::prune`]) and forgets their handles.
     fn prune(&mut self) {
-        let dead: Vec<LayerId> = self
-            .stack
-            .layers()
-            .iter()
-            .map(|layer| layer.id)
-            .filter(|id| self.handles.get(id).is_none_or(|handle| handle.upgrade().is_none()))
-            .collect();
+        let handles = &self.handles;
+        let dead = self.stack.prune(|id| handles.get(&id).is_some_and(|handle| handle.upgrade().is_some()));
         for id in dead {
-            self.stack.remove(id);
             self.handles.remove(&id);
         }
     }
@@ -249,6 +255,43 @@ mod tests {
         assert!(!stack.non_modal_below(menu));
         // An unknown layer has nothing below it.
         assert!(!stack.non_modal_below(popover));
+    }
+
+    /// b41 #2: pruning closes the layers that aren't live, wherever they
+    /// are, keeps the rest in order and says which it closed; a stack left
+    /// with no layer is empty, which is when the registry drops it.
+    #[test]
+    fn pruning_closes_the_layers_that_are_gone() {
+        struct Case {
+            layers: usize,
+            dead: &'static [usize],
+            kept: &'static [usize],
+            empty: bool,
+        }
+        let cases = [
+            Case { layers: 0, dead: &[], kept: &[], empty: true },
+            Case { layers: 3, dead: &[], kept: &[0, 1, 2], empty: false },
+            Case { layers: 3, dead: &[1], kept: &[0, 2], empty: false },
+            Case { layers: 3, dead: &[0, 2], kept: &[1], empty: false },
+            Case { layers: 1, dead: &[0], kept: &[], empty: true },
+            Case { layers: 3, dead: &[2, 1, 0], kept: &[], empty: true },
+        ];
+        for case in cases {
+            let mut stack = LayerStack::new();
+            let ids: Vec<LayerId> = (0..case.layers).map(|n| stack.push(n % 2 == 0)).collect();
+            let dead: Vec<LayerId> = case.dead.iter().map(|&n| ids[n]).collect();
+            let closed = stack.prune(|id| !dead.contains(&id));
+            // Bottom first, whatever order the dead were named in.
+            let mut expected = case.dead.to_vec();
+            expected.sort_unstable();
+            assert_eq!(closed, expected.iter().map(|&n| ids[n]).collect::<Vec<_>>());
+            let kept: Vec<LayerId> = stack.layers().iter().map(|layer| layer.id).collect();
+            assert_eq!(kept, case.kept.iter().map(|&n| ids[n]).collect::<Vec<_>>());
+            assert_eq!(stack.is_empty(), case.empty);
+            assert_eq!(stack.len(), case.kept.len());
+            // Pruning again closes nothing.
+            assert!(stack.prune(|id| !dead.contains(&id)).is_empty());
+        }
     }
 
     /// A press outside both a popover and the dialog it was opened from

@@ -3,9 +3,10 @@
 //!
 //! An entity the owner creates with its options, in [`CommandGroup`]s, and
 //! keeps, renders where the trigger goes and subscribes to:
-//! [`ComboboxEvent::Changed`] carries the chosen option's index across the
-//! groups (as [`CommandEvent::Confirmed`] does) and is emitted only when the
-//! choice changes ([`Selection::pick`]). The trigger looks like a
+//! [`ComboboxEvent::Changed`] carries the chosen option's [`ItemKey`] and is
+//! emitted only when the choice changes ([`Selection::pick`]). The choice is
+//! kept by that key, so options replaced under it keep it where an option
+//! still has it. The trigger looks like a
 //! [`Select`]'s and fills its parent's width: the chosen option's label, or
 //! the placeholder, and a chevron. A primary press on it, enter or space, or
 //! up or down while it has focus opens the panel below it
@@ -13,7 +14,9 @@
 //! it with that character as the search.
 //!
 //! The panel is shadcn's `<PopoverContent className="p-0">` around a
-//! `<Command>`, at the trigger's width or wider ([`panel_width`]). Its
+//! `<Command>`, at the trigger's width or wider ([`panel_width`]), and is
+//! placed only once the trigger has been measured (until then it waits a
+//! frame). Its
 //! search input has focus; the chosen option is highlighted, scrolled into
 //! view and checked ([`checked_groups`]). Typing filters the options, enter
 //! or a click chooses the highlighted one and closes the panel, and escape
@@ -23,30 +26,30 @@
 //! The panel is a non-modal [`Overlay`] placed with [`Anchored`], like a
 //! select's menu: deferred, so it paints above a dialog's body, flipping
 //! above the trigger when it doesn't fit below, and blocking the pointer
-//! outside it while open ([`Overlay::block_outside_pointer`]), so an outside
-//! press only closes it. As on a select, the trigger has no click handler:
-//! enter and space open it on key-down (see `select`'s module doc).
+//! outside it while open ([`OverlayKind::NonModal`] with `blocks_outside`),
+//! so an outside press only closes it. As on a select, the trigger has no
+//! click handler: enter and space open it on key-down (see `select`'s
+//! module doc).
 //!
 //! [`Select`]: crate::components::select::Select
 //! [`Overlay`]: crate::primitives::overlay::Overlay
-//! [`Overlay::block_outside_pointer`]: crate::primitives::overlay::Overlay::block_outside_pointer
 //! [`Anchored`]: crate::primitives::placement::Anchored
 
 use gpui::{
     App, AppContext, Bounds, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, SharedString,
-    Styled, Subscription, Window, div, prelude::FluentBuilder, px, rems,
+    Styled, Subscription, Window, div, prelude::FluentBuilder, rems,
 };
 
 use crate::actions::{ListConfirm, ListDown, ListFirst, ListLast, ListUp};
-use crate::components::command::{Command, CommandEvent, CommandGroup, CommandItem};
+use crate::components::command::{Command, CommandEvent, CommandGroup, CommandItem, item_keyed};
 use crate::components::popover::{PopoverContent, TriggerAction, follows_trigger};
 use crate::components::select::{ListKey, Selection, TypedKey, closed_trigger_key, typed_key};
-use crate::components::{DISABLED_OPACITY, FocusRing, inert_press};
+use crate::components::{DISABLED_OPACITY, FocusRing, ItemKey, inert_press};
 use crate::icon::Icon;
 use crate::primitives::focus_scope::FocusStops;
 use crate::primitives::focus_visible::{Modality, focus_from_pointer, modality, set_modality, shows_ring};
-use crate::primitives::overlay::Overlay;
+use crate::primitives::overlay::{Overlay, OverlayKind};
 use crate::primitives::placement::{Align, Anchored, Side, anchor_trigger};
 use crate::style::{MUTED_ICON_OPACITY, SELECT_MENU_MIN_WIDTH, focus_ring, select_style};
 use crate::theme::ActiveTheme;
@@ -58,10 +61,10 @@ pub fn option_at(groups: &[CommandGroup], ix: usize) -> Option<&CommandItem> {
     groups.iter().flat_map(|group| &group.items).nth(ix)
 }
 
-/// The index across `groups` of the first option labelled `label`, which
-/// is how an option is found again after the options are replaced.
-pub fn option_labelled(groups: &[CommandGroup], label: &str) -> Option<usize> {
-    groups.iter().flat_map(|group| &group.items).position(|item| item.label.as_ref() == label)
+/// The key of the option at `ix` across `groups`: how an index the owner
+/// gives, valid only in the groups of that call, becomes the choice kept.
+pub fn key_at(groups: &[CommandGroup], ix: Option<usize>) -> Option<ItemKey> {
+    option_at(groups, ix?).map(|item| item.key.clone())
 }
 
 /// `groups` with the option at `selected` checked, as shadcn's combobox
@@ -82,9 +85,10 @@ pub fn checked_groups(groups: &[CommandGroup], selected: Option<usize>) -> Vec<C
 }
 
 /// The panel's width: the trigger's, but at least `min` (a select menu's
-/// least width), so a narrow trigger still gets a usable search.
-pub fn panel_width(trigger: Pixels, min: Pixels) -> Pixels {
-    trigger.max(min)
+/// least width), so a narrow trigger still gets a usable search. A
+/// trigger not measured yet (`None`) gives `min`.
+pub fn panel_width(trigger: Option<Pixels>, min: Pixels) -> Pixels {
+    trigger.map_or(min, |width| width.max(min))
 }
 
 /// What a key typed on the closed trigger does: a character opens the
@@ -108,10 +112,10 @@ pub fn trigger_key(typed: TypedKey) -> TriggerKey {
 // ---- entity ------------------------------------------------------------------
 
 /// What a combobox tells its owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComboboxEvent {
-    /// The chosen option changed to this index across the groups.
-    Changed(usize),
+    /// The chosen option changed to the one with this key.
+    Changed(ItemKey),
 }
 
 /// The default search placeholder.
@@ -144,10 +148,11 @@ impl Focusable for Combobox {
 }
 
 impl Combobox {
-    /// A combobox over the options in `groups`, showing `selected` (`None`,
-    /// or an index out of range, shows the placeholder).
+    /// A combobox over the options in `groups`, showing option `selected`
+    /// of them, kept by its key from then on (`None`, or an index out of
+    /// range, shows the placeholder).
     pub fn new(groups: Vec<CommandGroup>, selected: Option<usize>, cx: &mut Context<Self>) -> Self {
-        let selected = selected.filter(|&ix| option_at(&groups, ix).is_some());
+        let selected = key_at(&groups, selected);
         Self {
             groups,
             selection: Selection::new(selected),
@@ -156,7 +161,7 @@ impl Combobox {
             empty_message: None,
             disabled: false,
             focus: cx.focus_handle(),
-            panel: Overlay::non_modal().block_outside_pointer(),
+            panel: Overlay::new(OverlayKind::NonModal { blocks_outside: true }),
             trigger: None,
             _picks: None,
         }
@@ -190,41 +195,46 @@ impl Combobox {
         option_at(&self.groups, ix)
     }
 
+    /// The chosen option's index across the groups of now.
     pub fn selected(&self) -> Option<usize> {
+        item_keyed(&self.groups, self.selection.selected()?)
+    }
+
+    /// The chosen option's key.
+    pub fn selected_key(&self) -> Option<&ItemKey> {
         self.selection.selected()
     }
 
     /// The chosen option's label, or `None` while the placeholder shows.
     pub fn selected_label(&self) -> Option<&SharedString> {
-        self.selection.selected().and_then(|ix| self.option(ix)).map(|item| &item.label)
+        self.selected().and_then(|ix| self.option(ix)).map(|item| &item.label)
     }
 
-    /// Sets the choice from the owner (an index out of range clears it).
-    /// No change is reported.
+    /// Chooses option `selected` of the groups of now, from the owner (an
+    /// index out of range clears the choice). No change is reported.
     pub fn set_selected(&mut self, selected: Option<usize>, cx: &mut Context<Self>) {
-        self.selection.set(selected.filter(|&ix| self.option(ix).is_some()));
+        self.selection.set(key_at(&self.groups, selected));
         self.sync_panel(cx);
         cx.notify();
     }
 
-    /// Replaces the options, with `selected` the choice among them. An open
-    /// panel lists the new options, keeping its search and the highlighted
-    /// option (found again by its label). No change is reported.
+    /// Replaces the options, with option `selected` of them the choice. An
+    /// open panel lists the new options, keeping its search and the
+    /// highlighted option (by its key). No change is reported.
     pub fn set_groups(&mut self, groups: Vec<CommandGroup>, selected: Option<usize>, cx: &mut Context<Self>) {
         self.groups = groups;
-        self.selection.set(selected.filter(|&ix| self.option(ix).is_some()));
+        self.selection.set(key_at(&self.groups, selected));
         self.sync_panel(cx);
         cx.notify();
     }
 
     /// Gives an open panel the current options and their check, keeping
-    /// its highlighted option.
+    /// its highlighted option by its key.
     fn sync_panel(&mut self, cx: &mut Context<Self>) {
         let Some(command) = self.command(cx) else { return };
-        let groups = checked_groups(&self.groups, self.selection.selected());
+        let groups = checked_groups(&self.groups, self.selected());
         command.update(cx, |command, cx| {
-            let highlighted = command.highlighted().and_then(|ix| command.item(ix)).map(|item| item.label.clone());
-            let keep = highlighted.and_then(|label| option_labelled(&groups, &label));
+            let keep = command.highlighted().and_then(|ix| command.item(ix)).map(|item| item.key.clone());
             command.set_groups(groups, keep, cx);
         });
     }
@@ -271,8 +281,8 @@ impl Combobox {
         if self.disabled || self.panel.is_open() {
             return;
         }
-        let selected = self.selection.selected();
-        let groups = checked_groups(&self.groups, selected);
+        let selected = self.selection.selected().cloned();
+        let groups = checked_groups(&self.groups, self.selected());
         let (placeholder, empty) = (self.search_placeholder.clone(), self.empty_message.clone());
         let query = query.map(str::to_string);
         let command = cx.new(|cx| {
@@ -288,16 +298,16 @@ impl Combobox {
             command
         });
         let width = panel_width(
-            self.trigger.map_or(px(0.), |bounds| bounds.size.width),
+            self.trigger.map(|bounds| bounds.size.width),
             SELECT_MENU_MIN_WIDTH.to_pixels(window.rem_size()),
         );
         let panel = cx.new(|cx| ComboboxPanel::new(command, width, cx));
         self._picks = Some(cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
-            let PanelEvent::Picked(ix) = *event;
+            let PanelEvent::Picked(key) = event;
             // Close first, so focus is back on the trigger when the owner
             // hears of the change.
             this.panel.close(window, cx);
-            this.choose(ix, cx);
+            this.choose(key, cx);
         }));
         self.panel.open(panel, |combobox| &mut combobox.panel, window, cx);
     }
@@ -311,10 +321,11 @@ impl Combobox {
         }
     }
 
-    /// Chooses `ix` as the user does, telling the owner when it changed.
-    fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(ix) = self.selection.pick(ix) {
-            cx.emit(ComboboxEvent::Changed(ix));
+    /// Chooses the option keyed `key` as the user does, telling the owner
+    /// when it changed.
+    fn choose(&mut self, key: &ItemKey, cx: &mut Context<Self>) {
+        if let Some(key) = self.selection.pick(key) {
+            cx.emit(ComboboxEvent::Changed(key));
         }
         cx.notify();
     }
@@ -447,12 +458,16 @@ impl Render for Combobox {
             }
         };
 
-        let at = self.trigger.unwrap_or_default();
-        let panel = self.panel.render_with(
-            move |panel| Anchored::new(at).side(Side::Bottom).align(Align::Start).child(panel).into_any_element(),
-            window,
-            cx,
-        );
+        // Placed only beside a measured trigger: an open panel whose
+        // trigger has no bounds yet waits for the frame that records them,
+        // which asks for the next (`follows_trigger`).
+        let panel = self.trigger.and_then(|at| {
+            self.panel.render_with(
+                move |panel| Anchored::new(at).side(Side::Bottom).align(Align::Start).child(panel).into_any_element(),
+                window,
+                cx,
+            )
+        });
 
         anchor_trigger(trigger, record).w_full().children(panel)
     }
@@ -460,10 +475,10 @@ impl Render for Combobox {
 
 // ---- panel -------------------------------------------------------------------
 
-/// What the panel tells its combobox.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the panel tells its combobox: the picked option's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PanelEvent {
-    Picked(usize),
+    Picked(ItemKey),
 }
 
 /// The open panel, the overlay's view: the command list in a popover's
@@ -491,8 +506,13 @@ impl FocusStops for ComboboxPanel {
 
 impl ComboboxPanel {
     fn new(command: Entity<Command>, width: Pixels, cx: &mut Context<Self>) -> Self {
-        let events = cx.subscribe(&command, |_, _, event: &CommandEvent, cx| match *event {
-            CommandEvent::Confirmed(ix) => cx.emit(PanelEvent::Picked(ix)),
+        let events = cx.subscribe(&command, |_, command, event: &CommandEvent, cx| match *event {
+            // The index is the command list's, valid in this update only.
+            CommandEvent::Confirmed(ix) => {
+                if let Some(key) = command.read(cx).item(ix).map(|item| item.key.clone()) {
+                    cx.emit(PanelEvent::Picked(key));
+                }
+            }
             // Escape, or an outside press (which asks the focused search
             // to dismiss): close without a change.
             CommandEvent::Cancelled => cx.emit(DismissEvent),
@@ -511,7 +531,7 @@ impl Render for ComboboxPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Modifiers;
+    use gpui::{Modifiers, px};
 
     fn groups() -> Vec<CommandGroup> {
         vec![
@@ -526,8 +546,31 @@ mod tests {
         assert_eq!(option_at(&groups, 0).map(|i| i.label.as_ref()), Some("Cascadia Mono"));
         assert_eq!(option_at(&groups, 2).map(|i| i.label.as_ref()), Some("Arial"));
         assert_eq!(option_at(&groups, 4), None);
-        assert_eq!(option_labelled(&groups, "Segoe UI"), Some(3));
-        assert_eq!(option_labelled(&groups, "Inter"), None);
+        assert_eq!(item_keyed(&groups, &ItemKey::from("Segoe UI")), Some(3));
+        assert_eq!(item_keyed(&groups, &ItemKey::from("Inter")), None);
+    }
+
+    /// b39 #3, #4: an index the owner gives becomes the key kept, and that
+    /// key finds the option again in groups that replaced the old ones.
+    #[test]
+    fn the_choice_is_kept_by_key() {
+        let groups = groups();
+        assert_eq!(key_at(&groups, Some(2)), Some(ItemKey::from("Arial")));
+        assert_eq!(key_at(&groups, Some(4)), None);
+        assert_eq!(key_at(&groups, None), None);
+        // A family list rebuilt with one more monospace family: Arial moved.
+        let rebuilt = vec![
+            CommandGroup::new("Monospace", ["Cascadia Mono", "Consolas", "Fira Code"]),
+            CommandGroup::new("Other", ["Arial", "Segoe UI"]),
+        ];
+        assert_eq!(item_keyed(&rebuilt, &ItemKey::from("Arial")), Some(3));
+        // Keys of the owner's own are found by key, not label.
+        let keyed = vec![CommandGroup::unnamed([
+            CommandItem::new("Default").key("default"),
+            CommandItem::new("Default").key("family:Default"),
+        ])];
+        assert_eq!(key_at(&keyed, Some(1)), Some(ItemKey::from("family:Default")));
+        assert_eq!(item_keyed(&keyed, &ItemKey::from("family:Default")), Some(1));
     }
 
     /// The chosen option, and only it, is checked; nothing is without one.
@@ -542,10 +585,12 @@ mod tests {
         assert!(none.iter().all(|g| g.items.iter().all(|i| !i.checked)));
     }
 
+    /// b39 #5: a trigger not measured yet gives the least width.
     #[test]
     fn the_panel_is_at_least_as_wide_as_the_trigger() {
-        assert_eq!(panel_width(px(300.), px(128.)), px(300.));
-        assert_eq!(panel_width(px(90.), px(128.)), px(128.));
+        assert_eq!(panel_width(Some(px(300.)), px(128.)), px(300.));
+        assert_eq!(panel_width(Some(px(90.)), px(128.)), px(128.));
+        assert_eq!(panel_width(None, px(128.)), px(128.));
     }
 
     /// A character on the closed trigger searches for it; a space opens;

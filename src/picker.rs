@@ -30,7 +30,8 @@ use crate::config::Config;
 use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
 use brindle_ui::{
-    Command, CommandEvent, CommandGroup, CommandItem, Dialog, Dismiss, FocusStops, Input, ListConfirm, TextInput,
+    Command, CommandEvent, CommandGroup, CommandItem, Dialog, Dismiss, FocusStops, Input, ItemKey, ListConfirm,
+    TextInput,
 };
 
 pub enum PaletteEvent {
@@ -52,8 +53,10 @@ pub struct PaletteRow {
 }
 
 impl PaletteRow {
-    fn item(&self) -> CommandItem {
+    /// The row as the command list's item, keyed `key`.
+    fn item(&self, key: ItemKey) -> CommandItem {
         CommandItem {
+            key,
             label: self.label.clone(),
             detail: self.detail.clone(),
             shortcut: self.shortcut.clone(),
@@ -61,6 +64,14 @@ impl PaletteRow {
             checked: false,
         }
     }
+}
+
+/// The key of the row at `ix` across a palette's groups. Rows are keyed by
+/// position for now (labels repeat: two sessions of one program), so a
+/// kept row is the one at the index the caller computed against the new
+/// groups, as before keys.
+fn row_key(ix: usize) -> ItemKey {
+    ItemKey::new(ix.to_string())
 }
 
 /// Rows under a heading, or none. A group after the first has a separator
@@ -82,14 +93,24 @@ impl PaletteGroup {
     }
 }
 
-/// The command list's groups.
+/// The command list's groups, each row keyed by its index across them
+/// ([`row_key`]).
 fn command_groups(groups: &[PaletteGroup]) -> Vec<CommandGroup> {
+    let mut row = 0;
     groups
         .iter()
         .enumerate()
         .map(|(ix, group)| CommandGroup {
             heading: group.heading.clone(),
-            items: group.rows.iter().map(PaletteRow::item).collect(),
+            items: group
+                .rows
+                .iter()
+                .map(|r| {
+                    let item = r.item(row_key(row));
+                    row += 1;
+                    item
+                })
+                .collect(),
             separator: ix > 0,
         })
         .collect()
@@ -207,7 +228,7 @@ impl Palette {
         if let Mode::List(list) = &mut self.mode {
             list.command.update(cx, |command, cx| {
                 command.set_empty_message(empty, cx);
-                command.set_groups(command_groups(&groups), keep, cx);
+                command.set_groups(command_groups(&groups), keep.map(row_key), cx);
             });
             list.groups = groups;
         }
@@ -780,6 +801,23 @@ mod tests {
         assert_eq!(text(&palette.groups[1].rows[0].detail), Some("5m ago"));
         let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
         assert_eq!(rows.highlighted_item(), Some(0), "the newest local session");
+    }
+
+    /// Rows are keyed by their index across the groups, so a row kept by
+    /// index is the one the command list keeps, even when labels repeat.
+    #[test]
+    fn rows_are_keyed_by_their_index_across_the_groups() {
+        let row = |label: &str| PaletteRow { label: label.to_string().into(), detail: None, shortcut: None, disabled: false };
+        let groups = [
+            PaletteGroup::named("This machine", vec![row("bash"), row("bash")]),
+            PaletteGroup::named("A8", vec![row("bash")]),
+        ];
+        let command = command_groups(&groups);
+        let keys: Vec<&str> = command.iter().flat_map(|g| &g.items).map(|item| item.key.as_str()).collect();
+        assert_eq!(keys, ["0", "1", "2"]);
+        for ix in 0..3 {
+            assert_eq!(brindle_ui::item_keyed(&command, &row_key(ix)), Some(ix));
+        }
     }
 
     /// With this machine's sessions alone the palette is one group with no

@@ -28,13 +28,15 @@ use std::rc::Rc;
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Combobox, ComboboxEvent, Command,
     CommandEvent, CommandGroup, CommandItem,
-    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, Kbd, MenuEntry,
-    MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption, Separator,
+    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, ItemKey, Kbd,
+    MenuEntry, MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
+    Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
     ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla,
     MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, TitlebarOptions, Window, WindowBounds,
     WindowOptions, div, prelude::*, px, rems, rgb, size,
 };
@@ -264,9 +266,13 @@ fn dot(color: Hsla) -> Div {
     div().flex_none().size(px(6.)).rounded_full().bg(color)
 }
 
-/// The label of entry `ix` of `entries`, for the menu log.
-fn entry_label(entries: &[MenuEntry], ix: usize) -> String {
-    entries.get(ix).map_or_else(|| format!("#{ix}"), |entry| entry.label().to_string())
+/// The label of the entry of `entries` keyed `key`, for the menu log.
+fn entry_label(entries: &[MenuEntry], key: &ItemKey) -> String {
+    entries
+        .iter()
+        .find(|entry| entry.key() == Some(key))
+        .and_then(MenuEntry::label)
+        .map_or_else(|| format!("#{}", key.as_str()), str::to_string)
 }
 
 /// A `div` around `element` that records the element's painted bounds under
@@ -399,14 +405,20 @@ impl Gallery {
         let focus = cx.focus_handle();
         window.focus(&focus);
         let subscriptions = vec![
-            cx.subscribe(&shell, |this, _, event: &SelectEvent, cx| {
-                let SelectEvent::Changed(ix) = *event;
-                this.shell_changes.push(ix);
+            // The changes are logged by the option's index now, which the
+            // checks compare.
+            cx.subscribe(&shell, |this, shell, event: &SelectEvent, cx| {
+                let SelectEvent::Changed(key) = event;
+                if let Some(ix) = brindle_ui::option_keyed(shell.read(cx).options(), key) {
+                    this.shell_changes.push(ix);
+                }
                 cx.notify();
             }),
-            cx.subscribe(&family, |this, _, event: &ComboboxEvent, cx| {
-                let ComboboxEvent::Changed(ix) = *event;
-                this.family_changes.push(ix);
+            cx.subscribe(&family, |this, family, event: &ComboboxEvent, cx| {
+                let ComboboxEvent::Changed(key) = event;
+                if let Some(ix) = brindle_ui::item_keyed(family.read(cx).groups(), key) {
+                    this.family_changes.push(ix);
+                }
                 cx.notify();
             }),
             cx.subscribe(&command, |this, command, event: &CommandEvent, cx| {
@@ -421,19 +433,19 @@ impl Gallery {
                 cx.notify();
             }),
             cx.subscribe(&context_menu, |this, _, event: &MenuEvent, cx| {
-                let MenuEvent::Selected(ix) = *event;
-                this.menu_log.push(format!("context:{}", entry_label(&context_entries(), ix)));
+                let MenuEvent::Selected(key) = event;
+                this.menu_log.push(format!("context:{}", entry_label(&context_entries(), key)));
                 cx.notify();
             }),
             cx.subscribe(&dropdown, |this, dropdown, event: &MenuEvent, cx| {
-                let MenuEvent::Selected(ix) = *event;
-                let label = entry_label(dropdown.read(cx).entries(), ix);
+                let MenuEvent::Selected(key) = event;
+                let label = entry_label(dropdown.read(cx).entries(), key);
                 this.menu_log.push(format!("dropdown:{label}"));
                 cx.notify();
             }),
             cx.subscribe(&long_dropdown, |this, dropdown, event: &MenuEvent, cx| {
-                let MenuEvent::Selected(ix) = *event;
-                let label = entry_label(dropdown.read(cx).entries(), ix);
+                let MenuEvent::Selected(key) = event;
+                let label = entry_label(dropdown.read(cx).entries(), key);
                 this.menu_log.push(format!("long:{label}"));
                 cx.notify();
             }),
@@ -1063,11 +1075,19 @@ impl Gallery {
 
     /// Moves the tab at `from` to `to`'s place; the active tab stays active.
     fn move_tab(&mut self, name: &str, request: &TabMove, cx: &mut Context<Self>) {
-        let TabMove { from, to } = *request;
+        let to = request.to;
+        // The dragged tab is named by its trigger's id; the log keeps its
+        // index now.
+        let from = self.tabs.get(name).and_then(|demo| {
+            demo.tabs.iter().position(|tab| ElementId::from(("tab", tab.id)) == request.from)
+        });
+        let Some(from) = from else {
+            self.tab_log.push(format!("{name}:move:?->{to}"));
+            cx.notify();
+            return;
+        };
         self.tab_log.push(format!("{name}:move:{from}->{to}"));
-        if let Some(demo) = self.tabs.get_mut(name)
-            && from < demo.tabs.len()
-        {
+        if let Some(demo) = self.tabs.get_mut(name) {
             let active = demo.tabs.get(demo.active).map(|tab| tab.id);
             let tab = demo.tabs.remove(from);
             demo.tabs.insert(to.min(demo.tabs.len()), tab);
@@ -3597,14 +3617,16 @@ mod check {
     }
 
     /// Replaces the inline command list's items, naming the item to keep
-    /// highlighted, and reads back the filter text and the highlighted item.
+    /// highlighted by its key (its label), and reads back the filter text
+    /// and the highlighted item.
     fn command_replace(
         c: &mut Checker,
         command: &Entity<brindle_ui::Command>,
         items: &[&str],
-        keep: Option<usize>,
+        keep: Option<&str>,
     ) -> Result<(String, Option<usize>), Failure> {
         let groups = vec![brindle_ui::CommandGroup::unnamed(items.iter().copied())];
+        let keep = keep.map(brindle_ui::ItemKey::from);
         let command = command.clone();
         c.with(move |_, _, cx| {
             command.update(cx, |command, cx| command.set_groups(groups, keep, cx));
@@ -3628,7 +3650,7 @@ mod check {
         c.key("down").await?;
         let highlighted = c.read(command, |command, _| command.highlighted())?;
         ensure!(highlighted == Some(1), "down highlighted {highlighted:?}, expected beta (1)");
-        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some(1))?;
+        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some("beta"))?;
         ensure!(highlighted == Some(1), "beta isn't highlighted after the items were replaced: {highlighted:?}");
         ensure!(query.is_empty(), "the filter text changed to {query:?}");
         Ok(())
@@ -3655,7 +3677,7 @@ mod check {
         for key in ["g", "a"] {
             c.key(key).await?;
         }
-        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some(1))?;
+        let (query, highlighted) = command_replace(c, command, &["alpha", "beta", "delta", "gamma"], Some("beta"))?;
         ensure!(query == "ga", "the filter text changed to {query:?}");
         ensure!(highlighted == Some(3), "gamma (3) isn't highlighted under `ga`: {highlighted:?}");
         Ok(())

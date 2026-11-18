@@ -7,18 +7,20 @@
 //! drawn as [`Kbd`] keycaps and a disabled state, and separators between
 //! groups. It is the view of a non-modal [`Overlay`] that blocks the
 //! pointer outside it, as a select's menu: an outside press only closes
-//! it. It emits [`MenuEvent::Selected`] with the entry's index (separators
-//! counted) when an item is chosen; every other way out (Escape, an
-//! outside press) is the overlay's `DismissEvent`. Focus goes back to what
-//! had it when the menu opened, either way.
+//! it. It emits [`MenuEvent::Selected`] with the chosen item's [`ItemKey`]
+//! (its label unless the owner keyed it), which the owner resolves against
+//! its items as they are then; every other way out (Escape, an outside
+//! press) is the overlay's `DismissEvent`. Focus goes back to what had it
+//! when the menu opened, either way.
 //!
 //! Keys, as Radix's menu: the highlight starts on nothing. Down (also
 //! ctrl-n), Home and PageUp highlight the first enabled item from there,
 //! Up (ctrl-p), End and PageDown the last; after that up and down move over
 //! the enabled items without wrapping ([`MenuNav`], on [`ListNav`]), home and
-//! PageUp go to the first and end and PageDown to the last. Typing
-//! highlights the next enabled item whose label starts with the typed text
-//! ([`Typeahead`], labels only). Enter and space choose the highlighted
+//! PageUp go to the first and end and PageDown to the last ([`page_key`]).
+//! Typing highlights the next enabled item whose label starts with the
+//! typed text ([`Typeahead`], labels only, separators never). Enter and
+//! space choose the highlighted
 //! item; space continues a typeahead search instead while one is under way.
 //! Tab does nothing (the menu lists no focus stops).
 //!
@@ -31,8 +33,9 @@
 //! press on a dropdown's trigger, a secondary press for a context menu) is
 //! ignored when the pointer moved no more than [`DRAG_THRESHOLD`] since the
 //! press; moved further, it chooses the enabled item it lands on, so press,
-//! drag and release is one gesture ([`menu_item_release`]). A release
-//! anywhere else does nothing.
+//! drag and release is one gesture ([`menu_item_release`], over what
+//! [`release_over`] says it landed on). A release anywhere else does
+//! nothing.
 //!
 //! [`ContextMenu`]: crate::components::context_menu::ContextMenu
 //! [`DropdownMenu`]: crate::components::dropdown_menu::DropdownMenu
@@ -43,19 +46,19 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Bounds, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window, div, prelude::FluentBuilder, px,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 
 use crate::actions::{ListConfirm, ListDown, ListFirst, ListLast, ListUp};
-use crate::components::DISABLED_OPACITY;
 use crate::components::kbd::Kbd;
 use crate::components::select::{MenuRelease, ReleaseOver, TypedKey, moved_off, typed_key};
+use crate::components::{DISABLED_OPACITY, ItemKey};
 use crate::primitives::focus_scope::FocusStops;
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::nav::{ListNav, Typeahead};
-use crate::primitives::overlay::Overlay;
+use crate::primitives::overlay::{Overlay, OverlayKind};
 use crate::primitives::placement::{Align, Anchored, EDGE_MARGIN, SIDE_OFFSET, Side, available_height};
 use crate::style::{MENU_MIN_WIDTH, MenuStyle, menu_style};
 use crate::theme::ActiveTheme;
@@ -65,6 +68,9 @@ use crate::theme::ActiveTheme;
 /// One item of a menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuItem {
+    /// The item's identity, which [`MenuEvent::Selected`] names it by: its
+    /// label unless the owner gives it one ([`MenuItem::key`]).
+    pub key: ItemKey,
     /// What the item says. Typeahead and the item's name use this alone.
     pub label: SharedString,
     /// A second line under the label, in the muted foreground.
@@ -77,8 +83,16 @@ pub struct MenuItem {
 }
 
 impl MenuItem {
+    /// An item labelled, and keyed, `label`.
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Self { label: label.into(), description: None, shortcut: None, disabled: false }
+        let label = label.into();
+        Self { key: ItemKey::new(label.clone()), label, description: None, shortcut: None, disabled: false }
+    }
+
+    /// Keys the item by `key` instead of its label.
+    pub fn key(mut self, key: impl Into<ItemKey>) -> Self {
+        self.key = key.into();
+        self
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
@@ -119,10 +133,29 @@ impl MenuEntry {
         self.item().is_some_and(|item| !item.disabled)
     }
 
-    /// The item's label, or nothing for a separator.
-    pub fn label(&self) -> &str {
-        self.item().map_or("", |item| item.label.as_ref())
+    /// The item's label; a separator has none.
+    pub fn label(&self) -> Option<&str> {
+        self.item().map(|item| item.label.as_ref())
     }
+
+    /// The item's key; a separator has none.
+    pub fn key(&self) -> Option<&ItemKey> {
+        self.item().map(|item| &item.key)
+    }
+}
+
+/// The index of the first entry of `entries` keyed `key` (separators
+/// counted): where an owner finds the item a [`MenuEvent::Selected`] names
+/// among its items as they are now.
+pub fn entry_keyed(entries: &[MenuEntry], key: &ItemKey) -> Option<usize> {
+    entries.iter().position(|entry| entry.key() == Some(key))
+}
+
+/// The key of entry `ix` of `entries` when choosing it chooses something:
+/// an enabled item. A separator, a disabled item or an index past the end
+/// gives `None`.
+pub fn chosen(entries: &[MenuEntry], ix: usize) -> Option<ItemKey> {
+    entries.get(ix).filter(|entry| entry.is_enabled()).and_then(MenuEntry::key).cloned()
 }
 
 impl From<MenuItem> for MenuEntry {
@@ -150,11 +183,13 @@ impl From<SharedString> for MenuEntry {
 }
 
 /// What a menu tells its owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuEvent {
-    /// The entry at this index (separators counted) was chosen. The menu
-    /// has closed and given focus back before the owner hears of it.
-    Selected(usize),
+    /// The item with this key was chosen. The menu has closed and given
+    /// focus back before the owner hears of it; the owner finds the item
+    /// among its own items as they are now, which may have changed since
+    /// the menu opened.
+    Selected(ItemKey),
 }
 
 /// An open menu's highlight and typeahead, over its entries. Pure: the
@@ -210,8 +245,8 @@ impl MenuNav {
     /// the new highlight when there was a match.
     pub fn type_char(&mut self, ch: char, now: Instant, entries: &[MenuEntry]) -> Option<usize> {
         self.typeahead.push(ch, now);
-        let labels: Vec<&str> = entries.iter().map(MenuEntry::label).collect();
-        let found = self.typeahead.find(&labels, self.list.highlight, enabled(entries))?;
+        let labels: Vec<Option<&str>> = entries.iter().map(MenuEntry::label).collect();
+        let found = self.typeahead.find_labelled(&labels, self.list.highlight, enabled(entries))?;
         self.list.highlight = Some(found);
         Some(found)
     }
@@ -225,6 +260,49 @@ impl MenuNav {
 
 /// A move of the highlight: one of `MenuNav`'s steps.
 type Step = fn(&mut MenuNav, &[MenuEntry]) -> Option<usize>;
+
+/// Where PageUp and PageDown move a menu's highlight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuJump {
+    /// To the first enabled item ([`MenuNav::first`]).
+    First,
+    /// To the last enabled item ([`MenuNav::last`]).
+    Last,
+}
+
+impl MenuJump {
+    fn step(self) -> Step {
+        match self {
+            MenuJump::First => MenuNav::first,
+            MenuJump::Last => MenuNav::last,
+        }
+    }
+}
+
+/// What a key the menu's bindings don't take does as a page key, as in
+/// Radix's menu: an unmodified PageUp jumps to the first item and PageDown
+/// to the last; anything else isn't a page key.
+pub fn page_key(key: &str, modifiers: Modifiers) -> Option<MenuJump> {
+    if modifiers.modified() {
+        return None;
+    }
+    match key {
+        "pageup" => Some(MenuJump::First),
+        "pagedown" => Some(MenuJump::Last),
+        _ => None,
+    }
+}
+
+/// What a release in or outside the menu landed on: the enabled item under
+/// it (`item`) when `inside` the menu, the menu itself when there is none,
+/// and outside the menu whatever is under it.
+pub fn release_over(item: Option<usize>, inside: bool) -> ReleaseOver {
+    match (item, inside) {
+        (Some(ix), true) => ReleaseOver::Option(ix),
+        (None, true) => ReleaseOver::Menu,
+        (Some(_) | None, false) => ReleaseOver::Outside,
+    }
+}
 
 fn enabled(entries: &[MenuEntry]) -> impl Fn(usize) -> bool + '_ {
     move |ix| entries.get(ix).is_some_and(MenuEntry::is_enabled)
@@ -397,10 +475,10 @@ impl Menu {
         self.entry_at(at).filter(|&ix| self.entries[ix].is_enabled())
     }
 
-    /// Chooses entry `ix` if it is an enabled item.
+    /// Chooses entry `ix` if it is an enabled item, naming it by its key.
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.entries.get(ix).is_some_and(MenuEntry::is_enabled) {
-            cx.emit(MenuEvent::Selected(ix));
+        if let Some(key) = chosen(&self.entries, ix) {
+            cx.emit(MenuEvent::Selected(key));
         }
     }
 
@@ -450,14 +528,9 @@ impl Menu {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let now = Instant::now();
         let keystroke = &event.keystroke;
-        let page: Option<Step> = match keystroke.key.as_str() {
-            "pageup" if !keystroke.modifiers.modified() => Some(MenuNav::first),
-            "pagedown" if !keystroke.modifiers.modified() => Some(MenuNav::last),
-            _ => None,
-        };
-        if let Some(step) = page {
+        if let Some(jump) = page_key(&keystroke.key, keystroke.modifiers) {
             set_modality(window, Modality::Keyboard, cx);
-            self.move_highlight(step, cx);
+            self.move_highlight(jump.step(), cx);
             cx.stop_propagation();
             return;
         }
@@ -488,13 +561,10 @@ impl Menu {
         if press.is_some_and(|press| press.button == button) {
             self.press = None;
         }
-        let over = match self.item_at(at) {
-            Some(ix) if inside => ReleaseOver::Option(ix),
-            _ if inside => ReleaseOver::Menu,
-            _ => ReleaseOver::Outside,
-        };
-        if let MenuRelease::Pick(ix) = menu_item_release(press, button, at, over) {
-            self.select(ix, cx);
+        let over = release_over(self.item_at(at), inside);
+        match menu_item_release(press, button, at, over) {
+            MenuRelease::Pick(ix) => self.select(ix, cx),
+            MenuRelease::Close | MenuRelease::Stay => {}
         }
     }
 
@@ -629,7 +699,7 @@ impl Render for Menu {
 /// the menu (Radix's menus are modal by default, which disables outside
 /// pointer events, and the select's menu does the same here).
 pub fn menu_overlay() -> Overlay<Menu> {
-    Overlay::non_modal().block_outside_pointer()
+    Overlay::new(OverlayKind::NonModal { blocks_outside: true })
 }
 
 /// Subscribes an opener to `menu`'s choices: the opener's overlay (found
@@ -647,7 +717,7 @@ pub(crate) fn forward_selection<O: EventEmitter<MenuEvent> + 'static>(
             return;
         }
         slot.close(window, cx);
-        cx.emit(*event);
+        cx.emit(event.clone());
         cx.notify();
     })
 }
@@ -802,9 +872,9 @@ mod tests {
         let entry: MenuEntry = "Close Tab".into();
         assert_eq!(entry, MenuEntry::Item(MenuItem::new("Close Tab")));
         assert!(entry.is_enabled());
-        assert_eq!(entry.label(), "Close Tab");
+        assert_eq!(entry.label(), Some("Close Tab"));
         assert!(!MenuEntry::Separator.is_enabled());
-        assert_eq!(MenuEntry::Separator.label(), "");
+        assert_eq!(MenuEntry::Separator.label(), None);
         assert_eq!(MenuEntry::Separator.item(), None);
         let item = MenuItem::new("toolbox").description("toolbox container · dev").shortcut("ctrl-alt-3");
         assert_eq!(item.description.as_ref().map(|s| s.as_ref()), Some("toolbox container · dev"));
@@ -812,7 +882,88 @@ mod tests {
         let entry: MenuEntry = item.disabled(true).into();
         assert!(!entry.is_enabled());
         let shared: MenuEntry = SharedString::from("fish").into();
-        assert_eq!(shared.label(), "fish");
+        assert_eq!(shared.label(), Some("fish"));
+    }
+
+    /// b40 #3: typeahead goes past a separator, which has no label, to the
+    /// next item that matches.
+    #[test]
+    fn typeahead_passes_over_a_separator() {
+        let entries: Vec<MenuEntry> =
+            vec!["Split Right".into(), MenuEntry::Separator, "Settings…".into(), MenuEntry::Separator];
+        let t0 = Instant::now();
+        let mut nav = MenuNav::new(entries.len());
+        assert_eq!(nav.type_char('s', t0, &entries), Some(0));
+        assert_eq!(nav.type_char('s', t0 + Duration::from_secs(2), &entries), Some(2));
+        // Round again, past the trailing separator.
+        assert_eq!(nav.type_char('s', t0 + Duration::from_secs(4), &entries), Some(0));
+        assert_eq!(MenuEntry::Separator.key(), None);
+    }
+
+    /// b40 #2: choosing an entry names the item by its key (the label
+    /// unless the owner keyed it), and only an enabled item is chosen.
+    #[test]
+    fn a_choice_names_the_item_by_its_key() {
+        let key = ItemKey::from;
+        let entries = tab_menu();
+        assert_eq!(chosen(&entries, 0), Some(key("Rename Tab")));
+        assert_eq!(chosen(&entries, 4), Some(key("Close Tab")));
+        // Disabled, a separator, past the end.
+        assert_eq!(chosen(&entries, 1), None);
+        assert_eq!(chosen(&entries, 3), None);
+        assert_eq!(chosen(&entries, 5), None);
+        // Two profiles of one name, keyed apart by their owner.
+        let profiles: Vec<MenuEntry> =
+            vec![MenuItem::new("Shell").key("p0").into(), MenuItem::new("Shell").key("p1").into()];
+        assert_eq!(chosen(&profiles, 1), Some(key("p1")));
+        assert_eq!(profiles[1].key(), Some(&key("p1")));
+        assert_eq!(profiles[1].label(), Some("Shell"));
+        // The owner finds the chosen key among its entries, separators
+        // counted, however they changed since.
+        assert_eq!(entry_keyed(&entries, &key("Close Tab")), Some(4));
+        assert_eq!(entry_keyed(&entries[2..], &key("Close Tab")), Some(2));
+        assert_eq!(entry_keyed(&profiles, &key("Shell")), None);
+        assert_eq!(entry_keyed(&profiles, &key("p1")), Some(1));
+    }
+
+    /// b40 #5: only an unmodified PageUp or PageDown is a page key.
+    #[test]
+    fn page_keys() {
+        let none = Modifiers::default();
+        let shift = Modifiers { shift: true, ..Modifiers::default() };
+        let ctrl = Modifiers { control: true, ..Modifiers::default() };
+        let cases = [
+            ("pageup", none, Some(MenuJump::First)),
+            ("pagedown", none, Some(MenuJump::Last)),
+            ("pageup", shift, None),
+            ("pagedown", ctrl, None),
+            ("home", none, None),
+            ("down", none, None),
+            ("p", none, None),
+        ];
+        for (key, modifiers, jump) in cases {
+            assert_eq!(page_key(key, modifiers), jump, "{key} {modifiers:?}");
+        }
+        // The jumps are home's and end's steps.
+        let entries = tab_menu();
+        let mut nav = MenuNav::new(entries.len());
+        assert_eq!((MenuJump::Last.step())(&mut nav, &entries), Some(4));
+        assert_eq!((MenuJump::First.step())(&mut nav, &entries), Some(0));
+    }
+
+    /// b40 #6: a release inside the menu is over the enabled item under it,
+    /// or the menu; outside, it is outside whatever is under it.
+    #[test]
+    fn what_a_release_lands_on() {
+        let cases = [
+            (Some(2), true, ReleaseOver::Option(2)),
+            (None, true, ReleaseOver::Menu),
+            (Some(2), false, ReleaseOver::Outside),
+            (None, false, ReleaseOver::Outside),
+        ];
+        for (item, inside, over) in cases {
+            assert_eq!(release_over(item, inside), over, "{item:?} {inside}");
+        }
     }
 
     /// A context menu goes on the right of a zero-size trigger at the

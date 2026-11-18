@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Bounds, Context, CursorStyle, Decorations, Entity,
+    Action, AnyElement, App, AppContext as _, BorrowAppContext as _, Bounds, Context, CursorStyle, Decorations, ElementId, Entity,
     FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
@@ -20,9 +20,9 @@ use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
-    TabWidth, TextInput, Tooltip, TooltipFor as _, button_style,
+    TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
 use crate::remote::Host;
 use crate::remote::hosts::{HostState, Hosts};
@@ -424,15 +424,20 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
         // The menu has closed and given focus back to the tab by now.
-        let profile_menu_subscription = cx.subscribe_in(&profile_menu, window, |this, _, event: &MenuEvent, window, cx| {
-            let MenuEvent::Selected(ix) = *event;
-            this.open_profile(ix, window, cx);
-        });
+        // The chosen item's key is found among the menu's entries, which
+        // gives the profile's index (`profile_menu_entries`).
+        let profile_menu_subscription =
+            cx.subscribe_in(&profile_menu, window, |this, menu, event: &MenuEvent, window, cx| {
+                let MenuEvent::Selected(key) = event;
+                if let Some(ix) = entry_keyed(menu.read(cx).entries(), key) {
+                    this.open_profile(ix, window, cx);
+                }
+            });
         let context_menu = cx.new(|_| ContextMenu::new());
         let context_menu_subscription =
             cx.subscribe_in(&context_menu, window, |this, _, event: &MenuEvent, window, cx| {
-                let MenuEvent::Selected(ix) = *event;
-                this.context_menu_selected(ix, window, cx);
+                let MenuEvent::Selected(key) = event;
+                this.context_menu_selected(key, window, cx);
             });
         let mut this = Self {
             tabs: Vec::new(),
@@ -1332,9 +1337,17 @@ impl Workspace {
         self.open_prompt(PromptRequest { label, initial, submit }, window, cx);
     }
 
-    /// A tab dragged onto another: the tab at `from` takes `to`'s place
-    /// (after it when it came from the left, before it from the right), and
-    /// the active tab stays active wherever it ends up.
+    /// A tab dragged onto another: the tab whose trigger the move names
+    /// takes the place of the tab at `to` ([`Workspace::move_tab_to`]); a
+    /// tab gone since the drag began moves nothing.
+    fn move_dragged_tab(&mut self, request: &TabMove, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|t| tab_trigger_id(t.id) == request.from) else { return };
+        self.move_tab_to(from, request.to, cx);
+    }
+
+    /// The tab at `from` takes `to`'s place (after it when it came from the
+    /// left, before it from the right), and the active tab stays active
+    /// wherever it ends up.
     fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         if let Some(active) = reorder_keeping(&mut self.tabs, self.active, from, to, |t| t.id) {
             self.active = active;
@@ -1446,9 +1459,13 @@ impl Workspace {
     /// menu's tab (gone by now: nothing); a zone menu's action runs from the
     /// focused zone, exactly as its keybinding would (as the command palette
     /// runs one).
-    fn context_menu_selected(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn context_menu_selected(&mut self, key: &ItemKey, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.context_menu_tab.take();
-        let Some(action) = self.context_menu_items.take().and_then(|menu| menu.action(ix).map(|a| a.boxed_clone())) else {
+        let action = self.context_menu_items.take().and_then(|menu| {
+            let ix = entry_keyed(&menu.entries, key)?;
+            menu.action(ix).map(|a| a.boxed_clone())
+        });
+        let Some(action) = action else {
             return;
         };
         self.focus_active_tab(window, cx);
@@ -2112,7 +2129,7 @@ impl Workspace {
             .iter()
             .map(|tab| {
                 let (surface, text) = tab.face_colors(cx);
-                let mut trigger = TabTrigger::new(("tab", tab.id as usize), tab.title.clone())
+                let mut trigger = TabTrigger::new(tab_trigger_id(tab.id), tab.title.clone())
                     .closable(true)
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
@@ -2133,7 +2150,7 @@ impl Workspace {
             .trigger_width(TabWidth::new(rems(5.), rems(15.)))
             .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
             .on_close(cx.listener(|this, ix: &usize, window, cx| this.close_tab_at(*ix, window, cx)))
-            .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_tab_to(request.from, request.to, cx)))
+            .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_dragged_tab(request, cx)))
             // A right-click on a tab opens its menu at the pointer; the press
             // goes no further, so the strip's window menu doesn't open too.
             // (On Windows a tab isn't a caption area: only the empty
@@ -2328,6 +2345,12 @@ fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
     true
 }
 
+/// The strip trigger's element id for the tab whose id is `id`, which a
+/// dragged trigger's `TabMove` names it by.
+fn tab_trigger_id(id: u64) -> ElementId {
+    ("tab", id as usize).into()
+}
+
 /// [`reorder`], following the item at `active` by its id: its new index, or
 /// `None` when nothing moved.
 fn reorder_keeping<T>(items: &mut Vec<T>, active: usize, from: usize, to: usize, id: impl Fn(&T) -> u64) -> Option<usize> {
@@ -2464,10 +2487,15 @@ fn profile_rows(profiles: &[Profile], shortcuts: &[Option<SharedString>]) -> Vec
 
 /// The profile menu's items: the picker's rows, the description under the
 /// name and the keys at the right. There are no separators, so an item's
-/// index is its profile's.
+/// index is its profile's, and each item is keyed by that index (names can
+/// repeat), so the chosen key is found again at it (`entry_keyed`).
 fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
     rows.into_iter()
-        .map(|row| MenuItem { label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into())
+        .enumerate()
+        .map(|(ix, row)| {
+            let key = ItemKey::new(ix.to_string());
+            MenuItem { key, label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into()
+        })
         .collect()
 }
 
@@ -3152,17 +3180,23 @@ mod tests {
         let keys: Vec<Option<&str>> = unbound.iter().map(|r| text(&r.shortcut)).collect();
         assert_eq!(keys, [Some("ctrl-alt-1"), None, None]);
 
-        // One item per row, in the same order, with nothing between them, so
-        // `MenuEvent::Selected(ix)` is profile `ix`.
+        // One item per row, in the same order, with nothing between them,
+        // each keyed so that the key of `MenuEvent::Selected` is found at
+        // profile `ix`.
         let entries = profile_menu_entries(build());
         assert_eq!(entries.len(), rows.len());
-        for (entry, row) in entries.iter().zip(&rows) {
+        for (ix, (entry, row)) in entries.iter().zip(&rows).enumerate() {
             let item = entry.item().expect("a separator in the profile menu");
             assert_eq!(item.label, row.label);
             assert_eq!(item.description, row.detail);
             assert_eq!(item.shortcut, row.shortcut);
             assert!(!item.disabled);
+            assert_eq!(entry_keyed(&entries, &item.key), Some(ix));
         }
+        // Two profiles of one name are still told apart.
+        let twins = profile_menu_entries(vec![rows[0].clone(), rows[0].clone()]);
+        let keys: Vec<&ItemKey> = twins.iter().filter_map(MenuEntry::key).collect();
+        assert_eq!(entry_keyed(&twins, keys[1]), Some(1));
     }
 
     /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth

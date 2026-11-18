@@ -93,20 +93,22 @@ pub fn tab_key(key: &str, modifiers: Modifiers) -> Option<TabKey> {
     })
 }
 
-/// The trigger `key` moves to from `current` among `count` triggers, of
-/// which `enabled` says which can be reached: the previous or next enabled
-/// one, coming round past the ends, or the first or last enabled one.
-/// `None` when no trigger is enabled; `current` itself when it is the only
-/// one.
+/// The trigger `key` moves to from `current` (the active one) among
+/// `count` triggers, of which `enabled` says which can be reached: the
+/// previous or next enabled one, coming round past the ends, or the first
+/// or last enabled one. `None` when no trigger is enabled, and when the
+/// move ends on `current` itself (it is the only one, or already the
+/// first or last): there is nothing to activate.
 pub fn tab_target(key: TabKey, current: Option<usize>, count: usize, enabled: impl Fn(usize) -> bool) -> Option<usize> {
-    let mut nav = ListNav { highlight: current.filter(|ix| *ix < count), count, wrap: true };
+    let from = current.filter(|ix| *ix < count);
+    let mut nav = ListNav { highlight: from, count, wrap: true };
     let target = match key {
         TabKey::Prev => nav.prev(&enabled),
         TabKey::Next => nav.next(&enabled),
         TabKey::First => nav.first(&enabled),
         TabKey::Last => nav.last(&enabled),
     };
-    target.filter(|ix| enabled(*ix))
+    target.filter(|ix| enabled(*ix) && Some(*ix) != from)
 }
 
 /// Which side of the target trigger a dragged one lands on.
@@ -128,6 +130,16 @@ pub fn drop_side(from: usize, to: usize) -> Option<DropSide> {
     }
 }
 
+/// The side of the trigger at `to` that the dragged trigger, `dragged` by
+/// its id, lands on, with `triggers` the list's trigger ids as it was last
+/// rendered: [`drop_side`] from where the dragged trigger is now, which
+/// may not be where its drag began. `None` for a drop on itself, and for a
+/// trigger the list no longer has.
+pub fn drop_target(triggers: &[ElementId], dragged: &ElementId, to: usize) -> Option<DropSide> {
+    let from = triggers.iter().position(|id| id == dragged)?;
+    drop_side(from, to)
+}
+
 /// The owner is asked to make the trigger at `index` the active one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabActivate {
@@ -139,10 +151,14 @@ pub struct TabActivate {
     pub by: Modality,
 }
 
-/// The owner is asked to move the trigger at `from` to `to`'s place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The owner is asked to move the trigger whose id is `from` to the place
+/// of the trigger at `to`, the index of the trigger it was dropped on as
+/// the list was last rendered. The dragged trigger is named by its id,
+/// since triggers may have moved since its drag began; the owner finds it
+/// among its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabMove {
-    pub from: usize,
+    pub from: ElementId,
     pub to: usize,
 }
 
@@ -166,20 +182,36 @@ pub enum TriggerPress {
     ContextMenu,
 }
 
+/// Whether a trigger can be closed: it has a close button and closes on a
+/// middle press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closes {
+    Yes,
+    No,
+}
+
+impl Closes {
+    /// A trigger closes when the list asks its owner to close triggers
+    /// (`has_handler`, its `on_close`), the trigger is `closable`, and it
+    /// isn't `disabled`.
+    pub fn new(has_handler: bool, closable: bool, disabled: bool) -> Self {
+        if has_handler && closable && !disabled { Closes::Yes } else { Closes::No }
+    }
+}
+
 /// What a press of `button` on a trigger does: a primary press activates
-/// an enabled trigger, a middle press closes a closable one (`closes`: it
-/// is closable, enabled and the list has `on_close`), and a secondary
-/// press asks for an enabled trigger's menu when the list has
+/// an enabled trigger, a middle press closes one that [`Closes`], and a
+/// secondary press asks for an enabled trigger's menu when the list has
 /// `on_context_menu` (`has_menu`). `None`: the press bubbles on, as on a
 /// disabled trigger.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "foreign enum: gpui::MouseButton, of which three buttons act"
 )]
-pub fn trigger_press(button: MouseButton, disabled: bool, closes: bool, has_menu: bool) -> Option<TriggerPress> {
+pub fn trigger_press(button: MouseButton, disabled: bool, closes: Closes, has_menu: bool) -> Option<TriggerPress> {
     match button {
         MouseButton::Left if !disabled => Some(TriggerPress::Activate),
-        MouseButton::Middle if closes => Some(TriggerPress::Close),
+        MouseButton::Middle if closes == Closes::Yes => Some(TriggerPress::Close),
         MouseButton::Right if !disabled && has_menu => Some(TriggerPress::ContextMenu),
         _ => None,
     }
@@ -192,8 +224,8 @@ pub fn trigger_press(button: MouseButton, disabled: bool, closes: bool, has_menu
 pub struct DraggedTab {
     /// The list's element id.
     pub list: ElementId,
-    /// Where the trigger was when the drag began.
-    pub index: usize,
+    /// The dragged trigger's own id, which finds it wherever it is now.
+    pub trigger: ElementId,
     pub label: SharedString,
 }
 
@@ -439,6 +471,8 @@ impl Styled for TabList {
 /// What every trigger of one list shares while it renders.
 struct ListContext {
     id: ElementId,
+    /// Every trigger's id, in order: where a dragged trigger is now.
+    triggers: Rc<[ElementId]>,
     active: Option<usize>,
     ring_shown: bool,
     width: Option<TabWidth>,
@@ -461,6 +495,7 @@ impl RenderOnce for TabList {
         let focused = self.focus.as_ref().is_some_and(|handle| handle.is_focused(window));
         let context = ListContext {
             id: self.id.clone(),
+            triggers: self.triggers.iter().map(|trigger| trigger.id.clone()).collect(),
             active,
             ring_shown: shows_ring(focused, modality(window, cx), false),
             width: self.width,
@@ -506,9 +541,7 @@ impl RenderOnce for TabList {
                     set_modality(window, Modality::Keyboard, cx);
                     cx.stop_propagation();
                     let target = tab_target(key, active, enabled.len(), |ix| enabled[ix]);
-                    if let (Some(index), Some(on_activate)) = (target, on_activate.as_ref())
-                        && Some(index) != active
-                    {
+                    if let (Some(index), Some(on_activate)) = (target, on_activate.as_ref()) {
                         on_activate(&TabActivate { index, by: Modality::Keyboard }, window, cx);
                     }
                 })
@@ -528,10 +561,13 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
     let disabled = trigger.disabled;
     let ring_shown = list.ring_shown && is_active;
     let on_activate = list.on_activate.clone().filter(|_| !disabled);
-    let on_close = list.on_close.clone().filter(|_| trigger.closable && !disabled);
+    let closes = Closes::new(list.on_close.is_some(), trigger.closable, disabled);
+    let on_close = match closes {
+        Closes::Yes => list.on_close.clone(),
+        Closes::No => None,
+    };
     let on_move = list.on_move.clone().filter(|_| !disabled);
     let on_context_menu = list.on_context_menu.clone().filter(|_| !disabled);
-    let closes = on_close.is_some();
 
     let label = trigger_label(trigger.label.clone());
     let close = on_close.clone().map(|on_close| {
@@ -566,6 +602,7 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
             .child(button)
     });
 
+    let id = trigger.id.clone();
     let mut element = div()
         .id(trigger.id)
         .group(TRIGGER_GROUP)
@@ -574,7 +611,10 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         .items_center()
         .gap(style.gap)
         .pl(style.padding_left)
-        .pr(if closes { style.padding_right_with_close } else { style.padding_right })
+        .pr(match closes {
+            Closes::Yes => style.padding_right_with_close,
+            Closes::No => style.padding_right,
+        })
         .text_size(style.text_size)
         .font_weight(style.font_weight)
         .whitespace_nowrap()
@@ -634,21 +674,24 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         .children(close);
     element = element.rounded(style.radius);
     if let Some(on_move) = on_move {
-        let value = DraggedTab { list: list.id.clone(), index: ix, label: trigger.label };
+        let value = DraggedTab { list: list.id.clone(), trigger: id.clone(), label: trigger.label };
         let (over_list, drop_list, primary) = (list.id.clone(), list.id.clone(), list.primary);
+        let triggers = list.triggers.clone();
         element = element
             .on_drag(value, |value, _, _, cx| cx.new(|_| value.clone()))
             .drag_over::<DraggedTab>(move |style, dragged, _, _| {
                 if dragged.list != over_list {
                     return style;
                 }
-                drop_bar(style, drop_side(dragged.index, ix), primary)
+                drop_bar(style, drop_target(&triggers, &dragged.trigger, ix), primary)
             })
             .can_drop(move |value, _, _| {
-                value.downcast_ref::<DraggedTab>().is_some_and(|dragged| dragged.list == drop_list && dragged.index != ix)
+                value
+                    .downcast_ref::<DraggedTab>()
+                    .is_some_and(|dragged| dragged.list == drop_list && dragged.trigger != id)
             })
             .on_drop(move |dragged: &DraggedTab, window, cx| {
-                on_move(&TabMove { from: dragged.index, to: ix }, window, cx);
+                on_move(&TabMove { from: dragged.trigger.clone(), to: ix }, window, cx);
             });
     }
     let element = attach(element, trigger.tooltip.filter(|_| !disabled));
@@ -760,11 +803,19 @@ mod tests {
         assert_eq!(tab_target(TabKey::Last, Some(1), 4, ends_disabled), Some(2));
     }
 
+    /// b41 #6: a move that ends on the active trigger has no target, so the
+    /// list asks nothing of its owner.
     #[test]
     fn nowhere_to_go() {
-        // The only enabled trigger stays.
-        assert_eq!(tab_target(TabKey::Next, Some(1), 3, |ix| ix == 1), Some(1));
-        assert_eq!(tab_target(TabKey::Prev, Some(1), 3, |ix| ix == 1), Some(1));
+        // The only enabled trigger: nothing to activate.
+        assert_eq!(tab_target(TabKey::Next, Some(1), 3, |ix| ix == 1), None);
+        assert_eq!(tab_target(TabKey::Prev, Some(1), 3, |ix| ix == 1), None);
+        // Home on the first, end on the last.
+        assert_eq!(tab_target(TabKey::First, Some(0), 3, ALL), None);
+        assert_eq!(tab_target(TabKey::Last, Some(2), 3, ALL), None);
+        assert_eq!(tab_target(TabKey::First, Some(1), 3, |ix| ix != 0), None);
+        // A single trigger.
+        assert_eq!(tab_target(TabKey::Next, Some(0), 1, ALL), None);
         // None enabled, or none at all.
         assert_eq!(tab_target(TabKey::Next, Some(1), 3, |_| false), None);
         assert_eq!(tab_target(TabKey::First, None, 0, ALL), None);
@@ -816,15 +867,54 @@ mod tests {
     /// navigation buttons) bubbles on.
     #[test]
     fn presses_by_button() {
+        use Closes::{No, Yes};
         use MouseButton::*;
-        assert_eq!(trigger_press(Left, false, false, false), Some(TriggerPress::Activate));
-        assert_eq!(trigger_press(Left, true, false, true), None);
-        assert_eq!(trigger_press(Middle, false, true, true), Some(TriggerPress::Close));
-        assert_eq!(trigger_press(Middle, false, false, true), None);
-        assert_eq!(trigger_press(Right, false, true, true), Some(TriggerPress::ContextMenu));
-        assert_eq!(trigger_press(Right, false, true, false), None);
-        assert_eq!(trigger_press(Right, true, false, true), None);
-        assert_eq!(trigger_press(Navigate(gpui::NavigationDirection::Back), false, true, true), None);
+        assert_eq!(trigger_press(Left, false, No, false), Some(TriggerPress::Activate));
+        assert_eq!(trigger_press(Left, true, No, true), None);
+        assert_eq!(trigger_press(Middle, false, Yes, true), Some(TriggerPress::Close));
+        assert_eq!(trigger_press(Middle, false, No, true), None);
+        assert_eq!(trigger_press(Right, false, Yes, true), Some(TriggerPress::ContextMenu));
+        assert_eq!(trigger_press(Right, false, Yes, false), None);
+        assert_eq!(trigger_press(Right, true, No, true), None);
+        assert_eq!(trigger_press(Navigate(gpui::NavigationDirection::Back), false, Yes, true), None);
+    }
+
+    /// b41 #6: a trigger closes only when the list has a close handler,
+    /// the trigger is closable, and it is enabled.
+    #[test]
+    fn what_closes() {
+        for (has_handler, closable, disabled, closes) in [
+            (true, true, false, Closes::Yes),
+            (true, true, true, Closes::No),
+            (true, false, false, Closes::No),
+            (false, true, false, Closes::No),
+            (false, false, true, Closes::No),
+        ] {
+            assert_eq!(Closes::new(has_handler, closable, disabled), closes, "{has_handler} {closable} {disabled}");
+        }
+        // A disabled trigger never closes, so a middle press on it bubbles.
+        assert_eq!(trigger_press(MouseButton::Middle, true, Closes::new(true, true, true), true), None);
+    }
+
+    /// b41 #1: the dragged trigger is found by its id where it is now, not
+    /// where its drag began, and the bar goes on the side it came past.
+    #[test]
+    fn a_drop_finds_the_dragged_trigger_by_id() {
+        let id = |n: usize| ElementId::from(("tab", n));
+        // Tabs 10, 11, 12, 13; tab 12 is dragged.
+        let before: Vec<ElementId> = [10, 11, 12, 13].into_iter().map(id).collect();
+        assert_eq!(drop_target(&before, &id(12), 0), Some(DropSide::Left));
+        assert_eq!(drop_target(&before, &id(12), 3), Some(DropSide::Right));
+        assert_eq!(drop_target(&before, &id(12), 2), None);
+        // Tab 10 closed during the drag: tab 12 is now second, so a drop on
+        // the trigger at 2 (tab 13) lands on its right, and on the one at 1
+        // is a drop on itself.
+        let after: Vec<ElementId> = [11, 12, 13].into_iter().map(id).collect();
+        assert_eq!(drop_target(&after, &id(12), 2), Some(DropSide::Right));
+        assert_eq!(drop_target(&after, &id(12), 1), None);
+        assert_eq!(drop_target(&after, &id(12), 0), Some(DropSide::Left));
+        // A dragged trigger the list no longer has lands nowhere.
+        assert_eq!(drop_target(&after, &id(10), 0), None);
     }
 
     #[test]

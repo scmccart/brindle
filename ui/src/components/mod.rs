@@ -29,6 +29,11 @@
 //! opacity it is drawn at, and the focus ring (`FocusRing`), a 3px band in
 //! the ring colour just outside the control (shadcn's `ring-[3px]
 //! ring-ring/50`) that takes no room, so focusing moves no layout.
+//!
+//! So is [`ItemKey`], the identity of an item of a list the owner can
+//! replace (a command item, a select's option, a menu item): what a
+//! component keeps across a refresh and what its events name the chosen
+//! item by, never a position.
 
 pub mod button;
 pub mod card;
@@ -53,7 +58,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClickEvent, Hsla, InteractiveElement, KeyboardButton, KeyboardClickEvent, Modifiers, MouseButton,
-    ParentElement, Pixels, Refineable, StatefulInteractiveElement, Style, Styled, Window, div, px,
+    ParentElement, Pixels, Refineable, SharedString, StatefulInteractiveElement, Style, Styled, Window, div, px,
 };
 
 use crate::primitives::focus_visible::{Modality, set_modality};
@@ -63,26 +68,28 @@ pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
 pub use combobox::{
-    Combobox, ComboboxEvent, TriggerKey, checked_groups, option_at, option_labelled, panel_width, trigger_key,
+    Combobox, ComboboxEvent, TriggerKey, checked_groups, key_at, option_at, panel_width, trigger_key,
 };
-pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows};
+pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows, Scroll, item_keyed};
 pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};
 pub use dropdown_menu::{DropdownMenu, trigger_key_opens};
 pub use input::Input;
 pub use kbd::{Kbd, KbdStyle, kbd_style, keycaps};
 pub use menu::{
-    Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuNav, MenuPress, menu_item_release, menu_overlay, render_menu,
+    Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuJump, MenuNav, MenuPress, chosen, entry_keyed, menu_item_release,
+    menu_overlay, page_key, release_over, render_menu,
 };
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
     Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,
-    TypedKey, closed_trigger_key, initial_highlight, menu_release, moved_off, trigger_activation, typed_key,
+    TypedKey, closed_trigger_key, initial_highlight, menu_release, moved_off, option_keyed, trigger_activation, typed_key,
 };
 pub use separator::{Separator, SeparatorStyle, separator_style};
 pub use switch::Switch;
 pub use tabs::{
-    DraggedTab, DropSide, TabActivate, TabContextMenu, TabKey, TabList, TabMove, TabTrigger, TriggerPress, drop_side,
+    Closes, DraggedTab, DropSide, TabActivate, TabContextMenu, TabKey, TabList, TabMove, TabTrigger, TriggerPress,
+    drop_side, drop_target,
     tab_key, tab_target, trigger_label, trigger_press,
 };
 pub use toggle::Toggle;
@@ -93,6 +100,48 @@ pub const DISABLED_OPACITY: f32 = 0.5;
 
 /// The ring's width, shadcn's `ring-[3px]`. In pixels, as shadcn's is.
 pub const RING_WIDTH: Pixels = px(3.);
+
+/// The identity of an item in a list its owner can replace: a command
+/// item ([`CommandItem`]), a select's option ([`SelectOption`]) or a menu
+/// item ([`MenuItem`]), as shadcn's `value` names one. It is the owner's,
+/// opaque to the crate, and defaults to the item's label; an owner whose
+/// labels can repeat gives each item a key of its own.
+///
+/// A component keeps an item by its key across a refresh of the list (a
+/// select's selection, a command list's kept highlight), and its events
+/// name the chosen item by it, so an item replaced or moved since is never
+/// mistaken for the one the user chose. An index into a list is valid only
+/// within the call that computed it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ItemKey(SharedString);
+
+impl ItemKey {
+    pub fn new(key: impl Into<SharedString>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ItemKey {
+    fn from(key: &str) -> Self {
+        Self::new(key.to_string())
+    }
+}
+
+impl From<String> for ItemKey {
+    fn from(key: String) -> Self {
+        Self::new(key)
+    }
+}
+
+impl From<SharedString> for ItemKey {
+    fn from(key: SharedString) -> Self {
+        Self::new(key)
+    }
+}
 
 /// A disabled control takes no part: it tracks no focus, so neither a press
 /// nor Tab can focus it, and it gets no click handler, so nothing runs.
@@ -273,5 +322,35 @@ mod tests {
         let space_up = ClickEvent::Keyboard(KeyboardClickEvent { button: KeyboardButton::Space, bounds: Bounds::default() });
         assert!(!accepts_click(&space_up));
         assert!(accepts_click(&ClickEvent::Mouse(MouseClickEvent::default())));
+    }
+
+    /// A disabled control gets neither the owner's focus handle nor its
+    /// click handler; an enabled one keeps what it was given, none included.
+    #[test]
+    fn a_disabled_control_takes_no_focus_and_no_clicks() {
+        assert_eq!(interaction(true, Some("focus"), Some("click")), (None, None));
+        assert_eq!(interaction(false, Some("focus"), Some("click")), (Some("focus"), Some("click")));
+        assert_eq!(interaction(false, None::<&str>, Some("click")), (None, Some("click")));
+        assert_eq!(interaction(false, Some("focus"), None::<&str>), (Some("focus"), None));
+        assert_eq!(interaction(true, None::<&str>, None::<&str>), (None, None));
+    }
+
+    /// An item made from its label is keyed by the label, and `key`
+    /// replaces that, for each kind of item.
+    #[test]
+    fn items_are_keyed_by_their_label_unless_given_a_key() {
+        let key = ItemKey::from;
+        assert_eq!(CommandItem::new("New Tab").key, key("New Tab"));
+        assert_eq!(CommandItem::new("bash").key("session-7").key, key("session-7"));
+        assert_eq!(SelectOption::new("fish").key, key("fish"));
+        let option = SelectOption::new("fish").key("shell-2");
+        assert_eq!((option.key.as_str(), option.label.as_ref()), ("shell-2", "fish"));
+        assert_eq!(MenuItem::new("Close Tab").key, key("Close Tab"));
+        let item = MenuItem::new("Shell").key("profile-1");
+        assert_eq!((item.key.as_str(), item.label.as_ref()), ("profile-1", "Shell"));
+        // The conversions agree.
+        assert_eq!(key("a"), ItemKey::from(String::from("a")));
+        assert_eq!(key("a"), ItemKey::from(SharedString::from("a")));
+        assert_eq!(key("a"), ItemKey::new("a"));
     }
 }

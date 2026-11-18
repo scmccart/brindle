@@ -42,7 +42,7 @@ use gpui::{
 };
 
 use crate::actions::{Dismiss, ListConfirm, ListDown, ListFirst, ListLast, ListUp};
-use crate::components::{DISABLED_OPACITY, inert_press};
+use crate::components::{DISABLED_OPACITY, ItemKey, inert_press};
 use crate::filter::filter;
 use crate::icon::Icon;
 use crate::primitives::focus_visible::{Modality, set_modality};
@@ -58,6 +58,9 @@ use crate::theme::ActiveTheme;
 /// One item of a command list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandItem {
+    /// The item's identity across a replacement of the groups: its label
+    /// unless the owner gives it one ([`CommandItem::key`]).
+    pub key: ItemKey,
     pub label: SharedString,
     /// A line under the label, in the muted colour.
     pub detail: Option<SharedString>,
@@ -72,8 +75,16 @@ pub struct CommandItem {
 }
 
 impl CommandItem {
+    /// An item labelled, and keyed, `label`.
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Self { label: label.into(), detail: None, shortcut: None, disabled: false, checked: false }
+        let label = label.into();
+        Self { key: ItemKey::new(label.clone()), label, detail: None, shortcut: None, disabled: false, checked: false }
+    }
+
+    /// Keys the item by `key` instead of its label.
+    pub fn key(mut self, key: impl Into<ItemKey>) -> Self {
+        self.key = key.into();
+        self
     }
 
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
@@ -143,6 +154,24 @@ impl CommandGroup {
         self.separator = separator;
         self
     }
+}
+
+/// The index across `groups`, in declaration order, of the first item keyed
+/// `key`: how a kept item is found in groups that replaced the ones it was
+/// chosen from.
+pub fn item_keyed(groups: &[CommandGroup], key: &ItemKey) -> Option<usize> {
+    groups.iter().flat_map(|group| &group.items).position(|item| item.key == *key)
+}
+
+/// Where a command list's scroll goes after its groups are replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    /// Back to the top, as for a change to the filter.
+    Top,
+    /// The offset stays, and the list moves only as far as `reveal`, the
+    /// highlighted row, needs to be in view (no row when nothing is
+    /// highlighted).
+    Keep { reveal: Option<usize> },
 }
 
 /// One row of the filtered list.
@@ -280,6 +309,14 @@ impl CommandRows {
         self.row_of(self.nav.highlight?)
     }
 
+    /// Where the scroll goes once these rows replace a list's:
+    /// `keep_found` says whether the owner named an item to keep and the
+    /// new groups have it. Then the user keeps their place, and the
+    /// highlighted row is revealed; otherwise the list starts at the top.
+    pub fn scroll_after(&self, keep_found: bool) -> Scroll {
+        if keep_found { Scroll::Keep { reveal: self.highlighted_row() } } else { Scroll::Top }
+    }
+
     /// Highlights the match ranked `rank`, as the pointer does. Returns
     /// whether that changed anything.
     pub fn set_highlight(&mut self, rank: usize) -> bool {
@@ -404,22 +441,28 @@ impl Command {
     ///
     /// With `keep: None` the first enabled match is highlighted and the list
     /// starts at the top, as for a change to the filter. With `keep` naming
-    /// an item of the new groups, by its index across them, that item stays
-    /// highlighted when it matches the query and is enabled (otherwise the
-    /// first enabled match is), and the list keeps its scroll offset, only
-    /// moving as far as the highlighted row needs to be in view. An owner
-    /// that refreshes a list the user is moving through uses it to keep
-    /// their place; it maps its own identities to the new index.
-    pub fn set_groups(&mut self, groups: Vec<CommandGroup>, keep: Option<usize>, cx: &mut Context<Self>) {
+    /// an item of the new groups by its key ([`item_keyed`]), that item
+    /// stays highlighted when it matches the query and is enabled
+    /// (otherwise the first enabled match is), and the list keeps its
+    /// scroll offset, only moving as far as the highlighted row needs to be
+    /// in view ([`CommandRows::scroll_after`]); a key the new groups don't
+    /// have is as `None`. An owner that refreshes a list the user is moving
+    /// through uses it to keep their place.
+    pub fn set_groups(&mut self, groups: Vec<CommandGroup>, keep: Option<ItemKey>, cx: &mut Context<Self>) {
         self.groups = groups;
-        let scroll = keep.map(|_| self.list.logical_scroll_top());
+        let keep = keep.and_then(|key| item_keyed(&self.groups, &key));
+        let offset = self.list.logical_scroll_top();
         self.rebuild(keep, cx);
-        if let Some(scroll) = scroll {
-            // `reset` scrolls to the top and forgets every row's height, so
-            // the offset goes back now and the reveal waits for a layout
-            // that measures the rows (`render`).
-            self.list.scroll_to(scroll);
-            self.reveal_pending = self.rows.highlighted_row();
+        match self.rows.scroll_after(keep.is_some()) {
+            // `rebuild`'s `reset` has scrolled to the top.
+            Scroll::Top => {}
+            Scroll::Keep { reveal } => {
+                // `reset` scrolls to the top and forgets every row's height,
+                // so the offset goes back now and the reveal waits for a
+                // layout that measures the rows (`render`).
+                self.list.scroll_to(offset);
+                self.reveal_pending = reveal;
+            }
         }
     }
 
@@ -1082,6 +1125,54 @@ mod tests {
         // Nothing enabled to fall back to.
         let none = [CommandGroup::unnamed([CommandItem::new("alpha").disabled(true)])];
         assert_eq!(CommandRows::build(&none, "", Some(0)).highlighted_item(), None);
+    }
+
+    /// b39 #2, #4: a replacement keeps the highlighted item by its key,
+    /// wherever it moved, and an item with a key of its own is found by
+    /// that key, not its label.
+    #[test]
+    fn a_kept_key_holds_the_highlight_across_a_replacement() {
+        let key = ItemKey::from;
+        let new = [
+            CommandGroup::new("Tabs", ["New Tab", "alpha"]),
+            CommandGroup::unnamed(["delta", "beta", "gamma"]),
+        ];
+        // `beta` was item 1; it is item 3 now.
+        assert_eq!(item_keyed(&new, &key("beta")), Some(3));
+        let rows = CommandRows::build(&new, "", item_keyed(&new, &key("beta")));
+        assert_eq!(rows.highlighted_item(), Some(3));
+        assert_eq!(rows.highlighted_row(), Some(4));
+        // A key the new groups don't have keeps nothing.
+        assert_eq!(item_keyed(&new, &key("omega")), None);
+        // The first of two items with one key; a key of its own wins over
+        // the label.
+        let sessions = [CommandGroup::unnamed([
+            CommandItem::new("bash").key("1"),
+            CommandItem::new("bash").key("2"),
+            CommandItem::new("2"),
+        ])];
+        assert_eq!(item_keyed(&sessions, &key("2")), Some(1));
+        assert_eq!(item_keyed(&sessions, &key("bash")), None);
+        let twice = [CommandGroup::unnamed(["bash", "bash"])];
+        assert_eq!(item_keyed(&twice, &key("bash")), Some(0));
+    }
+
+    /// b39 #2: the scroll after a replacement. Nothing kept starts at the
+    /// top; a kept item keeps the offset and reveals the highlighted row,
+    /// or no row when nothing could be highlighted.
+    #[test]
+    fn the_scroll_after_a_replacement() {
+        let rows = CommandRows::build(&groups(), "", Some(3));
+        assert_eq!(rows.scroll_after(false), Scroll::Top);
+        assert_eq!(rows.scroll_after(true), Scroll::Keep { reveal: Some(5) });
+        // Kept but filtered out: the first match is highlighted and revealed.
+        let rows = CommandRows::build(&groups(), "spr", Some(3));
+        assert_eq!(rows.scroll_after(true), Scroll::Keep { reveal: Some(1) });
+        // Nothing enabled to highlight, or nothing listed.
+        let none = [CommandGroup::unnamed([CommandItem::new("alpha").disabled(true)])];
+        assert_eq!(CommandRows::build(&none, "", Some(0)).scroll_after(true), Scroll::Keep { reveal: None });
+        assert_eq!(CommandRows::build(&groups(), "zzz", None).scroll_after(true), Scroll::Keep { reveal: None });
+        assert_eq!(CommandRows::build(&groups(), "zzz", None).scroll_after(false), Scroll::Top);
     }
 
     #[test]
