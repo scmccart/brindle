@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use brindle_remote_protocol::RequestId;
 use brindle_remote_protocol::client::{
-    self, HolderStatus, ServerStatus, SessionInfo, Sessions, ToClient,
+    self, HolderStatus, ServerStatus, Sessions, ToClient,
 };
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 
@@ -29,37 +29,16 @@ use super::{Answer, Core, log};
 use crate::server::event_loop::{EventLoop, Token};
 
 impl<L: EventLoop> Core<L> {
-    /// `LIST`: the running sessions. Ones still starting, or whose program
-    /// exited while their owner was away, aren't listed.
+    /// `LIST`: the running sessions ([`super::sessions::Session::info`]).
+    /// Ones still starting, or whose program exited while their owner was
+    /// away, aren't listed.
     pub(super) fn client_list(&mut self, client: Token, req: RequestId) {
         let now = Instant::now();
         let sessions = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.is_running())
-            .map(|(&id, session)| {
-                let detached = session.attached.is_none();
-                SessionInfo {
-                    session: id,
-                    pid: session.pid,
-                    attached: !detached,
-                    command: session.meta.command.clone(),
-                    cwd: session.meta.cwd.clone(),
-                    policy: session.meta.policy,
-                    cols: session.cols,
-                    rows: session.rows,
-                    key: session.meta.key.clone(),
-                    title: session.screen.title(),
-                    started: session.meta.started,
-                    profile: session.meta.profile.clone(),
-                    owned: detached && !session.meta.owner.is_empty(),
-                    detached_secs: session
-                        .detached_since
-                        .filter(|_| detached)
-                        .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
-                    layout: session.meta.layout.clone().filter(|_| detached),
-                }
-            })
+            .filter(|(_, session)| session.life.is_running())
+            .map(|(&id, session)| session.info(id, now))
             .collect();
         self.send_client(client, ToClient::Sessions(Sessions { req, sessions }));
     }

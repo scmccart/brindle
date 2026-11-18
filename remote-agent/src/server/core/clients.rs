@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::{RequestId, SessionId};
 
-use super::{
-    CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, Core, DEAD_CLIENT_READ_LIMIT, MAX_LINGER, Source, log,
-};
+use super::policy::{self, ClientOptions, Mark};
+use super::{Core, DEAD_CLIENT_READ_LIMIT, Source, log};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
 
@@ -35,15 +34,39 @@ pub(super) struct Pending {
     since: Instant,
 }
 
+/// A client's `client_token`, which its sessions' owner is matched by
+/// ([`policy::returning`]): never empty (`types R6`, `R7`). It is decoded
+/// once, from a `HELLO` or a holder's stored meta.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ClientToken(String);
+
+impl ClientToken {
+    /// The token a `HELLO` or a stored meta names: an empty one names none,
+    /// and owns nothing.
+    pub(super) fn from_wire(token: &str) -> Option<Self> {
+        if token.is_empty() {
+            None
+        } else {
+            Some(Self(token.to_string()))
+        }
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub(super) struct Client {
     pub(super) conn: Conn,
     pub(super) interest: Interest,
-    /// The `client_token` from its `HELLO`.
-    pub(super) token: String,
-    /// Its queue passed [`CLIENT_QUEUE_HIGH`], so its sessions are paused.
+    /// The `client_token` from its `HELLO`; `None` when it named none.
+    pub(super) token: Option<ClientToken>,
+    /// Its queue passed [`CLIENT_QUEUE_HIGH`](super::CLIENT_QUEUE_HIGH), so
+    /// its sessions are paused ([`policy::queue_mark`]).
     pub(super) over: bool,
     /// How long its `kill` sessions wait for it once its connection ends:
-    /// its `HELLO`'s `linger_secs`, at most [`MAX_LINGER`].
+    /// its `HELLO`'s `linger_secs`, at most
+    /// [`MAX_LINGER`](super::MAX_LINGER) ([`policy::client_options`]).
     linger: Duration,
     /// It speaks protocol 2 and asked for `PROCESS`.
     pub(super) process_info: bool,
@@ -158,13 +181,8 @@ impl<L: EventLoop> Core<L> {
                 return;
             }
         };
-        let mut holder_protocols: Vec<u32> = self
-            .holders
-            .values()
-            .filter_map(|holder| holder.protocol())
-            .collect();
-        holder_protocols.sort_unstable();
-        holder_protocols.dedup();
+        let holder_protocols =
+            policy::holder_protocols(self.holders.values().map(|holder| holder.protocol()));
         queue_or_log(
             &mut conn,
             &ToClient::Welcome(Welcome {
@@ -175,8 +193,10 @@ impl<L: EventLoop> Core<L> {
                 holder_protocols,
             }),
         );
-        let linger = Duration::from_secs(hello.linger_secs.into()).min(MAX_LINGER);
-        let process_info = protocol >= 2 && hello.process_info;
+        let ClientOptions {
+            linger,
+            process_info,
+        } = policy::client_options(protocol, &hello);
         log!(
             "client {token} connected ({:?}, protocol {protocol}{}{})",
             hello.client_version,
@@ -187,14 +207,17 @@ impl<L: EventLoop> Core<L> {
             },
             if process_info { ", process info" } else { "" }
         );
-        self.take_over(token, &hello.client_token);
+        let client_token = ClientToken::from_wire(&hello.client_token);
+        if let Some(client_token) = &client_token {
+            self.take_over(token, client_token);
+        }
         self.sources.insert(token, Source::Client);
         self.clients.insert(
             token,
             Client {
                 conn,
                 interest: Interest::READABLE,
-                token: hello.client_token,
+                token: client_token,
                 over: false,
                 linger,
                 process_info,
@@ -213,16 +236,13 @@ impl<L: EventLoop> Core<L> {
     /// their owner, so [`Core::reattach`] gives each to `new` with its
     /// replay. Its requests still waiting fail: spawns not yet sent to a
     /// holder get their `ERROR` (if the old connection still takes it), and
-    /// sessions still starting are hung up ([`Core::client_replaced`]). An
-    /// empty token owns nothing, so it replaces nothing.
-    fn take_over(&mut self, new: Token, client_token: &str) {
-        if client_token.is_empty() {
-            return;
-        }
+    /// sessions still starting are hung up ([`Core::client_replaced`]). A
+    /// `HELLO` with no token owns nothing, so it replaces nothing.
+    fn take_over(&mut self, new: Token, client_token: &ClientToken) {
         let stale: Vec<Token> = self
             .clients
             .iter()
-            .filter(|(_, client)| client.token == client_token)
+            .filter(|(_, client)| client.token.as_ref() == Some(client_token))
             .map(|(&token, _)| token)
             .collect();
         for old in stale {
@@ -249,7 +269,7 @@ impl<L: EventLoop> Core<L> {
                 let _ = stale.conn.flush();
             }
             self.drop_source(old);
-            self.client_replaced(old);
+            self.client_replaced(old, Instant::now());
         }
     }
 
@@ -308,9 +328,10 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Queues a message for a client. Past [`CLIENT_QUEUE_HIGH`] the client's
-    /// sessions are paused in their holders. A client whose write failed is
-    /// sent nothing: it is gone.
+    /// Queues a message for a client. Past
+    /// [`CLIENT_QUEUE_HIGH`](super::CLIENT_QUEUE_HIGH) the client's sessions
+    /// are paused in their holders. A client whose write failed is sent
+    /// nothing: it is gone.
     pub(super) fn send_client(&mut self, client: Token, message: ToClient) {
         let Some(entry) = self.clients.get_mut(&client) else {
             return;
@@ -331,15 +352,20 @@ impl<L: EventLoop> Core<L> {
             // the client there.
             let _ = entry.conn.flush();
         }
-        if !entry.over && entry.conn.queued() > CLIENT_QUEUE_HIGH {
-            entry.over = true;
-            self.pause_client_sessions(client, true);
+        match policy::queue_mark(entry.over, entry.conn.queued()) {
+            Some(Mark::Pause) => {
+                entry.over = true;
+                self.pause_client_sessions(client, true);
+            }
+            // Resuming waits for the loop's flush (`flush_client`).
+            Some(Mark::Resume) | None => {}
         }
     }
 
-    /// Sends what the socket takes; back under [`CLIENT_QUEUE_LOW`], the
-    /// client's sessions are resumed. A failed write drops the client once
-    /// what it sent is handled ([`Core::drop_failed_client`]).
+    /// Sends what the socket takes; back under
+    /// [`CLIENT_QUEUE_LOW`](super::CLIENT_QUEUE_LOW), the client's sessions
+    /// are resumed. A failed write drops the client once what it sent is
+    /// handled ([`Core::drop_failed_client`]).
     pub(super) fn flush_client(&mut self, client: Token) {
         let Some(entry) = self.clients.get_mut(&client) else {
             return;
@@ -347,9 +373,13 @@ impl<L: EventLoop> Core<L> {
         if let Err(error) = entry.conn.flush() {
             return self.drop_failed_client(client, &format!("write failed: {error}"));
         }
-        if entry.over && entry.conn.queued() < CLIENT_QUEUE_LOW {
-            entry.over = false;
-            self.pause_client_sessions(client, false);
+        match policy::queue_mark(entry.over, entry.conn.queued()) {
+            Some(Mark::Resume) => {
+                entry.over = false;
+                self.pause_client_sessions(client, false);
+            }
+            // A flush only shrinks its queue.
+            Some(Mark::Pause) | None => {}
         }
     }
 
@@ -382,11 +412,14 @@ impl<L: EventLoop> Core<L> {
             "client {client} left ({reason}) with {} session(s)",
             self.sessions_of(client).len()
         );
-        self.client_gone(client, entry.linger);
+        self.client_gone(client, entry.linger, Instant::now());
     }
 
-    pub(super) fn client_token(&self, client: Token) -> Option<&str> {
-        self.clients.get(&client).map(|entry| entry.token.as_str())
+    /// The token of a connected client, if its `HELLO` named one.
+    pub(super) fn client_token(&self, client: Token) -> Option<&ClientToken> {
+        self.clients
+            .get(&client)
+            .and_then(|entry| entry.token.as_ref())
     }
 
     pub(super) fn client_is_over(&self, client: Token) -> bool {
@@ -505,5 +538,14 @@ mod tests {
             panic!("not an ERROR");
         };
         assert_eq!((replacement.req, replacement.session), (None, Some(3)));
+    }
+
+    #[test]
+    fn an_empty_client_token_names_no_owner() {
+        assert_eq!(ClientToken::from_wire(""), None);
+        let token = ClientToken::from_wire("brindle-1").unwrap();
+        assert_eq!(token.as_str(), "brindle-1");
+        // Anything else is a token, as it is.
+        assert_eq!(ClientToken::from_wire(" ").as_ref().map(ClientToken::as_str), Some(" "));
     }
 }

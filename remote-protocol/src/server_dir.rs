@@ -273,11 +273,16 @@ pub fn after_image_removal(removal: ImageRemoval) -> PruneDir {
 }
 
 /// Splits a holder's lock file name, `holder-<build>-<n>.lock`, into the
+/// build and the holder's number ([`parse_holder_stem`]).
+pub fn parse_holder_lock(name: &str) -> Option<(String, u32)> {
+    parse_holder_stem(name.strip_suffix(".lock")?)
+}
+
+/// Splits the stem a holder's files share, `holder-<build>-<n>`, into the
 /// build and the holder's number. The build is everything between the prefix
 /// and the last `-`, so it may contain dashes itself.
-pub fn parse_holder_lock(name: &str) -> Option<(String, u32)> {
-    let stem = name.strip_prefix("holder-")?.strip_suffix(".lock")?;
-    let (build, n) = stem.rsplit_once('-')?;
+pub fn parse_holder_stem(stem: &str) -> Option<(String, u32)> {
+    let (build, n) = stem.strip_prefix("holder-")?.rsplit_once('-')?;
     if build.is_empty() || n.is_empty() || !n.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -451,6 +456,18 @@ mod tests {
             "xholder-b1-0.sock",
         ] {
             assert_eq!(holder_socket_stem(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_holders_stem_gives_its_build_and_number() {
+        assert_eq!(parse_holder_stem("holder-b1-0"), Some(("b1".to_string(), 0)));
+        assert_eq!(
+            parse_holder_stem("holder-0.3.1-abc-12"),
+            Some(("0.3.1-abc".to_string(), 12))
+        );
+        for other in ["holder-odd", "holder-", "holder--0", "holder-b1-", "holder-b1-0.lock", "b1-0"] {
+            assert_eq!(parse_holder_stem(other), None, "{other}");
         }
     }
 
