@@ -903,6 +903,21 @@ mod tests {
         assert!(state.describe(&None, "UI font", open).ends_with(" open=\"UI font\" query=\"in\" highlighted=\"Inter\"\n"));
     }
 
+    /// A family list as the combobox lists it: the groups and headings
+    /// kept, each choice by its label.
+    #[test]
+    fn command_groups_keep_the_headings_and_labels() {
+        let mono: HashSet<String> = ["Consolas"].iter().map(|s| s.to_string()).collect();
+        let names = family_names(&installed());
+        let groups = command_groups(&family_groups(FontField::Terminal, &names, Some(&mono)));
+        let headings: Vec<Option<&str>> = groups.iter().map(|g| g.heading.as_ref().map(|h| h.as_ref())).collect();
+        assert_eq!(headings, [None, Some("Monospace"), Some("Other")]);
+        let labels: Vec<Vec<&str>> =
+            groups.iter().map(|g| g.items.iter().map(|i| i.label.as_ref()).collect()).collect();
+        assert_eq!(labels, [vec!["Default"], vec!["Consolas"], vec!["Arial", "Cascadia Mono", "Inter", "Segoe UI"]]);
+        assert!(groups.iter().flat_map(|g| &g.items).all(|i| !i.disabled && !i.checked));
+    }
+
     #[test]
     fn family_names_drop_gpui_names_and_vertical_variants() {
         let installed: Vec<String> =

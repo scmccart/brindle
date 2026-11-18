@@ -2592,6 +2592,88 @@ background = "nope"
         }
     }
 
+    /// A second profile after Shell, for the profile operations.
+    fn two_profiles() -> String {
+        CONFIG.replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"Work\"\n")
+    }
+
+    #[test]
+    fn duplicating_opens_a_copy_only_in_the_profile_list() {
+        let f = Fixture::new("duplicate", &two_profiles());
+        let mut model = f.opened("mine");
+        model.start_duplicate();
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        assert_eq!(model.profiles.editor().unwrap().text(profiles::Field::Name), "Shell copy");
+        // Not from the editor, nor from another section.
+        model.start_duplicate();
+        assert_eq!(model.profiles.editor().unwrap().text(profiles::Field::Name), "Shell copy");
+        model.cancel();
+        model.select_section(Section::Theme);
+        model.start_duplicate();
+        assert!(model.in_list());
+        assert_eq!(f.text(), two_profiles());
+    }
+
+    #[test]
+    fn moving_a_profile_writes_it_one_place_on() {
+        let f = Fixture::new("move-profile", &two_profiles());
+        let mut model = f.opened("mine");
+        // Shell, the first, is selected: up has nowhere to go.
+        assert_eq!(model.move_profile(true), Outcome::Nothing);
+        assert_eq!(f.text(), two_profiles());
+        assert_eq!(model.move_profile(false), Outcome::Written);
+        assert_eq!(model.profiles.selected_entry().unwrap().name, "Shell");
+        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap().config;
+        assert_eq!(config.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Work", "Shell"]);
+        // Only in the Profiles section.
+        model.select_section(Section::Theme);
+        let before = f.text();
+        assert_eq!(model.move_profile(true), Outcome::Nothing);
+        assert_eq!(f.text(), before);
+    }
+
+    /// The themes a profile can choose: the readable ones, built-ins first,
+    /// each once.
+    #[test]
+    fn theme_names_are_the_readable_themes() {
+        let f = Fixture::new("theme-names", CONFIG);
+        let model = f.opened("mine");
+        let builtins: Vec<String> = BUILTIN_THEMES.iter().map(|t| t.to_string()).collect();
+        assert_eq!(model.theme_names(), [builtins.clone(), vec!["mine".to_string(), "spare".to_string()]].concat());
+        // A custom theme named like a built-in is listed once.
+        let f = Fixture::new("theme-names-shadow", "[themes.tokyo-night]\nbackground = \"#000000\"\n");
+        assert_eq!(f.opened("mine").theme_names(), builtins);
+    }
+
+    #[test]
+    fn renames_are_taken_once() {
+        let f = Fixture::new("renames", &two_profiles());
+        let mut model = f.opened("mine");
+        assert!(model.take_renames().is_empty());
+        key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::Name, "Main");
+        assert_eq!(model.confirm(), Outcome::Written);
+        assert_eq!(model.take_renames(), [("Shell".to_string(), "Main".to_string())]);
+        assert!(model.take_renames().is_empty());
+    }
+
+    /// The profile preview shows only while the Profiles section edits a
+    /// saved profile.
+    #[test]
+    fn the_profile_preview_is_the_profile_sections() {
+        let f = Fixture::new("profile-preview", &two_profiles());
+        let mut model = f.opened("mine");
+        assert!(model.profile_preview().is_none());
+        key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::FontSize, "18");
+        let (name, profile) = model.profile_preview().unwrap();
+        assert_eq!((name.as_str(), profile.font_size), ("Shell", Some(18.0)));
+        model.cancel();
+        assert!(model.profile_preview().is_none());
+        model.select_section(Section::Theme);
+        assert!(model.profile_preview().is_none());
+    }
+
     #[test]
     fn deleting_themes() {
         let f = Fixture::new("delete", CONFIG);

@@ -1984,6 +1984,37 @@ theme = "gone"
         assert_eq!(f.config().profiles[1].name, "Work");
     }
 
+    /// Up and down step through the list and wrap; in the editor and the
+    /// delete question they leave the selection alone.
+    #[test]
+    fn moving_the_selection_wraps_in_the_list_only() {
+        let f = Fixture::new("move-selection", CONFIG);
+        let mut state = f.state();
+        assert_eq!(state.selected_entry().unwrap().name, "Work");
+        state.move_selection(true);
+        assert_eq!(state.selected_entry().unwrap().name, "Shell");
+        state.move_selection(false);
+        assert_eq!(state.selected_entry().unwrap().name, "Work");
+        state.move_selection(false);
+        assert_eq!(state.selected_entry().unwrap().name, "htop");
+        state.start_edit(&themes()).unwrap();
+        state.move_selection(true);
+        state.discard();
+        assert_eq!(state.selected_entry().unwrap().name, "htop");
+        state.request_delete().unwrap();
+        state.move_selection(true);
+        assert_eq!(state.selected_entry().unwrap().name, "htop");
+    }
+
+    #[test]
+    fn the_delete_question_is_in_the_dump() {
+        let f = Fixture::new("delete-dump", CONFIG);
+        let mut state = f.state();
+        state.select(1);
+        state.request_delete().unwrap();
+        assert_eq!(state.describe(&None, ""), "--- settings section=Profiles mode=confirm-delete profile=\"htop\"\n");
+    }
+
     #[test]
     fn file_changed_underneath() {
         let f = Fixture::new("stale", CONFIG);
