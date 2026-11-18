@@ -150,7 +150,7 @@ The rules broken most often:
 - A wire change that isn't additive, or a new message without a new negotiated version and transcript tests (`process R4`–`R6`).
 - A `_ =>` arm on one of Brindle's own enums, or a panic on bytes from outside the process (`railway R3`, `R5`).
 - Work on the UI thread, or IO in `render` or `prepaint` (`process R13`, `R14`).
-- A sleep, retry or longer timeout to make a test pass, or a GUI check as a one-off script (`testing R9`, `R13`).
+- A sleep, retry or longer timeout to make a test pass, or a GUI check as a one-off script (`testing R9`, `R13`). `tests/architecture.rs` rejects `std::thread::sleep` in `remote-agent/tests/**` (outside `support/wait.rs`) and `tests/e2e/cases/**`, and a process-wide `set_var` or `remove_var` in any test (`testing R7`, `ports R10`); a sleep in a `src/` unit test is review's.
 
 `.claude/rules/` holds a short path-scoped reminder per layer, and `openspec/config.yaml` carries the design and task rules that follow from these docs. Use the `architecture-review` skill to check a diff or a design against them.
 

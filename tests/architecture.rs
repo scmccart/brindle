@@ -736,31 +736,41 @@ fn the_opt_in_suites_are_harness_false_targets() {
     }
 }
 
-/// What `testing R3` asks of an opt-in suite's runner that its source
-/// `text` doesn't name as a string literal in code (not in a comment): the
-/// variable that enables it (`BRINDLE_<SUITE>`), `--list` and
-/// `--self-test`. (`--shard` is not asked yet: perf has none.)
-fn runner_gaps(suite: &str, text: &str) -> Vec<&'static str> {
+/// Whether `text` has `literal` as a string literal in code, not in a
+/// comment.
+fn literal_in_code(text: &str, literal: &str) -> bool {
     let code = code_of(text);
-    let in_code = |literal: &str| {
-        text.match_indices(literal)
-            .any(|(at, _)| code.as_bytes()[at] == b'"')
-    };
+    text.match_indices(literal)
+        .any(|(at, _)| code.as_bytes()[at] == b'"')
+}
+
+/// The shared parser of the runners' arguments (`tests/common/mod.rs`): the
+/// one place that reads `--shard`.
+const SHARED_PARSER: &str = "Selection::parse";
+
+/// What `testing R3` asks of an opt-in suite's runner that its source
+/// `text` doesn't name in code (not in a comment): the variable that
+/// enables it (`BRINDLE_<SUITE>`, a string literal), `--list`,
+/// `--self-test` and `--shard` (string literals too, the last also through
+/// [`SHARED_PARSER`], which holds the literal for both runners).
+fn runner_gaps(suite: &str, text: &str) -> Vec<&'static str> {
     let variable = format!("\"BRINDLE_{}\"", suite.to_uppercase());
+    let shared = names_path(&code_of(text), SHARED_PARSER);
     [
-        (variable.as_str(), "its variable, BRINDLE_<SUITE>"),
-        ("\"--list\"", "--list"),
-        ("\"--self-test\"", "--self-test"),
+        (variable.as_str(), "its variable, BRINDLE_<SUITE>", false),
+        ("\"--list\"", "--list", false),
+        ("\"--self-test\"", "--self-test", false),
+        ("\"--shard\"", "--shard", shared),
     ]
     .into_iter()
-    .filter(|(literal, _)| !in_code(literal))
-    .map(|(_, gap)| gap)
+    .filter(|(literal, _, instead)| !instead && !literal_in_code(text, literal))
+    .map(|(_, gap, _)| gap)
     .collect()
 }
 
 /// testing R3: each opt-in suite's runner has its enabling variable,
-/// `--list` and a `--self-test` (which holds the harness's own pure helpers,
-/// `fcis R8` binding production code only).
+/// `--list`, `--shard` and a `--self-test` (which holds the harness's own
+/// pure helpers, `fcis R8` binding production code only).
 #[test]
 fn each_opt_in_runner_has_its_variable_list_and_self_test() {
     let manifest = manifest(".");
@@ -778,13 +788,20 @@ fn each_opt_in_runner_has_its_variable_list_and_self_test() {
              (docs/architecture/testing-architecture.md R3)"
         );
     }
+    let common = root().join("tests/common/mod.rs");
+    let text = fs::read_to_string(&common).unwrap_or_else(|e| panic!("{}: {e}", common.display()));
+    assert!(
+        literal_in_code(&text, "\"--shard\""),
+        "tests/common/mod.rs, the runners' shared parser, no longer reads --shard \
+         (docs/architecture/testing-architecture.md R3)"
+    );
 }
 
 /// The runner check: a runner missing a feature is found, and one written
 /// only in a comment doesn't count.
 #[test]
 fn a_runner_without_a_self_test_is_found() {
-    let runner = r#"//! BRINDLE_SOAK=1 cargo test --test soak -- --self-test
+    let runner = r#"//! BRINDLE_SOAK=1 cargo test --test soak -- --self-test --shard 1/2
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // "--self-test" comes later.
@@ -794,13 +811,41 @@ fn main() {
     if args.iter().any(|a| a == "--list") {
         list();
     }
+    // Selection::parse(&args) comes later too.
 }
 "#;
-    assert_eq!(runner_gaps("soak", runner), ["--self-test"]);
+    assert_eq!(runner_gaps("soak", runner), ["--self-test", "--shard"]);
     assert_eq!(
         runner_gaps("other", runner),
-        ["its variable, BRINDLE_<SUITE>", "--self-test"]
+        ["its variable, BRINDLE_<SUITE>", "--self-test", "--shard"]
     );
+}
+
+/// A runner that parses `--shard` itself, or through the shared
+/// `Selection::parse`, has it; one that only mentions it in a comment or a
+/// usage line doesn't.
+#[test]
+fn a_runner_without_shard_is_found() {
+    let complete = |shard: &str| {
+        format!(
+            r#"//! --shard K/N
+fn main() {{
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    eprintln!("usage: [--shard K/N]");
+    if std::env::var("BRINDLE_SOAK").as_deref() != Ok("1") {{
+        return;
+    }}
+    if args.iter().any(|a| a == "--self-test" || a == "--list") {{
+        self_test();
+    }}
+    {shard}
+}}
+"#
+        )
+    };
+    assert_eq!(runner_gaps("soak", &complete("")), ["--shard"]);
+    assert!(runner_gaps("soak", &complete("let s = Selection::parse(&args);")).is_empty());
+    assert!(runner_gaps("soak", &complete("let on = args.iter().any(|a| a == \"--shard\");")).is_empty());
 }
 
 /// The search itself: a path of its own counts, the tail of a longer name
@@ -1887,9 +1932,9 @@ fn in_test_module(file: &str, test_modules: &[String]) -> bool {
     })
 }
 
-/// Each production file's platform `cfg`s outside the allowances, without
-/// the files of test modules.
-fn production_platform_cfgs() -> BTreeMap<String, Vec<String>> {
+/// Each production file's platform `cfg`s outside the allowances, and the
+/// files of the modules they declare under a test-only `cfg`.
+fn scan_production() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     let files = production_files();
     let known: BTreeSet<String> = files.iter().cloned().collect();
     let (mut sites, mut test_modules) = (BTreeMap::new(), Vec::new());
@@ -1900,6 +1945,13 @@ fn production_platform_cfgs() -> BTreeMap<String, Vec<String>> {
         test_modules.extend(scan.test_modules);
         sites.insert(file.clone(), scan.sites);
     }
+    (sites, test_modules)
+}
+
+/// Each production file's platform `cfg`s outside the allowances, without
+/// the files of test modules.
+fn production_platform_cfgs() -> BTreeMap<String, Vec<String>> {
+    let (mut sites, test_modules) = scan_production();
     sites.retain(|file, _| !in_test_module(file, &test_modules));
     sites
 }
@@ -2634,4 +2686,162 @@ fn a_root_without_the_lint_is_reported() {
     assert_eq!(lints_missing_from("mod a;\n", &lint), ["clippy::wildcard_enum_match_arm"]);
     assert!(lints_missing_from(also, &["clippy::unwrap_used", "clippy::expect_used"]).is_empty());
     assert_eq!(lints_missing_from(also, &lint), ["clippy::wildcard_enum_match_arm"]);
+}
+
+// testing R7: tests wait on conditions, not on the clock.
+
+/// The test trees whose waits go through a helper (`testing R7`): the real
+/// process tests, with `eventually`, `until`, `Quiet`, `throttle` and
+/// `retry_busy_exec`, and the e2e cases, with `Scale`.
+const WAIT_TREES: [&str; 2] = ["remote-agent/tests", "tests/e2e/cases"];
+
+/// The files of [`WAIT_TREES`] that may sleep: the wait helper itself,
+/// which scales every pause by `BRINDLE_TEST_SLOW`.
+const SLEEPERS: [&str; 1] = ["remote-agent/tests/support/wait.rs"];
+
+/// What a sleep in a test resolves to, however it is imported or renamed.
+const SLEEP: &str = "std::thread::sleep";
+
+/// The numbers of the lines of `text` that sleep.
+fn sleep_lines(text: &str) -> Vec<usize> {
+    needle_lines(&code_lines(text, Scope::All), &[SLEEP])
+}
+
+/// testing R7: no test in a wait tree sleeps, except in the wait helper.
+#[test]
+fn test_waits_go_through_the_wait_helper() {
+    let files: Vec<PathBuf> = WAIT_TREES
+        .into_iter()
+        .flat_map(sources)
+        .filter(|file| !SLEEPERS.contains(&slashed(file).as_str()))
+        .collect();
+    assert_none(
+        offenders(&files, Scope::All, &[SLEEP]),
+        "a test waits for a condition, within a limit that BRINDLE_TEST_SLOW (e2e: BRINDLE_E2E_SLOW) \
+         scales, and never sleeps (docs/architecture/testing-architecture.md R7): use \
+         `eventually`, `until`, `Quiet`, `throttle` or `retry_busy_exec` from \
+         remote-agent/tests/support/wait.rs, or e2e's `Scale` (tests/e2e/wait.rs)",
+    );
+}
+
+/// testing R7: the allowed sleepers are files there are.
+#[test]
+fn every_allowed_sleeper_exists() {
+    let missing: Vec<&str> = SLEEPERS
+        .into_iter()
+        .filter(|file| !root().join(file).is_file())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SLEEPERS names files that don't exist: {missing:?}"
+    );
+}
+
+/// The sleep search: direct, imported, renamed and full-path sleeps are
+/// found, a comment or a string isn't.
+#[test]
+fn a_sleep_in_a_test_is_found() {
+    let text = r#"use std::thread;
+use std::thread::sleep as nap;
+use std::time::Duration;
+fn direct() {
+    thread::sleep(Duration::from_millis(1));
+}
+fn renamed() {
+    nap(Duration::from_millis(1));
+}
+fn full() {
+    std::thread::sleep(Duration::from_millis(1));
+}
+fn comment() {
+    // thread::sleep(Duration::from_millis(1));
+    let _ = "std::thread::sleep";
+}
+"#;
+    // A renamed or bare `sleep` is found at its import, which is a site.
+    assert_eq!(sleep_lines(text), [2, 5, 11]);
+    assert_eq!(sleep_lines("use std::thread::sleep;\nfn f() { sleep(d); }\n"), [1]);
+    assert!(sleep_lines("use std::thread;\nfn f() { thread::spawn(|| ()); }\n").is_empty());
+}
+
+// ports R10, testing R7: tests set no process environment.
+
+/// What changes the process environment, however imported or renamed.
+const ENV_WRITES: [&str; 2] = ["std::env::set_var", "std::env::remove_var"];
+
+/// The numbers of the lines of `text` that change the environment and are
+/// test code: every line when `whole_file` (a file of tests), else the lines
+/// [`production`] blanked.
+fn test_env_writes(text: &str, whole_file: bool) -> Vec<usize> {
+    let hits = needle_lines(&code_lines(text, Scope::All), &ENV_WRITES);
+    if whole_file {
+        return hits;
+    }
+    let production: BTreeSet<usize> = production_lines(text)
+        .into_iter()
+        .map(|(number, _)| number)
+        .collect();
+    hits.into_iter()
+        .filter(|number| !production.contains(number))
+        .collect()
+}
+
+/// ports R10: no test sets or removes a process-wide variable.
+#[test]
+fn tests_set_no_process_environment() {
+    let (_, test_modules) = scan_production();
+    let mut files: Vec<(String, bool)> = ["tests", "remote-agent/tests", "remote-protocol/tests"]
+        .into_iter()
+        .flat_map(sources)
+        .map(|path| (slashed(&path), true))
+        .collect();
+    files.extend(
+        production_files()
+            .into_iter()
+            .map(|file| (file.clone(), in_test_module(&file, &test_modules))),
+    );
+    let mut found = Vec::new();
+    for (file, whole) in files {
+        let path = root().join(&file);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let original: Vec<&str> = text.lines().collect();
+        for number in test_env_writes(&text, whole) {
+            found.push(format!("{file}:{number}: {}", original[number - 1].trim()));
+        }
+    }
+    assert_none(
+        found,
+        "a test changes no process-wide environment variable, since tests run in parallel \
+         (docs/architecture/ports-and-adapters.md R10, testing-architecture.md R7): pass the \
+         value as an argument, or set it on the `Command` of the process under test",
+    );
+}
+
+/// The environment search: each form is found in test code, and production
+/// code's, a comment's and a string's isn't.
+#[test]
+fn a_set_var_in_a_test_is_found() {
+    let text = r#"use std::env;
+pub fn parse() {
+    unsafe { std::env::set_var("A", "1") };
+}
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::env::remove_var as unset;
+    #[test]
+    fn t() {
+        unsafe { std::env::set_var("A", "1") };
+        unsafe { env::set_var("A", "1") };
+        unsafe { unset("A") };
+        // std::env::set_var("A", "1");
+        let _ = "std::env::remove_var";
+    }
+}
+"#;
+    // A renamed import is found at the import, which is a site.
+    assert_eq!(test_env_writes(text, false), [8, 11, 12]);
+    assert_eq!(test_env_writes("fn f() { std::env::set_var(\"A\", \"1\"); }\n", true), [1]);
+    assert_eq!(test_env_writes("fn f() { std::env::set_var(\"A\", \"1\"); }\n", false), Vec::<usize>::new());
+    assert_eq!(test_env_writes("fn f() { std::env::var(\"A\"); }\n", true), Vec::<usize>::new());
 }

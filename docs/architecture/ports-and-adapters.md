@@ -95,7 +95,9 @@ The composition root is `src/main.rs`: it takes the instance lock and handles `-
 - R5: `the_server_core_and_holder_name_no_platform_type`. CI compiles both platforms, which holds the "same item names" half.
 - R12: `no_crate_names_a_forbidden_dependency` (the dependency half; copying is a review matter).
 
-R6–R11 and R13 rely on review.
+- R10: `tests_set_no_process_environment` (no test sets or removes a process-wide environment variable: `tests/**`, `remote-agent/tests/**` and the test code of every crate's `src/`; production code is review's).
+
+R6–R9, R11 and R13 rely on review.
 
 ## PR checklist
 
