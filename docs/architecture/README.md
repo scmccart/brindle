@@ -17,7 +17,7 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 - **`brindle`**, the app: GPUI entities, the server's client, config, the composition root (`main.rs`). It depends on all three shared crates and may add dependencies with care.
 - **`brindle-remote-agent`**, the `brindle-remote` helper: the terminal server's roles, the relay, the management commands. It depends on `brindle-term-core` and `brindle-remote-protocol`, never on `gpui` or `brindle-ui`.
 - **The two binaries never reference each other.** What both need goes in a shared crate.
-- **`brindle-ui`**: components and tokens on `gpui` alone. It knows nothing of terminals, config or the `ACTIONS` table.
+- **`brindle-ui`**: components and tokens on `gpui` (and the `log` facade). It knows nothing of terminals, config or the `ACTIONS` table.
 - **`brindle-term-core`**: the pure terminal state both sides share (parser, marks, status records, replay, emulator). No IO, no clock, no threads.
 - **`brindle-remote-protocol`**: frames, messages and versions (pure codecs), plus the small platform helpers both sides must agree on (server directory, endpoint names, access checks, scopes).
 - **The shared crates never reference each other**, and each has a closed list of dependencies (`ports R3`).

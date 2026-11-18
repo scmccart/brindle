@@ -273,7 +273,7 @@ Needs change 4 (`tests/common/winproc.rs`).
 
 ## 7. `brindle-ui` icon path
 
-- [ ] 7.1 `Icon::path(&self, side, min_stroke) -> Result<Path<Pixels>, PathError>`, split out of `paint` in `ui/src/icon.rs`. `paint` logs an `Err` once per icon name.
+- [x] 7.1 `Icon::path(&self, side, min_stroke) -> Result<Path<Pixels>, PathError>`, split out of `paint` in `ui/src/icon.rs`. `paint` logs an `Err` once per icon name.
   - Unit test: `every_icon_builds_at_component_sizes`.
   - Verify with `cargo test -p brindle-ui icon`.
 

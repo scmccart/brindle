@@ -6,7 +6,7 @@ paths:
 
 You are editing the shared UI crate. Read `docs/architecture/ports-and-adapters.md` and `docs/architecture/functional-core-imperative-shell.md` before non-trivial changes, and `ui/README.md` for the component list and the listed differences from shadcn.
 
-- The only dependency is `gpui`, and the crate does no IO of its own (`ports R2`, `R3`).
+- Its dependencies are `gpui` and the `log` facade (a failed icon is logged once), and the crate does no IO of its own (`ports R2`, `R3`).
 - It knows nothing of terminals, config, `Settings`, terminal themes or the `ACTIONS` table. Components take tokens and plain values; the app maps its concepts onto them (`ports R2`).
 - It binds no keys itself: `default_bindings()` returns them and the app chains them in (`ports R2`).
 - State and rules go in a GPUI-free model (`EditState`, the filter, placement, list navigation) with unit tests; the entity adds focus, input and painting (`fcis R1`, `R5`).

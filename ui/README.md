@@ -8,7 +8,7 @@ changes; nothing in the crate is specific to Brindle.
 
 ## Boundary
 
-The crate depends on `gpui` and nothing else. It never depends on `brindle`,
+The crate depends on `gpui` and the `log` facade (a failed icon is logged once), and nothing else. It never depends on `brindle`,
 `brindle-term-core` or `alacritty_terminal`, and knows nothing of terminals,
 config or the app's actions table. The dependency direction is
 `brindle → brindle-ui → gpui`, and a new dependency here is a change to that

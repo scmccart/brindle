@@ -28,7 +28,7 @@ const CRATES: [(&str, &str); 5] = [
 /// Every dependency a crate below the app may name, of any kind (normal,
 /// build, dev) and for any target. The app (`brindle`) has no closed list.
 const ALLOWED: [(&str, &[&str]); 4] = [
-    ("ui", &["gpui"]),
+    ("ui", &["gpui", "log"]),
     (
         "term-core",
         &["alacritty_terminal", "base64", "parking_lot"],

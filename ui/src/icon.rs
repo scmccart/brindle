@@ -8,10 +8,37 @@
 //! `svg()` would need the app's single `AssetSource`, and text glyphs depend
 //! on the font, so the crate draws these itself.
 
+use std::collections::HashSet;
+use std::fmt;
+use std::sync::{Mutex, PoisonError};
+
 use gpui::{
-    App, Bounds, Hsla, IntoElement, PathBuilder, Pixels, Point, Rems, RenderOnce, Styled, Window,
-    canvas, point, px, rems,
+    App, Bounds, Hsla, IntoElement, Path, PathBuilder, Pixels, Point, Rems, RenderOnce, Styled,
+    Window, canvas, point, px, rems,
 };
+
+/// An icon's stroke couldn't be turned into a path (gpui's tessellator
+/// refused it), with the tessellator's account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathError(String);
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PathError {}
+
+/// The icons whose failure has been logged, so a paint that fails every
+/// frame says so once.
+static REPORTED: Mutex<Option<HashSet<Icon>>> = Mutex::new(None);
+
+/// Whether `icon` is new to `reported`, recording it: the decision to log
+/// a failed icon, once per icon.
+fn first_report(reported: &mut HashSet<Icon>, icon: Icon) -> bool {
+    reported.insert(icon)
+}
 
 /// The icons the components use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IntoElement)]
@@ -187,15 +214,15 @@ impl Icon {
         IconElement::new(self).color(color)
     }
 
-    /// Strokes the icon into the largest square centred in `bounds`, at
-    /// least `min_stroke` wide when given ([`stroke_width`]).
-    fn paint(self, bounds: Bounds<Pixels>, color: Hsla, min_stroke: Option<Pixels>, window: &mut Window) {
-        let side = bounds.size.width.min(bounds.size.height);
-        let origin = bounds.origin
-            + point(
-                (bounds.size.width - side) / 2.,
-                (bounds.size.height - side) / 2.,
-            );
+    /// The icon's strokes as one path, `side` pixels square with its
+    /// top-left corner at `origin`, at least `min_stroke` wide when given
+    /// ([`stroke_width`]). Pure: painting it is [`Icon::paint`]'s.
+    pub fn path(
+        self,
+        origin: Point<Pixels>,
+        side: Pixels,
+        min_stroke: Option<Pixels>,
+    ) -> Result<Path<Pixels>, PathError> {
         let at = |(x, y): (f32, f32)| -> Point<Pixels> { origin + point(side * x, side * y) };
 
         // Butt caps and miter joins: gpui doesn't re-export lyon's `LineCap`,
@@ -239,8 +266,30 @@ impl Icon {
                 }
             }
         }
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
+        path.build().map_err(|error| PathError(format!("{error:#}")))
+    }
+
+    /// Strokes the icon into the largest square centred in `bounds`
+    /// ([`Icon::path`]). A path that can't be built paints nothing, and is
+    /// logged once for this icon.
+    fn paint(self, bounds: Bounds<Pixels>, color: Hsla, min_stroke: Option<Pixels>, window: &mut Window) {
+        let side = bounds.size.width.min(bounds.size.height);
+        let origin = bounds.origin
+            + point(
+                (bounds.size.width - side) / 2.,
+                (bounds.size.height - side) / 2.,
+            );
+        match self.path(origin, side, min_stroke) {
+            Ok(path) => window.paint_path(path, color),
+            Err(error) => {
+                let first = {
+                    let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
+                    first_report(reported.get_or_insert_with(HashSet::new), self)
+                };
+                if first {
+                    log::warn!("the {self:?} icon can't be drawn: {error}");
+                }
+            }
         }
     }
 }
@@ -346,6 +395,31 @@ mod tests {
         let icon = Icon::Plus.size(rems(1.)).min_stroke(LEGIBLE_ICON_STROKE);
         assert_eq!((icon.size, icon.min_stroke), (rems(1.), Some(px(2.))));
         assert_eq!(IconElement::new(Icon::Plus).min_stroke, None);
+    }
+
+    /// Every icon builds at the sizes the components use (12 to 32px
+    /// squares, lucide's stroke and a chrome icon's two pixels), anywhere
+    /// in the window.
+    #[test]
+    fn every_icon_builds_at_component_sizes() {
+        for icon in Icon::ALL {
+            for side in [12., 14., 16., 20., 24., 32.] {
+                for min_stroke in [None, Some(LEGIBLE_ICON_STROKE)] {
+                    for origin in [point(px(0.), px(0.)), point(px(100.5), px(37.25))] {
+                        let built = icon.path(origin, px(side), min_stroke);
+                        assert!(built.is_ok(), "{icon:?} at {side}px, {min_stroke:?}: {built:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_icon_is_reported_once() {
+        let mut reported = HashSet::new();
+        assert!(first_report(&mut reported, Icon::Check));
+        assert!(!first_report(&mut reported, Icon::Check));
+        assert!(first_report(&mut reported, Icon::X));
     }
 
     #[test]
