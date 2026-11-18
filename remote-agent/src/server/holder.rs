@@ -55,6 +55,7 @@ use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
     Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
 };
+use brindle_remote_protocol::ready::ReadyRead;
 
 use super::conn::Conn;
 use super::daemon::ReadyPipe;
@@ -65,6 +66,7 @@ use super::platform::pty::{self, Group, Program, Pty};
 use super::{build_id, daemon, dir, fault};
 use crate::pty::{
     GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
+    Reparented,
 };
 
 /// From this much queued to the core, the holder stops reading PTYs...
@@ -315,6 +317,8 @@ struct Holder<L: EventLoop> {
     /// Process groups to kill when their hang-up grace ends, with the
     /// session whose program leads each one.
     kills: Vec<(SessionId, Group, Instant)>,
+    /// The log said that `REPARENT` does nothing here, which it says once.
+    reparent_unsupported: bool,
 }
 
 impl<L: EventLoop> Holder<L> {
@@ -347,6 +351,7 @@ impl<L: EventLoop> Holder<L> {
             core_starts: Vec::new(),
             core_ready: HashMap::new(),
             kills: Vec::new(),
+            reparent_unsupported: false,
         })
     }
 
@@ -778,12 +783,25 @@ impl<L: EventLoop> Holder<L> {
                 }
             }
             ToHolder::Reparent(reparent) => {
-                // Advisory where it is supported (Windows): no reply, and a
-                // session that just ended is no error.
+                // Advisory: no reply, and a session that just ended is no
+                // error. What it came to is the log's.
                 let session = self.sessions.get(&reparent.session);
                 let program = session.map(|session| &session.program);
-                if let Err(error) = pty::reparent(program, reparent.hwnd) {
-                    self.send_error(Some(reparent.session), error.to_string());
+                match pty::reparent(program, reparent.hwnd) {
+                    Ok(Reparented::Done) => {}
+                    Ok(Reparented::Unsupported) => {
+                        if !self.reparent_unsupported {
+                            self.reparent_unsupported = true;
+                            log!(
+                                "console windows get no owner here (REPARENT needs the packaged ConPTY on Windows); \
+                                 not said again"
+                            );
+                        }
+                    }
+                    Err(error) => log!(
+                        "session {}: can't give its console window an owner: {error}",
+                        reparent.session
+                    ),
                 }
             }
             ToHolder::Pause(target) => self.set_paused(target.session, true),
@@ -852,7 +870,9 @@ impl<L: EventLoop> Holder<L> {
         };
         let token = self.token();
         if let Err(error) = self.ev.register(&pty.source(), token, Interest::READABLE) {
-            program.group().kill();
+            if let Err(kill) = program.group().kill() {
+                log!("session {id}: can't end its program: {kill}");
+            }
             let _ = program.wait();
             return self.send(ToCore::SpawnFailed(SpawnFailed {
                 session: id,
@@ -1029,13 +1049,13 @@ impl<L: EventLoop> Holder<L> {
         let Some(ready) = self.core_ready.get_mut(&token) else {
             return;
         };
-        let Some(listening) = ready.read() else {
-            return;
-        };
-        if listening {
-            log!("the core it started is listening");
-        } else {
-            log!("the core it started exited before listening");
+        match ready.read() {
+            ReadyRead::Pending => return,
+            ReadyRead::Listening => log!("the core it started is listening"),
+            ReadyRead::Ended => log!("the core it started exited before listening"),
+            ReadyRead::Failed(error) => log!(
+                "the core it started didn't say it was listening (reading the ready pipe failed: {error})"
+            ),
         }
         self.core_ready.remove(&token);
         self.drop_source(token);
@@ -1109,13 +1129,15 @@ impl<L: EventLoop> Holder<L> {
             }
         }
 
-        self.kills.retain(|(_, group, at)| {
+        self.kills.retain(|(id, group, at)| {
             if now < *at {
                 return true;
             }
             // The reaped leader's children that ignored the hang-up are
             // still in the group, so it is killed as long as it exists.
-            group.kill_remaining();
+            if let Err(error) = group.kill_remaining() {
+                log!("session {id}: can't end what its hang-up left running: {error}");
+            }
             false
         });
 

@@ -8,7 +8,7 @@ Each group ends with its own checks: `cargo test --workspace --locked` (which ru
 
 Needs change 3 (its `SessionMeta::from_value` fuzz target) and change 10 (the seam decisions it moves).
 
-- [ ] 1.1 `SessionMeta::from_value(&Value) -> Result<SessionMeta, MetaFault>` in `remote-protocol/src/holder.rs` (decision 11).
+- [x] 1.1 `SessionMeta::from_value(&Value) -> Result<SessionMeta, MetaFault>` in `remote-protocol/src/holder.rs` (decision 11).
   - `MetaFault { malformed: Vec<&'static str>, read: SessionMeta }`: `"meta"` for a non-object, else each field of the wrong type. `read` keeps the well-formed fields.
   - A missing field stays its default and is `Ok`.
   - Write the unit tests first:
@@ -18,28 +18,28 @@ Needs change 3 (its `SessionMeta::from_value` fuzz target) and change 10 (the se
   - Check that every transcript test (`holder-set-meta-layout` among them) still decodes to `Ok`, byte for byte.
   - Change 3's fuzz target asserts `Ok` or `Err(MetaFault)`.
   - Verify with `cargo test -p brindle-remote-protocol holder`.
-- [ ] 1.2 `ready::ReadyRead { Pending, Listening, Ended, Failed(io::Error) }` and the pure `ready_read(io::Result<usize>, &[u8]) -> ReadyRead`, in `remote-protocol/src/ready.rs` beside the Linux rule, ungated so it is tested on every platform.
+- [x] 1.2 `ready::ReadyRead { Pending, Listening, Ended, Failed(io::Error) }` and the pure `ready_read(io::Result<usize>, &[u8]) -> ReadyRead`, in `remote-protocol/src/ready.rs` beside the Linux rule, ungated so it is tested on every platform.
   - Unit tests: `one_byte_is_listening`, `the_end_without_a_byte_is_ended`, `a_read_error_is_kept`.
-- [ ] 1.3 `prune_helper_copies` returns `Pruned { removed: usize, kept: Vec<(PathBuf, String)> }` (`remote-protocol/src/win.rs`).
+- [x] 1.3 `prune_helper_copies` returns `Pruned { removed: usize, kept: Vec<(PathBuf, String)> }` (`remote-protocol/src/win.rs`).
   - Change 10's pure `pruned_builds` still decides what to try.
   - A Windows unit test: a copy held open is kept, with its reason.
-- [ ] 1.4 `Conn::input_waiting() -> io::Result<bool>` on both platforms (decision 11): `platform/unix/conn.rs` (a failed `FIONREAD`) and `platform/windows/{conn,pipe}.rs` (`port.pump` and `PeekNamedPipe`).
+- [x] 1.4 `Conn::input_waiting() -> io::Result<bool>` on both platforms (decision 11): `platform/unix/conn.rs` (a failed `FIONREAD`) and `platform/windows/{conn,pipe}.rs` (`port.pump` and `PeekNamedPipe`).
   - `holder_behind` in `core/holders.rs` reads `Err` as behind, so the next read meets the error and `drop_holder` logs its cause.
   - The test helpers in `conn.rs` `.unwrap()`.
   - Verify with `cargo test -p brindle-remote-agent conn`.
-- [ ] 1.5 `adopt_meta(Result<SessionMeta, MetaFault>) -> (SessionMeta, Option<String>)`, pure, in `core/sessions.rs`.
+- [x] 1.5 `adopt_meta(Result<SessionMeta, MetaFault>) -> (SessionMeta, Option<String>)`, pure, in `core/sessions.rs`.
   - A fault keeps `read`, empties `owner`, sets `policy: Detach`, and gives a fresh `key` when the key was malformed.
   - It returns the `core.log` line naming the session and the fields.
   - Unit tests: `a_faulty_meta_is_adopted_detached_with_no_owner`, `a_malformed_key_is_replaced`, `a_good_meta_is_adopted_as_it_is`.
   - `Session::adopted` calls it, logs the line and queues `SET_META` with the repaired meta.
-- [ ] 1.6 Write the real-process test in `remote-agent/tests/core.rs`, on both platforms: `a_session_whose_meta_is_malformed_is_adopted_detached`.
+- [x] 1.6 Write the real-process test in `remote-agent/tests/core.rs`, on both platforms: `a_session_whose_meta_is_malformed_is_adopted_detached`.
   1. A holder with one session.
   2. `SET_META` with `{"owner": 7}`.
   3. Kill the core.
   4. The next core lists the session as detached with its program running, and an attach replays it.
 
   Show it fails before 1.5: the session gets the default `Kill` policy and is hung up after `RECONNECT_GRACE`.
-- [ ] 1.7 `queue -> io::Result<()>` in `core/holders.rs` and `core/clients.rs` (b11 #11, b10's `clients.rs:404` smell).
+- [x] 1.7 `queue -> io::Result<()>` in `core/holders.rs` and `core/clients.rs` (b11 #11, b10's `clients.rs:404` smell).
   - **For the holder:**
     - a failed `SPAWN` fails the waiting spawn with an `ERROR` to its client: `the terminal server couldn't pass the request to its holder: …`;
     - a failed `SET_META` leaves `storing` unset;
@@ -47,9 +47,9 @@ Needs change 3 (its `SessionMeta::from_value` fuzz target) and change 10 (the se
   - **For the client:** a reply that can't be encoded is replaced by an `ERROR` for its `req`.
   - Every `match` on the message names its variants (`railway R3`).
   - Unit tests on the pure parts: `an_unencodable_spawn_fails_its_request` and `an_unencodable_session_message_is_reported_to_its_client`, using a payload over `MAX_FRAME_PAYLOAD_SIZE`.
-- [ ] 1.8 Error texts name their action (b10 #13): `server/core.rs:124-143`, and `server/cli.rs:96, 202, 207, 259, 281, 308`.
+- [x] 1.8 Error texts name their action (b10 #13): `server/core.rs:124-143`, and `server/cli.rs:96, 202, 207, 259, 281, 308`.
   - Add to `remote-agent/tests/manage.rs`: `a_failed_command_names_its_action`, running `brindle-remote list` against a server directory that is a file, whose stderr names the action (`can't read the server directory` or the CLI's equivalent) and the system's error.
-- [ ] 1.9 The Windows seams (decision 11):
+- [x] 1.9 The Windows seams (decision 11):
   - **The ready pipe.** `ReadyPipe::read` returns `ReadyRead`, and the starter's error appends `reading the ready pipe failed: …`.
   - **`daemonize`.** It logs a failed `SetConsoleCtrlHandler` or `set_current_dir` to the role's log.
   - **Snapshots.** `end_its_programs -> io::Result<usize>`, passed up by `kill_remaining`. The holder logs a failed snapshot with the session id.
@@ -59,11 +59,11 @@ Needs change 3 (its `SessionMeta::from_value` fuzz target) and change 10 (the se
   - **The core's `prune_copies`** logs `Pruned.kept`.
 
   Unit tests in the agent, ungated where the code is: `cached_ok`'s `a_failure_is_not_cached` and `a_success_is_cached` (closures counting their calls), and `missing_names_the_export`. Verify on Windows CI: `cargo test -p brindle-remote-agent` runs them and `launch.rs`.
-- [ ] 1.10 The relay's build id (b15 `relay.rs:256`).
+- [x] 1.10 The relay's build id (b15 `relay.rs:256`).
   - `Server.build` becomes a `Result`, and an `Err` writes one `core.log` line.
   - `RELAY_HOST.build` stays `""`, through a pure `host_build(&Result<String, String>) -> &str`.
   - Unit test: `an_unreadable_build_id_is_sent_as_unknown`. The relay tests in `tests/relay.rs` keep passing unchanged.
-- [ ] 1.11 Docs:
+- [x] 1.11 Docs:
   - `docs/architecture/railway-oriented-programming.md`, "How it applies here": the `remote-agent` row's "the role's log; the client's tab" also names the `ERROR` a session's client gets for an unsendable message.
   - CLAUDE.md, the core paragraph: a malformed stored meta is adopted detached with no owner.
 

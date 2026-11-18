@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::endpoint::{self, Holder as Place};
 use brindle_remote_protocol::{SessionId, client};
 use brindle_remote_protocol::holder::{self as h1, Assembler, Hello, ToCore, ToHolder, Welcome};
+use brindle_remote_protocol::ready::ReadyRead;
 
 use super::clients::error;
 use super::sessions::Session;
@@ -184,13 +185,13 @@ impl<L: EventLoop> Core<L> {
         let mut conn = Conn::new(connect(&place.endpoint, retry_for)?)?;
         queue(
             &mut conn,
-            ToHolder::Hello(Hello {
+            &ToHolder::Hello(Hello {
                 min: h1::PROTOCOLS.min,
                 max: h1::PROTOCOLS.max,
                 core_build: self.build.clone(),
                 instance: self.instance,
             }),
-        );
+        )?;
         let token = self.token();
         self.ev.register(&conn.source(), token, Interest::READABLE)?;
         self.sources.insert(token, Source::Holder);
@@ -278,11 +279,13 @@ impl<L: EventLoop> Core<L> {
         self.checkpoint_due(token, false);
     }
 
-    /// Whether more of the holder's output is waiting to be read.
+    /// Whether more of the holder's output is waiting to be read. A
+    /// connection that can't say counts as behind: the next read meets the
+    /// error, and [`Core::drop_holder`] logs its cause.
     pub(super) fn holder_behind(&self, token: Token) -> bool {
         self.holders
             .get(&token)
-            .is_some_and(|holder| holder.conn.input_waiting())
+            .is_some_and(|holder| holder.conn.input_waiting().unwrap_or(true))
     }
 
     pub(super) fn flush_holder(&mut self, token: Token) {
@@ -293,10 +296,34 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    pub(super) fn send_holder(&mut self, token: Token, message: ToHolder) {
-        if let Some(holder) = self.holders.get_mut(&token) {
-            queue(&mut holder.conn, message);
+    /// Queues a message for the holder; whether it was queued. One that
+    /// can't be encoded is handled as [`unsent`] says: a spawn fails to its
+    /// client, a session's message is reported to that session's client,
+    /// and the rest are logged.
+    pub(super) fn send_holder(&mut self, token: Token, message: ToHolder) -> bool {
+        let Some(holder) = self.holders.get_mut(&token) else {
+            return false;
+        };
+        let Err(failure) = queue(&mut holder.conn, &message) else {
+            return true;
+        };
+        match unsent(&message, &failure) {
+            Unsent::Spawn { session, why } => self.session_spawn_failed(token, session, why),
+            Unsent::Meta { session, why } => log!("session {session}: {why}"),
+            Unsent::Session { session, why } => {
+                log!("session {session}: {why}");
+                let client = self
+                    .sessions
+                    .get(&session)
+                    .filter(|held| held.holder == token)
+                    .and_then(|held| held.attached);
+                if let Some(client) = client {
+                    self.send_client(client, error(None, Some(session), why));
+                }
+            }
+            Unsent::Holder { why } => log!("holder {token}: {why}"),
         }
+        false
     }
 
     /// Where what is queued for the holder so far ends, as a count of the
@@ -422,7 +449,13 @@ impl<L: EventLoop> Core<L> {
                 continue;
             }
             self.next_session = self.next_session.max(id.saturating_add(1));
-            self.sessions.insert(id, Session::adopted(token, held, now));
+            let (session, repaired) = Session::adopted(token, held, now);
+            self.sessions.insert(id, session);
+            // The next core reads the repaired meta.
+            if let Some(line) = repaired {
+                log!("{line}");
+                self.store_meta(id);
+            }
             adopted_any = true;
         }
         // A holder found after startup gives its sessions' owners the same
@@ -589,16 +622,19 @@ impl<L: EventLoop> Core<L> {
         let Some(start) = &mut self.holder_start else {
             return;
         };
-        let Some(listening) = start.ready.read() else {
-            return;
+        let failure = match start.ready.read() {
+            ReadyRead::Pending => return,
+            ReadyRead::Listening => None,
+            ReadyRead::Ended => Some("the holder exited before listening".to_string()),
+            ReadyRead::Failed(error) => Some(format!(
+                "the holder didn't say it was listening (reading the ready pipe failed: {error})"
+            )),
         };
         let start = self.holder_start.take().expect("a holder start");
         self.drop_source(start.token);
-        if !listening {
-            log!("the holder exited before listening; see its log");
-            return self.fail_waiting(
-                "the holder exited before listening; see its log in the server directory",
-            );
+        if let Some(why) = failure {
+            log!("{why}; see its log");
+            return self.fail_waiting(&format!("{why}; see its log in the server directory"));
         }
         self.discover(false);
         let coming = self
@@ -634,9 +670,123 @@ enum Blob {
     Tail,
 }
 
-fn queue(conn: &mut Conn, message: ToHolder) {
-    match message.encode() {
-        Ok(frame) => conn.queue(&frame),
-        Err(error) => log!("can't encode a message: {error}"),
+/// Queues `message` on the holder's connection, or returns why it can't be
+/// encoded (a payload over the frame limit, say).
+fn queue(conn: &mut Conn, message: &ToHolder) -> io::Result<()> {
+    conn.queue(&message.encode()?);
+    Ok(())
+}
+
+/// What a message that couldn't be queued for a holder was for, and what
+/// to say about it.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Unsent {
+    /// A `SPAWN`: the waiting spawn fails, with `why`, to its client.
+    Spawn { session: SessionId, why: String },
+    /// A `SET_META`: the session's `storing` stays unset, since nothing
+    /// went out for a replay to wait on.
+    Meta { session: SessionId, why: String },
+    /// Another message for one session: its attached client gets an
+    /// `ERROR` with the session.
+    Session { session: SessionId, why: String },
+    /// A message for the holder as a whole: logged.
+    Holder { why: String },
+}
+
+/// What [`queue`]'s `error` for `message` means (`railway R3`: every
+/// message is named).
+pub(super) fn unsent(message: &ToHolder, error: &io::Error) -> Unsent {
+    let session = |session: SessionId, what: &str| Unsent::Session {
+        session,
+        why: format!("the terminal server couldn't pass {what} to its holder: {error}"),
+    };
+    let holder = |what: &str| Unsent::Holder {
+        why: format!("can't send its {what}: {error}"),
+    };
+    match message {
+        ToHolder::Spawn(spawn) => Unsent::Spawn {
+            session: spawn.session,
+            why: format!("the terminal server couldn't pass the request to its holder: {error}"),
+        },
+        ToHolder::SetMeta(update) => Unsent::Meta {
+            session: update.session,
+            why: format!("can't store its meta in its holder: {error}"),
+        },
+        ToHolder::Input(data) => session(data.session, "input"),
+        ToHolder::Resize(resize) => session(resize.session, "a resize"),
+        ToHolder::Hangup(target) => session(target.session, "a hang-up"),
+        ToHolder::CheckpointBegin(begin) => session(begin.session, "a checkpoint"),
+        ToHolder::CheckpointChunk(chunk) => session(chunk.session, "a checkpoint"),
+        ToHolder::CheckpointEnd(end) => session(end.session, "a checkpoint"),
+        ToHolder::Reparent(reparent) => session(reparent.session, "the window that owns its console"),
+        ToHolder::Pause(target) => session(target.session, "a pause"),
+        ToHolder::Resume(target) => session(target.session, "a resume"),
+        ToHolder::Hello(_) => holder("HELLO"),
+        ToHolder::Drain(_) => holder("DRAIN"),
+        ToHolder::Goodbye(_) => holder("GOODBYE"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brindle_remote_protocol::{MAX_FRAME_PAYLOAD_SIZE, serde_json};
+
+    use super::*;
+
+    /// A spawn too large for a frame: its args alone are over the limit.
+    fn huge_spawn(session: SessionId) -> ToHolder {
+        ToHolder::Spawn(h1::Spawn {
+            session,
+            command: Some("sh".into()),
+            args: vec!["x".repeat(MAX_FRAME_PAYLOAD_SIZE + 1)],
+            cwd: None,
+            env: Default::default(),
+            cols: 80,
+            rows: 24,
+            cell_w: 0,
+            cell_h: 0,
+            meta: serde_json::Value::Null,
+        })
+    }
+
+    #[test]
+    fn an_unencodable_spawn_fails_its_request() {
+        let message = huge_spawn(4);
+        let error = message.encode().unwrap_err();
+        match unsent(&message, &error) {
+            Unsent::Spawn { session, why } => {
+                assert_eq!(session, 4);
+                assert_eq!(
+                    why,
+                    format!("the terminal server couldn't pass the request to its holder: {error}")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unencodable_session_message_is_reported_to_its_client() {
+        let message = ToHolder::Input(h1::Data {
+            session: 5,
+            bytes: vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 1],
+        });
+        let error = message.encode().unwrap_err();
+        assert_eq!(
+            unsent(&message, &error),
+            Unsent::Session {
+                session: 5,
+                why: format!("the terminal server couldn't pass input to its holder: {error}"),
+            }
+        );
+
+        // A meta is the session's, but its client isn't told: the replays
+        // that would wait for it don't.
+        let meta = ToHolder::SetMeta(h1::SetMeta {
+            session: 5,
+            meta: serde_json::Value::String("x".repeat(MAX_FRAME_PAYLOAD_SIZE)),
+        });
+        let error = meta.encode().unwrap_err();
+        assert!(matches!(unsent(&meta, &error), Unsent::Meta { session: 5, .. }));
     }
 }

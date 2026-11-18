@@ -43,7 +43,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brindle_remote_protocol::{ready, win};
+use brindle_remote_protocol::ready::{self, ReadyRead};
+use brindle_remote_protocol::win;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
     INVALID_HANDLE_VALUE, SetHandleInformation,
@@ -168,18 +169,16 @@ impl ReadyPipe {
         self.0.source()
     }
 
-    /// Whether the role is listening (`true`) or ended before it was
-    /// (`false`); `None` while neither is known. The first byte says so,
-    /// without the pipe's end that a Linux starter waits for: only the role
-    /// writes to this handle, and a process that inherited it may keep the
-    /// pipe open ([`ready`]).
-    pub fn read(&self) -> Option<bool> {
+    /// Whether the role is listening or ended before it was; `Pending`
+    /// while neither is known, and `Failed` with the error for a pipe that
+    /// can't be read. The first byte says so, without the pipe's end that a
+    /// Linux starter waits for: only the role writes to this handle, and a
+    /// process that inherited it may keep the pipe open
+    /// ([`ready::ready_read`]).
+    pub fn read(&self) -> ReadyRead {
         let mut buffer = [0u8; 16];
-        match self.0.read(&mut buffer) {
-            Ok(read) => Some(read > 0),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
-            Err(_) => Some(false),
-        }
+        let read = self.0.read(&mut buffer);
+        ready::ready_read(read, &buffer)
     }
 }
 
@@ -536,16 +535,46 @@ pub fn daemonize(log: &File) -> io::Result<()> {
         // nothing uses these any more.
         unsafe { CloseHandle(handle) }.ok();
     }
+    // What fails from here on is said in the log, now stderr, and the role
+    // carries on: neither stops it serving.
     // A new process group ignores Ctrl+C, and the programs a holder starts
     // would inherit that.
     // SAFETY: no handler is passed; this only clears the process's flag.
-    unsafe { SetConsoleCtrlHandler(None, false) }.ok();
+    if let Err(error) = unsafe { SetConsoleCtrlHandler(None, false) } {
+        log_line(&format!(
+            "can't let its programs take Ctrl+C (SetConsoleCtrlHandler failed: {})",
+            os(error)
+        ));
+    }
     // Leave the starter's directory, which a server running for days would
     // keep in use. The image's own directory is in use anyway.
-    if let Some(dir) = win::own_image_path().ok().as_deref().and_then(Path::parent) {
-        let _ = std::env::set_current_dir(dir);
+    match win::own_image_path() {
+        Ok(image) => {
+            if let Some(dir) = image.parent()
+                && let Err(error) = std::env::set_current_dir(dir)
+            {
+                log_line(&format!(
+                    "can't leave its starter's directory for {}: {error}",
+                    dir.display()
+                ));
+            }
+        }
+        Err(error) => log_line(&format!(
+            "can't leave its starter's directory: its own image is unknown: {error}"
+        )),
     }
     Ok(())
+}
+
+/// One line on stderr, which [`daemonize`] has pointed at the role's log.
+fn log_line(message: &str) {
+    // Not `eprintln!`, which panics when stderr can't be written to.
+    let _ = writeln!(
+        io::stderr(),
+        "{} brindle-remote[{}]: {message}",
+        crate::server::daemon::timestamp(),
+        std::process::id()
+    );
 }
 
 #[cfg(test)]
@@ -703,13 +732,25 @@ mod tests {
         ev
     }
 
+    /// A read's answer as these tests compare it: whether the role is
+    /// listening, or `None` while that isn't known. A failed read fails the
+    /// test.
+    fn listening(answer: ReadyRead) -> Option<bool> {
+        match answer {
+            ReadyRead::Pending => None,
+            ReadyRead::Listening => Some(true),
+            ReadyRead::Ended => Some(false),
+            ReadyRead::Failed(error) => panic!("reading the ready pipe failed: {error}"),
+        }
+    }
+
     /// Waits up to `limit` for the role to be listening (`Some(true)`) or
     /// gone (`Some(false)`).
     fn wait_ready(ev: &mut Loop, ready: &ReadyPipe, limit: Duration) -> Option<bool> {
         let deadline = Instant::now() + limit;
         let mut events = Vec::new();
         loop {
-            if let Some(listening) = ready.read() {
+            if let Some(listening) = listening(ready.read()) {
                 return Some(listening);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -918,7 +959,7 @@ mod tests {
         let (read, write) = ready_pipe().unwrap();
         let read = ReadyPipe(Pipe::of(Some(read), None));
         let mut ev = watch(&read);
-        assert_eq!(read.read(), None);
+        assert_eq!(listening(read.read()), None);
         let ready = Ready::from_handle(write.into_raw_handle() as usize).unwrap();
         ready.signal().unwrap();
         assert_eq!(wait_ready(&mut ev, &read, TIMEOUT), Some(true));

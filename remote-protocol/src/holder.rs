@@ -686,33 +686,66 @@ impl SessionMeta {
         serde_json::to_value(self).unwrap_or_default()
     }
 
-    /// Reads a held session's meta. Anything that isn't an object of the
-    /// expected fields gives the defaults for what's missing or malformed.
-    pub fn from_value(value: &serde_json::Value) -> Self {
+    /// Reads a held session's meta. A missing field is its default, as for
+    /// a meta an older core wrote (`process R5`). A field of the wrong type,
+    /// or a meta that isn't an object, is refused: the [`MetaFault`] names
+    /// it and keeps what was well formed.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the `Err` carries what was read, which the core adopts as it would the `Ok`, once per adopted session; a box would move it for nothing"
+    )]
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, MetaFault> {
         let Some(object) = value.as_object() else {
-            return Self::default();
+            return Err(MetaFault {
+                malformed: vec!["meta"],
+                read: Self::default(),
+            });
         };
-        fn parse<T: serde::de::DeserializeOwned + Default>(
-            object: &serde_json::Map<String, serde_json::Value>,
-            name: &str,
-        ) -> T {
-            object
-                .get(name)
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default()
-        }
-        Self {
-            command: parse(object, "command"),
-            cwd: parse(object, "cwd"),
-            key: parse(object, "key"),
+        let mut malformed = Vec::new();
+        let read = Self {
+            command: meta_field(object, "command", &mut malformed),
+            cwd: meta_field(object, "cwd", &mut malformed),
+            key: meta_field(object, "key", &mut malformed),
             layout: object.get("layout").filter(|value| !value.is_null()).cloned(),
-            owner: parse(object, "owner"),
-            policy: parse(object, "policy"),
-            profile: parse(object, "profile"),
-            scrollback: parse(object, "scrollback"),
-            started: parse(object, "started"),
+            owner: meta_field(object, "owner", &mut malformed),
+            policy: meta_field(object, "policy", &mut malformed),
+            profile: meta_field(object, "profile", &mut malformed),
+            scrollback: meta_field(object, "scrollback", &mut malformed),
+            started: meta_field(object, "started", &mut malformed),
+        };
+        if malformed.is_empty() {
+            Ok(read)
+        } else {
+            Err(MetaFault { malformed, read })
         }
     }
+}
+
+/// Field `name` of a meta: its default when it is missing, and when it has
+/// the wrong type, which is then added to `malformed`.
+fn meta_field<T: serde::de::DeserializeOwned + Default>(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &'static str,
+    malformed: &mut Vec<&'static str>,
+) -> T {
+    let Some(value) = object.get(name) else {
+        return T::default();
+    };
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        malformed.push(name);
+        T::default()
+    })
+}
+
+/// A held session's meta that [`SessionMeta::from_value`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaFault {
+    /// The fields of the wrong type, in [`SessionMeta`]'s order, or
+    /// `["meta"]` for a meta that isn't an object.
+    pub malformed: Vec<&'static str>,
+    /// What was read: the well-formed fields, and the defaults where a
+    /// field was malformed or missing.
+    pub read: SessionMeta,
 }
 
 /// A holder's answer to a `HELLO`: the version both speak, or the `ERROR` to
@@ -929,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cores_meta_has_sorted_keys_and_tolerates_anything() {
+    fn the_cores_meta_has_sorted_keys_and_reads_back() {
         let meta = SessionMeta {
             command: "bash -l".into(),
             cwd: Some("/home/u".into()),
@@ -945,7 +978,7 @@ mod tests {
             serde_json::to_string(&meta.to_value()).unwrap(),
             r#"{"command":"bash -l","cwd":"/home/u","key":"9f2c41d0","owner":"4f1c9a","policy":"detach","profile":"Shell","scrollback":10000,"started":1794000000}"#
         );
-        assert_eq!(SessionMeta::from_value(&meta.to_value()), meta);
+        assert_eq!(SessionMeta::from_value(&meta.to_value()), Ok(meta.clone()));
         // A layout sits in sorted order, kept as the client sent it.
         let laid_out = SessionMeta {
             layout: Some(serde_json::json!({"v": 1, "zones": {"key": "9f2c41d0"}})),
@@ -955,23 +988,83 @@ mod tests {
             serde_json::to_string(&laid_out.to_value()).unwrap(),
             r#"{"command":"bash -l","cwd":"/home/u","key":"9f2c41d0","layout":{"v":1,"zones":{"key":"9f2c41d0"}},"owner":"4f1c9a","policy":"detach","profile":"Shell","scrollback":10000,"started":1794000000}"#
         );
-        assert_eq!(SessionMeta::from_value(&laid_out.to_value()), laid_out);
+        assert_eq!(SessionMeta::from_value(&laid_out.to_value()), Ok(laid_out));
         let null = serde_json::json!({"layout": null, "owner": "o"});
-        assert_eq!(SessionMeta::from_value(&null).layout, None);
-        assert_eq!(SessionMeta::from_value(&samples::meta()).owner, "4f1c9a");
+        assert_eq!(SessionMeta::from_value(&null).unwrap().layout, None);
+        assert_eq!(SessionMeta::from_value(&samples::meta()).unwrap().owner, "4f1c9a");
+    }
 
-        let odd = serde_json::json!({"owner": 7, "policy": "kill", "later": [1]});
+    #[test]
+    fn a_missing_field_is_its_default() {
+        assert_eq!(
+            SessionMeta::from_value(&serde_json::json!({})),
+            Ok(SessionMeta::default())
+        );
+        // An older core's meta, without the fields added since, and one
+        // with a field a later core added.
+        let older = serde_json::json!({
+            "owner": "4f1c9a",
+            "policy": "detach",
+            "scrollback": 100,
+            "later": [1],
+        });
+        assert_eq!(
+            SessionMeta::from_value(&older),
+            Ok(SessionMeta {
+                owner: "4f1c9a".into(),
+                policy: crate::client::Policy::Detach,
+                scrollback: 100,
+                ..SessionMeta::default()
+            })
+        );
+        // `null` leaves an optional field unset.
+        let unset = serde_json::json!({"cwd": null, "profile": null, "layout": null});
+        assert_eq!(SessionMeta::from_value(&unset), Ok(SessionMeta::default()));
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_is_named_and_the_rest_kept() {
+        let odd = serde_json::json!({
+            "command": "bash",
+            "key": "9f2c41d0",
+            "owner": 7,
+            "policy": "later",
+            "scrollback": -1,
+        });
         assert_eq!(
             SessionMeta::from_value(&odd),
-            SessionMeta {
-                policy: crate::client::Policy::Kill,
-                ..SessionMeta::default()
-            }
+            Err(MetaFault {
+                malformed: vec!["owner", "policy", "scrollback"],
+                read: SessionMeta {
+                    command: "bash".into(),
+                    key: "9f2c41d0".into(),
+                    ..SessionMeta::default()
+                },
+            })
         );
-        assert_eq!(
-            SessionMeta::from_value(&serde_json::Value::Null),
-            SessionMeta::default()
-        );
+        let fault = SessionMeta::from_value(&serde_json::json!({"key": [1], "started": "now"}))
+            .unwrap_err();
+        assert_eq!(fault.malformed, ["key", "started"]);
+        assert_eq!(fault.read, SessionMeta::default());
+    }
+
+    #[test]
+    fn a_non_object_meta_is_refused() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("owner"),
+            serde_json::json!([{"owner": "o"}]),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                SessionMeta::from_value(&value),
+                Err(MetaFault {
+                    malformed: vec!["meta"],
+                    read: SessionMeta::default(),
+                }),
+                "{value}"
+            );
+        }
     }
 
     #[test]

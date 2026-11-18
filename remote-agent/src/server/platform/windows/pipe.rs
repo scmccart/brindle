@@ -981,8 +981,10 @@ impl Pipe {
     }
 
     /// Whether the peer has sent bytes this side hasn't taken: read into the
-    /// buffer, or waiting in the pipe.
-    pub(super) fn input_waiting(&self) -> bool {
+    /// buffer, or waiting in the pipe. An error is the port's, taking the
+    /// read in flight's packet, or `PeekNamedPipe`'s (a pipe whose peer is
+    /// gone).
+    pub(super) fn input_waiting(&self) -> io::Result<bool> {
         let buffered = |state: &State| {
             state
                 .reader
@@ -993,29 +995,30 @@ impl Pipe {
             let mut state = self.shared.lock();
             state.settle(&self.shared);
             if buffered(&state) {
-                return true;
+                return Ok(true);
             }
             state.due(Direction::Read)
         };
         // The read in flight may have taken the bytes already.
         if let Some(port) = port {
-            let _ = port.pump(Duration::ZERO);
+            port.pump(Duration::ZERO)?;
         }
         let state = self.shared.lock();
         if buffered(&state) {
-            return true;
+            return Ok(true);
         }
         let Some(handle) = state
             .reader
             .as_ref()
             .and_then(|reader| reader.handle.as_deref())
         else {
-            return false;
+            return Ok(false);
         };
         let mut waiting = 0u32;
         // SAFETY: the handle is open, and only the count is asked for.
-        unsafe { PeekNamedPipe(raw(handle), None, 0, None, Some(&mut waiting), None) }.is_ok()
-            && waiting > 0
+        unsafe { PeekNamedPipe(raw(handle), None, 0, None, Some(&mut waiting), None) }
+            .map_err(|error| os_error(win32(&error)))?;
+        Ok(waiting > 0)
     }
 
     /// How many bytes written here the pipe hasn't taken yet.
@@ -1444,7 +1447,7 @@ mod tests {
             }]
         );
         assert_eq!(input_peer.write(b"in").unwrap(), 2);
-        turn_until(&mut ev, || pipe.input_waiting());
+        turn_until(&mut ev, || pipe.input_waiting().unwrap());
         assert_eq!(read_exactly(&pipe, 2), b"in");
         assert_eq!(pipe.write(b"out").unwrap(), 3);
         assert_eq!(read_exactly(&output_peer, 3), b"out");
@@ -1460,7 +1463,7 @@ mod tests {
             io::ErrorKind::BrokenPipe
         );
         assert_eq!(input_peer.write(b"more").unwrap(), 4);
-        turn_until(&mut ev, || pipe.input_waiting());
+        turn_until(&mut ev, || pipe.input_waiting().unwrap());
         assert_eq!(read_exactly(&pipe, 4), b"more");
         // An end that can't be read from or written to says so.
         assert_eq!(

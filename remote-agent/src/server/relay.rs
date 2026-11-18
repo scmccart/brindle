@@ -64,6 +64,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{self, Hello, Request, ToClient, ToCore, Welcome};
+use brindle_remote_protocol::ready::ReadyRead;
 use brindle_remote_protocol::relay::{self, RelayError, RelayHost, RelayMessage};
 use brindle_remote_protocol::upgrade::{self, Build};
 use brindle_remote_protocol::{FRAME_STREAM_MARKER, Frame, HEARTBEAT_INTERVAL, scope, server_dir};
@@ -209,7 +210,7 @@ impl Output {
 /// The core, reached.
 struct Reached {
     dir: PathBuf,
-    build: Option<String>,
+    build: Result<String, String>,
     log: Log,
     /// The client's connection to the core, before its `HELLO`.
     core: UnixStream,
@@ -235,7 +236,7 @@ impl Reached {
             .unwrap_or_default();
         RelayHost {
             version: env!("CARGO_PKG_VERSION").into(),
-            build: self.build.clone().unwrap_or_default(),
+            build: host_build(&self.build).to_string(),
             env,
             shell,
             home,
@@ -243,6 +244,12 @@ impl Reached {
             core_pid: self.core_pid,
         }
     }
+}
+
+/// The build id `RELAY_HOST` carries: this binary's, or `""`, the wire's
+/// "unknown" (`process R5`), when it couldn't be read.
+fn host_build(build: &Result<String, String>) -> &str {
+    build.as_deref().unwrap_or_default()
 }
 
 /// Resolves the server directory, reaches the core (starting or upgrading
@@ -253,9 +260,14 @@ fn reach() -> Result<Reached, String> {
     let server = Server {
         socket: dir.join(server_dir::CORE_SOCKET),
         log: Log(dir.join(server_dir::CORE_LOG)),
-        build: build_id::current().ok(),
+        build: build_id::current().map_err(|error| error.to_string()),
         dir,
     };
+    if let Err(error) = &server.build {
+        server.log.line(format_args!(
+            "can't read its own build id, so it offers no upgrade and tells the client none: {error}"
+        ));
+    }
     let failure = |problem: String| {
         format!(
             "terminal server unreachable: {problem}; its log is {}",
@@ -282,9 +294,9 @@ struct Server {
     dir: PathBuf,
     socket: PathBuf,
     log: Log,
-    /// This binary's build id, `None` if it can't be read (then no upgrade
-    /// is offered).
-    build: Option<String>,
+    /// This binary's build id, or why it can't be read (then no upgrade is
+    /// offered, and the log says so once).
+    build: Result<String, String>,
 }
 
 /// A connection of the relay's own to the core, past `HELLO`.
@@ -374,23 +386,28 @@ impl Server {
         .map_err(|error| format!("can't start the core: {error}"))?;
         let (mut child, mut ready, program) = (started.child, started.ready, started.program);
         let ready = ready.wait(START_LIMIT);
-        if ready.is_none() {
+        if matches!(ready, ReadyRead::Pending) {
             // A starter that hasn't detached the core by now won't.
             let _ = child.kill();
         }
         let output = child.wait_with_output();
-        if ready == Some(true) {
-            return Ok(());
-        }
+        // What the pipe says beside what the starter said, if anything.
+        let pipe = match ready {
+            ReadyRead::Listening => return Ok(()),
+            ReadyRead::Ended => None,
+            ReadyRead::Pending => Some(format!("no ready signal within {} s", START_LIMIT.as_secs())),
+            ReadyRead::Failed(error) => Some(format!("reading the ready pipe failed: {error}")),
+        };
         let said = output
             .as_ref()
             .map(|output| String::from_utf8_lossy(&output.stderr).trim().to_string())
             .unwrap_or_default();
-        let reason = match (said.as_str(), ready, &output) {
-            ("", None, _) => format!("no ready signal within {} s", START_LIMIT.as_secs()),
-            ("", _, Ok(output)) => format!("it exited ({})", output.status),
-            ("", _, Err(error)) => error.to_string(),
-            (said, _, _) => said.to_string(),
+        let reason = match (said.as_str(), pipe, &output) {
+            ("", Some(pipe), _) => pipe,
+            ("", None, Ok(output)) => format!("it exited ({})", output.status),
+            ("", None, Err(error)) => error.to_string(),
+            (said, None, _) => said.to_string(),
+            (said, Some(pipe), _) => format!("{said}; {pipe}"),
         };
         Err(format!(
             "the core didn't start ({} serve): {reason}",
@@ -401,7 +418,7 @@ impl Server {
     /// Replaces the core behind `probe` with this binary's when it is newer
     /// (see the module docs), and returns a probe of the core to relay to.
     fn offer_upgrade(&self, probe: Probe) -> Result<Probe, String> {
-        let (Some(welcome), Some(build)) = (&probe.welcome, &self.build) else {
+        let (Some(welcome), Ok(build)) = (&probe.welcome, &self.build) else {
             return Ok(probe);
         };
         let own = Build {
@@ -744,6 +761,13 @@ fn heartbeats(output: &Output, every: Duration, ended: &Sender<End>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_build_id_is_sent_as_unknown() {
+        let unreadable = Err("can't read /proc/self/exe: permission denied".to_string());
+        assert_eq!(host_build(&unreadable), "");
+        assert_eq!(host_build(&Ok("4f2a91".to_string())), "4f2a91");
+    }
 
     fn outcome(decision: scope::Decision, user_manager: bool) -> scope::Outcome {
         scope::Outcome {

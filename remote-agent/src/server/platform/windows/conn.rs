@@ -111,8 +111,8 @@ impl Stream {
     }
 
     /// Whether bytes are waiting to be read: taken from the pipe already,
-    /// or still in it.
-    pub fn input_waiting(&self) -> bool {
+    /// or still in it. An error is the port's or the pipe's, from asking.
+    pub fn input_waiting(&self) -> io::Result<bool> {
         self.pipe.input_waiting()
     }
 
@@ -497,14 +497,14 @@ pub(super) mod tests {
         let error = a.read(&mut buffer).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() >= Duration::from_millis(45));
-        assert!(!a.input_waiting());
+        assert!(!a.input_waiting().unwrap());
 
         // The read that timed out is still in flight, and gets what comes.
         b.write_all(b"late").unwrap();
-        assert!(a.input_waiting());
+        assert!(a.input_waiting().unwrap());
         assert_eq!(a.read(&mut buffer).unwrap(), 4);
         assert_eq!(&buffer[..4], b"late");
-        assert!(!a.input_waiting());
+        assert!(!a.input_waiting().unwrap());
 
         a.set_read_timeout(None).unwrap();
         let writer = thread::spawn(move || {
@@ -521,25 +521,25 @@ pub(super) mod tests {
         let (mut a, b) = Stream::pair().unwrap();
         b.set_nonblocking().unwrap();
         let mut b = b;
-        assert!(!b.input_waiting());
+        assert!(!b.input_waiting().unwrap());
         a.write_all(b"abc").unwrap();
-        assert!(b.input_waiting(), "in the pipe, with no read issued");
+        assert!(b.input_waiting().unwrap(), "in the pipe, with no read issued");
         let mut byte = [0u8; 1];
         assert_eq!(b.read(&mut byte).unwrap(), 1);
-        assert!(b.input_waiting(), "read from the pipe, not yet taken");
+        assert!(b.input_waiting().unwrap(), "read from the pipe, not yet taken");
         assert_eq!(b.read(&mut byte).unwrap(), 1);
         assert_eq!(b.read(&mut byte).unwrap(), 1);
-        assert!(!b.input_waiting());
+        assert!(!b.input_waiting().unwrap());
 
         // Registered, the read in flight takes the bytes at once.
         let mut ev = Loop::new().unwrap();
         ev.register(&b.source(), 1, Interest::NONE).unwrap();
-        assert!(!b.input_waiting());
+        assert!(!b.input_waiting().unwrap());
         a.write_all(b"de").unwrap();
-        assert!(b.input_waiting(), "taken by the read in flight");
+        assert!(b.input_waiting().unwrap(), "taken by the read in flight");
         assert_eq!(b.read(&mut byte).unwrap(), 1);
         assert_eq!(b.read(&mut byte).unwrap(), 1);
-        assert!(!b.input_waiting());
+        assert!(!b.input_waiting().unwrap());
         assert_eq!(
             b.read(&mut byte).unwrap_err().kind(),
             io::ErrorKind::WouldBlock

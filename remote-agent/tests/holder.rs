@@ -283,24 +283,11 @@ fn a_new_holder_is_detached_and_welcomes_its_first_core() {
         session: 9,
         hwnd: 1,
     }));
-    // REPARENT is Windows-only.
-    #[cfg(unix)]
-    match core.recv() {
-        ToCore::Error(error) => {
-            assert_eq!(
-                (error.session, error.message.as_str()),
-                (Some(9), "unsupported")
-            )
-        }
-        other => panic!("{other:?}"),
-    }
-    // There it is advisory: a session that is gone gets no answer, so the
-    // next message is the next request's.
-    #[cfg(windows)]
-    {
-        core.spawn(programs::exits(1, 0));
-        assert_eq!(core.exit_code(1), Some(0));
-    }
+    // REPARENT is advisory, and does something only on Windows: no answer
+    // either way (what it came to is the holder's log's), so the next
+    // message is the next request's.
+    core.spawn(programs::exits(1, 0));
+    assert_eq!(core.exit_code(1), Some(0));
 }
 
 #[cfg(unix)]

@@ -46,9 +46,13 @@ impl Conn {
     }
 
     /// Whether the peer has sent more than this side has read: bytes are
-    /// waiting in the socket, or part of a frame was read.
-    pub fn input_waiting(&self) -> bool {
-        self.input.len() > self.input_start || self.stream.input_waiting()
+    /// waiting in the socket, or part of a frame was read. An error is the
+    /// stream's, from asking it.
+    pub fn input_waiting(&self) -> io::Result<bool> {
+        if self.input.len() > self.input_start {
+            return Ok(true);
+        }
+        self.stream.input_waiting()
     }
 
     /// Reads what the socket has, up to a budget. Returns `true` at EOF.
@@ -372,13 +376,13 @@ mod tests {
         assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[0]));
         assert_eq!(receiver.next_frame().unwrap(), None);
         assert!(receiver.input.is_empty(), "read past the limit");
-        assert!(receiver.input_waiting(), "the rest is in the socket");
+        assert!(receiver.input_waiting().unwrap(), "the rest is in the socket");
         // A limit past what the socket holds takes all of it, and stops
         // there: the peer is still connected.
         assert!(!receiver.read_up_to(usize::MAX).unwrap());
         assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[1]));
         assert_eq!(receiver.next_frame().unwrap().as_ref(), Some(&frames[2]));
-        assert!(!receiver.input_waiting());
+        assert!(!receiver.input_waiting().unwrap());
         drop(sender);
         assert!(receiver.read_up_to(usize::MAX).unwrap(), "EOF");
     }
@@ -387,18 +391,18 @@ mod tests {
     fn input_waiting_sees_unread_bytes_and_partial_frames() {
         let (mut a, b) = Stream::pair().unwrap();
         let mut receiver = Conn::new(b).unwrap();
-        assert!(!receiver.input_waiting());
+        assert!(!receiver.input_waiting().unwrap());
         let frame = [1, 0, 0, 0, 2, b'h', b'i'];
         a.write_all(&frame).unwrap();
-        assert!(receiver.input_waiting(), "unread in the socket");
+        assert!(receiver.input_waiting().unwrap(), "unread in the socket");
         receiver.read_available().unwrap();
-        assert!(receiver.input_waiting(), "read, but not taken as a frame");
+        assert!(receiver.input_waiting().unwrap(), "read, but not taken as a frame");
         assert!(receiver.next_frame().unwrap().is_some());
-        assert!(!receiver.input_waiting());
+        assert!(!receiver.input_waiting().unwrap());
         a.write_all(&frame[..3]).unwrap();
         receiver.read_available().unwrap();
         assert!(receiver.next_frame().unwrap().is_none());
-        assert!(receiver.input_waiting(), "part of a frame");
+        assert!(receiver.input_waiting().unwrap(), "part of a frame");
     }
 
     #[test]

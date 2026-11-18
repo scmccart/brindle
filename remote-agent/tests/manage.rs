@@ -121,6 +121,25 @@ fn with_no_server_running_nothing_is_printed_and_nothing_starts() {
 }
 
 #[test]
+fn a_failed_command_names_its_action() {
+    let dir = TempDir::new("cli-file");
+    // The server directory is a file: there may be a server, but it can't
+    // be reached, which isn't "no server".
+    let file = dir.path.join("server");
+    std::fs::write(&file, b"").unwrap();
+    let output = cli(&file, &["list"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let text = stderr(&output);
+    let prefix = "can't read the server directory ";
+    assert!(text.contains(prefix), "{text}");
+    // Then the system's own words for the failure, after the path.
+    let (_, cause) = text.split_once(prefix).unwrap().1.split_once(": ").unwrap();
+    assert!(!cause.trim().is_empty(), "{text}");
+    assert!(file.is_file(), "the file was left alone");
+}
+
+#[test]
 fn list_shows_one_line_per_session() {
     let began = std::time::Instant::now();
     let (dir, mut client) = core("cli-list");

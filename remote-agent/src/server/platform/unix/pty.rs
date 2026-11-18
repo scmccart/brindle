@@ -11,7 +11,7 @@ use std::process::Child;
 use brindle_term_core::shell_integration::PathStyle;
 
 use super::event_loop::{Source, Waker};
-use crate::pty::{self, PtyCommand};
+use crate::pty::{self, PtyCommand, Reparented};
 
 /// How the programs on these PTYs spell the directories they report (OSC
 /// 7), for the core's emulators.
@@ -110,10 +110,10 @@ impl Program {
     }
 }
 
-/// Refuses to give the console window of `program`'s session an owner
-/// window (`REPARENT`): that is for Windows.
-pub fn reparent(_program: Option<&Program>, _hwnd: u64) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))
+/// Giving the console window of `program`'s session an owner window
+/// (`REPARENT`) is for Windows: a terminal has no console window here.
+pub fn reparent(_program: Option<&Program>, _hwnd: u64) -> io::Result<Reparented> {
+    Ok(Reparented::Unsupported)
 }
 
 /// The process group a session's program leads. It outlives the program:
@@ -127,18 +127,32 @@ impl Group {
         pty::signal_process_group(self.0, libc::SIGHUP);
     }
 
-    /// Sends `SIGKILL`.
-    pub fn kill(self) {
-        pty::signal_process_group(self.0, libc::SIGKILL);
+    /// Sends `SIGKILL`. How many it ended, as far as Linux counts: the
+    /// group, so 1, or 0 for one with no members left. An error when the
+    /// signal can't be sent.
+    pub fn kill(self) -> io::Result<usize> {
+        if self.0 <= 0 {
+            return Ok(0);
+        }
+        // SAFETY: a plain call, signalling the group.
+        if unsafe { libc::kill(-self.0, libc::SIGKILL) } == 0 {
+            return Ok(1);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(0),
+            _ => Err(error),
+        }
     }
 
-    /// Sends `SIGKILL` if the group still has members. A group id can't be
-    /// reused while it has, the reaped leader's children that ignored
-    /// `SIGHUP` included.
-    pub fn kill_remaining(self) {
+    /// Sends `SIGKILL` if the group still has members, counted as
+    /// [`Group::kill`] counts it. A group id can't be reused while it has,
+    /// the reaped leader's children that ignored `SIGHUP` included.
+    pub fn kill_remaining(self) -> io::Result<usize> {
         if self.0 > 0 && unsafe { libc::kill(-self.0, 0) } == 0 {
-            self.kill();
+            return self.kill();
         }
+        Ok(0)
     }
 }
 

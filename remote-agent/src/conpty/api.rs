@@ -1,7 +1,7 @@
 //! Which ConPTY: the packaged one this binary embeds, or the one built
 //! into Windows.
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -46,61 +46,62 @@ pub(super) struct Api {
 }
 
 /// The ConPTY for a new pseudoconsole: the one built into Windows when
-/// `inbox`, or when the packaged one can't be used. Each is resolved the
-/// first time it is asked for, and the packaged one's failure is logged
-/// then, once.
+/// `inbox`, or when the packaged one can't be used. The built-in one is
+/// resolved once. The packaged one is kept once it loads, and a failure to
+/// load it is said in the log (the holder's stderr) and tried again for the
+/// next pseudoconsole, since an extraction or a load can work later. A
+/// build that embeds none says so once.
 pub(super) fn api(inbox: bool) -> &'static Api {
-    static PACKAGED: OnceLock<Option<Api>> = OnceLock::new();
+    static PACKAGED: OnceLock<Api> = OnceLock::new();
     static INBOX: OnceLock<Api> = OnceLock::new();
     static ASKED: Once = Once::new();
+    static UNPACKAGED: Once = Once::new();
     if inbox {
         ASKED.call_once(|| {
             eprintln!(
                 "conpty: BRINDLE_CONPTY=inbox: such sessions use the ConPTY built into Windows"
             );
         });
-    } else if let Some(api) = PACKAGED.get_or_init(packaged) {
-        return api;
+    } else if bundle::FILES.is_none() {
+        // Nothing to try again: the build has no packaged ConPTY.
+        UNPACKAGED.call_once(|| {
+            eprintln!(
+                "conpty: this build embeds no ConPTY (run scripts/fetch-conpty.ps1 before \
+                 building): sessions use the ConPTY built into Windows, which repaints output \
+                 and drops mouse modes"
+            );
+        });
+    } else {
+        match choice::cached_ok(&PACKAGED, packaged) {
+            Ok(api) => return api,
+            Err(why) => eprintln!(
+                "conpty: the packaged ConPTY {} isn't usable ({why}): this session uses the \
+                 ConPTY built into Windows, and the next one tries it again",
+                bundle::VERSION
+            ),
+        }
     }
     INBOX.get_or_init(inbox_api)
 }
 
-/// The packaged ConPTY, or `None` after saying why it isn't usable.
-fn packaged() -> Option<Api> {
+/// The packaged ConPTY, or why it isn't usable. Its success says where it
+/// loaded from in the log; a failure is the caller's to say.
+fn packaged() -> Result<Api, String> {
     let version = bundle::VERSION;
     let Some(files) = bundle::FILES else {
-        eprintln!(
-            "conpty: this build embeds no ConPTY (run scripts/fetch-conpty.ps1 before building): \
-             sessions use the ConPTY built into Windows, which repaints output and drops mouse modes"
-        );
-        return None;
+        return Err("this build embeds none".to_string());
     };
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     let extract_dir = choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version);
-    let loaded =
-        shipped_dir(exe_dir.as_deref(), extract_dir.as_deref(), files).and_then(|dir| {
-            load(&dir)
-                .map(|api| (api, dir))
-                .map_err(|err| format!("loading it: {err}"))
-        });
-    match loaded {
-        Ok((api, dir)) => {
-            eprintln!(
-                "conpty: sessions use ConPTY {version} from {}",
-                dir.display()
-            );
-            Some(api)
-        }
-        Err(why) => {
-            eprintln!(
-                "conpty: the packaged ConPTY {version} isn't usable ({why}): sessions use the \
-                 ConPTY built into Windows"
-            );
-            None
-        }
-    }
+    let dir = shipped_dir(exe_dir.as_deref(), extract_dir.as_deref(), files)?;
+    let api = load(&dir).map_err(|err| format!("loading it from {}: {err}", dir.display()))?;
+    eprintln!(
+        "conpty: sessions use ConPTY {version} from {}",
+        dir.display()
+    );
+    Ok(api)
 }
 
 /// Where to load the packaged ConPTY from: `exe_dir` when both files there
@@ -159,14 +160,24 @@ fn load(dir: &Path) -> io::Result<Api> {
     // SAFETY: the signatures are those `conpty.h` declares for these names.
     unsafe {
         Ok(Api {
-            create: function(module, s!("ConptyCreatePseudoConsole")).ok_or_else(missing)?,
-            resize: function(module, s!("ConptyResizePseudoConsole")).ok_or_else(missing)?,
-            close: function(module, s!("ConptyClosePseudoConsole")).ok_or_else(missing)?,
+            create: required(module, c"ConptyCreatePseudoConsole")?,
+            resize: required(module, c"ConptyResizePseudoConsole")?,
+            close: required(module, c"ConptyClosePseudoConsole")?,
             release: function(module, s!("ConptyReleasePseudoConsole")),
             reparent: function(module, s!("ConptyReparentPseudoConsole")),
             packaged: true,
         })
     }
+}
+
+/// The export `name` of `module`, or an error naming it.
+///
+/// # Safety
+/// `F` must be the export's real function type.
+unsafe fn required<F: Copy>(module: HMODULE, name: &CStr) -> io::Result<F> {
+    // SAFETY: the caller names the export's type; `name` is NUL-terminated.
+    unsafe { function(module, PCSTR(name.as_ptr().cast())) }
+        .ok_or_else(|| choice::missing(&name.to_string_lossy()))
 }
 
 fn inbox_api() -> Api {
@@ -183,13 +194,6 @@ fn inbox_api() -> Api {
             packaged: false,
         }
     }
-}
-
-fn missing() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotFound,
-        "conpty.dll lacks a pseudoconsole function",
-    )
 }
 
 /// # Safety

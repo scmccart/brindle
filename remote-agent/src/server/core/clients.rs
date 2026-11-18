@@ -124,9 +124,9 @@ impl<L: EventLoop> Core<L> {
                 match ToCore::decode(&frame) {
                     Ok(ToCore::Hello(hello)) => self.welcome(token, conn, hello),
                     _ => {
-                        queue(
+                        queue_or_log(
                             &mut conn,
-                            error(None, None, "the first message must be HELLO"),
+                            &error(None, None, "the first message must be HELLO"),
                         );
                         refuse(&mut conn);
                         self.drop_source(token);
@@ -152,7 +152,7 @@ impl<L: EventLoop> Core<L> {
                     hello.client_version,
                     refusal.message
                 );
-                queue(&mut conn, ToClient::Error(refusal));
+                queue_or_log(&mut conn, &ToClient::Error(refusal));
                 refuse(&mut conn);
                 self.drop_source(token);
                 return;
@@ -165,9 +165,9 @@ impl<L: EventLoop> Core<L> {
             .collect();
         holder_protocols.sort_unstable();
         holder_protocols.dedup();
-        queue(
+        queue_or_log(
             &mut conn,
-            ToClient::Welcome(Welcome {
+            &ToClient::Welcome(Welcome {
                 protocol,
                 core_version: env!("CARGO_PKG_VERSION").into(),
                 core_build: self.build.clone(),
@@ -318,7 +318,14 @@ impl<L: EventLoop> Core<L> {
         if entry.failed {
             return;
         }
-        queue(&mut entry.conn, message);
+        if let Err(failure) = queue(&mut entry.conn, &message) {
+            // An `ERROR` for the same request and session in its place.
+            let replacement = unsendable(&message, &failure);
+            log!("client {client}: {}", unsendable_text(&message, &failure));
+            if let Err(failure) = queue(&mut entry.conn, &replacement) {
+                log!("client {client}: {}", unsendable_text(&replacement, &failure));
+            }
+        }
         if entry.conn.queued() >= EAGER_FLUSH {
             // A failure shows again in the loop's own flush, which drops
             // the client there.
@@ -399,11 +406,55 @@ pub(super) fn error(
     })
 }
 
-fn queue(conn: &mut Conn, message: ToClient) {
-    match message.encode() {
-        Ok(frame) => conn.queue(&frame),
-        Err(error) => log!("can't encode a message: {error}"),
+/// Queues `message` on the client's connection, or returns why it can't be
+/// encoded (a payload over the frame limit, say).
+fn queue(conn: &mut Conn, message: &ToClient) -> io::Result<()> {
+    conn.queue(&message.encode()?);
+    Ok(())
+}
+
+/// Queues a message for a connection still in its handshake, which has no
+/// request or session to answer for; one that can't be encoded is logged.
+fn queue_or_log(conn: &mut Conn, message: &ToClient) {
+    if let Err(error) = queue(conn, message) {
+        log!("{}", unsendable_text(message, &error));
     }
+}
+
+/// The `ERROR` a client gets in place of `message`, which `failure` kept
+/// from being encoded: for the same request and session, and always small.
+pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
+    let (req, session) = match message {
+        ToClient::Welcome(_) => (None, None),
+        ToClient::Error(m) => (m.req, m.session),
+        ToClient::Spawned(m) => (Some(m.req), Some(m.session)),
+        ToClient::Data(m) => (None, Some(m.session)),
+        ToClient::Exit(m) => (None, Some(m.session)),
+        ToClient::ReplayStart(m) => (m.req, Some(m.session)),
+        ToClient::ReplayEnd(m) => (None, Some(m.session)),
+        ToClient::Sessions(m) => (Some(m.req), None),
+        ToClient::ServerStatus(m) => (Some(m.req), None),
+        ToClient::Ok(m) => (Some(m.req), None),
+        ToClient::Process(m) => (None, Some(m.session)),
+    };
+    error(req, session, unsendable_text(message, failure))
+}
+
+fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
+    let what = match message {
+        ToClient::Welcome(_) => "WELCOME",
+        ToClient::Error(_) => "error",
+        ToClient::Spawned(_) => "answer to the spawn",
+        ToClient::Data(_) => "output",
+        ToClient::Exit(_) => "exit",
+        ToClient::ReplayStart(_) => "replay",
+        ToClient::ReplayEnd(_) => "replay's end",
+        ToClient::Sessions(_) => "session list",
+        ToClient::ServerStatus(_) => "status",
+        ToClient::Ok(_) => "answer",
+        ToClient::Process(_) => "process info",
+    };
+    format!("the terminal server couldn't send its {what}: {failure}")
 }
 
 /// Closes a refused connection gracefully, within [`REFUSAL_CLOSE_LIMIT`]:
@@ -413,5 +464,46 @@ fn queue(conn: &mut Conn, message: ToClient) {
 fn refuse(conn: &mut Conn) {
     if let Err(error) = conn.close_for(REFUSAL_CLOSE_LIMIT) {
         log!("a refused client didn't close in time: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brindle_remote_protocol::MAX_FRAME_PAYLOAD_SIZE;
+    use brindle_remote_protocol::client::{Data, SessionInfo, Sessions};
+
+    use super::*;
+
+    #[test]
+    fn an_unencodable_reply_is_replaced_by_an_error_for_its_request() {
+        let reply = ToClient::Sessions(Sessions {
+            req: 9,
+            sessions: vec![SessionInfo {
+                command: "x".repeat(MAX_FRAME_PAYLOAD_SIZE),
+                ..SessionInfo::default()
+            }],
+        });
+        let failure = reply.encode().unwrap_err();
+        let replacement = unsendable(&reply, &failure);
+        assert_eq!(
+            replacement,
+            error(
+                Some(9),
+                None,
+                format!("the terminal server couldn't send its session list: {failure}")
+            )
+        );
+        assert!(replacement.encode().is_ok());
+
+        // A session's message is replaced for that session.
+        let output = ToClient::Data(Data {
+            session: 3,
+            bytes: vec![b'x'; MAX_FRAME_PAYLOAD_SIZE + 1],
+        });
+        let failure = output.encode().unwrap_err();
+        let ToClient::Error(replacement) = unsendable(&output, &failure) else {
+            panic!("not an ERROR");
+        };
+        assert_eq!((replacement.req, replacement.session), (None, Some(3)));
     }
 }

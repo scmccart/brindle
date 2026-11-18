@@ -76,7 +76,7 @@ use super::pipe::Pipe;
 use crate::conpty::cmdline::{self, launch_line};
 use crate::conpty::hosts::{self, HostSeen, Listed};
 use crate::conpty::{Process, Pseudoconsole, choice};
-use crate::pty::PtyCommand;
+use crate::pty::{PtyCommand, Reparented};
 
 /// How the programs on these pseudoconsoles spell the directories they
 /// report (OSC 9;9's `C:\src`, OSC 7's `/C:/src`), for the core's
@@ -235,10 +235,10 @@ impl Group {
     }
 
     /// Hangs the console's processes up, and ends them and the root process
-    /// at once.
-    pub fn kill(&self) {
+    /// at once, as [`Group::kill_remaining`] does and counts.
+    pub fn kill(&self) -> io::Result<usize> {
         self.hang_up();
-        self.kill_remaining();
+        self.kill_remaining()
     }
 
     /// Ends what a hang-up left running: every process still on the
@@ -246,13 +246,18 @@ impl Group {
     /// the programs on the console as it goes out, so one that connected
     /// just after it was never told, and the host stays for it. When Windows
     /// doesn't say which host the root was on, only the root is ended.
-    pub fn kill_remaining(&self) {
-        if let Some(host) = self.host() {
-            host.end_its_programs();
-        }
+    ///
+    /// How many processes on the host it ended, the root aside; an error
+    /// when they couldn't be listed (the root is ended all the same).
+    pub fn kill_remaining(&self) -> io::Result<usize> {
+        let ended = match self.host() {
+            Some(host) => host.end_its_programs(),
+            None => Ok(0),
+        };
         // Fails for a process that has exited, which is as wanted.
         // SAFETY: the handle is open and may terminate the process.
         let _ = unsafe { TerminateProcess(raw(self.root.handle()), KILLED) };
+        ended
     }
 
     /// The session's console host, if it still runs: the one the root
@@ -287,12 +292,11 @@ struct Host {
 }
 
 impl Host {
-    /// Terminates every process on this console host. Which ones are is
-    /// [`hosts`]'s.
-    fn end_its_programs(&self) {
-        let Ok(processes) = processes() else {
-            return;
-        };
+    /// Terminates every process on this console host, and says how many it
+    /// did. Which ones are is [`hosts`]'s. An error when the processes
+    /// can't be listed (the Toolhelp snapshot failed), which ends none.
+    fn end_its_programs(&self) -> io::Result<usize> {
+        let processes = processes()?;
         let snapshot: Vec<Listed> = processes
             .iter()
             .map(|entry| Listed {
@@ -302,9 +306,10 @@ impl Host {
             .collect();
         let own = std::process::id();
         if !hosts::is_ours(&snapshot, self.seen.pid, own) {
-            return;
+            return Ok(0);
         }
         let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        let mut ended = 0;
         for pid in hosts::candidates(&snapshot, self.seen.pid, own) {
             // Asked and terminated through one handle, so it is one process.
             let Some(process) = open_process(pid, access) else {
@@ -312,11 +317,15 @@ impl Host {
             };
             let on = crate::conpty::console_host(process.as_handle());
             let started = start_time(process.as_handle()).ok();
-            if hosts::ends(on, started, &self.seen) {
-                // SAFETY: the handle is open and may terminate the process.
-                let _ = unsafe { TerminateProcess(raw(process.as_handle()), KILLED) };
+            // One that exited meanwhile fails, which is as wanted.
+            // SAFETY: the handle is open and may terminate the process.
+            if hosts::ends(on, started, &self.seen)
+                && unsafe { TerminateProcess(raw(process.as_handle()), KILLED) }.is_ok()
+            {
+                ended += 1;
             }
         }
+        Ok(ended)
     }
 }
 
@@ -352,17 +361,18 @@ fn processes() -> io::Result<Vec<PROCESSENTRY32W>> {
 }
 
 /// Makes the window `hwnd` the owner of the console window of `program`'s
-/// session (`REPARENT`). It is advisory: nothing happens for a session that
-/// is gone (`None`) or whose pseudoconsole has closed, or with the ConPTY
-/// built into Windows, which logs that once. The host applies it a moment
-/// later, and a failure is only logged.
-pub fn reparent(program: Option<&Program>, hwnd: u64) -> io::Result<()> {
-    if let Some(program) = program
-        && let Some(console) = console(&program.console).as_ref()
-    {
-        console.reparent(hwnd);
+/// session (`REPARENT`). It is advisory: a session that is gone (`None`) or
+/// whose pseudoconsole has closed has nothing to give an owner, which is
+/// `Done`. The ConPTY built into Windows can't (`Unsupported`), and the
+/// host applies it a moment later. The caller logs what isn't `Done`.
+pub fn reparent(program: Option<&Program>, hwnd: u64) -> io::Result<Reparented> {
+    let Some(program) = program else {
+        return Ok(Reparented::Done);
+    };
+    match console(&program.console).as_ref() {
+        Some(console) => console.reparent(hwnd).map_err(plain),
+        None => Ok(Reparented::Done),
     }
-    Ok(())
 }
 
 /// A session's foreground program, for the core's `PROCESS` reports: none
@@ -987,12 +997,12 @@ mod tests {
         session.until("ready>");
         other.until("ready>");
         let group = session.program.group();
-        group.kill_remaining();
+        group.kill_remaining().unwrap();
         let (_, code) = session.finish();
         assert_eq!(code, KILLED as i32);
         // Again, once its program and host are gone, and with a hang-up.
-        group.kill_remaining();
-        group.kill();
+        group.kill_remaining().unwrap();
+        group.kill().unwrap();
         // The other session's console has another host.
         assert!(other.program.try_wait().unwrap().is_none());
         other.send("exit 4\r");
@@ -1022,7 +1032,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         // Nothing remains, and the pid may be another process's by now.
-        group.kill_remaining();
+        group.kill_remaining().unwrap();
         assert_ne!(program.try_wait().unwrap().unwrap().code, Some(KILLED as i32));
     }
 
@@ -1080,7 +1090,9 @@ mod tests {
 
     impl Drop for Leftovers {
         fn drop(&mut self) {
-            self.group.kill();
+            // A test's cleanup: what it can't end, the next round's checks
+            // find.
+            let _ = self.group.kill();
             let pings = self.ping_processes().into_iter().map(|(_, process)| process);
             for process in pings.chain(self.host.take()) {
                 // SAFETY: the handle is open and may terminate the process.
@@ -1122,7 +1134,7 @@ mod tests {
         let mut killed = false;
         loop {
             if !killed && Instant::now() >= grace {
-                left.group.kill_remaining();
+                left.group.kill_remaining().unwrap();
                 killed = true;
             }
             if root.exit_code().unwrap().is_some() {
@@ -1191,7 +1203,7 @@ mod tests {
         let stale = Group { console: Arc::default(), ..group.clone() };
         stale.hang_up();
         assert!(session.program.try_wait().unwrap().is_none());
-        stale.kill_remaining();
+        stale.kill_remaining().unwrap();
         assert_eq!(session.finish().1, KILLED as i32);
     }
 
@@ -1222,7 +1234,7 @@ mod tests {
         while stuck_program.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "the program outlived its console");
             if Instant::now() > hung_up + crate::pty::GRACEFUL_SHUTDOWN {
-                stuck_program.group().kill_remaining();
+                stuck_program.group().kill_remaining().unwrap();
             }
             session.turn();
         }
@@ -1241,7 +1253,8 @@ mod tests {
         let first = Window::new();
         let second = Window::new();
         for window in [&first, &second] {
-            reparent(Some(&session.program), window.id()).unwrap();
+            let done = reparent(Some(&session.program), window.id()).unwrap();
+            assert_eq!(done, Reparented::Done);
             // The host does it a moment later.
             let deadline = Instant::now() + Duration::from_secs(5);
             while owner(console_window) != window.id() {
@@ -1267,10 +1280,12 @@ mod tests {
             session.turn();
         }
 
-        // A session that is gone, and one whose console has closed.
-        reparent(None, first.id()).unwrap();
-        session.program.group().kill();
-        reparent(Some(&session.program), first.id()).unwrap();
+        // A session that is gone, and one whose console has closed: nothing
+        // to give an owner.
+        assert_eq!(reparent(None, first.id()).unwrap(), Reparented::Done);
+        session.program.group().kill().unwrap();
+        let closed = reparent(Some(&session.program), first.id()).unwrap();
+        assert_eq!(closed, Reparented::Done);
         session.finish();
     }
 
@@ -1281,7 +1296,8 @@ mod tests {
         assert!(!session.pty.packaged);
         let window = Window::new();
         for _ in 0..2 {
-            reparent(Some(&session.program), window.id()).unwrap();
+            let unsupported = reparent(Some(&session.program), window.id()).unwrap();
+            assert_eq!(unsupported, Reparented::Unsupported);
         }
         let settled = Instant::now() + Duration::from_secs(1);
         while Instant::now() < settled {
@@ -1289,7 +1305,7 @@ mod tests {
             session.turn();
         }
         assert_eq!(owner(console_window), 0);
-        session.program.group().kill();
+        session.program.group().kill().unwrap();
         session.finish();
     }
 }

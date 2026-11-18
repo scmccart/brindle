@@ -502,6 +502,7 @@ fn mutated_meta(rng: &mut XorShift) -> serde_json::Value {
 fn session_meta_reads_any_value_and_round_trips_what_it_returns() {
     let mut rng = XorShift::new(0x3e7a_0b1d_c0de_0005);
     let mut kept = 0usize;
+    let mut refused = 0usize;
     for _ in 0..3000 {
         let value = match rng.below(3) {
             0 => random_json(&mut rng, 3),
@@ -515,14 +516,24 @@ fn session_meta_reads_any_value_and_round_trips_what_it_returns() {
                     .collect(),
             ),
         };
-        let meta = holder::SessionMeta::from_value(&value);
+        // Read, or refused with what was well formed: never a panic.
+        let meta = match holder::SessionMeta::from_value(&value) {
+            Ok(meta) => meta,
+            Err(fault) => {
+                assert!(!fault.malformed.is_empty(), "a fault names nothing: {value}");
+                refused += 1;
+                fault.read
+            }
+        };
         assert_eq!(
             holder::SessionMeta::from_value(&meta.to_value()),
-            meta,
+            Ok(meta.clone()),
             "read from {value}"
         );
         kept += usize::from(meta != holder::SessionMeta::default());
     }
+    // It reaches both answers.
+    assert!(refused > 0 && refused < 3000, "{refused} of 3000 refused");
     // The generator reaches the fields' parsers, not only the defaults.
     assert!(kept > 0, "every meta read was the default");
 }
