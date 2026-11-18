@@ -38,41 +38,87 @@ const STEP_DOWN_LIMIT: Duration = Duration::from_secs(60);
 /// How long `--version` and `check` may take.
 const HELPER_LIMIT: Duration = Duration::from_secs(5);
 
+/// What [`offer`] did, and the connection to use.
+pub enum Offered {
+    /// The core stepped down for the helper's: the new core's connection.
+    Upgraded(Connected),
+    /// The helper isn't newer: the running core's.
+    Current(Connected),
+    /// The helper is newer, or couldn't be read, but the running core stays,
+    /// and why: the caller logs it.
+    Kept { connected: Connected, why: String },
+}
+
+impl Offered {
+    /// The connection to use.
+    pub fn connected(self) -> Connected {
+        match self {
+            Self::Upgraded(connected) | Self::Current(connected) | Self::Kept { connected, .. } => connected,
+        }
+    }
+}
+
+/// What to do with the running core.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// Keep it: the helper isn't newer.
+    Current,
+    /// Keep it, though the helper may be newer, and why.
+    Keep(String),
+    /// Step it down for the helper's core.
+    StepDown,
+}
+
+/// Whether the running core (`core`) steps down for the helper (`helper`,
+/// or why its build couldn't be read): only for a newer helper, and only
+/// once `check` (the helper's own check against the running holders, run
+/// only then) has passed.
+fn plan(helper: &Result<Build, String>, core: &Build, check: impl FnOnce() -> Result<(), String>) -> Plan {
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(error) => return Plan::Keep(format!("reading the helper's build: {error}")),
+    };
+    if !is_newer(helper, core) {
+        return Plan::Current;
+    }
+    match check() {
+        Ok(()) => Plan::StepDown,
+        Err(error) => Plan::Keep(format!(
+            "the helper {} ({}) refused the running holders: {error}",
+            helper.version, helper.build
+        )),
+    }
+}
+
 /// Upgrades the core behind `connected` when the helper is newer, and
 /// returns the connection to use: the new core's, or the running one's
-/// when the helper isn't newer, fails its check, or the step-down is
-/// refused.
-pub fn offer(endpoint: &Endpoint, token: &str, connected: Connected) -> Result<Connected> {
-    let helper = match helper_build(&endpoint.helper) {
-        Ok(helper) => helper,
-        Err(error) => {
-            log::warn!("not offering an upgrade: {error:#}");
-            return Ok(connected);
-        }
-    };
+/// when the helper isn't newer, can't be read, fails its check, or the
+/// step-down is refused (a [`Offered::Kept`], with why).
+pub fn offer(endpoint: &Endpoint, token: &str, connected: Connected) -> Result<Offered> {
+    let helper = helper_build(&endpoint.helper).map_err(|error| format!("{error:#}"));
     let core = core_build(&connected.welcome);
     log::debug!("terminal server upgrade check: helper {helper:?}, running core {core:?}");
-    if !is_newer(&helper, &core) {
-        return Ok(connected);
+    let check = || check(&endpoint.helper, &connected.welcome.holder_protocols).map_err(|error| format!("{error:#}"));
+    match plan(&helper, &core, check) {
+        Plan::Current => return Ok(Offered::Current(connected)),
+        Plan::Keep(why) => return Ok(Offered::Kept { connected, why }),
+        Plan::StepDown => {}
     }
-    log::info!(
-        "upgrading the terminal server from {} ({}) to {} ({})",
-        core.version,
-        core.build,
-        helper.version,
-        helper.build
-    );
-    if let Err(error) = check(&endpoint.helper, &connected.welcome.holder_protocols) {
-        log::warn!("keeping the running terminal server: {error:#}");
-        return Ok(connected);
+    if let Ok(helper) = &helper {
+        log::info!(
+            "upgrading the terminal server from {} ({}) to {} ({})",
+            core.version,
+            core.build,
+            helper.version,
+            helper.build
+        );
     }
     let Connected { mut stream, welcome } = connected;
     if let Err(error) = step_down(&mut stream) {
-        log::warn!("keeping the running terminal server: {error:#}");
-        return Ok(Connected { stream, welcome });
+        return Ok(Offered::Kept { connected: Connected { stream, welcome }, why: format!("{error:#}") });
     }
     drop(stream);
-    connect_new(endpoint, token)
+    connect_new(endpoint, token).map(Offered::Upgraded)
 }
 
 fn helper_build(helper: &Path) -> Result<Build> {
@@ -186,5 +232,41 @@ fn connect_new(endpoint: &Endpoint, token: &str) -> Result<Connected> {
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    fn build(version: &str, build: &str) -> Build {
+        Build { version: version.into(), build: build.into(), mtime: None }
+    }
+
+    /// A newer helper whose check fails keeps the running core, and says
+    /// which helper refused and why; the check runs only for a newer one.
+    #[test]
+    fn a_failed_check_keeps_the_running_core_with_its_reason() {
+        let core = build("0.4.0", "aaa");
+        let refused = || Err("holder protocol 1 is not supported".to_string());
+        assert_eq!(
+            plan(&Ok(build("0.5.0", "bbb")), &core, refused),
+            Plan::Keep("the helper 0.5.0 (bbb) refused the running holders: holder protocol 1 is not supported".into())
+        );
+        assert_eq!(plan(&Ok(build("0.5.0", "bbb")), &core, || Ok(())), Plan::StepDown);
+
+        let checked = Cell::new(false);
+        let check = || {
+            checked.set(true);
+            Ok(())
+        };
+        assert_eq!(plan(&Ok(build("0.3.0", "bbb")), &core, check), Plan::Current);
+        assert!(!checked.get(), "an older helper isn't checked");
+        assert_eq!(
+            plan(&Err("reading brindle-remote: not found".into()), &core, refused),
+            Plan::Keep("reading the helper's build: reading brindle-remote: not found".into())
+        );
     }
 }

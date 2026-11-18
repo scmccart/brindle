@@ -168,6 +168,13 @@ pub type Report = Arc<dyn Fn(u64, LinkState) + Send + Sync>;
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
+/// A connection id no connection had: each connection takes one, and so
+/// does a report made for a connection that couldn't be made, so `Hosts`
+/// orders it with the connections' own reports.
+pub fn next_connection_id() -> u64 {
+    NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Where a session's output and events go: its terminal.
 pub trait SessionSink: Send {
     /// Output from the program, or from a replay.
@@ -698,7 +705,7 @@ impl Connection {
             transport,
             token: token.to_string(),
             eager: AtomicBool::new(eager),
-            id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+            id: next_connection_id(),
             report,
         });
         (this, queue)

@@ -252,4 +252,20 @@ mod tests {
         assert!(hosts.want(std::slice::from_ref(&a8)));
         assert_eq!(hosts.states(), [(a8, HostState::Connecting)]);
     }
+
+    /// A connection that couldn't be made is reported offline under an id
+    /// of its own, taken after the earlier connection's: that one's late
+    /// reports don't hide it, and a connection made later replaces it.
+    #[test]
+    fn hosts_orders_an_offline_report_after_an_earlier_connection() {
+        let (mut hosts, a8) = (Hosts::default(), ssh("A8"));
+        hosts.want(std::slice::from_ref(&a8));
+        hosts.apply(&a8, 1, LinkState::Connecting);
+        let why = "connecting to A8: can't start a thread: out of memory";
+        assert!(hosts.apply(&a8, 2, LinkState::Offline(why.into())));
+        assert!(!hosts.apply(&a8, 1, LinkState::Connected), "the earlier connection's late report");
+        assert_eq!(hosts.state(&a8), Some(&offline(why)));
+        assert!(hosts.apply(&a8, 3, LinkState::Connected));
+        assert_eq!(hosts.state(&a8), Some(&HostState::Connected));
+    }
 }
