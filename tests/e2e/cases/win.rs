@@ -394,7 +394,12 @@ fn holder_children(ctx: &Ctx) -> String {
     if holders.is_empty() {
         return "no holder".into();
     }
-    let all = winproc::all();
+    // A process list that can't be read stands in for the names, so the
+    // case's check fails with the cause.
+    let all = match winproc::all() {
+        Ok(all) => all,
+        Err(error) => return format!("can't list processes: {error}"),
+    };
     let listed: Vec<String> = all.iter().map(|p| format!("{}\t{}\t{}\n", p.pid, p.parent, p.name)).collect();
     ctx.save("processes.txt", format!("holders: {holders:?}\npid\tparent\tname\n{}", listed.concat()));
     let names: Vec<String> = all.into_iter().filter(|p| holders.contains(&p.parent)).map(|p| p.name).collect();
@@ -461,7 +466,11 @@ fn conpty_host(ctx: &Ctx) -> Result<Outcome> {
 
 /// The console hosts among `pid`'s direct children.
 fn brindle_hosts(pid: u32) -> String {
-    let hosts = winproc::all().into_iter().filter(|p| p.parent == pid).map(|p| p.name);
+    let all = match winproc::all() {
+        Ok(all) => all,
+        Err(error) => return format!("can't list processes: {error}"),
+    };
+    let hosts = all.into_iter().filter(|p| p.parent == pid).map(|p| p.name);
     hosts.filter(|name| name == "OpenConsole.exe" || name == "conhost.exe").collect::<Vec<_>>().join(",")
 }
 

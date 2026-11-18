@@ -249,8 +249,11 @@ impl Shots {
         let (first, second) = (find(a)?, find(b)?);
         let result = check(first, second);
         if result.is_err() {
-            first.save_ppm(&ctx.dir.join(format!("{a}.ppm")));
-            second.save_ppm(&ctx.dir.join(format!("{b}.ppm")));
+            for (name, image) in [(a, first), (b, second)] {
+                image
+                    .save_ppm(&ctx.dir.join(format!("{name}.ppm")))
+                    .map_err(|e| format!("{a} against {b}: saving {name}.ppm: {e}"))?;
+            }
         }
         result.map_err(|e| format!("{a} against {b}: {e}"))
     }

@@ -244,15 +244,44 @@ fn main() {
         }
     }
 
-    std::fs::write(run_dir.join("summary.toml"), summary.to_toml()).ok();
+    let written = write_summary(&run_dir, &summary);
     println!("\n{}", report::render(&summary, baseline.as_ref()));
     if baseline.is_some() {
         println!("(changes against the baseline in parentheses: ms for latency, % for throughput; lower is better)");
+    }
+    // Numbers that weren't kept can't be compared with later runs.
+    if let Err(why) = written {
+        println!("perf: {why}");
+        std::process::exit(1);
     }
     // Numbers never fail the suite, but a case that couldn't measure does.
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+/// Writes `summary.toml` into the run directory.
+fn write_summary(run_dir: &std::path::Path, summary: &Summary) -> Result {
+    let path = run_dir.join("summary.toml");
+    std::fs::write(&path, summary.to_toml()).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// A summary written into a directory that can't hold it is an error that
+/// names the file, and one into a directory that can is on disk.
+fn self_test_summary() -> Result {
+    let missing = std::env::temp_dir().join(format!("brindle-perf-self-test-{}", std::process::id())).join("absent");
+    let failed = write_summary(&missing, &Summary::default());
+    crate::ensure!(
+        failed.as_ref().is_err_and(|why| why.contains("summary.toml")),
+        "an unwritable directory should fail, naming the file: {failed:?}"
+    );
+    let dir = std::env::temp_dir().join(format!("brindle-perf-self-test-{}-ok", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let written = write_summary(&dir, &Summary::default());
+    let on_disk = dir.join("summary.toml").is_file();
+    std::fs::remove_dir_all(&dir).ok();
+    crate::ensure!(written.is_ok() && on_disk, "a writable directory should get the file: {written:?}");
+    Ok(())
 }
 
 fn usage(why: &str) -> ! {
@@ -270,6 +299,7 @@ fn self_test() -> i32 {
         ("dat parsing", report::self_test_dat),
         ("report rendering", report::self_test_render),
         ("server helpers", common::server::self_test),
+        ("summary write", self_test_summary),
     ];
     let mut failed = 0;
     for (name, test) in tests {

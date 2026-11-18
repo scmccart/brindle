@@ -157,11 +157,20 @@ pub fn stop(helper: &Path, server_dir: &Path, case_dir: &Path) -> Result {
         problem.get_or_insert(format!("can't stop the server with {}: {error}", helper.display()));
     }
     // Holders hang their sessions up first (SIGHUP, then SIGKILL after 1 s).
-    let left = roles_left(server_dir, Duration::from_secs(5));
-    if !left.is_empty() {
-        let names: Vec<String> = left.iter().map(|(pid, role)| format!("{role} {pid}")).collect();
-        problem.get_or_insert(format!("left running after `brindle-remote stop`: {}", names.join(", ")));
-        end_roles(server_dir);
+    // A process list that can't be read fails the case: roles left running
+    // would go unnoticed.
+    match roles_left(server_dir, Duration::from_secs(5)) {
+        Ok(left) if left.is_empty() => {}
+        Ok(left) => {
+            let names: Vec<String> = left.iter().map(|(pid, role)| format!("{role} {pid}")).collect();
+            problem.get_or_insert(format!("left running after `brindle-remote stop`: {}", names.join(", ")));
+            if let Err(error) = end_roles(server_dir) {
+                problem.get_or_insert(error);
+            }
+        }
+        Err(error) => {
+            problem.get_or_insert(format!("can't tell whether roles are left running: {error}"));
+        }
     }
     save_logs(server_dir, case_dir);
     // Windows keeps a role's image (its copy under the directory's `bin`)
@@ -183,7 +192,11 @@ pub fn stop(helper: &Path, server_dir: &Path, case_dir: &Path) -> Result {
 /// The roles using `server_dir` that run in one of the server's own
 /// systemd scopes, as a problem to report; `None` when there are none.
 fn scoped_roles(server_dir: &Path) -> Option<String> {
-    let scoped: Vec<String> = server_processes(server_dir)
+    let roles = match roles(server_dir) {
+        Ok(roles) => roles,
+        Err(error) => return Some(format!("can't list the roles to check their scopes: {error}")),
+    };
+    let scoped: Vec<String> = roles
         .into_iter()
         .filter_map(|(pid, role)| {
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
@@ -209,37 +222,46 @@ fn save_logs(server_dir: &Path, case_dir: &Path) {
 }
 
 /// The roles still using `dir` once `limit` has passed; none as soon as
-/// they are all gone.
-fn roles_left(dir: &Path, limit: Duration) -> Vec<(u32, String)> {
+/// they are all gone. Fails when the processes can't be listed.
+fn roles_left(dir: &Path, limit: Duration) -> std::io::Result<Vec<(u32, String)>> {
     let deadline = Instant::now() + limit;
-    let mut left = server_processes(dir);
+    let mut left = roles(dir)?;
     while !left.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        left = server_processes(dir);
+        left = roles(dir)?;
     }
-    left
+    Ok(left)
 }
 
 /// Kills the roles using `dir`, and on Windows waits for them to be gone.
-pub fn end_roles(dir: &Path) {
-    for (pid, _) in server_processes(dir) {
+pub fn end_roles(dir: &Path) -> Result {
+    let running = roles(dir).map_err(|e| format!("can't list the roles using {}: {e}", dir.display()))?;
+    for (pid, _) in running {
         #[cfg(unix)]
         Command::new("kill").args(["-KILL", &pid.to_string()]).status().ok();
         #[cfg(windows)]
         super::winproc::kill(pid);
     }
     if cfg!(windows) {
-        roles_left(dir, Duration::from_secs(5));
+        roles_left(dir, Duration::from_secs(5)).map_err(|e| format!("can't list the roles using {}: {e}", dir.display()))?;
     }
+    Ok(())
+}
+
+/// The roles using `dir`, for a case that polls for one: the list is empty
+/// when the processes can't be read, which the case's own wait then reports.
+/// The harness's checks use [`roles`] and fail on that error.
+pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
+    roles(dir).unwrap_or_default()
 }
 
 /// The `serve` and `hold` processes using `dir` (their environment names
-/// it), with their roles.
+/// it), with their roles, or why the process list couldn't be read.
 #[cfg(unix)]
-pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
+pub fn roles(dir: &Path) -> std::io::Result<Vec<(u32, String)>> {
     let wanted = format!("BRINDLE_SERVER_DIR={}", dir.display());
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-    entries
+    let entries = std::fs::read_dir("/proc")?;
+    Ok(entries
         .flatten()
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
@@ -251,7 +273,7 @@ pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
             let environ = std::fs::read(entry.path().join("environ")).ok()?;
             environ.split(|&b| b == 0).any(|var| var == wanted.as_bytes()).then_some((pid, role))
         })
-        .collect()
+        .collect())
 }
 
 /// The `serve` and `hold` processes using `dir`, with their roles: on
@@ -260,11 +282,11 @@ pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
 /// starts a role, a role whose arguments can't be read) is listed under the
 /// helper's name, so nothing from the directory goes unnoticed.
 #[cfg(windows)]
-pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
+pub fn roles(dir: &Path) -> std::io::Result<Vec<(u32, String)>> {
     use super::winproc;
     let copies = dir.join("bin");
     let name = helper_name();
-    winproc::all()
+    Ok(winproc::all()?
         .into_iter()
         .filter(|process| process.name.eq_ignore_ascii_case(&name))
         .filter(|process| winproc::image(process.pid).is_some_and(|image| under(&image, &copies)))
@@ -273,7 +295,7 @@ pub fn server_processes(dir: &Path) -> Vec<(u32, String)> {
             let role = line.as_deref().and_then(winproc::first_argument).filter(|role| ["serve", "hold"].contains(role));
             (process.pid, role.map_or_else(|| name.clone(), str::to_string))
         })
-        .collect()
+        .collect())
 }
 
 /// Whether the Windows path `path` is under `dir`, however each is spelled.

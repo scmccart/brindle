@@ -197,8 +197,15 @@ pub fn listed_sessions(ctx: &Ctx) -> Result<Vec<(String, bool)>> {
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("running {}: {e}", ctx.helper.display()))?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    Ok(text
+    parse_listing(out.status.success(), &String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr))
+}
+
+/// What `brindle-remote list` printed as `(id, attached)`: an error naming
+/// its stderr when it failed, since a failed `list` printing nothing looks
+/// like a server with no sessions.
+fn parse_listing(success: bool, stdout: &str, stderr: &str) -> Result<Vec<(String, bool)>> {
+    ensure!(success, "`brindle-remote list` failed: {}", stderr.trim());
+    Ok(stdout
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
@@ -223,21 +230,40 @@ pub fn hang_up_detached(ctx: &Ctx) -> Result {
         Ok(listed_sessions(ctx)?.into_iter().filter(|(_, attached)| !attached).map(|(id, _)| id).collect())
     };
     let hung_up = detached()?;
+    // A kill that failed matters only for a session that is still there
+    // afterwards: one that ended by itself meanwhile makes `kill` fail too.
+    let mut refused: Vec<String> = Vec::new();
     for id in &hung_up {
-        Command::new(&ctx.helper)
+        let out = Command::new(&ctx.helper)
             .args(["kill", id])
             .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
             .stdin(Stdio::null())
             .output()
-            .ok();
+            .map_err(|e| format!("running {} kill {id}: {e}", ctx.helper.display()))?;
+        if !out.status.success() {
+            refused.push(format!("kill {id}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
     }
     if hung_up.is_empty() {
         return Ok(());
     }
     ctx.scale().poll(10.0, &format!("detached sessions {hung_up:?} ending"), || {
         let left = detached()?;
-        if left.iter().any(|id| hung_up.contains(id)) { Err(format!("still listed: {left:?}")) } else { Ok(Some(())) }
+        if left.iter().any(|id| hung_up.contains(id)) {
+            Err(format!("still listed: {left:?}; {}", if refused.is_empty() { "no kill failed".into() } else { refused.join("; ") }))
+        } else {
+            Ok(Some(()))
+        }
     })
+}
+
+/// A thread's panic payload as text, for the error that reports it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a payload that isn't text".into())
 }
 
 pub struct Output {
@@ -578,7 +604,8 @@ impl<'a> Run<'a> {
             let due = seen + Duration::from_secs_f64(ctx.secs(at));
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             let captured = capture::grab(&ctx.display, child.id(), ctx.secs(1.0))?;
-            captured.save_ppm(&ctx.dir.join(format!("{}.ppm", self.label)));
+            let path = ctx.dir.join(format!("{}.ppm", self.label));
+            captured.save_ppm(&path).map_err(|e| format!("saving {}: {e}", path.display()))?;
             image = Some(captured);
         }
 
@@ -596,7 +623,7 @@ impl<'a> Run<'a> {
         let mut stdout = String::new();
         child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
         ctx.save(&format!("{}.dump", self.label), &stdout);
-        let errors = events.join().unwrap_or_default();
+        let errors = events.join().map_err(|payload| format!("the timeline thread panicked: {}", panic_message(&*payload)))?;
         ensure!(errors.is_empty(), "timeline: {}", errors.join("; "));
         if !self.keep_detached {
             hang_up_detached(ctx)?;
@@ -911,6 +938,25 @@ pub fn self_test_dump_after_last_step() -> Result {
     ensure!((dump - 8.2).abs() < 1e-9, "2 steps, 3 s apart, then 0.7 s: {dump}");
     let run = run.dump_at(4.0);
     ensure!(run.dump_secs() == 12.0, "dump_at(4) at factor 3: {}", run.dump_secs());
+    Ok(())
+}
+
+pub fn self_test_list() -> Result {
+    let listing = "1\t10\tattached\t-\t-\tkill\t1s\t-\tbash\t/\n2\t11\tdetached\towned\t3s\tdetach\t5s\t-\tsh\t/\n";
+    ensure!(
+        parse_listing(true, listing, "") == Ok(vec![("1".into(), true), ("2".into(), false)]),
+        "listing {:?}",
+        parse_listing(true, listing, "")
+    );
+    ensure!(parse_listing(true, "", "") == Ok(Vec::new()), "no core is no sessions");
+    let failed = parse_listing(false, "", "can't read the server directory: Not a directory\n");
+    ensure!(
+        failed.as_ref().is_err_and(|why| why.contains("failed") && why.contains("can't read the server directory")),
+        "a failed list is an error with its stderr: {failed:?}"
+    );
+    ensure!(panic_message(&*Box::new("boom") as &(dyn std::any::Any + Send)) == "boom", "a str payload");
+    ensure!(panic_message(&*Box::new(String::from("bang")) as &(dyn std::any::Any + Send)) == "bang", "a String payload");
+    ensure!(panic_message(&*Box::new(7_u8) as &(dyn std::any::Any + Send)).contains("isn't text"), "another payload");
     Ok(())
 }
 

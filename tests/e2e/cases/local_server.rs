@@ -141,8 +141,8 @@ fn listed_when(srv: &Server, secs: f64, what: &str, ok: impl Fn(&[Listed]) -> bo
 }
 
 /// `program` runs, as a child of one of the `shells` (sessions' pids).
-fn in_session(program: u32, shells: &[u32]) -> bool {
-    alive(program) && parent(program).is_some_and(|p| shells.contains(&p))
+fn in_session(program: u32, shells: &[u32]) -> Result<bool> {
+    Ok(alive(program) && parent(program)?.is_some_and(|p| shells.contains(&p)))
 }
 
 /// The detached sessions' pids, once there are `count`.
@@ -173,13 +173,13 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn parent(pid: u32) -> Option<u32> {
-    stat(pid)?.get(1)?.parse().ok()
+fn parent(pid: u32) -> Result<Option<u32>> {
+    Ok(stat(pid).and_then(|fields| fields.get(1)?.parse().ok()))
 }
 
 #[cfg(windows)]
-fn parent(pid: u32) -> Option<u32> {
-    crate::winproc::parent(pid)
+fn parent(pid: u32) -> Result<Option<u32>> {
+    crate::winproc::parent(pid).map_err(|e| format!("listing processes for the parent of {pid}: {e}"))
 }
 
 #[cfg(unix)]
@@ -346,7 +346,7 @@ pub fn session(ctx: &Ctx) -> Result<Outcome> {
             let listed = srv.attached(10.0)?;
             let sessions = srv.list()?;
             ensure!(sessions.len() == 1, "sessions: {sessions:?}");
-            let holder = parent(listed.pid).ok_or("the shell has no parent")?;
+            let holder = parent(listed.pid)?.ok_or("the shell has no parent")?;
             ensure!(is_holder(holder), "the shell's parent {holder} is {}, not a holder", described(holder));
             std::fs::write(&save, listed.pid.to_string()).map_err(|e| e.to_string())
         })
@@ -419,7 +419,7 @@ pub fn quit(ctx: &Ctx) -> Result<Outcome> {
     let pids = wait_pids(&srv, &files)?;
     let detached = detached_pids(&srv, 10.0, 2)?;
     for pid in pids {
-        ensure!(in_session(pid, &detached), "sleep {pid} isn't in a detached session's shell {detached:?}");
+        ensure!(in_session(pid, &detached)?, "sleep {pid} isn't in a detached session's shell {detached:?}");
     }
     Ok(Outcome::Pass)
 }
@@ -441,7 +441,7 @@ pub fn crash(ctx: &Ctx) -> Result<Outcome> {
     let pids = wait_pids(&srv, &files)?;
     let detached = detached_pids(&srv, 10.0, 2)?;
     for pid in pids {
-        ensure!(in_session(pid, &detached), "sleep {pid} isn't in a detached session's shell {detached:?}");
+        ensure!(in_session(pid, &detached)?, "sleep {pid} isn't in a detached session's shell {detached:?}");
     }
     Ok(Outcome::Pass)
 }
@@ -492,7 +492,7 @@ pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     let pid = read_pid(&file).ok_or("sleep never started")?;
     let detached = detached_pids(&Server::of(ctx), 10.0, 1)?;
-    ensure!(in_session(pid, &detached), "sleep {pid} isn't detached: {detached:?}");
+    ensure!(in_session(pid, &detached)?, "sleep {pid} isn't detached: {detached:?}");
     Ok(Outcome::Pass)
 }
 
@@ -1331,7 +1331,7 @@ pub fn holder_lost(ctx: &Ctx) -> Result<Outcome> {
         .wait_for("before-2")
         .call_at(later(2.0), move |_| {
             let listed = srv.attached(10.0)?;
-            let holder = parent(listed.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let holder = parent(listed.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
             kill(holder)
         })
         .dump_at(later(6.0))
@@ -1355,7 +1355,7 @@ pub fn reused_id(ctx: &Ctx) -> Result<Outcome> {
         .prompt()
         .call_at(later(2.0), move |_| {
             let lost = srv.attached(10.0)?;
-            let holder = parent(lost.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let holder = parent(lost.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
             let core = srv.core().ok_or("no core running")?;
             // The holder goes first, so none is left to start a core that
             // would adopt it and keep its ids.
@@ -1509,7 +1509,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
         .send(&sh(&format!("echo in-server > \"{}\"\r", proof.display()), &format!("'in-server' > '{}'\r", slashed(&proof))))
         .call_at(later(5.0), move |_| {
             let listed = srv.attached(10.0)?;
-            let holder = parent(listed.pid).unwrap_or(0);
+            let holder = parent(listed.pid)?.unwrap_or(0);
             ensure!(is_holder(holder), "the new tab's shell's parent {holder} isn't a holder");
             Ok(())
         })
@@ -1824,7 +1824,7 @@ pub fn inbox_host(ctx: &Ctx) -> Result<Outcome> {
             srv.wait(15.0, "one holder with an OpenConsole and a conhost", || {
                 let holders: Vec<u32> =
                     crate::server_processes(&srv.dir).into_iter().filter(|(_, role)| role == "hold").map(|(pid, _)| pid).collect();
-                let all = crate::winproc::all();
+                let all = crate::winproc::all().map_err(|e| format!("listing processes: {e}"))?;
                 let under: Vec<String> =
                     all.iter().filter(|p| holders.contains(&p.parent)).map(|p| p.name.clone()).collect();
                 std::fs::write(&saved, format!("holders {holders:?}\n{}\n", under.join("\n"))).ok();
@@ -1859,7 +1859,7 @@ pub fn inbox_host(ctx: &Ctx) -> Result<Outcome> {
 #[cfg(windows)]
 pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
     use brindle_remote_protocol::server_dir::resolve_windows;
-    if !crate::winproc::elevated() {
+    if !crate::winproc::elevated().map_err(|e| format!("reading this process's token: {e}"))? {
         return Ok(Outcome::Skip(
             "not elevated: an elevated server beside an unelevated one needs an elevated runner \
              (elevating here would ask through UAC)"
@@ -1886,21 +1886,24 @@ pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
             .ok();
     }
     let copies = appdata.join("brindle").join("server");
-    let left = || -> Vec<u32> {
+    let left = || -> std::io::Result<Vec<u32>> {
         let name = ctx.helper.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        crate::winproc::all()
+        Ok(crate::winproc::all()?
             .into_iter()
             .filter(|p| p.name.eq_ignore_ascii_case(&name))
             // However the image's path is spelled (`\\?\`, case).
             .filter(|p| crate::winproc::image(p.pid).is_some_and(|image| crate::under(&image, &copies)))
             .map(|p| p.pid)
-            .collect()
+            .collect())
     };
     // Within 5 s (stretched); what is left after that is ended and reported.
-    ctx.scale().poll(5.0, "the copies' roles ending", || Ok(left().is_empty().then_some(()))).ok();
+    ctx.scale()
+        .poll(5.0, "the copies' roles ending", || Ok(left().map_err(|e| format!("listing processes: {e}"))?.is_empty().then_some(())))
+        .ok();
     let leftover = left();
-    leftover.iter().for_each(|&pid| crate::winproc::kill(pid));
+    leftover.iter().flatten().for_each(|&pid| crate::winproc::kill(pid));
     let outcome = result?;
+    let leftover = leftover.map_err(|e| format!("can't tell whether roles are left running: {e}"))?;
     ensure!(leftover.is_empty(), "left running after `brindle-remote stop`: {leftover:?}");
     Ok(outcome)
 }
@@ -1985,13 +1988,12 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
         }
         Err(why) => {
             // Brindle and the helper commands are cmd's children.
-            let children: Vec<u32> = crate::winproc::all()
-                .into_iter()
-                .filter(|p| p.parent == cmd)
-                .map(|p| p.pid)
-                .collect();
+            let (children, listing): (Vec<u32>, String) = match crate::winproc::all() {
+                Ok(all) => (all.into_iter().filter(|p| p.parent == cmd).map(|p| p.pid).collect(), String::new()),
+                Err(error) => (Vec::new(), format!("; can't list processes to end its children: {error}")),
+            };
             children.into_iter().chain([cmd]).for_each(crate::winproc::kill);
-            return Err(format!("{why}; see unelevated.log"));
+            return Err(format!("{why}{listing}; see unelevated.log"));
         }
     }
     let screen = std::fs::read_to_string(&dump).unwrap_or_default();

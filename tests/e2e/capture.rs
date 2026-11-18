@@ -108,10 +108,10 @@ impl Image {
         Ok(())
     }
 
-    pub fn save_ppm(&self, path: &Path) {
+    pub fn save_ppm(&self, path: &Path) -> std::io::Result<()> {
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
         out.extend_from_slice(&self.data);
-        std::fs::write(path, out).ok();
+        std::fs::write(path, out)
     }
 
     /// The whole image, as a rectangle.
