@@ -2037,8 +2037,10 @@ mod on_windows {
         let (dir, mut stalled) = core("stall");
         let core_pid = stalled.core_pid();
         let file = numbered_lines(&dir.path, 20_000);
+        let flooding = dir.path.join("flooding");
         let (flood, flood_pid) = stalled.spawn(client_shell(&format!(
-            "for /l %i in (0,0,1) do @type {}",
+            "type nul>{}& for /l %i in (0,0,1) do @type {}",
+            flooding.display(),
             file.display()
         )));
         // From here on it stops reading.
@@ -2047,8 +2049,11 @@ mod on_windows {
 
         // Once the flood has filled every queue on its way, its program
         // (`cmd`, whose `type` writes) is blocked, not the core: the core
-        // holds no more of it, however long the flood goes on.
-        assert!(stays_blocked(flood_pid), "the flooding program never blocked");
+        // holds no more of it, however long the flood goes on. The holder
+        // stops reading it once the core pauses the session.
+        assert!(eventually(TIMEOUT, || flooding.exists()), "the flood never started");
+        let holder = parent(flood_pid).unwrap();
+        assert!(stays_blocked(flood_pid, holder), "the flooding program never blocked");
         let held = working_set_kib(core_pid);
         assert!(held < 128 * 1024, "the core holds {held} KiB");
 

@@ -1625,26 +1625,36 @@ mod on_windows {
     /// About 2.9 MB of output: more than a tail and the pipes hold.
     const LINES: usize = 40_000;
 
-    /// Waits for a line, prints [`LINES`] numbered lines and `DONE`, and
-    /// waits for another line.
-    fn prints_lines_when_told(session: u32, dir: &TempDir) -> Spawn {
+    /// Waits for a line, creates the file it returns, prints [`LINES`]
+    /// numbered lines and `DONE`, and waits for another line. Once that
+    /// file exists, the program has had its line and is printing.
+    fn prints_lines_when_told(session: u32, dir: &TempDir) -> (Spawn, std::path::PathBuf) {
         let file = programs::numbered_lines(&dir.path, LINES);
-        let script = format!("set /p go=& type {}& echo DONE& set /p z=", file.display());
-        shell(session, &script)
+        let printing = dir.path.join("printing");
+        let script = format!(
+            "set /p go=& type nul>{}& type {}& echo DONE& set /p z=",
+            printing.display(),
+            file.display()
+        );
+        (shell(session, &script), printing)
     }
 
     #[test]
     fn without_a_core_a_program_blocks_instead_of_losing_output() {
         let (dir, mut core, holder_pid) = holder("block");
-        let pid = core.spawn(prints_lines_when_told(1, &dir));
+        let (request, printing) = prints_lines_when_told(1, &dir);
+        let pid = core.spawn(request);
         // The holder handles the input before it sees the connection end.
         core.input(1, b"go\r");
         drop(core);
 
-        // It stops writing once the tail is full, and doesn't end: nothing
-        // takes the rest of its output.
-        assert!(stays_blocked(pid), "the program never blocked");
-        assert!(alive(pid));
+        // `type` is `cmd`'s own, so `cmd` is the writer. Once it prints, it
+        // stays blocked when the holder stops reading at a full tail, and
+        // doesn't end: nothing takes the rest of its output.
+        assert!(eventually(TIMEOUT, || printing.exists()), "it never had its line");
+        let blocked = stays_blocked(pid, holder_pid);
+        assert!(alive(pid), "it finished, so its output went somewhere");
+        assert!(blocked, "it never stopped: the holder kept reading");
 
         // The holder read until the tail was full, and no further: nothing
         // was cut off its front.
@@ -1665,7 +1675,8 @@ mod on_windows {
     #[test]
     fn a_paused_session_blocks_until_resumed() {
         let (dir, mut core, _) = holder("pause");
-        let pid = core.spawn(prints_lines_when_told(1, &dir));
+        let (request, _) = prints_lines_when_told(1, &dir);
+        let pid = core.spawn(request);
         core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
         // What the console said before the pause is out of the way.
         settle(&mut core);

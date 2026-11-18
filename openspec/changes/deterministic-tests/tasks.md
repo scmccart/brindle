@@ -25,7 +25,7 @@ Prerequisites: changes 4 (`isolate-test-runs`), 5 (`enforce-platform-seams`) and
   - `skip(Capability, reason)` with `enum Capability { Scopes, PackagedConpty }` (design §5), appending to `env!("CARGO_TARGET_TMPDIR")/skipped.log`, writing stderr, and panicking when `BRINDLE_TEST_REQUIRE` names the capability.
   - Move `support/unix.rs:142` and `support/relay.rs:67` onto `retry_busy_exec`.
   - Rebuild `stays_blocked` (`support/unix.rs:305-325`) on `Quiet` over `context_switches`, polled by `eventually`.
-  - Add a Windows `stays_blocked(pid)` to `support/windows.rs`: `Quiet` over `GetProcessIoCounters`' `WriteTransferCount`.
+  - Add a Windows `stays_blocked(writer, reader)` to `support/windows.rs`: `Quiet` over the writer's I/O calls and the reader's bytes read (`GetProcessIoCounters`; a console write is a device control call, so `WriteTransferCount` doesn't see it), started once the writer is writing.
   - Move `attach_until` (`support/mod.rs:977`) and `Relay::exits_within` (`support/relay.rs:133`) onto `until`.
   - Verify: `cargo test --locked -p brindle-remote-agent --test holder --test core --test relay --test manage --test upgrade` passes on Linux, and `rg -n 'thread::sleep' remote-agent/tests` lists only `support/wait.rs`.
 - [x] 1.5 Add `tests/e2e/wait.rs` (`mod wait;` in `tests/e2e/main.rs`):
@@ -123,7 +123,7 @@ Prerequisites: changes 4 (`isolate-test-runs`), 5 (`enforce-platform-seams`) and
 - [ ] 4.7 `holder.rs`:
   - `:400` becomes `throttle`;
   - `:669` and `:1343` drop their elapsed bounds;
-  - `:1449` uses Windows `stays_blocked(pid)`;
+  - `:1449` waits for the program's marker file, then uses Windows `stays_blocked(pid, holder)`;
   - `:1492` calls `skip(PackagedConpty)`;
   - `:1516` uses `until` with `pump`.
 
