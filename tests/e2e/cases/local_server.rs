@@ -1518,7 +1518,7 @@ pub fn no_core_back(ctx: &Ctx) -> Result<Outcome> {
         .prompt()
         .call_at(later(2.0), move |_| {
             let listed = srv.attached(10.0)?;
-            let holder = parent(listed.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let holder = parent(listed.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
             let core = srv.core().ok_or("no core running")?;
             lock(0o000)?;
             // The core first, so none is left to tell the tab its holder
