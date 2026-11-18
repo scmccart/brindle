@@ -46,6 +46,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-layout-live", local_server::layout_live),
         display("local-server-palette", local_server::palette),
         display("local-server-palette-highlight", local_server::palette_highlight),
+        display("local-server-palette-unlisted", local_server::palette_unlisted),
         display("local-server-attach-flag", local_server::attach_flag),
         display("local-server-env", local_server::env),
         display("local-server-core-restart", local_server::core_restart),

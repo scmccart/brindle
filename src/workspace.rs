@@ -18,7 +18,7 @@ use crate::actions::*;
 use crate::config::{Config, Profile};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
+use crate::picker::{KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
 use brindle_ui::{
     ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
@@ -263,26 +263,42 @@ fn palette_endpoints(states: Vec<(Host, HostState)>) -> Vec<(Host, HostState)> {
     endpoints
 }
 
+/// Whether the sessions palette asks `host`, standing as `state`, for its
+/// sessions: this machine always, a remote endpoint only once connected
+/// (a connecting or offline one says so instead).
+fn asks(host: &Host, state: &HostState) -> bool {
+    match (host, state) {
+        (Host::Local, _) | (Host::Remote(_), HostState::Connected) => true,
+        (Host::Remote(_), HostState::Connecting | HostState::Offline(_)) => false,
+    }
+}
+
 /// What the sessions palette lists for `host`, `state` being how the
 /// endpoint stands and `listed` what asking it gave (`Err`: why that
-/// failed; `None`: it wasn't asked, which is how a connecting or offline
-/// endpoint is). A connecting or offline endpoint says so; this machine's
-/// failure is logged and lists nothing; any other endpoint that can't
-/// answer is offline. Sessions attached to a client are left out.
-fn listing_from(host: &Host, state: &HostState, listed: Option<Result<Vec<SessionInfo>, String>>) -> Listing {
-    match (host, state) {
-        (Host::Remote(_), HostState::Connecting) => return Listing::Connecting,
-        (Host::Remote(_), HostState::Offline(why)) => return Listing::Offline(why.clone()),
-        _ => {}
-    }
-    match listed.unwrap_or_else(|| Err("no listing was made".into())) {
-        Ok(sessions) => Listing::Sessions(sessions.into_iter().filter(|s| !s.attached).collect()),
-        Err(why) if host.is_local() => {
-            log::warn!("listing sessions: {why}");
-            Listing::Sessions(Vec::new())
+/// failed). A connecting or offline endpoint says so, whatever was asked;
+/// this machine's failure is unlisted (its server isn't offline when it
+/// can't be listed), and any other endpoint that can't answer is offline,
+/// the text naming what failed. Sessions attached to a client are left out.
+fn listing_from(host: &Host, state: &HostState, listed: Result<Vec<SessionInfo>, String>) -> Listing {
+    match (host, state, listed) {
+        (Host::Remote(_), HostState::Connecting, _) => Listing::Connecting,
+        (Host::Remote(_), HostState::Offline(why), _) => Listing::Offline(why.clone()),
+        (Host::Local | Host::Remote(_), HostState::Connected, Ok(sessions))
+        | (Host::Local, HostState::Connecting | HostState::Offline(_), Ok(sessions)) => {
+            Listing::Sessions(sessions.into_iter().filter(|s| !s.attached).collect())
         }
-        Err(why) => Listing::Offline(why),
+        (Host::Local, HostState::Connecting | HostState::Connected | HostState::Offline(_), Err(why)) => Listing::Unlisted(why),
+        (Host::Remote(_), HostState::Connected, Err(why)) => {
+            Listing::Offline(format!("listing sessions on {}: {why}", host.name()))
+        }
     }
+}
+
+/// What [`list_sessions`] gave: the sessions or why they couldn't be
+/// listed, and the outcome of the kill made first, if one was asked.
+struct Listed {
+    sessions: Result<Vec<SessionInfo>, String>,
+    kill: Option<KillOutcome>,
 }
 
 /// Kills session `kill` (if given), then lists `host`'s detached sessions
@@ -290,42 +306,40 @@ fn listing_from(host: &Host, state: &HostState, listed: Option<Result<Vec<Sessio
 /// off the UI thread. This machine's server is listed through the shared
 /// connection, as ever. A remote endpoint is listed only when connected,
 /// on the connection the process has (none is made), within [`LIST_LIMIT`];
-/// [`listing_from`] decides what that gives.
-fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> Listing {
-    let listed = match (host, state) {
-        (Host::Remote(_), HostState::Connecting | HostState::Offline(_)) => None,
-        _ => Some(list_sessions(host, kill)),
-    };
-    listing_from(host, state, listed)
+/// [`listing_from`] decides what that gives. A kill on an endpoint that
+/// isn't asked fails, so its session's row comes back.
+fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> (Listing, Option<KillOutcome>) {
+    if !asks(host, state) {
+        let kill = kill.map(|id| (id, Err(format!("{} is not connected", host.name()))));
+        return (listing_from(host, state, Ok(Vec::new())), kill);
+    }
+    let listed = list_sessions(host, kill);
+    (listing_from(host, state, listed.sessions), listed.kill)
 }
 
 /// Kills session `kill` (if given) on `host`'s connection, then lists its
-/// sessions.
-fn list_sessions(host: &Host, kill: Option<u32>) -> Result<Vec<SessionInfo>, String> {
+/// sessions. A connection that can't be had fails both.
+fn list_sessions(host: &Host, kill: Option<u32>) -> Listed {
     #[cfg(any(target_os = "linux", windows))]
     {
         use crate::remote::local;
 
         let connection = match host {
-            Host::Local => local::shared(host),
-            Host::Remote(_) => local::existing(host).ok_or_else(|| anyhow::anyhow!("the connection ended")),
+            Host::Local => local::shared(host).map_err(|why| format!("{why:#}")),
+            Host::Remote(_) => local::existing(host).ok_or_else(|| format!("the connection to {} ended", host.name())),
+        };
+        let connection = match connection {
+            Ok(connection) => connection,
+            Err(why) => return Listed { kill: kill.map(|id| (id, Err(why.clone()))), sessions: Err(why) },
         };
         let limit = (!host.is_local()).then_some(LIST_LIMIT);
-        connection
-            .and_then(|connection| {
-                if let Some(id) = kill
-                    && let Err(why) = connection.kill_within(id, limit)
-                {
-                    log::warn!("killing session {id} on {}: {why:#}", host.name());
-                }
-                connection.list_within(limit)
-            })
-            .map_err(|why| format!("{why:#}"))
+        let kill = kill.map(|id| (id, connection.kill_within(id, limit).map_err(|why| format!("{why:#}"))));
+        Listed { sessions: connection.list_within(limit).map_err(|why| format!("{why:#}")), kill }
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (host, kill);
-        Ok(Vec::new())
+        let _ = host;
+        Listed { sessions: Ok(Vec::new()), kill: kill.map(|id| (id, Ok(()))) }
     }
 }
 
@@ -1617,8 +1631,8 @@ impl Workspace {
                 cx.background_executor().spawn(async move { listing_of(&host, &state, kill) })
             };
             cx.spawn_in(window, async move |this, cx| {
-                let listed = listing.await;
-                this.update_in(cx, |this, window, cx| this.sessions_answered(round, host, listed, window, cx)).ok();
+                let (listed, killed) = listing.await;
+                this.update_in(cx, |this, window, cx| this.sessions_answered(round, host, listed, killed, window, cx)).ok();
             })
             .detach();
         }
@@ -1636,16 +1650,25 @@ impl Workspace {
         }
     }
 
-    /// `host`'s listing in `round` has arrived: into the open sessions
-    /// palette, which shows it at once, or into the one still opening, which
-    /// opens if that was the last answer it waited for.
-    fn sessions_answered(&mut self, round: u64, host: Host, listed: Listing, window: &mut Window, cx: &mut Context<Self>) {
+    /// `host`'s listing in `round` has arrived, with the outcome of the kill
+    /// made before it: into the open sessions palette, which shows it at
+    /// once, or into the one still opening, which opens if that was the last
+    /// answer it waited for.
+    fn sessions_answered(
+        &mut self,
+        round: u64,
+        host: Host,
+        listed: Listing,
+        killed: Option<KillOutcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind {
-            if model.answer(round, &host, listed) {
+            if model.answer(round, &host, listed, killed) {
                 self.show_sessions_palette(cx);
             }
         } else if let Some(model) = &mut self.sessions_opening
-            && model.answer(round, &host, listed)
+            && model.answer(round, &host, listed, killed)
             && model.complete()
         {
             self.open_sessions_palette(window, cx);
@@ -2968,24 +2991,35 @@ mod tests {
         };
 
         // Attached sessions are left out, on this machine and elsewhere.
-        assert_eq!(kept(listing_from(&Host::Local, &HostState::Connected, Some(sessions()))), [1, 3]);
-        assert_eq!(kept(listing_from(&a8, &HostState::Connected, Some(sessions()))), [1, 3]);
+        assert_eq!(kept(listing_from(&Host::Local, &HostState::Connected, sessions())), [1, 3]);
+        assert_eq!(kept(listing_from(&a8, &HostState::Connected, sessions())), [1, 3]);
 
         // A connecting or offline endpoint says so, whatever was asked.
-        assert_eq!(listing_from(&a8, &HostState::Connecting, None), Listing::Connecting);
-        assert_eq!(listing_from(&a8, &HostState::Connecting, Some(sessions())), Listing::Connecting);
+        assert!(!asks(&a8, &HostState::Connecting) && !asks(&a8, &HostState::Offline("refused".into())));
+        assert!(asks(&a8, &HostState::Connected) && asks(&Host::Local, &HostState::Connected));
+        assert_eq!(listing_from(&a8, &HostState::Connecting, sessions()), Listing::Connecting);
         assert_eq!(
-            listing_from(&a8, &HostState::Offline("refused".into()), None),
+            listing_from(&a8, &HostState::Offline("refused".into()), Ok(Vec::new())),
             Listing::Offline("refused".into())
         );
+    }
 
-        // A failure to list: this machine lists nothing, any other endpoint is offline.
-        assert_eq!(listing_from(&Host::Local, &HostState::Connected, Some(Err("boom".into()))), Listing::Sessions(Vec::new()));
+    /// This machine's server isn't offline when it can't be listed: its
+    /// row says it couldn't be listed, and why.
+    #[test]
+    fn this_machines_failure_is_unlisted() {
+        let why = "connecting to the terminal server: brindle-remote is missing";
+        assert_eq!(listing_from(&Host::Local, &HostState::Connected, Err(why.into())), Listing::Unlisted(why.into()));
+    }
+
+    /// A remote endpoint that can't be listed is offline, the text naming
+    /// what failed on which endpoint.
+    #[test]
+    fn a_remote_failure_is_offline() {
         assert_eq!(
-            listing_from(&a8, &HostState::Connected, Some(Err("the connection ended".into()))),
-            Listing::Offline("the connection ended".into())
+            listing_from(&ssh_host("A8"), &HostState::Connected, Err("the connection to A8 ended".into())),
+            Listing::Offline("listing sessions on A8: the connection to A8 ended".into())
         );
-        assert!(matches!(listing_from(&a8, &HostState::Connected, None), Listing::Offline(_)), "connected but never asked");
     }
 
     /// 6.2: a tab stays on the host it was made on. Once its profile moves

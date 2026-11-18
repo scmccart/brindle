@@ -1094,6 +1094,33 @@ pub fn palette_highlight(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The sessions palette says when this machine's sessions couldn't be
+/// listed: with `BRINDLE_SERVER_HELPER` naming a missing file no core can
+/// start, so this machine's row says its sessions could not be listed, and
+/// why, and no row says that nothing is detached.
+pub fn palette_unlisted(ctx: &Ctx) -> Result<Outcome> {
+    let missing = ctx.dir.join("no-helper").join(ctx.helper.file_name().ok_or("the helper has no file name")?);
+    let out = Run::new(ctx, "run")
+        .env("BRINDLE_SERVER_HELPER", missing.to_str().ok_or("the helper's path isn't UTF-8")?)
+        .wait_for("does not name a file")
+        .action("attach_session")
+        .dump_at(later(5.0))
+        .run()?;
+    let palette = &out.dump.palette;
+    ensure!(palette.first().is_some_and(|line| line.starts_with("list ")), "the palette isn't open: {palette:?}");
+    let rows = &palette[1..];
+    ensure!(
+        rows.iter().any(|row| row.starts_with("this machine  could not list sessions: ")
+            && row.contains("BRINDLE_SERVER_HELPER does not name a file")),
+        "no row says this machine's sessions could not be listed, and why: {palette:?}"
+    );
+    ensure!(
+        !rows.iter().any(|row| row.starts_with("No detached sessions")),
+        "a row says nothing is detached: {palette:?}"
+    );
+    Ok(Outcome::Pass)
+}
+
 /// `brindle --attach ID` opens that session as the active tab; an id the
 /// server doesn't have gives a tab saying so.
 pub fn attach_flag(ctx: &Ctx) -> Result<Outcome> {
