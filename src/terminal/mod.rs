@@ -428,7 +428,7 @@ impl Terminal {
     /// a spawned profile terminal does. Returns at once, like a spawn; a
     /// refused attach shows in the terminal, which then only shows that
     /// message ([`Terminal::shows_only_message`]). A session a restored
-    /// zone recorded (`request.recorded`) is attached once its endpoint's
+    /// zone recorded (`Attaching::Recorded`) is attached once its endpoint's
     /// listing confirms it, at the size listed; meanwhile a remote one says
     /// it is connecting, until the replay's `ESC c` clears the line.
     #[cfg(any(target_os = "linux", windows))]
@@ -446,10 +446,11 @@ impl Terminal {
         // The session's size: the replay is rendered at it, and the first
         // layout resizes the session only if the window's grid differs. A
         // recorded session's comes with its listing.
-        let size = if request.recorded {
-            GridSize::default()
-        } else {
-            GridSize { cols: request.cols, rows: request.rows, ..GridSize::default() }
+        let (size, recorded) = match request.when {
+            crate::remote::local::Attaching::Now { cols, rows } => {
+                (GridSize { cols, rows, ..GridSize::default() }, false)
+            }
+            crate::remote::local::Attaching::Recorded => (GridSize::default(), true),
         };
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
@@ -459,13 +460,13 @@ impl Terminal {
             let line = format!("\x1b[2mconnecting to {}…\x1b[22m\r\n", host.name());
             parser.lock().advance(&mut *term.lock_unfair(), &marks, line.as_bytes());
         }
-        let doing = if request.recorded {
+        let doing = if recorded {
             format!("restore session {} on {}", request.session, host.name())
         } else {
             format!("attach session {} ({what})", request.session)
         };
         let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener, doing);
-        if !request.recorded {
+        if !recorded {
             sink = sink.replayed_at(size);
         }
         let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
@@ -973,11 +974,14 @@ impl Terminal {
         let _ = layout;
     }
 
-    /// The terminal server session (id and key) this terminal shows, once
-    /// it exists and while its program runs; an attach reports the session
-    /// it asked for until it is answered.
+    /// The terminal server session (id and key, `None` from a core that
+    /// predates keys) this terminal shows, once it exists and while its
+    /// program runs; an attach reports the session it asked for until it is
+    /// answered.
     #[cfg(any(target_os = "linux", windows))]
-    pub fn server_session(&self) -> Option<(crate::remote::protocol::SessionId, String)> {
+    pub fn server_session(
+        &self,
+    ) -> Option<(crate::remote::protocol::SessionId, Option<crate::remote::SessionKey>)> {
         match &self.backend {
             Backend::Server { session, .. } if !self.exited => session.id_and_key(),
             _ => None,

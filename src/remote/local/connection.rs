@@ -19,12 +19,13 @@
 //! - **Reconnect:** when a link ends, the reader connects again with the
 //!   same `client_token`. The core then replays every session it still has
 //!   for this client. A `LIST` sent right after `WELCOME` tells which
-//!   sessions it doesn't have: those are lost, and their tabs say so.
-//!   Requests written on a link that ended fail, since their answers are
-//!   gone, except attaches (restored zones), which stay pending: the
-//!   reconnect's replay of the session answers one, and one whose session
-//!   the core lists without a client is sent again. The others wait for
-//!   the next link.
+//!   sessions it doesn't have, by id and key: a fresh core restarts ids at
+//!   1, so a session whose id it gave another is one it doesn't have. Those
+//!   are lost, and their tabs say so. Requests written on a link that ended
+//!   fail, since their answers are gone, except attaches (restored zones),
+//!   which stay pending: the reconnect's replay of the session answers one,
+//!   and one whose session the core lists with its key and no client is
+//!   sent again. The others wait for the next link.
 //!   - **Local:** a core is started if none appears within [`START_AFTER`],
 //!     and every session is lost when none answers within
 //!     [`RECONNECT_LIMIT`]. A request waits up to [`REQUEST_LIMIT`].
@@ -83,19 +84,20 @@
 //! - **This machine only:** a relay's sessions run on another machine, so
 //!   they are never sent `REPARENT` (a window handle of this one), and
 //!   what is known of their programs comes from `PROCESS` ([`Foreground`]).
-//! - **Listings:** a session a restored zone recorded ([`AttachRequest`]'s
-//!   `recorded`) and a launch's [`Connection::on_listing`] both wait for the
-//!   core's `LIST`, sent on the first link when either waits (and at once
-//!   when the link is up). The listing must have the recorded session with
-//!   its key and no client; then its `ATTACH` goes out at the listed size,
-//!   which its replay is rendered at. Both keep a relay connecting, as an
-//!   attach does; a hook only until it is withdrawn.
+//! - **Listings:** a session a restored zone recorded
+//!   ([`Attaching::Recorded`]) and a launch's [`Connection::on_listing`]
+//!   both wait for the core's `LIST`, sent on the first link when either
+//!   waits (and at once when the link is up). The listing must have the
+//!   recorded session with its key and no client; then its `ATTACH` goes
+//!   out at the listed size, which its replay is rendered at. Both keep a
+//!   relay connecting, as an attach does; a hook only until it is
+//!   withdrawn.
 //!
 //! The reader holds the state lock only to look a sink up; each sink has
 //! its own lock, taken without the state lock, so parsing never waits on
 //! the map and closing a tab never waits on parsing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
@@ -109,11 +111,12 @@ use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::protocol::client::{
     self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
-    Detach, SessionRef, SetLayout, Spawned, ToClient, ToCore,
+    Detach, SessionRef, SetLayout, ToClient, ToCore,
 };
 use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
 use crate::remote::protocol::{Frame, RequestId, SessionId};
+use crate::remote::{ListedSession, SessionKey};
 
 /// How long a request waits for its answer (a spawn's `SPAWNED`, an
 /// attach's `REPLAY_START`) on the local core, a reconnect included.
@@ -194,32 +197,74 @@ pub struct SpawnRequest {
     pub profile: Option<String>,
 }
 
-/// Which detached session to attach, and the tab's size.
+/// Which detached session to attach, and when.
 pub struct AttachRequest {
     pub session: SessionId,
-    /// The key the session was listed with, kept for the tab's state.
-    pub key: String,
-    pub cols: u16,
-    pub rows: u16,
-    /// A session a restored zone recorded, not one just listed: the core's
-    /// `LIST` must still have it, with this key and no client, before its
-    /// `ATTACH` goes out, at the size listed instead of `cols` and `rows`.
-    pub recorded: bool,
+    /// The key the session was listed or recorded with, which tells it
+    /// from another core's session with its id; `None` from a core that
+    /// predates keys.
+    pub key: Option<SessionKey>,
+    pub when: Attaching,
+}
+
+/// When an attach's `ATTACH` goes out, and at which size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attaching {
+    /// A session just listed: at once, at the tab's size.
+    Now { cols: u16, rows: u16 },
+    /// A session a restored zone recorded: only once the core's `LIST`
+    /// still has it, with its key and no client, at the size listed.
+    Recorded,
+}
+
+impl AttachRequest {
+    /// What the attach waits for under `req`, and the message to send now,
+    /// if any: a recorded session's waits for a listing.
+    fn waiting(self, req: RequestId, sink: Sink, reply: Reply<u32>) -> (Waiting, Option<ToCore>) {
+        let (cols, rows, awaits) = match self.when {
+            Attaching::Now { cols, rows } => (cols, rows, Awaits::Replay),
+            // The wire's "no size", which the core takes as the session's
+            // own, unless a listing gives one first.
+            Attaching::Recorded => (0, 0, Awaits::Listing),
+        };
+        let attach = client::Attach { req, session: self.session, cols, rows };
+        let message = match awaits {
+            Awaits::Replay => Some(ToCore::Attach(attach.clone())),
+            Awaits::Listing => None,
+        };
+        (Waiting::Attach { sink, reply, attach, key: self.key, awaits }, message)
+    }
 }
 
 type Reply<T> = mpsc::SyncSender<Result<T, String>>;
 
+/// What an attach waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Awaits {
+    /// A recorded session's: a listing that has it with its key and no
+    /// client. Nothing is sent until then.
+    Listing,
+    /// Its `REPLAY_START`: its `ATTACH` is out, or will go out.
+    Replay,
+}
+
+/// What `SPAWNED` reports, its key decoded where it was read.
+struct Started {
+    session: SessionId,
+    pid: u32,
+    key: Option<SessionKey>,
+}
+
 /// What a request waits for.
 enum Waiting {
     /// `SPAWNED`, whose sink then joins the session map.
-    Spawn { sink: Sink, reply: Reply<Spawned> },
+    Spawn { sink: Sink, reply: Reply<Started> },
     /// The `REPLAY_START` answering an `ATTACH` (its pid), whose sink joins
-    /// the map before the replay's first `DATA` is read. A reconnect's
-    /// replay of the session answers it too, and `attach` is sent again
-    /// when the reconnected core didn't give the session back. `check` is
-    /// a recorded session's key, until a listing has confirmed it: until
-    /// then nothing is sent.
-    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach, check: Option<String> },
+    /// the map, with `key`, before the replay's first `DATA` is read. A
+    /// reconnect's replay of the session answers it too, and `attach` is
+    /// sent again when the reconnected core lists the session with `key`
+    /// and didn't give it back ([`carried_attaches`]).
+    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach, key: Option<SessionKey>, awaits: Awaits },
     /// `SESSIONS`.
     List(Reply<Vec<SessionInfo>>),
     /// `OK`.
@@ -258,7 +303,13 @@ impl Pending {
 
     /// A recorded attach that waits for a listing to confirm its session.
     fn is_check(&self) -> bool {
-        matches!(self.waiting, Waiting::Attach { check: Some(_), .. })
+        match &self.waiting {
+            Waiting::Attach { awaits, .. } => match awaits {
+                Awaits::Listing => true,
+                Awaits::Replay => false,
+            },
+            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => false,
+        }
     }
 }
 
@@ -271,14 +322,34 @@ struct Listing {
     after_loss: bool,
 }
 
+/// A session this connection shows: where its output goes, the key that
+/// tells it from another core's session with its id, and what is kept for
+/// it while it is shown, which goes with it.
+struct Shown {
+    sink: Sink,
+    /// `None` from a core that predates keys.
+    key: Option<SessionKey>,
+    /// The window its console is parented to (Windows), sent again after a
+    /// reconnect's replay: a core doesn't keep it.
+    parent: Option<u64>,
+    /// Its last `PROCESS`.
+    foreground: Option<Foreground>,
+}
+
+impl Shown {
+    fn new(sink: Sink, key: Option<SessionKey>) -> Self {
+        Self { sink, key, parent: None, foreground: None }
+    }
+}
+
 #[derive(Default)]
 struct State {
-    sessions: HashMap<SessionId, Sink>,
-    /// The window each session's console is parented to (Windows), sent
-    /// again after a reconnect's replay: a core doesn't keep it.
-    parents: HashMap<SessionId, u64>,
-    /// The last `PROCESS` of each session shown.
-    foreground: HashMap<SessionId, Foreground>,
+    /// By id, which is all `DATA`, `EXIT`, `REPLAY_*` and `PROCESS` carry:
+    /// within one link, the core's ids are unique. Across links an id can
+    /// name another session (a fresh core restarts them at 1), so whatever
+    /// decides about a session after a link changed matches its key too
+    /// ([`State::keep_listed`], [`State::shows`], [`State::forget`]).
+    sessions: HashMap<SessionId, Shown>,
     requests: HashMap<RequestId, Pending>,
     /// The `LIST` sent after a link's `WELCOME`, or for a recorded attach
     /// or a listing hook.
@@ -309,11 +380,48 @@ struct State {
 }
 
 impl State {
-    /// Stops showing `session`: its sink, window and foreground program go.
-    fn remove(&mut self, session: SessionId) -> Option<Sink> {
-        self.parents.remove(&session);
-        self.foreground.remove(&session);
+    /// Shows `session` as `shown`. Gives back the entry it displaced, if
+    /// any, whose tab no longer gets its session's output and is to be told
+    /// it is lost.
+    fn show(&mut self, session: SessionId, shown: Shown) -> Option<Shown> {
+        self.sessions.insert(session, shown)
+    }
+
+    /// Whether `session` is shown as the session with `key`: the one a
+    /// handle names, not another that got its id since.
+    fn shows(&self, session: SessionId, key: Option<&SessionKey>) -> bool {
+        self.sessions.get(&session).is_some_and(|shown| shown.key.as_ref() == key)
+    }
+
+    /// The entry of `session` while it is shown as the session with `key`
+    /// ([`State::shows`]).
+    fn shown(&mut self, session: SessionId, key: Option<&SessionKey>) -> Option<&mut Shown> {
+        self.sessions.get_mut(&session).filter(|shown| shown.key.as_ref() == key)
+    }
+
+    /// Stops showing `session` when it is the one with `key`, giving back
+    /// its entry; one shown under its id with another key stays.
+    fn forget(&mut self, session: SessionId, key: Option<&SessionKey>) -> Option<Shown> {
+        if !self.shows(session, key) {
+            return None;
+        }
         self.sessions.remove(&session)
+    }
+
+    /// After a lost link, keeps showing only the sessions the core still
+    /// has for this client: `listed` with their keys ([`ListedSession::is`])
+    /// and a client. The others' sinks are taken out and given back, with
+    /// their windows and foreground programs gone.
+    fn keep_listed(&mut self, listed: &[ListedSession]) -> Vec<Sink> {
+        let gone: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|&(&session, shown)| {
+                !listed.iter().any(|listing| listing.attached && listing.is(session, shown.key.as_ref()))
+            })
+            .map(|(&session, _)| session)
+            .collect();
+        gone.into_iter().filter_map(|session| self.sessions.remove(&session)).map(|shown| shown.sink).collect()
     }
 
     /// Something needs the connection: a session it shows, a request
@@ -722,12 +830,13 @@ impl Connection {
         self.send(ToCore::Close(SessionRef { session }));
     }
 
-    /// Stops showing `session`; says whether it was shown. With `closing`,
-    /// the `CLOSE` the caller sends next is counted under the same lock,
-    /// so the connection is never out of use in between.
-    fn forget(&self, session: SessionId, closing: bool) -> bool {
+    /// Stops showing `session`, the one with `key` ([`State::forget`]);
+    /// says whether it was shown. With `closing`, the `CLOSE` the caller
+    /// sends next is counted under the same lock, so the connection is never
+    /// out of use in between.
+    fn forget(&self, session: SessionId, key: Option<&SessionKey>, closing: bool) -> bool {
         let mut state = self.state.lock();
-        let shown = state.remove(session).is_some();
+        let shown = state.forget(session, key).is_some();
         if shown && closing {
             state.closing(session);
         }
@@ -813,7 +922,7 @@ impl Connection {
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink, abandon: Option<&Abandon>) -> Result<Running> {
         let command = Some(request.command).filter(|command| !command.is_empty());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let spawned = self.ask("start the session", abandon, None, |req, reply| {
+        let started = self.ask("start the session", abandon, None, |req, reply| {
             let message = Some(ToCore::Spawn(client::Spawn {
                 req,
                 command,
@@ -830,22 +939,18 @@ impl Connection {
             }));
             (Waiting::Spawn { sink, reply }, message)
         })?;
-        Ok(Running { id: spawned.session, pid: spawned.pid, key: spawned.key, conn: self.clone(), layout: Mutex::default() })
+        let Started { session, pid, key } = started;
+        Ok(Running { id: session, pid, key, conn: self.clone(), layout: Mutex::default() })
     }
 
     /// Attaches a detached session, whose replay and then live output go to
     /// `sink`, and waits for its `REPLAY_START`. A recorded session is
     /// looked up in the core's listing first. Not on the UI thread.
     pub fn attach(self: &Arc<Self>, request: AttachRequest, sink: Sink, abandon: Option<&Abandon>) -> Result<Running> {
-        let session = request.session;
+        let (session, key) = (request.session, request.key.clone());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let check = request.recorded.then(|| request.key.clone());
-        let pid = self.ask("attach the session", abandon, None, |req, reply| {
-            let attach = client::Attach { req, session, cols: request.cols, rows: request.rows };
-            let message = check.is_none().then(|| ToCore::Attach(attach.clone()));
-            (Waiting::Attach { sink, reply, attach, check }, message)
-        })?;
-        Ok(Running { id: session, pid, key: request.key, conn: self.clone(), layout: Mutex::default() })
+        let pid = self.ask("attach the session", abandon, None, |req, reply| request.waiting(req, sink, reply))?;
+        Ok(Running { id: session, pid, key, conn: self.clone(), layout: Mutex::default() })
     }
 
     /// The core's sessions, this client's and detached ones. Blocks.
@@ -1116,8 +1221,11 @@ impl Connection {
                 let mut state = self.state.lock();
                 match state.requests.remove(&spawned.req).map(|pending| pending.waiting) {
                     Some(Waiting::Spawn { sink, reply }) => {
-                        state.sessions.insert(spawned.session, sink);
-                        reply.try_send(Ok(spawned)).ok();
+                        let (session, pid, key) = (spawned.session, spawned.pid, SessionKey::from_wire(&spawned.key));
+                        let displaced = state.show(session, Shown::new(sink, key.clone()));
+                        drop(state);
+                        reply.try_send(Ok(Started { session, pid, key })).ok();
+                        displaced_lost(session, displaced);
                     }
                     other => {
                         // Its spawner gave up: nobody shows this session.
@@ -1159,9 +1267,10 @@ impl Connection {
             ToClient::ReplayStart(ReplayStart { req: Some(req), session, pid }) => {
                 let mut state = self.state.lock();
                 match state.requests.remove(&req).map(|pending| pending.waiting) {
-                    Some(Waiting::Attach { sink, reply, .. }) => {
-                        state.sessions.insert(session, sink.clone());
+                    Some(Waiting::Attach { sink, reply, key, .. }) => {
+                        let displaced = state.show(session, Shown::new(sink.clone(), key));
                         drop(state);
+                        displaced_lost(session, displaced);
                         sink.lock().replay(true);
                         reply.try_send(Ok(pid)).ok();
                     }
@@ -1177,8 +1286,9 @@ impl Connection {
                 }
             }
             ToClient::Exit(exit) => {
-                let sink = self.state.lock().remove(exit.session);
-                if let Some(sink) = sink {
+                // Its session and window go with it.
+                let shown = self.state.lock().sessions.remove(&exit.session);
+                if let Some(Shown { sink, .. }) = shown {
                     match exit.lost {
                         Some(reason) => sink.lock().lost(&format!("the terminal server lost it: {reason}")),
                         None => sink.lock().exited(exit.code),
@@ -1189,7 +1299,8 @@ impl Connection {
                 let session = start.session;
                 if let Some(sink) = self.sink(session) {
                     sink.lock().replay(true);
-                } else if let Some((sink, reply)) = self.attached_by_replay(session) {
+                } else if let Some((sink, reply, displaced)) = self.attached_by_replay(session) {
+                    displaced_lost(session, displaced);
                     sink.lock().replay(true);
                     reply.try_send(Ok(start.pid)).ok();
                 } else {
@@ -1205,7 +1316,7 @@ impl Connection {
                 }
                 // The core that replayed may be a new one, which doesn't
                 // know the session's window.
-                let parent = self.state.lock().parents.get(&end.session).copied();
+                let parent = self.state.lock().sessions.get(&end.session).and_then(|shown| shown.parent);
                 if let Some(hwnd) = parent {
                     self.send(ToCore::Reparent(Reparent { session: end.session, hwnd }));
                 }
@@ -1218,30 +1329,23 @@ impl Connection {
                         return;
                     };
                     state.list = None;
+                    let listed: Vec<ListedSession> = sessions.sessions.iter().map(ListedSession::of).collect();
                     // Only a lost link's sessions can be missing: on a link
                     // that stayed up, every session shown here is listed.
-                    let lost = if listing.after_loss {
-                        let kept: HashSet<SessionId> =
-                            sessions.sessions.iter().filter(|s| s.attached).map(|s| s.session).collect();
-                        state.parents.retain(|session, _| kept.contains(session));
-                        state.foreground.retain(|session, _| kept.contains(session));
-                        missing(&mut state.sessions, &kept)
-                    } else {
-                        Vec::new()
-                    };
-                    let decided = carried_attaches(&mut state.requests, &sessions.sessions, &name);
+                    let lost = if listing.after_loss { state.keep_listed(&listed) } else { Vec::new() };
+                    let decided = carried_attaches(&mut state.requests, &listed, &name);
                     (lost, decided, std::mem::take(&mut state.on_listing))
                 };
                 for sink in lost {
-                    sink.lock().lost("the terminal server no longer has this session");
+                    sink.lock().lost(NO_LONGER_LISTED);
                 }
                 for (pending, reason) in decided.gone {
                     pending.waiting.fail(reason);
                 }
                 for (attach, recorded) in decided.again {
                     // Told before the ATTACH goes out, so before its replay.
-                    if let Some(sink) = recorded {
-                        sink.lock().replay_size(attach.cols, attach.rows);
+                    if let Some((sink, (cols, rows))) = recorded {
+                        sink.lock().replay_size(cols, rows);
                     }
                     self.send(ToCore::Attach(attach));
                 }
@@ -1254,10 +1358,10 @@ impl Connection {
                     let mut state = self.state.lock();
                     // Only for a session shown here: SPAWNED or REPLAY_START
                     // put its sink in the map before this was read.
-                    let Some(sink) = state.sessions.get(&process.session).cloned() else { return };
+                    let Some(shown) = state.sessions.get_mut(&process.session) else { return };
                     let foreground = Foreground { name: process.name, cwd: process.cwd };
-                    let previous = state.foreground.insert(process.session, foreground.clone());
-                    (previous.map(|previous| previous.name) != Some(foreground.name)).then_some(sink)
+                    let previous = shown.foreground.replace(foreground.clone());
+                    (previous.map(|previous| previous.name) != Some(foreground.name)).then(|| shown.sink.clone())
                 };
                 if let Some(sink) = renamed {
                     sink.lock().foreground();
@@ -1268,24 +1372,35 @@ impl Connection {
     }
 
     fn sink(&self, session: SessionId) -> Option<Sink> {
-        self.state.lock().sessions.get(&session).cloned()
+        self.state.lock().sessions.get(&session).map(|shown| shown.sink.clone())
     }
 
     /// A replay without a `req` (a reconnect's) of a session an attach
-    /// waits for answers that attach: its sink joins the map. A recorded
-    /// attach not sent yet asked the core for nothing, so it isn't one.
-    fn attached_by_replay(&self, session: SessionId) -> Option<(Sink, Reply<u32>)> {
+    /// waits for answers that attach: its sink joins the map, with the
+    /// attach's key, and the entry it displaced (if any) comes back. A
+    /// recorded attach not sent yet asked the core for nothing, so it isn't
+    /// one.
+    ///
+    /// It matches by id: `REPLAY_START` carries no key, and a replay without
+    /// a `req` comes only for a session the core gives back to this client's
+    /// token. A core that adopted the holders gives back the same session; a
+    /// fresh core, only sessions this client spawned or attached on it since
+    /// it reconnected. So the id names the session the attach waits for.
+    fn attached_by_replay(&self, session: SessionId) -> Option<(Sink, Reply<u32>, Option<Shown>)> {
         let mut state = self.state.lock();
         let req = state.requests.iter().find_map(|(&req, pending)| match &pending.waiting {
-            Waiting::Attach { attach, check: None, .. } if attach.session == session => Some(req),
-            _ => None,
+            Waiting::Attach { attach, awaits, .. } if attach.session == session => match awaits {
+                Awaits::Replay => Some(req),
+                Awaits::Listing => None,
+            },
+            Waiting::Attach { .. } | Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => None,
         })?;
-        let Some(Waiting::Attach { sink, reply, .. }) = state.requests.remove(&req).map(|pending| pending.waiting)
+        let Some(Waiting::Attach { sink, reply, key, .. }) = state.requests.remove(&req).map(|pending| pending.waiting)
         else {
             unreachable!("an attach")
         };
-        state.sessions.insert(session, sink.clone());
-        Some((sink, reply))
+        let displaced = state.show(session, Shown::new(sink.clone(), key));
+        Some((sink, reply, displaced))
     }
 
     /// The link ended: the writer holds its messages, and requests that
@@ -1321,7 +1436,7 @@ impl Connection {
 
     /// A relay link was lost: each of the endpoint's terminals says so.
     fn lost_link(&self, name: &str) {
-        let sinks: Vec<Sink> = self.state.lock().sessions.values().cloned().collect();
+        let sinks: Vec<Sink> = self.state.lock().sessions.values().map(|shown| shown.sink.clone()).collect();
         let line = lost_line(name);
         for sink in sinks {
             sink.lock().output(line.as_bytes());
@@ -1495,8 +1610,6 @@ impl Connection {
             let mut state = self.state.lock();
             state.ended.get_or_insert_with(|| reason.to_string());
             self.report(&mut state, LinkState::Ended(reason.to_string()));
-            state.parents.clear();
-            state.foreground.clear();
             // No listing will come.
             state.on_listing.clear();
             (std::mem::take(&mut state.sessions), std::mem::take(&mut state.requests), state.on_end.take())
@@ -1523,8 +1636,8 @@ impl Connection {
         for pending in requests.into_values() {
             pending.waiting.fail(reason.to_string());
         }
-        for sink in sessions.into_values() {
-            sink.lock().lost(reason);
+        for shown in sessions.into_values() {
+            shown.sink.lock().lost(reason);
         }
         if let Some(hook) = hook {
             hook();
@@ -1779,6 +1892,21 @@ fn encode(message: &ToCore, host: Option<&RelayHost>) -> io::Result<Frame> {
     message.encode()
 }
 
+/// Why a session shown here is lost when the core no longer has it: a
+/// reconnect's listing lacks it with its key, or another session took its id.
+const NO_LONGER_LISTED: &str = "the terminal server no longer has this session";
+
+/// Tells the tab of an entry another session displaced from its id
+/// `session` that its session is lost. Not under the state lock: a sink
+/// takes its own.
+fn displaced_lost(session: SessionId, displaced: Option<Shown>) {
+    if let Some(Shown { sink, key, .. }) = displaced {
+        let key = key.as_ref().map_or("none", SessionKey::as_str);
+        log::warn!("session {session} (key {key}) is lost: the terminal server gave its id to another session");
+        sink.lock().lost(NO_LONGER_LISTED);
+    }
+}
+
 /// What a relay's loss writes into each of its terminals: one dim line.
 fn lost_line(name: &str) -> String {
     format!("\r\n\x1b[2mconnection to {name} lost; reconnecting…\x1b[22m\r\n")
@@ -1789,57 +1917,67 @@ fn retrying_line(message: &str) -> String {
     format!("\r\n\x1b[2m{}; retrying…\x1b[22m\r\n", message.replace('\n', "\r\n"))
 }
 
+/// An attach to send (again). A recorded session's comes with its sink and
+/// the size it was listed at, which its replay is rendered at: the sink is
+/// told it before the `ATTACH` goes out. A core that lists no size tells it
+/// nothing.
+type Again = (client::Attach, Option<(Sink, (u16, u16))>);
+
 /// What a listing decides for the attaches that wait on it.
 #[derive(Default)]
 struct Decided {
-    /// To send (again), with a recorded session's sink, which is told the
-    /// listed size its replay is rendered at.
-    again: Vec<(client::Attach, Option<Sink>)>,
+    again: Vec<Again>,
     /// Taken out, with why.
     gone: Vec<(Pending, String)>,
 }
 
 /// What becomes of the attaches waiting on the core's `LIST` (`listed`),
-/// at endpoint `name`:
-/// - **Carried over a lost link:** the core gave this client back the
-///   sessions it owns before it answered, so one listed with a client waits
-///   for that replay. One listed without a client is sent again, and one not
-///   listed is taken out.
-/// - **Recorded (not sent yet):** sent at the listed size when the listing
-///   has the session with its key and no client. Taken out when another
-///   client has it, or when it isn't listed with its key (it ended, and the
-///   id may be another session's now).
-fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[SessionInfo], name: &str) -> Decided {
+/// at endpoint `name`. A session is listed when the listing has its id with
+/// its key ([`ListedSession::is`]):
+/// - **Recorded (`Awaits::Listing`, not sent yet):** sent at the listed
+///   size (else the request's) when its session is listed, with a key, and
+///   no client; it then waits for its replay. Taken out when another client
+///   has it, or when it has no key or isn't listed (it ended, and the id may
+///   be another session's now).
+/// - **Carried over a lost link (`Awaits::Replay`):** the core gave this
+///   client back the sessions it owns before it answered, so one listed with
+///   a client waits for that replay. One listed without a client is sent
+///   again. One not listed, or listed under another key, is taken out.
+fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[ListedSession], name: &str) -> Decided {
     let mut decided = Decided::default();
     let carried: Vec<RequestId> =
         requests.iter().filter(|(_, pending)| pending.carried).map(|(&req, _)| req).collect();
     for req in carried {
         let Some(pending) = requests.get_mut(&req) else { continue };
-        let Waiting::Attach { attach, check, sink, .. } = &mut pending.waiting else { continue };
+        let Waiting::Attach { attach, key, awaits, sink, .. } = &mut pending.waiting else { continue };
         let session = attach.session;
-        let info = listed.iter().find(|info| info.session == session);
-        let why = match (check.as_deref(), info) {
-            (Some(key), Some(info)) if !key.is_empty() && info.key == key => {
-                if info.attached {
-                    Some(format!("session {session} on {name} is shown by another Brindle"))
-                } else {
-                    if info.cols > 0 && info.rows > 0 {
-                        (attach.cols, attach.rows) = (info.cols, info.rows);
+        let found = listed.iter().find(|listing| listing.is(session, key.as_ref()));
+        let why = match awaits {
+            Awaits::Listing => match found {
+                Some(listing) if key.is_some() => {
+                    if listing.attached {
+                        Some(format!("session {session} on {name} is shown by another Brindle"))
+                    } else {
+                        if let Some((cols, rows)) = listing.size {
+                            (attach.cols, attach.rows) = (cols, rows);
+                        }
+                        *awaits = Awaits::Replay;
+                        pending.carried = false;
+                        decided.again.push((attach.clone(), listing.size.map(|size| (sink.clone(), size))));
+                        None
                     }
-                    *check = None;
+                }
+                Some(_) | None => Some(format!("session {session} on {name} has ended")),
+            },
+            Awaits::Replay => match found {
+                Some(listing) if listing.attached => None,
+                Some(_) => {
                     pending.carried = false;
-                    decided.again.push((attach.clone(), Some(sink.clone())));
+                    decided.again.push((attach.clone(), None));
                     None
                 }
-            }
-            (Some(_), _) => Some(format!("session {session} on {name} has ended")),
-            (None, Some(info)) if info.attached => None,
-            (None, Some(_)) => {
-                pending.carried = false;
-                decided.again.push((attach.clone(), None));
-                None
-            }
-            (None, None) => Some(format!("the terminal server no longer has session {session}")),
+                None => Some(format!("the terminal server no longer has session {session}")),
+            },
         };
         if let Some(why) = why {
             decided.gone.extend(requests.remove(&req).map(|pending| (pending, why)));
@@ -1848,18 +1986,19 @@ fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[Sessio
     decided
 }
 
-/// Takes the sessions out of `sessions` that the core no longer holds for
-/// this client (not in `kept`).
-fn missing<T>(sessions: &mut HashMap<SessionId, T>, kept: &HashSet<SessionId>) -> Vec<T> {
-    let gone: Vec<SessionId> = sessions.keys().filter(|id| !kept.contains(id)).copied().collect();
-    gone.into_iter().filter_map(|id| sessions.remove(&id)).collect()
-}
-
 /// A session the core started, once [`super::Session`] has it.
+///
+/// It acts only while its connection shows that session, by id and key
+/// ([`State::shows`]). Once the session exited or was lost, its id can name
+/// a session a fresh core started since, another tab's, which this one's
+/// input, resizes, window, layout, detach and close must never reach. The
+/// tab already says why it stopped (its exit or lost line), so the calls
+/// do nothing.
 pub struct Running {
     id: SessionId,
     pid: u32,
-    key: String,
+    /// `None` from a core that predates keys.
+    key: Option<SessionKey>,
     conn: Arc<Connection>,
     /// The layout last sent with `SET_LAYOUT`, so an unchanged one isn't
     /// sent again.
@@ -1876,25 +2015,39 @@ impl Running {
         self.id
     }
 
-    /// The session's key; empty from a core that predates keys.
-    pub fn key(&self) -> &str {
-        &self.key
+    /// The session's key; `None` from a core that predates keys.
+    pub fn key(&self) -> Option<&SessionKey> {
+        self.key.as_ref()
     }
 
-    pub fn input(&self, bytes: &[u8]) {
-        for chunk in bytes.chunks(INPUT_CHUNK) {
-            self.conn.send(ToCore::Data(Data { session: self.id, bytes: chunk.to_vec() }));
+    /// Sends `messages` while the connection shows this session, and
+    /// nothing otherwise. They are queued under the state lock, so the
+    /// reader can't stop showing the session, or show another under its id,
+    /// in between.
+    fn send_while_shown(&self, messages: impl IntoIterator<Item = ToCore>) {
+        let state = self.conn.state.lock();
+        if state.shows(self.id, self.key.as_ref()) {
+            for message in messages {
+                self.conn.send(message);
+            }
         }
     }
 
+    pub fn input(&self, bytes: &[u8]) {
+        let session = self.id;
+        self.send_while_shown(
+            bytes.chunks(INPUT_CHUNK).map(|chunk| ToCore::Data(Data { session, bytes: chunk.to_vec() })),
+        );
+    }
+
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
-        self.conn.send(ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h }));
+        self.send_while_shown([ToCore::Resize(Resize { session: self.id, cols, rows, cell_w, cell_h })]);
     }
 
     /// What the core last reported of the session's foreground program,
-    /// once it has.
+    /// once it has, while the session is shown.
     pub fn foreground(&self) -> Option<Foreground> {
-        self.conn.state.lock().foreground.get(&self.id).cloned()
+        self.conn.state.lock().shown(self.id, self.key.as_ref()).and_then(|shown| shown.foreground.clone())
     }
 
     /// Makes the window `hwnd` the owner of the session's console window
@@ -1906,29 +2059,27 @@ impl Running {
         if self.conn.is_relay() {
             return;
         }
-        {
-            let mut state = self.conn.state.lock();
-            if !state.sessions.contains_key(&self.id) {
-                return;
-            }
-            state.parents.insert(self.id, hwnd);
-        }
+        let mut state = self.conn.state.lock();
+        let Some(shown) = state.shown(self.id, self.key.as_ref()) else { return };
+        shown.parent = Some(hwnd);
         self.conn.send(ToCore::Reparent(Reparent { session: self.id, hwnd }));
     }
 
     /// Ends the session (`CLOSE`). Once is enough; a session that already
     /// exited or was lost isn't closed again.
     pub fn close(&self) {
-        if self.conn.forget(self.id, true) {
+        if self.conn.forget(self.id, self.key.as_ref(), true) {
             self.conn.send(ToCore::Close(SessionRef { session: self.id }));
         }
     }
 
     /// Makes `layout` the session's layout on the core (`SET_LAYOUT`), when it
-    /// differs from the one last sent and the link speaks client protocol 3;
-    /// a core below 3 gets it only with the `DETACH` on quit.
+    /// differs from the one last sent, the link speaks client protocol 3 and
+    /// the session is shown; a core below 3 gets it only with the `DETACH`
+    /// on quit.
     pub fn set_layout(&self, layout: Option<serde_json::Value>) {
-        if self.conn.state.lock().protocol < 3 {
+        let state = self.conn.state.lock();
+        if state.protocol < 3 || !state.shows(self.id, self.key.as_ref()) {
             return;
         }
         let mut sent = self.layout.lock();
@@ -1943,7 +2094,7 @@ impl Running {
     /// layout of the tab it was in for whichever client attaches it next,
     /// unless it already exited or was lost.
     pub fn detach(&self, layout: Option<serde_json::Value>) {
-        if self.conn.forget(self.id, false) {
+        if self.conn.forget(self.id, self.key.as_ref(), false) {
             self.conn.send(ToCore::Detach(Detach { session: self.id, layout }));
         }
     }
@@ -1956,7 +2107,7 @@ pub(super) mod fake {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::remote::protocol::client::{Hello, Welcome};
+    use crate::remote::protocol::client::{Hello, Spawned, Welcome};
 
     /// Timings short enough for tests.
     pub fn quick() -> Timings {
@@ -2231,6 +2382,7 @@ mod tests {
 
     use super::fake::{self, Plan};
     use super::*;
+    use crate::remote::protocol::client::Spawned;
     use crate::remote::protocol::relay::RelayError;
 
     fn seen(rx: &mpsc::Receiver<String>) -> String {
@@ -2264,13 +2416,19 @@ mod tests {
         }
     }
 
+    /// A session just listed, with the key a core gives it (`k{id}`, as
+    /// [`fake::spawning`]'s are).
     fn attach_request(session: SessionId) -> AttachRequest {
-        AttachRequest { session, key: format!("k{session}"), cols: 100, rows: 30, recorded: false }
+        AttachRequest {
+            session,
+            key: SessionKey::from_wire(&format!("k{session}")),
+            when: Attaching::Now { cols: 100, rows: 30 },
+        }
     }
 
     /// A session a restored zone recorded, whose size it doesn't know.
     fn recorded(session: SessionId) -> AttachRequest {
-        AttachRequest { cols: 80, rows: 24, recorded: true, ..attach_request(session) }
+        AttachRequest { when: Attaching::Recorded, ..attach_request(session) }
     }
 
     /// Waits until `count` requests wait in the connection.
@@ -2352,7 +2510,7 @@ mod tests {
         let (sink, _tab) = fake::sink();
         let request = spawn_request(&[("TERM", "xterm-256color"), ("FOO", "1")]);
         let running = connection.spawn(request, sink, None).unwrap();
-        assert_eq!((running.id(), running.pid(), running.key()), (11, 1011, "k11"));
+        assert_eq!((running.id(), running.pid(), running.key()), (11, 1011, Some(&key("k11"))));
         let hello = far.hello();
         assert_eq!((hello.linger_secs, hello.process_info, hello.client_token.as_str()), (300, true, "tok"));
         let ToCore::Spawn(spawn) = far.next() else { panic!("not SPAWN") };
@@ -2573,7 +2731,8 @@ mod tests {
                 out.send(ToClient::ReplayStart(ReplayStart { req: None, session: kept_id, pid: 1011 }));
                 out.send(ToClient::Data(Data { session: kept_id, bytes: b"screen".to_vec() }));
                 out.send(ToClient::ReplayEnd(SessionRef { session: kept_id }));
-                let info = SessionInfo { session: kept_id, attached: true, ..Default::default() };
+                let info =
+                    SessionInfo { session: kept_id, key: format!("k{kept_id}"), attached: true, ..Default::default() };
                 out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
             }
         });
@@ -2632,7 +2791,12 @@ mod tests {
         let (link, second) = fake::link(&[], |message, out| {
             if let ToCore::List(list) = message {
                 replay(out, 7, None);
-                let attached = |session: SessionId| SessionInfo { session, attached: true, ..Default::default() };
+                let attached = |session: SessionId| SessionInfo {
+                    session,
+                    key: format!("k{session}"),
+                    attached: true,
+                    ..Default::default()
+                };
                 out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![attached(7), attached(8)] }));
                 replay(out, 8, None);
             }
@@ -2671,7 +2835,7 @@ mod tests {
 
         let (link, second) = fake::link(&[], |message, out| match message {
             ToCore::List(list) => {
-                let detached = SessionInfo { session: 7, owned: true, ..Default::default() };
+                let detached = SessionInfo { session: 7, key: "k7".into(), owned: true, ..Default::default() };
                 out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![detached] }));
             }
             other => replaying(other, out),
@@ -2687,6 +2851,166 @@ mod tests {
         quiet(&tab);
         quiet(&gone_tab);
         assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// A fresh core (no holder survived) restarts ids at 1, so a reconnect
+    /// can list a shown session's id for another session, with another key
+    /// and a client (another Brindle's). That tab is lost, and its handle
+    /// reaches nothing; the session listed with its own key keeps its
+    /// replay and its input.
+    #[test]
+    fn a_session_whose_id_the_reconnected_core_gave_another_is_lost() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (reused_sink, reused_tab) = fake::sink();
+        let (kept_sink, kept_tab) = fake::sink();
+        let reused = connection.spawn(spawn_request(&[]), reused_sink, None).unwrap();
+        let kept = connection.spawn(spawn_request(&[]), kept_sink, None).unwrap();
+        first.next();
+        first.next();
+        first.out.cut();
+        assert!(seen(&reused_tab).contains("connection to A8 lost"));
+        assert!(seen(&kept_tab).contains("connection to A8 lost"));
+
+        let (reused_id, kept_id) = (reused.id(), kept.id());
+        let (link, second) = fake::link(&[], move |message, out| {
+            if let ToCore::List(list) = message {
+                replay(out, kept_id, None);
+                let sessions = vec![
+                    SessionInfo { session: reused_id, key: "another".into(), attached: true, ..Default::default() },
+                    SessionInfo { session: kept_id, key: format!("k{kept_id}"), attached: true, ..Default::default() },
+                ];
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions }));
+            }
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(seen(&kept_tab), "replay true");
+        assert_eq!(seen(&kept_tab), "output screen");
+        assert_eq!(seen(&kept_tab), "replay false");
+        assert_eq!(seen(&reused_tab), "lost the terminal server no longer has this session");
+        quiet(&reused_tab);
+        quiet(&kept_tab);
+        // The lost tab's input never goes out: the next message is the
+        // kept one's.
+        reused.input(b"lost\r");
+        kept.input(b"kept\r");
+        assert!(matches!(second.next(), ToCore::Data(data) if data.session == kept_id && data.bytes == b"kept\r"));
+    }
+
+    /// An attach cut off with its link, whose id the reconnected core lists
+    /// for another session (another key, no client), is never sent again:
+    /// it fails as one whose session isn't listed does, and its tab shows
+    /// nothing of the other session.
+    #[test]
+    fn a_cut_off_attach_whose_id_has_another_key_fails_and_is_not_sent_again() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], |_, _| {});
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let attaching = connection.clone();
+        let attach = in_background(move || attaching.attach(attach_request(7), sink, None).map(|r| r.pid()));
+        assert!(matches!(first.next(), ToCore::Attach(attach) if attach.session == 7));
+        first.out.cut();
+
+        let (link, second) = fake::link(&[], |message, out| match message {
+            ToCore::List(list) => {
+                let other = SessionInfo { session: 7, key: "another".into(), owned: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![other] }));
+            }
+            other => replaying(other, out),
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(attach.join().unwrap().unwrap_err().to_string(), "the terminal server no longer has session 7");
+        quiet(&tab);
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "the ATTACH went out again");
+        assert!(connection.state.lock().sessions.is_empty());
+    }
+
+    /// The handle of a session lost after a reconnect, whose id a fresh core
+    /// then gave a new tab's session, acts on neither: its input, resize,
+    /// close and detach write nothing and leave the new session shown, whose
+    /// own close still goes out.
+    #[test]
+    fn a_lost_session_handle_never_reaches_the_session_that_reused_its_id() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (lost_sink, lost_tab) = fake::sink();
+        let lost = connection.spawn(spawn_request(&[]), lost_sink, None).unwrap();
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        assert!(seen(&lost_tab).contains("connection to A8 lost"));
+
+        // A fresh core: it has no session, and gives the next one the lost
+        // one's id under another key.
+        let id = lost.id();
+        let (link, second) = fake::link(&[], move |message, out| match message {
+            ToCore::List(list) => {
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));
+            }
+            ToCore::Spawn(spawn) => {
+                out.send(ToClient::Spawned(Spawned { req: spawn.req, session: id, pid: 2000, key: "fresh".into() }));
+            }
+            _ => {}
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(seen(&lost_tab), "lost the terminal server no longer has this session");
+        let (fresh_sink, fresh_tab) = fake::sink();
+        let fresh = connection.spawn(spawn_request(&[]), fresh_sink, None).unwrap();
+        assert!(matches!(second.next(), ToCore::Spawn(_)));
+        assert_eq!((fresh.id(), fresh.key()), (id, Some(&key("fresh"))));
+
+        lost.input(b"leaked\r");
+        lost.resize(100, 30, 8, 16);
+        lost.close();
+        lost.detach(None);
+        assert!(connection.state.lock().shows(id, fresh.key()), "the new session isn't shown");
+        // The next message written is the new session's own CLOSE.
+        fresh.close();
+        assert_eq!(second.next(), ToCore::Close(SessionRef { session: id }));
+        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+        quiet(&lost_tab);
+        quiet(&fresh_tab);
+    }
+
+    /// A core that predates keys gives a session none, and lists it with
+    /// none: after a reconnect it is kept by its id, as there is nothing
+    /// better to compare, and its handle still acts.
+    #[test]
+    fn a_session_from_a_core_without_keys_is_kept_by_its_id() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, first) = fake::link(&[], |message, out| {
+            if let ToCore::Spawn(spawn) = message {
+                out.send(ToClient::Spawned(Spawned { req: spawn.req, session: 3, pid: 1003, key: String::new() }));
+            }
+        });
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert_eq!((running.id(), running.key()), (3, None));
+        assert!(matches!(first.next(), ToCore::Spawn(_)));
+        first.out.cut();
+        assert!(seen(&tab).contains("connection to A8 lost"));
+
+        let (link, second) = fake::link(&[], |message, out| {
+            if let ToCore::List(list) = message {
+                replay(out, 3, None);
+                let keyless = SessionInfo { session: 3, attached: true, ..Default::default() };
+                out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![keyless] }));
+            }
+        });
+        plan.link(link);
+        assert!(matches!(second.next(), ToCore::List(_)));
+        assert_eq!(seen(&tab), "replay true");
+        assert_eq!(seen(&tab), "output screen");
+        assert_eq!(seen(&tab), "replay false");
+        quiet(&tab);
+        running.input(b"x");
+        assert!(matches!(second.next(), ToCore::Data(data) if data.session == 3 && data.bytes == b"x"));
     }
 
     /// A replay of a session that no tab here shows or waits for (its tab
@@ -2801,7 +3125,7 @@ mod tests {
         let (link, second) = fake::link(&[], move |message, out| {
             if let ToCore::List(list) = message {
                 replay(out, id, None);
-                let info = SessionInfo { session: id, attached: true, ..Default::default() };
+                let info = SessionInfo { session: id, key: format!("k{id}"), attached: true, ..Default::default() };
                 out.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: vec![info] }));
             }
         });
@@ -2815,7 +3139,7 @@ mod tests {
         running.input(b"x");
         assert!(matches!(second.next(), ToCore::Data(data) if data.bytes == b"x"));
         assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
-        assert!(connection.state.lock().parents.is_empty());
+        assert!(connection.state.lock().sessions.values().all(|shown| shown.parent.is_none()));
     }
 
     /// 6.1: `PROCESS` read right behind `SPAWNED` (the core sends one at
@@ -2838,7 +3162,7 @@ mod tests {
         let reported = Some(Foreground { name: Some("bash".into()), cwd: Some("/home/u".into()) });
         eventually("the PROCESS is kept", || running.foreground() == reported);
         quiet(&tab);
-        assert_eq!(connection.state.lock().foreground.len(), 1, "nothing kept for session 99");
+        assert!(!connection.state.lock().sessions.contains_key(&99), "nothing kept for session 99");
         running.close();
         assert_eq!(running.foreground(), None);
     }
@@ -3210,7 +3534,7 @@ mod tests {
         let (sink, tab) = fake::sink();
         let attaching = connection.clone();
         let attach = in_background(move || {
-            attaching.attach(recorded(5), sink, None).map(|r| (r.id(), r.pid(), r.key().to_string()))
+            attaching.attach(recorded(5), sink, None).map(|r| (r.id(), r.pid(), r.key().cloned()))
         });
         waiting(&connection, 1);
         plan.next_dial();
@@ -3229,7 +3553,7 @@ mod tests {
         assert!(matches!(far.next(), ToCore::List(_)));
         let ToCore::Attach(sent) = far.next() else { panic!("not ATTACH") };
         assert_eq!((sent.session, sent.cols, sent.rows), (5, 132, 43));
-        assert_eq!(attach.join().unwrap().unwrap(), (5, 99, "k5".to_string()));
+        assert_eq!(attach.join().unwrap().unwrap(), (5, 99, Some(key("k5"))));
         assert_eq!(seen(&tab), "size 132x43");
         assert_eq!(seen(&tab), "replay true");
         assert_eq!(seen(&tab), "output screen");
@@ -3445,13 +3769,303 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
     }
 
+    fn key(text: &str) -> SessionKey {
+        SessionKey::from_wire(text).expect("a key")
+    }
+
+    /// A listing's entry; `key` as the wire has it (empty: a core that
+    /// predates keys), with no size.
+    fn entry(session: SessionId, key: &str, attached: bool) -> ListedSession {
+        ListedSession { session, key: SessionKey::from_wire(key), attached, size: None }
+    }
+
+    /// A state showing each of `shown` (id and key), with the sinks in the
+    /// same order.
+    fn showing(shown: &[(SessionId, Option<&str>)]) -> (State, Vec<Sink>) {
+        let mut state = State::default();
+        let sinks = shown
+            .iter()
+            .map(|&(session, wire_key)| {
+                let (sink, _tab) = fake::sink();
+                assert!(state.show(session, Shown::new(sink.clone(), wire_key.map(key))).is_none());
+                sink
+            })
+            .collect();
+        (state, sinks)
+    }
+
+    fn shown_ids(state: &State) -> Vec<SessionId> {
+        let mut ids: Vec<SessionId> = state.sessions.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Whether `sinks` are `expected`, in any order.
+    fn same_sinks(mut sinks: Vec<Sink>, expected: &[&Sink]) -> bool {
+        sinks.len() == expected.len()
+            && expected.iter().all(|wanted| {
+                let found = sinks.iter().position(|sink| Arc::ptr_eq(sink, wanted));
+                found.map(|at| sinks.swap_remove(at)).is_some()
+            })
+    }
+
+    /// After a lost link, a session shown here is kept only when the
+    /// listing has its id with its key, and a client (this one, given back).
     #[test]
-    fn sessions_the_core_no_longer_lists_are_missing() {
-        let mut sessions: HashMap<SessionId, &str> = [(1, "a"), (2, "b"), (3, "c")].into();
-        let mut lost = missing(&mut sessions, &[2].into());
-        lost.sort();
-        assert_eq!(lost, ["a", "c"]);
-        assert_eq!(sessions.keys().copied().collect::<Vec<_>>(), [2]);
-        assert!(missing(&mut sessions, &[2, 9].into()).is_empty());
+    fn a_shown_session_is_kept_only_when_listed_with_its_key_and_a_client() {
+        let (mut state, sinks) =
+            showing(&[(1, Some("k1")), (2, Some("k2")), (3, Some("k3")), (4, Some("k4")), (5, Some("k5"))]);
+        let listed = [
+            entry(1, "k1", true),
+            // The id is another session's now.
+            entry(2, "another", true),
+            // No client has it: not given back to this one.
+            entry(3, "k3", false),
+            // 4 isn't listed.
+            // A core without keys didn't give us ours.
+            entry(5, "", true),
+        ];
+        let lost = state.keep_listed(&listed);
+        assert!(same_sinks(lost, &[&sinks[1], &sinks[2], &sinks[3], &sinks[4]]));
+        assert_eq!(shown_ids(&state), [1]);
+        assert!(state.keep_listed(&listed).is_empty(), "taken out once");
+    }
+
+    /// A session from a core that predates keys has nothing but its id to
+    /// be matched by, as before keys.
+    #[test]
+    fn a_keyless_shown_session_is_kept_by_id() {
+        let (mut state, sinks) = showing(&[(1, None), (2, None), (3, None)]);
+        let listed = [entry(1, "", true), entry(2, "k2", true), entry(3, "", false)];
+        let lost = state.keep_listed(&listed);
+        assert!(same_sinks(lost, &[&sinks[2]]));
+        assert_eq!(shown_ids(&state), [1, 2]);
+    }
+
+    /// A session's window and foreground program are kept in its entry, so
+    /// they go with it: a session shown later under its id starts with none.
+    #[test]
+    fn a_pruned_session_takes_its_window_and_foreground_with_it() {
+        let (mut state, _sinks) = showing(&[(1, Some("k1"))]);
+        let shown = state.sessions.get_mut(&1).unwrap();
+        shown.parent = Some(0x1234);
+        shown.foreground = Some(Foreground { name: Some("bash".into()), cwd: None });
+        assert_eq!(state.keep_listed(&[entry(1, "another", true)]).len(), 1);
+        assert!(state.sessions.is_empty());
+
+        let (sink, _tab) = fake::sink();
+        assert!(state.show(1, Shown::new(sink, Some(key("another")))).is_none());
+        let shown = &state.sessions[&1];
+        assert_eq!((shown.parent, shown.foreground.clone()), (None, None));
+    }
+
+    /// The entry a session shown under an id it already has displaces comes
+    /// back, so its tab can be told it is lost.
+    #[test]
+    fn showing_a_session_under_a_shown_id_returns_the_one_it_displaced() {
+        let (mut state, sinks) = showing(&[(1, Some("k1"))]);
+        let (newer, _tab) = fake::sink();
+        let displaced = state.show(1, Shown::new(newer.clone(), Some(key("k1b")))).expect("displaced");
+        assert!(Arc::ptr_eq(&displaced.sink, &sinks[0]));
+        assert_eq!(displaced.key, Some(key("k1")));
+        assert!(Arc::ptr_eq(&state.sessions[&1].sink, &newer));
+        assert!(state.shows(1, Some(&key("k1b"))));
+    }
+
+    /// A handle forgets only its own session: one shown under its id with
+    /// another key stays.
+    #[test]
+    fn forget_leaves_a_session_shown_under_another_key() {
+        let (mut state, sinks) = showing(&[(1, Some("k1b"))]);
+        assert!(state.forget(1, Some(&key("k1"))).is_none());
+        assert!(state.forget(1, None).is_none());
+        assert!(state.forget(2, Some(&key("k1b"))).is_none());
+        assert_eq!(shown_ids(&state), [1]);
+        let forgotten = state.forget(1, Some(&key("k1b"))).expect("its own");
+        assert!(Arc::ptr_eq(&forgotten.sink, &sinks[0]));
+        assert!(state.sessions.is_empty());
+        assert!(state.forget(1, Some(&key("k1b"))).is_none(), "once");
+    }
+
+    #[test]
+    fn shows_needs_the_same_id_and_key() {
+        let (state, _sinks) = showing(&[(1, Some("k1")), (2, None)]);
+        assert!(state.shows(1, Some(&key("k1"))));
+        assert!(!state.shows(1, Some(&key("another"))));
+        assert!(!state.shows(1, None));
+        assert!(state.shows(2, None));
+        assert!(!state.shows(2, Some(&key("k2"))));
+        assert!(!state.shows(3, None));
+        assert!(!state.shows(3, Some(&key("k1"))));
+    }
+
+    /// The attaches waiting on a listing, as [`Connection::attach`] makes
+    /// them, all carried (cut off with a link, or recorded and not sent).
+    struct Carried {
+        requests: HashMap<RequestId, Pending>,
+        sinks: HashMap<RequestId, Sink>,
+    }
+
+    impl Carried {
+        fn new(attaches: impl IntoIterator<Item = (RequestId, AttachRequest)>) -> Self {
+            let mut carried = Self { requests: HashMap::new(), sinks: HashMap::new() };
+            for (req, request) in attaches {
+                let (sink, _tab) = fake::sink();
+                let (reply, _answer) = mpsc::sync_channel(1);
+                let (waiting, _message) = request.waiting(req, sink.clone(), reply);
+                carried.requests.insert(req, Pending { waiting, written: false, told: false, carried: true });
+                carried.sinks.insert(req, sink);
+            }
+            carried
+        }
+
+        /// What `listed` decides, with the failures by request.
+        fn decide(&mut self, listed: &[ListedSession]) -> (Vec<Again>, Vec<(RequestId, String)>) {
+            let decided = carried_attaches(&mut self.requests, listed, "A8");
+            let mut gone: Vec<(RequestId, String)> =
+                decided.gone.into_iter().map(|(pending, why)| (req_of(&pending), why)).collect();
+            gone.sort();
+            (decided.again, gone)
+        }
+
+        fn awaits(&self, req: RequestId) -> Option<Awaits> {
+            match &self.requests.get(&req)?.waiting {
+                Waiting::Attach { awaits, .. } => Some(*awaits),
+                Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => None,
+            }
+        }
+    }
+
+    fn req_of(pending: &Pending) -> RequestId {
+        match &pending.waiting {
+            Waiting::Attach { attach, .. } => attach.req,
+            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => panic!("not an attach"),
+        }
+    }
+
+    fn recorded_request(session: SessionId, wire_key: &str) -> AttachRequest {
+        AttachRequest { session, key: SessionKey::from_wire(wire_key), when: Attaching::Recorded }
+    }
+
+    fn listed_at(session: SessionId, key: &str, size: Option<(u16, u16)>) -> ListedSession {
+        ListedSession { size, ..entry(session, key, false) }
+    }
+
+    /// A recorded attach listed with its key and no client goes out at the
+    /// listed size, which its sink is told; with no size listed (a core that
+    /// predates sizes), it goes out at the request's and its sink is told
+    /// nothing. Either now waits for its replay.
+    #[test]
+    fn a_recorded_attach_goes_out_at_the_listed_size_when_listed_with_its_key_and_no_client() {
+        let mut carried = Carried::new([(1, recorded_request(5, "k5")), (2, recorded_request(6, "k6"))]);
+        let (mut again, gone) = carried.decide(&[listed_at(5, "k5", Some((132, 43))), listed_at(6, "k6", None)]);
+        assert!(gone.is_empty(), "{gone:?}");
+        again.sort_by_key(|(attach, _)| attach.req);
+        let [(at_listed, told), (as_requested, untold)] = <[_; 2]>::try_from(again).ok().expect("two attaches");
+        assert_eq!(at_listed, client::Attach { req: 1, session: 5, cols: 132, rows: 43 });
+        let (sink, size) = told.expect("its sink is told the size");
+        assert!(Arc::ptr_eq(&sink, &carried.sinks[&1]));
+        assert_eq!(size, (132, 43));
+        // The request's size: none, which the core takes as the session's.
+        assert_eq!(as_requested, client::Attach { req: 2, session: 6, cols: 0, rows: 0 });
+        assert!(untold.is_none());
+        for req in [1, 2] {
+            assert_eq!(carried.awaits(req), Some(Awaits::Replay));
+            assert!(!carried.requests[&req].carried);
+        }
+    }
+
+    #[test]
+    fn a_recorded_attach_shown_by_another_client_fails() {
+        let mut carried = Carried::new([(1, recorded_request(7, "k7"))]);
+        let (again, gone) = carried.decide(&[entry(7, "k7", true)]);
+        assert!(again.is_empty());
+        assert_eq!(gone, [(1, "session 7 on A8 is shown by another Brindle".to_string())]);
+        assert!(carried.requests.is_empty());
+    }
+
+    /// A recorded attach needs its key: without one, or listed with another
+    /// (the id was given to another session) or not at all, its session
+    /// ended.
+    #[test]
+    fn a_recorded_attach_without_a_key_or_with_another_has_ended() {
+        let mut carried = Carried::new([
+            (1, recorded_request(5, "")),
+            (2, recorded_request(6, "k6")),
+            (3, recorded_request(7, "k7")),
+            (4, recorded_request(8, "k8")),
+        ]);
+        let listed = [entry(5, "k5", false), entry(6, "another", false), entry(7, "", false)];
+        let (again, gone) = carried.decide(&listed);
+        assert!(again.is_empty());
+        assert_eq!(
+            gone,
+            [
+                (1, "session 5 on A8 has ended".to_string()),
+                (2, "session 6 on A8 has ended".to_string()),
+                (3, "session 7 on A8 has ended".to_string()),
+                (4, "session 8 on A8 has ended".to_string()),
+            ]
+        );
+        assert!(carried.requests.is_empty());
+    }
+
+    /// An attach cut off with its link whose session the core gave back to
+    /// this client waits for that replay: nothing is sent again.
+    #[test]
+    fn a_carried_attach_listed_with_its_key_and_a_client_waits_for_its_replay() {
+        let mut carried = Carried::new([(1, attach_request(7)), (2, AttachRequest { key: None, ..attach_request(8) })]);
+        // The keyless one, from a core that predates keys, by its id.
+        let (again, gone) = carried.decide(&[entry(7, "k7", true), entry(8, "", true)]);
+        assert!(again.is_empty());
+        assert!(gone.is_empty(), "{gone:?}");
+        for req in [1, 2] {
+            assert_eq!(carried.awaits(req), Some(Awaits::Replay));
+            assert!(carried.requests[&req].carried, "still decided by the next listing");
+        }
+    }
+
+    /// One the core lists with its key and no client (it never got the
+    /// `ATTACH`) is sent again as it was, with no size to tell.
+    #[test]
+    fn a_carried_attach_listed_with_its_key_and_no_client_is_sent_again() {
+        let mut carried = Carried::new([(1, attach_request(7))]);
+        let (again, gone) = carried.decide(&[listed_at(7, "k7", Some((132, 43)))]);
+        assert!(gone.is_empty(), "{gone:?}");
+        let [(attach, told)] = <[_; 1]>::try_from(again).ok().expect("one attach");
+        assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30 });
+        assert!(told.is_none());
+        assert_eq!(carried.awaits(1), Some(Awaits::Replay));
+        assert!(!carried.requests[&1].carried);
+    }
+
+    /// Its id is another session's now: never answered with that one.
+    #[test]
+    fn a_carried_attach_whose_id_has_another_key_fails() {
+        let mut carried = Carried::new([(1, attach_request(7)), (2, attach_request(8))]);
+        let (again, gone) = carried.decide(&[entry(7, "another", true), entry(8, "", false)]);
+        assert!(again.is_empty());
+        assert_eq!(
+            gone,
+            [
+                (1, "the terminal server no longer has session 7".to_string()),
+                (2, "the terminal server no longer has session 8".to_string()),
+            ]
+        );
+        assert!(carried.requests.is_empty());
+    }
+
+    #[test]
+    fn a_carried_attach_not_listed_fails() {
+        let mut carried = Carried::new([(1, attach_request(7)), (2, AttachRequest { key: None, ..attach_request(9) })]);
+        let (again, gone) = carried.decide(&[entry(8, "k7", false)]);
+        assert!(again.is_empty());
+        assert_eq!(
+            gone,
+            [
+                (1, "the terminal server no longer has session 7".to_string()),
+                (2, "the terminal server no longer has session 9".to_string()),
+            ]
+        );
     }
 }

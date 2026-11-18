@@ -50,6 +50,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-core-restart", local_server::core_restart),
         display("local-server-replay-quiet", local_server::replay_quiet),
         display("local-server-holder-lost", local_server::holder_lost),
+        display("local-server-reused-id", local_server::reused_id),
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),

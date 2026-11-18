@@ -1180,6 +1180,70 @@ pub fn holder_lost(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The holder and then the core of a tab's session killed, so the next core
+/// starts its ids again and a new tab's session gets the lost one's id. The
+/// lost tab, typed into and closed, reaches nothing: the new tab's program
+/// shows none of that input and keeps running, attached.
+pub fn reused_id(ctx: &Ctx) -> Result<Outcome> {
+    let srv = Server::of(ctx);
+    let file = ctx.dir.join("alive-pid");
+    let watched = file.clone();
+    let out = Run::new(ctx, "run")
+        .keep_detached()
+        .prompt()
+        .call_at(later(2.0), move |_| {
+            let lost = srv.attached(10.0)?;
+            let holder = parent(lost.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let core = srv.core().ok_or("no core running")?;
+            // The holder goes first, so none is left to start a core that
+            // would adopt it and keep its ids.
+            kill(holder)?;
+            gone(&srv, 10.0, &[holder])?;
+            kill(core)?;
+            let new = srv.wait(30.0, "the new tab's session", || {
+                if srv.core().is_none_or(|pid| pid == core) {
+                    return Ok(None);
+                }
+                Ok(srv.list()?.into_iter().find(|s| s.attached))
+            })?;
+            ensure!(
+                new.id == lost.id,
+                "the new tab's session got id {}, not the lost one's {}, so the case proves nothing",
+                new.id,
+                lost.id
+            );
+            // Written by the remaining tab's last command, after the lost
+            // tab was typed into and closed.
+            let shell = srv.wait(30.0, "the remaining tab's shell", || Ok(read_pid(&watched)))?;
+            let sessions = srv.list()?;
+            ensure!(
+                matches!(sessions.as_slice(), [s] if s.id == lost.id && s.pid == shell && s.attached),
+                "want only the remaining tab's session {} (shell {shell}) attached: {sessions:?}",
+                lost.id
+            );
+            Ok(())
+        })
+        .wait_for("Session lost:")
+        .action("new_tab")
+        .wait_for(PROMPT_START)
+        .action("prev_tab")
+        .send("echo leaked\r")
+        .action("close_tab")
+        .send(&format!("{}; {}\r", save_pid(&file), echo_sum("alive", 1, 1)))
+        .wait_for("alive-2")
+        .dump_at(later(20.0))
+        .run()?;
+    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    screen_has(&out, "alive-2")?;
+    ensure!(
+        !out.dump.screen.iter().any(|l| l.contains("leaked")),
+        "the lost tab's input reached the new tab: {:?}",
+        out.dump.screen
+    );
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
+    Ok(Outcome::Pass)
+}
+
 /// Brindle with no helper beside it shows the missing-helper error; a tab
 /// opened once the helper is installed beside it runs in the server. On
 /// Windows, `BRINDLE_SERVER_HELPER` names the helper's place while it is

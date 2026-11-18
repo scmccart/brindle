@@ -12,10 +12,14 @@ pub mod client;
 mod host;
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub mod hosts;
+// Only `local`, built on Linux and Windows, reads keys and listings yet.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod identity;
 #[cfg(any(target_os = "linux", windows))]
 pub mod local;
 pub use brindle_remote_protocol as protocol;
 pub use host::Host;
+pub use identity::{ListedSession, SessionKey};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

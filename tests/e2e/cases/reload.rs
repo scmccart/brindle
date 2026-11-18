@@ -1,6 +1,7 @@
 //! Live reload: a theme change redraws open tabs and their zones without
-//! restarting them. (The colors programs get from OSC 10/11 after a reload
-//! are `colors-reload`.)
+//! restarting them, and ctrl-, opens the config in an editor on this
+//! machine. (The colors programs get from OSC 10/11 after a reload are
+//! `colors-reload`.)
 
 use super::cells;
 use crate::brindle::{Run, theme};
@@ -47,5 +48,27 @@ pub fn theme_attached(ctx: &Ctx) -> Result<Outcome> {
     let image = out.image.as_ref().unwrap();
     let background = image.dominant(cells(&out)?.rect(2, 8, 20, 10));
     ensure!(background == Some(theme::ALT_BACKGROUND), "tab background {:?}", background.map(|c| c.hex()));
+    Ok(Outcome::Pass)
+}
+
+/// ctrl-, (`open_config`) with a default profile on an SSH host that can't
+/// be resolved: the editor runs in a new tab on this machine, on this
+/// machine's config file, rather than trying to reach that host. Linux
+/// only, since the editor command differs on Windows.
+pub fn config_editor_local(ctx: &Ctx) -> Result<Outcome> {
+    const AWAY: &str = "\n[[profiles]]\nname = \"Away\"\nremote = { type = \"ssh\", host = \"brindle-e2e.invalid\" }\n";
+    let config = ctx.dir.join("config.toml");
+    let out = Run::new(ctx, "run")
+        .config(AWAY)
+        .default_profile("Away")
+        .env("VISUAL", r#"sh -c 'echo editing "$0"; sleep 60'"#)
+        .action("open_config")
+        .wait_for("editing")
+        .dump_at(6.0)
+        .run()?;
+    ensure!(out.dump.tabs.len() == 2, "tabs: {:?}", out.dump.tabs);
+    // A long path can wrap onto the next row, which the dump keeps apart.
+    let want = format!("editing {}", config.display());
+    ensure!(out.dump.screen.concat().contains(&want), "no {want:?} on the screen: {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }
