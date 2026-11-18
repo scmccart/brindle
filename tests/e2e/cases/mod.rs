@@ -185,6 +185,8 @@ fn unix() -> Vec<Case> {
         display("local-server-reused-id", local_server::reused_id),
         display("local-server-sink-panic", local_server::sink_panic),
         display("local-server-session-error", local_server::session_error),
+        // Unix only: the case makes the server directory unreadable with a mode.
+        #[cfg(unix)]
         display("local-server-no-core-back", local_server::no_core_back),
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
