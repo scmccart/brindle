@@ -3,22 +3,25 @@
 //! written by Apply.
 //!
 //! The model half is GPUI-free and unit-tested: [`FontsState`] reads the four
-//! values from the config file, keeps the fields as text and choices,
-//! validates them and gives the preview and the write; [`family_names`] and
-//! [`family_groups`] build the family lists. The monospace probe behind the
-//! terminal font's grouping ([`monospace_families`]) and the view half, an
-//! `impl SettingsDialog`, follow.
+//! values from the config file's text it is given, keeps the fields as text
+//! and choices, validates them and gives the preview and the edit to write;
+//! [`family_names`] and [`family_groups`] build the family lists. The
+//! monospace probe behind the terminal font's grouping
+//! ([`monospace_families`]) and the view half, an `impl SettingsDialog`,
+//! follow.
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
-use std::path::Path;
 use std::sync::Arc;
 
+use brindle_ui::ItemKey;
 use toml_edit::{DocumentMut, Item};
 
 use crate::config::{DEFAULT_CONFIG, FontConfig, UiFontConfig};
-use crate::config_edit::{self, FONT_TABLE, UI_FONT_TABLE};
+use crate::config_edit::{self, ConfigEdit, FONT_TABLE, FileText, FontChange, UI_FONT_TABLE};
 use crate::settings::{FamilyChoice, FontPreview, first_installed};
+
+use super::{Btn, Step};
 
 /// A field of the Fonts section, in Tab order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,15 +149,6 @@ pub fn fonts_in(doc: &DocumentMut) -> (FontConfig, UiFontConfig) {
 
 // ---- the state ---------------------------------------------------------------
 
-/// What an apply did.
-#[derive(Debug, PartialEq)]
-pub enum Done {
-    /// Nothing was changed, so nothing was written.
-    Nothing,
-    /// The config file was written.
-    Written,
-}
-
 /// The Fonts section's fields. They are always editable: the section has
 /// no list and no editor mode.
 pub struct FontsState {
@@ -169,13 +163,18 @@ pub struct FontsState {
     pub read_only: Option<String>,
     /// The installed families, as GPUI lists them.
     installed: Vec<String>,
+    /// The families a family list offers ([`family_names`]).
+    names: Vec<String>,
+    /// The fonts to show (read-only) when the file can't be read: the
+    /// loaded config's.
+    fallback: (FontConfig, UiFontConfig),
 }
 
 impl FontsState {
-    /// Reads the fields from the file at `path` (the default config when
-    /// it doesn't exist), or from `fallback` (the loaded config's fonts),
-    /// read-only, when the file can't be parsed.
-    pub fn new(path: &Path, fallback: &(FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
+    /// Reads the fields from `text`, the config file's (the default config
+    /// when it doesn't exist), or from `fallback` (the loaded config's
+    /// fonts), read-only, when the file can't be parsed.
+    pub fn new(text: &FileText, fallback: (FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
         let saved = FontValues::new(&fallback.0, &fallback.1, &installed);
         let mut state = Self {
             terminal: saved.terminal.clone(),
@@ -184,28 +183,29 @@ impl FontsState {
             ui: saved.ui.clone(),
             saved,
             read_only: None,
+            names: family_names(&installed),
             installed,
+            fallback,
         };
-        state.reload(path, fallback);
+        state.reload(text);
         state
     }
 
-    /// Rereads the file and resets every field to it, dropping unapplied
-    /// changes.
-    pub fn reload(&mut self, path: &Path, fallback: &(FontConfig, UiFontConfig)) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => Ok(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DEFAULT_CONFIG.to_string()),
-            Err(e) => Err(format!("reading {}: {e}", path.display())),
+    /// Rereads the file's text and resets every field to it, dropping
+    /// unapplied changes.
+    pub fn reload(&mut self, text: &FileText) {
+        let parsed = match text {
+            Ok(text) => config_edit::parse(text.as_deref().unwrap_or(DEFAULT_CONFIG)),
+            Err(e) => Err(e.clone()),
         };
-        let (font, ui_font) = match text.and_then(|text| config_edit::parse(&text)) {
+        let (font, ui_font) = match parsed {
             Ok(doc) => {
                 self.read_only = None;
                 fonts_in(&doc)
             }
             Err(e) => {
                 self.read_only = Some(e);
-                fallback.clone()
+                self.fallback.clone()
             }
         };
         self.saved = FontValues::new(&font, &ui_font, &self.installed);
@@ -220,8 +220,17 @@ impl FontsState {
         self.ui = self.saved.ui.clone();
     }
 
-    pub fn installed(&self) -> &[String] {
-        &self.installed
+    /// The families a family list offers.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The choice a family list's item `key` stands for ([`family_key`]),
+    /// among the options the section offers: "Default" and its families.
+    pub fn choice_for(&self, key: &ItemKey) -> Option<FamilyChoice> {
+        std::iter::once(FamilyChoice::Default)
+            .chain(self.names.iter().map(|name| FamilyChoice::Family(name.clone())))
+            .find(|choice| family_key(choice) == *key)
     }
 
     /// A text field's text.
@@ -287,37 +296,49 @@ impl FontsState {
         (preview != FontPreview::default()).then_some(preview)
     }
 
-    /// Apply: writes the fields that differ from the file, and only those,
-    /// keeping its comments. A chosen family goes to the front of its
-    /// table's `family` list; "Default" removes the list.
-    pub fn apply(&mut self, path: &Path) -> Result<Done, String> {
+    /// Apply: the fields that differ from the file, and only those, to
+    /// write (keeping its comments; a chosen family goes to the front of
+    /// its table's `family` list, "Default" removes the list), or closing
+    /// when none does.
+    pub fn apply(&self) -> Result<Step, String> {
         if let Some(e) = &self.read_only {
             return Err(e.clone());
         }
         if !self.can_apply() {
             return Err("Fix the fields marked invalid first".into());
         }
-        let Some(changes) = self.preview() else { return Ok(Done::Nothing) };
-        let name = |choice: &FamilyChoice| match choice {
+        let Some(changes) = self.preview() else { return Ok(Step::Close) };
+        let name = |choice: FamilyChoice| match choice {
             FamilyChoice::Default => None,
-            FamilyChoice::Family(name) => Some(name.clone()),
+            FamilyChoice::Family(name) => Some(name),
         };
-        config_edit::save(path, |doc| {
-            if let Some(choice) = &changes.terminal_family {
-                config_edit::set_font_family(doc, FONT_TABLE, name(choice).as_deref());
-            }
-            if let Some(size) = changes.size {
-                config_edit::set_font_number(doc, "size", size);
-            }
-            if let Some(line_height) = changes.line_height {
-                config_edit::set_font_number(doc, "line_height", line_height);
-            }
-            if let Some(choice) = &changes.ui_family {
-                config_edit::set_font_family(doc, UI_FONT_TABLE, name(choice).as_deref());
-            }
-            Ok(())
-        })?;
-        Ok(Done::Written)
+        let edits = [
+            changes.terminal_family.map(|choice| FontChange::TerminalFamily(name(choice))),
+            changes.size.map(FontChange::Size),
+            changes.line_height.map(FontChange::LineHeight),
+            changes.ui_family.map(|choice| FontChange::UiFamily(name(choice))),
+        ];
+        Ok(Step::Write(ConfigEdit::SetFonts(edits.into_iter().flatten().collect())))
+    }
+
+    /// Whether button `b` can be pressed (and focused) in this section.
+    pub fn enabled(&self, b: Btn) -> bool {
+        match b {
+            Btn::Apply => self.can_apply() && self.read_only.is_none(),
+            Btn::New
+            | Btn::Duplicate
+            | Btn::Edit
+            | Btn::Delete
+            | Btn::Up
+            | Btn::Down
+            | Btn::Cancel
+            | Btn::Close
+            | Btn::Keep
+            | Btn::ConfirmDelete
+            | Btn::Clear
+            | Btn::Discard
+            | Btn::Save => true,
+        }
     }
 
     /// The section's `--- settings` line. `field` names the focused
@@ -389,6 +410,16 @@ pub fn family_groups(field: FontField, names: &[String], monospace: Option<&Hash
 /// list is counted.
 pub fn family_options(groups: &[FamilyGroup]) -> Vec<FamilyChoice> {
     groups.iter().flat_map(|group| group.choices.iter().cloned()).collect()
+}
+
+/// The key of `choice`'s item in a family list: its identity there, which
+/// [`FontsState::choice_for`] reads back. Unlike its label, it can't be
+/// mistaken for another choice (a family named "Default").
+pub fn family_key(choice: &FamilyChoice) -> ItemKey {
+    match choice {
+        FamilyChoice::Default => ItemKey::new("default"),
+        FamilyChoice::Family(name) => ItemKey::new(format!("family:{name}")),
+    }
 }
 
 /// Where `choice` is among `options` (a family matched case-insensitively).
@@ -463,10 +494,10 @@ use gpui::{
     ParentElement, SharedString, Styled, Window, div, px,
 };
 
-use super::{Btn, Section, SettingsDialog};
+use super::{Section, SettingsDialog};
 use brindle_ui::{
     ActiveTheme as _, ButtonVariant, Combobox, ComboboxEvent, CommandGroup, CommandItem, FIELD_HEIGHT, Input, TextInput,
-    TextInputEvent, item_keyed,
+    TextInputEvent,
 };
 
 /// The fields typed as text.
@@ -474,12 +505,16 @@ const TEXT_FIELDS: [FontField; 2] = [FontField::Size, FontField::LineHeight];
 /// The family fields, each a combobox.
 const FAMILY_FIELDS: [FontField; 2] = [FontField::Terminal, FontField::Ui];
 
-/// A family list's groups as a combobox lists them.
+/// A family list's groups as a combobox lists them, each item keyed by
+/// its choice ([`family_key`]).
 fn command_groups(groups: &[FamilyGroup]) -> Vec<CommandGroup> {
     groups
         .iter()
         .map(|group| {
-            let items = group.choices.iter().map(|choice| CommandItem::new(choice_label(choice).to_string()));
+            let items = group
+                .choices
+                .iter()
+                .map(|choice| CommandItem::new(choice_label(choice).to_string()).key(family_key(choice)));
             match group.heading {
                 Some(heading) => CommandGroup::new(heading, items),
                 None => CommandGroup::unnamed(items),
@@ -504,10 +539,8 @@ impl SettingsDialog {
         if !self.font_inputs.is_empty() {
             return;
         }
-        if self.font_names.is_empty() {
-            self.font_names = family_names(self.model.fonts.installed());
-        }
-        let monospace = monospace_families(&self.font_names, cx);
+        let names = self.model.fonts.names().to_vec();
+        let monospace = monospace_families(&names, cx);
         if monospace.is_none() {
             // The terminal font's list regroups when the probe is done.
             let probed = cx.observe_global::<MonospaceProbe>(|this, cx| this.regroup_terminal_families(cx));
@@ -527,7 +560,7 @@ impl SettingsDialog {
             self.font_inputs.push((field, input));
         }
         for field in FAMILY_FIELDS {
-            let groups = family_groups(field, &self.font_names, monospace.as_deref());
+            let groups = family_groups(field, &names, monospace.as_deref());
             let selected = option_index(&family_options(&groups), self.model.fonts.choice(field));
             let combobox = cx.new(|cx| {
                 Combobox::new(command_groups(&groups), selected, cx)
@@ -535,20 +568,9 @@ impl SettingsDialog {
                     .with_search_placeholder("Search fonts…")
                     .with_empty_message("No font found.")
             });
-            let changed = cx.subscribe_in(&combobox, window, move |this, combobox, event: &ComboboxEvent, _, cx| {
+            let changed = cx.subscribe_in(&combobox, window, move |this, _, event: &ComboboxEvent, _, cx| {
                 let ComboboxEvent::Changed(key) = event;
-                // Items are keyed by their label; the key's option is found
-                // again by its index. Option 0 is "Default"; the others are
-                // families, by name.
-                let combobox = combobox.read(cx);
-                let choice = match item_keyed(combobox.groups(), key) {
-                    Some(0) => FamilyChoice::Default,
-                    Some(ix) => match combobox.option(ix) {
-                        Some(item) => FamilyChoice::Family(item.label.to_string()),
-                        None => return,
-                    },
-                    None => return,
-                };
+                let Some(choice) = this.model.fonts.choice_for(key) else { return };
                 this.model.fonts.choose(field, choice);
                 this.model.error = None;
                 this.preview(cx);
@@ -564,7 +586,7 @@ impl SettingsDialog {
     fn regroup_terminal_families(&mut self, cx: &mut Context<Self>) {
         let Some(monospace) = cx.try_global::<MonospaceProbe>().and_then(|p| p.families.clone()) else { return };
         let Some(combobox) = self.font_combobox(FontField::Terminal).cloned() else { return };
-        let groups = family_groups(FontField::Terminal, &self.font_names, Some(&monospace));
+        let groups = family_groups(FontField::Terminal, self.model.fonts.names(), Some(&monospace));
         let selected = option_index(&family_options(&groups), self.model.fonts.choice(FontField::Terminal));
         combobox.update(cx, |c, cx| c.set_groups(command_groups(&groups), selected, cx));
     }
@@ -687,8 +709,8 @@ impl SettingsDialog {
                         cx.emit(gpui::DismissEvent)
                     }))
                     .child(self.button(Btn::Apply, "Apply", ButtonVariant::Default, cx, |this, window, cx| {
-                        let outcome = this.model.confirm();
-                        this.outcome(outcome, window, cx);
+                        let step = this.model.confirm();
+                        this.step(step, window, cx);
                     })),
             )
             .into_any_element()
@@ -698,7 +720,6 @@ impl SettingsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     const INSTALLED: [&str; 6] = ["Cascadia Mono", "Consolas", "Arial", "Segoe UI", "Inter", ".SystemUIFont"];
 
@@ -710,34 +731,42 @@ mod tests {
         (FontConfig::default(), UiFontConfig::default())
     }
 
+    /// The config file as text: the state reads it, and an apply's edit is
+    /// written to it as the view writes it to the file.
     struct Fixture {
-        dir: PathBuf,
-        path: PathBuf,
+        text: Option<String>,
     }
 
     impl Fixture {
-        fn new(name: &str, text: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("brindle-fonts-{}-{name}", std::process::id()));
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("config.toml");
-            std::fs::write(&path, text).unwrap();
-            Self { dir, path }
+        fn new(text: &str) -> Self {
+            Self { text: Some(text.to_string()) }
+        }
+
+        fn read(&self) -> FileText {
+            Ok(self.text.clone())
         }
 
         fn state(&self) -> FontsState {
-            FontsState::new(&self.path, &fallback(), installed())
+            FontsState::new(&self.read(), fallback(), installed())
         }
 
         fn text(&self) -> String {
-            std::fs::read_to_string(&self.path).unwrap()
+            self.text.clone().unwrap_or_default()
+        }
+
+        /// Apply, with what it asks for written.
+        fn apply(&mut self, state: &FontsState) -> Result<Step, String> {
+            let step = state.apply()?;
+            if let Step::Write(edit) = &step {
+                let (text, _) = config_edit::edited(self.text.as_deref(), |doc| edit.apply(doc))?;
+                self.text = Some(text);
+            }
+            Ok(step)
         }
     }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).ok();
-        }
+    fn wrote(step: Result<Step, String>) -> bool {
+        matches!(step, Ok(Step::Write(_)))
     }
 
     fn family(name: &str) -> FamilyChoice {
@@ -747,7 +776,7 @@ mod tests {
     /// The spec's "Current fonts shown".
     #[test]
     fn current_fonts_are_shown() {
-        let f = Fixture::new("current", "# mine\n[font]\nfamily = [\"Nonexistent\", \"cascadia mono\"]\nsize = 13\n");
+        let f = Fixture::new("# mine\n[font]\nfamily = [\"Nonexistent\", \"cascadia mono\"]\nsize = 13\n");
         let state = f.state();
         assert_eq!(state.terminal, family("Cascadia Mono"));
         assert_eq!((state.size.as_str(), state.line_height.as_str()), ("13", "1.25"));
@@ -755,7 +784,7 @@ mod tests {
         assert!(state.read_only.is_none());
         assert_eq!(state.preview(), None);
         // Nothing installed from the list: "Default".
-        let f = Fixture::new("none", "[font]\nfamily = [\"Nonexistent\"]\n[ui_font]\nfamily = [\"Inter\"]\n");
+        let f = Fixture::new("[font]\nfamily = [\"Nonexistent\"]\n[ui_font]\nfamily = [\"Inter\"]\n");
         let state = f.state();
         assert_eq!(state.terminal, FamilyChoice::Default);
         assert_eq!(state.ui, family("Inter"));
@@ -765,13 +794,12 @@ mod tests {
     /// error, and out-of-range numbers show as the load clamps them.
     #[test]
     fn fonts_are_read_past_errors_elsewhere() {
-        let f = Fixture::new("elsewhere", "bogus_key = 1\ntheme = 7\n[font]\nsize = 200\nline_height = \"tall\"\n");
+        let f = Fixture::new("bogus_key = 1\ntheme = 7\n[font]\nsize = 200\nline_height = \"tall\"\n");
         let state = f.state();
         assert!(state.read_only.is_none());
         assert_eq!((state.size.as_str(), state.line_height.as_str()), ("96", "1.25"));
         // A missing file reads as the default config, which can be applied.
-        let f = Fixture::new("missing", "");
-        std::fs::remove_file(&f.path).unwrap();
+        let f = Fixture { text: None };
         let state = f.state();
         assert!(state.read_only.is_none());
         assert_eq!(state.terminal, family("Cascadia Mono"));
@@ -782,7 +810,7 @@ mod tests {
     /// disabled, and the invalid value not previewed.
     #[test]
     fn a_size_out_of_range_is_invalid() {
-        let f = Fixture::new("range", "[font]\nsize = 13\n");
+        let mut f = Fixture::new("[font]\nsize = 13\n");
         let mut state = f.state();
         state.set_text(FontField::Size, "200");
         let errors = state.errors();
@@ -791,7 +819,7 @@ mod tests {
         assert!(errors[0].1.contains("4 to 96"), "{}", errors[0].1);
         assert!(!state.can_apply());
         assert_eq!(state.preview(), None);
-        assert!(state.apply(&f.path).is_err());
+        assert!(f.apply(&state).is_err());
         assert_eq!(f.text(), "[font]\nsize = 13\n");
         for bad in ["", "abc", "3.9", "NaN", "inf"] {
             state.set_text(FontField::Size, bad);
@@ -809,7 +837,7 @@ mod tests {
     /// Only the fields that differ from the file are previewed.
     #[test]
     fn the_preview_holds_the_changed_fields() {
-        let f = Fixture::new("preview", "[font]\nsize = 13\n");
+        let f = Fixture::new("[font]\nsize = 13\n");
         let mut state = f.state();
         state.choose(FontField::Ui, family("Inter"));
         state.set_text(FontField::Size, "18");
@@ -841,10 +869,10 @@ mod tests {
     #[test]
     fn choosing_a_ui_font_writes_ui_font() {
         let text = "# My config\ntheme = \"brindle-dark\" # dark\n\n[font]\nsize = 13\n";
-        let f = Fixture::new("ui", text);
+        let mut f = Fixture::new(text);
         let mut state = f.state();
         state.choose(FontField::Ui, family("Inter"));
-        assert_eq!(state.apply(&f.path), Ok(Done::Written));
+        assert!(wrote(f.apply(&state)));
         assert_eq!(f.text(), format!("{text}\n[ui_font]\nfamily = [\"Inter\"]\n"));
         let config = crate::config::Config::parse(&f.text()).unwrap().config;
         assert_eq!(config.ui_font.family, ["Inter"]);
@@ -856,22 +884,22 @@ mod tests {
     #[test]
     fn a_chosen_family_moves_to_the_front() {
         let text = "[font]\nfamily = [\"JetBrains Mono\", \"Cascadia Mono\"]\nsize = 13.0 # mine\n";
-        let f = Fixture::new("fallback", text);
+        let mut f = Fixture::new(text);
         let mut state = f.state();
         assert_eq!(state.terminal, family("Cascadia Mono"));
         state.choose(FontField::Terminal, family("Consolas"));
-        assert_eq!(state.apply(&f.path), Ok(Done::Written));
+        assert!(wrote(f.apply(&state)));
         // The size wasn't changed, so it is still written as it was.
         assert_eq!(f.text(), "[font]\nfamily = [\"Consolas\", \"JetBrains Mono\", \"Cascadia Mono\"]\nsize = 13.0 # mine\n");
         // "Default" removes the list.
         let mut state = f.state();
         state.choose(FontField::Terminal, FamilyChoice::Default);
         state.set_text(FontField::Size, "20");
-        assert_eq!(state.apply(&f.path), Ok(Done::Written));
+        assert!(wrote(f.apply(&state)));
         assert_eq!(f.text(), "[font]\nsize = 20 # mine\n");
         // Nothing changed: nothing written.
-        let mut state = f.state();
-        assert_eq!(state.apply(&f.path), Ok(Done::Nothing));
+        let state = f.state();
+        assert_eq!(f.apply(&state), Ok(Step::Close));
         assert_eq!(f.text(), "[font]\nsize = 20 # mine\n");
     }
 
@@ -879,20 +907,71 @@ mod tests {
     /// and Apply writes nothing and says why.
     #[test]
     fn an_unparseable_file_is_read_only() {
-        let f = Fixture::new("broken", "[font\nsize = 13\n");
+        let mut f = Fixture::new("[font\nsize = 13\n");
         let fallback = (FontConfig { size: 15.0, ..FontConfig::default() }, UiFontConfig { family: vec!["Arial".into()] });
-        let mut state = FontsState::new(&f.path, &fallback, installed());
+        let mut state = FontsState::new(&f.read(), fallback, installed());
         assert!(state.read_only.is_some());
         assert_eq!((state.size.as_str(), &state.ui), ("15", &family("Arial")));
         state.set_text(FontField::Size, "18");
-        let err = state.apply(&f.path).unwrap_err();
+        let err = f.apply(&state).unwrap_err();
         assert!(err.contains("not valid TOML"), "{err}");
         assert_eq!(f.text(), "[font\nsize = 13\n");
     }
 
+    /// Apply's edit holds the changed fields, in the form's order, and
+    /// nothing else; Apply is enabled only when it can write.
+    #[test]
+    fn apply_returns_the_changed_fields() {
+        let f = Fixture::new("[font]\nsize = 13\n");
+        let mut state = f.state();
+        assert!(state.enabled(Btn::Apply) && state.enabled(Btn::Cancel));
+        state.choose(FontField::Ui, family("Inter"));
+        state.set_text(FontField::LineHeight, "1.5");
+        state.choose(FontField::Terminal, FamilyChoice::Default);
+        assert_eq!(
+            state.apply(),
+            Ok(Step::Write(ConfigEdit::SetFonts(vec![
+                FontChange::TerminalFamily(None),
+                FontChange::LineHeight(1.5),
+                FontChange::UiFamily(Some("Inter".into())),
+            ])))
+        );
+        state.set_text(FontField::Size, "200");
+        assert!(!state.enabled(Btn::Apply));
+        let read_only = Fixture::new("[font\n").state();
+        assert!(!read_only.enabled(Btn::Apply) && read_only.enabled(Btn::Cancel));
+        // The state reads the file only through the text it is given: an
+        // unreadable file is read-only with the read's error.
+        let unreadable = FontsState::new(&Err("reading /c/config.toml: denied".into()), fallback(), installed());
+        assert_eq!(unreadable.read_only.as_deref(), Some("reading /c/config.toml: denied"));
+    }
+
+    /// A family list's items are keyed by their choice, which is found
+    /// again by its key, whatever its place or label.
+    #[test]
+    fn family_items_are_found_by_key() {
+        let state = Fixture::new("").state();
+        assert_eq!(state.choice_for(&family_key(&FamilyChoice::Default)), Some(FamilyChoice::Default));
+        assert_eq!(state.choice_for(&family_key(&family("Inter"))), Some(family("Inter")));
+        // Not installed (or a GPUI name): not offered.
+        assert_eq!(state.choice_for(&family_key(&family("Missing"))), None);
+        assert_eq!(state.choice_for(&family_key(&family(".SystemUIFont"))), None);
+        // A family named "Default" is still a family.
+        assert_ne!(family_key(&family("Default")), family_key(&FamilyChoice::Default));
+        let mono: HashSet<String> = ["Consolas"].iter().map(|s| s.to_string()).collect();
+        let groups = command_groups(&family_groups(FontField::Terminal, state.names(), Some(&mono)));
+        let found: Vec<Option<FamilyChoice>> =
+            groups.iter().flat_map(|g| &g.items).map(|i| state.choice_for(&i.key)).collect();
+        assert_eq!(
+            found,
+            [FamilyChoice::Default, family("Consolas"), family("Arial"), family("Cascadia Mono"), family("Inter"), family("Segoe UI")]
+                .map(Some)
+        );
+    }
+
     #[test]
     fn the_dump_line_names_every_field() {
-        let f = Fixture::new("dump", "[font]\nsize = 13\n");
+        let f = Fixture::new("[font]\nsize = 13\n");
         let mut state = f.state();
         state.set_text(FontField::Size, "200");
         assert_eq!(

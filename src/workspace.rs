@@ -27,6 +27,7 @@ use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
 use crate::config::{Config, Profile, ProfileKey};
+use crate::config_edit;
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{
@@ -1848,14 +1849,17 @@ impl Workspace {
         }
         let settings = Settings::get(cx);
         let config = &settings.config;
+        let path = Config::path();
+        let text = config_edit::read_text(&path);
         let model = settings_dialog::Model::new(
-            Config::path(),
+            path,
+            &text,
             config.theme.clone(),
             config.themes.clone(),
             config.profiles.clone(),
             config.default_profile.clone(),
         )
-        .with_fonts((config.font.clone(), config.ui_font.clone()), settings.installed_fonts().to_vec());
+        .with_fonts(&text, (config.font.clone(), config.ui_font.clone()), settings.installed_fonts().to_vec());
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, _, cx| match event {
@@ -2160,7 +2164,7 @@ impl Workspace {
         } else if let Some(dialog) =
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
-            format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx))
+            format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx).unwrap_or(""))
         } else if self.strip_focus.is_focused(window) {
             "tabs".to_string()
         } else if self.open_menu(cx).is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx)) {

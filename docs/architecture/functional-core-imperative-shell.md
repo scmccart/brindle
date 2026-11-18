@@ -75,6 +75,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
 | `src/workspace/{tabs,launch,overlays,previews}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them |
 | `src/picker/sessions.rs` | the sessions palette's state and rows: what each endpoint listed, the sessions killed from it and the failed kills, the highlighted row, whether every endpoint has answered |
+| `src/settings_dialog/themes.rs` | the settings dialog's Theme section (`ThemesState`): the theme list and its selection by name, the theme editor and its fields (`FieldId`), what deleting a theme refuses, and the `ConfigEdit` each operation writes |
 | `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | filtering, where an overlay goes |
 | `remote-protocol/src/{client,holder,wire,version,relay,upgrade}.rs` | encoding, decoding, version negotiation, whether a build is newer |
 | `remote-protocol/src/{access,hresult}.rs` | who may use a pipe, and an `HRESULT`'s Win32 code |
@@ -91,7 +92,7 @@ These modules mix pure items with shell code, which a text search can't tell apa
 | `src/terminal/pace.rs` (`step`) | when the event task waits |
 | `src/session.rs` (`merge_windows`, `drop_lost_zones`, `record_zones`, `resolve_tab`) | which windows, tabs and zones a launch restores, and the zones a tab is saved with |
 | `src/settings.rs` (`Settings::new`, `Settings::zoomed`) | the fonts and sizes a config and a preview resolve to, and the zoom a key leaves |
-| `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
+| `src/settings_dialog.rs` (`Model`, `focus_target`), `src/settings_dialog/profiles.rs` (`ProfilesState`, `ProfileEditor`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows, which buttons are enabled, where focus goes, and the `ConfigEdit` each operation writes |
 | `ui/src/text_input.rs` (`EditState`) | editing |
 | `src/workspace.rs` (`program_title`) | whether an OSC title is the program's own, by the path style of the programs' paths |
 | `src/desktop.rs` (`without_verbatim_prefix`) | a Windows path without its verbatim `\\?\` prefix |

@@ -343,6 +343,25 @@ impl ProfileKey {
         let (nth, name) = text.split_once(':')?;
         Some(Self { name: name.to_string(), nth: nth.parse().ok()? })
     }
+
+    /// The key of the `ix`th of `names`, a profile list in order: its name,
+    /// and how many names before it match it. `None` past the last.
+    pub fn of<'a>(names: impl IntoIterator<Item = &'a str> + Clone, ix: usize) -> Option<Self> {
+        let name = names.clone().into_iter().nth(ix)?;
+        let nth = names.into_iter().take(ix).filter(|n| n.eq_ignore_ascii_case(name)).count();
+        Some(Self { name: name.to_string(), nth })
+    }
+
+    /// Where the profile this key names is among `names`: the key's `nth`
+    /// of the names matching its own. `None` when there is none.
+    pub fn find<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Option<usize> {
+        names
+            .into_iter()
+            .enumerate()
+            .filter(|(_, n)| n.eq_ignore_ascii_case(&self.name))
+            .nth(self.nth)
+            .map(|(ix, _)| ix)
+    }
 }
 
 impl fmt::Display for ProfileKey {
@@ -351,7 +370,7 @@ impl fmt::Display for ProfileKey {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
     #[serde(default)]
@@ -576,9 +595,7 @@ impl Config {
     /// The key of profile `ix`: its name, and how many profiles before it
     /// have that name. `None` past the last profile.
     pub fn profile_key(&self, ix: usize) -> Option<ProfileKey> {
-        let name = &self.profiles.get(ix)?.name;
-        let nth = self.profiles[..ix].iter().filter(|p| p.name.eq_ignore_ascii_case(name)).count();
-        Some(ProfileKey { name: name.clone(), nth })
+        ProfileKey::of(self.profiles.iter().map(|p| p.name.as_str()), ix)
     }
 
     /// Every profile's key, in configuration order.
@@ -590,12 +607,7 @@ impl Config {
     /// `nth` profile of its name. `None` when the config has none (it was
     /// renamed or removed).
     pub fn find_profile(&self, key: &ProfileKey) -> Option<usize> {
-        self.profiles
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.name.eq_ignore_ascii_case(&key.name))
-            .nth(key.nth)
-            .map(|(ix, _)| ix)
+        key.find(self.profiles.iter().map(|p| p.name.as_str()))
     }
 
     pub fn profile_theme(&self, profile: &Profile) -> Theme {

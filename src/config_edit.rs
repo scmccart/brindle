@@ -15,22 +15,149 @@ pub fn parse(text: &str) -> Result<DocumentMut, String> {
 }
 
 /// Reads the config at `path` (the default config if it doesn't exist),
-/// applies `edit` and writes it back in one step. Nothing is written if the
-/// file isn't valid TOML or `edit` fails.
-pub fn save(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<(), String>) -> Result<(), String> {
+/// applies `edit` and writes it back in one step, giving what `edit` gave.
+/// Nothing is written if the file isn't valid TOML or `edit` fails.
+pub fn save<T>(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<T, String>) -> Result<T, String> {
     // Write through symlinks (dotfile managers) rather than replacing them.
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
-    let mut doc = parse(&text)?;
-    edit(&mut doc)?;
+    let (text, out) = edited(text.as_deref(), edit)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     }
-    write_replacing(&path, &doc.to_string()).map_err(|e| format!("writing {}: {e}", path.display()))
+    write_replacing(&path, &text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(out)
+}
+
+/// What [`save`] writes: `text` (the default config when there is no
+/// file) with `edit` applied, and what `edit` gave. Refused, as `save` is,
+/// when the text isn't valid TOML or `edit` fails.
+pub fn edited<T>(
+    text: Option<&str>,
+    edit: impl FnOnce(&mut DocumentMut) -> Result<T, String>,
+) -> Result<(String, T), String> {
+    let mut doc = parse(text.unwrap_or(DEFAULT_CONFIG))?;
+    let out = edit(&mut doc)?;
+    Ok((doc.to_string(), out))
+}
+
+/// The config file as the settings dialog read it: its text, `None` when
+/// there is no file, or why it couldn't be read (`reading <path>: <cause>`).
+/// Each section reads a missing file its own way: the theme and profile
+/// lists as an empty file, the Fonts section as the default config, which
+/// is what a write starts from.
+pub type FileText = Result<Option<String>, String>;
+
+/// Reads the config file at `path` for the settings dialog.
+pub fn read_text(path: &Path) -> FileText {
+    text_from(path, std::fs::read_to_string(path))
+}
+
+/// [`read_text`] for what reading `path` gave.
+pub fn text_from(path: &Path, read: std::io::Result<String>) -> FileText {
+    match read {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// A change to the config file the settings dialog asks for. Its sections
+/// decide what to write and return one; the view writes it with [`save`]
+/// and [`ConfigEdit::apply`].
+#[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one edit at a time, made and written in one handler; boxing the profile adds an indirection for nothing"
+)]
+pub enum ConfigEdit {
+    /// The top-level `theme`.
+    SetGlobalTheme { name: String },
+    /// `[themes.<name>]`, renamed from `original` (and every reference to
+    /// it) first when that is another name.
+    SaveTheme { original: Option<String>, name: String, theme: Theme },
+    DeleteTheme { name: String },
+    /// The profile at `at`, or a new one last, with the default changed.
+    SaveProfile { at: Option<ProfileRef>, profile: Profile, default: DefaultChange },
+    /// The profile at `at`, listed as `name`.
+    DeleteProfile { at: ProfileRef, name: String },
+    /// The profile at `at` one place up or down.
+    MoveProfile { at: ProfileRef, up: bool },
+    /// The Fonts section's changed fields, in this order.
+    SetFonts(Vec<FontChange>),
+}
+
+/// What saving a profile does to `default_profile`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultChange {
+    Keep,
+    /// The profile was renamed: a `default_profile` naming `old` names
+    /// `new`.
+    Rename { old: String, new: String },
+    /// The profile is made the default.
+    Set(String),
+}
+
+/// A Fonts field written by Apply.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FontChange {
+    /// `[font].family`: the family first, or `None` for Brindle's list.
+    TerminalFamily(Option<String>),
+    /// `[font].size`.
+    Size(f32),
+    /// `[font].line_height`.
+    LineHeight(f32),
+    /// `[ui_font].family`: the family first, or `None` for Brindle's list.
+    UiFamily(Option<String>),
+}
+
+/// What applying an edit gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    Done,
+    /// A moved profile's new position.
+    MovedTo(usize),
+}
+
+impl ConfigEdit {
+    /// Makes the edit in `doc`, through the functions below.
+    pub fn apply(&self, doc: &mut DocumentMut) -> Result<Applied, String> {
+        match self {
+            ConfigEdit::SetGlobalTheme { name } => set_global_theme(doc, name),
+            ConfigEdit::SaveTheme { original, name, theme } => {
+                if let Some(old) = original.as_deref().filter(|old| old != name) {
+                    rename_theme(doc, old, name)?;
+                }
+                upsert_theme(doc, name, theme);
+            }
+            ConfigEdit::DeleteTheme { name } => delete_theme(doc, name)?,
+            ConfigEdit::SaveProfile { at, profile, default } => {
+                upsert_profile(doc, at.as_ref(), profile)?;
+                match default {
+                    DefaultChange::Keep => {}
+                    DefaultChange::Rename { old, new } => rename_default_profile(doc, old, new),
+                    DefaultChange::Set(name) => set_default_profile(doc, name),
+                }
+            }
+            ConfigEdit::DeleteProfile { at, name } => delete_profile(doc, at, name)?,
+            ConfigEdit::MoveProfile { at, up } => return move_profile(doc, at, *up).map(Applied::MovedTo),
+            ConfigEdit::SetFonts(changes) => {
+                for change in changes {
+                    match change {
+                        FontChange::TerminalFamily(family) => set_font_family(doc, FONT_TABLE, family.as_deref()),
+                        FontChange::Size(size) => set_font_number(doc, "size", *size),
+                        FontChange::LineHeight(height) => set_font_number(doc, "line_height", *height),
+                        FontChange::UiFamily(family) => set_font_family(doc, UI_FONT_TABLE, family.as_deref()),
+                    }
+                }
+            }
+        }
+        Ok(Applied::Done)
+    }
 }
 
 /// Sets the top-level `theme`.
@@ -169,20 +296,15 @@ fn root_table(doc: &DocumentMut) -> Result<toml::Table, Shape> {
     toml::from_str::<toml::Table>(&doc.to_string()).map_err(|e| Shape::Unparsable(e.message().to_string()))
 }
 
-/// The config file at `path` as a document, for a section of the settings
-/// dialog. A file that doesn't exist reads as an empty one, as
-/// `Config::load` treats it; any other failure is a message naming what was
-/// being done, the file and the cause.
-pub fn read_document(path: &Path) -> Result<DocumentMut, String> {
-    document_from(path, std::fs::read_to_string(path))
-}
-
-/// [`read_document`] for what reading `path` gave.
-pub fn document_from(path: &Path, read: std::io::Result<String>) -> Result<DocumentMut, String> {
-    match read {
-        Ok(text) => text.parse::<DocumentMut>().map_err(|e| Shape::Unparsable(e.to_string()).describe(path)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(e) => Err(format!("reading {}: {e}", path.display())),
+/// The config file at `path`, read as `text`, as a document for a section
+/// of the settings dialog. A file that doesn't exist reads as an empty one,
+/// as `Config::load` treats it; any other failure is a message naming what
+/// was being done, the file and the cause.
+pub fn document_in(path: &Path, text: &FileText) -> Result<DocumentMut, String> {
+    match text {
+        Ok(Some(text)) => text.parse::<DocumentMut>().map_err(|e| Shape::Unparsable(e.to_string()).describe(path)),
+        Ok(None) => Ok(DocumentMut::new()),
+        Err(e) => Err(e.clone()),
     }
 }
 
@@ -227,8 +349,9 @@ fn themes_table_mut(doc: &mut DocumentMut) -> &mut dyn TableLike {
 // ---- profiles ---------------------------------------------------------------
 
 /// Where a profile is in the file, as it was when the dialog read it: its
-/// position in `profiles` and its `name` key (`None` when it has none).
-/// Profiles have no ids, so every edit checks both before writing.
+/// position in `profiles` and its `name` key (`None` when it has none, or
+/// a blank one). Profiles have no ids, so every edit checks both before
+/// writing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileRef {
     pub index: usize,
@@ -243,8 +366,9 @@ pub const IMPLICIT_PROFILE: &str = "Shell";
 pub type ProfileReads = Vec<(Option<String>, Result<Profile, String>)>;
 
 /// The `profiles` entries in file order, each with its raw `name` key (for
-/// a [`ProfileRef`]) and read on its own, so one bad profile (or an error
-/// elsewhere in the file) doesn't hide the others.
+/// a [`ProfileRef`]; `None` when it is missing, not a string or blank) and
+/// read on its own, so one bad profile (or an error elsewhere in the file)
+/// doesn't hide the others.
 ///
 /// A missing `profiles` key is no profiles; one that isn't an array is a
 /// [`Shape`] error, as is a document the plain parser refuses.
@@ -258,10 +382,16 @@ pub fn profiles(doc: &DocumentMut) -> Result<ProfileReads, Shape> {
     Ok(entries
         .iter()
         .map(|v| {
-            let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
+            let name = named(v.get("name").and_then(|n| n.as_str()));
             (name, v.clone().try_into::<Profile>().map_err(|e| e.message().to_string()))
         })
         .collect())
+}
+
+/// A profile's `name` key as a [`ProfileRef`] holds it: a blank one is
+/// none.
+fn named(name: Option<&str>) -> Option<String> {
+    name.filter(|name| !name.trim().is_empty()).map(str::to_string)
 }
 
 /// The `profiles` array in either form.
@@ -302,13 +432,15 @@ fn profile_count(doc: &mut DocumentMut) -> usize {
     profiles_mut(doc).map_or(0, |p| p.len())
 }
 
+/// Why an edit of a profile was refused: the file no longer has it where
+/// the dialog read it.
+pub const PROFILES_CHANGED: &str = "The config file changed since the profiles were read; reopen the Profiles section.";
+
 /// The profile at `at`, after checking it is still the one the dialog read.
 fn profile_at<'a>(doc: &'a mut DocumentMut, at: &ProfileRef) -> Result<&'a mut dyn TableLike, String> {
-    const CHANGED: &str = "The config file changed since the profiles were read; reopen the Profiles section.";
-    let table = profiles_mut(doc).and_then(|p| p.entry(at.index)).ok_or(CHANGED)?;
-    let name = table.get("name").and_then(|i| i.as_str()).map(str::to_string);
-    if name != at.name {
-        return Err(CHANGED.into());
+    let table = profiles_mut(doc).and_then(|p| p.entry(at.index)).ok_or(PROFILES_CHANGED)?;
+    if named(table.get("name").and_then(|i| i.as_str())) != at.name {
+        return Err(PROFILES_CHANGED.into());
     }
     Ok(table)
 }
@@ -818,7 +950,7 @@ background = "nope"
         assert!(profiles(&doc).unwrap().is_empty());
         // A file that doesn't exist reads as an empty document.
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let doc = document_from(Path::new("/c/config.toml"), Err(missing)).unwrap();
+        let doc = document_in(Path::new("/c/config.toml"), &text_from(Path::new("/c/config.toml"), Err(missing))).unwrap();
         assert!(profiles(&doc).unwrap().is_empty());
     }
 
@@ -826,9 +958,9 @@ background = "nope"
     fn a_document_that_cant_be_read_names_the_path_and_cause() {
         let path = Path::new("/c/config.toml");
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let err = document_from(path, Err(denied)).unwrap_err();
+        let err = document_in(path, &text_from(path, Err(denied))).unwrap_err();
         assert!(err.starts_with("reading /c/config.toml: ") && err.contains("ermission denied"), "{err}");
-        let err = document_from(path, Ok("[broken\n".into())).unwrap_err();
+        let err = document_in(path, &text_from(path, Ok("[broken\n".into()))).unwrap_err();
         assert!(err.starts_with("/c/config.toml isn't valid TOML: "), "{err}");
     }
 
@@ -952,6 +1084,31 @@ background = "nope"
         let inline = parse("profiles = [{ name = \"X\" }, { name = \"Y\", args = [\"-l\"] }]\n").unwrap();
         assert_eq!(names_of(&inline), ["X", "Y"]);
         assert!(profiles(&parse("").unwrap()).unwrap().is_empty());
+    }
+
+    /// A blank `name` key is no name, in the read and in the check before
+    /// a write.
+    #[test]
+    fn a_blank_profile_name_is_none() {
+        let mut doc = parse("[[profiles]]\nname = \"  \"\ncwd = \"~\"\n[[profiles]]\nname = \"B\"\n").unwrap();
+        let read = profiles(&doc).unwrap();
+        assert_eq!((read[0].0.as_deref(), read[1].0.as_deref()), (None, Some("B")));
+        let blank = ProfileRef { index: 0, name: None };
+        let profile = Profile { name: "A".into(), ..Default::default() };
+        upsert_profile(&mut doc, Some(&blank), &profile).unwrap();
+        assert_eq!(names_of(&doc), ["A", "B"]);
+        let stale = ProfileRef { index: 0, name: None };
+        assert_eq!(upsert_profile(&mut doc, Some(&stale), &profile), Err(PROFILES_CHANGED.to_string()));
+    }
+
+    #[test]
+    fn document_in_reads_a_missing_file_as_empty() {
+        let path = Path::new("/c/config.toml");
+        assert_eq!(document_in(path, &Ok(None)).unwrap().to_string(), "");
+        assert_eq!(document_in(path, &Ok(Some("a = 1\n".into()))).unwrap().to_string(), "a = 1\n");
+        let broken = document_in(path, &Ok(Some("[oops\n".into()))).unwrap_err();
+        assert!(broken.starts_with("/c/config.toml isn't valid TOML: "), "{broken}");
+        assert_eq!(document_in(path, &Err("reading /c/config.toml: denied".into())).unwrap_err(), "reading /c/config.toml: denied");
     }
 
     #[test]
@@ -1255,5 +1412,153 @@ background = "nope"
         let mut doc = parse("theme = \"x\"\n").unwrap();
         set_font_number(&mut doc, "line_height", 1.0);
         assert_eq!(doc.to_string(), "theme = \"x\"\n\n[font]\nline_height = 1\n");
+    }
+
+    // ---- ConfigEdit ----
+
+    /// `edit` applied to SAMPLE, and the text it leaves.
+    fn applied(edit: &ConfigEdit) -> (Result<Applied, String>, String) {
+        let mut doc = doc();
+        let result = edit.apply(&mut doc);
+        (result, doc.to_string())
+    }
+
+    #[test]
+    fn edit_sets_the_global_theme() {
+        let (result, text) = applied(&ConfigEdit::SetGlobalTheme { name: "tokyo-night".into() });
+        assert_eq!(result, Ok(Applied::Done));
+        assert_eq!(text, SAMPLE.replace(r#"theme = "mine" # the one"#, r#"theme = "tokyo-night" # the one"#));
+    }
+
+    #[test]
+    fn edit_saves_a_theme_renaming_it_first() {
+        let theme = builtin_theme("gruvbox-dark").unwrap();
+        // Under its own name: written in place.
+        let (result, text) =
+            applied(&ConfigEdit::SaveTheme { original: Some("mine".into()), name: "mine".into(), theme: theme.clone() });
+        assert_eq!(result, Ok(Applied::Done));
+        assert!(text.contains("# A dark one.\n[themes.mine]\nbackground = \"#282828\" # pure black\n"), "{text}");
+        // Renamed: every reference follows.
+        let (result, text) =
+            applied(&ConfigEdit::SaveTheme { original: Some("mine".into()), name: "ours".into(), theme: theme.clone() });
+        assert_eq!(result, Ok(Applied::Done));
+        assert!(!text.contains("mine") && text.contains("[themes.ours]"), "{text}");
+        assert!(text.contains("name = \"Work\"\ntheme = \"ours\""), "{text}");
+        // A new theme, and a rename onto a taken name refused.
+        let (_, text) = applied(&ConfigEdit::SaveTheme { original: None, name: "new".into(), theme: theme.clone() });
+        assert!(text.contains("[themes.new]") && text.contains("[themes.mine]"), "{text}");
+        let refused = ConfigEdit::SaveTheme { original: Some("mine".into()), name: "broken".into(), theme };
+        assert!(applied(&refused).0.unwrap_err().contains("already exists"));
+    }
+
+    #[test]
+    fn edit_deletes_a_theme_only_when_unused() {
+        let (result, text) = applied(&ConfigEdit::DeleteTheme { name: "broken".into() });
+        assert_eq!(result, Ok(Applied::Done));
+        assert!(!text.contains("broken"), "{text}");
+        let (result, _) = applied(&ConfigEdit::DeleteTheme { name: "mine".into() });
+        assert!(result.unwrap_err().contains("in use by"));
+    }
+
+    #[test]
+    fn edit_saves_a_profile_and_changes_the_default() {
+        let work = ProfileRef { index: 1, name: Some("Work".into()) };
+        let profile = Profile { name: "Job".into(), cwd: Some("~".into()), ..Default::default() };
+        // Renamed: the default follows only when it named the old name.
+        let rename = DefaultChange::Rename { old: "Shell".into(), new: "Job".into() };
+        let edit = ConfigEdit::SaveProfile { at: Some(shell_ref()), profile: profile.clone(), default: rename };
+        let (result, text) = applied(&edit);
+        assert_eq!(result, Ok(Applied::Done));
+        assert!(text.starts_with("# My config\ndefault_profile = \"Job\"\n"), "{text}");
+        let rename = DefaultChange::Rename { old: "Work".into(), new: "Job".into() };
+        let (_, text) = applied(&ConfigEdit::SaveProfile { at: Some(work.clone()), profile: profile.clone(), default: rename });
+        assert!(text.starts_with("# My config\ndefault_profile = \"Shell\"\n"), "{text}");
+        assert!(text.contains("[[profiles]]\nname = \"Job\"\ncwd = \"~\"\n"), "{text}");
+        // Made the default; kept; new.
+        let set = DefaultChange::Set("Job".into());
+        let (_, text) = applied(&ConfigEdit::SaveProfile { at: Some(work.clone()), profile: profile.clone(), default: set });
+        assert!(text.starts_with("# My config\ndefault_profile = \"Job\"\n"), "{text}");
+        let keep = ConfigEdit::SaveProfile { at: None, profile, default: DefaultChange::Keep };
+        let (result, text) = applied(&keep);
+        assert_eq!(result, Ok(Applied::Done));
+        assert!(text.starts_with("# My config\ndefault_profile = \"Shell\"\n"), "{text}");
+        let mut doc = doc();
+        keep.apply(&mut doc).unwrap();
+        assert_eq!(names_of(&doc), ["Shell", "Work", "Job"]);
+        // A stale reference is refused.
+        let stale = ConfigEdit::SaveProfile {
+            at: Some(ProfileRef { index: 1, name: Some("Shell".into()) }),
+            profile: Profile { name: "X".into(), ..Default::default() },
+            default: DefaultChange::Keep,
+        };
+        assert!(applied(&stale).0.unwrap_err().contains("reopen"));
+    }
+
+    #[test]
+    fn edit_deletes_a_profile() {
+        let edit = ConfigEdit::DeleteProfile { at: ProfileRef { index: 1, name: Some("Work".into()) }, name: "Work".into() };
+        let mut doc = doc();
+        assert_eq!(edit.apply(&mut doc), Ok(Applied::Done));
+        assert_eq!(names_of(&doc), ["Shell"]);
+        // The last one can't go.
+        assert!(edit.apply(&mut parse("[[profiles]]\nname = \"Work\"\n").unwrap()).unwrap_err().contains("last profile"));
+    }
+
+    #[test]
+    fn edit_moves_a_profile_and_says_where() {
+        let mut doc = doc();
+        let up = ConfigEdit::MoveProfile { at: ProfileRef { index: 1, name: Some("Work".into()) }, up: true };
+        assert_eq!(up.apply(&mut doc), Ok(Applied::MovedTo(0)));
+        assert_eq!(names_of(&doc), ["Work", "Shell"]);
+        let edge = ConfigEdit::MoveProfile { at: ProfileRef { index: 0, name: Some("Work".into()) }, up: true };
+        assert_eq!(edge.apply(&mut doc), Ok(Applied::MovedTo(0)));
+    }
+
+    #[test]
+    fn edit_sets_the_fonts_in_order() {
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        let edit = ConfigEdit::SetFonts(vec![
+            FontChange::TerminalFamily(Some("Consolas".into())),
+            FontChange::Size(20.0),
+            FontChange::LineHeight(1.3),
+            FontChange::UiFamily(Some("Inter".into())),
+        ]);
+        assert_eq!(edit.apply(&mut doc), Ok(Applied::Done));
+        let config = reparse(&doc);
+        assert_eq!(config.font.family[0], "Consolas");
+        assert_eq!((config.font.size, config.font.line_height), (20.0, 1.3));
+        assert_eq!(config.ui_font.family, ["Inter"]);
+        // "Default" removes the lists.
+        let back = ConfigEdit::SetFonts(vec![FontChange::TerminalFamily(None), FontChange::UiFamily(None)]);
+        back.apply(&mut doc).unwrap();
+        let config = reparse(&doc);
+        assert_eq!(config.font.family, crate::config::FontConfig::default().family);
+        assert!(config.ui_font.family.is_empty());
+    }
+
+    /// What `save` writes, without a file: the default config when there is
+    /// none, and nothing for malformed text or a failed edit.
+    #[test]
+    fn edited_text_is_what_save_writes() {
+        let (text, ()) = edited(None, |doc| {
+            set_global_theme(doc, "gruvbox-dark");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(text, DEFAULT_CONFIG.replace("theme = \"brindle-dark\"", "theme = \"gruvbox-dark\""));
+        let (text, moved) = edited(Some(SAMPLE), |doc| move_profile(doc, &shell_ref(), false)).unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(names_of(&parse(&text).unwrap()), ["Work", "Shell"]);
+        assert!(edited(Some("[oops\n"), |_| Ok(())).unwrap_err().contains("not valid TOML"));
+        assert!(edited(Some(SAMPLE), |doc| delete_theme(doc, "mine")).is_err());
+    }
+
+    #[test]
+    fn file_text_reads_a_missing_file_as_none() {
+        let path = Path::new("/c/config.toml");
+        assert_eq!(text_from(path, Ok("x".into())), Ok(Some("x".to_string())));
+        assert_eq!(text_from(path, Err(std::io::Error::from(std::io::ErrorKind::NotFound))), Ok(None));
+        let denied = text_from(path, Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).unwrap_err();
+        assert!(denied.starts_with("reading /c/config.toml: "), "{denied}");
     }
 }

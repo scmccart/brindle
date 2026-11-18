@@ -2,22 +2,59 @@
 //! for every profile setting. Saving writes one profile's table with
 //! `config_edit`; theme and font size preview on the profile's open tabs.
 //!
-//! [`ProfilesState`] holds the state and logic and has no GPUI dependency;
-//! the view half is in the parent module.
+//! [`ProfilesState`] holds the state and logic and has no GPUI dependency:
+//! it reads the profiles from the config file's text it is given and
+//! returns the [`ConfigEdit`] to write, never touching the file. The view
+//! half, an `impl SettingsDialog`, follows it.
 
 use std::path::Path;
 
-use crate::config::{Profile, RemoteTarget};
-use crate::config_edit::{self, IMPLICIT_PROFILE, ProfileRef};
+use crate::config::{Profile, ProfileKey, RemoteTarget};
+use crate::config_edit::{self, ConfigEdit, DefaultChange, FileText, IMPLICIT_PROFILE, ProfileRef};
+
+use super::{ListMode, Step};
 
 /// A profile in the list.
 #[derive(Clone, Debug)]
 pub struct ProfileEntry {
     /// The name it is listed (and looked up) by.
     pub name: String,
-    pub at: ProfileRef,
+    /// Its `name` key as the file has it, which a write checks is still
+    /// there: `None` when it has none (or a blank one).
+    raw: Option<String>,
     /// A profile that can't be read carries its error.
     pub profile: Result<Profile, String>,
+}
+
+/// A row of the profile list, as the view draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileRow {
+    pub name: String,
+    /// The profile's description, or why it can't be read.
+    pub detail: String,
+    pub readable: bool,
+    /// The digit of its ctrl-alt-N shortcut, for the first nine.
+    pub hint: Option<String>,
+    pub selected: bool,
+    pub default: bool,
+}
+
+/// What the profile editor edits: a new profile, or the saved one with
+/// this key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    New,
+    Saved(ProfileKey),
+}
+
+impl Target {
+    /// The saved profile's listed name.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Target::New => None,
+            Target::Saved(key) => Some(&key.name),
+        }
+    }
 }
 
 /// A setting the profile editor edits, in the editor's (and tab) order.
@@ -278,12 +315,11 @@ impl Values {
 /// The profile editor.
 #[derive(Clone, Debug)]
 pub struct ProfileEditor {
-    /// The saved profile being edited; `None` for a new one.
-    pub at: Option<ProfileRef>,
-    /// Its listed name, for renames and the preview.
-    pub original_name: Option<String>,
-    /// List selection to go back to on discard.
-    return_to: usize,
+    /// The profile being edited; its key's name is the listed name, for
+    /// renames and the preview.
+    pub target: Target,
+    /// The list selection to go back to on discard.
+    return_to: Option<ProfileKey>,
     initial: Values,
     values: Values,
     /// The fields whose words from the file can't be written as shell
@@ -295,13 +331,7 @@ pub struct ProfileEditor {
 }
 
 impl ProfileEditor {
-    fn new(
-        profile: &Profile,
-        at: Option<ProfileRef>,
-        default: bool,
-        return_to: usize,
-        themes: &[String],
-    ) -> Self {
+    fn new(profile: &Profile, target: Target, default: bool, return_to: Option<ProfileKey>, themes: &[String]) -> Self {
         let (values, unquotable) = Values::from_profile(profile, default);
         let mut theme_choices: Vec<Option<String>> = std::iter::once(None).chain(themes.iter().cloned().map(Some)).collect();
         // A theme that no longer exists stays choosable, so opening and
@@ -311,15 +341,62 @@ impl ProfileEditor {
         {
             theme_choices.push(Some(theme.clone()));
         }
-        let original_name = at.as_ref().map(|_| profile.name.clone());
-        Self {
-            at,
-            original_name,
-            return_to,
-            initial: values.clone(),
-            values,
-            unquotable,
-            theme_choices,
+        Self { target, return_to, initial: values.clone(), values, unquotable, theme_choices }
+    }
+
+    /// The editor's heading.
+    pub fn title(&self) -> String {
+        match self.target.name() {
+            Some(name) => format!("Edit {name:?}"),
+            None => "New profile".to_string(),
+        }
+    }
+
+    /// The note beside the default checkbox: the current default can't be
+    /// unticked.
+    pub fn default_note(&self) -> &'static str {
+        if self.default_locked() {
+            "New tabs use this profile. Make another profile the default to change it."
+        } else {
+            "Use this profile for new tabs and windows"
+        }
+    }
+
+    /// The theme select's labels: "follow global", then each theme, marked
+    /// missing unless it is one of the `known` themes.
+    pub fn theme_labels(&self, known: &[String]) -> Vec<String> {
+        self.theme_choices
+            .iter()
+            .map(|theme| match theme {
+                None => "follow global".to_string(),
+                Some(name) if known.contains(name) => name.clone(),
+                Some(name) => format!("{name} (missing)"),
+            })
+            .collect()
+    }
+
+    /// The options of select field `field`, in the editor's order, with the
+    /// `known` themes; none for a field that isn't a select.
+    pub fn choice_labels(&self, field: Field, known: &[String]) -> Vec<String> {
+        match field {
+            Field::Theme => self.theme_labels(known),
+            Field::Remote => REMOTE_KINDS.iter().map(|&k| remote_label(k).to_string()).collect(),
+            Field::Engine => ENGINES.iter().map(|e| e.to_string()).collect(),
+            Field::Name
+            | Field::Command
+            | Field::Args
+            | Field::Cwd
+            | Field::Env
+            | Field::FontSize
+            | Field::Default
+            | Field::SshHost
+            | Field::SshUser
+            | Field::SshPort
+            | Field::SshIdentity
+            | Field::SshArgs
+            | Field::Container
+            | Field::ContainerUser
+            | Field::ConnectAtLaunch => Vec::new(),
         }
     }
 
@@ -578,46 +655,50 @@ pub enum Mode {
     ConfirmDelete,
 }
 
+/// The Profiles section's state: the list, its selection by
+/// [`ProfileKey`], and the editor or delete question when one shows.
 pub struct ProfilesState {
-    pub entries: Vec<ProfileEntry>,
+    entries: Vec<ProfileEntry>,
     /// `default_profile` from the file.
-    pub default_name: Option<String>,
-    pub selected: usize,
-    pub mode: Mode,
+    default_name: Option<String>,
+    /// The selected profile; always one of the list's once it is read.
+    selected: Option<ProfileKey>,
+    mode: Mode,
     /// Why the list can't be edited (the file isn't valid TOML).
     pub read_only: Option<String>,
     /// Renames saved since the last [`Self::take_renames`].
     renames: Vec<(String, String)>,
-}
-
-/// What a profile operation did.
-#[derive(Debug)]
-pub enum Done {
-    Nothing,
-    /// The config file was written.
-    Written,
+    /// The profiles to list (read-only) when the file can't be read: the
+    /// config in effect's.
+    fallback: Vec<Profile>,
 }
 
 impl ProfilesState {
-    pub fn new(path: &Path, fallback: &[Profile], fallback_default: Option<String>) -> Self {
+    /// The list read from `text` (the file at `path`), with the default
+    /// profile selected.
+    pub fn new(path: &Path, text: &FileText, fallback: Vec<Profile>, fallback_default: Option<String>) -> Self {
         let mut state = Self {
             entries: Vec::new(),
             default_name: None,
-            selected: 0,
+            selected: None,
             mode: Mode::List,
             read_only: None,
             renames: Vec::new(),
+            fallback,
         };
-        state.reload(path, fallback, fallback_default);
-        state.selected = state.default_index();
+        state.reload(path, text, fallback_default);
+        state.select_index(state.default_index());
         state
     }
 
-    /// Rereads the profiles from the file, or lists `fallback` read-only
-    /// when it can't be read: the message names the file and the cause. A
-    /// file that doesn't exist reads as an empty one.
-    pub fn reload(&mut self, path: &Path, fallback: &[Profile], fallback_default: Option<String>) {
-        let read = config_edit::read_document(path).and_then(|doc| {
+    /// Rereads the profiles from the file's text, or lists the fallback
+    /// read-only (with `fallback_default` the default) when it can't be
+    /// read: the message names the file and the cause. A file that doesn't
+    /// exist reads as an empty one. The selection is kept by its key, or
+    /// else by its place.
+    pub fn reload(&mut self, path: &Path, text: &FileText, fallback_default: Option<String>) {
+        let previous = self.selected_index().unwrap_or(0);
+        let read = config_edit::document_in(path, text).and_then(|doc| {
             let read = config_edit::profiles(&doc).map_err(|shape| shape.describe(path))?;
             Ok((doc, read))
         });
@@ -630,7 +711,8 @@ impl ProfilesState {
             Err(e) => {
                 self.read_only = Some(e);
                 self.default_name = fallback_default;
-                fallback.iter().map(|p| (Some(p.name.clone()), Ok(p.clone()))).collect()
+                let named = |p: &Profile| Some(p.name.clone()).filter(|name| !name.trim().is_empty());
+                self.fallback.iter().map(|p| (named(p), Ok(p.clone()))).collect()
             }
         };
         self.entries = read
@@ -638,26 +720,59 @@ impl ProfilesState {
             .enumerate()
             .map(|(index, (raw, profile))| {
                 // Unnamed profiles are listed as `Profile N`, as `Config` names them.
-                let name = match (&profile, &raw) {
-                    (Ok(p), _) if !p.name.trim().is_empty() => p.name.clone(),
-                    (Err(_), Some(raw)) if !raw.trim().is_empty() => raw.clone(),
-                    _ => format!("Profile {}", index + 1),
-                };
+                let name = raw.clone().unwrap_or_else(|| format!("Profile {}", index + 1));
                 let profile = profile.map(|mut p| {
                     p.name = name.clone();
                     p
                 });
-                ProfileEntry { name, at: ProfileRef { index, name: raw }, profile }
+                ProfileEntry { name, raw, profile }
             })
             .collect();
         if self.entries.is_empty() {
             self.entries.push(ProfileEntry {
                 name: IMPLICIT_PROFILE.into(),
-                at: ProfileRef { index: 0, name: Some(IMPLICIT_PROFILE.into()) },
+                raw: Some(IMPLICIT_PROFILE.into()),
                 profile: Ok(Profile::default_shell()),
             });
         }
-        self.selected = self.selected.min(self.entries.len() - 1);
+        self.reselect(previous);
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> + Clone {
+        self.entries.iter().map(|e| e.name.as_str())
+    }
+
+    /// Keeps the selection when its key is still listed, or else selects
+    /// the profile at `fallback` (the last when the list is shorter).
+    fn reselect(&mut self, fallback: usize) {
+        if self.selected_index().is_none() {
+            self.select_index(fallback.min(self.entries.len() - 1));
+        }
+    }
+
+    fn select_index(&mut self, ix: usize) {
+        if let Some(key) = ProfileKey::of(self.names(), ix) {
+            self.selected = Some(key);
+        }
+    }
+
+    /// Where the selected profile is in the list.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected.as_ref()?.find(self.names())
+    }
+
+    /// The listed profiles.
+    #[cfg(test)]
+    pub fn entries(&self) -> &[ProfileEntry] {
+        &self.entries
+    }
+
+    pub fn list_mode(&self) -> ListMode {
+        match self.mode {
+            Mode::List => ListMode::List,
+            Mode::Editor(_) => ListMode::Editor,
+            Mode::ConfirmDelete => ListMode::ConfirmDelete,
+        }
     }
 
     /// The profile new tabs use: the one `default_profile` names, else the
@@ -670,7 +785,27 @@ impl ProfilesState {
     }
 
     pub fn selected_entry(&self) -> Option<&ProfileEntry> {
-        self.entries.get(self.selected)
+        self.entries.get(self.selected_index()?)
+    }
+
+    /// The list's rows, in order.
+    pub fn rows(&self) -> Vec<ProfileRow> {
+        let (selected, default) = (self.selected_index(), self.default_index());
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| ProfileRow {
+                name: entry.name.clone(),
+                detail: match &entry.profile {
+                    Ok(p) => p.description(),
+                    Err(e) => e.clone(),
+                },
+                readable: entry.profile.is_ok(),
+                hint: (ix < 9).then(|| (ix + 1).to_string()),
+                selected: selected == Some(ix),
+                default: ix == default,
+            })
+            .collect()
     }
 
     pub fn take_renames(&mut self) -> Vec<(String, String)> {
@@ -678,22 +813,30 @@ impl ProfilesState {
     }
 
     fn names_except(&self, except: Option<&str>) -> Vec<&str> {
-        self.entries.iter().map(|e| e.name.as_str()).filter(|n| Some(*n) != except).collect()
+        self.names().filter(|n| Some(*n) != except).collect()
+    }
+
+    /// Where the profile `key` names is in the file, checked by the write:
+    /// built only for that write, never kept.
+    fn profile_ref(&self, key: &ProfileKey) -> Result<ProfileRef, String> {
+        let index = key.find(self.names()).ok_or(config_edit::PROFILES_CHANGED)?;
+        Ok(ProfileRef { index, name: self.entries[index].raw.clone() })
     }
 
     /// The name and settings to preview on the edited profile's open tabs.
     pub fn preview(&self) -> Option<(String, Profile)> {
         let Mode::Editor(editor) = &self.mode else { return None };
-        let name = editor.original_name.clone()?;
-        let base = self.entries.iter().find(|e| e.name == name)?.profile.as_ref().ok()?;
-        Some((name, editor.preview(base)))
+        let Target::Saved(key) = &editor.target else { return None };
+        let base = self.entries.get(key.find(self.names())?)?.profile.as_ref().ok()?;
+        Some((key.name.clone(), editor.preview(base)))
     }
 
     pub fn move_selection(&mut self, forward: bool) {
-        match &mut self.mode {
+        match self.mode {
             Mode::List => {
                 let n = self.entries.len();
-                self.selected = if forward { (self.selected + 1) % n } else { (self.selected + n - 1) % n };
+                let ix = self.selected_index().unwrap_or(0);
+                self.select_index(if forward { (ix + 1) % n } else { (ix + n - 1) % n });
             }
             // The editor's fields are focus stops: the view moves focus.
             Mode::Editor(_) | Mode::ConfirmDelete => {}
@@ -702,8 +845,13 @@ impl ProfilesState {
 
     pub fn select(&mut self, ix: usize) {
         if matches!(self.mode, Mode::List) && ix < self.entries.len() {
-            self.selected = ix;
+            self.select_index(ix);
         }
+    }
+
+    /// Home and end: the first profile, or the `last`.
+    pub fn edge(&self, last: bool) -> Option<usize> {
+        if last { self.entries.len().checked_sub(1) } else { Some(0) }
     }
 
     fn editable(&self) -> Result<(), String> {
@@ -713,17 +861,18 @@ impl ProfilesState {
         }
     }
 
-    fn open_editor(&mut self, profile: &Profile, at: Option<ProfileRef>, default: bool, themes: &[String]) {
-        self.mode = Mode::Editor(ProfileEditor::new(profile, at, default, self.selected, themes));
+    fn open_editor(&mut self, profile: &Profile, target: Target, default: bool, themes: &[String]) {
+        self.mode = Mode::Editor(ProfileEditor::new(profile, target, default, self.selected.clone(), themes));
     }
 
     /// Edit: the selected profile.
     pub fn start_edit(&mut self, themes: &[String]) -> Result<(), String> {
         self.editable()?;
         let entry = self.selected_entry().ok_or("no profile selected")?.clone();
+        let key = self.selected.clone().ok_or("no profile selected")?;
         let profile = entry.profile.map_err(|e| format!("{:?} can't be read: {e}", entry.name))?;
-        let default = self.selected == self.default_index();
-        self.open_editor(&profile, Some(entry.at), default, themes);
+        let default = self.selected_index() == Some(self.default_index());
+        self.open_editor(&profile, Target::Saved(key), default, themes);
         Ok(())
     }
 
@@ -735,7 +884,7 @@ impl ProfilesState {
             .map(|n| format!("Profile {n}"))
             .find(|n| !taken.iter().any(|t| t.eq_ignore_ascii_case(n)))
             .unwrap();
-        self.open_editor(&Profile { name, ..Default::default() }, None, false, themes);
+        self.open_editor(&Profile { name, ..Default::default() }, Target::New, false, themes);
         Ok(())
     }
 
@@ -752,7 +901,7 @@ impl ProfilesState {
         } else {
             (2..).map(|n| format!("{} copy {n}", entry.name)).find(free).unwrap()
         };
-        self.open_editor(&profile, None, false, themes);
+        self.open_editor(&profile, Target::New, false, themes);
         Ok(())
     }
 
@@ -773,42 +922,54 @@ impl ProfilesState {
     /// The editor's validation, with the other profiles' names.
     pub fn editor_result(&self) -> Option<Result<Profile, Vec<(Field, String)>>> {
         let editor = self.editor()?;
-        Some(editor.result(&self.names_except(editor.original_name.as_deref())))
+        Some(editor.result(&self.names_except(editor.target.name())))
     }
 
-    /// Save: writes the profile and returns to the list with it selected.
-    pub fn save(&mut self, path: &Path, fallback: &[Profile]) -> Result<Done, String> {
+    /// Save: the profile's edit, made the default or following a rename of
+    /// the default. The editor stays open until it is written
+    /// ([`Self::written`]).
+    pub fn save(&self) -> Result<Step, String> {
         let Some(Ok(profile)) = self.editor_result() else {
             return Err("Fix the fields marked invalid first".into());
         };
-        let editor = self.editor().expect("editing").clone();
-        let old = editor.original_name.clone();
-        let make_default = editor.is_default() && !editor.default_locked();
-        config_edit::save(path, |doc| {
-            config_edit::upsert_profile(doc, editor.at.as_ref(), &profile)?;
-            if let Some(old) = old.as_deref().filter(|old| *old != profile.name) {
-                config_edit::rename_default_profile(doc, old, &profile.name);
-            }
-            if make_default {
-                config_edit::set_default_profile(doc, &profile.name);
-            }
-            Ok(())
-        })?;
-        if let Some(old) = old.filter(|old| *old != profile.name) {
-            self.renames.push((old, profile.name.clone()));
-        }
-        self.mode = Mode::List;
-        self.reload(path, fallback, None);
-        self.selected = self.entries.iter().position(|e| e.name == profile.name).unwrap_or(0);
-        Ok(Done::Written)
+        let editor = self.editor().expect("editing");
+        let at = match &editor.target {
+            Target::New => None,
+            Target::Saved(key) => Some(self.profile_ref(key)?),
+        };
+        let renamed = editor.target.name().filter(|old| *old != profile.name);
+        let default = match (editor.is_default() && !editor.default_locked(), renamed) {
+            (true, _) => DefaultChange::Set(profile.name.clone()),
+            (false, Some(old)) => DefaultChange::Rename { old: old.to_string(), new: profile.name.clone() },
+            (false, None) => DefaultChange::Keep,
+        };
+        Ok(Step::Write(ConfigEdit::SaveProfile { at, profile, default }))
     }
 
     /// Discard: back to the list as it was.
     pub fn discard(&mut self) {
         if let Mode::Editor(editor) = &self.mode {
-            self.selected = editor.return_to.min(self.entries.len() - 1);
+            let fallback = self.selected_index().unwrap_or(0);
+            self.selected = editor.return_to.clone();
+            self.reselect(fallback);
         }
         self.mode = Mode::List;
+    }
+
+    /// Escape: closes in the list, discards in the editor, keeps the
+    /// profile when asked about deleting it.
+    pub fn cancel(&mut self) -> Step {
+        match self.mode {
+            Mode::List => Step::Close,
+            Mode::Editor(_) => {
+                self.discard();
+                Step::Nothing
+            }
+            Mode::ConfirmDelete => {
+                self.mode = Mode::List;
+                Step::Nothing
+            }
+        }
     }
 
     /// Delete: asks for confirmation, or explains why the profile can't go.
@@ -824,40 +985,89 @@ impl ProfilesState {
     /// The confirmation question.
     pub fn delete_question(&self) -> String {
         let name = self.selected_entry().map(|e| e.name.as_str()).unwrap_or("");
-        if self.selected == self.default_index() && self.default_name.is_some() {
+        if self.selected_index() == Some(self.default_index()) && self.default_name.is_some() {
             format!("Delete {name:?}? It is the default profile; new tabs will use the first profile instead.")
         } else {
             format!("Delete {name:?}?")
         }
     }
 
-    pub fn delete_selected(&mut self, path: &Path, fallback: &[Profile]) -> Result<Done, String> {
+    /// Delete, confirmed: back to the list, deleting the selected profile.
+    pub fn delete_selected(&mut self) -> Result<Step, String> {
         self.mode = Mode::List;
-        let entry = self.selected_entry().ok_or("no profile selected")?.clone();
-        config_edit::save(path, |doc| config_edit::delete_profile(doc, &entry.at, &entry.name))?;
-        self.reload(path, fallback, None);
-        Ok(Done::Written)
+        let entry = self.selected_entry().ok_or("no profile selected")?;
+        let key = self.selected.as_ref().ok_or("no profile selected")?;
+        Ok(Step::Write(ConfigEdit::DeleteProfile { at: self.profile_ref(key)?, name: entry.name.clone() }))
     }
 
-    /// alt-up / alt-down: moves the selected profile one place.
-    pub fn move_selected(&mut self, up: bool, path: &Path, fallback: &[Profile]) -> Result<Done, String> {
+    /// alt-up / alt-down: moves the selected profile one place, unless it
+    /// is at that end.
+    pub fn move_selected(&self, up: bool) -> Result<Step, String> {
         self.editable()?;
         if !matches!(self.mode, Mode::List) {
-            return Ok(Done::Nothing);
+            return Ok(Step::Nothing);
         }
-        let entry = self.selected_entry().ok_or("no profile selected")?.clone();
-        let edge = if up { self.selected == 0 } else { self.selected + 1 >= self.entries.len() };
+        let key = self.selected.as_ref().ok_or("no profile selected")?;
+        let at = self.profile_ref(key)?;
+        let edge = if up { at.index == 0 } else { at.index + 1 >= self.entries.len() };
         if edge {
-            return Ok(Done::Nothing);
+            return Ok(Step::Nothing);
         }
-        let mut moved_to = entry.at.index;
-        config_edit::save(path, |doc| {
-            moved_to = config_edit::move_profile(doc, &entry.at, up)?;
-            Ok(())
-        })?;
-        self.reload(path, fallback, None);
-        self.selected = moved_to.min(self.entries.len() - 1);
-        Ok(Done::Written)
+        Ok(Step::Write(ConfigEdit::MoveProfile { at, up }))
+    }
+
+    /// The edit this section asked for was written (`applied` is what it
+    /// gave), and the file now reads `text`: back to the list, with the
+    /// saved profile selected, the one in a deleted profile's place, or the
+    /// moved one.
+    pub fn written(&mut self, edit: &ConfigEdit, applied: config_edit::Applied, path: &Path, text: &FileText) {
+        match edit {
+            ConfigEdit::SaveProfile { profile, .. } => {
+                let old = self.editor().and_then(|e| e.target.name()).map(str::to_string);
+                if let Some(old) = old.filter(|old| *old != profile.name) {
+                    self.renames.push((old, profile.name.clone()));
+                }
+                self.mode = Mode::List;
+                self.reload(path, text, None);
+                self.select_index(self.entries.iter().position(|e| e.name == profile.name).unwrap_or(0));
+            }
+            ConfigEdit::DeleteProfile { .. } => self.reload(path, text, None),
+            ConfigEdit::MoveProfile { at, .. } => {
+                let moved_to = match applied {
+                    config_edit::Applied::MovedTo(ix) => ix,
+                    config_edit::Applied::Done => at.index,
+                };
+                self.reload(path, text, None);
+                self.select_index(moved_to.min(self.entries.len() - 1));
+            }
+            ConfigEdit::SetGlobalTheme { .. }
+            | ConfigEdit::SaveTheme { .. }
+            | ConfigEdit::DeleteTheme { .. }
+            | ConfigEdit::SetFonts(_) => {}
+        }
+    }
+
+    /// Whether button `b` can be pressed (and focused) in this section.
+    pub fn enabled(&self, b: super::Btn) -> bool {
+        use super::Btn;
+        let editable = self.read_only.is_none();
+        let readable = self.selected_entry().is_some_and(|e| e.profile.is_ok());
+        let (ix, len) = (self.selected_index().unwrap_or(0), self.entries.len());
+        match b {
+            Btn::New => editable,
+            Btn::Duplicate | Btn::Edit => editable && readable,
+            Btn::Delete => editable && len > 1,
+            Btn::Up => editable && ix > 0,
+            Btn::Down => editable && ix + 1 < len,
+            Btn::Save => matches!(self.editor_result(), Some(Ok(_))),
+            Btn::Cancel
+            | Btn::Apply
+            | Btn::Close
+            | Btn::Keep
+            | Btn::ConfirmDelete
+            | Btn::Clear
+            | Btn::Discard => true,
+        }
     }
 
     /// Debug description for `--dump-screen-after`. `field` names the
@@ -869,13 +1079,13 @@ impl ProfilesState {
                 "--- settings section={section} mode=list selected={:?} default={:?} profiles={:?} error={:?}\n",
                 self.selected_entry().map(|e| e.name.as_str()).unwrap_or(""),
                 self.entries.get(self.default_index()).map(|e| e.name.as_str()).unwrap_or(""),
-                self.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+                self.names().collect::<Vec<_>>(),
                 error
             ),
             Mode::Editor(editor) => {
                 let invalid = match self.editor_result() {
                     Some(Err(errors)) => errors.iter().map(|(f, _)| f.label()).collect::<Vec<_>>(),
-                    _ => Vec::new(),
+                    Some(Ok(_)) | None => Vec::new(),
                 };
                 format!(
                     "--- settings section={section} mode=editor name={:?} field={:?} theme={:?} default={} remote={} connect_at_launch={} invalid={:?} can_save={} error={:?}\n",
@@ -907,7 +1117,7 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
-use super::{Btn, Choice, Section, SettingsDialog};
+use super::{Btn, ListOp, Section, SettingsDialog};
 use crate::actions::{
     SettingsDuplicate, SettingsMoveDown, SettingsMoveUp, SettingsSectionFirst, SettingsSectionLast, SettingsSectionNext,
     SettingsSectionPrev,
@@ -938,6 +1148,7 @@ impl SettingsDialog {
             return;
         }
         let editor = self.model.profiles.editor().expect("editing").clone();
+        let known = self.model.themes.theme_names();
         for field in TEXT_FIELDS {
             let text = editor.text(field).to_string();
             let input = cx.new(|cx| TextInput::new(&text, cx).with_placeholder(field.placeholder()));
@@ -956,8 +1167,8 @@ impl SettingsDialog {
         for field in SELECT_FIELDS {
             // Each option is keyed by its index (labels can repeat), and the
             // chosen key is found again at it.
-            let options: Vec<SelectOption> = self
-                .choice_labels(&editor, field)
+            let options: Vec<SelectOption> = editor
+                .choice_labels(field, &known)
                 .into_iter()
                 .enumerate()
                 .map(|(ix, label)| SelectOption::new(label).key(ix.to_string()))
@@ -967,36 +1178,11 @@ impl SettingsDialog {
             let changed = cx.subscribe_in(&select, window, move |this, select, event: &SelectEvent, window, cx| {
                 let SelectEvent::Changed(key) = event;
                 if let Some(ix) = option_keyed(select.read(cx).options(), key) {
-                    this.apply_choice(Choice::Profile(field), ix, window, cx);
+                    this.apply_choice(field, ix, window, cx);
                 }
             });
             self._profile_subscriptions.push(changed);
             self.profile_selects.push((field, select));
-        }
-    }
-
-    /// The options of select field `field`, in the editor's order.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "railway R3 exception: `Field` has 17 variants and only the three select fields have options"
-    )]
-    fn choice_labels(&self, editor: &ProfileEditor, field: Field) -> Vec<SharedString> {
-        match field {
-            Field::Theme => {
-                let known = |name: &str| self.model.entries.iter().any(|e| e.theme.is_ok() && e.name == name);
-                editor
-                    .theme_choices
-                    .iter()
-                    .map(|theme| match theme {
-                        None => "follow global".into(),
-                        Some(name) if known(name) => name.clone().into(),
-                        Some(name) => format!("{name} (missing)").into(),
-                    })
-                    .collect()
-            }
-            Field::Remote => REMOTE_KINDS.iter().map(|&k| remote_label(k).into()).collect(),
-            Field::Engine => ENGINES.iter().map(|&e| e.into()).collect(),
-            _ => Vec::new(),
         }
     }
 
@@ -1046,38 +1232,33 @@ impl SettingsDialog {
     // ---- actions ----
 
     pub(super) fn section_next(&mut self, _: &SettingsSectionNext, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.next_section(true);
-        self.changed(window, cx);
+        self.switch_section(|model, text| model.next_section(true, text), window, cx);
     }
 
     pub(super) fn section_prev(&mut self, _: &SettingsSectionPrev, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.next_section(false);
-        self.changed(window, cx);
+        self.switch_section(|model, text| model.next_section(false, text), window, cx);
     }
 
     pub(super) fn section_first(&mut self, _: &SettingsSectionFirst, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.edge_section(false);
-        self.changed(window, cx);
+        self.switch_section(|model, text| model.edge_section(false, text), window, cx);
     }
 
     pub(super) fn section_last(&mut self, _: &SettingsSectionLast, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.edge_section(true);
-        self.changed(window, cx);
+        self.switch_section(|model, text| model.edge_section(true, text), window, cx);
     }
 
     pub(super) fn duplicate(&mut self, _: &SettingsDuplicate, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.start_duplicate();
-        self.changed(window, cx);
+        self.list_op(ListOp::Duplicate, window, cx);
     }
 
     pub(super) fn move_up(&mut self, _: &SettingsMoveUp, window: &mut Window, cx: &mut Context<Self>) {
-        let outcome = self.model.move_profile(true);
-        self.outcome(outcome, window, cx);
+        let step = self.model.move_profile(true);
+        self.step(step, window, cx);
     }
 
     pub(super) fn move_down(&mut self, _: &SettingsMoveDown, window: &mut Window, cx: &mut Context<Self>) {
-        let outcome = self.model.move_profile(false);
-        self.outcome(outcome, window, cx);
+        let step = self.model.move_profile(false);
+        self.step(step, window, cx);
     }
 
     /// Runs `f` on the profile editor, then previews and redraws.
@@ -1097,12 +1278,9 @@ impl SettingsDialog {
     // ---- rendering ----
 
     pub(super) fn render_profiles(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        match &self.model.profiles.mode {
-            Mode::Editor(editor) => {
-                let editor = editor.clone();
-                self.render_profile_editor(&editor, cx)
-            }
-            Mode::List | Mode::ConfirmDelete => self.render_profile_list(window, cx),
+        match self.model.profiles.editor().cloned() {
+            Some(editor) => self.render_profile_editor(&editor, cx),
+            None => self.render_profile_list(window, cx),
         }
     }
 
@@ -1111,18 +1289,12 @@ impl SettingsDialog {
         let fg = t.foreground;
         let muted = t.muted_foreground;
         let state = &self.model.profiles;
-        let default = state.default_index();
 
         let rows = state
-            .entries
-            .iter()
+            .rows()
+            .into_iter()
             .enumerate()
-            .map(|(ix, entry)| {
-                let selected = ix == state.selected;
-                let detail = match &entry.profile {
-                    Ok(p) => p.description(),
-                    Err(e) => e.clone(),
-                };
+            .map(|(ix, row)| {
                 div()
                     .id(("profile", ix))
                     .flex()
@@ -1132,8 +1304,8 @@ impl SettingsDialog {
                     .px_3()
                     .py_1p5()
                     .rounded_md()
-                    .when(selected, |d| d.bg(t.accent))
-                    .when(!selected, |d| d.hover(|d| d.bg(t.accent.opacity(0.5))))
+                    .when(row.selected, |d| d.bg(t.accent))
+                    .when(!row.selected, |d| d.hover(|d| d.bg(t.accent.opacity(0.5))))
                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         this.model.select(ix);
                         if e.click_count() >= 2 {
@@ -1147,7 +1319,7 @@ impl SettingsDialog {
                             .flex_none()
                             .text_xs()
                             .text_color(muted)
-                            .child(if ix < 9 { SharedString::from(format!("{}", ix + 1)) } else { SharedString::default() }),
+                            .child(row.hint.map(SharedString::from).unwrap_or_default()),
                     )
                     .child(
                         div()
@@ -1155,18 +1327,14 @@ impl SettingsDialog {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .text_color(if entry.profile.is_ok() { fg } else { muted })
-                                    .child(SharedString::from(entry.name.clone())),
-                            )
-                            .child(div().text_xs().text_color(muted).child(SharedString::from(detail))),
+                            .child(div().text_color(if row.readable { fg } else { muted }).child(SharedString::from(row.name)))
+                            .child(div().text_xs().text_color(muted).child(SharedString::from(row.detail))),
                     )
-                    .when(ix == default, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● default")))
+                    .when(row.default, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● default")))
             })
             .collect::<Vec<_>>();
 
-        let confirming = matches!(state.mode, Mode::ConfirmDelete);
+        let confirming = state.list_mode() == ListMode::ConfirmDelete;
         let footer = if confirming {
             self.confirm_footer(state.delete_question(), cx)
         } else {
@@ -1177,28 +1345,24 @@ impl SettingsDialog {
                 .items_center()
                 .gap_2()
                 .child(self.button(Btn::New, "New (n)", outline, cx, |this, window, cx| {
-                    this.model.start_new();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::New, window, cx)
                 }))
                 .child(self.button(Btn::Duplicate, "Duplicate (c)", outline, cx, |this, window, cx| {
-                    this.model.start_duplicate();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::Duplicate, window, cx)
                 }))
                 .child(self.button(Btn::Edit, "Edit (e)", outline, cx, |this, window, cx| {
-                    this.model.start_edit();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::Edit, window, cx)
                 }))
                 .child(self.button(Btn::Delete, "Delete (d)", ButtonVariant::Destructive, cx, |this, window, cx| {
-                    this.model.request_delete();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::Delete, window, cx)
                 }))
                 .child(self.button(Btn::Up, "↑", outline, cx, |this, window, cx| {
-                    let outcome = this.model.move_profile(true);
-                    this.outcome(outcome, window, cx);
+                    let step = this.model.move_profile(true);
+                    this.step(step, window, cx);
                 }))
                 .child(self.button(Btn::Down, "↓", outline, cx, |this, window, cx| {
-                    let outcome = this.model.move_profile(false);
-                    this.outcome(outcome, window, cx);
+                    let step = this.model.move_profile(false);
+                    this.step(step, window, cx);
                 }))
                 .child(div().flex_1())
                 .child(self.button(Btn::Close, "Close", ButtonVariant::Default, cx, |_, _, cx| {
@@ -1241,24 +1405,32 @@ impl SettingsDialog {
         let red = t.destructive;
         let errors = match self.model.profiles.editor_result() {
             Some(Err(errors)) => errors,
-            _ => Vec::new(),
+            Some(Ok(_)) | None => Vec::new(),
         };
         let error_for = |field: Field| errors.iter().find(|(f, _)| *f == field).map(|(_, e)| e.clone());
         let label = |text: &'static str| div().w(px(120.0)).flex_none().text_color(muted).child(text);
 
         let row = |this: &Self, field: Field, cx: &mut Context<Self>| -> AnyElement {
             let error = error_for(field);
-            #[allow(
-                clippy::wildcard_enum_match_arm,
-                reason = "railway R3 exception: every field but the two switches and the selects is a text input"
-            )]
             let control: AnyElement = match field {
-                f if SELECT_FIELDS.contains(&f) => {
-                    this.choice_slot(Choice::Profile(f)).flex_1().min_w_0().into_any_element()
+                Field::Theme | Field::Remote | Field::Engine => {
+                    this.choice_slot(field).flex_1().min_w_0().into_any_element()
                 }
                 Field::Default => this.render_default_toggle(editor, cx),
                 Field::ConnectAtLaunch => this.render_connect_toggle(editor, cx),
-                _ => div()
+                Field::Name
+                | Field::Command
+                | Field::Args
+                | Field::Cwd
+                | Field::Env
+                | Field::FontSize
+                | Field::SshHost
+                | Field::SshUser
+                | Field::SshPort
+                | Field::SshIdentity
+                | Field::SshArgs
+                | Field::Container
+                | Field::ContainerUser => div()
                     .flex_1()
                     .min_w_0()
                     .children(this.profile_input(field).map(|input| Input::new(input).invalid(error.is_some())))
@@ -1289,10 +1461,7 @@ impl SettingsDialog {
         let visible = editor.visible_fields();
         let name_row = row(self, Field::Name, cx);
         let rows: Vec<AnyElement> = visible.iter().skip(1).map(|&f| row(self, f, cx)).collect();
-        let title = match &editor.original_name {
-            Some(name) => format!("Edit {name:?}"),
-            None => "New profile".to_string(),
-        };
+        let title = editor.title();
         div()
             .flex()
             .flex_col()
@@ -1364,11 +1533,7 @@ impl SettingsDialog {
     fn render_default_toggle(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.ui_theme().muted_foreground;
         let locked = editor.default_locked();
-        let note = if locked {
-            "New tabs use this profile. Make another profile the default to change it."
-        } else {
-            "Use this profile for new tabs and windows"
-        };
+        let note = editor.default_note();
         let toggle = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             this.edit_profile(window, cx, |e| e.toggle_default());
         };
@@ -1429,37 +1594,66 @@ theme = "gone"
 
     const THEMES: &[&str] = &["brindle-dark", "tokyo-night", "mine"];
 
+    fn path() -> &'static Path {
+        Path::new("/c/config.toml")
+    }
+
+    /// The config file as text: the state reads it, and each edit the state
+    /// asks for is written to it as the view writes it to the file, then
+    /// reported back with `written`.
     struct Fixture {
-        dir: std::path::PathBuf,
-        path: std::path::PathBuf,
+        text: Option<String>,
     }
 
     impl Fixture {
-        fn new(name: &str, text: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("brindle-profiles-{}-{name}", std::process::id()));
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("config.toml");
-            std::fs::write(&path, text).unwrap();
-            Self { dir, path }
+        fn new(text: &str) -> Self {
+            Self { text: Some(text.to_string()) }
+        }
+
+        fn read(&self) -> FileText {
+            Ok(self.text.clone())
         }
 
         fn state(&self) -> ProfilesState {
-            ProfilesState::new(&self.path, &[], None)
+            ProfilesState::new(path(), &self.read(), Vec::new(), None)
         }
 
         fn text(&self) -> String {
-            std::fs::read_to_string(&self.path).unwrap()
+            self.text.clone().unwrap_or_default()
         }
 
         fn config(&self) -> Config {
             Config::parse(&self.text()).unwrap().config
         }
-    }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).ok();
+        /// Takes what an operation returned: writes its edit and reports
+        /// it. Whether it wrote, or why not.
+        fn take(&mut self, state: &mut ProfilesState, step: Result<Step, String>) -> Result<bool, String> {
+            match step? {
+                Step::Nothing => Ok(false),
+                Step::Close => panic!("the dialog closed"),
+                Step::Write(edit) => {
+                    let (text, applied) = config_edit::edited(self.text.as_deref(), |doc| edit.apply(doc))?;
+                    self.text = Some(text);
+                    state.written(&edit, applied, path(), &self.read());
+                    Ok(true)
+                }
+            }
+        }
+
+        fn save(&mut self, state: &mut ProfilesState) -> Result<bool, String> {
+            let step = state.save();
+            self.take(state, step)
+        }
+
+        fn delete(&mut self, state: &mut ProfilesState) -> Result<bool, String> {
+            let step = state.delete_selected();
+            self.take(state, step)
+        }
+
+        fn move_selected(&mut self, state: &mut ProfilesState, up: bool) -> Result<bool, String> {
+            let step = state.move_selected(up);
+            self.take(state, step)
         }
     }
 
@@ -1486,23 +1680,23 @@ theme = "gone"
 
     #[test]
     fn list_order_default_and_initial_selection() {
-        let f = Fixture::new("list", CONFIG);
+        let f = Fixture::new(CONFIG);
         let state = f.state();
         assert_eq!(names(&state), ["Shell", "htop", "Work"]);
         assert_eq!(state.default_index(), 2);
-        assert_eq!(state.selected, 2);
+        assert_eq!(state.selected_index(), Some(2));
         assert!(state.describe(&None, "").contains("default=\"Work\""));
     }
 
     #[test]
     fn implicit_unnamed_unreadable_and_broken_files() {
-        let f = Fixture::new("implicit", "theme = \"mine\"\n");
+        let f = Fixture::new("theme = \"mine\"\n");
         let state = f.state();
         assert_eq!(names(&state), ["Shell"]);
         assert_eq!(state.default_index(), 0);
         // An unknown key elsewhere doesn't hide the profiles; a bad profile
         // is listed with its error and can't be edited.
-        let f = Fixture::new("errors", "fontsize = 3\n[[profiles]]\nname = \"Work\"\n[[profiles]]\nfont_size = \"big\"\n[[profiles]]\ncwd = \"~\"\n");
+        let f = Fixture::new("fontsize = 3\n[[profiles]]\nname = \"Work\"\n[[profiles]]\nfont_size = \"big\"\n[[profiles]]\ncwd = \"~\"\n");
         let mut state = f.state();
         assert_eq!(names(&state), ["Work", "Profile 2", "Profile 3"]);
         assert!(state.entries[1].profile.is_err());
@@ -1510,8 +1704,9 @@ theme = "gone"
         assert!(state.start_edit(&themes()).unwrap_err().contains("can't be read"));
         assert!(!edit(&mut state, "Work").dirty());
         // A file that isn't TOML lists the loaded profiles, read-only.
-        let f = Fixture::new("broken", "[oops\n");
-        let mut state = ProfilesState::new(&f.path, &[Profile { name: "Loaded".into(), ..Default::default() }], None);
+        let f = Fixture::new("[oops\n");
+        let mut state =
+            ProfilesState::new(path(), &f.read(), vec![Profile { name: "Loaded".into(), ..Default::default() }], None);
         assert_eq!(names(&state), ["Loaded"]);
         assert!(state.start_edit(&themes()).unwrap_err().contains("isn't valid TOML"));
         assert!(state.start_new(&themes()).is_err());
@@ -1520,19 +1715,19 @@ theme = "gone"
     /// What the read-only text says, and that a missing file isn't one.
     #[test]
     fn the_read_only_text_names_the_file_and_the_cause() {
-        let f = Fixture::new("not-an-array", "profiles = 3\n");
-        let state = ProfilesState::new(&f.path, &[], None);
+        let f = Fixture::new("profiles = 3\n");
+        let state = f.state();
         let why = state.read_only.clone().unwrap();
         assert!(why.starts_with("profiles in ") && why.ends_with("config.toml is not an array"), "{why}");
 
-        // A path that can't be read at all: a directory.
-        let state = ProfilesState::new(&f.dir, &[], None);
+        // A file that can't be read at all.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let state = ProfilesState::new(path(), &config_edit::text_from(path(), Err(denied)), Vec::new(), None);
         let why = state.read_only.clone().unwrap();
-        assert!(why.starts_with(&format!("reading {}: ", f.dir.display())), "{why}");
+        assert!(why.starts_with("reading /c/config.toml: "), "{why}");
 
         // No file reads as an empty document: the implicit profile, editable.
-        std::fs::remove_file(&f.path).unwrap();
-        let mut state = ProfilesState::new(&f.path, &[], None);
+        let mut state = Fixture { text: None }.state();
         assert_eq!(state.read_only, None);
         assert_eq!(names(&state), [IMPLICIT_PROFILE]);
         assert!(state.start_edit(&themes()).is_ok());
@@ -1552,8 +1747,7 @@ theme = "gone"
     /// the text shown wouldn't be what the file has.
     #[test]
     fn an_unquotable_argument_blocks_save() {
-        let f = Fixture::new(
-            "unquotable",
+        let mut f = Fixture::new(
             "[[profiles]]\nname = \"Odd\"\nargs = [\"-c\", \"a\\u0000b\"]\nenv = { K = \"x\\u0000y\" }\n",
         );
         let mut state = f.state();
@@ -1563,7 +1757,7 @@ theme = "gone"
         assert!(errors.iter().all(|(_, why)| why.contains("can't be written as a shell word")), "{errors:?}");
         // The file is untouched by a refused save.
         let before = f.text();
-        assert!(state.save(&f.path, &[]).is_err());
+        assert!(f.save(&mut state).is_err());
         assert_eq!(f.text(), before);
         // Editing the field replaces the words, so it is valid again.
         let editor = state.editor_mut().unwrap();
@@ -1576,7 +1770,7 @@ theme = "gone"
 
     #[test]
     fn fields_as_shell_words_round_trip() {
-        let f = Fixture::new("words", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         assert_eq!(editor.text(Field::Env), "PAGER='less -R'");
@@ -1586,7 +1780,7 @@ theme = "gone"
         assert_eq!(editor.theme_choices.last().unwrap().as_deref(), Some("gone"));
         assert!(editor.is_default() && editor.default_locked());
         // Saving without changes keeps every value.
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         let work = f.config().profiles[2].clone();
         assert_eq!(work.args, ["-c", "echo hi; exec bash"]);
         assert_eq!(work.env["PAGER"], "less -R");
@@ -1596,7 +1790,7 @@ theme = "gone"
 
     #[test]
     fn validation() {
-        let f = Fixture::new("validation", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         editor.set_text(Field::Name, "shell");
@@ -1614,7 +1808,7 @@ theme = "gone"
         editor.set_text(Field::FontSize, "x");
         assert_eq!(invalid(&state), [Field::Env, Field::FontSize]);
         let before = f.text();
-        assert!(state.save(&f.path, &[]).is_err());
+        assert!(f.save(&mut state).is_err());
         assert_eq!(f.text(), before);
         // Keeping its own name, in another case, is fine.
         let editor = state.editor_mut().unwrap();
@@ -1628,7 +1822,7 @@ theme = "gone"
     /// checkbox.
     #[test]
     fn local_fields_end_with_font_size_then_default() {
-        let f = Fixture::new("fields", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Shell");
         let visible = editor.visible_fields();
@@ -1637,7 +1831,7 @@ theme = "gone"
 
     #[test]
     fn ssh_target_is_written_and_read_back() {
-        let f = Fixture::new("remote-ssh", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         assert_eq!(editor.remote_kind(), RemoteKind::Local);
@@ -1650,7 +1844,7 @@ theme = "gone"
         editor.set_text(Field::SshUser, "ubuntu");
         editor.set_text(Field::SshPort, "2222");
         editor.set_text(Field::SshArgs, "-J 'my bastion'");
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         match &f.config().profiles[2].remote {
             Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch }) => {
                 assert_eq!((host.as_str(), user.as_deref(), *port), ("A8", Some("ubuntu"), Some(2222)));
@@ -1676,17 +1870,17 @@ theme = "gone"
                     [[profiles]]\nname = \"A8\"\nremote = { type = \"ssh\", host = \"A8\", connect_at_launch = true }\n\
                     [[profiles]]\nname = \"box\"\nremote = { type = \"container\", container = \"box\", connect_at_launch = true }\n\
                     [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n";
-        let f = Fixture::new("connect-at-launch", text);
+        let mut f = Fixture::new(text);
         let mut state = f.state();
         for name in ["A8", "box", "B9"] {
             edit(&mut state, name).set_text(Field::Cwd, "/srv");
-            state.save(&f.path, &[]).unwrap();
+            f.save(&mut state).unwrap();
         }
         // The kind changed too: SSH to a container, the setting kept.
         let editor = edit(&mut state, "A8");
         editor.choose_remote(RemoteKind::Container);
         editor.set_text(Field::Container, "a8box");
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         let config = f.config();
         let eager: Vec<(&str, bool, Option<&str>)> = config.profiles[1..]
             .iter()
@@ -1703,7 +1897,7 @@ theme = "gone"
     /// its visible fields in order) after the kind's own fields.
     #[test]
     fn connect_at_launch_switch_shows_per_kind() {
-        let f = Fixture::new("connect-shows", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         assert_eq!(editor.remote_kind(), RemoteKind::Local);
@@ -1727,13 +1921,13 @@ theme = "gone"
     /// editor dirty and survives a trip through `none`.
     #[test]
     fn connect_at_launch_switch_is_written_only_when_on() {
-        let f = Fixture::new("connect-writes", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         editor.choose_remote(RemoteKind::Ssh);
         editor.set_text(Field::SshHost, "A8");
         assert!(!editor.connect_at_launch());
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert!(!f.text().contains("connect_at_launch"), "{}", f.text());
 
         let editor = edit(&mut state, "Work");
@@ -1744,7 +1938,7 @@ theme = "gone"
         editor.choose_remote(RemoteKind::Local);
         editor.choose_remote(RemoteKind::Ssh);
         assert!(editor.connect_at_launch());
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert!(f.text().contains(r#"remote = { type = "ssh", host = "A8", connect_at_launch = true }"#), "{}", f.text());
         assert_eq!(f.config().profiles[2].remote.as_ref().map(RemoteTarget::connects_at_launch), Some(true));
 
@@ -1752,7 +1946,7 @@ theme = "gone"
         let editor = edit(&mut state, "Work");
         assert!(editor.connect_at_launch() && !editor.dirty());
         editor.toggle_connect_at_launch();
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert!(!f.text().contains("connect_at_launch"), "{}", f.text());
         assert!(f.text().contains(r#"remote = { type = "ssh", host = "A8" }"#), "{}", f.text());
 
@@ -1762,17 +1956,17 @@ theme = "gone"
         editor.choose_remote(RemoteKind::Container);
         editor.set_text(Field::Container, "box");
         editor.toggle_connect_at_launch();
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert!(f.text().contains("connect_at_launch = true"), "{}", f.text());
         let editor = edit(&mut state, "Work");
         editor.choose_remote(RemoteKind::Local);
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert!(!f.text().contains("remote") && !f.text().contains("connect_at_launch"), "{}", f.text());
     }
 
     #[test]
     fn connect_at_launch_shows_in_the_dump() {
-        let f = Fixture::new("connect-dump", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         edit(&mut state, "Work");
         let line = state.describe(&None, "Connect at launch");
@@ -1786,14 +1980,14 @@ theme = "gone"
 
     #[test]
     fn container_target_and_removal() {
-        let f = Fixture::new("remote-container", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         editor.choose(Field::Remote, 2);
         assert_eq!(editor.remote_kind(), RemoteKind::Container);
         editor.set_text(Field::Container, "my-box");
         editor.choose(Field::Engine, 1);
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert_eq!(
             f.config().profiles[2].remote,
             Some(RemoteTarget::Container {
@@ -1806,14 +2000,14 @@ theme = "gone"
         let editor = edit(&mut state, "Work");
         assert_eq!((editor.remote_kind(), editor.engine()), (RemoteKind::Container, "podman"));
         editor.choose_remote(RemoteKind::Local);
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert_eq!(f.config().profiles[2].remote, None);
         assert!(!f.text().contains("remote"));
     }
 
     #[test]
     fn remote_validation() {
-        let f = Fixture::new("remote-validation", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         editor.choose_remote(RemoteKind::Ssh);
@@ -1837,7 +2031,7 @@ theme = "gone"
     /// index sets it.
     #[test]
     fn choice_indexes() {
-        let f = Fixture::new("choices", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "Work");
         // Follow global, the three themes, then the missing `gone`.
@@ -1870,7 +2064,7 @@ theme = "gone"
 
     #[test]
     fn theme_and_font_size_preview() {
-        let f = Fixture::new("preview", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         assert!(state.preview().is_none());
         let editor = edit(&mut state, "Shell");
@@ -1892,10 +2086,10 @@ theme = "gone"
 
     #[test]
     fn rename_the_default() {
-        let f = Fixture::new("rename", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         edit(&mut state, "Work").set_text(Field::Name, "Job");
-        assert!(matches!(state.save(&f.path, &[]).unwrap(), Done::Written));
+        assert_eq!(f.save(&mut state), Ok(true));
         let config = f.config();
         assert_eq!(config.default_profile.as_deref(), Some("Job"));
         assert_eq!(config.profiles[2].name, "Job");
@@ -1907,12 +2101,12 @@ theme = "gone"
 
     #[test]
     fn make_default() {
-        let f = Fixture::new("default", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         let editor = edit(&mut state, "htop");
         assert!(!editor.is_default());
         editor.toggle_default();
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert_eq!(f.config().default_profile.as_deref(), Some("htop"));
         // The default can't be unchecked.
         let editor = edit(&mut state, "htop");
@@ -1922,7 +2116,7 @@ theme = "gone"
 
     #[test]
     fn new_and_duplicate() {
-        let f = Fixture::new("new", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         state.start_new(&themes()).unwrap();
         assert_eq!(state.editor().unwrap().text(Field::Name), "Profile 4");
@@ -1933,7 +2127,7 @@ theme = "gone"
         assert_eq!(editor.text(Field::Name), "Work copy");
         assert!(!editor.is_default());
         assert_eq!(editor.text(Field::Cwd), "~/src");
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert_eq!(names(&state), ["Shell", "htop", "Work", "Work copy"]);
         assert_eq!(state.selected_entry().unwrap().name, "Work copy");
         assert_eq!(f.config().default_profile.as_deref(), Some("work"));
@@ -1944,43 +2138,43 @@ theme = "gone"
 
     #[test]
     fn first_profile_on_an_empty_config() {
-        let f = Fixture::new("empty", "# nothing\n");
+        let mut f = Fixture::new("# nothing\n");
         let mut state = f.state();
         state.start_new(&themes()).unwrap();
         state.editor_mut().unwrap().set_text(Field::Name, "Work");
-        state.save(&f.path, &[]).unwrap();
+        f.save(&mut state).unwrap();
         assert_eq!(names(&state), ["Shell", "Work"]);
     }
 
     #[test]
     fn deleting() {
-        let f = Fixture::new("delete", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         state.select(2);
         state.request_delete().unwrap();
         assert!(state.delete_question().contains("default profile"));
-        state.delete_selected(&f.path, &[]).unwrap();
+        f.delete(&mut state).unwrap();
         assert_eq!(names(&state), ["Shell", "htop"]);
         assert_eq!(f.config().default_profile, None);
         assert!(f.text().starts_with("# test config\n"));
         state.select(0);
         assert_eq!(state.delete_question(), "Delete \"Shell\"?");
-        state.delete_selected(&f.path, &[]).unwrap();
+        f.delete(&mut state).unwrap();
         assert!(state.request_delete().unwrap_err().contains("last profile"));
         assert_eq!(names(&state), ["htop"]);
     }
 
     #[test]
     fn moving() {
-        let f = Fixture::new("move", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         state.select(2);
-        assert!(matches!(state.move_selected(true, &f.path, &[]).unwrap(), Done::Written));
+        assert_eq!(f.move_selected(&mut state, true), Ok(true));
         assert_eq!(names(&state), ["Shell", "Work", "htop"]);
-        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_index(), Some(1));
         assert!(f.text().contains("# my work profile\n[[profiles]]\nname = \"Work\""));
         state.select(0);
-        assert!(matches!(state.move_selected(true, &f.path, &[]).unwrap(), Done::Nothing));
+        assert_eq!(f.move_selected(&mut state, true), Ok(false));
         assert_eq!(f.config().profiles[1].name, "Work");
     }
 
@@ -1988,7 +2182,7 @@ theme = "gone"
     /// delete question they leave the selection alone.
     #[test]
     fn moving_the_selection_wraps_in_the_list_only() {
-        let f = Fixture::new("move-selection", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         assert_eq!(state.selected_entry().unwrap().name, "Work");
         state.move_selection(true);
@@ -2008,7 +2202,7 @@ theme = "gone"
 
     #[test]
     fn the_delete_question_is_in_the_dump() {
-        let f = Fixture::new("delete-dump", CONFIG);
+        let f = Fixture::new(CONFIG);
         let mut state = f.state();
         state.select(1);
         state.request_delete().unwrap();
@@ -2017,14 +2211,143 @@ theme = "gone"
 
     #[test]
     fn file_changed_underneath() {
-        let f = Fixture::new("stale", CONFIG);
+        let mut f = Fixture::new(CONFIG);
         let mut state = f.state();
         edit(&mut state, "Work").set_text(Field::Cwd, "~");
-        std::fs::write(&f.path, CONFIG.replace("name = \"Work\"", "name = \"Other\"")).unwrap();
+        f.text = Some(CONFIG.replace("name = \"Work\"", "name = \"Other\""));
         let before = f.text();
-        let err = state.save(&f.path, &[]).unwrap_err();
+        let err = f.save(&mut state).unwrap_err();
         assert!(err.contains("reopen the Profiles section"), "{err}");
         assert_eq!(f.text(), before);
         assert!(state.editor().is_some());
+    }
+
+    /// Each operation returns the edit to write, with the profile it acts
+    /// on as the list has it, and touches nothing.
+    #[test]
+    fn operations_return_their_edits() {
+        let f = Fixture::new(CONFIG);
+        let mut state = f.state();
+        let work = ProfileRef { index: 2, name: Some("Work".into()) };
+        assert_eq!(state.move_selected(true), Ok(Step::Write(ConfigEdit::MoveProfile { at: work.clone(), up: true })));
+        assert_eq!(state.move_selected(false), Ok(Step::Nothing), "at the end");
+        state.request_delete().unwrap();
+        assert_eq!(
+            state.delete_selected(),
+            Ok(Step::Write(ConfigEdit::DeleteProfile { at: work.clone(), name: "Work".into() }))
+        );
+        assert_eq!(state.list_mode(), ListMode::List);
+        // A rename of the default renames `default_profile` with it.
+        edit(&mut state, "Work").set_text(Field::Name, "Job");
+        let Ok(Step::Write(ConfigEdit::SaveProfile { at, profile, default })) = state.save() else { panic!("a save") };
+        assert_eq!((at, profile.name.as_str()), (Some(work), "Job"));
+        assert_eq!(default, DefaultChange::Rename { old: "Work".into(), new: "Job".into() });
+        state.discard();
+        // Another made the default; a new one is added.
+        edit(&mut state, "htop").toggle_default();
+        let Ok(Step::Write(ConfigEdit::SaveProfile { at, default, .. })) = state.save() else { panic!("a save") };
+        assert_eq!((at, default), (Some(ProfileRef { index: 1, name: Some("htop".into()) }), DefaultChange::Set("htop".into())));
+        state.discard();
+        state.start_new(&themes()).unwrap();
+        let Ok(Step::Write(ConfigEdit::SaveProfile { at, profile, default })) = state.save() else { panic!("a save") };
+        assert_eq!((at, profile.name.as_str(), default), (None, "Profile 4", DefaultChange::Keep));
+        // A profile renamed that isn't the default.
+        state.discard();
+        edit(&mut state, "Shell").set_text(Field::Name, "Main");
+        let Ok(Step::Write(ConfigEdit::SaveProfile { default, .. })) = state.save() else { panic!("a save") };
+        assert_eq!(default, DefaultChange::Rename { old: "Shell".into(), new: "Main".into() });
+        assert_eq!(f.text(), CONFIG);
+    }
+
+    /// A reload keeps the selection by its key wherever the profile moved,
+    /// and a profile that is gone gives way to the one in its place.
+    #[test]
+    fn a_reload_keeps_the_selection_by_key() {
+        let mut f = Fixture::new(CONFIG);
+        let mut state = f.state();
+        assert_eq!(state.selected_entry().unwrap().name, "Work");
+        // Moved to the front, elsewhere; the key matches names in any case.
+        f.text = Some(
+            "default_profile = \"work\"\n[[profiles]]\nname = \"WORK\"\n[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"htop\"\n"
+                .into(),
+        );
+        state.reload(path(), &f.read(), None);
+        assert_eq!((state.selected_index(), state.selected_entry().unwrap().name.as_str()), (Some(0), "WORK"));
+        // Gone: the profile now at its place.
+        f.text = Some("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"htop\"\n".into());
+        state.reload(path(), &f.read(), None);
+        assert_eq!(state.selected_entry().unwrap().name, "Shell");
+        state.select(1);
+        // Gone, and the list shorter than its place: the last.
+        f.text = Some("[[profiles]]\nname = \"Shell\"\n".into());
+        state.reload(path(), &f.read(), None);
+        assert_eq!(state.selected_entry().unwrap().name, "Shell");
+        // A deleted profile's place, after the write.
+        let mut f = Fixture::new(CONFIG);
+        let mut state = f.state();
+        state.select(1);
+        f.delete(&mut state).unwrap();
+        assert_eq!(state.selected_entry().unwrap().name, "Work");
+        // An edit discarded goes back to the profile it was opened on.
+        edit(&mut state, "Shell");
+        f.text = Some(CONFIG.replace("[[profiles]]\nname = \"Shell\"\n", ""));
+        let text = f.read();
+        state.reload(path(), &text, None);
+        state.discard();
+        assert_eq!(state.selected_entry().unwrap().name, "htop", "Shell went: the one in its place");
+    }
+
+    /// The list's rows: name, detail, shortcut digit, selection and the
+    /// default, as the view draws them.
+    #[test]
+    fn rows_mark_the_selection_and_the_default() {
+        let f = Fixture::new(&format!("{CONFIG}[[profiles]]\nfont_size = \"big\"\n"));
+        let mut state = f.state();
+        state.select(1);
+        let rows = state.rows();
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Shell", "htop", "Work", "Profile 4"]);
+        assert_eq!(rows.iter().map(|r| (r.selected, r.default)).collect::<Vec<_>>(), [
+            (false, false),
+            (true, false),
+            (false, true),
+            (false, false)
+        ]);
+        assert_eq!(rows[1].hint.as_deref(), Some("2"));
+        assert_eq!(rows[1].detail, state.entries[1].profile.as_ref().unwrap().description());
+        assert!(!rows[3].readable && !rows[3].detail.is_empty());
+    }
+
+    /// The editor's title, default note and theme labels.
+    #[test]
+    fn the_editors_texts() {
+        let f = Fixture::new(CONFIG);
+        let mut state = f.state();
+        let editor = edit(&mut state, "Work");
+        assert_eq!(editor.title(), "Edit \"Work\"");
+        assert!(editor.default_note().starts_with("New tabs use this profile."));
+        assert_eq!(editor.theme_labels(&themes()), ["follow global", "brindle-dark", "tokyo-night", "mine", "gone (missing)"]);
+        assert_eq!(editor.choice_labels(Field::Theme, &themes()), editor.theme_labels(&themes()));
+        assert_eq!(editor.choice_labels(Field::Remote, &themes()), ["none", "ssh", "container"]);
+        assert!(editor.choice_labels(Field::Cwd, &themes()).is_empty());
+        state.discard();
+        let editor = edit(&mut state, "htop");
+        assert_eq!(editor.default_note(), "Use this profile for new tabs and windows");
+        state.discard();
+        state.start_new(&themes()).unwrap();
+        assert_eq!(state.editor().unwrap().title(), "New profile");
+    }
+
+    /// Which buttons the list and the editor can press.
+    #[test]
+    fn buttons_follow_the_selection_and_the_file() {
+        let f = Fixture::new(&format!("{CONFIG}[[profiles]]\nfont_size = \"big\"\n"));
+        let mut state = f.state();
+        state.select(0);
+        assert!(state.enabled(Btn::Edit) && state.enabled(Btn::Down) && !state.enabled(Btn::Up));
+        state.select(3);
+        assert!(!state.enabled(Btn::Edit) && !state.enabled(Btn::Duplicate), "unreadable");
+        assert!(state.enabled(Btn::Delete) && state.enabled(Btn::Up) && !state.enabled(Btn::Down));
+        let single = Fixture::new("[[profiles]]\nname = \"Only\"\n").state();
+        assert!(!single.enabled(Btn::Delete));
     }
 }
