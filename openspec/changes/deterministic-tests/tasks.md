@@ -176,18 +176,18 @@ Prerequisites: changes 4 (`isolate-test-runs`), 5 (`enforce-platform-seams`) and
 
 Write each planted test first and watch it fail (`testing R13`). Verify each task with `cargo test --locked -p brindle --test architecture`.
 
-- [ ] 6.1 `test_waits_go_through_the_wait_helper`, `every_allowed_sleeper_exists` and `a_sleep_in_a_test_is_found` (design §8). They are written on change 7's matcher, over `remote-agent/tests/**` and `tests/e2e/cases/**`, with `remote-agent/tests/support/wait.rs` the one allowed file. In the same commit:
+- [x] 6.1 `test_waits_go_through_the_wait_helper`, `every_allowed_sleeper_exists` and `a_sleep_in_a_test_is_found` (design §8). They are written on change 7's matcher, over `remote-agent/tests/**` and `tests/e2e/cases/**`, with `remote-agent/tests/support/wait.rs` the one allowed file. In the same commit:
   - `testing-architecture.md`: R7 names `BRINDLE_TEST_SLOW` and `BRINDLE_E2E_SLOW`; R5 gains the unscaled-offset sentence; Enforcement gains the sentence in design §8, and the "No lint keeps `std::thread::sleep` …" bullet is narrowed to `#[cfg(test)]` modules in `src/`;
   - `.claude/rules/tests.md` names both factors and the check under "Enforced by".
 
   Verify also: re-adding `thread::sleep(Duration::from_millis(1));` to any case makes the check fail and name that line (don't commit it).
-- [ ] 6.2 `tests_set_no_process_environment` and `a_set_var_in_a_test_is_found` (design §8). They scan `tests/**`, `remote-agent/tests/**` and the test lines of every crate's `src/`, using change 5's test-item scanner. In the same commit:
+- [x] 6.2 `tests_set_no_process_environment` and `a_set_var_in_a_test_is_found` (design §8). They scan `tests/**`, `remote-agent/tests/**` and the test lines of every crate's `src/`, using change 5's test-item scanner. In the same commit:
   - `ports-and-adapters.md`'s Enforcement names it for R10, and "R4, R6–R11 and R13 rely on review" drops R10;
   - `testing-architecture.md`'s Enforcement adds it under R7.
 
   Verify also: it passes on the tree as change 4 left it, which has no test `set_var`.
-- [ ] 6.3 Change 7's `runner_gaps` requires `"--shard"`, and `a_runner_without_a_self_test_is_found` gains a runner without `--shard`. In the same commit, `testing-architecture.md`'s Enforcement says the runner check covers `--shard`. Verify also: removing `--shard` from perf in a scratch edit makes it fail.
-- [ ] 6.4 `CLAUDE.md`:
+- [x] 6.3 Change 7's `runner_gaps` requires `"--shard"`, and `a_runner_without_a_self_test_is_found` gains a runner without `--shard`. In the same commit, `testing-architecture.md`'s Enforcement says the runner check covers `--shard`. Verify also: removing `--shard` from perf in a scratch edit makes it fail.
+- [x] 6.4 `CLAUDE.md`:
   - the terminal-server "Tests" bullet names `BRINDLE_TEST_SLOW`, `BRINDLE_TEST_REQUIRE` and `target/tmp/skipped.log`;
   - "End-to-end suite" says waits go through `tests/e2e/wait.rs`'s `Scale`;
   - "Performance suite" lists `--shard`;

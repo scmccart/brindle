@@ -11,7 +11,7 @@ You are editing a test harness or its cases. Read `docs/architecture/testing-arc
 - Drive Brindle through its debug hooks (`--send`, `--action`, `--key`, `--wait-for`, `--dump-screen-after`), never synthetic OS input (`testing R2`).
 - Every case is hermetic: its own config, state and server directories, artifacts kept, processes cleaned up; never the user's config, session or server (`testing R4`).
 - Windows on the user's desktop need asking first; headless runs use `scripts/with-xvfb` (`testing R5`).
-- No fixed sleeps or padding: wait for the condition, scaled by `BRINDLE_E2E_SLOW` (`testing R7`).
+- No fixed sleeps or padding: wait for the condition, within a limit scaled by `BRINDLE_TEST_SLOW` (unit and real-process tests) or `BRINDLE_E2E_SLOW` (e2e, through `Scale`). `tests/architecture.rs` rejects `std::thread::sleep` in `remote-agent/tests/**` outside `support/wait.rs` and in `tests/e2e/cases/**`, and any process-wide `set_var` in a test (`testing R7`, `ports R10`).
 - Assert the rule, not a count that depends on timing; expected colours come from the `e2e` theme (`testing R6`, `R8`).
 - A flake is fixed at its cause, with failures over N runs before and after. No retry, skip or longer wait on passing runs (`testing R9`, `R10`).
 - A GUI check is a named case in `tests/e2e/cases/`, never a one-off script (`testing R13`). The perf suite reports numbers and never fails (`testing R14`).
@@ -21,4 +21,4 @@ You are editing a test harness or its cases. Read `docs/architecture/testing-arc
 
 If a rule can only be reached through an e2e case, it probably lives in a view; move it into a pure function or model and unit-test it there (`testing R1`).
 
-Enforced by: the harness (stale or missing helper, leftover roles), both `--self-test`s in CI, and `the_opt_in_suites_are_harness_false_targets` and `each_opt_in_runner_has_its_variable_list_and_self_test` (each runner names its variable, `--list` and `--self-test`) in `tests/architecture.rs`.
+Enforced by: the harness (stale or missing helper, leftover roles), both `--self-test`s in CI, and in `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets`, `each_opt_in_runner_has_its_variable_list_and_self_test` (each runner names its variable, `--list`, `--self-test` and `--shard`), `test_waits_go_through_the_wait_helper` and `tests_set_no_process_environment`.
