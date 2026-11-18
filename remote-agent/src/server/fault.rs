@@ -11,6 +11,20 @@
 use std::any::Any;
 use std::sync::OnceLock;
 
+/// The holder's switch: `inject_fault` in `holder.rs` panics on bytes
+/// holding its marker.
+pub const HOLDER_PANIC: &str = "BRINDLE_TEST_HOLDER_PANIC";
+/// The core's switch: `inject_fault` in `core/screen.rs` panics on output
+/// holding its marker.
+pub const FEED_PANIC: &str = "BRINDLE_TEST_FEED_PANIC";
+
+/// The switches this build honours, as `--list-fault-switches` prints
+/// them: both in a debug build, none in a release build, which never reads
+/// them (`process R20`).
+pub fn honoured() -> &'static [&'static str] {
+    if cfg!(debug_assertions) { &[HOLDER_PANIC, FEED_PANIC] } else { &[] }
+}
+
 /// What a caught panic said: its message, or "no message".
 pub fn describe(payload: &(dyn Any + Send)) -> String {
     payload
@@ -46,6 +60,15 @@ pub fn holds(bytes: &[u8], marker: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_helper_lists_its_switches_only_in_debug_builds() {
+        if cfg!(debug_assertions) {
+            assert_eq!(honoured(), ["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC"]);
+        } else {
+            assert!(honoured().is_empty(), "{:?}", honoured());
+        }
+    }
 
     #[test]
     fn a_panics_text_is_its_message() {

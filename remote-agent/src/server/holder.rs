@@ -1402,10 +1402,10 @@ fn name_of(message: &ToHolder) -> &'static str {
 /// marker: a fault the tests inject.
 fn inject_fault(bytes: &[u8]) {
     static MARKER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    if let Some(marker) = fault::marker("BRINDLE_TEST_HOLDER_PANIC", &MARKER)
+    if let Some(marker) = fault::marker(fault::HOLDER_PANIC, &MARKER)
         && fault::holds(bytes, marker)
     {
-        panic!("BRINDLE_TEST_HOLDER_PANIC matched");
+        panic!("{} matched", fault::HOLDER_PANIC);
     }
 }
 

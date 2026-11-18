@@ -18,7 +18,7 @@ use brindle_remote_protocol::{Frame, RequestId};
 
 use super::platform::conn::Stream;
 use super::platform::listen;
-use super::{check, dir};
+use super::{check, dir, fault};
 
 /// How long a command waits for the core's answer. `stop` waits for every
 /// session to end, which includes the holders' hang-up grace period.
@@ -37,6 +37,7 @@ usage: brindle-remote <command>
   kill ID | kill --all              hang up one session, or all of them
   status [--json]                   the core and its holders
   stop                              hang up every session and stop the server
+  --list-fault-switches             print the BRINDLE_TEST_* fault switches this build honours (none in a release build)
 The server directory is $BRINDLE_SERVER_DIR, else $XDG_RUNTIME_DIR/brindle,
 else ~/.cache/brindle/run.";
 
@@ -53,6 +54,7 @@ usage: brindle-remote <command>
   kill ID | kill --all              hang up one session, or all of them
   status [--json]                   the core and its holders
   stop                              hang up every session and stop the server
+  --list-fault-switches             print the BRINDLE_TEST_* fault switches this build honours (none in a release build)
 The server directory is %BRINDLE_SERVER_DIR%, else %LOCALAPPDATA%\\brindle\\run
 (run-elevated for an elevated process).";
 
@@ -64,8 +66,17 @@ pub fn run(command: &str, args: &[String]) -> Option<Result<(), String>> {
         "kill" => kill(args),
         "status" => json_flag("status", args).and_then(status),
         "stop" => no_args("stop", args).and_then(|()| stop()),
+        "--list-fault-switches" => no_args("--list-fault-switches", args).map(|()| list_fault_switches()),
         _ => return None,
     })
+}
+
+/// `--list-fault-switches`: the `BRINDLE_TEST_*` switches this build honours,
+/// one per line. It never connects to a core.
+fn list_fault_switches() {
+    for name in fault::honoured() {
+        println!("{name}");
+    }
 }
 
 fn no_args(command: &str, args: &[String]) -> Result<(), String> {

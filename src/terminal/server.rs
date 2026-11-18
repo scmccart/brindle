@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 
 use super::shell_integration::{Marks, Parser};
 use super::tab_note::{self, NoteGate};
+#[cfg(debug_assertions)]
+use super::SINK_PANIC;
 use super::{ChannelEvent, GridSize, Listener};
 use alacritty_terminal::grid::Dimensions as _;
 use crate::notify::osc::Scanner;
@@ -194,12 +196,12 @@ impl SessionSink for Sink {
 fn inject_fault(bytes: &[u8]) {
     static MARKER: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     let marker = MARKER.get_or_init(|| {
-        std::env::var_os("BRINDLE_TEST_SINK_PANIC").filter(|value| !value.is_empty()).map(|value| value.into_encoded_bytes())
+        std::env::var_os(SINK_PANIC).filter(|value| !value.is_empty()).map(|value| value.into_encoded_bytes())
     });
     if let Some(marker) = marker
         && bytes.windows(marker.len()).any(|window| window == marker.as_slice())
     {
-        panic!("BRINDLE_TEST_SINK_PANIC: the output held its marker");
+        panic!("{SINK_PANIC}: the output held its marker");
     }
 }
 

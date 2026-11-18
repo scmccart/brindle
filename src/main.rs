@@ -101,6 +101,8 @@ DEBUGGING:
                                  Steps run in order, 1s apart
         --step-interval <S>      Run the steps S seconds apart instead (default 1)
         --dump-screen-after <S>  Print the active tab's screen after S seconds and exit
+        --list-fault-switches    Print the BRINDLE_TEST_* fault switches this build
+                                 honours (none in a release build) and exit
         --latency-log <FILE>     Time each keystroke (key to output, paint and next
                                  frame), append them to FILE as JSON lines, and
                                  print a summary on exit
@@ -299,6 +301,13 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
             "--list-actions" => {
                 console_output();
                 for name in actions::action_names() {
+                    println!("{name}");
+                }
+                std::process::exit(0);
+            }
+            "--list-fault-switches" => {
+                console_output();
+                for name in fault_switches() {
                     println!("{name}");
                 }
                 std::process::exit(0);
@@ -722,6 +731,17 @@ fn startup_launch(
     }
 }
 
+/// The launch listing's fault switch, which [`launch_listing`] reads and
+/// [`fault_switches`] lists.
+const LAUNCH_LISTING: &str = "BRINDLE_TEST_LAUNCH_LISTING";
+
+/// The fault switches (`process R20`) this build honours, as
+/// `--list-fault-switches` prints them: both in a debug build, none in a
+/// release build, which never reads them.
+fn fault_switches() -> &'static [&'static str] {
+    if cfg!(debug_assertions) { &[terminal::SINK_PANIC, LAUNCH_LISTING] } else { &[] }
+}
+
 /// `BRINDLE_TEST_LAUNCH_LISTING` (debug builds only, `process R20`): what
 /// the e2e cases make the launch's listing do.
 #[cfg(debug_assertions)]
@@ -792,11 +812,11 @@ fn read_launch(restore_from: Option<&Path>, attach: bool) -> LaunchReads {
 /// in debug builds.
 fn launch_listing() -> Listing {
     #[cfg(debug_assertions)]
-    match test_listing(std::env::var("BRINDLE_TEST_LAUNCH_LISTING").ok().as_deref()) {
+    match test_listing(std::env::var(LAUNCH_LISTING).ok().as_deref()) {
         Some(TestListing::Fail) => {
-            let why = "BRINDLE_TEST_LAUNCH_LISTING=fail";
+            let why = format!("{LAUNCH_LISTING}=fail");
             log::warn!("not attaching detached sessions: {why}");
-            return Listing::Failed(why.into());
+            return Listing::Failed(why);
         }
         // The fault injector's delay, not a wait for a condition.
         Some(TestListing::Delay(delay)) => std::thread::sleep(delay),
@@ -1711,6 +1731,17 @@ mod tests {
         let recorded = window(vec![tab(1, "a")]);
         let (detached, first, then) = startup(&failed, Some(recorded.clone()), true, Some(7), None);
         assert_eq!((detached.is_empty(), first, then), (true, Opens::Restore(recorded), Some(Opens::Attach(7, Err(why.into())))));
+    }
+
+    #[test]
+    fn fault_switches_are_listed_only_in_debug_builds() {
+        let listed = fault_switches();
+        if cfg!(debug_assertions) {
+            assert_eq!(listed, ["BRINDLE_TEST_SINK_PANIC", "BRINDLE_TEST_LAUNCH_LISTING"]);
+        } else {
+            assert!(listed.is_empty(), "{listed:?}");
+        }
+        assert!(listed.iter().all(|name| name.starts_with("BRINDLE_TEST_")));
     }
 
     #[cfg(debug_assertions)]
