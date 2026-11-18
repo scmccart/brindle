@@ -7,7 +7,12 @@
 //! `config_edit`.
 //!
 //! [`Model`] holds the state and all the logic and has no GPUI dependency,
-//! so it is unit-tested; [`SettingsDialog`] is the view around it.
+//! so it is unit-tested. Each section is a model of its own
+//! ([`ThemesState`], [`ProfilesState`], [`FontsState`]), and none of them
+//! touches the file: they are given its text, and answer an operation with
+//! a [`Step`], which may be a [`ConfigEdit`] to write. [`SettingsDialog`]
+//! is the view around the model: it reads the file, writes the edits and
+//! reports each write back with [`Model::written`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,16 +32,18 @@ use brindle_ui::{
 use crate::actions::{
     SettingsConfirm, SettingsDelete, SettingsDown, SettingsEdit, SettingsFirst, SettingsLast, SettingsNew, SettingsUp,
 };
-use crate::config_edit;
-use crate::theme::{BUILTIN_THEMES, Color, Theme, builtin_theme};
+use crate::config_edit::{self, Applied, ConfigEdit, FileText};
+use crate::theme::{Color, Theme};
 
 mod fonts;
 mod profiles;
+mod themes;
 
 use crate::config::{FontConfig, Profile, UiFontConfig};
 use crate::settings::FontPreview;
 use fonts::FontsState;
 use profiles::ProfilesState;
+use themes::{Editor, FieldId, SLOTS, ThemesState};
 
 /// The dialog's sections, in the order they are listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,249 +67,43 @@ impl Section {
 
 // ---- model ------------------------------------------------------------------
 
-/// A theme in the list.
-#[derive(Clone, Debug)]
-pub struct ThemeEntry {
-    pub name: String,
-    pub custom: bool,
-    /// A custom theme that can't be read carries its error.
-    pub theme: Result<Theme, String>,
+/// What a section with a list shows: the list, an editor, or the delete
+/// confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListMode {
+    List,
+    Editor,
+    ConfirmDelete,
 }
 
-/// The Theme section's list: every built-in theme, then the file's custom
-/// themes in name order. When the file (`path`, read as `read`) can't be
-/// read as themes, the custom themes are the `fallback` (the config in
-/// effect's), and the message says why: it names the file and the cause.
-fn theme_entries(
-    path: &Path,
-    read: Result<toml_edit::DocumentMut, String>,
-    fallback: &BTreeMap<String, Theme>,
-) -> (Vec<ThemeEntry>, Option<String>) {
-    let (customs, note) = match read.and_then(|doc| config_edit::custom_themes(&doc).map_err(|shape| shape.describe(path))) {
-        Ok(customs) => (customs, None),
-        Err(note) => (fallback.iter().map(|(name, theme)| (name.clone(), Ok(theme.clone()))).collect(), Some(note)),
-    };
-    let entries = BUILTIN_THEMES
-        .iter()
-        .map(|name| ThemeEntry { name: name.to_string(), custom: false, theme: Ok(builtin_theme(name).unwrap()) })
-        .chain(customs.into_iter().map(|(name, theme)| ThemeEntry { name, custom: true, theme }))
-        .collect();
-    (entries, note)
+/// What the dialog shows: a section, and its list's mode for the two that
+/// have one. The Fonts section is a form, always.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Profiles(ListMode),
+    Theme(ListMode),
+    Fonts,
 }
 
-/// A color a theme editor field edits.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Slot {
-    Foreground,
-    Background,
-    Cursor,
-    CursorText,
-    SelectionBackground,
-    SelectionForeground,
-    Accent,
-    SearchMatchBackground,
-    SearchMatchForeground,
-    SearchFocusedBackground,
-    SearchFocusedForeground,
-    Ansi(usize),
-}
-
-const ANSI_NAMES: [&str; 16] = [
-    "Black",
-    "Red",
-    "Green",
-    "Yellow",
-    "Blue",
-    "Magenta",
-    "Cyan",
-    "White",
-    "Bright black",
-    "Bright red",
-    "Bright green",
-    "Bright yellow",
-    "Bright blue",
-    "Bright magenta",
-    "Bright cyan",
-    "Bright white",
-];
-
-const SLOTS: [Slot; 27] = [
-    Slot::Foreground,
-    Slot::Background,
-    Slot::Cursor,
-    Slot::CursorText,
-    Slot::SelectionBackground,
-    Slot::SelectionForeground,
-    Slot::Accent,
-    Slot::SearchMatchBackground,
-    Slot::SearchMatchForeground,
-    Slot::SearchFocusedBackground,
-    Slot::SearchFocusedForeground,
-    Slot::Ansi(0),
-    Slot::Ansi(1),
-    Slot::Ansi(2),
-    Slot::Ansi(3),
-    Slot::Ansi(4),
-    Slot::Ansi(5),
-    Slot::Ansi(6),
-    Slot::Ansi(7),
-    Slot::Ansi(8),
-    Slot::Ansi(9),
-    Slot::Ansi(10),
-    Slot::Ansi(11),
-    Slot::Ansi(12),
-    Slot::Ansi(13),
-    Slot::Ansi(14),
-    Slot::Ansi(15),
-];
-
-impl Slot {
-    fn label(self) -> &'static str {
+impl View {
+    pub fn section(self) -> Section {
         match self {
-            Slot::Foreground => "Foreground",
-            Slot::Background => "Background",
-            Slot::Cursor => "Cursor",
-            Slot::CursorText => "Cursor text",
-            Slot::SelectionBackground => "Selection background",
-            Slot::SelectionForeground => "Selection foreground",
-            Slot::Accent => "Accent",
-            Slot::SearchMatchBackground => "Search match",
-            Slot::SearchMatchForeground => "Search match text",
-            Slot::SearchFocusedBackground => "Current match",
-            Slot::SearchFocusedForeground => "Current match text",
-            Slot::Ansi(i) => ANSI_NAMES[i],
+            View::Profiles(_) => Section::Profiles,
+            View::Theme(_) => Section::Theme,
+            View::Fonts => Section::Fonts,
         }
     }
 
-    /// Only the selection foreground may be left empty ("keep each cell's
-    /// own color"); see design decision 4.
-    fn optional(self) -> bool {
-        self == Slot::SelectionForeground
-    }
-
-    fn get(self, theme: &Theme) -> Option<Color> {
+    pub fn kind(self) -> ModeKind {
         match self {
-            Slot::Foreground => Some(theme.foreground),
-            Slot::Background => Some(theme.background),
-            Slot::Cursor => Some(theme.cursor),
-            Slot::CursorText => theme.cursor_text,
-            Slot::SelectionBackground => Some(theme.selection_background),
-            Slot::SelectionForeground => theme.selection_foreground,
-            Slot::Accent => theme.accent,
-            Slot::SearchMatchBackground => theme.search_match_background,
-            Slot::SearchMatchForeground => theme.search_match_foreground,
-            Slot::SearchFocusedBackground => theme.search_focused_match_background,
-            Slot::SearchFocusedForeground => theme.search_focused_match_foreground,
-            Slot::Ansi(i) => Some(theme.ansi[i]),
+            View::Profiles(mode) | View::Theme(mode) => match mode {
+                ListMode::List => ModeKind::List,
+                ListMode::Editor => ModeKind::Editor,
+                ListMode::ConfirmDelete => ModeKind::ConfirmDelete,
+            },
+            View::Fonts => ModeKind::Form,
         }
     }
-
-    fn set(self, theme: &mut Theme, color: Option<Color>) {
-        match (self, color) {
-            (Slot::SelectionForeground, c) => theme.selection_foreground = c,
-            (_, None) => {}
-            (Slot::Foreground, Some(c)) => theme.foreground = c,
-            (Slot::Background, Some(c)) => theme.background = c,
-            (Slot::Cursor, Some(c)) => theme.cursor = c,
-            (Slot::CursorText, Some(c)) => theme.cursor_text = Some(c),
-            (Slot::SelectionBackground, Some(c)) => theme.selection_background = c,
-            (Slot::Accent, Some(c)) => theme.accent = Some(c),
-            (Slot::SearchMatchBackground, Some(c)) => theme.search_match_background = Some(c),
-            (Slot::SearchMatchForeground, Some(c)) => theme.search_match_foreground = Some(c),
-            (Slot::SearchFocusedBackground, Some(c)) => theme.search_focused_match_background = Some(c),
-            (Slot::SearchFocusedForeground, Some(c)) => theme.search_focused_match_foreground = Some(c),
-            (Slot::Ansi(i), Some(c)) => theme.ansi[i] = c,
-        }
-    }
-}
-
-/// The custom-theme editor.
-#[derive(Clone, Debug)]
-struct Editor {
-    /// The saved custom theme being edited; `None` for a new one.
-    original: Option<String>,
-    /// List selection to go back to on discard.
-    return_to: usize,
-    name: String,
-    /// One field per [`SLOTS`] entry.
-    colors: Vec<String>,
-    /// The theme as of the last valid edit of every field.
-    current: Theme,
-    /// The fields as the editor opened, to tell unsaved edits.
-    initial: Vec<String>,
-}
-
-const FIELD_COUNT: usize = 1 + SLOTS.len();
-
-impl Editor {
-    fn new(original: Option<String>, name: String, theme: &Theme, return_to: usize) -> Self {
-        let current = theme.with_effective_colors();
-        let colors: Vec<String> = SLOTS
-            .iter()
-            .map(|slot| slot.get(&current).map(|c| c.to_string()).unwrap_or_default())
-            .collect();
-        let initial = std::iter::once(name.clone()).chain(colors.iter().cloned()).collect();
-        Self { original, return_to, name, colors, current, initial }
-    }
-
-    /// Parses color field `ix`: `Ok(None)` is a cleared optional color.
-    fn parse_color(&self, ix: usize) -> Result<Option<Color>, &'static str> {
-        let text = self.colors[ix].trim();
-        if text.is_empty() && SLOTS[ix].optional() {
-            return Ok(None);
-        }
-        Color::parse(text).map(Some).ok_or("use #rrggbb or #rgb")
-    }
-
-    fn invalid_colors(&self) -> Vec<usize> {
-        (0..SLOTS.len()).filter(|&ix| self.parse_color(ix).is_err()).collect()
-    }
-
-    fn name_result(&self, others: &[&str]) -> Result<String, String> {
-        config_edit::validate_theme_name(&self.name, others.iter().copied())
-    }
-
-    /// Sets field `field` (0 is the name) and updates the preview theme if
-    /// it now holds a valid color.
-    fn set_field(&mut self, field: usize, text: &str) {
-        match field {
-            0 => self.name = text.to_string(),
-            n if n < FIELD_COUNT => {
-                let ix = n - 1;
-                self.colors[ix] = text.to_string();
-                if let Ok(color) = self.parse_color(ix) {
-                    SLOTS[ix].set(&mut self.current, color);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn dirty(&self) -> bool {
-        (0..FIELD_COUNT).any(|field| self.field(field) != self.initial[field])
-    }
-
-    fn field(&self, field: usize) -> &str {
-        match field {
-            0 => &self.name,
-            n => &self.colors[n - 1],
-        }
-    }
-
-}
-
-/// A theme editor field's name in the `--dump-screen-after` line: `name`
-/// for field 0, else its color's label.
-fn field_label(field: usize) -> &'static str {
-    match field {
-        0 => "name",
-        n => SLOTS.get(n - 1).map_or("", |slot| slot.label()),
-    }
-}
-
-/// The selection foreground's field (its color slot plus one for the name).
-fn selection_foreground_field() -> usize {
-    SLOTS.iter().position(|s| *s == Slot::SelectionForeground).unwrap() + 1
 }
 
 /// What kind of view a section shows: its list, an editor, the delete
@@ -317,15 +118,55 @@ pub enum ModeKind {
     Form,
 }
 
-#[derive(Clone, Debug)]
-enum Mode {
-    List,
-    Editor(Editor),
-    /// Asking whether to delete the selected custom theme.
-    ConfirmDelete,
+/// What the view does after an operation.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "returned and taken at once by the view, never stored; boxing the edit adds an indirection for nothing"
+)]
+pub enum Step {
+    /// Show the model as it is now.
+    Nothing,
+    /// Write this edit to the config file, then report it with
+    /// [`Model::written`].
+    Write(ConfigEdit),
+    /// Close the dialog.
+    Close,
 }
 
-/// What the view should tell the workspace after an operation.
+/// A section's answer to an operation, which [`Model`] takes as its step
+/// and its error line.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant, reason = "a step on its way to the view, as `Step` is")]
+pub enum Reply {
+    /// Nothing happened: the error line stays as it is.
+    Quiet,
+    /// Done, or this step to take: the error line clears.
+    Done(Step),
+    /// Refused, saying why in the error line.
+    Refused(String),
+}
+
+impl From<Result<Step, String>> for Reply {
+    fn from(result: Result<Step, String>) -> Self {
+        match result {
+            Ok(step) => Reply::Done(step),
+            Err(e) => Reply::Refused(e),
+        }
+    }
+}
+
+/// What a list key (or button) asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListOp {
+    New,
+    Edit,
+    /// Profiles only.
+    Duplicate,
+    Delete,
+}
+
+/// What the view should tell the workspace after a write.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Nothing,
@@ -333,137 +174,122 @@ pub enum Outcome {
     Written,
     /// The config file changed and the dialog is done.
     Applied,
-    /// Nothing was written and the dialog is done (an Apply with nothing
-    /// changed).
-    Close,
+}
+
+/// Where focus goes after the model changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusMove {
+    Stay,
+    /// To the view's first control.
+    Default,
+}
+
+/// What the view finds about focus when the model changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FocusFacts {
+    /// A select's menu or a family list is open; it holds focus while it is.
+    pub menu_open: bool,
+    /// The section list has focus.
+    pub on_sections: bool,
+    /// Focus is on the dialog or one of the view's stops.
+    pub valid: bool,
+}
+
+/// Where focus goes when the dialog shows `view`, focus having last been
+/// placed for `placed_for`: to the new view's first control when the view
+/// changed, and off a control the view no longer shows (or shows
+/// disabled). An open menu keeps it while the view is the same, and so
+/// does the section list while the sections change under it (by key or
+/// click: the user is still choosing one), though a view that opens in the
+/// same section (an editor, by a list key) takes focus as usual.
+pub fn focus_target(placed_for: View, view: View, facts: FocusFacts) -> FocusMove {
+    let moved = view != placed_for;
+    if !moved && facts.menu_open {
+        return FocusMove::Stay;
+    }
+    let section_changed = view.section() != placed_for.section();
+    if facts.on_sections && (section_changed || !moved) {
+        return FocusMove::Stay;
+    }
+    if moved || !facts.valid { FocusMove::Default } else { FocusMove::Stay }
 }
 
 pub struct Model {
+    /// The config file, which messages name.
     config_path: PathBuf,
-    entries: Vec<ThemeEntry>,
-    /// The global theme's name when the dialog opened.
-    active: String,
-    selected: usize,
-    mode: Mode,
+    section: Section,
+    themes: ThemesState,
+    profiles: ProfilesState,
+    fonts: FontsState,
     /// The last failure to show (save errors, refused deletes).
     error: Option<String>,
-    /// Why the file's themes couldn't be read, when they couldn't: the
-    /// Theme section's error line says it whenever it has nothing newer.
-    themes_note: Option<String>,
-    /// Custom themes to list when the file can't be parsed.
-    fallback: BTreeMap<String, Theme>,
-    section: Section,
-    profiles: ProfilesState,
-    /// Profiles to list (read-only) when the file can't be parsed.
-    fallback_profiles: Vec<Profile>,
-    fonts: FontsState,
-    /// The fonts to show (read-only) when the file can't be parsed.
-    fallback_fonts: (FontConfig, UiFontConfig),
 }
 
 impl Model {
+    /// The dialog's model, from the config file at `config_path` as it
+    /// reads (`text`). The `fallback`s are the config in effect's, shown
+    /// read-only when the file can't be read; `active` is its global theme.
     pub fn new(
         config_path: PathBuf,
+        text: &FileText,
         active: String,
         fallback: BTreeMap<String, Theme>,
         fallback_profiles: Vec<Profile>,
         fallback_default: Option<String>,
     ) -> Self {
-        let profiles = ProfilesState::new(&config_path, &fallback_profiles, fallback_default);
-        let fallback_fonts = (FontConfig::default(), UiFontConfig::default());
-        let fonts = FontsState::new(&config_path, &fallback_fonts, Vec::new());
-        let mut model = Self {
-            config_path,
-            entries: Vec::new(),
-            active,
-            selected: 0,
-            mode: Mode::List,
-            error: None,
-            themes_note: None,
-            fallback,
-            section: Section::Profiles,
-            profiles,
-            fallback_profiles,
-            fonts,
-            fallback_fonts,
-        };
-        model.reload_entries();
-        let active = model.active.clone();
-        model.selected = model.selectable_index(&active).or_else(|| model.selectable_index("brindle-dark")).unwrap_or(0);
-        model
+        let themes = ThemesState::new(&config_path, text, active, fallback);
+        let profiles = ProfilesState::new(&config_path, text, fallback_profiles, fallback_default);
+        let fonts = FontsState::new(text, (FontConfig::default(), UiFontConfig::default()), Vec::new());
+        Self { config_path, section: Section::Profiles, themes, profiles, fonts, error: None }
     }
 
-    /// The Fonts section's fonts: `fallback`, the loaded config's, shown
-    /// read-only when the file can't be parsed, and the `installed`
-    /// families (GPUI's names), which decide what a family field shows and
-    /// lists.
-    pub fn with_fonts(mut self, fallback: (FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
-        self.fonts = FontsState::new(&self.config_path, &fallback, installed);
-        self.fallback_fonts = fallback;
+    /// The Fonts section's fonts, from `text`: `fallback`, the loaded
+    /// config's, shown read-only when the file can't be parsed, and the
+    /// `installed` families (GPUI's names), which decide what a family
+    /// field shows and lists.
+    pub fn with_fonts(mut self, text: &FileText, fallback: (FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
+        self.fonts = FontsState::new(text, fallback, installed);
         self
     }
 
-    /// Rereads the custom themes from the config file. When it can't be
-    /// read as themes, the Theme section says why (`themes_note`), in its
-    /// error line, and lists the themes of the config in effect.
-    fn reload_entries(&mut self) {
-        let read = config_edit::read_document(&self.config_path);
-        let (entries, note) = theme_entries(&self.config_path, read, &self.fallback);
-        self.entries = entries;
-        self.themes_note = note;
-        if self.section == Section::Theme {
-            self.error = self.themes_note.clone();
+    /// The config file the dialog edits.
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// Takes a section's reply: the step it asks for, with the error line
+    /// cleared, set or left as it is.
+    fn reply(&mut self, reply: Reply) -> Step {
+        match reply {
+            Reply::Quiet => Step::Nothing,
+            Reply::Done(step) => {
+                self.error = None;
+                step
+            }
+            Reply::Refused(e) => {
+                self.error = Some(e);
+                Step::Nothing
+            }
         }
-    }
-
-    /// The index of the readable entry `name` (custom themes shadow
-    /// built-ins of the same name, as in the config).
-    fn selectable_index(&self, name: &str) -> Option<usize> {
-        let matches = |e: &ThemeEntry| e.name == name && e.theme.is_ok();
-        self.entries.iter().rposition(matches)
-    }
-
-    fn custom_names(&self) -> Vec<&str> {
-        self.entries.iter().filter(|e| e.custom).map(|e| e.name.as_str()).collect()
-    }
-
-    pub fn selected_entry(&self) -> Option<&ThemeEntry> {
-        self.entries.get(self.selected)
     }
 
     /// The theme the tabs should show right now.
     pub fn preview(&self) -> Option<Theme> {
-        match &self.mode {
-            Mode::Editor(editor) => Some(editor.current.clone()),
-            Mode::List | Mode::ConfirmDelete => self.selected_entry()?.theme.as_ref().ok().cloned(),
-        }
+        self.themes.preview()
     }
 
     pub fn move_selection(&mut self, forward: bool) {
-        if self.section == Section::Fonts {
+        match self.section {
             // The form's fields are focus stops: the view moves focus.
-            return;
-        }
-        if self.section == Section::Profiles {
-            self.profiles.move_selection(forward);
-            self.error = None;
-            return;
-        }
-        match &mut self.mode {
-            Mode::List => {
-                let count = self.entries.len();
-                let mut ix = self.selected;
-                for _ in 0..count {
-                    ix = if forward { (ix + 1) % count } else { (ix + count - 1) % count };
-                    if self.entries[ix].theme.is_ok() {
-                        self.selected = ix;
-                        self.error = None;
-                        return;
-                    }
-                }
+            Section::Fonts => {}
+            Section::Profiles => {
+                self.profiles.move_selection(forward);
+                self.error = None;
             }
-            // The editor's fields are focus stops: the view moves focus.
-            Mode::Editor(_) | Mode::ConfirmDelete => {}
+            Section::Theme => {
+                let reply = self.themes.move_selection(forward);
+                self.reply(reply);
+            }
         }
     }
 
@@ -472,339 +298,162 @@ impl Model {
     pub fn select_edge(&mut self, last: bool) {
         match self.section {
             Section::Profiles => {
-                if let Some(ix) = if last { self.profiles.entries.len().checked_sub(1) } else { Some(0) } {
+                if let Some(ix) = self.profiles.edge(last) {
                     self.profiles.select(ix);
                     self.error = None;
                 }
             }
             Section::Theme => {
-                let readable = |ix: &usize| self.entries[*ix].theme.is_ok();
-                let mut ixs = 0..self.entries.len();
-                let found = if last { ixs.rfind(readable) } else { ixs.find(readable) };
-                if let Some(ix) = found {
-                    self.select(ix);
-                }
+                let reply = self.themes.select_edge(last);
+                self.reply(reply);
             }
             Section::Fonts => {}
         }
     }
 
     pub fn select(&mut self, ix: usize) {
-        if self.section == Section::Fonts {
-            return;
-        }
-        if self.section == Section::Profiles {
-            self.profiles.select(ix);
-            self.error = None;
-            return;
-        }
-        if matches!(self.mode, Mode::List) && self.entries.get(ix).is_some_and(|e| e.theme.is_ok()) {
-            self.selected = ix;
-            self.error = None;
-        }
-    }
-
-    fn save(&mut self, edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>) -> Result<(), ()> {
-        match config_edit::save(&self.config_path, edit) {
-            Ok(()) => {
-                self.error = None;
-                Ok(())
-            }
-            Err(e) => {
-                self.error = Some(e);
-                Err(())
-            }
-        }
-    }
-
-    /// Enter: apply in the list, save in the editor, delete when confirming,
-    /// apply the Fonts form.
-    pub fn confirm(&mut self) -> Outcome {
-        if self.section == Section::Fonts {
-            return match self.fonts.apply(&self.config_path) {
-                Ok(fonts::Done::Written) => {
-                    self.error = None;
-                    Outcome::Applied
-                }
-                Ok(fonts::Done::Nothing) => {
-                    self.error = None;
-                    Outcome::Close
-                }
-                Err(e) => {
-                    self.error = Some(e);
-                    Outcome::Nothing
-                }
-            };
-        }
-        if self.section == Section::Profiles {
-            let result = match &self.profiles.mode {
-                profiles::Mode::List => {
-                    let themes = self.theme_names();
-                    self.profiles.start_edit(&themes).map(|()| profiles::Done::Nothing)
-                }
-                profiles::Mode::Editor(_) => self.profiles.save(&self.config_path, &self.fallback_profiles),
-                profiles::Mode::ConfirmDelete => self.profiles.delete_selected(&self.config_path, &self.fallback_profiles),
-            };
-            return self.profiles_done(result);
-        }
-        match &self.mode {
-            Mode::List => self.apply(),
-            Mode::Editor(_) => self.save_editor(),
-            Mode::ConfirmDelete => self.delete_selected(),
-        }
-    }
-
-    /// Escape: `true` when the whole dialog should close (cancel).
-    pub fn cancel(&mut self) -> bool {
-        if self.section == Section::Fonts {
-            return true;
-        }
-        if self.section == Section::Profiles {
-            self.error = None;
-            return match self.profiles.mode {
-                profiles::Mode::List => true,
-                profiles::Mode::Editor(_) => {
-                    self.profiles.discard();
-                    false
-                }
-                profiles::Mode::ConfirmDelete => {
-                    self.profiles.mode = profiles::Mode::List;
-                    false
-                }
-            };
-        }
-        match std::mem::replace(&mut self.mode, Mode::List) {
-            Mode::List => true,
-            Mode::Editor(editor) => {
-                self.selected = editor.return_to;
-                self.error = None;
-                false
-            }
-            Mode::ConfirmDelete => false,
-        }
-    }
-
-    fn apply(&mut self) -> Outcome {
-        let Some(entry) = self.selected_entry().filter(|e| e.theme.is_ok()) else { return Outcome::Nothing };
-        let name = entry.name.clone();
-        match self.save(|doc| {
-            config_edit::set_global_theme(doc, &name);
-            Ok(())
-        }) {
-            Ok(()) => Outcome::Applied,
-            Err(()) => Outcome::Nothing,
-        }
-    }
-
-    /// New: a copy of the selected theme under an unused name.
-    pub fn start_new(&mut self) {
-        if self.section == Section::Fonts {
-            return;
-        }
-        if self.section == Section::Profiles {
-            if matches!(self.profiles.mode, profiles::Mode::List) {
-                let themes = self.theme_names();
-                let result = self.profiles.start_new(&themes).map(|()| profiles::Done::Nothing);
-                self.profiles_done(result);
-            }
-            return;
-        }
-        if !matches!(self.mode, Mode::List) {
-            return;
-        }
-        let Some(ThemeEntry { name, theme: Ok(theme), .. }) = self.selected_entry().cloned() else { return };
-        let name = config_edit::unused_name(&name, self.custom_names());
-        self.mode = Mode::Editor(Editor::new(None, name, &theme, self.selected));
-        self.error = None;
-    }
-
-    /// Edit: a custom theme in place; a built-in is copied first.
-    pub fn start_edit(&mut self) {
-        if self.section == Section::Fonts {
-            return;
-        }
-        if self.section == Section::Profiles {
-            if matches!(self.profiles.mode, profiles::Mode::List) {
-                let themes = self.theme_names();
-                let result = self.profiles.start_edit(&themes).map(|()| profiles::Done::Nothing);
-                self.profiles_done(result);
-            }
-            return;
-        }
-        if !matches!(self.mode, Mode::List) {
-            return;
-        }
-        match self.selected_entry().cloned() {
-            Some(ThemeEntry { name, custom: true, theme: Ok(theme) }) => {
-                self.mode = Mode::Editor(Editor::new(Some(name.clone()), name, &theme, self.selected));
+        match self.section {
+            Section::Fonts => {}
+            Section::Profiles => {
+                self.profiles.select(ix);
                 self.error = None;
             }
-            Some(ThemeEntry { custom: false, .. }) => self.start_new(),
-            _ => {}
+            Section::Theme => {
+                let reply = self.themes.select(ix);
+                self.reply(reply);
+            }
         }
     }
 
-    pub fn editor_can_save(&self) -> bool {
-        let Mode::Editor(editor) = &self.mode else { return false };
-        editor.invalid_colors().is_empty() && editor.name_result(&self.other_names(editor)).is_ok()
-    }
-
-    fn other_names(&self, editor: &Editor) -> Vec<&str> {
-        self.custom_names().into_iter().filter(|n| Some(*n) != editor.original.as_deref()).collect()
-    }
-
-    fn save_editor(&mut self) -> Outcome {
-        let Mode::Editor(editor) = &self.mode else { return Outcome::Nothing };
-        let name = match editor.name_result(&self.other_names(editor)) {
-            Ok(name) => name,
-            Err(e) => {
-                self.error = Some(e);
-                return Outcome::Nothing;
-            }
+    /// Enter: apply in the theme list, edit in the profile list, save in an
+    /// editor, delete when confirming, apply the Fonts form.
+    pub fn confirm(&mut self) -> Step {
+        let reply = match self.section {
+            Section::Fonts => self.fonts.apply().into(),
+            Section::Profiles => match self.profiles.list_mode() {
+                ListMode::List => {
+                    let themes = self.themes.theme_names();
+                    self.profiles.start_edit(&themes).map(|()| Step::Nothing).into()
+                }
+                ListMode::Editor => self.profiles.save().into(),
+                ListMode::ConfirmDelete => self.profiles.delete_selected().into(),
+            },
+            Section::Theme => self.themes.confirm(),
         };
-        if !editor.invalid_colors().is_empty() {
-            self.error = Some("Fix the colors marked invalid first".into());
-            return Outcome::Nothing;
-        }
-        let theme = editor.current.clone();
-        let original = editor.original.clone();
-        let saved = self.save(|doc| {
-            if let Some(old) = original.as_deref().filter(|old| *old != name) {
-                config_edit::rename_theme(doc, old, &name)?;
-            }
-            config_edit::upsert_theme(doc, &name, &theme);
-            Ok(())
-        });
-        if saved.is_err() {
-            return Outcome::Nothing;
-        }
-        if original.as_deref() == Some(self.active.as_str()) {
-            // A rename carries the global theme along.
-            self.active = name.clone();
-        }
-        self.mode = Mode::List;
-        self.reload_entries();
-        self.selected = self.selectable_index(&name).unwrap_or(0);
-        Outcome::Written
+        self.reply(reply)
     }
 
-    /// Delete: asks for confirmation, or explains why the theme can't go.
-    pub fn request_delete(&mut self) {
-        if self.section == Section::Fonts {
-            return;
-        }
-        if self.section == Section::Profiles {
-            if matches!(self.profiles.mode, profiles::Mode::List) {
-                let result = self.profiles.request_delete().map(|()| profiles::Done::Nothing);
-                self.profiles_done(result);
-            }
-            return;
-        }
-        if !matches!(self.mode, Mode::List) {
-            return;
-        }
-        let Some(entry) = self.selected_entry() else { return };
-        if !entry.custom {
-            self.error = Some(format!("{:?} is a built-in theme and can't be deleted", entry.name));
-            return;
-        }
-        let name = entry.name.clone();
-        let refs = std::fs::read_to_string(&self.config_path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| config_edit::parse(&t))
-            .map(|mut doc| config_edit::theme_references(&mut doc, &name));
-        match refs {
-            Ok(refs) if refs.is_empty() => {
-                self.mode = Mode::ConfirmDelete;
+    /// Escape: closes the dialog from a list or the form; otherwise leaves
+    /// the editor or the confirmation for the list.
+    pub fn cancel(&mut self) -> Step {
+        match self.section {
+            Section::Fonts => Step::Close,
+            Section::Profiles => {
                 self.error = None;
+                self.profiles.cancel()
             }
-            Ok(refs) => self.error = Some(format!("{name:?} is in use by {}", refs.join(", "))),
-            Err(e) => self.error = Some(e),
+            Section::Theme => {
+                let reply = self.themes.cancel();
+                self.reply(reply)
+            }
         }
     }
 
-    fn delete_selected(&mut self) -> Outcome {
-        let Some(name) = self.selected_entry().map(|e| e.name.clone()) else { return Outcome::Nothing };
-        self.mode = Mode::List;
-        if self.save(|doc| config_edit::delete_theme(doc, &name)).is_err() {
-            return Outcome::Nothing;
-        }
-        let previous = self.selected;
-        self.reload_entries();
-        // Stay near where the theme was.
-        self.selected = previous.min(self.entries.len().saturating_sub(1));
-        if self.entries[self.selected].theme.is_err() {
-            let active = self.active.clone();
-            self.selected = self.selectable_index(&active).unwrap_or(0);
-        }
-        Outcome::Written
-    }
-
-    /// List shortcuts. In the editor and the Fonts form, keys belong to the
-    /// fields.
-    pub fn key(&mut self, ks: &Keystroke) -> bool {
-        if self.section == Section::Fonts {
-            return false;
-        }
-        if self.section == Section::Profiles {
-            let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
-            if !plain || !matches!(self.profiles.mode, profiles::Mode::List) {
-                return false;
-            }
-            match ks.key.as_str() {
-                "n" => self.start_new(),
-                "e" => self.start_edit(),
-                "c" => self.start_duplicate(),
-                "delete" | "d" => self.request_delete(),
-                _ => return false,
-            }
-            return true;
-        }
-        match &mut self.mode {
-            Mode::Editor(_) => false,
-            Mode::List if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform => false,
-            Mode::List => {
-                match ks.key.as_str() {
-                    "n" => self.start_new(),
-                    "e" => self.start_edit(),
-                    "delete" | "d" => self.request_delete(),
-                    _ => return false,
+    /// New: a copy of the selected theme, or a new profile.
+    pub fn start_new(&mut self) {
+        match self.section {
+            Section::Fonts => {}
+            Section::Profiles => {
+                if self.profiles.list_mode() == ListMode::List {
+                    let themes = self.themes.theme_names();
+                    let reply = self.profiles.start_new(&themes).map(|()| Step::Nothing).into();
+                    self.reply(reply);
                 }
-                true
             }
-            Mode::ConfirmDelete => false,
+            Section::Theme => {
+                let reply = self.themes.start_new();
+                self.reply(reply);
+            }
         }
     }
 
-    /// A field's text changed in its input.
-    pub fn set_field(&mut self, field: usize, text: &str) {
-        if let Mode::Editor(editor) = &mut self.mode {
-            editor.set_field(field, text);
-            self.error = None;
+    /// Edit: the selected theme (a built-in is copied first) or profile.
+    pub fn start_edit(&mut self) {
+        match self.section {
+            Section::Fonts => {}
+            Section::Profiles => {
+                if self.profiles.list_mode() == ListMode::List {
+                    let themes = self.themes.theme_names();
+                    let reply = self.profiles.start_edit(&themes).map(|()| Step::Nothing).into();
+                    self.reply(reply);
+                }
+            }
+            Section::Theme => {
+                let reply = self.themes.start_edit();
+                self.reply(reply);
+            }
         }
     }
 
-    /// The editor's field texts (name first), when editing.
-    pub fn editor_fields(&self) -> Option<Vec<String>> {
-        let Mode::Editor(editor) = &self.mode else { return None };
-        Some((0..FIELD_COUNT).map(|field| editor.field(field).to_string()).collect())
-    }
-
-    /// Clears the selection foreground; returns its field.
-    pub fn clear_selection_foreground(&mut self) -> Option<usize> {
-        let Mode::Editor(editor) = &mut self.mode else { return None };
-        let field = selection_foreground_field();
-        editor.set_field(field, "");
-        Some(field)
-    }
-
-    /// Whether the editor's selection foreground holds a color, so Clear
-    /// has something to clear.
-    fn selection_foreground_set(&self) -> bool {
-        match &self.mode {
-            Mode::Editor(editor) => Slot::SelectionForeground.get(&editor.current).is_some(),
-            Mode::List | Mode::ConfirmDelete => false,
+    /// Duplicate (profiles only).
+    pub fn start_duplicate(&mut self) {
+        if self.section == Section::Profiles && self.profiles.list_mode() == ListMode::List {
+            let themes = self.themes.theme_names();
+            let reply = self.profiles.start_duplicate(&themes).map(|()| Step::Nothing).into();
+            self.reply(reply);
         }
+    }
+
+    /// Delete: asks for confirmation, or explains why the theme or profile
+    /// can't go. `text` is the config file as it reads now, which tells
+    /// what still refers to a theme.
+    pub fn request_delete(&mut self, text: &FileText) {
+        match self.section {
+            Section::Fonts => {}
+            Section::Profiles => {
+                if self.profiles.list_mode() == ListMode::List {
+                    let reply = self.profiles.request_delete().map(|()| Step::Nothing).into();
+                    self.reply(reply);
+                }
+            }
+            Section::Theme => {
+                let reply = self.themes.request_delete(text);
+                self.reply(reply);
+            }
+        }
+    }
+
+    /// The list shortcut `ks` is, in a list. In an editor and the Fonts
+    /// form, keys belong to the fields.
+    pub fn list_key(&self, ks: &Keystroke) -> Option<ListOp> {
+        let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
+        if !plain || self.mode_kind() != ModeKind::List {
+            return None;
+        }
+        match ks.key.as_str() {
+            "n" => Some(ListOp::New),
+            "e" => Some(ListOp::Edit),
+            "c" if self.section == Section::Profiles => Some(ListOp::Duplicate),
+            "delete" | "d" => Some(ListOp::Delete),
+            _ => None,
+        }
+    }
+
+    /// A theme editor field's text changed in its input.
+    pub fn set_field(&mut self, field: FieldId, text: &str) {
+        let reply = self.themes.set_field(field, text);
+        self.reply(reply);
+    }
+
+    /// The theme editor's fields and their texts, in Tab order, when
+    /// editing.
+    pub fn editor_fields(&self) -> Option<Vec<(FieldId, String)>> {
+        self.themes.editor_fields()
+    }
+
+    /// Clears the theme editor's selection foreground; returns its field.
+    pub fn clear_selection_foreground(&mut self) -> Option<FieldId> {
+        self.themes.clear_selection_foreground()
     }
 
     #[cfg(test)]
@@ -812,21 +461,18 @@ impl Model {
         self.mode_kind() == ModeKind::List
     }
 
+    /// What the dialog shows.
+    pub fn view(&self) -> View {
+        match self.section {
+            Section::Theme => View::Theme(self.themes.list_mode()),
+            Section::Profiles => View::Profiles(self.profiles.list_mode()),
+            Section::Fonts => View::Fonts,
+        }
+    }
+
     /// What the current section shows.
     pub fn mode_kind(&self) -> ModeKind {
-        match self.section {
-            Section::Theme => match self.mode {
-                Mode::List => ModeKind::List,
-                Mode::Editor(_) => ModeKind::Editor,
-                Mode::ConfirmDelete => ModeKind::ConfirmDelete,
-            },
-            Section::Profiles => match self.profiles.mode {
-                profiles::Mode::List => ModeKind::List,
-                profiles::Mode::Editor(_) => ModeKind::Editor,
-                profiles::Mode::ConfirmDelete => ModeKind::ConfirmDelete,
-            },
-            Section::Fonts => ModeKind::Form,
-        }
+        self.view().kind()
     }
 
     pub fn section(&self) -> Section {
@@ -836,13 +482,15 @@ impl Model {
     /// Switches section, refused while an editor has unsaved edits. Leaving
     /// Theme drops an unapplied preview: its selection goes back to the
     /// active theme. Leaving Fonts drops its unapplied changes; it has no
-    /// editor, so it never holds the section.
-    pub fn select_section(&mut self, section: Section) -> bool {
+    /// editor, so it never holds the section. Profiles and Fonts are reread
+    /// from `text`, the file as it reads now, to pick up edits made
+    /// elsewhere since the dialog opened.
+    pub fn select_section(&mut self, section: Section, text: &FileText) -> bool {
         if section == self.section {
             return true;
         }
         let dirty = match self.section {
-            Section::Theme => matches!(&self.mode, Mode::Editor(e) if e.dirty()),
+            Section::Theme => self.themes.dirty(),
             Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
             Section::Fonts => false,
         };
@@ -851,85 +499,92 @@ impl Model {
             return false;
         }
         match self.section {
-            Section::Theme => {
-                self.mode = Mode::List;
-                let active = self.active.clone();
-                self.selected = self.selectable_index(&active).or_else(|| self.selectable_index("brindle-dark")).unwrap_or(0);
-            }
+            Section::Theme => self.themes.leave(),
             Section::Profiles => {
-                if !matches!(self.profiles.mode, profiles::Mode::List) {
+                if self.profiles.list_mode() != ListMode::List {
                     self.profiles.discard();
                 }
             }
             Section::Fonts => self.fonts.reset(),
         }
-        // Pick up edits made elsewhere since the dialog opened.
         match section {
-            Section::Profiles => self.profiles.reload(&self.config_path, &self.fallback_profiles, None),
-            Section::Fonts => self.fonts.reload(&self.config_path, &self.fallback_fonts),
+            Section::Profiles => self.profiles.reload(&self.config_path, text, None),
+            Section::Fonts => self.fonts.reload(text),
             Section::Theme => {}
         }
         self.section = section;
-        self.error = (section == Section::Theme).then(|| self.themes_note.clone()).flatten();
+        self.error = (section == Section::Theme).then(|| self.themes.note().cloned()).flatten();
         true
     }
 
-    /// Cycles through the sections (ctrl-tab).
     /// Home and end in the section list: the first or the `last` section.
-    pub fn edge_section(&mut self, last: bool) -> bool {
-        self.select_section(if last { SECTIONS[SECTIONS.len() - 1] } else { SECTIONS[0] })
+    pub fn edge_section(&mut self, last: bool, text: &FileText) -> bool {
+        self.select_section(if last { SECTIONS[SECTIONS.len() - 1] } else { SECTIONS[0] }, text)
     }
 
-    pub fn next_section(&mut self, forward: bool) -> bool {
+    /// Cycles through the sections (ctrl-tab).
+    pub fn next_section(&mut self, forward: bool, text: &FileText) -> bool {
         let ix = SECTIONS.iter().position(|s| *s == self.section).unwrap_or(0);
         let n = SECTIONS.len();
-        self.select_section(SECTIONS[if forward { (ix + 1) % n } else { (ix + n - 1) % n }])
+        self.select_section(SECTIONS[if forward { (ix + 1) % n } else { (ix + n - 1) % n }], text)
     }
 
     /// Every theme a profile can choose: built-ins, then custom themes.
+    #[cfg(test)]
     fn theme_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for entry in self.entries.iter().filter(|e| e.theme.is_ok()) {
-            if !names.contains(&entry.name) {
-                names.push(entry.name.clone());
-            }
-        }
-        names
-    }
-
-    fn profiles_done(&mut self, result: Result<profiles::Done, String>) -> Outcome {
-        match result {
-            Ok(profiles::Done::Written) => {
-                self.error = None;
-                Outcome::Written
-            }
-            Ok(profiles::Done::Nothing) => {
-                self.error = None;
-                Outcome::Nothing
-            }
-            Err(e) => {
-                self.error = Some(e);
-                Outcome::Nothing
-            }
-        }
-    }
-
-    /// Duplicate (profiles only).
-    pub fn start_duplicate(&mut self) {
-        if self.section == Section::Profiles && matches!(self.profiles.mode, profiles::Mode::List) {
-            let themes = self.theme_names();
-            let result = self.profiles.start_duplicate(&themes).map(|()| profiles::Done::Nothing);
-            self.profiles_done(result);
-        }
+        self.themes.theme_names()
     }
 
     /// alt-up / alt-down in the profile list.
-    pub fn move_profile(&mut self, up: bool) -> Outcome {
+    pub fn move_profile(&mut self, up: bool) -> Step {
         if self.section != Section::Profiles {
-            return Outcome::Nothing;
+            return Step::Nothing;
         }
-        let result = self.profiles.move_selected(up, &self.config_path, &self.fallback_profiles);
-        self.profiles_done(result)
+        let reply = self.profiles.move_selected(up).into();
+        self.reply(reply)
+    }
+
+    /// The edit a step asked for was written, giving `result`, and the file
+    /// now reads `text`: the section that asked rereads it, and the view
+    /// learns what to tell the workspace. A failed write keeps the section
+    /// as it was, with the error.
+    pub fn written(&mut self, edit: &ConfigEdit, result: Result<Applied, String>, text: &FileText) -> Outcome {
+        let applied = match result {
+            Ok(applied) => applied,
+            Err(e) => {
+                self.error = Some(e);
+                return Outcome::Nothing;
+            }
+        };
+        self.error = None;
+        match edit {
+            ConfigEdit::SetGlobalTheme { .. } | ConfigEdit::SetFonts(_) => Outcome::Applied,
+            ConfigEdit::SaveTheme { .. } | ConfigEdit::DeleteTheme { .. } => {
+                self.themes.written(edit, &self.config_path, text);
+                if self.section == Section::Theme {
+                    self.error = self.themes.note().cloned();
+                }
+                Outcome::Written
+            }
+            ConfigEdit::SaveProfile { .. } | ConfigEdit::DeleteProfile { .. } | ConfigEdit::MoveProfile { .. } => {
+                self.profiles.written(edit, applied, &self.config_path, text);
+                Outcome::Written
+            }
+        }
+    }
+
+    /// Whether button `b` can be pressed (and focused) in the current view.
+    pub fn enabled(&self, b: Btn) -> bool {
+        match self.section {
+            Section::Theme => self.themes.enabled(b),
+            Section::Profiles => self.profiles.enabled(b),
+            Section::Fonts => self.fonts.enabled(b),
+        }
+    }
+
+    /// The theme list's row marked active: the global theme's.
+    pub fn active_row(&self) -> Option<usize> {
+        self.themes.active_row()
     }
 
     /// The fonts the window should preview: the Fonts section's valid,
@@ -957,40 +612,19 @@ impl Model {
     /// [`Model::describe_open`] with no family list open.
     #[cfg(test)]
     pub fn describe(&self, field: &str) -> String {
-        self.describe_open(field, None)
+        self.describe_open(Some(field), None)
     }
 
     /// Debug description for `--dump-screen-after`. `field` names the
-    /// focused control, which an editor reports as its `field=`; `open` is
-    /// an open family list's field, search and highlighted option, for the
-    /// Fonts section's line.
-    pub fn describe_open(&self, field: &str, open: Option<(fonts::FontField, String, Option<String>)>) -> String {
-        if self.section == Section::Fonts {
-            return self.fonts.describe(&self.error, field, open);
-        }
-        if self.section == Section::Profiles {
-            return self.profiles.describe(&self.error, field);
-        }
-        let section = "Theme";
-        match &self.mode {
-            Mode::List => format!(
-                "--- settings section={section} mode=list selected={:?} active={:?} error={:?}\n",
-                self.selected_entry().map(|e| e.name.as_str()).unwrap_or(""),
-                self.active,
-                self.error
-            ),
-            Mode::Editor(editor) => format!(
-                "--- settings section={section} mode=editor name={:?} field={:?} invalid={:?} can_save={} error={:?}\n",
-                editor.name,
-                field,
-                editor.invalid_colors().iter().map(|&ix| SLOTS[ix].label()).collect::<Vec<_>>(),
-                self.editor_can_save(),
-                self.error
-            ),
-            Mode::ConfirmDelete => format!(
-                "--- settings section={section} mode=confirm-delete theme={:?}\n",
-                self.selected_entry().map(|e| e.name.as_str()).unwrap_or("")
-            ),
+    /// focused control, which an editor reports as its `field=` (`""` for
+    /// none); `open` is an open family list's field, search and highlighted
+    /// option, for the Fonts section's line.
+    pub fn describe_open(&self, field: Option<&str>, open: Option<(fonts::FontField, String, Option<String>)>) -> String {
+        let field = field.unwrap_or("");
+        match self.section {
+            Section::Fonts => self.fonts.describe(&self.error, field, open),
+            Section::Profiles => self.profiles.describe(&self.error, field),
+            Section::Theme => self.themes.describe(&self.error, field),
         }
     }
 }
@@ -1018,7 +652,7 @@ pub enum SettingsEvent {
 /// theme and profile views share (New, Save, …) shares its handle too, since
 /// only one of them shows at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Btn {
+pub enum Btn {
     New,
     Duplicate,
     Edit,
@@ -1095,13 +729,15 @@ impl Btn {
 }
 
 /// The footer buttons of each view, in Tab order (left to right).
-fn footer_buttons(section: Section, kind: ModeKind) -> &'static [Btn] {
-    match (section, kind) {
-        (Section::Fonts, _) | (_, ModeKind::Form) => &[Btn::Cancel, Btn::Apply],
-        (_, ModeKind::ConfirmDelete) => &[Btn::Keep, Btn::ConfirmDelete],
-        (_, ModeKind::Editor) => &[Btn::Discard, Btn::Save],
-        (Section::Theme, ModeKind::List) => &[Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply],
-        (Section::Profiles, ModeKind::List) => {
+fn footer_buttons(view: View) -> &'static [Btn] {
+    match view {
+        View::Fonts => &[Btn::Cancel, Btn::Apply],
+        View::Theme(ListMode::ConfirmDelete) | View::Profiles(ListMode::ConfirmDelete) => {
+            &[Btn::Keep, Btn::ConfirmDelete]
+        }
+        View::Theme(ListMode::Editor) | View::Profiles(ListMode::Editor) => &[Btn::Discard, Btn::Save],
+        View::Theme(ListMode::List) => &[Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply],
+        View::Profiles(ListMode::List) => {
             &[Btn::New, Btn::Duplicate, Btn::Edit, Btn::Delete, Btn::Up, Btn::Down, Btn::Close]
         }
     }
@@ -1114,12 +750,6 @@ fn footer_buttons(section: Section, kind: ModeKind) -> &'static [Btn] {
 /// without this a focused Discard would save.
 fn enter_confirms(on_button: bool) -> bool {
     !on_button
-}
-
-/// A choice field: one of the profile editor's selects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Choice {
-    Profile(profiles::Field),
 }
 
 pub struct SettingsDialog {
@@ -1137,8 +767,9 @@ pub struct SettingsDialog {
     theme: Theme,
     list_scroll: ScrollHandle,
     editor_scroll: ScrollHandle,
-    /// The editor's inputs, one per field (name first); empty in the list.
-    fields: Vec<Entity<TextInput>>,
+    /// The theme editor's inputs, one per field (name first); empty in the
+    /// list.
+    fields: Vec<(FieldId, Entity<TextInput>)>,
     _field_subscriptions: Vec<Subscription>,
     /// What the last profile preview showed: name, theme and font size.
     profile_previewed: Option<(String, Option<String>, Option<f32>)>,
@@ -1157,13 +788,10 @@ pub struct SettingsDialog {
     font_inputs: Vec<(fonts::FontField, Entity<TextInput>)>,
     font_choices: Vec<(fonts::FontField, Entity<Combobox>)>,
     _font_subscriptions: Vec<Subscription>,
-    /// The installed families a family list offers, read when the Fonts
-    /// section is first shown.
-    font_names: Vec<String>,
     /// What the last font preview showed, to tell when it changes.
     font_previewed: Option<FontPreview>,
-    /// The section and kind of view focus was last placed for.
-    placed_for: (Section, ModeKind),
+    /// The view focus was last placed for.
+    placed_for: View,
     /// The focused handle an editor last scrolled into view.
     scrolled_to: Option<FocusHandle>,
 }
@@ -1182,24 +810,22 @@ impl FocusStops for SettingsDialog {
     /// one stop), then its footer buttons, then the close `X`.
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         let mut stops = vec![self.sections_handle.clone()];
-        let (section, kind) = (self.model.section(), self.model.mode_kind());
-        match (section, kind) {
-            (Section::Theme | Section::Profiles, ModeKind::List) => stops.push(self.list_handle.clone()),
-            (Section::Theme, ModeKind::Editor) => {
-                for (field, input) in self.fields.iter().enumerate() {
+        let view = self.model.view();
+        match view {
+            View::Theme(ListMode::List) | View::Profiles(ListMode::List) => stops.push(self.list_handle.clone()),
+            View::Theme(ListMode::Editor) => {
+                for (field, input) in &self.fields {
                     stops.push(input.focus_handle(cx));
-                    if field == selection_foreground_field() && self.enabled(Btn::Clear) {
+                    if *field == FieldId::selection_foreground() && self.model.enabled(Btn::Clear) {
                         stops.push(self.button_handle(Btn::Clear));
                     }
                 }
             }
-            (Section::Profiles, ModeKind::Editor) => stops.extend(self.profile_field_stops(cx)),
-            (Section::Fonts, _) => stops.extend(self.font_field_stops(cx)),
-            _ => {}
+            View::Profiles(ListMode::Editor) => stops.extend(self.profile_field_stops(cx)),
+            View::Fonts => stops.extend(self.font_field_stops(cx)),
+            View::Theme(ListMode::ConfirmDelete) | View::Profiles(ListMode::ConfirmDelete) => {}
         }
-        stops.extend(
-            footer_buttons(section, kind).iter().filter(|b| self.enabled(**b)).map(|b| self.button_handle(*b)),
-        );
+        stops.extend(footer_buttons(view).iter().filter(|b| self.model.enabled(**b)).map(|b| self.button_handle(*b)));
         stops.push(self.close_handle.clone());
         stops
     }
@@ -1216,8 +842,10 @@ impl SettingsDialog {
     pub fn new(model: Model, theme: Theme, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = model.preview().unwrap_or(theme);
         let list_scroll = ScrollHandle::new();
-        list_scroll.scroll_to_item(model.selected);
-        let placed_for = (model.section(), model.mode_kind());
+        if let Some(ix) = model.themes.selected_index() {
+            list_scroll.scroll_to_item(ix);
+        }
+        let placed_for = model.view();
         Self {
             focus_handle: cx.focus_handle(),
             close_handle: cx.focus_handle(),
@@ -1241,7 +869,6 @@ impl SettingsDialog {
             font_inputs: Vec::new(),
             font_choices: Vec::new(),
             _font_subscriptions: Vec::new(),
-            font_names: Vec::new(),
             font_previewed: None,
             placed_for,
             scrolled_to: None,
@@ -1257,24 +884,24 @@ impl SettingsDialog {
     /// The editor input that has keyboard focus, or a Fonts field's (an
     /// open family list's search included).
     pub fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
-        let mut inputs = self.fields.iter().chain(self.profile_inputs.iter().map(|(_, i)| i));
+        let mut inputs = self.fields.iter().map(|(_, i)| i).chain(self.profile_inputs.iter().map(|(_, i)| i));
         inputs.find(|f| f.read(cx).is_focused(window)).cloned().or_else(|| self.focused_font_input(window, cx))
     }
 
     /// The name of the focused control: an editor field's label, a
-    /// button's, `list` for a list, `close` for the `X`, or empty.
-    pub fn focused_label(&self, window: &Window, cx: &App) -> &'static str {
+    /// button's, `list` for a list, `close` for the `X`; `None` for none.
+    pub fn focused_label(&self, window: &Window, cx: &App) -> Option<&'static str> {
         if self.sections_handle.is_focused(window) {
-            return "sections";
+            return Some("sections");
         }
         if self.list_handle.is_focused(window) {
-            return "list";
+            return Some("list");
         }
-        if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
-            return field_label(field);
+        if let Some((field, _)) = self.fields.iter().find(|(_, f)| f.read(cx).is_focused(window)) {
+            return themes::field_label(*field);
         }
         if let Some((field, _)) = self.profile_inputs.iter().find(|(_, i)| i.read(cx).is_focused(window)) {
-            return field.label();
+            return Some(field.label());
         }
         // A select whose menu is open still counts as the focused field.
         let select_focused = |s: &Entity<Select>| {
@@ -1282,24 +909,24 @@ impl SettingsDialog {
             s.is_open() || s.focus_handle(cx).is_focused(window)
         };
         if let Some((field, _)) = self.profile_selects.iter().find(|(_, s)| select_focused(s)) {
-            return field.label();
+            return Some(field.label());
         }
         if let Some(field) = self.focused_font_field(window, cx) {
-            return field.label();
+            return Some(field.label());
         }
         if self.default_handle.is_focused(window) {
-            return profiles::Field::Default.label();
+            return Some(profiles::Field::Default.label());
         }
         if self.connect_handle.is_focused(window) {
-            return profiles::Field::ConnectAtLaunch.label();
+            return Some(profiles::Field::ConnectAtLaunch.label());
         }
         if let Some((b, _)) = self.buttons.iter().find(|(_, h)| h.is_focused(window)) {
-            return b.label();
+            return Some(b.label());
         }
         if self.close_handle.is_focused(window) {
-            return "close";
+            return Some("close");
         }
-        ""
+        None
     }
 
     fn button_handle(&self, b: Btn) -> FocusHandle {
@@ -1311,35 +938,20 @@ impl SettingsDialog {
         self.close_handle.is_focused(window) || self.buttons.iter().any(|(_, h)| h.is_focused(window))
     }
 
-    /// Whether button `b` can be pressed (and focused) in the current view.
-    fn enabled(&self, b: Btn) -> bool {
-        let model = &self.model;
-        let profiles = &model.profiles;
-        let editable = profiles.read_only.is_none();
-        let profile_ok = profiles.selected_entry().is_some_and(|e| e.profile.is_ok());
-        match (model.section(), b) {
-            (Section::Theme, Btn::Delete) => model.selected_entry().is_some_and(|e| e.custom),
-            (Section::Theme, Btn::Clear) => model.selection_foreground_set(),
-            (Section::Theme, Btn::Save) => model.editor_can_save(),
-            (Section::Profiles, Btn::New) => editable,
-            (Section::Profiles, Btn::Duplicate | Btn::Edit) => editable && profile_ok,
-            (Section::Profiles, Btn::Delete) => editable && profiles.entries.len() > 1,
-            (Section::Profiles, Btn::Up) => editable && profiles.selected > 0,
-            (Section::Profiles, Btn::Down) => editable && profiles.selected + 1 < profiles.entries.len(),
-            (Section::Profiles, Btn::Save) => matches!(profiles.editor_result(), Some(Ok(_))),
-            (Section::Fonts, Btn::Apply) => model.fonts.can_apply() && model.fonts.read_only.is_none(),
-            _ => true,
-        }
+    /// The theme editor's input for `field`.
+    fn theme_input(&self, field: FieldId) -> Option<&Entity<TextInput>> {
+        self.fields.iter().find(|(f, _)| *f == field).map(|(_, i)| i)
     }
 
     /// The editor's field stops, in order; the first takes focus when the
     /// editor opens. Empty outside an editor.
     fn field_stops(&self, cx: &App) -> Vec<FocusHandle> {
-        match (self.model.section(), self.model.mode_kind()) {
-            (Section::Theme, ModeKind::Editor) => self.fields.iter().map(|f| f.focus_handle(cx)).collect(),
-            (Section::Profiles, ModeKind::Editor) => self.profile_field_stops(cx),
-            (Section::Fonts, _) => self.font_field_stops(cx),
-            _ => Vec::new(),
+        match self.model.view() {
+            View::Theme(ListMode::Editor) => self.fields.iter().map(|(_, f)| f.focus_handle(cx)).collect(),
+            View::Profiles(ListMode::Editor) => self.profile_field_stops(cx),
+            View::Fonts => self.font_field_stops(cx),
+            View::Theme(ListMode::List | ListMode::ConfirmDelete)
+            | View::Profiles(ListMode::List | ListMode::ConfirmDelete) => Vec::new(),
         }
     }
 
@@ -1361,28 +973,19 @@ impl SettingsDialog {
         self.profile_selects.iter().any(|(_, s)| s.read(cx).is_open()) || self.font_list_open(cx)
     }
 
-    /// Moves focus to the new view's first control when the section or the
-    /// kind of view changed, and off a control the view no longer shows
-    /// (or shows disabled).
+    /// Moves focus where [`focus_target`] says, once the model changed.
     fn place_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = (self.model.section(), self.model.mode_kind());
-        let moved = view != self.placed_for;
-        let section_changed = view.0 != self.placed_for.0;
-        self.placed_for = view;
-        if !moved && self.menu_open(cx) {
-            return;
-        }
-        // On the section list, focus stays while the sections change under
-        // it, by key or click: the user is still choosing a section. A view
-        // that opens in the same section (an editor, by a list key) takes
-        // focus as usual.
-        if self.sections_handle.is_focused(window) && (section_changed || !moved) {
-            return;
-        }
+        let view = self.model.view();
+        let placed_for = std::mem::replace(&mut self.placed_for, view);
         let stops = self.stops(cx);
-        let valid = window.focused(cx).is_some_and(|f| f == self.focus_handle || stops.contains(&f));
-        if moved || !valid {
-            window.focus(&self.default_focus(cx));
+        let facts = FocusFacts {
+            menu_open: self.menu_open(cx),
+            on_sections: self.sections_handle.is_focused(window),
+            valid: window.focused(cx).is_some_and(|f| f == self.focus_handle || stops.contains(&f)),
+        };
+        match focus_target(placed_for, view, facts) {
+            FocusMove::Stay => {}
+            FocusMove::Default => window.focus(&self.default_focus(cx)),
         }
     }
 
@@ -1394,18 +997,20 @@ impl SettingsDialog {
         self.sync_fields(window, cx);
         self.sync_selects(cx);
         self.place_focus(window, cx);
-        match self.model.section() {
-            Section::Theme => {
-                if matches!(self.model.mode, Mode::List) {
-                    self.list_scroll.scroll_to_item(self.model.selected);
+        match self.model.view() {
+            View::Theme(ListMode::List) => {
+                if let Some(ix) = self.model.themes.selected_index() {
+                    self.list_scroll.scroll_to_item(ix);
                 }
             }
-            Section::Profiles => {
-                if matches!(self.model.profiles.mode, profiles::Mode::List) {
-                    self.profile_list_scroll.scroll_to_item(self.model.profiles.selected);
+            View::Profiles(ListMode::List) => {
+                if let Some(ix) = self.model.profiles.selected_index() {
+                    self.profile_list_scroll.scroll_to_item(ix);
                 }
             }
-            Section::Fonts => {}
+            View::Theme(ListMode::Editor | ListMode::ConfirmDelete)
+            | View::Profiles(ListMode::Editor | ListMode::ConfirmDelete)
+            | View::Fonts => {}
         }
         cx.notify();
     }
@@ -1422,24 +1027,21 @@ impl SettingsDialog {
         }
     }
 
-    /// The select behind a choice field.
-    fn choice_select(&self, choice: Choice) -> Option<Entity<Select>> {
-        match choice {
-            Choice::Profile(field) => self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s.clone()),
-        }
+    /// The select behind a profile choice field.
+    fn choice_select(&self, field: profiles::Field) -> Option<Entity<Select>> {
+        self.profile_selects.iter().find(|(f, _)| *f == field).map(|(_, s)| s.clone())
     }
 
-    /// Option `ix` of a choice field was chosen: change the edited profile.
-    fn apply_choice(&mut self, choice: Choice, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match choice {
-            Choice::Profile(field) => self.edit_profile(window, cx, |e| e.choose(field, ix)),
-        }
+    /// Option `ix` of a profile choice field was chosen: change the edited
+    /// profile.
+    fn apply_choice(&mut self, field: profiles::Field, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_profile(window, cx, |e| e.choose(field, ix));
     }
 
     /// The slot a choice field's select is laid out in. It adds no keys: a
     /// choice changes only through the select's menu (`SelectEvent::Changed`).
-    fn choice_slot(&self, choice: Choice) -> gpui::Div {
-        div().children(self.choice_select(choice))
+    fn choice_slot(&self, field: profiles::Field) -> gpui::Div {
+        div().children(self.choice_select(field))
     }
 
     /// Scrolls an editor's focused field into view when focus moved, by
@@ -1449,11 +1051,9 @@ impl SettingsDialog {
         if focused == self.scrolled_to {
             return;
         }
-        if let Some(field) = self.fields.iter().position(|f| f.read(cx).is_focused(window)) {
-            // The name sits above the scrolling color rows.
-            if field > 0 {
-                self.editor_scroll.scroll_to_item(field - 1);
-            }
+        // The name sits above the scrolling color rows.
+        if let Some((FieldId::Color(ix), _)) = self.fields.iter().find(|(_, f)| f.read(cx).is_focused(window)) {
+            self.editor_scroll.scroll_to_item(*ix);
         }
         self.scroll_to_focused_profile_field(window, cx);
         self.scrolled_to = focused;
@@ -1490,8 +1090,8 @@ impl SettingsDialog {
             return;
         };
         if self.fields.is_empty() {
-            for (field, text) in texts.iter().enumerate() {
-                let input = cx.new(|cx| TextInput::new(text, cx));
+            for (field, text) in texts {
+                let input = cx.new(|cx| TextInput::new(&text, cx));
                 let changed = cx.subscribe_in(&input, window, move |this, input, _: &TextInputEvent, _, cx| {
                     let text = input.read(cx).text().to_string();
                     this.model.set_field(field, &text);
@@ -1499,8 +1099,24 @@ impl SettingsDialog {
                     cx.notify();
                 });
                 self._field_subscriptions.push(changed);
-                self.fields.push(input);
+                self.fields.push((field, input));
             }
+        }
+    }
+
+    /// Takes the step an operation returned: shows the model, writes its
+    /// edit and reports it back, or closes.
+    fn step(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+        match step {
+            Step::Nothing => self.changed(window, cx),
+            Step::Write(edit) => {
+                let path = self.model.config_path().to_path_buf();
+                let result = config_edit::save(&path, |doc| edit.apply(doc));
+                let text = config_edit::read_text(&path);
+                let outcome = self.model.written(&edit, result, &text);
+                self.outcome(outcome, window, cx);
+            }
+            Step::Close => cx.emit(DismissEvent),
         }
     }
 
@@ -1516,8 +1132,35 @@ impl SettingsDialog {
                 cx.emit(SettingsEvent::ConfigWritten(self.model.take_renames()));
                 cx.emit(DismissEvent);
             }
-            Outcome::Close => cx.emit(DismissEvent),
         }
+    }
+
+    /// Switches section through `switch`, with the config file as it reads
+    /// now.
+    pub(super) fn switch_section(
+        &mut self,
+        switch: impl FnOnce(&mut Model, &FileText) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = config_edit::read_text(self.model.config_path());
+        switch(&mut self.model, &text);
+        self.changed(window, cx);
+    }
+
+    /// A list key or button: New, Edit, Duplicate or Delete. A delete
+    /// reads the file, to tell what still refers to a theme.
+    pub(super) fn list_op(&mut self, op: ListOp, window: &mut Window, cx: &mut Context<Self>) {
+        match op {
+            ListOp::New => self.model.start_new(),
+            ListOp::Edit => self.model.start_edit(),
+            ListOp::Duplicate => self.model.start_duplicate(),
+            ListOp::Delete => {
+                let text = config_edit::read_text(self.model.config_path());
+                self.model.request_delete(&text);
+            }
+        }
+        self.changed(window, cx);
     }
 
     /// Up and down move a list's selection. In an editor they do nothing
@@ -1565,8 +1208,8 @@ impl SettingsDialog {
             cx.propagate();
             return;
         }
-        let outcome = self.model.confirm();
-        self.outcome(outcome, window, cx);
+        let step = self.model.confirm();
+        self.step(step, window, cx);
     }
 
     /// Escape (through the overlay's `Dismiss`, after an open select menu
@@ -1579,32 +1222,26 @@ impl SettingsDialog {
 
     /// Escape or the close `X`: closes in a list, discards in an editor.
     fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.cancel() {
-            cx.emit(DismissEvent);
-        } else {
-            self.changed(window, cx);
-        }
+        let step = self.model.cancel();
+        self.step(step, window, cx);
     }
 
     fn new_theme(&mut self, _: &SettingsNew, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.start_new();
-        self.changed(window, cx);
+        self.list_op(ListOp::New, window, cx);
     }
 
     fn edit_theme(&mut self, _: &SettingsEdit, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.start_edit();
-        self.changed(window, cx);
+        self.list_op(ListOp::Edit, window, cx);
     }
 
     fn delete_theme(&mut self, _: &SettingsDelete, window: &mut Window, cx: &mut Context<Self>) {
-        self.model.request_delete();
-        self.changed(window, cx);
+        self.list_op(ListOp::Delete, window, cx);
     }
 
     fn key_down(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.model.key(&e.keystroke) {
+        if let Some(op) = self.model.list_key(&e.keystroke) {
             cx.stop_propagation();
-            self.changed(window, cx);
+            self.list_op(op, window, cx);
         }
     }
 
@@ -1635,7 +1272,7 @@ impl SettingsDialog {
     }
 
     /// A footer button: small, focusable through its own handle, disabled
-    /// when [`Self::enabled`] says so.
+    /// when [`Model::enabled`] says so.
     fn button(
         &self,
         b: Btn,
@@ -1647,7 +1284,7 @@ impl SettingsDialog {
         Button::new(b.id(), label)
             .variant(variant)
             .size(ButtonSize::Sm)
-            .disabled(!self.enabled(b))
+            .disabled(!self.model.enabled(b))
             .focus(&self.button_handle(b))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)))
     }
@@ -1666,11 +1303,12 @@ impl SettingsDialog {
         let t = *cx.ui_theme();
         let fg = t.foreground;
         let muted = t.muted_foreground;
-        let model = &self.model;
+        let themes = &self.model.themes;
+        let (selected_row, active_row) = (themes.selected_index(), self.model.active_row());
 
-        let rows = model.entries.iter().enumerate().map(|(ix, entry)| {
-            let selected = ix == model.selected;
-            let active = entry.name == model.active && model.selectable_index(&model.active) == Some(ix);
+        let rows = themes.entries().iter().enumerate().map(|(ix, entry)| {
+            let selected = selected_row == Some(ix);
+            let active = active_row == Some(ix);
             let readable = entry.theme.is_ok();
             let mut row = div()
                 .id(("theme", ix))
@@ -1686,8 +1324,8 @@ impl SettingsDialog {
                     d.when(!selected, |d| d.hover(|d| d.bg(t.accent.opacity(0.5)))).on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                         this.model.select(ix);
                         if e.click_count() >= 2 {
-                            let outcome = this.model.confirm();
-                            this.outcome(outcome, window, cx);
+                            let step = this.model.confirm();
+                            this.step(step, window, cx);
                         } else {
                             this.changed(window, cx);
                         }
@@ -1724,9 +1362,9 @@ impl SettingsDialog {
         })
         .collect::<Vec<_>>();
 
-        let confirming = matches!(model.mode, Mode::ConfirmDelete);
+        let confirming = themes.list_mode() == ListMode::ConfirmDelete;
         let footer = if confirming {
-            let name = model.selected_entry().map(|e| e.name.clone()).unwrap_or_default();
+            let name = themes.selected_entry().map(|e| e.name.clone()).unwrap_or_default();
             self.confirm_footer(format!("Delete {name:?}?"), cx)
         } else {
             div()
@@ -1734,22 +1372,19 @@ impl SettingsDialog {
                 .items_center()
                 .gap_2()
                 .child(self.button(Btn::New, "New (n)", ButtonVariant::Outline, cx, |this, window, cx| {
-                    this.model.start_new();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::New, window, cx)
                 }))
                 .child(self.button(Btn::Edit, "Edit (e)", ButtonVariant::Outline, cx, |this, window, cx| {
-                    this.model.start_edit();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::Edit, window, cx)
                 }))
                 .child(self.button(Btn::Delete, "Delete (d)", ButtonVariant::Destructive, cx, |this, window, cx| {
-                    this.model.request_delete();
-                    this.changed(window, cx);
+                    this.list_op(ListOp::Delete, window, cx)
                 }))
                 .child(div().flex_1())
                 .child(self.button(Btn::Cancel, "Cancel", ButtonVariant::Outline, cx, |_, _, cx| cx.emit(DismissEvent)))
                 .child(self.button(Btn::Apply, "Apply", ButtonVariant::Default, cx, |this, window, cx| {
-                    let outcome = this.model.confirm();
-                    this.outcome(outcome, window, cx);
+                    let step = this.model.confirm();
+                    this.step(step, window, cx);
                 }))
         };
 
@@ -1786,31 +1421,30 @@ impl SettingsDialog {
             .gap_2()
             .child(div().flex_1().min_w_0().text_color(fg).child(SharedString::from(question)))
             .child(self.button(Btn::Keep, "Keep", ButtonVariant::Outline, cx, |this, window, cx| {
-                this.model.cancel();
-                this.changed(window, cx);
+                let step = this.model.cancel();
+                this.step(step, window, cx);
             }))
             .child(self.button(Btn::ConfirmDelete, "Delete (enter)", ButtonVariant::Destructive, cx, |this, window, cx| {
-                let outcome = this.model.confirm();
-                this.outcome(outcome, window, cx);
+                let step = this.model.confirm();
+                this.step(step, window, cx);
             }))
     }
 
-    /// Editor field `field`'s input, framed, red when `invalid`.
-    fn render_field(&self, field: usize, invalid: bool) -> impl IntoElement {
+    /// Theme editor field `field`'s input, framed, red when `invalid`.
+    fn render_field(&self, field: FieldId, invalid: bool) -> impl IntoElement {
         div()
             .flex_1()
             .min_w_0()
-            .children(self.fields.get(field).map(|input| Input::new(input).invalid(invalid)))
+            .children(self.theme_input(field).map(|input| Input::new(input).invalid(invalid)))
     }
 
     fn render_editor(&self, editor: &Editor, cx: &mut Context<Self>) -> AnyElement {
         let t = *cx.ui_theme();
         let muted = t.muted_foreground;
-        let name_error = editor.name_result(&self.model.other_names(editor)).err();
+        let name_error = self.model.themes.name_error(editor);
 
         let label = |text: SharedString| div().w(px(150.0)).flex_none().text_color(muted).child(text);
         let rows = SLOTS.iter().enumerate().map(|(ix, slot)| {
-            let field = ix + 1;
             let invalid = editor.parse_color(ix).is_err();
             let color = slot.get(&editor.current);
             div()
@@ -1820,11 +1454,11 @@ impl SettingsDialog {
                 .gap_2()
                 .child(label(slot.label().into()))
                 .child(Self::swatch(color, 18.0, &t))
-                .child(self.render_field(field, invalid))
+                .child(self.render_field(FieldId::Color(ix), invalid))
                 .when(slot.optional(), |d| {
                     d.child(self.button(Btn::Clear, "Clear", ButtonVariant::Outline, cx, |this, window, cx| {
                         if let Some(field) = this.model.clear_selection_foreground()
-                            && let Some(input) = this.fields.get(field).cloned()
+                            && let Some(input) = this.theme_input(field).cloned()
                         {
                             input.update(cx, |input, cx| input.set_text("", cx));
                             // Clear is disabled now: focus its field.
@@ -1836,24 +1470,20 @@ impl SettingsDialog {
         })
         .collect::<Vec<_>>();
 
-        let title = match &editor.original {
-            Some(name) => format!("Edit {name:?}"),
-            None => "New theme".to_string(),
-        };
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .gap_2()
-            .child(div().text_color(t.foreground).child(SharedString::from(title)))
+            .child(div().text_color(t.foreground).child(SharedString::from(editor.title())))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(label("Name".into()))
-                    .child(self.render_field(0, name_error.is_some())),
+                    .child(self.render_field(FieldId::Name, name_error.is_some())),
             )
             .when_some(name_error, |d, e| d.child(div().text_xs().text_color(t.destructive).child(SharedString::from(e))))
             .child(
@@ -1886,12 +1516,12 @@ impl SettingsDialog {
             .flex_none()
             .gap_2()
             .child(self.button(Btn::Discard, "Discard", ButtonVariant::Outline, cx, |this, window, cx| {
-                this.model.cancel();
-                this.changed(window, cx);
+                let step = this.model.cancel();
+                this.step(step, window, cx);
             }))
             .child(self.button(Btn::Save, "Save", ButtonVariant::Default, cx, |this, window, cx| {
-                let outcome = this.model.confirm();
-                this.outcome(outcome, window, cx);
+                let step = this.model.confirm();
+                this.step(step, window, cx);
             }))
     }
 }
@@ -1901,14 +1531,13 @@ impl Render for SettingsDialog {
         // Focus moves by Tab, clicks and keys; scroll an editor after it.
         self.follow_focus(window, cx);
         let t = *cx.ui_theme();
-        let content = match (self.model.section(), &self.model.mode) {
-            (Section::Profiles, _) => self.render_profiles(window, cx),
-            (Section::Theme, Mode::Editor(editor)) => {
-                let editor = editor.clone();
-                self.render_editor(&editor, cx)
-            }
-            (Section::Theme, _) => self.render_list(window, cx),
-            (Section::Fonts, _) => self.render_fonts(cx),
+        let content = match self.model.section() {
+            Section::Profiles => self.render_profiles(window, cx),
+            Section::Theme => match self.model.themes.editor().cloned() {
+                Some(editor) => self.render_editor(&editor, cx),
+                None => self.render_list(window, cx),
+            },
+            Section::Fonts => self.render_fonts(cx),
         };
         let current = self.model.section();
         // The section list is a vertical tab list: one Tab stop whose
@@ -1927,8 +1556,7 @@ impl Render for SettingsDialog {
                 .when(section == current, |d| d.bg(t.accent).text_color(t.accent_foreground))
                 .when(section != current, |d| d.text_color(t.foreground).hover(|d| d.bg(t.accent.opacity(0.5))))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.model.select_section(section);
-                    this.changed(window, cx);
+                    this.switch_section(|model, text| model.select_section(section, text), window, cx);
                 }))
                 .focus_ring(ring_shown && section == current, ring, window)
                 .child(section.label())
@@ -2022,6 +1650,7 @@ impl Render for SettingsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{BUILTIN_THEMES, builtin_theme};
 
     const CONFIG: &str = r##"# test config
 theme = "mine"
@@ -2039,348 +1668,207 @@ background = "#111111"
 background = "nope"
 "##;
 
-    struct Fixture {
-        dir: PathBuf,
-        path: PathBuf,
+    fn path() -> PathBuf {
+        PathBuf::from("/c/config.toml")
     }
 
-    impl Fixture {
-        fn new(name: &str, text: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("brindle-settings-{}-{name}", std::process::id()));
-            std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("config.toml");
-            std::fs::write(&path, text).unwrap();
-            Self { dir, path }
+    /// The config file as the view reads and writes it, held as text: the
+    /// tests take each step as the view does, with no file.
+    struct File {
+        text: Option<String>,
+    }
+
+    impl File {
+        fn new(text: &str) -> Self {
+            Self { text: Some(text.to_string()) }
         }
 
-        /// A model on the Theme section, where most tests start.
-        fn model(&self, active: &str) -> Model {
-            let mut model = self.opened(active);
-            model.select_section(Section::Theme);
-            model
+        fn read(&self) -> FileText {
+            Ok(self.text.clone())
+        }
+
+        fn text(&self) -> String {
+            self.text.clone().unwrap_or_default()
         }
 
         /// A model as the dialog opens: on the Profiles section.
         fn opened(&self, active: &str) -> Model {
-            Model::new(self.path.clone(), active.into(), BTreeMap::new(), Vec::new(), None)
+            Model::new(path(), &self.read(), active.into(), BTreeMap::new(), Vec::new(), None)
         }
 
-        fn text(&self) -> String {
-            std::fs::read_to_string(&self.path).unwrap()
+        /// A model on the Theme section, where the theme tests start.
+        fn model(&self, active: &str) -> Model {
+            let mut model = self.opened(active);
+            self.section(&mut model, Section::Theme);
+            model
+        }
+
+        fn section(&self, model: &mut Model, section: Section) -> bool {
+            model.select_section(section, &self.read())
+        }
+
+        fn next(&self, model: &mut Model, forward: bool) -> bool {
+            model.next_section(forward, &self.read())
+        }
+
+        fn edge(&self, model: &mut Model, last: bool) -> bool {
+            model.edge_section(last, &self.read())
+        }
+
+        /// Takes `step` as the view does: writes its edit, then reports it.
+        /// A step that closes the dialog isn't one to take here: the tests
+        /// that expect one check the step itself.
+        fn take(&mut self, model: &mut Model, step: Step) -> Outcome {
+            match step {
+                Step::Nothing => Outcome::Nothing,
+                Step::Close => panic!("the dialog closed"),
+                Step::Write(edit) => {
+                    let result = config_edit::edited(self.text.as_deref(), |doc| edit.apply(doc));
+                    let result = result.map(|(text, applied)| {
+                        self.text = Some(text);
+                        applied
+                    });
+                    model.written(&edit, result, &self.read())
+                }
+            }
+        }
+
+        fn confirm(&mut self, model: &mut Model) -> Outcome {
+            let step = model.confirm();
+            self.take(model, step)
+        }
+
+        fn move_profile(&mut self, model: &mut Model, up: bool) -> Outcome {
+            let step = model.move_profile(up);
+            self.take(model, step)
+        }
+
+        /// Presses each of `keys`, which must be list shortcuts, as the
+        /// view runs them.
+        fn key(&self, model: &mut Model, keys: &str) {
+            for k in keys.split(' ') {
+                let op = model.list_key(&Keystroke::parse(k).unwrap());
+                match op.unwrap_or_else(|| panic!("{k} not handled")) {
+                    ListOp::New => model.start_new(),
+                    ListOp::Edit => model.start_edit(),
+                    ListOp::Duplicate => model.start_duplicate(),
+                    ListOp::Delete => model.request_delete(&self.read()),
+                }
+            }
         }
     }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.dir).ok();
-        }
+    /// A second profile after Shell, for the profile operations.
+    fn two_profiles() -> String {
+        CONFIG.replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"Work\"\n")
+    }
+
+    fn selected_theme(model: &Model) -> &str {
+        &model.themes.selected_entry().unwrap().name
     }
 
     fn names(model: &Model) -> Vec<&str> {
-        model.entries.iter().map(|e| e.name.as_str()).collect()
-    }
-
-    fn key(model: &mut Model, keys: &str) {
-        for k in keys.split(' ') {
-            assert!(model.key(&Keystroke::parse(k).unwrap()), "{k} not handled");
-        }
-    }
-
-    /// Edits field `field` as its input would: the model gets the new text.
-    fn type_into(model: &mut Model, field: usize, text: &str) {
-        model.set_field(field, text);
+        model.themes.entries().iter().map(|e| e.name.as_str()).collect()
     }
 
     fn editor(model: &Model) -> &Editor {
-        match &model.mode {
-            Mode::Editor(e) => e,
-            _ => panic!("not editing: {}", model.describe("")),
-        }
-    }
-
-    #[test]
-    fn list_order_and_initial_selection() {
-        let f = Fixture::new("order", CONFIG);
-        let model = f.model("mine");
-        assert_eq!(
-            names(&model),
-            ["brindle-dark", "brindle-light", "tokyo-night", "gruvbox-dark", "solarized-dark", "broken", "mine", "spare"]
-        );
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
-        assert!(model.entries[5].theme.is_err());
-        // Unknown or unreadable active themes fall back to brindle-dark.
-        assert_eq!(f.model("broken").selected_entry().unwrap().name, "brindle-dark");
-        assert_eq!(f.model("nope").selected_entry().unwrap().name, "brindle-dark");
-    }
-
-    #[test]
-    fn moving_skips_unreadable_themes() {
-        let f = Fixture::new("skip", CONFIG);
-        let mut model = f.model("solarized-dark");
-        model.move_selection(true);
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
-        model.move_selection(false);
-        assert_eq!(model.selected_entry().unwrap().name, "solarized-dark");
-        model.select(5);
-        assert_eq!(model.selected_entry().unwrap().name, "solarized-dark");
-        assert_eq!(model.preview(), builtin_theme("solarized-dark"));
+        model.themes.editor().unwrap_or_else(|| panic!("not editing: {}", model.describe("")))
     }
 
     /// The section list's keys: down and up step and wrap (Radix's `loop`),
     /// home and end go to the ends.
     #[test]
     fn section_keys_step_wrap_and_reach_the_ends() {
-        let f = Fixture::new("section-keys", CONFIG);
+        let f = File::new(CONFIG);
         let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
-        assert!(model.next_section(true));
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Theme);
-        assert!(model.next_section(true));
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Fonts);
-        assert!(model.next_section(true));
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Profiles);
-        assert!(model.next_section(false));
+        assert!(f.next(&mut model, false));
         assert_eq!(model.section(), Section::Fonts);
-        assert!(model.edge_section(false));
+        assert!(f.edge(&mut model, false));
         assert_eq!(model.section(), Section::Profiles);
-        assert!(model.edge_section(true));
+        assert!(f.edge(&mut model, true));
         assert_eq!(model.section(), Section::Fonts);
-    }
-
-    #[test]
-    fn home_and_end_select_the_lists_edges() {
-        let f = Fixture::new("edges", CONFIG);
-        let mut model = f.model("mine");
-        model.select_edge(true);
-        assert_eq!(model.selected_entry().unwrap().name, "spare");
-        model.select_edge(false);
-        assert_eq!(model.selected_entry().unwrap().name, "brindle-dark");
     }
 
     #[test]
     fn apply_writes_the_global_theme() {
-        let f = Fixture::new("apply", CONFIG);
+        let mut f = File::new(CONFIG);
         let mut model = f.model("mine");
         model.move_selection(true);
-        assert_eq!(model.confirm(), Outcome::Applied);
+        assert_eq!(f.confirm(&mut model), Outcome::Applied);
         assert_eq!(f.text(), CONFIG.replace("theme = \"mine\"", "theme = \"spare\""));
-    }
-
-    /// A file that can't be read as themes lists the config in effect's
-    /// themes, and the message names the file and the cause.
-    #[test]
-    fn theme_entries_name_the_path_and_cause() {
-        let path = Path::new("/c/config.toml");
-        let fallback = BTreeMap::from([("mine".to_string(), Theme::default())]);
-        let customs = |entries: &[ThemeEntry]| -> Vec<String> {
-            entries.iter().filter(|e| e.custom).map(|e| e.name.clone()).collect()
-        };
-
-        let (entries, note) = theme_entries(path, config_edit::parse("themes = 3\n"), &fallback);
-        assert_eq!(note.as_deref(), Some("themes in /c/config.toml is not a table"));
-        assert_eq!(customs(&entries), ["mine"]);
-        assert_eq!(entries.len(), BUILTIN_THEMES.len() + 1, "the built-ins are listed too");
-
-        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let (entries, note) = theme_entries(path, config_edit::document_from(path, Err(denied)), &BTreeMap::new());
-        assert!(note.as_deref().unwrap().starts_with("reading /c/config.toml: "), "{note:?}");
-        assert!(customs(&entries).is_empty());
-
-        let (entries, note) = theme_entries(path, config_edit::document_from(path, Ok("[oops\n".into())), &fallback);
-        assert!(note.as_deref().unwrap().starts_with("/c/config.toml isn't valid TOML: "), "{note:?}");
-        assert_eq!(customs(&entries), ["mine"]);
-
-        // A file that doesn't exist, or that holds its own themes, has no note.
-        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let (entries, note) = theme_entries(path, config_edit::document_from(path, Err(missing)), &fallback);
-        assert_eq!((note, customs(&entries)), (None, Vec::<String>::new()));
-        let (entries, note) =
-            theme_entries(path, config_edit::parse("[themes.own]\nbackground = \"#000000\"\n"), &fallback);
-        assert_eq!((note, customs(&entries)), (None, vec!["own".to_string()]));
     }
 
     /// The Theme section's error line shows the note once the section is
     /// selected, and drops it on leaving.
     #[test]
     fn the_theme_section_shows_why_its_themes_couldnt_be_read() {
-        let f = Fixture::new("themes-not-a-table", "themes = 3\n");
+        let f = File::new("themes = 3\n");
         let mut model = f.opened("brindle-dark");
         assert_eq!(model.error, None, "the Profiles section is shown first");
-        model.select_section(Section::Theme);
+        f.section(&mut model, Section::Theme);
         let error = model.error.clone().unwrap();
         assert!(error.starts_with("themes in ") && error.ends_with(" is not a table"), "{error}");
-        assert!(model.describe_open("", None).contains("is not a table"));
-        model.select_section(Section::Profiles);
+        assert!(model.describe_open(None, None).contains("is not a table"));
+        f.section(&mut model, Section::Profiles);
         assert_eq!(model.error, None);
     }
 
     #[test]
     fn apply_on_a_malformed_file_keeps_the_dialog() {
-        let f = Fixture::new("malformed", "theme = \"mine\"\n[oops\n");
+        let mut f = File::new("theme = \"mine\"\n[oops\n");
         let mut model = Model::new(
-            f.path.clone(),
+            path(),
+            &f.read(),
             "mine".into(),
             BTreeMap::from([("mine".into(), Theme::default())]),
             Vec::new(),
             None,
         );
-        model.select_section(Section::Theme);
+        f.section(&mut model, Section::Theme);
         // The fallback themes are still listed.
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
+        assert_eq!(selected_theme(&model), "mine");
         model.move_selection(false);
-        assert_eq!(model.confirm(), Outcome::Nothing);
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
         assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
         assert!(model.in_list());
-        assert_eq!(model.selected_entry().unwrap().name, "solarized-dark");
+        assert_eq!(selected_theme(&model), "solarized-dark");
         assert_eq!(f.text(), "theme = \"mine\"\n[oops\n");
     }
 
     #[test]
     fn cancel_closes_from_the_list() {
-        let f = Fixture::new("cancel", CONFIG);
+        let f = File::new(CONFIG);
         let mut model = f.model("mine");
         model.move_selection(true);
-        assert!(model.cancel());
+        assert_eq!(model.cancel(), Step::Close);
         assert_eq!(f.text(), CONFIG);
     }
 
+    /// A theme saved and a theme deleted are written, and the error line
+    /// shows the section's note again, if it has one.
     #[test]
-    fn new_copies_the_selected_theme() {
-        let f = Fixture::new("new", CONFIG);
-        let mut model = f.model("tokyo-night");
-        key(&mut model, "n");
-        let tokyo = builtin_theme("tokyo-night").unwrap();
-        let e = editor(&model);
-        assert_eq!(e.name, "tokyo-night-custom");
-        assert_eq!(e.original, None);
-        assert_eq!(e.current.accent, Some(tokyo.ansi[4]));
-        assert_eq!(e.current, tokyo.with_effective_colors());
-        assert_eq!(model.preview(), Some(tokyo.with_effective_colors()));
-        // Edit on a built-in copies it too.
-        model.cancel();
-        key(&mut model, "e");
-        assert_eq!(editor(&model).name, "tokyo-night-custom");
-    }
-
-    #[test]
-    fn color_edits_preview_and_validate() {
-        let f = Fixture::new("colors", CONFIG);
-        let mut model = f.model("brindle-dark");
-        model.start_new();
-        // Field 2 is the background.
-        type_into(&mut model, 2, "#000");
-        assert_eq!(model.preview().unwrap().background, Color::hex(0));
-        assert!(model.editor_can_save());
-        // Field 3 is the cursor: an invalid value keeps the previous color.
-        let cursor = model.preview().unwrap().cursor;
-        assert_eq!(field_label(3), "Cursor");
-        let text = model.editor_fields().unwrap()[3].clone();
-        model.set_field(3, &text[..text.len() - 1]);
-        assert_eq!(model.preview().unwrap().cursor, cursor);
-        assert!(!model.editor_can_save());
-        let line = model.describe("Cursor");
-        assert!(line.contains("field=\"Cursor\" invalid=[\"Cursor\"]"), "{line}");
-        model.set_field(3, &format!("{}x", &text[..text.len() - 1]));
-        assert_eq!(model.confirm(), Outcome::Nothing);
-        assert!(model.error.is_some());
-        assert_eq!(f.text(), CONFIG);
-    }
-
-    #[test]
-    fn name_rules() {
-        let f = Fixture::new("names", CONFIG);
+    fn theme_writes_reread_the_list() {
+        let mut f = File::new(CONFIG);
         let mut model = f.model("mine");
         model.start_edit();
-        // Keeping its own name is fine.
-        assert!(model.editor_can_save());
-        type_into(&mut model, 0, "spare");
-        assert!(!model.editor_can_save());
-        type_into(&mut model, 0, "tokyo-night");
-        assert!(!model.editor_can_save());
-        assert_eq!(model.confirm(), Outcome::Nothing);
-        assert!(model.error.as_deref().unwrap().contains("built-in"));
-    }
-
-    #[test]
-    fn saving_a_new_theme_keeps_the_global_theme() {
-        let f = Fixture::new("save-new", CONFIG);
-        let mut model = f.model("mine");
-        model.move_selection(true); // spare
-        model.start_new();
-        assert_eq!(model.confirm(), Outcome::Written);
+        model.set_field(FieldId::Name, "ours");
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
         assert!(model.in_list());
-        assert_eq!(model.selected_entry().unwrap().name, "spare-custom");
-        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap().config;
-        assert_eq!(config.theme, "mine");
-        assert_eq!(config.themes["spare-custom"].background, Color::hex(0x111111));
-        assert_eq!(model.preview().unwrap().background, Color::hex(0x111111));
-    }
-
-    #[test]
-    fn renaming_the_active_theme() {
-        let f = Fixture::new("rename", &CONFIG.replace("name = \"Shell\"", "name = \"Shell\"\ntheme = \"mine\""));
-        let mut model = f.model("mine");
+        assert_eq!(selected_theme(&model), "ours");
+        assert!(f.text().contains("theme = \"ours\""), "{}", f.text());
+        // A refused write keeps the editor, with the error.
         model.start_edit();
-        type_into(&mut model, 0, "ours");
-        assert_eq!(model.confirm(), Outcome::Written);
-        let text = f.text();
-        assert!(text.contains("theme = \"ours\"\n\n[[profiles]]"), "{text}");
-        assert!(text.contains("name = \"Shell\"\ntheme = \"ours\""), "{text}");
-        assert!(text.contains("[themes.ours]") && !text.contains("mine"), "{text}");
-        assert_eq!(model.active, "ours");
-        assert_eq!(model.selected_entry().unwrap().name, "ours");
-    }
-
-    #[test]
-    fn discard_restores_the_selection() {
-        let f = Fixture::new("discard", CONFIG);
-        let mut model = f.model("mine");
-        model.move_selection(true);
-        model.start_edit();
-        type_into(&mut model, 2, "#1");
-        assert!(!model.cancel());
-        assert!(model.in_list());
-        assert_eq!(model.selected_entry().unwrap().name, "spare");
-        assert_eq!(model.preview().unwrap().background, Color::hex(0x111111));
-        assert_eq!(f.text(), CONFIG);
-    }
-
-    #[test]
-    fn clearing_the_selection_foreground() {
-        let f = Fixture::new("clear", CONFIG);
-        let mut model = f.model("solarized-dark");
-        model.start_new();
-        assert!(editor(&model).current.selection_foreground.is_some());
-        model.clear_selection_foreground();
-        assert_eq!(model.preview().unwrap().selection_foreground, None);
-        assert!(model.editor_can_save());
-        assert_eq!(model.confirm(), Outcome::Written);
-        assert!(!f.text().contains("selection_foreground"));
-    }
-
-    #[test]
-    fn editor_fields_and_keys() {
-        let f = Fixture::new("fields", CONFIG);
-        let mut model = f.model("mine");
-        assert_eq!(model.editor_fields(), None);
-        model.start_edit();
-        let fields = model.editor_fields().unwrap();
-        assert_eq!(fields.len(), FIELD_COUNT);
-        assert_eq!(fields[0], "mine");
-        assert_eq!(fields[2], "#000000");
-        assert_eq!((field_label(0), field_label(1)), ("name", "Foreground"));
-        // Typing belongs to the inputs; list shortcuts are off, and up and
-        // down leave the editor (the view moves focus between fields).
-        assert!(!model.key(&Keystroke::parse("n").unwrap()));
-        model.move_selection(true);
-        assert_eq!(model.mode_kind(), ModeKind::Editor);
-        type_into(&mut model, 6, "#abcdef");
-        assert!(model.selection_foreground_set());
-        assert_eq!(model.clear_selection_foreground(), Some(6));
-        assert_eq!(selection_foreground_field(), 6);
-        assert_eq!(model.editor_fields().unwrap()[6], "");
-        assert!(!model.selection_foreground_set());
+        let step = model.confirm();
+        let Step::Write(edit) = step else { panic!("a save") };
+        assert_eq!(model.written(&edit, Err("writing: denied".into()), &f.read()), Outcome::Nothing);
+        assert_eq!((model.mode_kind(), model.error.as_deref()), (ModeKind::Editor, Some("writing: denied")));
     }
 
     /// Escape (the overlay's dismiss request) per section and mode: it
@@ -2389,36 +1877,65 @@ background = "nope"
     #[test]
     fn escape_outcome_per_mode() {
         // A second profile, so one can be asked about deleting.
-        let config = CONFIG.replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"Work\"\n");
-        let f = Fixture::new("escape", &config);
+        let config = two_profiles();
+        let f = File::new(&config);
         let mut model = f.opened("mine");
         assert_eq!(model.mode_kind(), ModeKind::List);
 
-        model.select_section(Section::Theme);
-        assert!(model.cancel(), "the theme list closes");
+        f.section(&mut model, Section::Theme);
+        assert_eq!(model.cancel(), Step::Close, "the theme list closes");
         model.start_edit();
-        type_into(&mut model, 2, "#123456");
+        model.set_field(FieldId::Color(1), "#123456");
         assert_eq!(model.mode_kind(), ModeKind::Editor);
-        assert!(!model.cancel(), "the theme editor discards");
+        assert_eq!(model.cancel(), Step::Nothing, "the theme editor discards");
         assert_eq!(model.mode_kind(), ModeKind::List);
         model.select(7);
-        key(&mut model, "d");
+        f.key(&mut model, "d");
         assert_eq!(model.mode_kind(), ModeKind::ConfirmDelete);
-        assert!(!model.cancel(), "the theme delete question goes back to the list");
+        assert_eq!(model.cancel(), Step::Nothing, "the theme delete question goes back to the list");
         assert_eq!(model.mode_kind(), ModeKind::List);
 
-        model.select_section(Section::Profiles);
-        assert!(model.cancel(), "the profile list closes");
-        key(&mut model, "e");
+        f.section(&mut model, Section::Profiles);
+        assert_eq!(model.cancel(), Step::Close, "the profile list closes");
+        f.key(&mut model, "e");
         assert_eq!(model.mode_kind(), ModeKind::Editor);
-        assert!(!model.cancel(), "the profile editor discards");
+        assert_eq!(model.cancel(), Step::Nothing, "the profile editor discards");
         assert_eq!(model.mode_kind(), ModeKind::List);
-        key(&mut model, "d");
+        f.key(&mut model, "d");
         assert_eq!(model.mode_kind(), ModeKind::ConfirmDelete);
-        assert!(!model.cancel(), "the profile delete question goes back to the list");
+        assert_eq!(model.cancel(), Step::Nothing, "the profile delete question goes back to the list");
         assert_eq!(model.mode_kind(), ModeKind::List);
+
+        f.section(&mut model, Section::Fonts);
+        assert_eq!(model.cancel(), Step::Close, "the Fonts form closes");
         // Nothing was written.
         assert_eq!(f.text(), config);
+    }
+
+    /// The list shortcuts, per section and mode: Duplicate is the profile
+    /// list's only; the editor and the form keep their keys, as do
+    /// modified keys.
+    #[test]
+    fn list_keys_per_view() {
+        let f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        let key = |model: &Model, k: &str| model.list_key(&Keystroke::parse(k).unwrap());
+        assert_eq!(key(&model, "n"), Some(ListOp::New));
+        assert_eq!(key(&model, "e"), Some(ListOp::Edit));
+        assert_eq!(key(&model, "c"), Some(ListOp::Duplicate));
+        assert_eq!(key(&model, "d"), Some(ListOp::Delete));
+        assert_eq!(key(&model, "delete"), Some(ListOp::Delete));
+        assert_eq!(key(&model, "ctrl-n"), None);
+        assert_eq!(key(&model, "x"), None);
+        f.section(&mut model, Section::Theme);
+        assert_eq!(key(&model, "c"), None);
+        assert_eq!(key(&model, "alt-e"), None);
+        assert_eq!(key(&model, "e"), Some(ListOp::Edit));
+        model.start_edit();
+        assert_eq!(key(&model, "n"), None, "typing belongs to the editor's inputs");
+        model.cancel();
+        f.section(&mut model, Section::Fonts);
+        assert_eq!(key(&model, "n"), None);
     }
 
     /// Enter on a focused button (or the close `X`) is the button's: the
@@ -2433,80 +1950,180 @@ background = "nope"
     #[test]
     fn footer_buttons_per_view() {
         assert_eq!(
-            footer_buttons(Section::Theme, ModeKind::List),
+            footer_buttons(View::Theme(ListMode::List)),
             [Btn::New, Btn::Edit, Btn::Delete, Btn::Cancel, Btn::Apply]
         );
-        for section in [Section::Theme, Section::Profiles] {
-            assert_eq!(footer_buttons(section, ModeKind::Editor), [Btn::Discard, Btn::Save]);
-            assert_eq!(footer_buttons(section, ModeKind::ConfirmDelete), [Btn::Keep, Btn::ConfirmDelete]);
+        for view in [View::Theme, View::Profiles] {
+            assert_eq!(footer_buttons(view(ListMode::Editor)), [Btn::Discard, Btn::Save]);
+            assert_eq!(footer_buttons(view(ListMode::ConfirmDelete)), [Btn::Keep, Btn::ConfirmDelete]);
         }
-        assert_eq!(footer_buttons(Section::Profiles, ModeKind::List).last(), Some(&Btn::Close));
-        assert_eq!(footer_buttons(Section::Fonts, ModeKind::Form), [Btn::Cancel, Btn::Apply]);
+        assert_eq!(footer_buttons(View::Profiles(ListMode::List)).last(), Some(&Btn::Close));
+        assert_eq!(footer_buttons(View::Fonts), [Btn::Cancel, Btn::Apply]);
         // Ids are unique, so the shared handles never meet in one view.
         let ids: std::collections::HashSet<_> = BUTTONS.iter().map(|b| b.id()).collect();
         assert_eq!(ids.len(), BUTTONS.len());
         assert_eq!(Btn::Discard.label(), "Discard");
     }
 
+    /// Which buttons can be pressed, per section: the theme list's Delete
+    /// only on a custom theme, Clear and Save as the editor allows, the
+    /// profile list's by the selection and the file, and the Fonts form's
+    /// Apply while its fields are valid.
+    #[test]
+    fn buttons_are_enabled_per_view() {
+        let mut f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        // Shell, the first of two, is selected.
+        assert!(model.enabled(Btn::New) && model.enabled(Btn::Edit) && model.enabled(Btn::Delete));
+        assert!(!model.enabled(Btn::Up) && model.enabled(Btn::Down));
+        model.select(1);
+        assert!(model.enabled(Btn::Up) && !model.enabled(Btn::Down));
+        model.start_edit();
+        assert!(model.enabled(Btn::Save));
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::Name, "");
+        assert!(!model.enabled(Btn::Save));
+        model.cancel();
+        let read_only = File::new("[oops\n").opened("mine");
+        for b in [Btn::New, Btn::Duplicate, Btn::Edit, Btn::Delete, Btn::Up, Btn::Down] {
+            assert!(!read_only.enabled(b), "{b:?}");
+        }
+        assert!(read_only.enabled(Btn::Close));
+
+        f.section(&mut model, Section::Theme);
+        assert!(model.enabled(Btn::Delete), "mine is custom");
+        model.select(0);
+        assert!(!model.enabled(Btn::Delete), "a built-in");
+        model.start_new();
+        assert!(model.enabled(Btn::Save) && !model.enabled(Btn::Clear));
+        model.set_field(FieldId::selection_foreground(), "#abcdef");
+        assert!(model.enabled(Btn::Clear));
+        model.cancel();
+
+        f.section(&mut model, Section::Fonts);
+        assert!(model.enabled(Btn::Apply) && model.enabled(Btn::Cancel));
+        model.fonts.set_text(fonts::FontField::Size, "200");
+        assert!(!model.enabled(Btn::Apply));
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
+    }
+
+    #[test]
+    fn the_active_row_is_the_global_themes() {
+        let f = File::new(CONFIG);
+        let model = f.model("mine");
+        let active = model.active_row().unwrap();
+        assert_eq!(model.themes.entries()[active].name, "mine");
+        assert_eq!(f.model("broken").active_row(), None, "an unreadable theme isn't marked");
+        assert_eq!(f.model("nope").active_row(), None);
+    }
+
+    /// Focus moves to the new view's first control when the view changes,
+    /// and off a control that is gone; an open menu holds it, and so does
+    /// the section list while the sections change under it.
+    #[test]
+    fn focus_follows_the_view() {
+        let facts = |menu_open, on_sections, valid| FocusFacts { menu_open, on_sections, valid };
+        let list = View::Theme(ListMode::List);
+        let editor = View::Theme(ListMode::Editor);
+        let profiles = View::Profiles(ListMode::List);
+        assert_eq!(focus_target(list, list, facts(false, false, true)), FocusMove::Stay);
+        assert_eq!(focus_target(list, list, facts(false, false, false)), FocusMove::Default, "off a stop that went");
+        assert_eq!(focus_target(list, editor, facts(false, false, true)), FocusMove::Default, "an editor opened");
+        assert_eq!(focus_target(list, list, facts(true, false, false)), FocusMove::Stay, "an open menu holds it");
+        assert_eq!(focus_target(list, editor, facts(true, false, true)), FocusMove::Default, "unless the view changed");
+        // On the section list.
+        assert_eq!(focus_target(list, profiles, facts(false, true, true)), FocusMove::Stay, "choosing a section");
+        assert_eq!(focus_target(list, list, facts(false, true, false)), FocusMove::Stay);
+        assert_eq!(focus_target(list, editor, facts(false, true, true)), FocusMove::Default, "a list key opened an editor");
+        assert_eq!(View::Fonts.kind(), ModeKind::Form);
+        assert_eq!((editor.section(), editor.kind()), (Section::Theme, ModeKind::Editor));
+    }
+
     #[test]
     fn switching_sections() {
-        let f = Fixture::new("sections", CONFIG);
+        let f = File::new(CONFIG);
         let mut model = f.model("mine");
         assert_eq!(model.section(), Section::Theme);
         // An unapplied preview is dropped on leaving Theme.
         model.move_selection(true);
-        assert_eq!(model.selected_entry().unwrap().name, "spare");
-        assert!(model.next_section(false));
+        assert_eq!(selected_theme(&model), "spare");
+        assert!(f.next(&mut model, false));
         assert_eq!(model.section(), Section::Profiles);
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
+        assert_eq!(selected_theme(&model), "mine");
         assert!(model.describe("").starts_with("--- settings section=Profiles mode=list selected=\"Shell\""), "{}", model.describe(""));
         // Escape in the profile list closes the dialog.
-        assert!(model.cancel());
+        assert_eq!(model.cancel(), Step::Close);
         // A dirty profile editor holds the section; a clean one doesn't.
-        key(&mut model, "e");
+        f.key(&mut model, "e");
         assert!(!model.in_list());
-        assert!(model.select_section(Section::Theme));
+        assert!(f.section(&mut model, Section::Theme));
         assert!(model.in_list());
-        model.select_section(Section::Profiles);
-        key(&mut model, "e");
+        f.section(&mut model, Section::Profiles);
+        f.key(&mut model, "e");
         model.profiles.editor_mut().unwrap().set_text(profiles::Field::Cwd, "~/src");
-        assert!(!model.select_section(Section::Theme));
+        assert!(!f.section(&mut model, Section::Theme));
         assert_eq!(model.section(), Section::Profiles);
         assert!(model.error.as_deref().unwrap().contains("Save or discard"));
         // The same for the theme editor.
         model.cancel();
-        model.select_section(Section::Theme);
+        f.section(&mut model, Section::Theme);
         model.start_edit();
-        type_into(&mut model, 2, "#123456");
-        assert!(!model.next_section(true));
+        model.set_field(FieldId::Color(1), "#123456");
+        assert!(!f.next(&mut model, true));
         assert_eq!(f.text(), CONFIG);
+    }
+
+    /// Entering the Profiles section rereads the file, and keeps the
+    /// selected profile by its key; one that is gone gives way to the one
+    /// in its place.
+    #[test]
+    fn entering_profiles_keeps_the_selection_by_key() {
+        let mut f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        model.select(1);
+        f.section(&mut model, Section::Theme);
+        // A profile added before Work, elsewhere.
+        f.text = Some(two_profiles().replace("name = \"Shell\"\n", "name = \"Shell\"\n\n[[profiles]]\nname = \"New\"\n"));
+        f.section(&mut model, Section::Profiles);
+        assert_eq!(model.profiles.selected_entry().unwrap().name, "Work");
+        assert_eq!(model.profiles.selected_index(), Some(2));
+        // Work renamed elsewhere: the one in its place.
+        f.section(&mut model, Section::Theme);
+        f.text = Some(f.text().replace("name = \"Work\"", "name = \"Job\""));
+        f.section(&mut model, Section::Profiles);
+        assert_eq!(model.profiles.selected_entry().unwrap().name, "Job");
+        // Gone, and the list shorter: the last.
+        f.section(&mut model, Section::Theme);
+        f.text = Some(CONFIG.to_string());
+        f.section(&mut model, Section::Profiles);
+        assert_eq!(model.profiles.selected_entry().unwrap().name, "Shell");
     }
 
     #[test]
     fn opens_on_profiles_and_sections_wrap() {
-        let f = Fixture::new("section-order", CONFIG);
+        let f = File::new(CONFIG);
         let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
         assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme", "Fonts"]);
         assert!(model.in_list());
-        assert!(model.next_section(true));
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Theme);
         // The theme list shows the active theme.
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
-        assert!(model.next_section(true));
+        assert_eq!(selected_theme(&model), "mine");
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Fonts);
         assert_eq!(model.mode_kind(), ModeKind::Form);
-        assert!(model.next_section(true));
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Profiles);
-        assert!(model.next_section(false));
+        assert!(f.next(&mut model, false));
         assert_eq!(model.section(), Section::Fonts);
         assert_eq!(f.text(), CONFIG);
     }
 
-    fn fonts_model(f: &Fixture) -> Model {
+    fn fonts_model(f: &File) -> Model {
         let installed = ["Cascadia Mono", "Consolas", "Inter"].map(String::from).to_vec();
-        let mut model = f.opened("mine").with_fonts((FontConfig::default(), UiFontConfig::default()), installed);
-        assert!(model.select_section(Section::Fonts));
+        let mut model =
+            f.opened("mine").with_fonts(&f.read(), (FontConfig::default(), UiFontConfig::default()), installed);
+        assert!(f.section(&mut model, Section::Fonts));
         model
     }
 
@@ -2514,32 +2131,32 @@ background = "nope"
     /// go back to the file's values.
     #[test]
     fn leaving_fonts_drops_the_changes() {
-        let f = Fixture::new("fonts-leave", "[font]\nsize = 13\n");
+        let f = File::new("[font]\nsize = 13\n");
         let mut model = fonts_model(&f);
         assert_eq!(model.font_preview(), None);
         model.fonts.set_text(fonts::FontField::Size, "18");
         assert_eq!(model.font_preview(), Some(FontPreview { size: Some(18.0), ..Default::default() }));
         assert!(model.describe("Size").starts_with("--- settings section=Fonts mode=form "), "{}", model.describe(""));
         // Nothing holds the section.
-        assert!(model.select_section(Section::Theme));
+        assert!(f.section(&mut model, Section::Theme));
         assert_eq!(model.font_preview(), None);
         assert!(model.in_list());
-        assert!(model.select_section(Section::Fonts));
+        assert!(f.section(&mut model, Section::Fonts));
         assert_eq!(model.fonts.size, "13");
         assert_eq!(model.font_preview(), None);
         assert_eq!(f.text(), "[font]\nsize = 13\n");
         // Escape closes the dialog; the view ends the preview.
-        assert!(model.cancel());
+        assert_eq!(model.cancel(), Step::Close);
     }
 
     /// Fonts are reread from the file each time the section is shown.
     #[test]
     fn entering_fonts_rereads_the_file() {
-        let f = Fixture::new("fonts-reread", "[font]\nsize = 13\n");
+        let mut f = File::new("[font]\nsize = 13\n");
         let mut model = fonts_model(&f);
-        model.select_section(Section::Theme);
-        std::fs::write(&f.path, "[font]\nsize = 15\n[ui_font]\nfamily = [\"Inter\"]\n").unwrap();
-        model.select_section(Section::Fonts);
+        f.section(&mut model, Section::Theme);
+        f.text = Some("[font]\nsize = 15\n[ui_font]\nfamily = [\"Inter\"]\n".into());
+        f.section(&mut model, Section::Fonts);
         assert_eq!(model.fonts.size, "15");
         assert_eq!(model.fonts.ui, crate::settings::FamilyChoice::Family("Inter".into()));
     }
@@ -2548,38 +2165,325 @@ background = "nope"
     /// writing; an invalid field keeps the dialog with the error.
     #[test]
     fn applying_fonts() {
-        let f = Fixture::new("fonts-apply", "# mine\n[font]\nsize = 13\n");
+        let mut f = File::new("# mine\n[font]\nsize = 13\n");
         let mut model = fonts_model(&f);
-        assert_eq!(model.confirm(), Outcome::Close);
+        assert_eq!(model.confirm(), Step::Close);
         assert_eq!(f.text(), "# mine\n[font]\nsize = 13\n");
         model.fonts.set_text(fonts::FontField::Size, "200");
-        assert_eq!(model.confirm(), Outcome::Nothing);
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
         assert!(model.error.is_some());
         assert_eq!(f.text(), "# mine\n[font]\nsize = 13\n");
         model.fonts.set_text(fonts::FontField::Size, "20");
-        assert_eq!(model.confirm(), Outcome::Applied);
+        assert_eq!(f.confirm(&mut model), Outcome::Applied);
         assert_eq!(model.error, None);
         assert_eq!(f.text(), "# mine\n[font]\nsize = 20\n");
         // The list keys do nothing in the form.
         let before = model.describe("");
         model.move_selection(true);
         model.select_edge(true);
-        assert!(!model.key(&Keystroke::parse("n").unwrap()));
+        assert_eq!(model.list_key(&Keystroke::parse("n").unwrap()), None);
         model.start_new();
         model.start_edit();
-        model.request_delete();
+        model.request_delete(&f.read());
         assert_eq!(model.describe(""), before);
         assert_eq!(model.mode_kind(), ModeKind::Form);
     }
 
     #[test]
+    fn duplicating_opens_a_copy_only_in_the_profile_list() {
+        let f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        model.start_duplicate();
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        assert_eq!(model.profiles.editor().unwrap().text(profiles::Field::Name), "Shell copy");
+        // Not from the editor, nor from another section.
+        model.start_duplicate();
+        assert_eq!(model.profiles.editor().unwrap().text(profiles::Field::Name), "Shell copy");
+        model.cancel();
+        f.section(&mut model, Section::Theme);
+        model.start_duplicate();
+        assert!(model.in_list());
+        assert_eq!(f.text(), two_profiles());
+    }
+
+    #[test]
+    fn moving_a_profile_writes_it_one_place_on() {
+        let mut f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        // Shell, the first, is selected: up has nowhere to go.
+        assert_eq!(model.move_profile(true), Step::Nothing);
+        assert_eq!(
+            model.move_profile(false),
+            Step::Write(ConfigEdit::MoveProfile {
+                at: config_edit::ProfileRef { index: 0, name: Some("Shell".into()) },
+                up: false
+            })
+        );
+        assert_eq!(f.move_profile(&mut model, false), Outcome::Written);
+        assert_eq!(model.profiles.selected_entry().unwrap().name, "Shell");
+        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap().config;
+        assert_eq!(config.profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Work", "Shell"]);
+        // Only in the Profiles section.
+        f.section(&mut model, Section::Theme);
+        assert_eq!(model.move_profile(true), Step::Nothing);
+    }
+
+    /// The themes a profile can choose: the readable ones, built-ins first,
+    /// each once.
+    #[test]
+    fn theme_names_are_the_readable_themes() {
+        let f = File::new(CONFIG);
+        let model = f.opened("mine");
+        let builtins: Vec<String> = BUILTIN_THEMES.iter().map(|t| t.to_string()).collect();
+        assert_eq!(model.theme_names(), [builtins.clone(), vec!["mine".to_string(), "spare".to_string()]].concat());
+        // A custom theme named like a built-in is listed once.
+        let f = File::new("[themes.tokyo-night]\nbackground = \"#000000\"\n");
+        assert_eq!(f.opened("mine").theme_names(), builtins);
+    }
+
+    #[test]
+    fn renames_are_taken_once() {
+        let mut f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        assert!(model.take_renames().is_empty());
+        f.key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::Name, "Main");
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
+        assert_eq!(model.take_renames(), [("Shell".to_string(), "Main".to_string())]);
+        assert!(model.take_renames().is_empty());
+    }
+
+    /// The profile preview shows only while the Profiles section edits a
+    /// saved profile.
+    #[test]
+    fn the_profile_preview_is_the_profile_sections() {
+        let f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        assert!(model.profile_preview().is_none());
+        f.key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::FontSize, "18");
+        let (name, profile) = model.profile_preview().unwrap();
+        assert_eq!((name.as_str(), profile.font_size), ("Shell", Some(18.0)));
+        model.cancel();
+        assert!(model.profile_preview().is_none());
+        f.section(&mut model, Section::Theme);
+        assert!(model.profile_preview().is_none());
+    }
+
+    /// What each write tells the view: a theme or profile edit keeps the
+    /// dialog, the global theme and the fonts close it.
+    #[test]
+    fn writes_keep_or_close_the_dialog() {
+        let mut f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        f.key(&mut model, "d");
+        assert_eq!(f.confirm(&mut model), Outcome::Written, "a profile deleted");
+        assert_eq!(model.profiles.entries().len(), 1);
+        f.section(&mut model, Section::Theme);
+        model.select(7);
+        f.key(&mut model, "d");
+        assert_eq!(f.confirm(&mut model), Outcome::Written, "a theme deleted");
+        assert_eq!(selected_theme(&model), "mine", "the one in its place, the last readable");
+        model.select(0);
+        assert_eq!(f.confirm(&mut model), Outcome::Applied, "the global theme set");
+        f.section(&mut model, Section::Fonts);
+        model.fonts.set_text(fonts::FontField::Size, "20");
+        assert_eq!(f.confirm(&mut model), Outcome::Applied, "the fonts set");
+        assert!(f.text().contains("theme = \"brindle-dark\"") && f.text().contains("size = 20"), "{}", f.text());
+    }
+
+    #[test]
+    fn list_order_and_initial_selection() {
+        let f = File::new(CONFIG);
+        let model = f.model("mine");
+        assert_eq!(
+            names(&model),
+            ["brindle-dark", "brindle-light", "tokyo-night", "gruvbox-dark", "solarized-dark", "broken", "mine", "spare"]
+        );
+        assert_eq!(selected_theme(&model), "mine");
+        assert!(model.themes.entries()[5].theme.is_err());
+        // Unknown or unreadable active themes fall back to brindle-dark.
+        assert_eq!(selected_theme(&f.model("broken")), "brindle-dark");
+        assert_eq!(selected_theme(&f.model("nope")), "brindle-dark");
+    }
+
+    #[test]
+    fn moving_skips_unreadable_themes() {
+        let f = File::new(CONFIG);
+        let mut model = f.model("solarized-dark");
+        model.move_selection(true);
+        assert_eq!(selected_theme(&model), "mine");
+        model.move_selection(false);
+        assert_eq!(selected_theme(&model), "solarized-dark");
+        model.select(5);
+        assert_eq!(selected_theme(&model), "solarized-dark");
+        assert_eq!(model.preview(), builtin_theme("solarized-dark"));
+    }
+
+    #[test]
+    fn home_and_end_select_the_lists_edges() {
+        let f = File::new(CONFIG);
+        let mut model = f.model("mine");
+        model.select_edge(true);
+        assert_eq!(selected_theme(&model), "spare");
+        model.select_edge(false);
+        assert_eq!(selected_theme(&model), "brindle-dark");
+    }
+
+    #[test]
+    fn new_copies_the_selected_theme() {
+        let f = File::new(CONFIG);
+        let mut model = f.model("tokyo-night");
+        f.key(&mut model, "n");
+        let tokyo = builtin_theme("tokyo-night").unwrap();
+        let e = editor(&model);
+        assert_eq!(e.name, "tokyo-night-custom");
+        assert_eq!(e.original, None);
+        assert_eq!(e.current.accent, Some(tokyo.ansi[4]));
+        assert_eq!(e.current, tokyo.with_effective_colors());
+        assert_eq!(model.preview(), Some(tokyo.with_effective_colors()));
+        // Edit on a built-in copies it too.
+        model.cancel();
+        f.key(&mut model, "e");
+        assert_eq!(editor(&model).name, "tokyo-night-custom");
+    }
+
+    #[test]
+    fn color_edits_preview_and_validate() {
+        let mut f = File::new(CONFIG);
+        let mut model = f.model("brindle-dark");
+        model.start_new();
+        // Color 1 is the background.
+        model.set_field(FieldId::Color(1), "#000");
+        assert_eq!(model.preview().unwrap().background, Color::hex(0));
+        assert!(model.themes.editor_can_save());
+        // Color 2 is the cursor: an invalid value keeps the previous color.
+        let cursor = model.preview().unwrap().cursor;
+        assert_eq!(themes::field_label(FieldId::Color(2)), Some("Cursor"));
+        let (field, text) = model.editor_fields().unwrap()[3].clone();
+        assert_eq!(field, FieldId::Color(2));
+        model.set_field(field, &text[..text.len() - 1]);
+        assert_eq!(model.preview().unwrap().cursor, cursor);
+        assert!(!model.themes.editor_can_save());
+        let line = model.describe("Cursor");
+        assert!(line.contains("field=\"Cursor\" invalid=[\"Cursor\"]"), "{line}");
+        model.set_field(field, &format!("{}x", &text[..text.len() - 1]));
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
+        assert!(model.error.is_some());
+        assert_eq!(f.text(), CONFIG);
+    }
+
+    #[test]
+    fn name_rules() {
+        let mut f = File::new(CONFIG);
+        let mut model = f.model("mine");
+        model.start_edit();
+        // Keeping its own name is fine.
+        assert!(model.themes.editor_can_save());
+        model.set_field(FieldId::Name, "spare");
+        assert!(!model.themes.editor_can_save());
+        model.set_field(FieldId::Name, "tokyo-night");
+        assert!(!model.themes.editor_can_save());
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
+        assert!(model.error.as_deref().unwrap().contains("built-in"));
+    }
+
+    #[test]
+    fn saving_a_new_theme_keeps_the_global_theme() {
+        let mut f = File::new(CONFIG);
+        let mut model = f.model("mine");
+        model.move_selection(true); // spare
+        model.start_new();
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
+        assert!(model.in_list());
+        assert_eq!(selected_theme(&model), "spare-custom");
+        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap().config;
+        assert_eq!(config.theme, "mine");
+        assert_eq!(config.themes["spare-custom"].background, Color::hex(0x111111));
+        assert_eq!(model.preview().unwrap().background, Color::hex(0x111111));
+    }
+
+    #[test]
+    fn renaming_the_active_theme() {
+        let mut f = File::new(&CONFIG.replace("name = \"Shell\"", "name = \"Shell\"\ntheme = \"mine\""));
+        let mut model = f.model("mine");
+        model.start_edit();
+        model.set_field(FieldId::Name, "ours");
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
+        let text = f.text();
+        assert!(text.contains("theme = \"ours\"\n\n[[profiles]]"), "{text}");
+        assert!(text.contains("name = \"Shell\"\ntheme = \"ours\""), "{text}");
+        assert!(text.contains("[themes.ours]") && !text.contains("mine"), "{text}");
+        assert_eq!(model.themes.active(), "ours");
+        assert_eq!(selected_theme(&model), "ours");
+    }
+
+    #[test]
+    fn discard_restores_the_selection() {
+        let f = File::new(CONFIG);
+        let mut model = f.model("mine");
+        model.move_selection(true);
+        model.start_edit();
+        model.set_field(FieldId::Color(1), "#1");
+        assert_eq!(model.cancel(), Step::Nothing);
+        assert!(model.in_list());
+        assert_eq!(selected_theme(&model), "spare");
+        assert_eq!(model.preview().unwrap().background, Color::hex(0x111111));
+        assert_eq!(f.text(), CONFIG);
+    }
+
+    #[test]
+    fn clearing_the_selection_foreground() {
+        let mut f = File::new(CONFIG);
+        let mut model = f.model("solarized-dark");
+        model.start_new();
+        assert!(editor(&model).current.selection_foreground.is_some());
+        model.clear_selection_foreground();
+        assert_eq!(model.preview().unwrap().selection_foreground, None);
+        assert!(model.themes.editor_can_save());
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
+        assert!(!f.text().contains("selection_foreground"));
+    }
+
+    #[test]
+    fn editor_fields_and_keys() {
+        let f = File::new(CONFIG);
+        let mut model = f.model("mine");
+        assert_eq!(model.editor_fields(), None);
+        model.start_edit();
+        let fields = model.editor_fields().unwrap();
+        assert_eq!(fields.len(), 1 + SLOTS.len());
+        assert_eq!(fields[0], (FieldId::Name, "mine".to_string()));
+        assert_eq!(fields[2], (FieldId::Color(1), "#000000".to_string()));
+        assert_eq!(
+            (themes::field_label(FieldId::Name), themes::field_label(FieldId::Color(0))),
+            (Some("name"), Some("Foreground"))
+        );
+        assert_eq!(themes::field_label(FieldId::Color(SLOTS.len())), None);
+        // Typing belongs to the inputs; list shortcuts are off, and up and
+        // down leave the editor (the view moves focus between fields).
+        assert_eq!(model.list_key(&Keystroke::parse("n").unwrap()), None);
+        model.move_selection(true);
+        assert_eq!(model.mode_kind(), ModeKind::Editor);
+        model.set_field(FieldId::Color(5), "#abcdef");
+        assert!(model.enabled(Btn::Clear));
+        assert_eq!(model.clear_selection_foreground(), Some(FieldId::Color(5)));
+        assert_eq!(FieldId::selection_foreground(), FieldId::Color(5));
+        assert_eq!(model.editor_fields().unwrap()[6], (FieldId::Color(5), String::new()));
+        assert!(!model.enabled(Btn::Clear));
+        // The dump names the focused field, and nothing for none.
+        assert!(model.describe_open(Some("Cursor"), None).contains("field=\"Cursor\""));
+        assert!(model.describe_open(None, None).contains("field=\"\""));
+    }
+
+    #[test]
     fn copies_save_the_derived_search_colors() {
-        let f = Fixture::new("search-colors", CONFIG);
+        let mut f = File::new(CONFIG);
         let mut model = f.model("tokyo-night");
         model.start_new();
         let tokyo = builtin_theme("tokyo-night").unwrap();
         assert_eq!(editor(&model).current.search_focused_match_background, Some(tokyo.ansi[3]));
-        assert_eq!(model.confirm(), Outcome::Written);
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
         let text = f.text();
         let (match_bg, match_fg) = tokyo.search_match();
         for (key, color) in [
@@ -2594,26 +2498,26 @@ background = "nope"
 
     #[test]
     fn deleting_themes() {
-        let f = Fixture::new("delete", CONFIG);
+        let mut f = File::new(CONFIG);
         let mut model = f.model("mine");
         // In use as the global theme.
-        key(&mut model, "d");
+        f.key(&mut model, "d");
         assert!(model.in_list());
         assert!(model.error.as_deref().unwrap().contains("the global theme"));
         // Built-ins can't be deleted.
         model.select(0);
-        key(&mut model, "d");
+        f.key(&mut model, "d");
         assert!(model.error.as_deref().unwrap().contains("built-in"));
         // An unused one goes after confirming.
         model.select(7);
-        key(&mut model, "delete");
+        f.key(&mut model, "delete");
         assert!(model.describe("").contains("mode=confirm-delete theme=\"spare\""));
-        assert!(!model.cancel());
+        assert_eq!(model.cancel(), Step::Nothing);
         assert_eq!(f.text(), CONFIG);
-        key(&mut model, "d");
-        assert_eq!(model.confirm(), Outcome::Written);
+        f.key(&mut model, "d");
+        assert_eq!(f.confirm(&mut model), Outcome::Written);
         assert!(!f.text().contains("spare"));
         assert!(!names(&model).contains(&"spare"));
-        assert_eq!(model.selected_entry().unwrap().name, "mine");
+        assert_eq!(selected_theme(&model), "mine");
     }
 }

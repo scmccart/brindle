@@ -129,25 +129,25 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 7. Settings dialog
 
-- [ ] 7.1 Add `ConfigEdit` and `Applied` in `config_edit.rs`, with `apply` calling the existing functions. Verify with one unit test per variant on a parsed document.
-- [ ] 7.2 Add `ThemesState` in `settings_dialog/themes.rs`. `Model` becomes `{ section, themes, profiles, fonts, error }`, with a mode per section. Verify with the existing `settings_dialog::` tests, moved (b04 #5, #11).
-- [ ] 7.3 The models take the file's text and return `Step`, and the view writes and then calls `written`. Verify with unit tests that each operation returns the expected `ConfigEdit` without touching a file (b04 #1, #2; b05 `fonts.rs:196`, `:293`, `profiles.rs:558`, `:715`, `:769`, `:778`).
-- [ ] 7.4 Selection is kept by theme name and `ProfileKey`, `Target { New, Saved }` is added, and a `ProfileRef` is built only where it is written. Verify with unit tests in which a reload keeps the selection by key, and a deleted key falls back by position (b04 #7, b05 `profiles.rs:249-251`, `:520-530`, b00 #11).
-- [ ] 7.5 Move the decisions out of the view:
+- [x] 7.1 Add `ConfigEdit` and `Applied` in `config_edit.rs`, with `apply` calling the existing functions. Verify with one unit test per variant on a parsed document.
+- [x] 7.2 Add `ThemesState` in `settings_dialog/themes.rs`. `Model` becomes `{ section, themes, profiles, fonts, error }`, with a mode per section. Verify with the existing `settings_dialog::` tests, moved (b04 #5, #11).
+- [x] 7.3 The models take the file's text and return `Step`, and the view writes and then calls `written`. Verify with unit tests that each operation returns the expected `ConfigEdit` without touching a file (b04 #1, #2; b05 `fonts.rs:196`, `:293`, `profiles.rs:558`, `:715`, `:769`, `:778`).
+- [x] 7.4 Selection is kept by theme name and `ProfileKey`, `Target { New, Saved }` is added, and a `ProfileRef` is built only where it is written. Verify with unit tests in which a reload keeps the selection by key, and a deleted key falls back by position (b04 #7, b05 `profiles.rs:249-251`, `:520-530`, b00 #11).
+- [x] 7.5 Move the decisions out of the view:
   - `Model::enabled`, `active_row` and `focus_target`;
   - `ProfilesState::rows`, `editor_title`, `default_note` and `theme_labels`;
   - `FontsState::choice_for`.
 
   Verify with unit tests (b04 #3, #4; b05's `fcis R1` and `R10` sites).
-- [ ] 7.6 Clean up the types:
+- [x] 7.6 Clean up the types:
   - `FieldId { Name, Color(usize) }`;
   - `focused_label`/`field_label -> Option` (the dump prints `""`);
   - remove `Choice`;
   - a blank profile name is `None`.
 
   Verify with unit tests, and that the `--- settings` dump lines are unchanged (b04 #8, #9, #10, b05 `profiles.rs:575-579`).
-- [ ] 7.7 Add the tests that are missing: `start_duplicate`, `move_profile`, `theme_names`, `take_renames`, `profile_preview`, `move_selection`, `describe` in `ConfirmDelete`, and `command_groups`. Verify with `cargo test --locked -p brindle settings_dialog::` (b04 #6, b05 `profiles.rs:627`, `fonts.rs:478`).
-- [ ] 7.8 Name the models in `CLAUDE.md`'s settings paragraph, and verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- settings`.
+- [x] 7.7 Add the tests that are missing: `start_duplicate`, `move_profile`, `theme_names`, `take_renames`, `profile_preview`, `move_selection`, `describe` in `ConfirmDelete`, and `command_groups`. Verify with `cargo test --locked -p brindle settings_dialog::` (b04 #6, b05 `profiles.rs:627`, `fonts.rs:478`).
+- [x] 7.8 Name the models in `CLAUDE.md`'s settings paragraph, and verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- settings`.
 
 ## Workflow follow-up
 
