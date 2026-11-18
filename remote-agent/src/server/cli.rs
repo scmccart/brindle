@@ -425,4 +425,125 @@ mod tests {
         assert_eq!(uptime(65), "1m05s");
         assert_eq!(uptime(7322), "2h02m");
     }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// A core with two holders, the second of another build and draining.
+    fn server_status() -> ServerStatus {
+        use brindle_remote_protocol::client::HolderStatus;
+        use brindle_remote_protocol::version::VersionRange;
+
+        ServerStatus {
+            req: 7,
+            core_version: "0.3.0".into(),
+            core_build: "4f2a91".into(),
+            protocols: VersionRange::new(1, 3),
+            holder_protocols: VersionRange::new(1, 2),
+            pid: 4242,
+            uptime_secs: 65,
+            clients: 2,
+            holders: vec![
+                HolderStatus {
+                    pid: 10,
+                    build: "4f2a91".into(),
+                    protocol: 2,
+                    sessions: 3,
+                    draining: false,
+                },
+                HolderStatus {
+                    pid: 11,
+                    build: "0be1d7".into(),
+                    protocol: 1,
+                    sessions: 1,
+                    draining: true,
+                },
+            ],
+        }
+    }
+
+    /// `status`: the core's line, its protocols, and a line per holder,
+    /// a draining one marked so.
+    #[test]
+    fn status_text_names_the_core_and_each_holder() {
+        assert_eq!(
+            status_text(&server_status()),
+            "core: version 0.3.0, build 4f2a91, pid 4242, up 1m05s, 2 client(s)\n\
+             protocols: client 1–3, holder H1–2\n\
+             holder: pid 10, build 4f2a91, H2, 3 session(s)\n\
+             holder: pid 11, build 0be1d7, H1, 1 session(s), draining\n"
+        );
+        let alone = ServerStatus {
+            holders: Vec::new(),
+            ..server_status()
+        };
+        assert_eq!(
+            status_text(&alone),
+            "core: version 0.3.0, build 4f2a91, pid 4242, up 1m05s, 2 client(s)\n\
+             protocols: client 1–3, holder H1–2\n"
+        );
+    }
+
+    /// `status --json`: `SERVER_STATUS` as it is, without its `req` and
+    /// with `running`, which a missing server's `{"running":false}` has
+    /// too.
+    #[test]
+    fn status_json_drops_the_request_and_adds_running() {
+        let text = status_json(&server_status()).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value.get("req"), None);
+        assert_eq!(value["running"], Value::Bool(true));
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["holders"][1]["draining"], true);
+
+        let mut expected = serde_json::to_value(server_status()).unwrap();
+        let object = expected.as_object_mut().unwrap();
+        object.remove("req");
+        object.insert("running".into(), Value::Bool(true));
+        assert_eq!(value, expected);
+    }
+
+    /// `list` and `status` take `--json` and nothing else.
+    #[test]
+    fn json_flag_takes_json_alone() {
+        assert_eq!(json_flag("list", &args(&[])), Ok(false));
+        assert_eq!(json_flag("list", &args(&["--json"])), Ok(true));
+        let usage = Err("usage: brindle-remote status [--json]".to_string());
+        for refused in [
+            &["--yaml"][..],
+            &["--json", "--json"],
+            &["--json", "extra"],
+            &["extra", "--json"],
+            &["json"],
+        ] {
+            assert_eq!(json_flag("status", &args(refused)), usage, "{refused:?}");
+        }
+    }
+
+    /// `stop` takes no arguments; any is refused with the usage.
+    #[test]
+    fn no_args_refuses_any_argument() {
+        assert_eq!(no_args("stop", &[]), Ok(()));
+        let refused = Err(format!("stop takes no arguments\n{USAGE}"));
+        assert_eq!(no_args("stop", &args(&["now"])), refused);
+        assert_eq!(no_args("stop", &args(&["--json"])), refused);
+        assert_eq!(no_args("stop", &args(&[""])), refused);
+    }
+
+    /// An unexpected answer: an `ERROR` says its message, any other is
+    /// named by its debug text.
+    #[test]
+    fn unexpected_answers_say_the_errors_message_or_name_the_answer() {
+        let error = ToClient::Error(client::ErrorMessage {
+            req: Some(1),
+            session: None,
+            message: "no session 9".into(),
+        });
+        assert_eq!(unexpected(&error), "no session 9");
+        assert_eq!(
+            unexpected(&ToClient::Ok(Request { req: 3 })),
+            "unexpected answer from the core: Ok(Request { req: 3 })"
+        );
+    }
 }

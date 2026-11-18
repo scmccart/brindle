@@ -61,8 +61,9 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::PCWSTR;
 
+use super::super::wait::millis;
 use super::conn::Stream;
-use super::event_loop::{Port, Source, Watched, millis, os_error, win32};
+use super::event_loop::{Port, Source, Watched, os_error, win32};
 use crate::server::event_loop::{Event, Interest, Token};
 
 /// Each instance's own buffers, each way.

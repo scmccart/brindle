@@ -434,6 +434,70 @@ mod tests {
         assert_eq!(Color::parse("zzzzzz"), None);
     }
 
+    /// A colour is written as `#rrggbb`, lowercase with leading zeros, and
+    /// reads back as itself.
+    #[test]
+    fn display_round_trips_parse() {
+        assert_eq!(Color::hex(0x0a0b0c).to_string(), "#0a0b0c");
+        assert_eq!(Color { r: 255, g: 128, b: 0 }.to_string(), "#ff8000");
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            let colors = [theme.foreground, theme.background, theme.cursor, theme.selection_background];
+            for color in colors.into_iter().chain(theme.ansi) {
+                assert_eq!(Color::parse(&color.to_string()), Some(color), "{name}: {color}");
+            }
+        }
+        for color in [Color::hex(0), Color::hex(0xffffff), Color::hex(0x010203)] {
+            assert_eq!(Color::parse(&color.to_string()), Some(color));
+        }
+    }
+
+    /// The xterm palette: the theme's own 16 colours, then the 6×6×6 cube
+    /// (0, then 95 and up in steps of 40) and the gray ramp (8 and up in
+    /// steps of 10), whatever the theme.
+    #[test]
+    fn indexed_colors_are_the_theme_then_the_cube_and_the_ramp() {
+        for name in ["brindle-dark", "brindle-light"] {
+            let theme = builtin_theme(name).unwrap();
+            for index in 0..16u8 {
+                assert_eq!(theme.indexed(index), theme.ansi[usize::from(index)], "{name}: {index}");
+            }
+            // The cube's corners: black, blue, red and white.
+            assert_eq!(theme.indexed(16), Color::hex(0x000000), "{name}");
+            assert_eq!(theme.indexed(21), Color::hex(0x0000ff), "{name}");
+            assert_eq!(theme.indexed(196), Color::hex(0xff0000), "{name}");
+            assert_eq!(theme.indexed(231), Color::hex(0xffffff), "{name}");
+            // One step on every axis.
+            assert_eq!(theme.indexed(59), Color::hex(0x5f5f5f), "{name}");
+            // The ramp's ends.
+            assert_eq!(theme.indexed(232), Color::hex(0x080808), "{name}");
+            assert_eq!(theme.indexed(255), Color::hex(0xeeeeee), "{name}");
+        }
+    }
+
+    /// `mix` is `self` at 0, `other` at 1, and rounds the channels between.
+    #[test]
+    fn mix_blends_linearly() {
+        let (a, b) = (Color { r: 0, g: 100, b: 255 }, Color { r: 255, g: 0, b: 100 });
+        assert_eq!(a.mix(b, 0.0), a);
+        assert_eq!(a.mix(b, 1.0), b);
+        // 127.5, 50 and 177.5, rounded half away from zero.
+        assert_eq!(a.mix(b, 0.5), Color { r: 128, g: 50, b: 178 });
+        assert_eq!(b.mix(a, 0.5), Color { r: 128, g: 50, b: 178 });
+        assert_eq!(a.mix(a, 0.5), a);
+    }
+
+    /// Luminance is 0 for black and 1 for white, with green weighing most.
+    #[test]
+    fn luminance_runs_from_black_to_white() {
+        let close = |value: f32, expected: f32| (value - expected).abs() < 1e-5;
+        assert_eq!(Color::hex(0x000000).luminance(), 0.0);
+        assert!(close(Color::hex(0xffffff).luminance(), 1.0));
+        assert!(close(Color::hex(0x00ff00).luminance(), 0.7152));
+        assert!(close(Color::hex(0xff0000).luminance(), 0.2126));
+        assert!(close(Color::hex(0x0000ff).luminance(), 0.0722));
+    }
+
     #[test]
     fn all_builtins_exist() {
         for name in BUILTIN_THEMES {

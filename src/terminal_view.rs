@@ -738,6 +738,19 @@ mod tests {
         assert_eq!(grid.describe(1.0), "--- grid origin=6,51 cell=8.4x18 scale=1\n");
         assert_eq!(grid.describe(2.0), "--- grid origin=6,51 cell=8.4x18 scale=2\n");
     }
+
+    /// Links take ctrl without alt, whatever shift does: ctrl-alt is a
+    /// block selection, and alt alone or no modifier leaves links alone.
+    #[test]
+    fn links_take_ctrl_without_alt() {
+        let held = |control: bool, alt: bool, shift: bool| Modifiers { control, alt, shift, ..Modifiers::default() };
+        for shift in [false, true] {
+            assert!(!wants_links(&held(false, false, shift)), "none, shift {shift}");
+            assert!(wants_links(&held(true, false, shift)), "ctrl, shift {shift}");
+            assert!(!wants_links(&held(false, true, shift)), "alt, shift {shift}");
+            assert!(!wants_links(&held(true, true, shift)), "ctrl-alt, shift {shift}");
+        }
+    }
     use gpui::{point, px};
 
     #[test]

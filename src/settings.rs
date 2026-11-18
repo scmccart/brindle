@@ -396,6 +396,30 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The terminal font draws without ligatures, and falls back to the
+    /// glyph families of `FALLBACK_FAMILIES` that are installed, in that
+    /// list's order, never to its own family. Installed names match
+    /// exactly.
+    #[test]
+    fn the_terminal_font_falls_back_to_the_installed_glyph_families_but_its_own() {
+        let fallbacks = |font: &Font| font.fallbacks.as_ref().map(|list| list.fallback_list().to_vec());
+        let installed =
+            names(&["Noto Color Emoji", "DejaVu Sans Mono", "Arial", "Symbols Nerd Font Mono", "noto sans mono"]);
+        let font = terminal_font("DejaVu Sans Mono".into(), &installed);
+        assert_eq!(font.family.to_string(), "DejaVu Sans Mono");
+        assert_eq!(font.features, FontFeatures::disable_ligatures());
+        assert_eq!(fallbacks(&font), Some(names(&["Symbols Nerd Font Mono", "Noto Color Emoji"])));
+
+        // A family that isn't a glyph family keeps every installed one.
+        let font = terminal_font("Iosevka".into(), &installed);
+        assert_eq!(fallbacks(&font), Some(names(&["Symbols Nerd Font Mono", "DejaVu Sans Mono", "Noto Color Emoji"])));
+
+        // Nothing installed: no fallbacks.
+        let font = terminal_font("Iosevka".into(), &[]);
+        assert_eq!(fallbacks(&font), Some(Vec::new()));
+        assert_eq!(font.features, FontFeatures::disable_ligatures());
+    }
+
     /// GPUI lists its fallback stack's names (Cantarell, Segoe UI, …) on
     /// every machine; only the ones the platform has are installed, so a
     /// missing Cantarell neither wins the built-in UI list nor shows in a

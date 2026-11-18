@@ -31,3 +31,23 @@ pub struct Notice {
     pub title: String,
     pub body: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names the notifier's log lines and `BRINDLE_NOTIFY_LOG`'s first
+    /// column use, one per source.
+    #[test]
+    fn each_source_has_its_own_name() {
+        let names = [
+            (Source::Bell, "bell"),
+            (Source::Osc9, "osc9"),
+            (Source::Osc777, "osc777"),
+            (Source::Osc7501, "osc7501"),
+        ];
+        for (source, name) in names {
+            assert_eq!(source.name(), name, "{source:?}");
+        }
+    }
+}

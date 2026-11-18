@@ -25,7 +25,9 @@
 //! - `ensure_dir`: what making sure of the Windows server directory does
 //!   with what it found (`dir`);
 //! - `pipe_state`: the Windows pipes' read and write buffers and their
-//!   readiness (`pipe`).
+//!   readiness (`pipe`);
+//! - `wait`: a wait's timeout in whole milliseconds, never `INFINITE`
+//!   (the Windows `event_loop`, `pipe` and `listen`).
 
 #[cfg_attr(
     windows,
@@ -48,6 +50,12 @@ mod ensure_dir;
     allow(dead_code, reason = "only the Windows pipes keep it")
 )]
 mod pipe_state;
+
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows waits take milliseconds")
+)]
+mod wait;
 
 #[cfg(unix)]
 mod unix;

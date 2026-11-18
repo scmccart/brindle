@@ -223,14 +223,10 @@ impl Reached {
         let env: BTreeMap<String, String> = std::env::vars_os()
             .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
             .collect();
-        let shell = env
-            .get("SHELL")
-            .filter(|shell| !shell.is_empty())
-            .cloned()
-            .or_else(|| {
-                crate::pty::passwd_entry().map(|(shell, _)| shell.to_string_lossy().into_owned())
-            })
-            .unwrap_or_default();
+        let passwd_shell = crate::pty::passwd_entry()
+            .map(|(shell, _)| shell.to_string_lossy().into_owned());
+        // No shell is the wire's empty field (`types R9`).
+        let shell = login_shell(env.get("SHELL").cloned(), passwd_shell).unwrap_or_default();
         let home = crate::pty::home_dir(&BTreeMap::new())
             .map(|home| home.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -244,6 +240,13 @@ impl Reached {
             core_pid: self.core_pid,
         }
     }
+}
+
+/// The user's login shell, which `RELAY_HOST` carries: `SHELL` when it is
+/// set and not empty, else the passwd database's (`docker exec` sets no
+/// `SHELL`); `None` when neither names one.
+fn login_shell(shell_var: Option<String>, passwd_shell: Option<String>) -> Option<String> {
+    shell_var.filter(|shell| !shell.is_empty()).or(passwd_shell)
 }
 
 /// The build id `RELAY_HOST` carries: this binary's, or `""`, the wire's
@@ -579,9 +582,13 @@ fn wait_gone(pid: u32, limit: Duration) -> bool {
 
 /// Whether `pid` runs: its `/proc` entry exists and isn't a zombie's.
 fn runs(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_runs(&stat))
+}
+
+/// Whether a `/proc/<pid>/stat` line is a running process's: its state,
+/// the first field after the command's last `)`, is there and isn't a
+/// zombie's (`Z`) or a dead one's (`X`).
+fn stat_runs(stat: &str) -> bool {
     let state = stat
         .rfind(')')
         .and_then(|end| stat[end + 1..].trim_start().chars().next());
@@ -767,6 +774,73 @@ mod tests {
         let unreadable = Err("can't read /proc/self/exe: permission denied".to_string());
         assert_eq!(host_build(&unreadable), "");
         assert_eq!(host_build(&Ok("4f2a91".to_string())), "4f2a91");
+    }
+
+    /// A `SHELL` that says something wins; else the passwd database's
+    /// shell, as under `docker exec`, which sets none; else none.
+    #[test]
+    fn the_login_shell_is_shell_then_the_passwd_database() {
+        let some = |shell: &str| Some(shell.to_string());
+        assert_eq!(login_shell(some("/bin/zsh"), some("/bin/bash")), some("/bin/zsh"));
+        assert_eq!(login_shell(some("/bin/zsh"), None), some("/bin/zsh"));
+        assert_eq!(login_shell(some(""), some("/bin/bash")), some("/bin/bash"));
+        assert_eq!(login_shell(None, some("/bin/bash")), some("/bin/bash"));
+        assert_eq!(login_shell(some(""), None), None);
+        assert_eq!(login_shell(None, None), None);
+        // An empty passwd shell is what the database says.
+        assert_eq!(login_shell(None, some("")), some(""));
+    }
+
+    /// A process runs while its stat line has a state after the command's
+    /// last `)` that isn't a zombie's or a dead one's.
+    #[test]
+    fn a_stat_line_runs_unless_its_state_is_missing_zombie_or_dead() {
+        assert!(stat_runs("4242 (serve) R 1 4242 4242 0 -1"));
+        assert!(stat_runs("4242 (serve) S 1 4242 4242 0 -1\n"));
+        assert!(stat_runs("4242 (serve) D 1"));
+        assert!(!stat_runs("4242 (serve) Z 1 4242 4242 0 -1"));
+        assert!(!stat_runs("4242 (serve) X 1"));
+        // The command may hold `)` and spaces: the last `)` ends it.
+        assert!(stat_runs("4242 (a) Z (b) S 1"));
+        assert!(!stat_runs("4242 (a) S (b) Z 1"));
+        // No state to read.
+        assert!(!stat_runs("4242 serve S 1"));
+        assert!(!stat_runs("4242 (serve)"));
+        assert!(!stat_runs("4242 (serve)   \n"));
+        assert!(!stat_runs(""));
+    }
+
+    /// A socket that isn't there, or that nothing listens on, is no core.
+    #[test]
+    fn no_listener_is_a_missing_or_refusing_socket() {
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            assert!(no_listener(&io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!no_listener(&io::Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    /// A read timeout surfaces as `WouldBlock` or `TimedOut`, whichever
+    /// the platform gives.
+    #[test]
+    fn timed_out_is_either_kind_a_read_timeout_gives() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            assert!(timed_out(&io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::NotFound,
+        ] {
+            assert!(!timed_out(&io::Error::from(kind)), "{kind:?}");
+        }
     }
 
     fn outcome(decision: scope::Decision, user_manager: bool) -> scope::Outcome {

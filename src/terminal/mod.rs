@@ -1488,15 +1488,17 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
-/// Resolves a cell color against the term's dynamic palette and the theme.
-pub fn resolve_color(color: ansi::Color, colors: &term::color::Colors, terminal: &Terminal) -> Rgb {
+/// Resolves a cell color against the term's dynamic palette (the colors
+/// the program set, OSC 4, 10, 11 and 12) and then `theme`, the terminal's
+/// own ([`Terminal::default_color`]).
+pub fn resolve_color(color: ansi::Color, colors: &term::color::Colors, theme: &Theme) -> Rgb {
     match color {
         ansi::Color::Spec(rgb) => rgb,
         ansi::Color::Named(named) => {
-            colors[named as usize].unwrap_or_else(|| terminal.default_color(named as usize))
+            colors[named as usize].unwrap_or_else(|| palette_color(theme, named as usize).into())
         }
         ansi::Color::Indexed(i) => {
-            colors[i as usize].unwrap_or_else(|| terminal.default_color(i as usize))
+            colors[i as usize].unwrap_or_else(|| palette_color(theme, i as usize).into())
         }
     }
 }
@@ -1597,6 +1599,101 @@ mod tests {
         );
         assert_eq!(palette_color(&t, 1), t.ansi[1]);
         assert_eq!(palette_color(&t, NamedColor::Cursor as usize), t.cursor);
+    }
+
+    /// A cell's colour: an RGB one as it is; a named or indexed one from
+    /// the palette entries the program set, else from the theme.
+    #[test]
+    fn cell_colors_take_the_programs_palette_then_the_theme() {
+        let theme = crate::theme::builtin_theme("tokyo-night").unwrap();
+        let resolve = |color: ansi::Color, colors: &term::color::Colors| resolve_color(color, colors, &theme);
+        let mut colors = term::color::Colors::default();
+        let spec = Rgb { r: 1, g: 2, b: 3 };
+        assert_eq!(resolve(ansi::Color::Spec(spec), &colors), spec);
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Red), &colors), Rgb::from(theme.ansi[1]));
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Background), &colors), Rgb::from(theme.background));
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Cursor), &colors), Rgb::from(theme.cursor));
+        assert_eq!(resolve(ansi::Color::Indexed(4), &colors), Rgb::from(theme.ansi[4]));
+        assert_eq!(resolve(ansi::Color::Indexed(196), &colors), Rgb::from(theme.indexed(196)));
+
+        // What the program set (OSC 4, 11) wins over the theme.
+        let (red, background) = (Rgb { r: 9, g: 8, b: 7 }, Rgb { r: 6, g: 5, b: 4 });
+        colors[NamedColor::Red] = Some(red);
+        colors[NamedColor::Background] = Some(background);
+        colors[196] = Some(red);
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Red), &colors), red);
+        assert_eq!(resolve(ansi::Color::Indexed(1), &colors), red, "index 1 is red");
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Background), &colors), background);
+        assert_eq!(resolve(ansi::Color::Indexed(196), &colors), red);
+        // The entries it didn't set stay the theme's, and RGB stays RGB.
+        assert_eq!(resolve(ansi::Color::Indexed(4), &colors), Rgb::from(theme.ansi[4]));
+        assert_eq!(resolve(ansi::Color::Named(NamedColor::Cursor), &colors), Rgb::from(theme.cursor));
+        assert_eq!(resolve(ansi::Color::Spec(spec), &colors), spec);
+    }
+
+    /// The emulator's settings come from the config: OSC 52 reads only
+    /// when `osc52_paste` allows them, the scrollback, and the cursor's
+    /// shape and blink.
+    #[test]
+    fn the_emulator_takes_osc52_scrollback_and_the_cursor_from_the_config() {
+        let defaults = term_config(&Config::default());
+        assert_eq!(defaults.osc52, term::Osc52::OnlyCopy);
+        assert_eq!(defaults.scrolling_history, 10_000);
+        assert_eq!(defaults.default_cursor_style.shape, ansi::CursorShape::Block);
+        assert!(defaults.default_cursor_style.blinking);
+
+        let mut config = Config::default();
+        config.osc52_paste = true;
+        config.scrollback_lines = 0;
+        config.cursor = crate::config::CursorConfig { shape: CursorShapeConfig::Beam, blink: false };
+        let set = term_config(&config);
+        assert_eq!(set.osc52, term::Osc52::CopyPaste);
+        assert_eq!(set.scrolling_history, 0);
+        assert_eq!(set.default_cursor_style.shape, ansi::CursorShape::Beam);
+        assert!(!set.default_cursor_style.blinking);
+
+        config.cursor.shape = CursorShapeConfig::Underline;
+        assert_eq!(term_config(&config).default_cursor_style.shape, ansi::CursorShape::Underline);
+    }
+
+    /// A terminal's parser reads directory reports in its host's path
+    /// style: this machine's for a local session, POSIX for a remote
+    /// endpoint's. So OSC 7's `/C:/src` is `C:\src`, and OSC 9;9's `C:\src`
+    /// a directory at all, only for a Windows session here.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_terminals_parser_reads_directories_in_its_hosts_path_style() {
+        use crate::config::RemoteTarget;
+        use shell_integration::PathStyle;
+
+        let reported = |host: &Host, report: &[u8]| {
+            let mut parser = parser_for(host);
+            let size = GridSize { cols: 20, rows: 2, ..Default::default() };
+            let mut term = Term::new(term::Config::default(), &size, alacritty_terminal::event::VoidListener);
+            let marks = Mutex::new(Marks::default());
+            parser.advance(&mut term, &marks, report);
+            marks.lock().reported_dir().map(|dir| dir.to_string_lossy().into_owned())
+        };
+        let osc7: &[u8] = b"\x1b]7;file://host/C:/src\x1b\\";
+        let osc9: &[u8] = b"\x1b]9;9;C:\\src\x1b\\";
+
+        let remote = Host::Remote(RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        assert_eq!(reported(&remote, osc7).as_deref(), Some("/C:/src"));
+        assert_eq!(reported(&remote, osc9), None);
+
+        let (osc7_here, osc9_here) = match process::LOCAL_PATH_STYLE {
+            PathStyle::Posix => (Some("/C:/src"), None),
+            PathStyle::Windows => (Some(r"C:\src"), Some(r"C:\src")),
+        };
+        assert_eq!(reported(&Host::Local, osc7).as_deref(), osc7_here);
+        assert_eq!(reported(&Host::Local, osc9).as_deref(), osc9_here);
     }
 
     #[test]
