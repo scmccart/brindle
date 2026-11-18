@@ -81,7 +81,7 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
   Verify with unit tests of the enums' predicates, with `Session::info` (b11 #8), and with `--test core` and `--test upgrade` unchanged (b11 #13, #14, #17).
 - [x] 3.4 Add `ClientToken::from_wire`, decoded once in `welcome`, `enum Peer` for `close_peers` and `forget_peer`, and `endpoint::Holder.build`, parsed once. Verify with unit tests in `remote-protocol`'s `endpoint.rs` and the core's `clients.rs`, and with `--test core` (b10 #10, #11, b11 #18).
-- [ ] 3.5 Make `check::refusal_reason` pure, with tests. Verify with `--test manage` (b10 #8).
+- [x] 3.5 Make `check::refusal_reason` pure, with tests. Verify with `--test manage` (b10 #8).
 - [x] 3.6 Add the tests that are missing: `kept_layout`, `command_line`, `allocate_id`'s wrap and skip of 0, and `holders.rs`'s `is_adopted` and `status`. Verify with `cargo test --locked -p brindle-remote-agent server::core::` (b11 #10).
 - [ ] 3.7 Add the pure `holder/policy.rs`:
   - `spawn_refusal`, whose `Display` gives today's texts;
