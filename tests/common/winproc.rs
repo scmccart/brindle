@@ -136,9 +136,10 @@ pub fn alive(pid: u32) -> bool {
     unsafe { GetExitCodeProcess(process.0, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
 }
 
-/// The pid that started `pid`, as the process list has it.
-pub fn parent(pid: u32) -> Option<u32> {
-    all().into_iter().find(|p| p.pid == pid).map(|p| p.parent)
+/// The pid that started `pid`, as the process list has it (`None` when it
+/// isn't listed), or why the list couldn't be taken.
+pub fn parent(pid: u32) -> std::io::Result<Option<u32>> {
+    Ok(all()?.into_iter().find(|p| p.pid == pid).map(|p| p.parent))
 }
 
 /// A window handle, as a number (0 for none).
@@ -355,7 +356,8 @@ pub fn self_test() -> crate::Result {
     let me = all().map_err(|e| format!("listing processes: {e}"))?.into_iter().find(|p| p.pid == std::process::id()).ok_or("this process isn't listed")?;
     ensure!(image(me.pid).is_some_and(|path| path.file_name().is_some_and(|n| *n == *me.name)), "image of {}", me.name);
     ensure!(alive(me.pid), "this process isn't alive");
-    ensure!(parent(me.pid) == Some(me.parent), "parent of this process: {:?}", parent(me.pid));
+    let parent_of_me = parent(me.pid).map_err(|e| format!("parent of this process: {e}"))?;
+    ensure!(parent_of_me == Some(me.parent), "parent of this process: {parent_of_me:?}");
     let mut ended = std::process::Command::new("cmd.exe")
         .args(["/d", "/c", "exit"])
         .spawn()

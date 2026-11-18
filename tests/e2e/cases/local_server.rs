@@ -141,8 +141,8 @@ fn listed_when(srv: &Server, secs: f64, what: &str, ok: impl Fn(&[Listed]) -> bo
 }
 
 /// `program` runs, as a child of one of the `shells` (sessions' pids).
-fn in_session(program: u32, shells: &[u32]) -> bool {
-    alive(program) && parent(program).is_some_and(|p| shells.contains(&p))
+fn in_session(program: u32, shells: &[u32]) -> Result<bool> {
+    Ok(alive(program) && parent(program)?.is_some_and(|p| shells.contains(&p)))
 }
 
 /// The detached sessions' pids, once there are `count`.
@@ -173,13 +173,13 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn parent(pid: u32) -> Option<u32> {
-    stat(pid)?.get(1)?.parse().ok()
+fn parent(pid: u32) -> Result<Option<u32>> {
+    Ok(stat(pid).and_then(|fields| fields.get(1)?.parse().ok()))
 }
 
 #[cfg(windows)]
-fn parent(pid: u32) -> Option<u32> {
-    crate::winproc::parent(pid)
+fn parent(pid: u32) -> Result<Option<u32>> {
+    crate::winproc::parent(pid).map_err(|e| format!("listing processes for the parent of {pid}: {e}"))
 }
 
 #[cfg(unix)]
@@ -346,7 +346,7 @@ pub fn session(ctx: &Ctx) -> Result<Outcome> {
             let listed = srv.attached(10.0)?;
             let sessions = srv.list()?;
             ensure!(sessions.len() == 1, "sessions: {sessions:?}");
-            let holder = parent(listed.pid).ok_or("the shell has no parent")?;
+            let holder = parent(listed.pid)?.ok_or("the shell has no parent")?;
             ensure!(is_holder(holder), "the shell's parent {holder} is {}, not a holder", described(holder));
             std::fs::write(&save, listed.pid.to_string()).map_err(|e| e.to_string())
         })
@@ -419,7 +419,7 @@ pub fn quit(ctx: &Ctx) -> Result<Outcome> {
     let pids = wait_pids(&srv, &files)?;
     let detached = detached_pids(&srv, 10.0, 2)?;
     for pid in pids {
-        ensure!(in_session(pid, &detached), "sleep {pid} isn't in a detached session's shell {detached:?}");
+        ensure!(in_session(pid, &detached)?, "sleep {pid} isn't in a detached session's shell {detached:?}");
     }
     Ok(Outcome::Pass)
 }
@@ -441,7 +441,7 @@ pub fn crash(ctx: &Ctx) -> Result<Outcome> {
     let pids = wait_pids(&srv, &files)?;
     let detached = detached_pids(&srv, 10.0, 2)?;
     for pid in pids {
-        ensure!(in_session(pid, &detached), "sleep {pid} isn't in a detached session's shell {detached:?}");
+        ensure!(in_session(pid, &detached)?, "sleep {pid} isn't in a detached session's shell {detached:?}");
     }
     Ok(Outcome::Pass)
 }
@@ -492,7 +492,7 @@ pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     let pid = read_pid(&file).ok_or("sleep never started")?;
     let detached = detached_pids(&Server::of(ctx), 10.0, 1)?;
-    ensure!(in_session(pid, &detached), "sleep {pid} isn't detached: {detached:?}");
+    ensure!(in_session(pid, &detached)?, "sleep {pid} isn't detached: {detached:?}");
     Ok(Outcome::Pass)
 }
 
@@ -1331,7 +1331,7 @@ pub fn holder_lost(ctx: &Ctx) -> Result<Outcome> {
         .wait_for("before-2")
         .call_at(later(2.0), move |_| {
             let listed = srv.attached(10.0)?;
-            let holder = parent(listed.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let holder = parent(listed.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
             kill(holder)
         })
         .dump_at(later(6.0))
@@ -1355,7 +1355,7 @@ pub fn reused_id(ctx: &Ctx) -> Result<Outcome> {
         .prompt()
         .call_at(later(2.0), move |_| {
             let lost = srv.attached(10.0)?;
-            let holder = parent(lost.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let holder = parent(lost.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
             let core = srv.core().ok_or("no core running")?;
             // The holder goes first, so none is left to start a core that
             // would adopt it and keep its ids.
@@ -1509,7 +1509,7 @@ pub fn no_helper(ctx: &Ctx) -> Result<Outcome> {
         .send(&sh(&format!("echo in-server > \"{}\"\r", proof.display()), &format!("'in-server' > '{}'\r", slashed(&proof))))
         .call_at(later(5.0), move |_| {
             let listed = srv.attached(10.0)?;
-            let holder = parent(listed.pid).unwrap_or(0);
+            let holder = parent(listed.pid)?.unwrap_or(0);
             ensure!(is_holder(holder), "the new tab's shell's parent {holder} isn't a holder");
             Ok(())
         })
