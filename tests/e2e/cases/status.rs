@@ -2,6 +2,7 @@
 //! (read from `BRINDLE_NOTIFY_LOG`, as in `notify.rs`), and the feature
 //! query's reply.
 
+use super::Gate;
 use crate::brindle::Run;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -35,7 +36,11 @@ fn setup(ctx: &Ctx) -> String {
 pub fn local(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
     // `--send` turns `\n` into a newline, so the reply is printed with echo.
-    let query = r#"printf '\033]7501;?\033\\'; read -rs -t 3 -d '\\' r; echo "reply:$r" | tr -d '\033'\r"#;
+    // The read gives up after 3 s, stretched like the case's other waits.
+    let query = format!(
+        r#"printf '\033]7501;?\033\\'; read -rs -t {} -d '\\' r; echo "reply:$r" | tr -d '\033'\r"#,
+        ctx.secs(3.0)
+    );
     let working = r"\033]7501;state=working:id=a:progress=40:app=cargo\033\\";
     let blocked = r"\033]7501;state=blocked:kind=permission:app=claude-code:msg=UnVuIGNhcmdvIHRlc3Q/\033\\";
     let out = Run::new(ctx, "blocked")
@@ -43,7 +48,7 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
         .config("\n[notifications]\nwhen = \"always\"\n")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
         .send(&setup(ctx))
-        .send(query)
+        .send(&query)
         .send(&format!("printf '{working}{blocked}'; sleep 30\r"))
         .dump_at(6.0)
         .run()?;
@@ -87,14 +92,16 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
 /// A `blocked` report without a message from a tab that isn't active (the
 /// default `when = "unfocused"`): one notification, naming the app and
 /// saying what kind of wait it is. The report waits until a second tab has
-/// opened in front of it.
+/// opened in front of it: the new tab's own command opens its [`Gate`].
 pub fn background_tab(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
-    let report = r"sleep 3; printf '\033]7501;state=blocked:kind=auth:app=brew\033\\'; sleep 30\r";
+    let gate = Gate::new(ctx, "go");
+    let report = format!(r"{}; printf '\033]7501;state=blocked:kind=auth:app=brew\033\\'; sleep 30\r", gate.wait());
     let out = Run::new(ctx, "run")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
-        .send(report)
+        .send(&report)
         .action("new_tab")
+        .send(&gate.open())
         .dump_at(7.0)
         .run()?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "expected the second tab active: {:?}", out.dump.tabs);

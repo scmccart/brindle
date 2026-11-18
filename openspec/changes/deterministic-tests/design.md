@@ -144,7 +144,7 @@ Where each lives:
 | `:1640` (R8) | told within 3 s | drop it; told at all, with nothing printed, is the rule |
 | `:1669-1673` (R8) | an idle session isn't looked at (relies on `sleep 3` inside 7 s) | the program waits for a file (`while [ ! -e go ]; do sleep 0.1; done; exec sleep 1000`); the test creates it and waits until `program_of(pid)` is `sleep`; then a sentinel interactive session gets input and runs `sleep`; once its `PROCESS` arrives (a look after the change), a `LIST` round trip, then no `PROCESS` for the idle session was queued |
 | `:1739-1744` | skip when the user manager can't make scopes (made opt-in by change 4) | `skip(Capability::Scopes, reason)` (decision 5) |
-| `:1932` Windows | the flood filled every queue (3 s) | Windows `stays_blocked(pid)`: `Quiet` over the program's `WriteTransferCount` (`GetProcessIoCounters`), the same item as Unix's in `support/windows.rs` |
+| `:1932` Windows | the flood filled every queue (3 s) | Windows `stays_blocked(writer, reader)`, once a marker file shows the flood started: `Quiet` over the program's I/O calls and the holder's bytes read (`GetProcessIoCounters`; `cmd`'s console writes are device control calls, which `WriteTransferCount` doesn't count), the same item as Unix's in `support/windows.rs` |
 | `:2221-2224` Windows | skip without the packaged ConPTY | `skip(Capability::PackagedConpty, …)` |
 | `:2260` Windows | the console window's owner changed | `until`, with `Window::pump()` in the probe |
 
@@ -155,7 +155,7 @@ Where each lives:
 | `holder.rs:400` | stimulus | `throttle(self.pause)` |
 | `holder.rs:669` (R8) | SIGHUP, not the later SIGKILL, ended it | drop the elapsed bound; the `killed by signal Some(SIGHUP)` count (`:676`) is the rule |
 | `holder.rs:1343` Windows (R8) | the close, not the grace's `TerminateProcess`, ended it | drop the bound; `exit_code != TERMINATED` (`:1342`) is the rule |
-| `holder.rs:1449` Windows | without a core, the program blocks once the tail is full | Windows `stays_blocked(pid)` |
+| `holder.rs:1449` Windows | without a core, the program blocks once the tail is full | a marker file the program writes on its cue, then Windows `stays_blocked(pid, holder)` |
 | `holder.rs:1492` Windows | skip | `skip(Capability::PackagedConpty, …)` |
 | `holder.rs:1516` Windows | the owner changed | `until` with `pump` |
 | `manage.rs:125`, `:129` (R8) | age and detached time under a minute | a `duration_column(text) -> Option<u64>` parser (digits, then `s`/`m`/`h`/`d` parts) that the columns must satisfy; the attached session's detached column is `-` |
@@ -305,7 +305,7 @@ Both are pure scans over text, tested on planted input (`testing R1`, `R13`). Th
 
 - **[Log lines become test contracts]** A reworded core or holder line breaks a test, not a user. → Each marker is matched in one support helper (`core_logged(dir, session, Decision)`), so a rewording touches one place, and the core's lines are already asserted in tests today.
 - **[Sentinels lengthen some tests]** The linger and grace tests now wait out the linger or grace once (10 s and 10 s). They waited 5 s and 12 s before. → Accepted. The wait is the property under test, and it ends on the sentinel's line, not on padding.
-- **[`Quiet` is still a window]** "Blocked" means no context switch (or write) for `BLOCKED_FOR`. → A process that didn't run at all in a quarter-second is blocked, whatever the load. This is the one absence the suite still measures, in one place, and it is labelled so (`testing R11`).
+- **[`Quiet` is still a window]** "Blocked" means no context switch (on Windows, no I/O call by the writer and no read by its reader) for `BLOCKED_FOR`. → A process that didn't run at all in a quarter-second is blocked, whatever the load. This is the one absence the suite still measures, in one place, and it is labelled so (`testing R11`).
 - **[Dropping wall-clock bounds weakens two checks]** `flood_responsive`/`close_mid_output` and the stalled-client rounds detect a freeze, not a slowdown. → The regressions behind them were freezes. A slowdown is the perf suite's question (`testing R14`).
 - **[Windows modules change without a local run]** → Windows CI's `cargo test` is their first run (`testing R17`). Report them as CI's.
 - **[The `face_top` loop may not reproduce]** → Decision 7 files the issue instead. The case keeps its mitigation, labelled.

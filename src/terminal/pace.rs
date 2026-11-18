@@ -30,10 +30,21 @@ pub const BUDGET: Duration = Duration::from_millis(16);
 /// Handles `first`, then each batch `rx` already has ready, until it has
 /// none or [`BUDGET`] has passed. A closed stream stops it too; the loop's
 /// next `rx.next()` sees the end.
-pub fn drain<S: Stream + Unpin>(rx: &mut S, first: S::Item, mut handle: impl FnMut(S::Item)) {
-    let start = Instant::now();
+pub fn drain<S: Stream + Unpin>(rx: &mut S, first: S::Item, handle: impl FnMut(S::Item)) {
+    drain_with(rx, first, handle, Instant::now);
+}
+
+/// [`drain`] on the clock `now`, which it reads once before `first` and
+/// once before taking each further batch.
+pub fn drain_with<S: Stream + Unpin>(
+    rx: &mut S,
+    first: S::Item,
+    mut handle: impl FnMut(S::Item),
+    mut now: impl FnMut() -> Instant,
+) {
+    let start = now();
     handle(first);
-    while start.elapsed() < BUDGET {
+    while now().saturating_duration_since(start) < BUDGET {
         match rx.next().now_or_never() {
             Some(Some(more)) => handle(more),
             _ => break,
@@ -131,24 +142,29 @@ mod tests {
 
     #[test]
     fn drain_stops_at_the_budget() {
-        // Each item takes over half the budget, so the queue outlasts it. How
-        // long the sleeps really take is up to the scheduler, so the rule is
-        // checked against the recorded times rather than a count of items.
+        // Each item takes over half the budget on the test's clock, so the
+        // queue outlasts it. The clock moves only while an item is handled.
         const ITEMS: usize = 10;
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         for i in 1..=ITEMS {
             tx.unbounded_send(i).unwrap();
         }
+        let clock = std::cell::Cell::new(Instant::now());
         let mut seen = Vec::new();
         let mut calls: Vec<(Instant, Instant)> = Vec::new();
-        let before = Instant::now();
-        drain(&mut rx, 0, |i| {
-            let start = Instant::now();
-            seen.push(i);
-            std::thread::sleep(BUDGET / 2 + MS);
-            calls.push((start, Instant::now()));
-        });
-        let after = Instant::now();
+        let before = clock.get();
+        drain_with(
+            &mut rx,
+            0,
+            |i| {
+                let start = clock.get();
+                seen.push(i);
+                clock.set(start + BUDGET / 2 + MS);
+                calls.push((start, clock.get()));
+            },
+            || clock.get(),
+        );
+        let after = clock.get();
 
         // `first`, then the queue in order.
         assert!(!seen.is_empty());
@@ -167,6 +183,8 @@ mod tests {
         // budget, unless the queue was empty.
         let most = after - before;
         assert!(seen.len() == ITEMS + 1 || most >= BUDGET, "stopped {most:?} in, after {seen:?}");
+        // On this clock two items fill the budget: `first`, then one more.
+        assert_eq!(seen, [0, 1]);
     }
 
     #[test]

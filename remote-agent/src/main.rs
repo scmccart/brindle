@@ -5,6 +5,8 @@ mod liveness;
 mod pty;
 #[cfg(any(target_os = "linux", windows))]
 mod server;
+#[cfg(test)]
+mod test_support;
 
 use std::env;
 use std::process::ExitCode;

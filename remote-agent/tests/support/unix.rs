@@ -9,7 +9,6 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::ready;
@@ -136,18 +135,7 @@ pub fn start_with(
         command.pre_exec(move || pass_fd_as(write_fd, 3));
         command.pre_exec(in_child);
     }
-    // A freshly written binary can be briefly busy: another test thread's
-    // fork may still hold the writer's fd until it execs.
-    let mut attempts = 0;
-    let child = loop {
-        match command.spawn() {
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 100 => {
-                attempts += 1;
-                thread::sleep(Duration::from_millis(20));
-            }
-            result => break result?,
-        }
-    };
+    let child = super::retry_busy_exec(|| command.spawn())?;
     drop(write);
     let signal = read_ready_pipe(&read);
     let output = child.wait_with_output()?;
@@ -295,7 +283,7 @@ pub fn context_switches(pid: u32) -> Option<u64> {
 }
 
 /// How long [`stays_blocked`] watches a writer do nothing.
-const BLOCKED_FOR: Duration = Duration::from_millis(250);
+pub const BLOCKED_FOR: Duration = Duration::from_millis(250);
 
 /// Waits until `writer` is blocked for good on output that `reader` no
 /// longer takes. Returns `false` if `writer` ends instead, or isn't blocked
@@ -308,24 +296,16 @@ const BLOCKED_FOR: Duration = Duration::from_millis(250);
 /// as it would with a fixed sleep.
 pub fn stays_blocked(writer: u32, reader: u32) -> bool {
     let asleep = |pid| state(pid) == Some('S');
-    let deadline = Instant::now() + TIMEOUT;
-    // Since when it has been quiet, and the writer's switch count then.
-    let mut quiet: Option<(Instant, u64)> = None;
-    while alive(writer) && Instant::now() < deadline {
-        let switches = context_switches(writer).filter(|_| asleep(writer) && asleep(reader));
-        quiet = match (switches, quiet) {
-            (Some(now), Some((since, before))) if now == before => {
-                if since.elapsed() >= BLOCKED_FOR {
-                    return true;
-                }
-                quiet
-            }
-            (Some(now), _) => Some((Instant::now(), now)),
-            (None, _) => None,
-        };
-        thread::sleep(Duration::from_millis(20));
-    }
-    false
+    let mut quiet = super::Quiet::new(BLOCKED_FOR);
+    let mut ended = false;
+    let blocked = super::eventually(TIMEOUT, || {
+        if !alive(writer) {
+            ended = true;
+            return true;
+        }
+        quiet.observe(context_switches(writer).filter(|_| asleep(writer) && asleep(reader)))
+    });
+    blocked && !ended
 }
 
 /// Hands `stream` to a `sleep` process (as its fd 3), so killing that

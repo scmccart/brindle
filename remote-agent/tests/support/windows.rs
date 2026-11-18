@@ -30,7 +30,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetProcessTimes, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
+    CreateEventW, GetProcessIoCounters, GetProcessTimes, INFINITE, IO_COUNTERS, OpenProcess,
+    PROCESS_ACCESS_RIGHTS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, SetEvent,
     TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
@@ -517,6 +518,65 @@ pub fn working_set_kib(pid: u32) -> u64 {
     // SAFETY: the handle is open, and `counters` has `size` bytes.
     unsafe { GetProcessMemoryInfo(raw(&process), &mut counters, size) }.unwrap();
     counters.WorkingSetSize as u64 / 1024
+}
+
+/// `pid`'s I/O counts, `None` once it is gone.
+fn io_counters(pid: u32) -> Option<IO_COUNTERS> {
+    let process = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut counters = IO_COUNTERS::default();
+    // SAFETY: the handle is open, and `counters` is writable.
+    unsafe { GetProcessIoCounters(raw(&process), &mut counters) }.ok()?;
+    Some(counters)
+}
+
+/// How many I/O calls `pid` has made, reads, writes and the rest, `None`
+/// once it is gone. The count stands still while the process stays blocked
+/// in a call.
+///
+/// Not the bytes it wrote: a console write (`WriteConsoleW`, as `cmd`'s
+/// `type` makes) is a device control call to the console driver, an "other"
+/// operation, so `WriteTransferCount` doesn't move while a program floods
+/// its console.
+pub fn io_calls(pid: u32) -> Option<u64> {
+    let counters = io_counters(pid)?;
+    Some(counters.ReadOperationCount + counters.WriteOperationCount + counters.OtherOperationCount)
+}
+
+/// How many bytes `pid` has read, overlapped pipe reads included, `None`
+/// once it is gone.
+pub fn bytes_read(pid: u32) -> Option<u64> {
+    Some(io_counters(pid)?.ReadTransferCount)
+}
+
+/// How long [`stays_blocked`] watches a writer and its reader do nothing.
+pub const BLOCKED_FOR: Duration = Duration::from_millis(250);
+
+/// Waits until `writer` is blocked for good on output that `reader` no
+/// longer takes. Returns `false` if `writer` ends instead, or isn't blocked
+/// within [`TIMEOUT`].
+///
+/// Windows has no context-switch count per process, so I/O stands in for
+/// Linux's switches and sleeping states: it counts as blocked once, for
+/// [`BLOCKED_FOR`], `writer` made no I/O call (it is stuck in one) and
+/// `reader` read nothing. A writer faster than its reader waits too, but
+/// only until the reader takes some more. The writer must already be
+/// writing: one still waiting for its cue makes no calls either.
+pub fn stays_blocked(writer: u32, reader: u32) -> bool {
+    let mut writer_quiet = super::Quiet::new(BLOCKED_FOR);
+    let mut reader_quiet = super::Quiet::new(BLOCKED_FOR);
+    let mut ended = false;
+    let blocked = super::eventually(TIMEOUT, || {
+        if !alive(writer) {
+            ended = true;
+            return true;
+        }
+        // Both observe every look, so each window starts at its own last
+        // change.
+        let wrote_nothing = writer_quiet.observe(io_calls(writer));
+        let read_nothing = reader_quiet.observe(bytes_read(reader));
+        wrote_nothing && read_nothing
+    });
+    blocked && !ended
 }
 
 /// A hidden top-level window of this thread's, destroyed on drop.

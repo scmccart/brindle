@@ -1,6 +1,7 @@
 //! Desktop notifications, read from the `BRINDLE_NOTIFY_LOG` file instead
 //! of the desktop: one `source<TAB>title<TAB>body` line each.
 
+use super::Gate;
 use crate::brindle::Run;
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -55,15 +56,20 @@ pub fn log_at_exit(ctx: &Ctx) -> Result<Outcome> {
 /// A bell storm and an OSC 777 from a tab that isn't active (the default
 /// `when = "unfocused"`): one bell notification and one OSC 777, both
 /// naming the tab. The command waits until a second tab has opened in
-/// front of it; the tab title follows the foreground process, so it isn't
-/// pinned down.
+/// front of it: the new tab's own command opens its [`Gate`]. The tab title
+/// follows the foreground process, so it isn't pinned down.
 pub fn background_tab(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
-    let storm = r"sleep 3; for i in $(seq 20); do printf '\a'; done; printf '\033]777;notify;Build;done\a'\r";
+    let gate = Gate::new(ctx, "go");
+    let storm = format!(
+        r"{}; for i in $(seq 20); do printf '\a'; done; printf '\033]777;notify;Build;done\a'\r",
+        gate.wait()
+    );
     let out = Run::new(ctx, "run")
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
-        .send(storm)
+        .send(&storm)
         .action("new_tab")
+        .send(&gate.open())
         .dump_at(7.0)
         .run()?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "expected the second tab active: {:?}", out.dump.tabs);

@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::multi_window::two_processes;
 use crate::brindle::{Run, state_dir};
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -166,14 +167,9 @@ pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
 pub fn second_instance(ctx: &Ctx) -> Result<Outcome> {
     let recorded = state(1, &[local("Shell", &ctx.dir), local("Shell", &ctx.dir)]);
     write_state(ctx, &recorded)?;
-    let (first, second) = std::thread::scope(|scope| {
-        let first =
-            scope.spawn(|| Run::new(ctx, "first").restore().default_profile("Shell").dump_at(7.0).run());
-        ctx.sleep(2.0);
-        let second = Run::new(ctx, "second").restore().default_profile("Shell").dump_at(3.0).run();
-        (first.join().unwrap_or_else(|_| Err("first run panicked".into())), second)
-    });
-    let (first, second) = (first?, second?);
+    let first = Run::new(ctx, "first").restore().default_profile("Shell").dump_at(7.0);
+    let second = Run::new(ctx, "second").restore().default_profile("Shell").dump_at(3.0);
+    let (first, second) = two_processes(ctx, first, second)?;
     ensure!(titles(&first.dump.tabs) == ["bash", "bash*"], "first: {:?}", first.dump.tabs);
     ensure!(second.dump.tabs.len() == 1, "second: {:?}", second.dump.tabs);
     let log = std::fs::read_to_string(ctx.dir.join("second.log")).unwrap_or_default();

@@ -418,6 +418,13 @@ struct State {
     closing: Vec<(SessionId, Instant)>,
     /// Since when a relay connection has been out of use ([`State::in_use`]).
     idle_since: Option<Instant>,
+    /// When [`Connection::end_when_unused`] last took its idle decision. An
+    /// observation for tests, which decides nothing: a look at or after
+    /// `idle` past the moment a connection became idle-eligible shows that
+    /// the decision was taken there, so a test can assert what it decided
+    /// without waiting out a fixed window.
+    #[cfg_attr(not(test), allow(dead_code))]
+    last_look: Option<Instant>,
     /// The connection ended for good, and why; the next tab makes a new one.
     ended: Option<String>,
     /// Run once when it ends ([`Connection::on_end`]).
@@ -793,6 +800,7 @@ impl Connection {
                 log::warn!("{text}");
                 given_up = Some(text);
             }
+            state.last_look = Some(Instant::now());
             if self.eager.load(Ordering::Acquire) || state.in_use() {
                 state.idle_since = None;
                 given_up = None;
@@ -1032,6 +1040,13 @@ impl Connection {
     #[cfg(test)]
     pub fn kill(&self, session: SessionId) -> Result<()> {
         self.kill_within(session, None)
+    }
+
+    /// How many requests wait for their answer, for tests in the sibling
+    /// modules.
+    #[cfg(test)]
+    pub(super) fn requests_waiting(&self) -> usize {
+        self.state.lock().requests.len()
     }
 
     /// Ends a session whatever its policy or client, waiting at most `limit`
@@ -2415,6 +2430,9 @@ pub(super) mod fake {
         pub hello: mpsc::Receiver<Hello>,
         /// The client's heartbeats, which the relay drops.
         pub heartbeats: Arc<AtomicUsize>,
+        /// The next `LIST` is a test's round trip: the far end answers it
+        /// with no sessions itself, without the link's `answer`.
+        pub settle: Arc<AtomicBool>,
     }
 
     impl Far {
@@ -2438,7 +2456,8 @@ pub(super) mod fake {
         let (got_tx, got) = mpsc::channel();
         let (hello_tx, hello) = mpsc::channel();
         let heartbeats = Arc::new(AtomicUsize::new(0));
-        let (far, counting) = (out.clone(), heartbeats.clone());
+        let settle = Arc::new(AtomicBool::new(false));
+        let (far, counting, settling) = (out.clone(), heartbeats.clone(), settle.clone());
         std::thread::spawn(move || {
             let mut welcomed = false;
             while let Ok(frame) = Frame::read_from(&mut far_reader) {
@@ -2462,12 +2481,17 @@ pub(super) mod fake {
                     hello_tx.send(hello).ok();
                     continue;
                 }
-                answer(&message, &far);
+                match &message {
+                    ToCore::List(list) if settling.swap(false, Ordering::AcqRel) => {
+                        far.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));
+                    }
+                    _ => answer(&message, &far),
+                }
                 got_tx.send(message).ok();
             }
         });
         let wire = Arc::new(PipeWire { pipe: Mutex::new(client_writer), far: out.clone() });
-        (Link { reader: Box::new(client_reader), wire }, Far { out, got, hello, heartbeats })
+        (Link { reader: Box::new(client_reader), wire }, Far { out, got, hello, heartbeats, settle })
     }
 
     /// The fake relay's `RELAY_HOST`, with `env`.
@@ -2589,17 +2613,48 @@ mod tests {
     use crate::remote::budget::Refusal;
     use crate::remote::protocol::client::Spawned;
     use crate::remote::protocol::relay::RelayError;
+    use crate::test_support::wait::{limit, until};
 
     const MIB: usize = 1 << 20;
 
     fn seen(rx: &mpsc::Receiver<String>) -> String {
-        rx.recv_timeout(Duration::from_secs(10)).expect("an event")
+        rx.recv_timeout(limit(Duration::from_secs(10))).expect("an event")
     }
 
-    fn quiet(rx: &mpsc::Receiver<String>) {
-        if let Ok(event) = rx.recv_timeout(Duration::from_millis(300)) {
+    /// A round trip through `far`'s link, the positive marker for "nothing
+    /// more happened": the client sends a `LIST`, which the far end answers
+    /// itself once it has read everything the client sent before, and the
+    /// client takes the answer only after everything the far end sent
+    /// before it. So once this returns, the tabs have been told all the far
+    /// end caused, and `far` has had every message the client sent before:
+    /// those are returned, the `LIST` left out.
+    fn settled(connection: &Connection, far: &fake::Far) -> Vec<ToCore> {
+        far.settle.store(true, Ordering::Release);
+        assert!(connection.list().unwrap().is_empty(), "the round trip's LIST");
+        let mut before = Vec::new();
+        loop {
+            match far.next() {
+                ToCore::List(_) => return before,
+                other => before.push(other),
+            }
+        }
+    }
+
+    /// The tab has been told nothing it hasn't been asked about. Only after
+    /// a positive marker ([`settled`], or a later event in order).
+    fn told_nothing_more(rx: &mpsc::Receiver<String>) {
+        if let Ok(event) = rx.try_recv() {
             panic!("unexpected: {event:?}");
         }
+    }
+
+    /// Waits until every thread of the connection's own has returned, as a
+    /// dead connection's do: only the test's `handles` hold it then. Nothing
+    /// it does (a dial, a report) is still to come after that.
+    fn threads_ended(connection: &Arc<Connection>, handles: usize) {
+        until("the connection's threads end", Duration::from_secs(10), || {
+            (Arc::strong_count(connection) == handles).then_some(())
+        });
     }
 
     fn relay(name: &str) -> (Arc<Connection>, Plan) {
@@ -2643,12 +2698,18 @@ mod tests {
         eventually(&format!("{count} requests wait"), || connection.state.lock().requests.len() == count);
     }
 
+    /// Waits, within a scaled 10 s, until `done` holds.
     fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(Instant::now() < deadline, "never: {what}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        until(what, Duration::from_secs(10), || done().then_some(()));
+    }
+
+    /// Waits until the idle thread has taken its decision at or after
+    /// `idle` past `since`, when the connection became idle-eligible: had
+    /// it ended the connection, it would have done so by then.
+    fn looked_past(connection: &Connection, since: Instant, idle: Duration) {
+        eventually("a look past the idle time", || {
+            connection.state.lock().last_look.is_some_and(|look| look >= since + idle)
+        });
     }
 
     fn in_background<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T> {
@@ -2743,7 +2804,10 @@ mod tests {
         let second = plan.next_dial();
         assert!(second - linked >= timings.dead, "{:?}", second - linked);
         assert!(far.out.is_cut(), "the dead link was ended");
-        assert!(far.heartbeats.load(Ordering::Relaxed) >= 2, "{:?}", far.heartbeats);
+        // The client beat at least once before the link was declared dead,
+        // which its timings leave room for.
+        assert!(timings.dead >= timings.heartbeat * 2);
+        assert!(far.heartbeats.load(Ordering::Relaxed) >= 1, "{:?}", far.heartbeats);
         // Nothing but heartbeats went to the silent core.
         assert!(far.got.try_recv().is_err());
         // The next link is a reconnect: it asks which sessions are left.
@@ -2760,20 +2824,21 @@ mod tests {
         plan.link(link);
         plan.next_dial();
         far.hello();
-        let beating = Arc::new(AtomicBool::new(true));
+        // The relay beats every 100 ms until it is told to stop: a stimulus,
+        // paced by the stop channel's wait.
+        let (stop, stopped) = mpsc::channel::<()>();
         {
-            let (out, beating) = (far.out.clone(), beating.clone());
+            let out = far.out.clone();
             std::thread::spawn(move || {
-                while beating.load(Ordering::Acquire) {
+                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Duration::from_millis(100)) {
                     out.relay(RelayMessage::Heartbeat);
-                    std::thread::sleep(Duration::from_millis(100));
                 }
             });
         }
         // Three dead-link limits with only heartbeats: still the one link.
         assert!(plan.dialed.recv_timeout(fake::quick().dead * 3).is_err(), "redialed");
         assert!(!far.out.is_cut());
-        beating.store(false, Ordering::Release);
+        stop.send(()).unwrap();
         plan.next_dial();
         assert!(far.out.is_cut());
     }
@@ -2810,7 +2875,8 @@ mod tests {
         assert_eq!(seen(&tab), "replay true");
         assert_eq!(seen(&tab), "output screen");
         assert_eq!(seen(&tab), "replay false");
-        quiet(&tab);
+        settled(&connection, &far);
+        told_nothing_more(&tab);
     }
 
     /// Requests made while the relay connects wait for it, with no limit,
@@ -2825,7 +2891,8 @@ mod tests {
         waiting(&connection, 1);
         let list = in_background(move || asking.list().map(|sessions| sessions.len()));
         waiting(&connection, 2);
-        std::thread::sleep(Duration::from_millis(300));
+        // No link to finish on yet; their success once one comes shows they
+        // waited for it.
         assert!(!spawn.is_finished() && !list.is_finished());
         let (link, far) = fake::link(&[], |message, out| {
             fake::spawning(message, out);
@@ -2868,21 +2935,24 @@ mod tests {
         assert!(asked.elapsed() < Duration::from_secs(10));
         plan.fail("ssh: Could not resolve hostname A8");
         assert!(spawn.join().unwrap().is_err());
-        quiet(&attach_tab);
         assert!(!attach.is_finished());
         // Once the endpoint answers, the attach and a new spawn go out.
         let (sink, _tab) = fake::sink();
         let spawning = connection.clone();
         let spawn = in_background(move || spawning.spawn(spawn_request(&[]), sink, None).map(|r| r.id()));
         plan.next_dial();
-        let (link, _far) = fake::link(&[], |message, out| {
+        let (link, far) = fake::link(&[], |message, out| {
             fake::spawning(message, out);
             replaying(message, out);
         });
         plan.link(link);
         assert_eq!(attach.join().unwrap().unwrap(), 99);
         assert!(spawn.join().unwrap().is_ok());
-        quiet(&spawn_tab);
+        // The attach's next event is its replay: the second failure told it
+        // nothing.
+        assert_eq!(seen(&attach_tab), "replay true");
+        settled(&connection, &far);
+        told_nothing_more(&spawn_tab);
     }
 
     /// With nothing waiting, a failed first connect ends the connection,
@@ -2895,7 +2965,8 @@ mod tests {
         eventually("the connection ends", || connection.is_dead());
         let error = connection.list().unwrap_err().to_string();
         assert_eq!(error, "can't connect to A8: docker: no such container: devbox");
-        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err(), "no retry");
+        threads_ended(&connection, 1);
+        assert!(plan.dialed.try_recv().is_err(), "no retry");
 
         let (dial, plan) = fake::dialer("A8");
         let (eager, _queue) = Connection::new(Transport::Relay { dial, timings: fake::quick() }, "tok");
@@ -2950,8 +3021,9 @@ mod tests {
         assert_eq!(seen(&kept_tab), "output screen");
         assert_eq!(seen(&kept_tab), "replay false");
         assert_eq!(seen(&gone_tab), "lost the terminal server no longer has this session");
-        quiet(&kept_tab);
-        quiet(&gone_tab);
+        settled(&connection, &second);
+        told_nothing_more(&kept_tab);
+        told_nothing_more(&gone_tab);
         assert!(!connection.is_dead());
     }
 
@@ -3015,11 +3087,12 @@ mod tests {
             assert_eq!(seen(tab), "replay true");
             assert_eq!(seen(tab), "output screen");
             assert_eq!(seen(tab), "replay false");
-            quiet(tab);
         }
         // Neither is asked for again, and nothing is detached or closed.
         assert!(matches!(second.next(), ToCore::List(_)));
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &second), []);
+        told_nothing_more(&seven_tab);
+        told_nothing_more(&eight_tab);
     }
 
     /// An attach cut off with its link whose session the reconnected core
@@ -3055,9 +3128,9 @@ mod tests {
         assert_eq!(seen(&tab), "replay true");
         assert_eq!(seen(&tab), "output screen");
         assert_eq!(seen(&tab), "replay false");
-        quiet(&tab);
-        quiet(&gone_tab);
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &second), []);
+        told_nothing_more(&tab);
+        told_nothing_more(&gone_tab);
     }
 
     /// A fresh core (no holder survived) restarts ids at 1, so a reconnect
@@ -3097,8 +3170,9 @@ mod tests {
         assert_eq!(seen(&kept_tab), "output screen");
         assert_eq!(seen(&kept_tab), "replay false");
         assert_eq!(seen(&reused_tab), "lost the terminal server no longer has this session");
-        quiet(&reused_tab);
-        quiet(&kept_tab);
+        assert_eq!(settled(&connection, &second), []);
+        told_nothing_more(&reused_tab);
+        told_nothing_more(&kept_tab);
         // The lost tab's input never goes out: the next message is the
         // kept one's.
         reused.input(b"lost\r");
@@ -3131,8 +3205,8 @@ mod tests {
         plan.link(link);
         assert!(matches!(second.next(), ToCore::List(_)));
         assert_eq!(attach.join().unwrap().unwrap_err().to_string(), "the terminal server no longer has session 7");
-        quiet(&tab);
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "the ATTACH went out again");
+        assert_eq!(settled(&connection, &second), [], "the ATTACH went out again");
+        told_nothing_more(&tab);
         assert!(connection.state.lock().sessions.is_empty());
     }
 
@@ -3179,9 +3253,9 @@ mod tests {
         // The next message written is the new session's own CLOSE.
         fresh.close();
         assert_eq!(second.next(), ToCore::Close(SessionRef { session: id }));
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
-        quiet(&lost_tab);
-        quiet(&fresh_tab);
+        assert_eq!(settled(&connection, &second), []);
+        told_nothing_more(&lost_tab);
+        told_nothing_more(&fresh_tab);
     }
 
     /// What [`fake::failing_sink`]s fail on, as `BRINDLE_TEST_SINK_PANIC`
@@ -3224,7 +3298,8 @@ mod tests {
         far.out.send(ToClient::Data(Data { session: failing.id(), bytes: b"more".to_vec() }));
         far.out.send(ToClient::Data(Data { session: fine.id(), bytes: b"later".to_vec() }));
         assert_eq!(seen(&fine_tab), "output later");
-        quiet(&failing_tab);
+        settled(&connection, &far);
+        told_nothing_more(&failing_tab);
         assert!(!connection.is_dead());
     }
 
@@ -3253,8 +3328,9 @@ mod tests {
         plan.link(link);
         assert!(matches!(second.next(), ToCore::List(_)));
         assert_eq!(second.next(), ToCore::Detach(Detach { session: failing_id, layout: None }));
-        quiet(&fine_tab);
-        quiet(&failing_tab);
+        settled(&connection, &second);
+        told_nothing_more(&fine_tab);
+        told_nothing_more(&failing_tab);
         fine.input(b"ls\r");
         assert!(matches!(second.next(), ToCore::Data(data) if data.session == fine_id && data.bytes == b"ls\r"));
     }
@@ -3264,15 +3340,15 @@ mod tests {
     /// session's close still goes out.
     #[test]
     fn a_broken_sessions_running_handle_writes_nothing() {
-        let (_connection, _plan, far, failing, failing_tab, fine, _fine_tab) = broken_by_data();
+        let (connection, _plan, far, failing, failing_tab, fine, _fine_tab) = broken_by_data();
         failing.input(b"typed\r");
         failing.resize(100, 30, 8, 16);
         failing.close();
         failing.detach(None);
         fine.close();
         assert_eq!(far.next(), ToCore::Close(SessionRef { session: fine.id() }));
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
-        quiet(&failing_tab);
+        assert_eq!(settled(&connection, &far), []);
+        told_nothing_more(&failing_tab);
     }
 
     /// Answers `LIST` with `sessions`, each with its key and a client, as a
@@ -3430,7 +3506,8 @@ mod tests {
         assert_eq!(seen(&tab), "replay true");
         assert_eq!(seen(&tab), "output screen");
         assert_eq!(seen(&tab), "replay false");
-        quiet(&tab);
+        settled(&connection, &second);
+        told_nothing_more(&tab);
         running.input(b"x");
         assert!(matches!(second.next(), ToCore::Data(data) if data.session == 3 && data.bytes == b"x"));
     }
@@ -3448,7 +3525,7 @@ mod tests {
         assert_eq!(far.next(), ToCore::Detach(Detach { session: 5, layout: None }));
         replay(&far.out, 6, Some(77));
         assert_eq!(far.next(), ToCore::Detach(Detach { session: 6, layout: None }));
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &far), []);
         assert!(!connection.is_dead());
     }
 
@@ -3472,7 +3549,7 @@ mod tests {
         plan.link(link);
         assert!(connection.list().unwrap().is_empty());
         assert!(matches!(far.next(), ToCore::List(_)));
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &far), []);
 
         // Let go of before it was asked: withdrawn at once.
         let abandon = Abandon::default();
@@ -3480,7 +3557,7 @@ mod tests {
         let (sink, _tab) = fake::sink();
         let error = connection.attach(attach_request(6), sink, Some(&abandon)).err().expect("withdrawn");
         assert_eq!(error.to_string(), "closed before it started");
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &far), []);
     }
 
     /// With its attach let go, a relay that can't connect stops trying.
@@ -3560,7 +3637,7 @@ mod tests {
         // Input still goes out: the link is up, and REPARENT never went.
         running.input(b"x");
         assert!(matches!(second.next(), ToCore::Data(data) if data.bytes == b"x"));
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &second), []);
         assert!(connection.state.lock().sessions.values().all(|shown| shown.parent.is_none()));
     }
 
@@ -3570,7 +3647,7 @@ mod tests {
     #[test]
     fn process_right_after_spawned_is_kept_for_the_session() {
         let (connection, plan) = steady_relay("A8");
-        let (link, _far) = fake::link(&[], |message, out| {
+        let (link, far) = fake::link(&[], |message, out| {
             fake::spawning(message, out);
             if let ToCore::Spawn(spawn) = message {
                 let session = 10 + spawn.req as SessionId;
@@ -3583,7 +3660,8 @@ mod tests {
         let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
         let reported = Some(Foreground { name: Some("bash".into()), cwd: Some("/home/u".into()) });
         eventually("the PROCESS is kept", || running.foreground() == reported);
-        quiet(&tab);
+        settled(&connection, &far);
+        told_nothing_more(&tab);
         assert!(!connection.state.lock().sessions.contains_key(&99), "nothing kept for session 99");
         running.close();
         assert_eq!(running.foreground(), None);
@@ -3596,7 +3674,7 @@ mod tests {
     #[test]
     fn a_close_queued_while_disconnected_keeps_the_relay_until_it_is_written() {
         let (dial, plan) = fake::dialer("A8");
-        let idle = Duration::from_millis(300);
+        let idle = Duration::from_millis(250);
         let close_limit = Duration::from_secs(30);
         let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
         let connection = Connection::relay(dial, "tok", timings).unwrap();
@@ -3608,9 +3686,10 @@ mod tests {
         assert!(matches!(first.next(), ToCore::Spawn(_)));
         first.out.cut();
         plan.next_dial();
-        // Closed while reconnecting: the CLOSE waits for a link.
+        // Closed while reconnecting: the CLOSE waits for a link, and is all
+        // that keeps the connection in use.
         running.close();
-        std::thread::sleep(idle * 3);
+        looked_past(&connection, Instant::now(), idle);
         assert!(!connection.is_dead(), "ended with its CLOSE unwritten");
 
         let id = running.id();
@@ -3629,7 +3708,8 @@ mod tests {
         assert!(written.1.elapsed() >= idle * 4 / 5, "{:?}", written.1.elapsed());
         eventually("its relay is ended", || second.out.is_cut());
         // It doesn't come back.
-        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err());
+        threads_ended(&connection, 2);
+        assert!(plan.dialed.try_recv().is_err());
     }
 
     /// 3.1: a `CLOSE` made while the link is down keeps the connection
@@ -3659,7 +3739,8 @@ mod tests {
         assert_eq!(connection.list().unwrap_err().to_string(), reason);
         // The attempt under way finds the connection ended; none follows.
         plan.fail("ssh: connect to host A8 port 22: Connection refused");
-        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err(), "dialled again");
+        threads_ended(&connection, 2);
+        assert!(plan.dialed.try_recv().is_err(), "dialled again");
     }
 
     /// 3.1: an eager connection keeps trying past the close limit, but the
@@ -3668,7 +3749,7 @@ mod tests {
     #[test]
     fn a_close_given_up_is_never_written() {
         let (dial, plan) = fake::dialer("A8");
-        let (idle, close_limit) = (Duration::from_millis(100), Duration::from_millis(300));
+        let (idle, close_limit) = (Duration::from_millis(100), Duration::from_millis(250));
         let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
         let connection = Connection::relay_with(dial, "tok", timings, true, None).unwrap();
         let (link, first) = fake::link(&[], fake::spawning);
@@ -3681,12 +3762,12 @@ mod tests {
         plan.next_dial();
         running.close();
         eventually("the close is given up", || connection.state.lock().closing.is_empty());
-        std::thread::sleep(idle * 3);
+        looked_past(&connection, Instant::now(), idle);
         assert!(!connection.is_dead(), "an eager connection ended");
         let (link, second) = fake::link(&[], listing);
         plan.link(link);
         assert!(matches!(second.next(), ToCore::List(_)));
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "the CLOSE given up went out");
+        assert_eq!(settled(&connection, &second), [], "the CLOSE given up went out");
     }
 
     /// 3.1: what a connection says of the closes it gave up, and its limit
@@ -3723,7 +3804,7 @@ mod tests {
         let (link, far) = fake::link(&[], |_, _| {});
         plan.link(link);
         far.hello();
-        std::thread::sleep(idle * 5);
+        looked_past(&eager, Instant::now(), idle);
         assert!(!eager.is_dead());
         assert!(!far.out.is_cut());
         // No longer eager: it ends.
@@ -3776,12 +3857,14 @@ mod tests {
         // The same error again says nothing new.
         assert_eq!(reported(&reports, id), LinkState::Connected);
         second.hello();
-        assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing while connected");
+        settled(&connection, &second);
+        assert!(reports.try_recv().is_err(), "nothing while connected");
 
         connection.set_eager(false);
         assert_eq!(reported(&reports, id), LinkState::Ended("the connection was no longer used".into()));
         eventually("its relay is ended", || second.out.is_cut());
-        assert!(reports.recv_timeout(Duration::from_millis(300)).is_err(), "nothing after the end");
+        threads_ended(&connection, 1);
+        assert!(reports.try_recv().is_err(), "nothing after the end");
     }
 
     /// An eager relay connection that reports its states, with the plan for
@@ -3941,7 +4024,7 @@ mod tests {
         let (link, second) = fake::link(&[], |_, _| {});
         plan.link(link);
         assert!(matches!(second.next(), ToCore::List(_)), "the reconnect's own");
-        assert!(second.got.recv_timeout(Duration::from_millis(300)).is_err(), "not the one given up on");
+        assert_eq!(settled(&connection, &second), [], "not the one given up on");
     }
 
     /// 7.1: a session a restored zone recorded waits, through failed
@@ -3979,8 +4062,8 @@ mod tests {
         assert_eq!(seen(&tab), "replay true");
         assert_eq!(seen(&tab), "output screen");
         assert_eq!(seen(&tab), "replay false");
-        quiet(&tab);
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &far), []);
+        told_nothing_more(&tab);
     }
 
     /// 7.1: a recorded session the listing lacks, lists with another key
@@ -4015,7 +4098,7 @@ mod tests {
             ["session 5 on A8 has ended", "session 6 on A8 has ended", "session 7 on A8 is shown by another Brindle"]
         );
         // Only listings went out.
-        while let Ok(message) = far.got.recv_timeout(Duration::from_millis(300)) {
+        for message in settled(&connection, &far) {
             assert!(matches!(message, ToCore::List(_)), "{message:?}");
         }
         assert!(connection.state.lock().requests.is_empty());
@@ -4053,7 +4136,8 @@ mod tests {
         assert!(connection.on_listing(hook(&got)).is_ok());
         assert!(matches!(far.next(), ToCore::List(_)));
         assert_eq!(hooked.recv_timeout(Duration::from_secs(10)).unwrap(), [3]);
-        assert!(hooked.recv_timeout(Duration::from_millis(300)).is_err(), "each runs once");
+        settled(&connection, &far);
+        assert!(hooked.try_recv().is_err(), "each runs once");
         assert!(!connection.state.lock().in_use(), "nothing waits any more");
 
         let (ended, plan) = relay("B9");
@@ -4081,7 +4165,7 @@ mod tests {
         plan.fail("ssh: connect to host A8 port 22: Connection refused");
         // The next attempt waits on the test.
         plan.next_dial();
-        std::thread::sleep(idle * 3);
+        looked_past(&connection, Instant::now(), idle);
         assert!(!connection.is_dead(), "the hook keeps it trying");
 
         let withdrawn = Instant::now();
@@ -4093,7 +4177,8 @@ mod tests {
         assert!(withdrawn.elapsed() >= idle * 4 / 5, "ended {:?} after the withdrawal", withdrawn.elapsed());
         assert_eq!(connection.list().unwrap_err().to_string(), "the connection was no longer used");
         plan.fail("ssh: connect to host A8 port 22: Connection refused");
-        assert!(plan.dialed.recv_timeout(Duration::from_millis(300)).is_err(), "dialled again");
+        threads_ended(&connection, 1);
+        assert!(plan.dialed.try_recv().is_err(), "dialled again");
     }
 
     /// A link that holds every frame while it is shut, as a stalled one
@@ -4102,7 +4187,8 @@ mod tests {
         inner: Arc<dyn Wire>,
         shut: Mutex<bool>,
         opened: Condvar,
-        passed: Mutex<Vec<u8>>,
+        /// Each frame's type, and when it went through.
+        passed: Mutex<Vec<(u8, Instant)>>,
     }
 
     impl Gate {
@@ -4123,8 +4209,13 @@ mod tests {
 
         /// Whether a frame of `message`'s type has gone through.
         fn passed(&self, message: &ToCore) -> bool {
+            self.passed_at(message).is_some()
+        }
+
+        /// When the first frame of `message`'s type went through.
+        fn passed_at(&self, message: &ToCore) -> Option<Instant> {
             let kind = message.encode().unwrap().msg_type;
-            self.passed.lock().contains(&kind)
+            self.passed.lock().iter().find(|(passed, _)| *passed == kind).map(|&(_, at)| at)
         }
     }
 
@@ -4136,7 +4227,7 @@ mod tests {
             }
             drop(shut);
             self.inner.send(frame)?;
-            self.passed.lock().push(frame.msg_type);
+            self.passed.lock().push((frame.msg_type, Instant::now()));
             Ok(())
         }
 
@@ -4165,29 +4256,36 @@ mod tests {
         let detach = ToCore::Detach(Detach { session: running.id(), layout: None });
         gate.shut(true);
         running.detach(None);
+        let deadline = Duration::from_millis(200);
         let started = Instant::now();
-        assert!(!connection.flush(started + Duration::from_millis(300)));
-        assert!(started.elapsed() >= Duration::from_millis(300), "gave up after {:?}", started.elapsed());
+        assert!(!connection.flush(started + deadline));
+        // Not before its deadline, which the flush guarantees.
+        assert!(started.elapsed() >= deadline, "gave up after {:?}", started.elapsed());
         assert!(!gate.passed(&detach));
 
-        // Written while a flush waits: the flush returns, with it written.
+        // Written while a flush waits: the flush returns, with it written,
+        // and only after it was written.
         let flushing = connection.clone();
-        let flush = in_background(move || flushing.flush(Instant::now() + Duration::from_secs(10)));
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!flush.is_finished(), "returned before the DETACH was written");
+        let flush = in_background(move || {
+            let flushed = flushing.flush(Instant::now() + limit(Duration::from_secs(10)));
+            (flushed, Instant::now())
+        });
         gate.shut(false);
-        assert!(flush.join().unwrap());
-        assert!(gate.passed(&detach), "returned before the DETACH was written");
+        let (flushed, returned) = flush.join().unwrap();
+        assert!(flushed);
+        let written = gate.passed_at(&detach).expect("the DETACH written");
+        assert!(written <= returned, "returned before the DETACH was written");
         assert_eq!(far.next(), detach);
 
         // Down: nothing can be written until a next link, which an exiting
-        // process won't wait for.
+        // process won't wait for, whatever its deadline.
         far.out.cut();
         eventually("the link is down", || connection.slot.lock().link.is_none());
         connection.send(ToCore::Detach(Detach { session: 99, layout: None }));
-        let started = Instant::now();
-        assert!(!connection.flush(started + Duration::from_secs(10)));
-        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+        let flushing = connection.clone();
+        let flush = in_background(move || flushing.flush(Instant::now() + Duration::from_secs(3600)));
+        eventually("the flush gives up", || flush.is_finished());
+        assert!(!flush.join().unwrap());
     }
 
     fn key(text: &str) -> SessionKey {

@@ -167,6 +167,9 @@ pub struct Run<'a> {
     env_remove: Vec<String>,
     timeline: Vec<(f64, Event)>,
     dump_at: f64,
+    /// Dump this many seconds, unscaled, after the last step, in place of
+    /// `dump_at` ([`Run::dump_after_last_step`]).
+    dump_after_last_step: Option<f64>,
     capture_at: Option<f64>,
     /// Session restore: a plain launch (no `-p` or `--no-restore`), with the state in
     /// `<case dir>/state` as for every run.
@@ -184,6 +187,30 @@ pub struct Run<'a> {
     interval: Option<f64>,
 }
 
+/// The case server's sessions as `brindle-remote list` prints them
+/// (`id<TAB>pid<TAB>attached|detached<TAB>…`), as `(id, attached)`. Empty
+/// while no core runs: `list` never starts one.
+pub fn listed_sessions(ctx: &Ctx) -> Result<Vec<(String, bool)>> {
+    let out = Command::new(&ctx.helper)
+        .arg("list")
+        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", ctx.helper.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            match fields.get(2) {
+                Some(&"attached") => Some((fields[0].to_string(), true)),
+                Some(&"detached") => Some((fields[0].to_string(), false)),
+                _ => None,
+            }
+        })
+        .collect())
+}
+
 /// Hangs up the case server's detached sessions and waits for them to go,
 /// so the case's next Brindle (which attaches detached sessions at launch)
 /// starts with only the tabs it asks for.
@@ -192,25 +219,11 @@ pub fn hang_up_detached(ctx: &Ctx) -> Result {
     if cfg!(not(any(target_os = "linux", windows))) {
         return Ok(());
     }
-    let list = || -> Result<Vec<String>> {
-        let out = Command::new(&ctx.helper)
-            .arg("list")
-            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("running {}: {e}", ctx.helper.display()))?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        // `id<TAB>pid<TAB>attached|detached<TAB>…`
-        Ok(text
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split('\t').collect();
-                (fields.get(2) == Some(&"detached")).then(|| fields[0].to_string())
-            })
-            .collect())
+    let detached = || -> Result<Vec<String>> {
+        Ok(listed_sessions(ctx)?.into_iter().filter(|(_, attached)| !attached).map(|(id, _)| id).collect())
     };
-    let detached = list()?;
-    for id in &detached {
+    let hung_up = detached()?;
+    for id in &hung_up {
         Command::new(&ctx.helper)
             .args(["kill", id])
             .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
@@ -218,16 +231,13 @@ pub fn hang_up_detached(ctx: &Ctx) -> Result {
             .output()
             .ok();
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !detached.is_empty() {
-        let left = list()?;
-        if !left.iter().any(|id| detached.contains(id)) {
-            break;
-        }
-        ensure!(Instant::now() < deadline, "detached sessions {left:?} didn't end");
-        std::thread::sleep(Duration::from_millis(100));
+    if hung_up.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    ctx.scale().poll(10.0, &format!("detached sessions {hung_up:?} ending"), || {
+        let left = detached()?;
+        if left.iter().any(|id| hung_up.contains(id)) { Err(format!("still listed: {left:?}")) } else { Ok(Some(())) }
+    })
 }
 
 pub struct Output {
@@ -252,6 +262,7 @@ impl<'a> Run<'a> {
             env_remove: Vec::new(),
             timeline: Vec::new(),
             dump_at: 4.0,
+            dump_after_last_step: None,
             capture_at: None,
             restore: false,
             default_profile: "Shell",
@@ -441,7 +452,33 @@ impl<'a> Run<'a> {
 
     pub fn dump_at(mut self, secs: f64) -> Self {
         self.dump_at = secs;
+        self.dump_after_last_step = None;
         self
+    }
+
+    /// Dumps `secs` after the last step, in place of [`Run::dump_at`]. The
+    /// steps' times are scaled as usual, but `secs` is not: it is an offset
+    /// measured against one of the app's own limits, which don't stretch
+    /// with `BRINDLE_E2E_SLOW` (`testing R5`), so the caller names that
+    /// limit beside the call. Brindle counts steps and dump from the same
+    /// origin, so the gap on its own clock is exactly `secs`, unless a
+    /// `--wait-for` step held the steps back.
+    pub fn dump_after_last_step(mut self, secs: f64) -> Self {
+        self.dump_after_last_step = Some(secs);
+        self
+    }
+
+    /// When Brindle dumps, in seconds on its own clock, as passed to
+    /// `--dump-screen-after`.
+    fn dump_secs(&self) -> f64 {
+        let ctx = self.ctx;
+        match self.dump_after_last_step {
+            Some(offset) => {
+                let interval = ctx.secs(self.interval.unwrap_or(1.0));
+                last_step_secs(self.steps.len() / 2, interval) + offset
+            }
+            None => ctx.secs(self.dump_at),
+        }
     }
 
     /// Captures the window `secs` after it first appears, which is when
@@ -454,6 +491,7 @@ impl<'a> Run<'a> {
 
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
+        let dump_secs = self.dump_secs();
         let config_path = ctx.dir.join("config.toml");
         let mut text = config_with("e2e", self.default_profile, &self.top);
         if let Some(padding) = self.padding {
@@ -486,7 +524,7 @@ impl<'a> Run<'a> {
                 Some(secs) => vec!["--step-interval".to_string(), ctx.secs(secs).to_string()],
                 None => ctx.step_interval(),
             })
-            .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
+            .args(["--dump-screen-after", &dump_secs.to_string()])
             .args(if self.command.is_empty() { &[][..] } else { &["-e"][..] })
             .args(&self.command)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
@@ -544,7 +582,8 @@ impl<'a> Run<'a> {
             image = Some(captured);
         }
 
-        let deadline = started + Duration::from_secs_f64(ctx.secs(self.dump_at) + 30.0);
+        // The dump's time, then 30 s (stretched) to print it and quit.
+        let deadline = started + Duration::from_secs_f64(dump_secs + ctx.secs(30.0));
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 break status;
@@ -840,6 +879,39 @@ fn parse_grid(text: &str) -> Option<Grid> {
         line_height: h.parse().ok()?,
         scale: field("scale=")?.parse().ok()?,
     })
+}
+
+/// When Brindle runs the last of `steps` steps spaced `interval` seconds
+/// apart (already scaled), on its own clock: it waits half an interval,
+/// then one interval before each step (`main.rs`'s step task).
+fn last_step_secs(steps: usize, interval: f64) -> f64 {
+    interval / 2.0 + steps as f64 * interval
+}
+
+pub fn self_test_dump_after_last_step() -> Result {
+    ensure!(last_step_secs(0, 1.0) == 0.5, "no steps: {}", last_step_secs(0, 1.0));
+    ensure!(last_step_secs(3, 1.0) == 3.5, "3 steps, 1 s apart: {}", last_step_secs(3, 1.0));
+    // At `BRINDLE_E2E_SLOW=3` the interval is 3 s; the offset after it isn't
+    // scaled.
+    let dump = last_step_secs(4, 3.0) + 0.7;
+    ensure!((dump - 14.2).abs() < 1e-9, "4 steps, 3 s apart, then 0.7 s: {dump}");
+
+    // A run's own steps, at factor 3.
+    let ctx = Ctx {
+        name: "self-test",
+        dir: std::env::temp_dir(),
+        bin: std::path::PathBuf::new(),
+        helper: std::path::PathBuf::new(),
+        display: String::new(),
+        server_dir: std::env::temp_dir(),
+        scale: crate::Scale::new(3.0),
+    };
+    let run = Run::new(&ctx, "self-test").action("new_tab").key("enter").dump_after_last_step(0.7);
+    let dump = run.dump_secs();
+    ensure!((dump - 8.2).abs() < 1e-9, "2 steps, 3 s apart, then 0.7 s: {dump}");
+    let run = run.dump_at(4.0);
+    ensure!(run.dump_secs() == 12.0, "dump_at(4) at factor 3: {}", run.dump_secs());
+    Ok(())
 }
 
 pub fn self_test_dump() -> Result {

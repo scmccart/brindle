@@ -702,18 +702,16 @@ mod tests {
             let mut rest = Vec::new();
             tx.send(reader.read_to_end(&mut rest).map(|_| rest.len()).map_err(|e| e.kind())).ok();
         });
-        assert!(read.recv_timeout(Duration::from_millis(300)).is_err(), "still running");
+        // The silent relay keeps the read open until the end: what ends it
+        // is the end (nothing read, or a broken pipe), not an error before.
         link.wire.end();
-        let ended = read.recv_timeout(Duration::from_secs(10)).expect("the read ended");
+        let ended = read.recv_timeout(crate::test_support::wait::limit(Duration::from_secs(10))).expect("the read ended");
         assert!(matches!(ended, Ok(0) | Err(io::ErrorKind::BrokenPipe)), "{ended:?}");
         // It was killed: it says how, and writes fail.
         assert!(!link.wire.why().is_empty());
         let frame = Frame::new(1, b"x".to_vec()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while link.wire.send(&frame).is_ok() {
-            assert!(Instant::now() < deadline, "writes still succeed");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let failing = || link.wire.send(&frame).is_err();
+        assert!(crate::test_support::wait::eventually(Duration::from_secs(10), failing), "writes still succeed");
         // Ending it again kills nothing.
         link.wire.end();
     }

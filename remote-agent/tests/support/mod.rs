@@ -19,6 +19,8 @@ pub use windows::*;
 pub mod programs;
 #[cfg(unix)]
 pub mod relay;
+mod wait;
+pub use wait::*;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -510,20 +512,6 @@ pub fn shell(session: SessionId, script: &str) -> Spawn {
     spawn(session, "cmd.exe", &["/d", "/v:on", "/c", script])
 }
 
-/// Polls `condition` every 20 ms until it holds or `timeout` passes.
-pub fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if condition() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// Starts a core for `dir` from the built binary. Its holders inherit
 /// `env`; unless it says otherwise, a core a holder starts on its own (once
 /// a test has killed the core) only prints the version.
@@ -575,6 +563,95 @@ pub const SUPERVISED: (&str, &str) = ("BRINDLE_TEST_HOLDER_CORE_ARGS", SERVE_ARG
 /// Waits until `pid` is gone.
 pub fn gone(pid: u32) -> bool {
     eventually(TIMEOUT, || !alive(pid))
+}
+
+/// A decision the core logs about a session (`server/core/sessions.rs`).
+/// Its line is the positive marker a "nothing happens" check waits for: once
+/// it is in the log, the core has taken that decision, and the test asserts
+/// the state after it rather than waiting out a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// A `detach` session lost its client and runs on.
+    Detached,
+    /// A `kill` session lost a client that asked for this many seconds'
+    /// linger, and waits for it.
+    Lingers(u32),
+    /// An adopted `kill` session's owner didn't come back within the grace
+    /// period, so it is hung up.
+    OwnerGone,
+    /// A lingering session's client didn't come back in time, so it is hung
+    /// up.
+    LingerOver,
+}
+
+impl Decision {
+    /// The core's message for `session`, after its `core[pid]: ` prefix.
+    fn message(self, session: SessionId) -> String {
+        match self {
+            Decision::Detached => format!("session {session}: detached"),
+            Decision::Lingers(secs) => {
+                format!("session {session}: its client left; it waits {secs}s for it")
+            }
+            Decision::OwnerGone => {
+                format!("session {session}: its owner didn't come back; hanging up")
+            }
+            Decision::LingerOver => {
+                format!("session {session}: its client didn't come back in time; hanging up")
+            }
+        }
+    }
+}
+
+/// The messages of every core that logged in `dir`, in the order they were
+/// written: each `core.log` line's text after its `<time> core[<pid>]: `
+/// prefix. Lines of other roles' (a check's, say) are left out.
+pub fn core_messages(dir: &TempDir) -> Vec<String> {
+    let log = dir
+        .path
+        .join(brindle_remote_protocol::server_dir::CORE_LOG);
+    let text = fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(" core[")?;
+            let (_, message) = rest.split_once("]: ")?;
+            Some(message.to_string())
+        })
+        .collect()
+}
+
+/// Waits until the core has logged `decision` for `session`, and returns
+/// where the line is among [`core_messages`], for checks of their order.
+#[track_caller]
+pub fn core_logged(dir: &TempDir, session: SessionId, decision: Decision) -> usize {
+    let wanted = decision.message(session);
+    let found = eventually(TIMEOUT, || {
+        core_messages(dir).iter().any(|message| *message == wanted)
+    });
+    let messages = core_messages(dir);
+    match messages.iter().position(|message| *message == wanted) {
+        Some(at) if found => at,
+        _ => panic!("the core never logged {wanted:?}; its log:\n{}", messages.join("\n")),
+    }
+}
+
+/// Waits until the core has logged at least `count` clients' departures
+/// (`client N left (…) with K session(s)`): each line is written in the same
+/// handler as the close policies of that client's sessions, so once it is
+/// there they have been applied.
+#[track_caller]
+pub fn left(dir: &TempDir, count: usize) {
+    let departures = || {
+        core_messages(dir)
+            .iter()
+            .filter(|message| message.starts_with("client ") && message.contains(" left ("))
+            .count()
+    };
+    assert!(
+        eventually(TIMEOUT, || departures() >= count),
+        "the core logged {} of {count} clients' departures; its log:\n{}",
+        departures(),
+        core_messages(dir).join("\n")
+    );
 }
 
 /// What [`TestClient::next`] got.
@@ -1003,22 +1080,25 @@ impl TestClient {
         scrollback: usize,
         mut done: impl FnMut(&Emulator) -> bool,
     ) -> (client::ReplayStart, Emulator) {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
+        // `until`'s poll, keeping the last screen for the failure.
+        let mut matched = None;
+        let mut last = String::new();
+        let found = eventually(TIMEOUT, || {
             let (start, bytes) = self
                 .attach(session, 80, 24)
                 .unwrap_or_else(|error| panic!("attach refused: {}", error.message));
             let screen = replayed(&bytes, 80, 24, scrollback);
             if done(&screen) {
-                return (start, screen);
+                matched = Some((start, screen));
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the replay never matched; last:\n{}",
-                snapshot(&screen)
-            );
+            last = snapshot(&screen);
             self.detach(session);
-            thread::sleep(Duration::from_millis(50));
+            false
+        });
+        match matched {
+            Some(matched) if found => matched,
+            _ => panic!("the replay never matched; last:\n{last}"),
         }
     }
 

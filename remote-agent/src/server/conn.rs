@@ -280,6 +280,7 @@ fn wait_slice(limit: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::limit;
 
     #[test]
     fn frames_survive_any_split() {
@@ -442,9 +443,9 @@ mod tests {
         let mut peer = Conn::new(b).unwrap();
         sender.queue(&frame);
         let reader = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            // The sender is waiting by now.
-            std::thread::sleep(Duration::from_millis(50));
+            // Whether this reads first or the sender waits first, the
+            // sender's `flush_for` must get it all out.
+            let deadline = Instant::now() + limit(Duration::from_secs(10));
             loop {
                 let eof = peer.read_available().unwrap();
                 if let Some(frame) = peer.next_frame().unwrap() {
@@ -455,7 +456,7 @@ mod tests {
                 wait(&[&peer], Duration::from_millis(100));
             }
         });
-        sender.flush_for(Duration::from_secs(10)).unwrap();
+        sender.flush_for(limit(Duration::from_secs(10))).unwrap();
         drop(sender);
         assert_eq!(reader.join().unwrap(), frame);
 

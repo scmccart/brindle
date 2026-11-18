@@ -804,10 +804,9 @@ impl SessionStore {
 mod tests {
     use super::*;
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("brindle-session-{name}-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+    /// A fresh directory for one test, removed when it ends.
+    fn tmp_dir(name: &str) -> crate::test_support::TempDir {
+        crate::test_support::TempDir::new(&format!("session-{name}"))
     }
 
     fn sample() -> State {
@@ -859,7 +858,7 @@ mod tests {
     #[test]
     fn atomic_write_and_load() {
         let dir = tmp_dir("write");
-        let file = StateFile::new(dir.clone());
+        let file = StateFile::new(dir.to_path_buf());
         assert_eq!(file.path(), state_path(&dir));
         assert_eq!(load(&dir), Ok(None));
         file.write(&sample().to_text().expect("serializes"), file.ticket()).unwrap();
@@ -882,7 +881,6 @@ mod tests {
         assert_eq!(load(&dir), Ok(None));
         std::fs::write(state_path(&dir), "garbage").unwrap();
         assert!(load(&dir).unwrap_err().contains("ignoring session state"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Tickets order the writes of one directory only: a newer write to
@@ -890,15 +888,13 @@ mod tests {
     #[test]
     fn a_newer_write_elsewhere_does_not_skip_this_directorys_write() {
         let (a, b) = (tmp_dir("ordered-a"), tmp_dir("ordered-b"));
-        let (file_a, file_b) = (StateFile::new(a.clone()), StateFile::new(b.clone()));
+        let (file_a, file_b) = (StateFile::new(a.to_path_buf()), StateFile::new(b.to_path_buf()));
         let first = file_a.ticket();
         // `b`'s landed ticket is a higher number than `first`.
         file_b.ticket();
         file_b.write("version = 1\n", file_b.ticket()).unwrap();
         file_a.write(&sample().to_text().expect("serializes"), first).unwrap();
         assert_eq!(load(&a), Ok(Some(sample())));
-        std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
@@ -920,7 +916,6 @@ mod tests {
         };
         assert!(retaken.is_ok(), "lock not retaken within 5 s: {:?}", retaken.err());
         drop(retaken);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn config() -> Config {
@@ -1035,10 +1030,9 @@ mod tests {
                     [[windows]]\n[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"work\"\nsession = \"work\"\n";
         assert!(State::parse(only).unwrap().windows.is_empty());
         let dir = tmp_dir("only-tmux");
-        let file = StateFile::new(dir.clone());
+        let file = StateFile::new(dir.to_path_buf());
         file.write(only, file.ticket()).unwrap();
         assert_eq!(load(&dir), Ok(None));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1306,7 +1300,8 @@ mod tests {
         let mut store = SessionStore::default();
         // Nothing recorded and no lock: nothing to write.
         assert_eq!(store.pending_write(), PendingWrite::Nothing);
-        store.lock = Some(Lock::acquire(&tmp_dir("store")).unwrap());
+        let dir = tmp_dir("store");
+        store.lock = Some(Lock::acquire(&dir).unwrap());
         assert_eq!(store.pending_write(), PendingWrite::Nothing);
         store.record(20, 2, window(2));
         store.record(10, 1, window(1));
@@ -1324,7 +1319,6 @@ mod tests {
         store.forget(20);
         assert!(store.state().windows.is_empty());
         assert!(matches!(store.pending_write(), PendingWrite::Write(_)), "an emptied store is written");
-        std::fs::remove_dir_all(tmp_dir("store")).ok();
     }
 
     #[test]
@@ -1334,7 +1328,6 @@ mod tests {
         store.forget(1);
         let PendingWrite::Write(text) = store.pending_write() else { panic!("written") };
         assert!(State::parse(&text).unwrap().windows.is_empty(), "nothing to restore: {text}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn failure(message: &str) -> toml::ser::Error {
@@ -1408,7 +1401,6 @@ mod tests {
         let PendingWrite::Write(text) = store.pending_write() else { panic!("written once it serializes") };
         let state = State::parse(&text).unwrap();
         assert!(matches!(&state.windows[0].tabs[0], TabState::Local { cwd: Some(c), .. } if c == Path::new("/tmp")), "{text}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

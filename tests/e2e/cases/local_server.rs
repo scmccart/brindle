@@ -21,18 +21,19 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
-use super::multi_window::two_processes;
-use crate::brindle::Run;
-use crate::{Ctx, Outcome, Result, ensure};
+use super::multi_window::{two_processes, two_processes_after};
+use crate::brindle::{Run, state_dir};
+use crate::{Ctx, Outcome, Result, Scale, ensure};
 
 /// The case's terminal server, as `brindle-remote` sees it.
 #[derive(Clone)]
 struct Server {
     dir: PathBuf,
     helper: PathBuf,
-    slow: f64,
+    /// The case's waits ([`Scale`]), which a `call_at` closure carries.
+    scale: Scale,
 }
 
 /// One line of `brindle-remote list`.
@@ -45,7 +46,7 @@ struct Listed {
 
 impl Server {
     fn of(ctx: &Ctx) -> Self {
-        Self { dir: ctx.server_dir.clone(), helper: ctx.helper.clone(), slow: ctx.secs(1.0) }
+        Self { dir: ctx.server_dir.clone(), helper: ctx.helper.clone(), scale: ctx.scale() }
     }
 
     /// Runs a `brindle-remote` command against the case's server.
@@ -81,21 +82,34 @@ impl Server {
     }
 
     /// Polls `probe` until it gives a value, for at most `secs` (stretched).
-    fn wait<T>(&self, secs: f64, what: &str, mut probe: impl FnMut() -> Result<Option<T>>) -> Result<T> {
-        let deadline = Instant::now() + Duration::from_secs_f64(secs * self.slow);
-        let mut last = String::new();
-        loop {
-            match probe() {
-                Ok(Some(value)) => return Ok(value),
-                Ok(None) => {}
-                Err(why) => last = why,
-            }
-            if Instant::now() >= deadline {
-                let why = if last.is_empty() { String::new() } else { format!(" (last: {last})") };
-                return Err(format!("{what}: not within {secs} s{why}"));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    fn wait<T>(&self, secs: f64, what: &str, probe: impl FnMut() -> Result<Option<T>>) -> Result<T> {
+        self.scale.poll(secs, what, probe)
+    }
+
+    /// The listed session `id`'s fields, from `list --json`.
+    fn session(&self, id: u32) -> Result<serde_json::Value> {
+        let text = self.command(&["list", "--json"])?;
+        let listed: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("list --json: {e}"))?;
+        let session = listed.as_array().into_iter().flatten().find(|s| s["session"] == id);
+        session.cloned().ok_or_else(|| format!("no session {id} in {text}"))
+    }
+
+    /// The listed session `id`'s key.
+    fn key(&self, id: u32) -> Result<String> {
+        let session = self.session(id)?;
+        let key = session["key"].as_str().filter(|key| !key.is_empty());
+        key.map(str::to_string).ok_or_else(|| format!("session {id} has no key: {session}"))
+    }
+
+    /// Polls `state_file` (Brindle's `session.toml`, written within a
+    /// second of a change) until it records every listed session in
+    /// `sessions` by key.
+    fn in_state_file(&self, state_file: &Path, sessions: &[Listed]) -> Result {
+        let keys = sessions.iter().map(|s| self.key(s.id)).collect::<Result<Vec<String>>>()?;
+        self.wait(10.0, "the state file recording every session", || {
+            let text = std::fs::read_to_string(state_file).unwrap_or_default();
+            Ok(keys.iter().all(|key| text.contains(key.as_str())).then_some(()))
+        })
     }
 
     /// The one attached session.
@@ -301,6 +315,12 @@ fn mark(pid: u32, text: &str) -> Result {
         .open(format!("/proc/{pid}/fd/1"))
         .map_err(|e| format!("opening {pid}'s terminal: {e}"))?;
     tty.write_all(text.as_bytes()).map_err(|e| format!("writing to {pid}'s terminal: {e}"))
+}
+
+/// The bytes `pid` has written so far (`/proc/<pid>/io`'s `wchar`).
+fn written(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    text.lines().find_map(|line| line.strip_prefix("wchar:"))?.trim().parse().ok()
 }
 
 /// Waits for `pids` to be gone.
@@ -560,6 +580,7 @@ pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
     let saved = ctx.dir.join("pids");
     let save = saved.clone();
     let checked = srv.clone();
+    let state_file = state_dir(ctx).join("session.toml");
     Run::new(ctx, "first")
         .keep_detached()
         .restore()
@@ -574,8 +595,8 @@ pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
             let sessions = listed_when(&checked, 10.0, "two attached sessions", |s| {
                 s.len() == 2 && s.iter().all(|s| s.attached)
             })?;
-            // The state file is written within a second of a change.
-            std::thread::sleep(Duration::from_secs_f64(3.0 * checked.slow));
+            // Killed once the state file records both zones' sessions.
+            checked.in_state_file(&state_file, &sessions)?;
             let mut pids: Vec<u32> = sessions.iter().map(|s| s.pid).collect();
             pids.sort();
             std::fs::write(&save, format!("{pids:?}")).map_err(|e| e.to_string())?;
@@ -878,20 +899,52 @@ pub fn layout_live(ctx: &Ctx) -> Result<Outcome> {
         Ok((sessions.len() == 2 && layouts.len() == 2 && layouts[0] == layouts[1] && named(layouts[0]) == 2)
             .then(|| layouts[0].clone()))
     }
+    // Only `SET_LAYOUT` can put a layout there, since a kill sends no
+    // `DETACH`, and the core lists a layout only once a session is
+    // detached, so the kill waits on a round trip instead: Brindle's
+    // once-a-second recorder sends the tab's layouts (`send_layouts`) and
+    // then writes the state file on the same tick, so once the state file
+    // records both zones' sessions by key, their layout has been queued
+    // for the core. The right zone's command then waits for `ready` before
+    // it prints its marker, and the input that follows the marker (`touch
+    // typed`) goes to the core on the same connection after that layout;
+    // once `typed` exists the core has handled both.
     let checked = srv.clone();
+    let state_file = state_dir(ctx).join("session.toml");
+    let [ready, typed] = [ctx.dir.join("ready"), ctx.dir.join("typed")];
+    let (open, done) = (ready.clone(), typed.clone());
     Run::new(ctx, "split")
         .keep_detached()
         .prompt()
         .action("split_zone_right")
         .prompt()
-        .send(&format!("{}\r", echo_sum("right", 3, 3)))
+        .send(&format!(
+            "{}\r",
+            sh(
+                &format!(
+                    "while [ ! -e \"{}\" ]; do sleep 0.1; done; {}",
+                    ready.display(),
+                    echo_sum("right", 3, 3)
+                ),
+                &format!(
+                    "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; {}",
+                    slashed(&ready),
+                    echo_sum("right", 3, 3)
+                ),
+            )
+        ))
         .wait_for("right-6")
+        .send(&format!(
+            "{}\r",
+            sh(&format!("touch \"{}\"", typed.display()), &format!("'' > '{}'", slashed(&typed)))
+        ))
         .call_at(later(4.0), move |brindle| {
-            // Both shells up (the second prompt answered), then a few of the
-            // recorder's once-a-second ticks: only `SET_LAYOUT` can have put
-            // a layout there, since a kill sends no `DETACH`.
-            listed_when(&checked, 15.0, "both zones' sessions", |s| s.len() == 2 && s.iter().all(|s| s.attached))?;
-            std::thread::sleep(Duration::from_secs_f64(3.0 * checked.slow));
+            let sessions = listed_when(&checked, 15.0, "both zones' sessions", |s| {
+                s.len() == 2 && s.iter().all(|s| s.attached)
+            })?;
+            checked.in_state_file(&state_file, &sessions)?;
+            std::fs::write(&open, "").map_err(|e| format!("writing {}: {e}", open.display()))?;
+            checked.wait(15.0, "the typed command's file", || Ok(done.exists().then_some(())))?;
             kill(brindle)
         })
         .dump_at(30.0)
@@ -922,7 +975,7 @@ pub fn reattach_second(ctx: &Ctx) -> Result<Outcome> {
             Ok(())
         })
         .dump_at(later(4.0));
-    let (_, second) = two_processes(ctx, 3.0, first, second)?;
+    let (_, second) = two_processes(ctx, first, second)?;
     ensure!(second.dump.tabs.len() == 1, "the second Brindle's tabs: {:?}", second.dump.tabs);
     Ok(Outcome::Pass)
 }
@@ -1078,7 +1131,7 @@ pub fn env(ctx: &Ctx) -> Result<Outcome> {
     let shown = sh("echo foo-$FOO-x\r", "\"foo-$env:FOO-x\"\r");
     let first = Run::new(ctx, "first").keep_detached().env("FOO", "1").prompt().send(&shown).dump_at(later(8.0));
     let second = Run::new(ctx, "second").keep_detached().env("FOO", "2").prompt().send(&shown).dump_at(later(4.0));
-    let (first, second) = two_processes(ctx, 3.0, first, second)?;
+    let (first, second) = two_processes(ctx, first, second)?;
     screen_has(&first, "foo-1-x")?;
     screen_has(&second, "foo-2-x")?;
     ensure!(!second.dump.screen.concat().contains("foo-1-x"), "second: {:?}", second.dump.screen);
@@ -1118,8 +1171,15 @@ fn core_restart_less(ctx: &Ctx) -> Result<Outcome> {
         .call_at(2.0, move |_| {
             let less = srv.wait(15.0, "less started", || Ok(read_pid(&watched)))?;
             let listed = srv.attached(10.0)?;
-            // Let less draw before the core goes.
-            std::thread::sleep(Duration::from_secs_f64(srv.slow));
+            // less draws before the core goes, and before the marker below,
+            // which its first screen would clear. It can't write a marker
+            // file, so the case reads how much it has written: its terminal
+            // setup (some 30 bytes), then its first screen in one write of
+            // more than 8 bytes a row (`line-NN` and a newline), flushed
+            // when it first waits for a key.
+            let rows = srv.session(listed.id)?["rows"].as_u64().ok_or("no rows listed")?;
+            let screen = 8 * rows.saturating_sub(1);
+            srv.wait(15.0, "less's first screen written", || Ok(written(less).filter(|&n| n >= screen)))?;
             restart_core(&srv, &listed)?;
             ensure!(alive(less), "less {less} is gone");
             // The tab shows it once the replay arrived.
@@ -1138,12 +1198,13 @@ fn core_restart_less(ctx: &Ctx) -> Result<Outcome> {
 
 /// [`core_restart`] on Windows, where the core is ended with
 /// `TerminateProcess` and there is no `less`: a PowerShell script draws on
-/// the alternate screen, keeps its pid, and answers a key. It waits for a
-/// file the case creates once the session is attached again, then prints a
-/// marker.
+/// the alternate screen, keeps its pid, and answers a key. It writes a
+/// file once it has drawn, waits for a file the case creates once the
+/// session is attached again, then prints a marker.
 fn core_restart_windows(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let (file, go) = (ctx.dir.join("program-pid"), ctx.dir.join("reconnected"));
+    let drawn = ctx.dir.join("drawn");
     let script = pwsh_script(
         ctx,
         "alternate.ps1",
@@ -1152,6 +1213,7 @@ fn core_restart_windows(ctx: &Ctx) -> Result<Outcome> {
 "$PID" | Set-Content -LiteralPath '{file}'
 [Console]::Write("$e[?1049h$e[H")
 1..20 | ForEach-Object {{ 'line-{{0:D2}}' -f $_ }}
+'' | Set-Content -LiteralPath '{drawn}'
 while (-not (Test-Path -LiteralPath '{go}')) {{ Start-Sleep -Milliseconds 100 }}
 'RECONNECTED-' + 'MARK'
 $key = [Console]::ReadKey($true)
@@ -1160,6 +1222,7 @@ Start-Sleep 600
 "#,
             file = file.display(),
             go = go.display(),
+            drawn = drawn.display(),
         ),
     )?;
     let watched = file.clone();
@@ -1171,8 +1234,8 @@ Start-Sleep 600
         .call_at(2.0, move |_| {
             let program = srv.wait(15.0, "the program started", || Ok(read_pid(&watched)))?;
             let listed = srv.attached(10.0)?;
-            // Let it draw before the core goes.
-            std::thread::sleep(Duration::from_secs_f64(srv.slow));
+            // It has drawn before the core goes.
+            srv.wait(15.0, "the program's drawing", || Ok(drawn.exists().then_some(())))?;
             restart_core(&srv, &listed)?;
             ensure!(alive(program), "the program {program} is gone");
             std::fs::write(&go, "").map_err(|e| e.to_string())
@@ -1192,10 +1255,19 @@ Start-Sleep 600
 /// A bell, an OSC 9 and a `blocked` status since the last checkpoint
 /// notify once, live, and not again when the core restarts and the tab
 /// gets its replay; the status record is back.
+///
+/// The program prints `replayed-2` once the case creates `go`, after the
+/// session is attached again: that output follows the replay on the same
+/// connection, so a dump that shows it was taken after Brindle read the
+/// whole replay, and the log is compared then.
 pub fn replay_quiet(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
     let log = ctx.dir.join("notify.log");
     let watched = log.clone();
+    let go = ctx.dir.join("go");
+    let opened = go.clone();
+    let before = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let kept = before.clone();
     let blocked = r"\033]7501;state=blocked:kind=permission:app=e2e:msg=T2s/\033\\";
     let out = Run::new(ctx, "run")
         .keep_detached()
@@ -1203,29 +1275,43 @@ pub fn replay_quiet(ctx: &Ctx) -> Result<Outcome> {
         .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
         .prompt()
         .send(&sh(
-            &format!(r"printf '\a\033]9;Ping\a{blocked}'; cat\r"),
-            "[Console]::Write(\"`a`e]9;Ping`a`e]7501;state=blocked:kind=permission:app=e2e:msg=T2s/`a\"); \
-             $null = [Console]::ReadLine()\r",
+            &format!(
+                r#"printf '\a\033]9;Ping\a{blocked}'; while [ ! -e "{}" ]; do sleep 0.1; done; {}; cat\r"#,
+                go.display(),
+                echo_sum("replayed", 1, 1)
+            ),
+            &format!(
+                "[Console]::Write(\"`a`e]9;Ping`a`e]7501;state=blocked:kind=permission:app=e2e:msg=T2s/`a\"); \
+                 while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 100 }}; {}; \
+                 $null = [Console]::ReadLine()\r",
+                slashed(&go),
+                echo_sum("replayed", 1, 1)
+            ),
         ))
         .call_at(2.0, move |_| {
             let read = || std::fs::read_to_string(&watched).unwrap_or_default();
-            let live = srv.wait(15.0, "the live notifications", || {
+            srv.wait(15.0, "the live notifications", || {
                 let text = read();
                 Ok((text.contains("osc9\t") && text.contains("osc7501\t")).then_some(()))
-            });
-            live?;
+            })?;
             let listed = srv.attached(10.0)?;
-            // Anything late from the live output arrives first.
-            std::thread::sleep(Duration::from_secs_f64(srv.slow));
-            let before = read();
+            // Anything late from the live output arrives first: the log is
+            // the same before and after a round trip through the core.
+            let settled = srv.wait(10.0, "the notification log settled", || {
+                let first = read();
+                srv.list()?;
+                Ok((read() == first).then_some(first))
+            })?;
+            *kept.lock().map_err(|_| "poisoned")? = Some(settled);
             restart_core(&srv, &listed)?;
-            std::thread::sleep(Duration::from_secs_f64(3.0 * srv.slow));
-            let after = read();
-            ensure!(after == before, "the reconnect notified: before {before:?}, after {after:?}");
-            Ok(())
+            std::fs::write(&opened, "").map_err(|e| format!("writing {}: {e}", opened.display()))
         })
         .dump_at(later(22.0))
         .run()?;
+    screen_has(&out, "replayed-2")?;
+    let before = before.lock().map_err(|_| "poisoned")?.clone().ok_or("the log was never read")?;
+    let after = std::fs::read_to_string(&log).unwrap_or_default();
+    ensure!(after == before, "the reconnect notified: before {before:?}, after {after:?}");
     ensure!(
         out.dump.status.iter().any(|s| s.starts_with("state=blocked")),
         "the replay didn't restore the status: {:?}",
@@ -1246,7 +1332,6 @@ pub fn holder_lost(ctx: &Ctx) -> Result<Outcome> {
         .call_at(later(2.0), move |_| {
             let listed = srv.attached(10.0)?;
             let holder = parent(listed.pid).filter(|&pid| is_holder(pid)).ok_or("no holder")?;
-            std::thread::sleep(Duration::from_secs_f64(srv.slow));
             kill(holder)
         })
         .dump_at(later(6.0))
@@ -1525,6 +1610,8 @@ fn upgrade_windows(ctx: &Ctx) -> Result<Outcome> {
     let report = ctx.dir.join("status.json");
     let saved = report.clone();
     let go = ctx.dir.join("upgraded");
+    let checked = ctx.dir.join("checked");
+    let check = checked.clone();
     let waits = pwsh_script(
         ctx,
         "wait.ps1",
@@ -1542,6 +1629,8 @@ fn upgrade_windows(ctx: &Ctx) -> Result<Outcome> {
             let listed = srv.attached(10.0)?;
             let status = srv.status()?;
             ensure!(status["core_build"] == old_build.as_str(), "the first core's build: {status}");
+            // The second Brindle, which upgrades the core, starts now.
+            std::fs::write(&check, "").map_err(|e| format!("writing {}: {e}", check.display()))?;
             upgraded(&srv, &listed, &old_build, &new_build, &saved)?;
             std::fs::write(&go, "").map_err(|e| e.to_string())
         })
@@ -1555,7 +1644,8 @@ fn upgrade_windows(ctx: &Ctx) -> Result<Outcome> {
         .prompt()
         .send(&format!("{}\r", echo_sum("second", 1, 1)))
         .dump_at(later(6.0));
-    let (first, second) = two_processes(ctx, 4.0, first, second)?;
+    let checked_old = || Ok(checked.exists().then_some(()));
+    let (first, second) = two_processes_after(ctx, "the first core's build checked", checked_old, first, second)?;
     screen_has(&second, "second-2")?;
     let pid = shown_pid(&first, "first=")?;
     screen_has(&first, &format!("after-7={pid}"))?;
@@ -1574,6 +1664,8 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
     let (newer, old_build, new_build) = other_build_elf(ctx)?;
     let report = ctx.dir.join("status.json");
     let saved = report.clone();
+    let checked = ctx.dir.join("checked");
+    let check = checked.clone();
     let first = Run::new(ctx, "first")
         .keep_detached()
         .send("echo first=$$\r")
@@ -1581,6 +1673,8 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
             let listed = srv.attached(10.0)?;
             let status = srv.status()?;
             ensure!(status["core_build"] == old_build.as_str(), "the first core's build: {status}");
+            // The second Brindle, which upgrades the core, starts now.
+            std::fs::write(&check, "").map_err(|e| format!("writing {}: {e}", check.display()))?;
             upgraded(&srv, &listed, &old_build, &new_build, &saved)?;
             mark(listed.pid, "UPGRADED-MARK\r\n")
         })
@@ -1593,7 +1687,8 @@ pub fn upgrade(ctx: &Ctx) -> Result<Outcome> {
         .env("BRINDLE_REMOTE_AGENT", newer.to_str().unwrap())
         .send("echo second-$((1+1))\r")
         .dump_at(6.0);
-    let (first, second) = two_processes(ctx, 3.0, first, second)?;
+    let checked_old = || Ok(checked.exists().then_some(()));
+    let (first, second) = two_processes_after(ctx, "the first core's build checked", checked_old, first, second)?;
     screen_has(&second, "second-2")?;
     let pid = first
         .dump
@@ -1659,13 +1754,13 @@ $answer = [BrindleE2e.Box]::MessageBoxW([BrindleE2e.Box]::GetConsoleWindow(), 'O
     for (label, title) in [("first", "brindle-e2e-box-1"), ("second", "brindle-e2e-box-2")] {
         let chain = ctx.dir.join(format!("{label}-owners.txt"));
         let saved = chain.clone();
-        let slow = ctx.secs(1.0);
+        let scale = ctx.scale();
         let out = Run::new(ctx, label)
             .keep_detached()
             .restore()
             .prompt()
             .send(&show(title))
-            .call_at(2.0, move |brindle| check_box_owner(brindle, title, &saved, slow))
+            .call_at(2.0, move |brindle| check_box_owner(brindle, title, &saved, scale))
             .wait_for(&format!("box-closed-{title}="))
             .dump_at(later(14.0))
             .run()?;
@@ -1680,17 +1775,9 @@ $answer = [BrindleE2e.Box]::MessageBoxW([BrindleE2e.Box]::GetConsoleWindow(), 'O
 /// reach Brindle's window (reparenting is asynchronous), saving the chain to
 /// `saved`, and closes the box with `WM_CLOSE` whatever was found.
 #[cfg(windows)]
-fn check_box_owner(brindle: u32, title: &str, saved: &Path, slow: f64) -> Result {
+fn check_box_owner(brindle: u32, title: &str, saved: &Path, scale: Scale) -> Result {
     use crate::winproc::{owner, post_close, window_of, window_titled};
-    let wait = |secs: f64| Instant::now() + Duration::from_secs_f64(secs * slow);
-    let deadline = wait(20.0);
-    let found = loop {
-        if let Some(found) = window_titled(title) {
-            break found;
-        }
-        ensure!(Instant::now() < deadline, "no message box {title:?} within 20 s");
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let found = scale.poll(20.0, &format!("the message box {title:?}"), || Ok(window_titled(title)))?;
     let chain_of = |window| {
         let mut chain = vec![window];
         while let Some(next) = owner(*chain.last().unwrap()).filter(|next| !chain.contains(next)) {
@@ -1698,25 +1785,18 @@ fn check_box_owner(brindle: u32, title: &str, saved: &Path, slow: f64) -> Result
         }
         chain
     };
-    let deadline = wait(10.0);
-    let checked = loop {
+    let checked = scale.poll(10.0, "the box's owners reaching Brindle's window", || {
         let main = window_of(brindle);
         let chain = chain_of(found);
         let text: Vec<String> = chain.iter().map(|w| format!("{w:#x}")).collect();
         std::fs::write(saved, format!("brindle {main:x?}\nbox and owners {}\n", text.join(" "))).ok();
         // The box's owner is the console window, whose owner is Brindle's.
-        let owned = main.is_some_and(|main| chain[1..].contains(&main));
-        if owned {
-            break Ok(());
+        if main.is_some_and(|main| chain[1..].contains(&main)) {
+            Ok(Some(()))
+        } else {
+            Err(format!("owners {}, Brindle's window {main:x?}", text.join(" → ")))
         }
-        if Instant::now() >= deadline {
-            break Err(format!(
-                "the box's owners {} don't reach Brindle's window {main:x?} within 10 s",
-                text.join(" → ")
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    });
     post_close(found)?;
     checked
 }
@@ -1816,10 +1896,8 @@ pub fn elevated(ctx: &Ctx) -> Result<Outcome> {
             .map(|p| p.pid)
             .collect()
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !left().is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Within 5 s (stretched); what is left after that is ended and reported.
+    ctx.scale().poll(5.0, "the copies' roles ending", || Ok(left().is_empty().then_some(()))).ok();
     let leftover = left();
     leftover.iter().for_each(|&pid| crate::winproc::kill(pid));
     let outcome = result?;
@@ -1839,7 +1917,7 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
         .dump_at(later(4.0))
         .run()?;
     screen_has(&out, "elevated-tab")?;
-    let high_server = Server { dir: high.to_path_buf(), helper: ctx.helper.clone(), slow: ctx.secs(1.0) };
+    let high_server = Server { dir: high.to_path_buf(), helper: ctx.helper.clone(), scale: ctx.scale() };
     // Not `detached_pids`: with `BRINDLE_SERVER_DIR` unset the copies the
     // roles run from are in `appdata\brindle\server`, shared by both
     // servers, not in the server directory's `bin`, so `Server::core` never
@@ -1884,11 +1962,17 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
         Ok(pid) => pid,
         Err(why) => return Ok(Outcome::Skip(format!("can't run an unelevated Brindle beside: {why}"))),
     };
-    let deadline = Instant::now() + Duration::from_secs_f64(ctx.secs(60.0));
-    while !done.exists() {
+    let finished = ctx.scale().poll(60.0, "the unelevated run", || {
+        if done.exists() {
+            return Ok(Some(true));
+        }
         // The script writes `done` last, so a cmd gone without it stopped
         // early: most likely it couldn't write to the case directory.
-        if !crate::winproc::alive(cmd) && !done.exists() {
+        Ok((!crate::winproc::alive(cmd) && !done.exists()).then_some(false))
+    });
+    match finished {
+        Ok(true) => {}
+        Ok(false) => {
             let present = |path: &Path| if path.exists() { "present" } else { "missing" };
             return Err(format!(
                 "the unelevated script ended without finishing (unelevated.dump {}, unelevated.log {}, \
@@ -1899,7 +1983,7 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
                 ctx.dir.display()
             ));
         }
-        if Instant::now() >= deadline {
+        Err(why) => {
             // Brindle and the helper commands are cmd's children.
             let children: Vec<u32> = crate::winproc::all()
                 .into_iter()
@@ -1907,9 +1991,8 @@ fn elevated_pair(ctx: &Ctx, appdata: &Path, high: &Path, medium: &Path) -> Resul
                 .map(|p| p.pid)
                 .collect();
             children.into_iter().chain([cmd]).for_each(crate::winproc::kill);
-            return Err("the unelevated run didn't finish; see unelevated.log".into());
+            return Err(format!("{why}; see unelevated.log"));
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
     let screen = std::fs::read_to_string(&dump).unwrap_or_default();
     ensure!(screen.contains("unelevated-tab"), "the unelevated tab: see unelevated.dump");

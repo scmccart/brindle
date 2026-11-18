@@ -430,7 +430,7 @@ fn a_flood_and_its_exit_reach_a_slow_client() {
                 output.extend(data.bytes);
                 if since_pause >= 64 * 1024 {
                     since_pause = 0;
-                    thread::sleep(Duration::from_millis(30));
+                    throttle(Duration::from_millis(30));
                 }
             }
             ToClient::Exit(exit) if exit.session == session => break exit,
@@ -514,31 +514,17 @@ fn a_stalled_client_doesnt_delay_another_clients_session() {
         "while read line; do echo \"pong $line\"; done",
     ));
 
-    // The flood's program ends up blocked, not the core.
-    let mut samples = 0;
-    assert!(
-        eventually(TIMEOUT, || {
-            samples = if state(flood_pid) == Some('S') {
-                samples + 1
-            } else {
-                0
-            };
-            samples >= 10
-        }),
-        "the flooding program never blocked"
-    );
+    // The flood's program ends up blocked, not the core: the holder stops
+    // reading its terminal once the core pauses the session.
+    let holder = parent(flood_pid).unwrap();
+    assert!(stays_blocked(flood_pid, holder), "the flooding program never blocked");
     let core_rss = rss_kib(stalled.core_pid());
     assert!(core_rss < 128 * 1024, "the core holds {core_rss} KiB");
 
+    // A core the stalled client blocked would never answer a round.
     for round in 0..5 {
-        let sent = Instant::now();
         reader.input(echo, format!("{round}\n").as_bytes());
         reader.output_until(echo, format!("pong {round}\r\n").as_bytes());
-        assert!(
-            sent.elapsed() < Duration::from_secs(5),
-            "round {round} took {:?}",
-            sent.elapsed()
-        );
     }
 
     // Once the stalled client reads again, its session flows again: far
@@ -556,8 +542,18 @@ fn a_stalled_client_doesnt_delay_another_clients_session() {
 
 // 4.3
 
-/// A little more than the core's reconnect grace period.
-const PAST_GRACE: Duration = Duration::from_secs(12);
+/// A sentinel for the end of a restarted core's grace period: a `kill`
+/// session of a client (token `never`) that won't come back. The new core
+/// hangs it up when the grace period ends, logging
+/// [`Decision::OwnerGone`], and it decides for every adopted session in that
+/// one pass (`end_grace`), so once the line is there the others' fate is
+/// settled too. Call it before the core is killed, and keep the client
+/// until then: a client that leaves earlier takes its session with it.
+fn grace_sentinel(dir: &TempDir) -> (TestClient, SessionId) {
+    let mut never = TestClient::hello(&dir.path, "never");
+    let (sentinel, _) = never.spawn(programs::echoer());
+    (never, sentinel)
+}
 
 fn detach(mut spawn: client::Spawn) -> client::Spawn {
     spawn.policy = client::Policy::Detach;
@@ -604,7 +600,7 @@ fn a_sigkilled_clients_kill_session_ends_with_its_children_and_detach_survives()
         eventually(Duration::from_secs(5), || !alive(pid) && !alive(background)),
         "the kill session outlived its client"
     );
-    thread::sleep(Duration::from_millis(500));
+    core_logged(&dir, kept, Decision::Detached);
     assert!(alive(kept_pid), "the detach session ended with its client");
     assert!(alive(core_pid), "the core keeps the detach session");
 
@@ -635,7 +631,7 @@ fn a_detach_session_goes_back_to_its_owners_token() {
     let (dir, mut client) = core("detach");
     let (session, pid) = client.spawn(detach(programs::echoer()));
     drop(client);
-    thread::sleep(Duration::from_millis(500));
+    core_logged(&dir, session, Decision::Detached);
     assert!(alive(pid));
 
     let mut stranger = TestClient::hello(&dir.path, "stranger");
@@ -656,13 +652,15 @@ fn a_client_back_within_the_grace_period_keeps_its_kill_sessions() {
     let old_core = client.core_pid();
     let (session, pid) = client.spawn(programs::echoer());
     dir.track(parent(pid).unwrap());
+    let (never, sentinel) = grace_sentinel(&dir);
 
     kill_core_and_wait_for_another(&dir, &mut client);
+    drop(never);
     let mut client = TestClient::hello(&dir.path, "back");
     assert_ne!(client.core_pid(), old_core);
     say(&mut client, session, "still here");
 
-    thread::sleep(PAST_GRACE);
+    core_logged(&dir, sentinel, Decision::OwnerGone);
     assert!(alive(pid));
     say(&mut client, session, "later");
 }
@@ -942,13 +940,10 @@ fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
     );
 
     owner.detach(session);
-    let (start, _) = loop {
-        match other.attach(session, 100, 30) {
-            Ok(replay) => break replay,
-            // The DETACH may not have been read yet.
-            Err(_) => thread::sleep(Duration::from_millis(20)),
-        }
-    };
+    // The DETACH may not have been read yet.
+    let (start, _) = until("an attach after the DETACH", TIMEOUT, || {
+        other.attach(session, 100, 30).ok()
+    });
     assert_eq!(start.session, session);
     other.input(session, b"\n");
     other.output_until(session, b"30 100");
@@ -1167,11 +1162,19 @@ fn sessions_list_their_key_title_start_and_profile_and_keys_outlive_ids() {
     assert_eq!(spawned.key.len(), 32, "{spawned:?}");
     client.output_until(spawned.session, b"ready.");
     let listed = client.list();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let info = listed.iter().find(|s| s.session == spawned.session).unwrap();
     assert_eq!(info.key, spawned.key);
     assert_eq!(info.title, programs::title("build"));
     assert_eq!(info.profile.as_deref(), Some("Shell"));
-    assert!(info.started >= before && info.started <= before + 60, "{info:?}");
+    assert!(
+        before <= info.started && info.started <= after,
+        "started {} outside {before}..={after}: {info:?}",
+        info.started
+    );
 
     // A fresh server starts its ids over; the key tells the sessions apart.
     client.send(client::ToCore::Stop(client::Request { req: 900 }));
@@ -1196,7 +1199,8 @@ fn an_explicit_detach_keeps_a_kill_session_and_clears_its_owner() {
     let info = listed.iter().find(|s| s.session == session).unwrap();
     assert_eq!((info.attached, info.policy), (false, client::Policy::Detach));
     drop(client);
-    thread::sleep(Duration::from_millis(500));
+    // The core applies the close policies as it logs the departure.
+    left(&dir, 1);
     assert!(alive(pid), "the detached kill session ended with its client");
 
     // Its old client gets nothing back; anyone may attach it.
@@ -1360,12 +1364,14 @@ fn owner_and_policy_changes_survive_a_core_restart() {
     a.detach(taken);
     let mut b = TestClient::hello(&dir.path, "b");
     b.attach(taken, 80, 24).unwrap();
+    let (never, sentinel) = grace_sentinel(&dir);
 
     kill_core_and_wait_for_another(&dir, &mut a);
     assert!(b.closes());
+    drop(never);
     // Past the grace period: `left` was `kill` at spawn, and only its
     // stored policy (now `detach`) keeps it running.
-    thread::sleep(PAST_GRACE);
+    core_logged(&dir, sentinel, Decision::OwnerGone);
     assert!(alive(left_pid), "the detached kill session ended after the restart");
 
     let mut a = TestClient::hello(&dir.path, "a");
@@ -1467,7 +1473,8 @@ fn a_connection_with_a_connected_clients_token_takes_its_sessions_over() {
     assert!(first.closes(), "the replaced connection stayed open");
 
     // No close policy applied: the kill session runs on, as the second's.
-    thread::sleep(Duration::from_millis(500));
+    // The take-over closed the first connection in the handler that logged
+    // it, so nothing about it is pending.
     assert!(alive(killed_pid) && alive(kept_pid));
     say(&mut second, killed, "second");
     say(&mut second, kept, "second");
@@ -1484,19 +1491,27 @@ fn lingering(dir: &TempDir, token: &str, secs: u32) -> TestClient {
 fn a_lingering_clients_kill_session_is_given_back_when_it_returns_in_time() {
     let mut dir = TempDir::new("linger-back");
     start_core(&dir.path, &[]).unwrap();
-    let mut client = lingering(&dir, "back", 3);
+    // Long enough that a loaded machine reconnects within it.
+    const LINGER: u32 = 10;
+    let mut client = lingering(&dir, "back", LINGER);
     dir.track(client.core_pid());
     let (session, pid) = client.spawn(programs::echoer());
     say(&mut client, session, "before");
     drop(client);
-    thread::sleep(Duration::from_secs(1));
+    core_logged(&dir, session, Decision::Lingers(LINGER));
     assert!(alive(pid), "the kill session ended with its connection");
 
-    let mut client = lingering(&dir, "back", 3);
+    let mut client = lingering(&dir, "back", LINGER);
     let (start, _) = client.reconnect_replay();
     assert_eq!((start.session, start.pid), (session, pid));
-    // Back in time, so the linger no longer counts.
-    thread::sleep(Duration::from_secs(4));
+    // Back in time, so the linger no longer counts. A sentinel that left
+    // after it and never comes back is hung up once its own, later,
+    // deadline has passed; the core checks every lingering session at
+    // once, so by then the subject's old deadline has passed too.
+    let mut sentinel = lingering(&dir, "never", LINGER);
+    let (sentinel_session, _) = sentinel.spawn(programs::echoer());
+    drop(sentinel);
+    core_logged(&dir, sentinel_session, Decision::LingerOver);
     assert!(alive(pid), "hung up although its client came back");
     say(&mut client, session, "after");
 }
@@ -1513,20 +1528,23 @@ fn a_kill_session_ends_when_its_lingering_client_doesnt_return_and_at_once_witho
     say(&mut away, waits, "up");
     say(&mut plain, ends, "up");
 
-    let left = Instant::now();
+    let departed = Instant::now();
     drop(away);
     drop(plain);
     assert!(
         eventually(Duration::from_secs(3), || !alive(ends_pid)),
         "a kill session without a linger outlived its client"
     );
-    assert!(alive(waits_pid), "the lingering session ended after {:?}", left.elapsed());
+    let waiting = core_logged(&dir, waits, Decision::Lingers(4));
     assert!(gone(waits_pid), "the lingering session never ended");
+    // Never before its linger, which the core guarantees on any machine.
     assert!(
-        left.elapsed() >= Duration::from_secs(3),
+        departed.elapsed() >= Duration::from_secs(3),
         "hung up after {:?}",
-        left.elapsed()
+        departed.elapsed()
     );
+    let over = core_logged(&dir, waits, Decision::LingerOver);
+    assert!(over > waiting, "the hang-up was logged before the linger began");
 }
 
 #[test]
@@ -1534,6 +1552,7 @@ fn the_session_list_tells_a_dropped_owner_from_an_explicit_detach() {
     let (dir, mut owner) = core("owned");
     let (dropped, _) = owner.spawn(detach(programs::echoer()));
     let (released, _) = owner.spawn(detach(programs::echoer()));
+    let since_release = Instant::now();
     owner.detach(released);
     let mut observer = TestClient::hello(&dir.path, "observer");
     let listed = |observer: &mut TestClient, session: SessionId| {
@@ -1544,18 +1563,25 @@ fn the_session_list_tells_a_dropped_owner_from_an_explicit_detach() {
     let info = listed(&mut observer, dropped);
     assert!(info.attached && !info.owned && info.detached_secs == 0, "{info:?}");
 
+    let since_drop = Instant::now();
     drop(owner);
     assert!(
         eventually(TIMEOUT, || !listed(&mut observer, dropped).attached),
         "the session kept its client"
     );
-    thread::sleep(Duration::from_millis(2100));
-    let info = listed(&mut observer, dropped);
+    // The time counts up from the client's departure, and never past what
+    // this test's own clock saw since.
+    let info = until("a listing two seconds after the drop", TIMEOUT, || {
+        let info = listed(&mut observer, dropped);
+        (info.detached_secs >= 2).then_some(info)
+    });
     assert!(!info.attached && info.owned, "{info:?}");
-    assert!((2..60).contains(&info.detached_secs), "{info:?}");
+    assert!(info.detached_secs <= since_drop.elapsed().as_secs() + 1, "{info:?}");
     let info = listed(&mut observer, released);
     assert!(!info.attached && !info.owned, "{info:?}");
-    assert!((2..60).contains(&info.detached_secs), "{info:?}");
+    // Released before the other was dropped, so detached for longer.
+    assert!(info.detached_secs >= 2, "{info:?}");
+    assert!(info.detached_secs <= since_release.elapsed().as_secs() + 1, "{info:?}");
 }
 
 /// How many times [`a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write`]
@@ -1583,13 +1609,22 @@ fn a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write() {
         let (released, _) = owner.spawn(detach(programs::sleeps()));
         owner.spawn(programs::floods());
         // Another thread reads the flood, so the core keeps writing to this
-        // connection and is about to write again when it closes.
+        // connection and is about to write again when it closes. It says so
+        // once the first 64 KiB of it have come.
+        let (flowing, is_flowing) = std::sync::mpsc::channel();
         let draining = thread::spawn(move || {
             let mut buffer = [0u8; 64 * 1024];
+            let mut read = 0usize;
             loop {
                 match std::io::Read::read(&mut reader, &mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {}
+                    Ok(count) => {
+                        let before = read;
+                        read += count;
+                        if before < buffer.len() && read >= buffer.len() {
+                            let _ = flowing.send(());
+                        }
+                    }
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -1601,7 +1636,9 @@ fn a_detach_counts_when_the_core_finds_its_client_gone_by_a_failed_write() {
                 }
             }
         });
-        thread::sleep(Duration::from_millis(300));
+        is_flowing
+            .recv_timeout(limit(TIMEOUT))
+            .expect("the flood never reached the connection");
         owner.detach(released);
         close(&closer);
         drop(owner);
@@ -1656,6 +1693,21 @@ fn interactive_shell() -> client::Spawn {
     spawn
 }
 
+/// The first `PROCESS` for `session` that names the program `name`,
+/// skipping earlier ones.
+#[cfg(unix)]
+fn told_of(client: &mut TestClient, session: SessionId, name: &str) -> client::Process {
+    let deadline = Instant::now() + limit(TIMEOUT);
+    loop {
+        let process = client
+            .process_within(session, deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|| panic!("never told that session {session} runs {name}"));
+        if process.name.as_deref() == Some(name) {
+            return process;
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_client_that_asks_is_told_of_the_foreground_program_when_it_changes() {
@@ -1672,18 +1724,10 @@ fn a_client_that_asks_is_told_of_the_foreground_program_when_it_changes() {
     assert_ne!(first.name.as_deref(), Some("sleep"), "{first:?}");
     assert_eq!(first.cwd.as_deref(), Some("/"), "{first:?}");
 
-    // A program started in the shell, which prints nothing.
-    let typed = Instant::now();
+    // A program started in the shell, which prints nothing: told at all,
+    // the echo of the line having been its only activity.
     client.input(session, b"cd /tmp && sleep 1000\n");
-    let sleep = loop {
-        let process = client
-            .process_within(session, (typed + TIMEOUT).saturating_duration_since(Instant::now()))
-            .expect("never told of sleep");
-        if process.name.as_deref() == Some("sleep") {
-            break process;
-        }
-    };
-    assert!(typed.elapsed() < Duration::from_secs(3), "told after {:?}", typed.elapsed());
+    let sleep = told_of(&mut client, session, "sleep");
     assert_eq!(sleep.cwd.as_deref(), Some("/tmp"), "{sleep:?}");
 
     // An attach tells the client once, though nothing changed.
@@ -1702,22 +1746,42 @@ fn an_idle_session_is_not_looked_at() {
     start_core(&dir.path, &[]).unwrap();
     let mut client = asking_for_processes(&dir, "asks");
     dir.track(client.core_pid());
-    // Its foreground program changes 3 s in, with no output or input.
-    let started = Instant::now();
-    let (session, pid) = client.spawn(client_shell("printf 'ready.'; sleep 3; exec sleep 1000"));
+    // Its foreground program changes once the file `go` exists, with no
+    // output or input.
+    let go = dir.path.join("go");
+    let (session, pid) = client.spawn(client_shell(&format!(
+        "printf 'ready.'; while [ ! -e '{}' ]; do sleep 0.1; done; exec sleep 1000",
+        go.display()
+    )));
     client.output_until(session, b"ready.");
     let first = client
         .process_within(session, TIMEOUT)
         .expect("no PROCESS after the start");
     assert_eq!(first.name.as_deref(), Some("sh"), "{first:?}");
 
-    // A core that looked at idle sessions would report `sleep` by now.
-    let late = client.process_within(
-        session,
-        (started + Duration::from_secs(7)).saturating_duration_since(Instant::now()),
+    // A sentinel, whose changes are made by input, so the core looks at it.
+    // Its first change is told at a look after the one that told `first`:
+    // past that look the idle session's start no longer counts as recent
+    // activity, so from then on only a core that looks at idle sessions
+    // would look at it.
+    let (sentinel, _) = client.spawn(interactive_shell());
+    client.output_until(sentinel, b"ready> ");
+    client.input(sentinel, b"sleep 1000\n");
+    told_of(&mut client, sentinel, "sleep");
+
+    fs::write(&go, "").unwrap();
+    assert!(
+        eventually(TIMEOUT, || program_of(pid).as_deref() == Some("sleep")),
+        "the idle session's program never changed"
     );
+    // The sentinel's next change is told at a look after the idle one's;
+    // a `LIST` round trip then brings in everything the core sent before
+    // its answer, so a report of the idle session would be here.
+    client.input(sentinel, b"\x03");
+    told_of(&mut client, sentinel, "sh");
+    client.list();
+    let late = client.process_within(session, Duration::ZERO);
     assert!(late.is_none(), "told of an idle session: {late:?}");
-    assert_eq!(program_of(pid).as_deref(), Some("sleep"));
 
     // Input makes it look again.
     client.input(session, b"x");
@@ -1783,7 +1847,10 @@ fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
     // Opt-in: it starts scopes in this user's own systemd manager, which a
     // developer's run shouldn't do unasked. CI's disposable runner sets it.
     if std::env::var("BRINDLE_SCOPE_TEST").as_deref() != Ok("1") {
-        eprintln!("skipped: set BRINDLE_SCOPE_TEST=1 to start scopes in this user's systemd manager");
+        skip(
+            Capability::Scopes,
+            "set BRINDLE_SCOPE_TEST=1 to start scopes in this user's systemd manager",
+        );
         return;
     }
     // `start_core` sets BRINDLE_NO_SCOPE=1 for the starter; "0" overrides it
@@ -1791,7 +1858,7 @@ fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
     if let brindle_remote_protocol::scope::Decision::Plain(reason) =
         brindle_remote_protocol::scope::current()
     {
-        eprintln!("skipped: {reason}");
+        skip(Capability::Scopes, reason);
         return;
     }
     let mut dir = TempDir::new("scopes");
@@ -1970,29 +2037,29 @@ mod on_windows {
         let (dir, mut stalled) = core("stall");
         let core_pid = stalled.core_pid();
         let file = numbered_lines(&dir.path, 20_000);
-        let (flood, _) = stalled.spawn(client_shell(&format!(
-            "for /l %i in (0,0,1) do @type {}",
+        let flooding = dir.path.join("flooding");
+        let (flood, flood_pid) = stalled.spawn(client_shell(&format!(
+            "type nul>{}& for /l %i in (0,0,1) do @type {}",
+            flooding.display(),
             file.display()
         )));
         // From here on it stops reading.
         let mut reader = TestClient::hello(&dir.path, "reader");
         let (echo, _) = reader.spawn(programs::echoer());
 
-        // Long enough for the flood to fill every queue on its way. Then
-        // its program is blocked, not the core: the core holds no more of
-        // it, however long the flood goes on.
-        thread::sleep(Duration::from_secs(3));
+        // Once the flood has filled every queue on its way, its program
+        // (`cmd`, whose `type` writes) is blocked, not the core: the core
+        // holds no more of it, however long the flood goes on. The holder
+        // stops reading it once the core pauses the session.
+        assert!(eventually(TIMEOUT, || flooding.exists()), "the flood never started");
+        let holder = parent(flood_pid).unwrap();
+        assert!(stays_blocked(flood_pid, holder), "the flooding program never blocked");
         let held = working_set_kib(core_pid);
         assert!(held < 128 * 1024, "the core holds {held} KiB");
 
+        // A core the stalled client blocked would never answer a round.
         for round in 0..5 {
-            let sent = Instant::now();
             say(&mut reader, echo, &format!("ping{round}"));
-            assert!(
-                sent.elapsed() < Duration::from_secs(5),
-                "round {round} took {:?}",
-                sent.elapsed()
-            );
         }
         let held = working_set_kib(core_pid);
         assert!(held < 128 * 1024, "the core holds {held} KiB");
@@ -2129,13 +2196,10 @@ mod on_windows {
         );
 
         owner.detach(session);
-        let (start, _) = loop {
-            match other.attach(session, 100, 30) {
-                Ok(replay) => break replay,
-                // The DETACH may not have been read yet.
-                Err(_) => thread::sleep(Duration::from_millis(20)),
-            }
-        };
+        // The DETACH may not have been read yet.
+        let (start, _) = until("an attach after the DETACH", TIMEOUT, || {
+            other.attach(session, 100, 30).ok()
+        });
         assert_eq!(start.session, session);
         becomes_100x30(&mut other, session);
         // The first client no longer has it.
@@ -2305,7 +2369,7 @@ mod on_windows {
     fn reparent_reaches_the_sessions_holder() {
         // Only the packaged ConPTY can; a build without it uses Windows' own.
         if !Path::new(BIN).with_file_name("conpty.dll").exists() {
-            eprintln!("skipped: no packaged ConPTY beside the helper");
+            skip(Capability::PackagedConpty, "no conpty.dll beside the helper");
             return;
         }
         let (dir, mut client) = core("reparent");
@@ -2334,17 +2398,11 @@ mod on_windows {
             hwnd: window.id(),
         }));
         // The host applies it a moment later.
-        let deadline = Instant::now() + TIMEOUT;
-        while window_owner(console_window) != window.id() {
-            assert!(
-                Instant::now() < deadline,
-                "the owner is {:#x}, not {:#x}",
-                window_owner(console_window),
-                window.id()
-            );
+        let wanted = window.id();
+        until(&format!("the console window's owner is {wanted:#x}"), TIMEOUT, || {
             Window::pump();
-            thread::sleep(Duration::from_millis(10));
-        }
+            (window_owner(console_window) == wanted).then_some(())
+        });
         // It has no answer: the next message is the close's.
         client.send(client::ToCore::Close(client::SessionRef { session }));
         client.hung_up(session);

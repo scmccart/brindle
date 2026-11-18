@@ -314,7 +314,6 @@ fn run(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -323,7 +322,9 @@ mod tests {
     use crate::remote::local::{Attaching, Endpoint, Stream, connect};
     use crate::remote::protocol::Frame;
     use crate::remote::budget::Refusal;
-    use crate::remote::protocol::client::{self, Spawned, ToClient, ToCore, Welcome};
+    use crate::remote::protocol::client::{self, KillTarget, Spawned, ToClient, ToCore, Welcome};
+    use crate::test_support::TempDir;
+    use crate::test_support::wait::{limit, until};
 
     /// What the tab saw.
     struct Recorder(mpsc::Sender<String>);
@@ -368,24 +369,24 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("brindle-session-{tag}-{}", std::process::id()));
-        std::fs::remove_dir_all(&path).ok();
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    /// A fresh directory for one test, removed when it ends.
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(&format!("session-{tag}"))
     }
 
-    /// A core that waits `delay` before its `WELCOME`, starts one session,
-    /// and reports the messages it gets after `SPAWN`.
-    fn slow_core(dir: &std::path::Path, delay: Duration) -> mpsc::Receiver<ToCore> {
+    /// A core that holds its `WELCOME` until the test sends on the gate it
+    /// gives back, starts one session, and reports the messages it gets
+    /// after `SPAWN`.
+    fn slow_core(dir: &std::path::Path) -> (mpsc::Receiver<ToCore>, mpsc::Sender<()>) {
         let listener = Listener::bind(dir);
         let (tx, rx) = mpsc::channel();
+        let (open, gate) = mpsc::channel::<()>();
         std::thread::spawn(move || {
             let mut stream = listener.accept();
             let ToCore::Hello(_) = ToCore::decode(&Frame::read_from(&mut stream).unwrap()).unwrap() else {
                 panic!("not HELLO")
             };
-            std::thread::sleep(delay);
+            gate.recv().ok();
             let welcome = Welcome {
                 protocol: 1,
                 core_version: "0.0.0".into(),
@@ -407,7 +408,7 @@ mod tests {
                 }
             }
         });
-        rx
+        (rx, open)
     }
 
     fn send(stream: &mut Stream, message: ToClient) {
@@ -446,13 +447,54 @@ mod tests {
             send(&mut stream, ToClient::Welcome(welcome));
             while let Ok(frame) = Frame::read_from(&mut stream) {
                 let message = ToCore::decode(&frame).unwrap();
-                answer(&message, &mut stream);
+                match &message {
+                    // [`settled`]'s round trip, which it answers itself.
+                    ToCore::Kill(kill) if kill.target == KillTarget::Session(SETTLE) => {
+                        let message = "no such session".to_string();
+                        send(&mut stream, ToClient::Error(client::ErrorMessage { req: Some(kill.req), session: None, message }));
+                    }
+                    _ => answer(&message, &mut stream),
+                }
                 if tx.send(message).is_err() {
                     break;
                 }
             }
         });
         rx
+    }
+
+    /// The session [`settled`]'s `KILL` names, which a scripted core answers
+    /// itself.
+    const SETTLE: SessionId = SessionId::MAX;
+
+    /// Two round trips through a scripted core, the positive marker for
+    /// "nothing more was sent": after the first, the client has read all
+    /// the core sent before its answer; after the second, the core has read
+    /// all the client sent in reply to that. The messages the core got
+    /// before the second are returned, the round trips' left out.
+    fn settled(connection: &Connection, core: &mpsc::Receiver<ToCore>) -> Vec<ToCore> {
+        let mut before = Vec::new();
+        for _ in 0..2 {
+            assert!(connection.kill(SETTLE).is_err(), "the round trip's KILL");
+            loop {
+                match recv(core) {
+                    ToCore::Kill(kill) if kill.target == KillTarget::Session(SETTLE) => break,
+                    other => before.push(other),
+                }
+            }
+        }
+        before
+    }
+
+    /// The connection a scripted core at `dir` serves, for sessions started
+    /// on it and for [`settled`].
+    fn connected(dir: &std::path::Path) -> Arc<Connection> {
+        connector(dir)().unwrap()
+    }
+
+    /// Waits, within a scaled 10 s, until `done` holds.
+    fn eventually(mut done: impl FnMut() -> bool) {
+        until("the condition", Duration::from_secs(10), || done().then_some(()));
     }
 
     fn connector(dir: &std::path::Path) -> impl FnOnce() -> Result<Arc<Connection>> + Send + 'static {
@@ -483,11 +525,11 @@ mod tests {
     }
 
     fn recv(rx: &mpsc::Receiver<ToCore>) -> ToCore {
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()
+        rx.recv_timeout(limit(Duration::from_secs(10))).unwrap()
     }
 
     fn seen(rx: &mpsc::Receiver<String>) -> String {
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()
+        rx.recv_timeout(limit(Duration::from_secs(10))).unwrap()
     }
 
     /// `REPARENT` asked for while the session starts goes out once it has,
@@ -510,7 +552,9 @@ mod tests {
             _ => {}
         });
         let (tx, tab) = mpsc::channel();
-        let session = Session::start_with(connector(&dir), request(), Box::new(Recorder(tx)));
+        let connection = connected(&dir);
+        let starting = connection.clone();
+        let session = Session::start_with(move || Ok(starting), request(), Box::new(Recorder(tx)));
         session.reparent(0x1234);
         assert!(matches!(recv(&core), ToCore::Spawn(_)));
         let reparent = client::Reparent { session: 7, hwnd: 0x1234 };
@@ -525,7 +569,7 @@ mod tests {
         assert!(matches!(recv(&core), ToCore::Close(_)));
         // The replay end after the close brings nothing more.
         session.reparent(0x9abc);
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(settled(&connection, &core), []);
     }
 
     /// `REPARENT` goes out again after a real reconnect: the core's
@@ -600,7 +644,9 @@ mod tests {
         let dir = temp_dir("attach");
         let core = scripted_core(&dir, replaying);
         let (tx, tab) = mpsc::channel();
-        let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
+        let connection = connected(&dir);
+        let attaching = connection.clone();
+        let session = Session::attach_with(move || Ok(attaching), attach_request(5), Box::new(Recorder(tx)));
         session.resize(100, 30, 9, 18);
         session.input(b"typed early");
         let ToCore::Attach(attach) = recv(&core) else { panic!("not ATTACH") };
@@ -623,8 +669,7 @@ mod tests {
         session.detach_with(None);
         session.close();
         session.input(b"late");
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(settled(&connection, &core), []);
     }
 
     /// A quit's detach carries its tab's layout to the core.
@@ -649,7 +694,6 @@ mod tests {
                 other => panic!("not DETACH: {other:?}"),
             }
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// On client protocol 3 a layout goes out only when it changed; below 3
@@ -680,7 +724,6 @@ mod tests {
             }
             let expected = if protocol >= 3 { vec![Some(one), Some(two)] } else { Vec::new() };
             assert_eq!(sent, expected, "protocol {protocol}");
-            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -698,7 +741,6 @@ mod tests {
         let session = Session::attach_with(connector(&dir), attach_request(3), Box::new(Recorder(tx)));
         assert_eq!(seen(&tab), "failed session 3 is attached to another client");
         assert_eq!(session.pid(), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -715,14 +757,15 @@ mod tests {
             replaying(message, stream);
         });
         let (tx, _tab) = mpsc::channel();
-        let session = Session::attach_with(connector(&dir), attach_request(5), Box::new(Recorder(tx)));
-        got.recv_timeout(Duration::from_secs(10)).unwrap();
+        let connection = connected(&dir);
+        let attaching = connection.clone();
+        let session = Session::attach_with(move || Ok(attaching), attach_request(5), Box::new(Recorder(tx)));
+        got.recv_timeout(limit(Duration::from_secs(10))).unwrap();
         session.detach_with(None);
         release.send(()).unwrap();
         let ToCore::Attach(_) = recv(&core) else { panic!("not ATTACH") };
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == 5));
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "no CLOSE");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(settled(&connection, &core), [], "no CLOSE");
     }
 
     #[test]
@@ -750,9 +793,7 @@ mod tests {
         };
 
         let (ended, _tab, id) = start("/a");
-        while ended.pid().is_none() {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        eventually(|| ended.pid().is_some());
         // This core predates keys: the session has none.
         assert_eq!(ended.id_and_key(), Some((id, None)));
         ended.close();
@@ -763,8 +804,7 @@ mod tests {
         assert_eq!(seen(&tab), "exited Some(0)");
         exited.close();
         exited.detach_with(None);
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "nothing for an exited session");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(settled(&connection, &core), [], "nothing for an exited session");
     }
 
     /// What quitting does to a window's tabs: each terminal leaves its
@@ -786,9 +826,7 @@ mod tests {
             let connection = connection.clone();
             let session = Session::start_with(move || Ok(connection), request(), Box::new(Recorder(mpsc::channel().0)));
             let ToCore::Spawn(spawn) = recv(&core) else { panic!("not SPAWN") };
-            while session.pid().is_none() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            eventually(|| session.pid().is_some());
             (session, 30 + spawn.req as u32)
         };
         let (kept, kept_id) = start();
@@ -802,8 +840,7 @@ mod tests {
         assert!(connection.flush(Instant::now() + Duration::from_secs(10)), "not written");
         assert!(matches!(recv(&core), ToCore::Detach(detach) if detach.session == kept_id));
         assert!(matches!(recv(&core), ToCore::Close(close) if close.session == ended_id));
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "a session was left twice");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(settled(&connection, &core), [], "a session was left twice");
     }
 
     #[test]
@@ -866,17 +903,15 @@ mod tests {
             .collect();
         closed.sort_unstable();
         assert_eq!(closed, ids);
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err());
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(settled(&connection, &core), []);
     }
 
     #[test]
     fn a_slow_core_never_blocks_the_start_and_queued_input_arrives() {
         let dir = temp_dir("slow");
-        let core = slow_core(&dir, Duration::from_millis(800));
-        let endpoint = Endpoint::at(dir.join("unused"), dir.clone());
+        let (core, welcome) = slow_core(&dir);
+        let endpoint = Endpoint::at(dir.join("unused"), dir.to_path_buf());
         let (tx, seen) = mpsc::channel();
-        let started = Instant::now();
         let session = Session::start_with(
             move || {
                 let connected = connect(&endpoint, "tok")?;
@@ -888,10 +923,12 @@ mod tests {
         session.resize(100, 30, 9, 18);
         session.input(b"echo one\r");
         session.input(b"echo two\r");
-        assert!(started.elapsed() < Duration::from_millis(200), "{:?}", started.elapsed());
+        // The core holds its WELCOME until after all of that returned: the
+        // start blocked on nothing, and nothing runs yet.
         assert_eq!(session.pid(), None);
+        welcome.send(()).unwrap();
 
-        let next = || core.recv_timeout(Duration::from_secs(10)).unwrap();
+        let next = || recv(&core);
         let ToCore::Spawn(spawn) = next() else { panic!("not SPAWN") };
         assert_eq!(spawn.command.as_deref(), Some("sh"));
         let ToCore::Resize(resize) = next() else { panic!("not RESIZE") };
@@ -900,9 +937,8 @@ mod tests {
         let ToCore::Data(two) = next() else { panic!("not DATA") };
         assert_eq!((one.session, one.bytes.as_slice()), (7, &b"echo one\r"[..]));
         assert_eq!(two.bytes, b"echo two\r");
-        assert!(started.elapsed() >= Duration::from_millis(800));
         assert_eq!(session.pid(), Some(4242));
-        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), "output $ ");
+        assert_eq!(seen.recv_timeout(limit(Duration::from_secs(5))).unwrap(), "output $ ");
 
         // Running now: input goes straight out.
         session.input(b"x");
@@ -910,7 +946,6 @@ mod tests {
         assert_eq!(x.bytes, b"x");
         session.close();
         assert!(matches!(next(), ToCore::Close(close) if close.session == 7));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 6.1: a session keeps the last `PROCESS` for it, from the one the
@@ -956,20 +991,12 @@ mod tests {
         recv(&core);
         assert_eq!(seen(&tab), "exited Some(0)");
         assert_eq!(session.foreground(), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn eventually(mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(Instant::now() < deadline, "never");
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     /// A session starting on a core that answers `SPAWN` with session 7,
-    /// held in `Starting` until `release` is sent to.
-    fn held_start(tag: &str) -> (PathBuf, mpsc::Receiver<ToCore>, Session, mpsc::Sender<()>) {
+    /// held in `Starting` until `release` is sent to. The connection is
+    /// the one it starts on, for [`settled`].
+    fn held_start(tag: &str) -> (TempDir, Arc<Connection>, mpsc::Receiver<ToCore>, Session, mpsc::Sender<()>) {
         let dir = temp_dir(tag);
         let core = scripted_core(&dir, |message, stream| {
             if let ToCore::Spawn(spawn) = message {
@@ -977,17 +1004,18 @@ mod tests {
             }
         });
         let (release, wait) = mpsc::channel::<()>();
-        let connect = connector(&dir);
+        let connection = connected(&dir);
+        let starting = connection.clone();
         let (tx, _tab) = mpsc::channel();
         let session = Session::start_with(
             move || {
                 wait.recv().ok();
-                connect()
+                Ok(starting)
             },
             request(),
             Box::new(Recorder(tx)),
         );
-        (dir, core, session, release)
+        (dir, connection, core, session, release)
     }
 
     /// The next `total` bytes of input the core gets, in order.
@@ -1005,7 +1033,7 @@ mod tests {
     /// nothing waits.
     #[test]
     fn input_held_while_starting_counts_once_across_the_handoff() {
-        let (dir, core, session, release) = held_start("budget-handoff");
+        let (_dir, _connection, core, session, release) = held_start("budget-handoff");
         let held = vec![b'a'; 3 << 20];
         assert_eq!(session.input(&held), Delivery::Queued);
         assert_eq!(session.waiting(), held.len());
@@ -1014,14 +1042,13 @@ mod tests {
         assert_eq!(input_received(&core, held.len()), held);
         eventually(|| session.waiting() == 0);
         session.close();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 5.1: input while the session starts is refused past the high mark,
     /// and only what was taken goes out once it has started.
     #[test]
     fn input_while_starting_is_refused_past_the_high_mark() {
-        let (dir, core, session, release) = held_start("budget-starting");
+        let (_dir, connection, core, session, release) = held_start("budget-starting");
         let held = vec![b'a'; 4 << 20];
         assert_eq!(session.input(&held), Delivery::Queued);
         assert_eq!(session.input(b"x"), Delivery::Refused(Refusal::First));
@@ -1029,21 +1056,19 @@ mod tests {
         release.send(()).unwrap();
         assert!(matches!(recv(&core), ToCore::Spawn(_)));
         assert_eq!(input_received(&core, held.len()), held);
-        assert!(core.recv_timeout(Duration::from_millis(300)).is_err(), "nothing refused is written");
+        assert_eq!(settled(&connection, &core), [], "nothing refused is written");
         session.close();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A tab closed while its session starts frees the input it held.
     #[test]
     fn input_held_by_a_tab_closed_while_starting_is_freed() {
-        let (dir, _core, session, release) = held_start("budget-left");
+        let (_dir, _connection, _core, session, release) = held_start("budget-left");
         assert_eq!(session.input(&[b'a'; 1024]), Delivery::Queued);
         session.close();
         assert_eq!(session.waiting(), 0);
         assert_eq!(session.input(b"late"), Delivery::Discarded);
         drop(release);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1075,8 +1100,8 @@ mod tests {
         let attaching = connection.clone();
         let session = Session::attach_with(move || Ok(attaching), attach_request(5), Box::new(Recorder(tx)));
         session.input(b"x");
-        // Let the request reach the connection before the tab closes.
-        std::thread::sleep(Duration::from_millis(200));
+        // The request reaches the connection before the tab closes.
+        eventually(|| connection.requests_waiting() == 1);
         session.detach_with(None);
         let (link, far) = fake::link(&[], |message, out| {
             if let ToCore::List(list) = message {
@@ -1086,8 +1111,12 @@ mod tests {
         plan.link(link);
         assert!(connection.list().unwrap().is_empty());
         assert!(matches!(far.next(), ToCore::List(_)), "no ATTACH before the LIST");
-        assert!(far.got.recv_timeout(Duration::from_millis(300)).is_err());
-        assert!(tab.recv_timeout(Duration::from_millis(300)).is_err(), "the closed tab says nothing");
+        // A round trip the far end answers itself: nothing went out before
+        // its LIST, and the tab heard nothing before its answer.
+        far.settle.store(true, std::sync::atomic::Ordering::Release);
+        assert!(connection.list().unwrap().is_empty());
+        assert!(matches!(far.next(), ToCore::List(_)), "nothing before the round trip's LIST");
+        assert!(tab.try_recv().is_err(), "the closed tab says nothing");
         assert_eq!(session.pid(), None);
     }
 
@@ -1144,8 +1173,10 @@ mod tests {
         session.input(b"x");
         session.close();
         release.send(()).unwrap();
-        ran.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Closed tabs say nothing, even about a failure.
-        assert!(seen.recv_timeout(Duration::from_millis(300)).is_err());
+        ran.recv_timeout(limit(Duration::from_secs(5))).unwrap();
+        // Closed tabs say nothing, even about a failure: the session's
+        // thread drops the tab's sink having told it nothing.
+        let heard = seen.recv_timeout(limit(Duration::from_secs(10)));
+        assert_eq!(heard, Err(mpsc::RecvTimeoutError::Disconnected));
     }
 }

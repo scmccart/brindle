@@ -2,15 +2,13 @@
 //! socket pair, and the test reads and writes the other end, as `ssh` would.
 
 use std::fs::File;
-use std::io;
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use brindle_remote_protocol::client;
 use brindle_remote_protocol::relay::{RelayHost, RelayMessage};
@@ -55,20 +53,7 @@ impl Relay {
             .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
             .stdout(Stdio::from(OwnedFd::from(theirs)))
             .stderr(Stdio::from(stderr));
-        // A freshly written binary can be briefly busy: another test
-        // thread's fork may still hold the writer's fd until it execs.
-        let mut attempts = 0;
-        let child = loop {
-            match command.spawn() {
-                Err(error)
-                    if error.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 100 =>
-                {
-                    attempts += 1;
-                    thread::sleep(Duration::from_millis(20));
-                }
-                result => break result.unwrap(),
-            }
-        };
+        let child = super::retry_busy_exec(|| command.spawn()).unwrap();
         // Only the relay holds its end of the link now.
         drop(command);
         Self {
@@ -120,18 +105,10 @@ impl Relay {
         TestClient::over(stream).greet(token, edit)
     }
 
-    /// Waits up to `limit` for the relay to exit, and returns how it did.
-    pub fn exits_within(&mut self, limit: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + limit;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+    /// Waits for the relay to exit, within the scaled `limit`, and returns
+    /// how it did; past the limit it panics, naming `what`.
+    pub fn exits_within(&mut self, limit: Duration, what: &str) -> ExitStatus {
+        super::until(what, limit, || self.child.try_wait().unwrap())
     }
 
     pub fn running(&mut self) -> bool {

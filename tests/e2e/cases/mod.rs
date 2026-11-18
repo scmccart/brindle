@@ -191,6 +191,28 @@ fn cells(out: &Output) -> Result<Cells> {
     Ok(Cells::from_pane(out.dump.grid()?, 0, 0))
 }
 
+/// A file in the case's directory that a command typed into a bash tab
+/// waits for before it goes on, and that a later step's command creates:
+/// what the first command does next happens only after that step, however
+/// slowly the steps run.
+struct Gate(std::path::PathBuf);
+
+impl Gate {
+    fn new(ctx: &Ctx, name: &str) -> Self {
+        Gate(ctx.dir.join(name))
+    }
+
+    /// A bash command that returns once the file exists.
+    fn wait(&self) -> String {
+        format!("while [ ! -e '{}' ]; do sleep 0.1; done", self.0.display())
+    }
+
+    /// A command line, Enter included, that creates the file.
+    fn open(&self) -> String {
+        format!("touch '{}'\r", self.0.display())
+    }
+}
+
 /// The gap round a local tab's zone cards (`ZONE_GAP`), and a card's border (`brindle_ui::CARD_BORDER`), in
 /// logical pixels: a card's content starts this far in from the tab's area.
 const ZONE_GAP: f32 = 6.0;

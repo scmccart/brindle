@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::brindle::{self, Dump, Run};
-use crate::{Ctx, Outcome, Result, ensure};
+use crate::{Ctx, Outcome, Result, Scale, ensure};
 
 const CONTAINER_PROFILE: &str = "Remote container";
 const SSH_PROFILE: &str = "Remote SSH";
@@ -264,7 +264,7 @@ pub fn ssh_quit(ctx: &Ctx) -> Result<Outcome> {
     no_waits_left(&first.dump)?;
     let program = shown_pid(&first.dump, "program=")?;
     let docker = ssh.container.docker.clone();
-    let left = poll(ctx.secs(1.0), 10.0, "the tab's session detached", || {
+    let left = ctx.scale().poll(10.0, "the tab's session detached", || {
         let sessions = docker.sessions()?;
         Ok(match sessions.as_slice() {
             [session] if !session.attached => Some(session.clone()),
@@ -275,7 +275,7 @@ pub fn ssh_quit(ctx: &Ctx) -> Result<Outcome> {
     docker.runs_in(program, "sleep", left.pid)?;
 
     let attached = ctx.dir.join("attached.txt");
-    let (save, checked, slow) = (attached.clone(), docker.clone(), ctx.secs(1.0));
+    let (save, checked, scale) = (attached.clone(), docker.clone(), ctx.scale());
     let second = needs
         .run(ctx, "second", &config)
         .restore()
@@ -283,7 +283,7 @@ pub fn ssh_quit(ctx: &Ctx) -> Result<Outcome> {
         .wait_for("sleeping-42")
         .action("scroll_to_top")
         .call_at(1.0, move |_| {
-            let again = poll(slow, 30.0, "the session attached again", || {
+            let again = scale.poll(30.0, "the session attached again", || {
                 let sessions = checked.sessions()?;
                 Ok(match sessions.as_slice() {
                     [session] if session.attached => Some(session.clone()),
@@ -335,7 +335,7 @@ pub fn ssh_split(ctx: &Ctx) -> Result<Outcome> {
     };
     let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
     let counts = ctx.dir.join("counts.txt");
-    let (save, docker, slow) = (counts.clone(), ssh.container.docker.clone(), ctx.secs(1.0));
+    let (save, docker, scale) = (counts.clone(), ssh.container.docker.clone(), ctx.scale());
     let out = needs
         .run(ctx, "run", &ssh.profile(SSH_PROFILE, "ssh-split", false))
         // A local tab first, so the window stays once the SSH tab closes.
@@ -348,7 +348,7 @@ pub fn ssh_split(ctx: &Ctx) -> Result<Outcome> {
         .wait_for(COUNTED)
         .action("close_tab")
         .call_at(1.0, move |brindle| {
-            count_connections(&docker, brindle, slow, &save, COUNTED)
+            count_connections(&docker, brindle, scale, &save, COUNTED)
         })
         .dump_at(22.0)
         .run()?;
@@ -369,11 +369,11 @@ pub fn ssh_split(ctx: &Ctx) -> Result<Outcome> {
 fn count_connections(
     docker: &Docker,
     brindle: u32,
-    slow: f64,
+    scale: Scale,
     save: &Path,
     counted: &str,
 ) -> Result {
-    let sessions = poll(slow, 30.0, "three attached sessions", || {
+    let sessions = scale.poll(30.0, "three attached sessions", || {
         let sessions = docker.sessions()?;
         let all = sessions.len() == 3 && sessions.iter().all(|s| s.attached);
         Ok(all.then_some(sessions))
@@ -393,15 +393,15 @@ fn count_connections(
     let newest = sessions.iter().max_by_key(|s| s.id).ok_or("no sessions")?;
     docker.mark(newest.pid, counted)?;
     let pids: Vec<u32> = sessions.iter().map(|s| s.pid).collect();
-    poll(slow, 15.0, "the closed tab's programs gone", || {
+    scale.poll(15.0, "the closed tab's programs gone", || {
         let gone = pids.iter().all(|&pid| docker.stat(pid).is_none());
         Ok((gone && docker.sessions()?.is_empty()).then_some(()))
     })?;
     // The connection closes a few seconds after nothing uses it.
-    poll(slow, 20.0, "the unused connection's ssh gone", || {
+    scale.poll(20.0, "the unused connection's ssh gone", || {
         Ok(ssh_processes(brindle).is_empty().then_some(()))
     })?;
-    poll(slow, 10.0, "its relay gone", || {
+    scale.poll(10.0, "its relay gone", || {
         Ok(docker.relays()?.is_empty().then_some(()))
     })
 }
@@ -432,7 +432,7 @@ pub fn ssh_network(ctx: &Ctx) -> Result<Outcome> {
         pid_file: PID_FILE,
         log: ctx.dir.join("run.log"),
         save: timings.clone(),
-        slow: ctx.secs(1.0),
+        scale: ctx.scale(),
     };
     let out = needs
         .run(ctx, "run", &ssh.profile(SSH_PROFILE, "ssh-network", false))
@@ -494,17 +494,17 @@ struct Cut {
     log: PathBuf,
     /// Where the timings go, for the report.
     save: PathBuf,
-    slow: f64,
+    scale: Scale,
 }
 
 impl Cut {
     fn run(&self, brindle: u32) -> Result {
-        let (docker, slow) = (&self.docker, self.slow);
-        let shell = poll(slow, 30.0, "the shell's pid", || {
+        let (docker, scale) = (&self.docker, self.scale);
+        let shell = scale.poll(30.0, "the shell's pid", || {
             let text = docker.exec(&["cat", self.pid_file]).ok();
             Ok(text.and_then(|pid| pid.trim().parse::<u32>().ok()))
         })?;
-        let session = poll(slow, 10.0, "the shell's session attached", || {
+        let session = scale.poll(10.0, "the shell's session attached", || {
             let sessions = docker.sessions()?;
             Ok(sessions.into_iter().find(|s| s.attached && s.pid == shell))
         })?;
@@ -516,7 +516,7 @@ impl Cut {
         let cut = Instant::now();
         docker.disconnect(&self.network)?;
         let ended = format!("connection to {} ended", self.endpoint);
-        poll(slow, 45.0, "the silent link noticed", || {
+        scale.poll(45.0, "the silent link noticed", || {
             let noticed = logged(&self.log, &ended) > 0 && !alive(links[0]);
             Ok(noticed.then_some(()))
         })?;
@@ -534,13 +534,13 @@ impl Cut {
         );
         // Brindle retries while the network is down, and fails.
         let failed = format!("can't connect to {}", self.endpoint);
-        poll(slow, 30.0, "a reconnect failing", || {
+        scale.poll(30.0, "a reconnect failing", || {
             Ok((logged(&self.log, &failed) > 0).then_some(()))
         })?;
         let down = cut.elapsed();
         docker.connect(&self.network, &self.address)?;
         let restored = Instant::now();
-        let again = poll(slow, 30.0, "the session attached again", || {
+        let again = scale.poll(30.0, "the session attached again", || {
             let sessions = docker.sessions()?;
             Ok(match sessions.as_slice() {
                 [again] if again.attached => Some(again.clone()),
@@ -553,7 +553,7 @@ impl Cut {
             "after the reconnect the session is {again:?}, not {session:?}"
         );
         // The new relay took the client over, and the old one ends.
-        let relays = poll(slow, 15.0, "one relay left", || {
+        let relays = scale.poll(15.0, "one relay left", || {
             let relays = docker.relays()?;
             Ok((relays.len() == 1).then_some(relays))
         })?;
@@ -598,7 +598,7 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
     no_waits_left(&first.dump)?;
     let shell = shown_pid(&first.dump, "left-2 ")?;
     let docker = ssh.container.docker.clone();
-    let left = poll(ctx.secs(1.0), 10.0, "the tab's session detached", || {
+    let left = ctx.scale().poll(10.0, "the tab's session detached", || {
         let sessions = docker.sessions()?;
         Ok(match sessions.as_slice() {
             [session] if !session.attached && session.pid == shell => Some(session.clone()),
@@ -613,7 +613,7 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
     // it back.
     fs::remove_dir_all(brindle::state_dir(ctx)).ok();
 
-    let (helper, server_dir, slow) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.secs(1.0));
+    let (helper, server_dir, scale) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.scale());
     let second = needs
         .run(ctx, "second", &ssh.profile(SSH_PROFILE, "ssh-eager", true))
         .restore()
@@ -621,20 +621,15 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
         .action("next_tab")
         .wait_for("left-2")
         .call_at(1.0, move |_| {
-            poll(
-                slow,
-                30.0,
-                "the detached session attached at launch",
-                || {
-                    let sessions = docker.sessions()?;
-                    Ok(sessions
-                        .iter()
-                        .any(|s| s.attached && s.pid == shell)
-                        .then_some(()))
-                },
-            )?;
+            scale.poll(30.0, "the detached session attached at launch", || {
+                let sessions = docker.sessions()?;
+                Ok(sessions
+                    .iter()
+                    .any(|s| s.attached && s.pid == shell)
+                    .then_some(()))
+            })?;
             // The launch's own tab is the local one, which shows the marker.
-            let local = poll(slow, 10.0, "the launch's local tab", || {
+            let local = scale.poll(10.0, "the launch's local tab", || {
                 Ok(local_sessions(&helper, &server_dir)?
                     .into_iter()
                     .find(|s| s.attached))
@@ -686,17 +681,17 @@ pub fn ssh_restored_closed(ctx: &Ctx) -> Result<Outcome> {
     let tabs = &first.dump.tabs;
     ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
     let docker = ssh.container.docker.clone();
-    poll(ctx.secs(1.0), 10.0, "the SSH tab's session detached", || {
+    ctx.scale().poll(10.0, "the SSH tab's session detached", || {
         let sessions = docker.sessions()?;
         Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
     })?;
-    poll(ctx.secs(1.0), 10.0, "the local tab's session detached", || {
+    ctx.scale().poll(10.0, "the local tab's session detached", || {
         let local = local_sessions(&ctx.helper, &ctx.server_dir)?;
         Ok(matches!(local.as_slice(), [session] if !session.attached).then_some(()))
     })?;
     ssh.container.stop()?;
     let (host, port) = (ssh.host.clone(), ssh.port);
-    poll(ctx.secs(1.0), 10.0, "the stopped fixture's port refusing", || {
+    ctx.scale().poll(10.0, "the stopped fixture's port refusing", || {
         Ok(TcpStream::connect((host.as_str(), port)).is_err().then_some(()))
     })?;
 
@@ -709,7 +704,7 @@ pub fn ssh_restored_closed(ctx: &Ctx) -> Result<Outcome> {
         helper: ctx.helper.clone(),
         server_dir: ctx.server_dir.clone(),
         checked: CHECKED,
-        slow: ctx.secs(1.0),
+        scale: ctx.scale(),
     };
     let second = needs
         .run(ctx, "second", &config)
@@ -761,14 +756,14 @@ struct ClosedTab {
     helper: PathBuf,
     server_dir: PathBuf,
     checked: &'static str,
-    slow: f64,
+    scale: Scale,
 }
 
 impl ClosedTab {
     fn run(&self, brindle: u32) -> Result {
-        let slow = self.slow;
+        let scale = self.scale;
         let withdrawn = format!("not waiting for {}'s sessions any more", self.endpoint);
-        poll(slow, 30.0, "the SSH tab closed, withdrawing the launch's wait", || {
+        scale.poll(30.0, "the SSH tab closed, withdrawing the launch's wait", || {
             Ok((logged(&self.log, &withdrawn) > 0).then_some(()))
         })?;
         let closed = Instant::now();
@@ -784,7 +779,7 @@ impl ClosedTab {
         // (5 s) later, unused, whichever comes first.
         let at_close = logged(&self.log, &failed);
         let unused = format!("closing the unused connection to {}", self.endpoint);
-        poll(slow, 15.0, "the connection ended and its ssh gone", || {
+        scale.poll(15.0, "the connection ended and its ssh gone", || {
             let ended = logged(&self.log, &unused) > 0 || logged(&self.log, &failed) > at_close;
             Ok((ended && ssh_processes(brindle).is_empty()).then_some(()))
         })?;
@@ -792,16 +787,14 @@ impl ClosedTab {
         let attempts = logged(&self.log, &failed);
         // A refused `ssh` lives for milliseconds, which sampling can miss,
         // but each attempt logs its failure.
-        let watch = Instant::now();
         let mut started: Vec<u32> = Vec::new();
-        while watch.elapsed() < Duration::from_secs_f64(10.0 * slow) {
+        scale.observe_for(10.0, || {
             for pid in ssh_processes(brindle) {
                 if !started.contains(&pid) {
                     started.push(pid);
                 }
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        });
         let later = logged(&self.log, &failed) - attempts;
         let text = format!(
             "connection ended {:.1}s after the close\nfailed attempts {attempts} before, {later} after\n\
@@ -818,7 +811,7 @@ impl ClosedTab {
             "Brindle dialled {} {later} more times after the connection ended",
             self.endpoint
         );
-        let local = poll(slow, 10.0, "the restored local tab", || {
+        let local = scale.poll(10.0, "the restored local tab", || {
             Ok(local_sessions(&self.helper, &self.server_dir)?
                 .into_iter()
                 .find(|s| s.attached))
@@ -894,13 +887,25 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
 /// and the host's `listing sessions…` row, long before the listing gives up
 /// (`LIST_LIMIT`, 2 s).
 ///
-/// The steps are spaced far enough apart that the pause (made by a timeline
-/// call, once the relay runs in the container) comes before the palette's
-/// step, and the dump follows that step by well under `LIST_LIMIT`.
+/// Two of Brindle's own limits, which `BRINDLE_E2E_SLOW` doesn't stretch,
+/// bound the timeline. The paused link is given up once ssh's keepalives go
+/// unanswered: Brindle runs ssh with `ServerAliveInterval=5` and
+/// `ServerAliveCountMax=3` (`client.rs`), about 15 s, sooner than its own
+/// `Timings::dead` (30 s), so the palette's step must come less than that
+/// after the pause. The listing gives up after `LIST_LIMIT` (2 s), so the
+/// dump must come less than that after the palette's step. The pause is
+/// made by a timeline call once the relay runs in the container and the
+/// step before the palette's has run (it creates a file), so the palette's
+/// step follows it by one step interval; the dump follows that step by
+/// 0.7 s, unstretched.
 pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
-    // The run's steps: one that only takes an interval, then the palette's,
-    // and the dump just after it.
-    const INTERVAL: f64 = 6.0;
+    // The run's steps: the modality, the one the pause waits for, then the
+    // palette's, and the dump just after it.
+    const INTERVAL: f64 = 3.0;
+    // Under ssh's keepalive limit (about 15 s), with room for the pause.
+    if ctx.secs(INTERVAL) >= 12.0 {
+        return Ok(Outcome::Skip("BRINDLE_E2E_SLOW stretches the palette step past ssh's 15 s keepalive limit".into()));
+    }
     let needs = match Needs::check(ctx)? {
         Ok(needs) => needs,
         Err(skip) => return Ok(skip),
@@ -913,7 +918,7 @@ pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
         .wait_for("left-2")
         .dump_at(5.0)
         .run()?;
-    let left = poll(ctx.secs(1.0), 10.0, "the first run's shell detached", || {
+    let left = ctx.scale().poll(10.0, "the first run's shell detached", || {
         let sessions = local_sessions(&ctx.helper, &ctx.server_dir)?;
         Ok(match sessions.as_slice() {
             [session] if !session.attached => Some(session.clone()),
@@ -921,25 +926,28 @@ pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
         })
     })?;
 
-    let (waiting, pausing) = (ssh.container.docker.clone(), ssh.container.docker.clone());
-    let slow = ctx.secs(1.0);
+    let docker = ssh.container.docker.clone();
+    let scale = ctx.scale();
+    let stepped = ctx.dir.join("stepped");
+    let seen = stepped.clone();
     let out = needs
         .run(ctx, "second", &ssh.profile(SSH_PROFILE, "ssh-slow-host", true))
         .step_interval(INTERVAL)
         .modality("keyboard")
+        .send(&format!("touch '{}'\r", stepped.display()))
         .action("attach_session")
-        // Brindle's relay runs in the container: the endpoint is connected.
+        // Once Brindle's relay runs in the container (the endpoint is
+        // connected) and the step before the palette's has run, the host
+        // goes silent.
         .call_at(1.0, move |_| {
-            poll(slow, 10.0, "Brindle's relay in the container", || {
-                Ok((!waiting.relays()?.is_empty()).then_some(()))
-            })
+            scale.poll(10.0, "Brindle's relay in the container", || {
+                Ok((!docker.relays()?.is_empty()).then_some(()))
+            })?;
+            scale.poll(30.0, "the step before the palette's", || Ok(seen.exists().then_some(())))?;
+            docker.pause()
         })
-        // The pause comes a couple of (stretched) seconds before the
-        // palette's step, so the silent link isn't given up on first: the
-        // steps count from the window's first appearance, a little after
-        // the spawn this counts from.
-        .call_at(INTERVAL * 2.5 - 2.0, move |_| pausing.pause())
-        .dump_at(INTERVAL * 2.5 + 0.7)
+        // Within `LIST_LIMIT` (2 s) of the palette's step, unstretched.
+        .dump_after_last_step(0.7)
         .run();
     // Back in order, so the container's logs and removal work.
     ssh.container.unpause().ok();
@@ -1342,34 +1350,6 @@ fn refused_port() -> Result<u16> {
         .map_err(|error| format!("finding a free port: {error}"))
 }
 
-/// Polls `probe` every 100 ms until it gives a value, for at most `secs`
-/// stretched by `slow` (the case's `ctx.secs(1.0)`). The last error it gave
-/// says why it failed.
-fn poll<T>(
-    slow: f64,
-    secs: f64,
-    what: &str,
-    mut probe: impl FnMut() -> Result<Option<T>>,
-) -> Result<T> {
-    let deadline = Instant::now() + Duration::from_secs_f64(secs * slow);
-    let mut last = String::new();
-    loop {
-        match probe() {
-            Ok(Some(value)) => return Ok(value),
-            Ok(None) => {}
-            Err(why) => last = why,
-        }
-        if Instant::now() >= deadline {
-            let why = if last.is_empty() {
-                String::new()
-            } else {
-                format!(" (last: {last})")
-            };
-            return Err(format!("{what}: not within {secs} s{why}"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 
 /// The number after `prefix` on a line of the dumped screen.
 fn shown_pid(dump: &Dump, prefix: &str) -> Result<u32> {
@@ -1609,21 +1589,17 @@ impl Container {
 
 impl Docker {
     fn wait_running(&self, ctx: &Ctx) -> Result {
-        let deadline = Instant::now() + Duration::from_secs_f64(ctx.secs(10.0));
-        loop {
+        ctx.scale().poll(10.0, "the Docker fixture container running", || {
             let output = Command::new("docker")
                 .args(["inspect", "--format", "{{.State.Running}}", &self.name])
                 .output()
                 .map_err(|error| format!("probing Docker fixture container: {error}"))?;
-            let message = output_message(&output);
             if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
-                return Ok(());
+                Ok(Some(()))
+            } else {
+                Err(output_message(&output))
             }
-            if Instant::now() >= deadline {
-                return Err(format!("Docker fixture container was not ready: {message}"));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        })
     }
 
     fn exec_output(&self, args: &[&str]) -> Result<Output> {
@@ -1877,23 +1853,18 @@ impl Drop for KeyPair {
 }
 
 fn wait_for_ssh(ctx: &Ctx, identity: &Path, host: &str, port: u16) -> Result {
-    let deadline = Instant::now() + Duration::from_secs_f64(ctx.secs(15.0));
-    loop {
+    ctx.scale().poll(15.0, "the fixture SSH server ready", || {
         let output = ssh_command(identity, port)
             .arg(format!("root@{host}"))
             .arg("printf BRINDLE_SSH_READY")
             .output()
             .map_err(|error| format!("probing fixture SSH server: {error}"))?;
-        let message = output_message(&output);
-        if output.status.success() && String::from_utf8_lossy(&output.stdout) == "BRINDLE_SSH_READY"
-        {
-            return Ok(());
+        if output.status.success() && String::from_utf8_lossy(&output.stdout) == "BRINDLE_SSH_READY" {
+            Ok(Some(()))
+        } else {
+            Err(output_message(&output))
         }
-        if Instant::now() >= deadline {
-            return Err(format!("fixture SSH server was not ready: {message}"));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    })
 }
 
 fn ssh_command(identity: &Path, port: u16) -> Command {

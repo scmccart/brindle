@@ -22,7 +22,7 @@ mod settings_dialog;
 mod terminal;
 mod terminal_element;
 mod terminal_view;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod test_support;
 mod theme;
 #[cfg(windows)]

@@ -406,7 +406,7 @@ struct Throttled<R> {
 
 impl<R: std::io::Read> std::io::Read for Throttled<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        std::thread::sleep(self.pause);
+        throttle(self.pause);
         let len = buffer.len().min(self.chunk);
         self.inner.read(&mut buffer[..len])
     }
@@ -671,14 +671,10 @@ fn a_program_reading_its_terminal_is_hung_up_by_sighup() {
     for session in 1..=ROUNDS {
         let pid = core.spawn(spawn(session, "cat", &[]));
         assert!(eventually(TIMEOUT, || blocked(pid)), "round {session}: never blocked");
-        let hung_up_at = std::time::Instant::now();
+        // SIGHUP, not the SIGKILL that would follow it, ends it: the
+        // holder's log says which signal it was, counted below.
         core.hang_up(session);
         assert_eq!(core.exit_code(session), None, "round {session}: not ended by a signal");
-        assert!(
-            hung_up_at.elapsed() < Duration::from_millis(500),
-            "round {session}: took {:?}",
-            hung_up_at.elapsed()
-        );
     }
     let sighup = format!(": killed by signal Some({})", libc::SIGHUP);
     let logs = dir.logs();
@@ -1537,10 +1533,10 @@ mod on_windows {
         // Closing the console ends the programs on it, the shell's child
         // too, and the holder ends any the close missed after the grace
         // (`ping` started just as it went out).
-        let hung_up_at = Instant::now();
+        // The close, not the grace's `TerminateProcess`, ended it: that would
+        // have given it the termination's code.
         core.hang_up(1);
         assert_ne!(core.exit_code(1), Some(TERMINATED));
-        assert!(hung_up_at.elapsed() < GRACE, "it took the grace");
         assert!(eventually(TIMEOUT, || !alive(pid) && !alive(ping[0])));
 
         core.hang_up(2);
@@ -1629,25 +1625,36 @@ mod on_windows {
     /// About 2.9 MB of output: more than a tail and the pipes hold.
     const LINES: usize = 40_000;
 
-    /// Waits for a line, prints [`LINES`] numbered lines and `DONE`, and
-    /// waits for another line.
-    fn prints_lines_when_told(session: u32, dir: &TempDir) -> Spawn {
+    /// Waits for a line, creates the file it returns, prints [`LINES`]
+    /// numbered lines and `DONE`, and waits for another line. Once that
+    /// file exists, the program has had its line and is printing.
+    fn prints_lines_when_told(session: u32, dir: &TempDir) -> (Spawn, std::path::PathBuf) {
         let file = programs::numbered_lines(&dir.path, LINES);
-        let script = format!("set /p go=& type {}& echo DONE& set /p z=", file.display());
-        shell(session, &script)
+        let printing = dir.path.join("printing");
+        let script = format!(
+            "set /p go=& type nul>{}& type {}& echo DONE& set /p z=",
+            printing.display(),
+            file.display()
+        );
+        (shell(session, &script), printing)
     }
 
     #[test]
     fn without_a_core_a_program_blocks_instead_of_losing_output() {
         let (dir, mut core, holder_pid) = holder("block");
-        let pid = core.spawn(prints_lines_when_told(1, &dir));
+        let (request, printing) = prints_lines_when_told(1, &dir);
+        let pid = core.spawn(request);
         // The holder handles the input before it sees the connection end.
         core.input(1, b"go\r");
         drop(core);
 
-        // Long enough to print everything, if anything took it.
-        std::thread::sleep(Duration::from_secs(2));
-        assert!(alive(pid));
+        // `type` is `cmd`'s own, so `cmd` is the writer. Once it prints, it
+        // stays blocked when the holder stops reading at a full tail, and
+        // doesn't end: nothing takes the rest of its output.
+        assert!(eventually(TIMEOUT, || printing.exists()), "it never had its line");
+        let blocked = stays_blocked(pid, holder_pid);
+        assert!(alive(pid), "it finished, so its output went somewhere");
+        assert!(blocked, "it never stopped: the holder kept reading");
 
         // The holder read until the tail was full, and no further: nothing
         // was cut off its front.
@@ -1668,7 +1675,8 @@ mod on_windows {
     #[test]
     fn a_paused_session_blocks_until_resumed() {
         let (dir, mut core, _) = holder("pause");
-        let pid = core.spawn(prints_lines_when_told(1, &dir));
+        let (request, _) = prints_lines_when_told(1, &dir);
+        let pid = core.spawn(request);
         core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
         // What the console said before the pause is out of the way.
         settle(&mut core);
@@ -1690,7 +1698,7 @@ mod on_windows {
     fn reparent_makes_a_window_the_owner_of_the_sessions_console_window() {
         // Only the packaged ConPTY can; a build without it uses Windows' own.
         if !Path::new(BIN).with_file_name("conpty.dll").exists() {
-            eprintln!("skipped: no packaged ConPTY beside the helper");
+            skip(Capability::PackagedConpty, "no conpty.dll beside the helper");
             return;
         }
         let (_dir, mut core, _) = holder("reparent");
@@ -1704,17 +1712,11 @@ mod on_windows {
             hwnd: window.id(),
         }));
         // The host applies it a moment later.
-        let deadline = Instant::now() + TIMEOUT;
-        while window_owner(console_window) != window.id() {
-            assert!(
-                Instant::now() < deadline,
-                "the owner is {:#x}, not {:#x}",
-                window_owner(console_window),
-                window.id()
-            );
+        let wanted = window.id();
+        until(&format!("the console window's owner is {wanted:#x}"), TIMEOUT, || {
             Window::pump();
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            (window_owner(console_window) == wanted).then_some(())
+        });
         // It has no answer: the next message is the hang-up's.
         core.hang_up(1);
         core.hung_up(1);
