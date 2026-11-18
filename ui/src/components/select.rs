@@ -1,8 +1,11 @@
 //! `Select`: shadcn's select, a trigger that opens a menu of options.
 //!
 //! An entity the owner creates with its options and keeps, renders where
-//! the trigger goes and subscribes to: [`SelectEvent::Changed`] is emitted
-//! only when the selected option actually changes ([`Selection::pick`]).
+//! the trigger goes and subscribes to: [`SelectEvent::Changed`], naming the
+//! option by its [`ItemKey`], is emitted only when the selected option
+//! actually changes ([`Selection::pick`]). The selection is kept by that
+//! key: options replaced under it keep it only when one still has the key
+//! ([`Selection::retain`]), and the placeholder shows otherwise.
 //! The trigger shows the selected option's label, or the placeholder, and
 //! a chevron; it fills its parent's width. A primary press on it, enter or
 //! space, or up or down (also ctrl-p/ctrl-n) while it has focus, opens the
@@ -26,8 +29,9 @@
 //! a release that hardly moved ([`moved_off`]) leaves the menu open, and one
 //! that moved and lands outside the menu, the trigger included, closes it
 //! ([`menu_release`]). While the menu is open its layer blocks the pointer
-//! outside it ([`Overlay::block_outside_pointer`]), so an outside press only
-//! closes the menu and reaches nothing beneath, the trigger included.
+//! outside it ([`OverlayKind::NonModal`] with `blocks_outside`), so an
+//! outside press only closes the menu and reaches nothing beneath, the
+//! trigger included.
 //!
 //! The trigger has no click handler, so gpui's keyboard click (on enter and
 //! space *key-up*, for whatever has focus then) never reaches it: a pick on
@@ -37,7 +41,6 @@
 //! in the `UiList` context) and space through `on_key_down`
 //! ([`trigger_activation`], [`typed_key`]).
 //!
-//! [`Overlay::block_outside_pointer`]: crate::primitives::overlay::Overlay::block_outside_pointer
 //! [`Overlay`]: crate::primitives::overlay::Overlay
 //! [`Anchored`]: crate::primitives::placement::Anchored
 
@@ -52,12 +55,12 @@ use gpui::{
 
 use crate::actions::{ListConfirm, ListDown, ListFirst, ListLast, ListUp};
 use crate::components::popover::{TriggerAction, follows_trigger};
-use crate::components::{DISABLED_OPACITY, FocusRing, inert_press};
+use crate::components::{DISABLED_OPACITY, FocusRing, ItemKey, inert_press};
 use crate::icon::Icon;
 use crate::primitives::focus_scope::FocusStops;
 use crate::primitives::focus_visible::{Modality, focus_from_pointer, modality, set_modality, shows_ring};
 use crate::primitives::nav::{ListNav, Typeahead};
-use crate::primitives::overlay::Overlay;
+use crate::primitives::overlay::{Overlay, OverlayKind};
 use crate::primitives::placement::{Align, Anchored, Side, anchor_trigger};
 use crate::style::{
     MUTED_ICON_OPACITY, SELECT_MENU_MAX_HEIGHT, SELECT_MENU_MIN_WIDTH, SELECT_TICK_SIZE, focus_ring, select_style,
@@ -69,14 +72,25 @@ use crate::theme::ActiveTheme;
 /// One option of a select.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectOption {
+    /// The option's identity across a replacement of the options: its label
+    /// unless the owner gives it one ([`SelectOption::key`]).
+    pub key: ItemKey,
     pub label: SharedString,
     /// A disabled option is drawn muted and can't be highlighted or chosen.
     pub disabled: bool,
 }
 
 impl SelectOption {
+    /// An option labelled, and keyed, `label`.
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Self { label: label.into(), disabled: false }
+        let label = label.into();
+        Self { key: ItemKey::new(label.clone()), label, disabled: false }
+    }
+
+    /// Keys the option by `key` instead of its label.
+    pub fn key(mut self, key: impl Into<ItemKey>) -> Self {
+        self.key = key.into();
+        self
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
@@ -103,53 +117,70 @@ impl From<SharedString> for SelectOption {
     }
 }
 
-/// A select's selection, and the typeahead that moves it while the menu is
-/// closed. Pure: the entity holds one and reports what it returns.
+/// The index of the first of `options` keyed `key`: where a selection kept
+/// by its key is in the options of now.
+pub fn option_keyed(options: &[SelectOption], key: &ItemKey) -> Option<usize> {
+    options.iter().position(|option| option.key == *key)
+}
+
+/// A select's selection, by the chosen option's key, and the typeahead that
+/// moves it while the menu is closed. Pure: the entity holds one, finds the
+/// key in its options wherever it needs an index, and reports what it
+/// returns. A combobox keeps its choice in one too.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
-    selected: Option<usize>,
+    selected: Option<ItemKey>,
     typeahead: Typeahead,
 }
 
 impl Selection {
-    pub fn new(selected: Option<usize>) -> Self {
+    pub fn new(selected: Option<ItemKey>) -> Self {
         Self { selected, typeahead: Typeahead::new() }
     }
 
-    pub fn selected(&self) -> Option<usize> {
-        self.selected
+    pub fn selected(&self) -> Option<&ItemKey> {
+        self.selected.as_ref()
     }
 
     /// Sets the selection from the owner. No change is reported.
-    pub fn set(&mut self, selected: Option<usize>) {
+    pub fn set(&mut self, selected: Option<ItemKey>) {
         self.selected = selected;
     }
 
-    /// Picks option `ix`, as a click or enter in the menu does. Returns the
-    /// new selection when it differs from the current one, which is when the
-    /// owner is told; picking the selected option again returns `None`.
-    pub fn pick(&mut self, ix: usize) -> Option<usize> {
-        if self.selected == Some(ix) {
+    /// The options were replaced by ones with `keys`: the selection stays
+    /// when one of them has its key, and is cleared otherwise. No change is
+    /// reported.
+    pub fn retain<'a>(&mut self, mut keys: impl Iterator<Item = &'a ItemKey>) {
+        if let Some(selected) = &self.selected
+            && !keys.any(|key| key == selected)
+        {
+            self.selected = None;
+        }
+    }
+
+    /// Picks the option keyed `key`, as a click or enter in the menu does.
+    /// Returns the new selection when it differs from the current one,
+    /// which is when the owner is told; picking the selected option again
+    /// returns `None`.
+    pub fn pick(&mut self, key: &ItemKey) -> Option<ItemKey> {
+        if self.selected.as_ref() == Some(key) {
             return None;
         }
-        self.selected = Some(ix);
-        Some(ix)
+        self.selected = Some(key.clone());
+        Some(key.clone())
     }
 
     /// A character typed at `now` while the menu is closed: it extends or
     /// starts the typeahead query, and the selection moves to the first
-    /// enabled option from the selection on whose label starts with it
-    /// (`Typeahead::find`). Returns the new selection when it changed.
-    pub fn type_char<S: AsRef<str>>(
-        &mut self,
-        ch: char,
-        now: Instant,
-        labels: &[S],
-        enabled: impl Fn(usize) -> bool,
-    ) -> Option<usize> {
+    /// enabled one of `options` from the selection on whose label starts
+    /// with it (`Typeahead::find`). Returns the new selection when it
+    /// changed.
+    pub fn type_char(&mut self, ch: char, now: Instant, options: &[SelectOption]) -> Option<ItemKey> {
         self.typeahead.push(ch, now);
-        let found = self.typeahead.find(labels, self.selected, enabled)?;
-        self.pick(found)
+        let labels: Vec<&str> = options.iter().map(|option| option.label.as_ref()).collect();
+        let current = self.selected.as_ref().and_then(|key| option_keyed(options, key));
+        let found = self.typeahead.find(&labels, current, |ix| !options[ix].disabled)?;
+        self.pick(&options[found].key)
     }
 
     /// Whether a character typed at `now` extends the query, so a space
@@ -304,10 +335,10 @@ pub fn closed_trigger_key(key: ListKey) -> TriggerAction {
 // ---- entity ------------------------------------------------------------------
 
 /// What a select tells its owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectEvent {
-    /// The selected option changed to this index.
-    Changed(usize),
+    /// The selected option changed to the one with this key.
+    Changed(ItemKey),
 }
 
 /// A select. The owner keeps the entity, renders it where the trigger goes
@@ -335,22 +366,23 @@ impl Focusable for Select {
 }
 
 impl Select {
-    /// A select over `options` showing `selected` (`None`, or an index out
-    /// of range, shows the placeholder).
+    /// A select over `options` showing option `selected` of them, kept by
+    /// its key from then on (`None`, or an index out of range, shows the
+    /// placeholder).
     pub fn new(
         options: impl IntoIterator<Item = impl Into<SelectOption>>,
         selected: Option<usize>,
         cx: &mut Context<Self>,
     ) -> Self {
         let options: Vec<SelectOption> = options.into_iter().map(Into::into).collect();
-        let selected = selected.filter(|&ix| ix < options.len());
+        let selected = selected.and_then(|ix| options.get(ix)).map(|option| option.key.clone());
         Self {
             options,
             selection: Selection::new(selected),
             placeholder: SharedString::default(),
             disabled: false,
             focus: cx.focus_handle(),
-            menu: Overlay::non_modal().block_outside_pointer(),
+            menu: Overlay::new(OverlayKind::NonModal { blocks_outside: true }),
             trigger: None,
             _picks: None,
         }
@@ -366,8 +398,9 @@ impl Select {
         &self.options
     }
 
-    /// Replaces the options. An open menu closes, and a selection past the
-    /// new end is cleared. No change is reported.
+    /// Replaces the options. An open menu closes, and the selection stays
+    /// only when one of the new options has its key ([`Selection::retain`]).
+    /// No change is reported.
     pub fn set_options(
         &mut self,
         options: impl IntoIterator<Item = impl Into<SelectOption>>,
@@ -376,24 +409,29 @@ impl Select {
     ) {
         self.close(window, cx);
         self.options = options.into_iter().map(Into::into).collect();
-        let selected = self.selection.selected().filter(|&ix| ix < self.options.len());
-        self.selection.set(selected);
+        self.selection.retain(self.options.iter().map(|option| &option.key));
         cx.notify();
     }
 
+    /// The selected option's index in the options of now.
     pub fn selected(&self) -> Option<usize> {
+        option_keyed(&self.options, self.selection.selected()?)
+    }
+
+    /// The selected option's key.
+    pub fn selected_key(&self) -> Option<&ItemKey> {
         self.selection.selected()
     }
 
     /// The selected option's label, or `None` while the placeholder shows.
     pub fn selected_label(&self) -> Option<&SharedString> {
-        self.selection.selected().and_then(|ix| self.options.get(ix)).map(|option| &option.label)
+        self.selected().and_then(|ix| self.options.get(ix)).map(|option| &option.label)
     }
 
-    /// Sets the selection from the owner (an index out of range clears
-    /// it). No change is reported.
+    /// Selects option `selected` of the options of now, from the owner (an
+    /// index out of range clears the selection). No change is reported.
     pub fn set_selected(&mut self, selected: Option<usize>, cx: &mut Context<Self>) {
-        self.selection.set(selected.filter(|&ix| ix < self.options.len()));
+        self.selection.set(selected.and_then(|ix| self.options.get(ix)).map(|option| option.key.clone()));
         cx.notify();
     }
 
@@ -436,16 +474,16 @@ impl Select {
             return;
         }
         let options = self.options.clone();
-        let selected = self.selection.selected();
+        let selected = self.selected();
         let highlight = initial_highlight(selected, options.len(), |ix| !options[ix].disabled);
         let min_width = self.trigger.map_or(px(0.), |bounds| bounds.size.width);
         let menu = cx.new(|cx| SelectMenu::new(options, selected, highlight, min_width, press, cx));
         self._picks = Some(cx.subscribe_in(&menu, window, |this, _, event: &MenuEvent, window, cx| {
-            let MenuEvent::Picked(ix) = *event;
+            let MenuEvent::Picked(key) = event;
             // Close first, so focus is back on the trigger when the owner
             // hears of the change.
             this.menu.close(window, cx);
-            this.choose(ix, cx);
+            this.choose(key, cx);
         }));
         self.selection.clear_typeahead();
         self.menu.open(menu, |select| &mut select.menu, window, cx);
@@ -460,10 +498,11 @@ impl Select {
         }
     }
 
-    /// Selects `ix` as the user does, telling the owner when it changed.
-    fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(ix) = self.selection.pick(ix) {
-            cx.emit(SelectEvent::Changed(ix));
+    /// Selects the option keyed `key` as the user does, telling the owner
+    /// when it changed.
+    fn choose(&mut self, key: &ItemKey, cx: &mut Context<Self>) {
+        if let Some(key) = self.selection.pick(key) {
+            cx.emit(SelectEvent::Changed(key));
         }
         cx.notify();
     }
@@ -528,10 +567,8 @@ impl Select {
         match typed_key(&keystroke.key, keystroke.key_char.as_deref(), keystroke.modifiers, searching) {
             TypedKey::Char(ch) => {
                 set_modality(window, Modality::Keyboard, cx);
-                let options = &self.options;
-                let labels: Vec<&str> = options.iter().map(|option| option.label.as_ref()).collect();
-                if let Some(ix) = self.selection.type_char(ch, now, &labels, |ix| !options[ix].disabled) {
-                    cx.emit(SelectEvent::Changed(ix));
+                if let Some(key) = self.selection.type_char(ch, now, &self.options) {
+                    cx.emit(SelectEvent::Changed(key));
                     cx.notify();
                 }
                 cx.stop_propagation();
@@ -625,10 +662,10 @@ impl Render for Select {
 
 // ---- menu --------------------------------------------------------------------
 
-/// What the menu tells its select.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the menu tells its select: the picked option's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum MenuEvent {
-    Picked(usize),
+    Picked(ItemKey),
 }
 
 /// The open menu: the overlay's view. It lists no focus stops, so Tab does
@@ -696,7 +733,7 @@ impl SelectMenu {
         match menu_release(gesture, over) {
             MenuRelease::Pick(ix) => {
                 if !self.options[ix].disabled {
-                    cx.emit(MenuEvent::Picked(ix));
+                    cx.emit(MenuEvent::Picked(self.options[ix].key.clone()));
                 }
             }
             MenuRelease::Close => cx.emit(DismissEvent),
@@ -739,7 +776,7 @@ impl SelectMenu {
         if let Some(ix) = self.nav.highlight
             && !self.options[ix].disabled
         {
-            cx.emit(MenuEvent::Picked(ix));
+            cx.emit(MenuEvent::Picked(self.options[ix].key.clone()));
         }
     }
 
@@ -886,50 +923,107 @@ mod tests {
 
     const ALL: fn(usize) -> bool = |_| true;
 
+    fn key(key: &str) -> ItemKey {
+        ItemKey::from(key)
+    }
+
     /// The owner is told only when the selection actually changes.
     #[test]
     fn a_pick_is_a_change_only_when_it_differs() {
         // The spec's scenarios: bash shown, fish picked; bash shown, bash picked.
-        let mut selection = Selection::new(Some(0));
-        assert_eq!(selection.pick(1), Some(1));
-        assert_eq!(selection.selected(), Some(1));
-        assert_eq!(selection.pick(1), None);
-        assert_eq!(selection.selected(), Some(1));
+        let mut selection = Selection::new(Some(key("bash")));
+        assert_eq!(selection.pick(&key("fish")), Some(key("fish")));
+        assert_eq!(selection.selected(), Some(&key("fish")));
+        assert_eq!(selection.pick(&key("fish")), None);
+        assert_eq!(selection.selected(), Some(&key("fish")));
         // From the placeholder, any pick is a change.
         let mut none = Selection::new(None);
-        assert_eq!(none.pick(0), Some(0));
+        assert_eq!(none.pick(&key("bash")), Some(key("bash")));
         // The owner's own set reports nothing and is the new baseline.
-        none.set(Some(2));
-        assert_eq!(none.pick(2), None);
+        none.set(Some(key("foot")));
+        assert_eq!(none.pick(&key("foot")), None);
         none.set(None);
-        assert_eq!(none.pick(2), Some(2));
+        assert_eq!(none.pick(&key("foot")), Some(key("foot")));
     }
 
     /// Typing while the menu is closed moves the selection as the open
     /// menu's typeahead moves the highlight, from the selection.
     #[test]
     fn typeahead_moves_the_selection_while_closed() {
-        let labels = ["bash", "fish", "foot"];
+        let options: Vec<SelectOption> = ["bash", "fish", "foot"].into_iter().map(SelectOption::new).collect();
         let t0 = Instant::now();
-        let mut selection = Selection::new(Some(0));
+        let mut selection = Selection::new(Some(key("bash")));
         assert!(!selection.is_searching(t0));
         // `f` from bash: fish, a change.
-        assert_eq!(selection.type_char('f', t0, &labels, ALL), Some(1));
+        assert_eq!(selection.type_char('f', t0, &options), Some(key("fish")));
         assert!(selection.is_searching(t0 + Duration::from_millis(500)));
         // `f` again, two seconds later: foot (a one-character query cycles).
-        assert_eq!(selection.type_char('f', t0 + Duration::from_secs(2), &labels, ALL), Some(2));
+        assert_eq!(selection.type_char('f', t0 + Duration::from_secs(2), &options), Some(key("foot")));
         // `o` within the second: `fo`, still foot, so no change.
-        assert_eq!(selection.type_char('o', t0 + Duration::from_millis(2500), &labels, ALL), None);
-        assert_eq!(selection.selected(), Some(2));
+        assert_eq!(selection.type_char('o', t0 + Duration::from_millis(2500), &options), None);
+        assert_eq!(selection.selected(), Some(&key("foot")));
         // Nothing starts with `z`: the selection stays and nothing is reported.
-        assert_eq!(selection.type_char('z', t0 + Duration::from_secs(5), &labels, ALL), None);
-        assert_eq!(selection.selected(), Some(2));
+        assert_eq!(selection.type_char('z', t0 + Duration::from_secs(5), &options), None);
+        assert_eq!(selection.selected(), Some(&key("foot")));
         // Case-insensitive, and a disabled match is skipped.
-        assert_eq!(selection.type_char('B', t0 + Duration::from_secs(8), &labels, ALL), Some(0));
-        assert_eq!(selection.type_char('f', t0 + Duration::from_secs(11), &labels, |ix| ix != 1), Some(2));
+        assert_eq!(selection.type_char('B', t0 + Duration::from_secs(8), &options), Some(key("bash")));
+        let mut fish_off = options.clone();
+        fish_off[1].disabled = true;
+        assert_eq!(selection.type_char('f', t0 + Duration::from_secs(11), &fish_off), Some(key("foot")));
         // Opening the menu forgets the query.
         selection.clear_typeahead();
         assert!(!selection.is_searching(t0 + Duration::from_secs(11)));
+        // Typing names options by key, not label.
+        let keyed = [SelectOption::new("bash").key("1"), SelectOption::new("fish").key("2")];
+        let mut by_id = Selection::new(Some(key("1")));
+        assert_eq!(by_id.type_char('f', t0, &keyed), Some(key("2")));
+    }
+
+    /// b40 #1: options replaced under a selection keep it when an option
+    /// has its key, wherever that option now is, and the index the owner
+    /// reads follows it.
+    #[test]
+    fn a_refresh_keeps_the_selection_by_key() {
+        let before = [SelectOption::new("bash"), SelectOption::new("fish"), SelectOption::new("foot")];
+        let mut selection = Selection::new(Some(before[1].key.clone()));
+        assert_eq!(option_keyed(&before, selection.selected().unwrap()), Some(1));
+        // An option was inserted before fish.
+        let after = [
+            SelectOption::new("bash"),
+            SelectOption::new("dash"),
+            SelectOption::new("fish"),
+            SelectOption::new("foot"),
+        ];
+        selection.retain(after.iter().map(|option| &option.key));
+        assert_eq!(selection.selected(), Some(&key("fish")));
+        assert_eq!(option_keyed(&after, selection.selected().unwrap()), Some(2));
+        // Keys of the owner's own: the label may change, the key holds.
+        let mut profile = Selection::new(Some(key("p2")));
+        let renamed = [SelectOption::new("Shell").key("p1"), SelectOption::new("Work (ssh)").key("p2")];
+        profile.retain(renamed.iter().map(|option| &option.key));
+        assert_eq!(option_keyed(&renamed, profile.selected().unwrap()), Some(1));
+        // Nothing selected stays nothing.
+        let mut none = Selection::new(None);
+        none.retain(after.iter().map(|option| &option.key));
+        assert_eq!(none.selected(), None);
+    }
+
+    /// b40 #1: a refresh without the selected key clears the selection
+    /// (the placeholder shows) instead of selecting whatever took its index.
+    #[test]
+    fn a_refresh_without_the_key_clears_it() {
+        let mut selection = Selection::new(Some(key("fish")));
+        let after = [SelectOption::new("bash"), SelectOption::new("foot"), SelectOption::new("zsh")];
+        selection.retain(after.iter().map(|option| &option.key));
+        assert_eq!(selection.selected(), None);
+        // A shorter list that still has the key keeps it.
+        let mut kept = Selection::new(Some(key("foot")));
+        kept.retain([SelectOption::new("foot")].iter().map(|option| &option.key));
+        assert_eq!(kept.selected(), Some(&key("foot")));
+        // An empty list clears it.
+        kept.retain(std::iter::empty());
+        assert_eq!(kept.selected(), None);
+        assert_eq!(option_keyed(&after, &key("fish")), None);
     }
 
     #[test]

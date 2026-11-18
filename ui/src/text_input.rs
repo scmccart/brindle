@@ -68,6 +68,36 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// How a run of an input's text is underlined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Underline {
+    None,
+    /// The text an input method is composing.
+    Composition,
+}
+
+/// Where a pointer at height `y` hits a one-line input whose line runs
+/// from `top` to `bottom`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// Above the line: the start of the text.
+    Start,
+    /// Below the line: the end of the text.
+    End,
+    /// On the line: the character nearest the pointer's `x`.
+    Line,
+}
+
+pub fn hit_for_y(y: Pixels, top: Pixels, bottom: Pixels) -> Hit {
+    if y < top {
+        Hit::Start
+    } else if y > bottom {
+        Hit::End
+    } else {
+        Hit::Line
+    }
+}
+
 impl EditState {
     /// `text` with the cursor at its end.
     pub fn new(text: &str) -> Self {
@@ -212,6 +242,43 @@ impl EditState {
 
     pub fn unmark(&mut self) {
         self.marked = None;
+    }
+
+    /// Whether the input shows its placeholder instead: there is no text
+    /// and nothing being composed.
+    pub fn shows_placeholder(&self) -> bool {
+        self.text.is_empty() && self.marked.is_none()
+    }
+
+    /// The text's style runs, in order, as byte lengths: the composition
+    /// underlined, the text before and after it plain, and no empty run.
+    /// The lengths add up to the text's.
+    pub fn run_lens(&self) -> Vec<(usize, Underline)> {
+        let len = self.text.len();
+        let runs = match &self.marked {
+            Some(marked) => vec![
+                (marked.start, Underline::None),
+                (marked.end - marked.start, Underline::Composition),
+                (len - marked.end, Underline::None),
+            ],
+            None => vec![(len, Underline::None)],
+        };
+        runs.into_iter().filter(|(len, _)| *len > 0).collect()
+    }
+
+    /// A primary press at `offset`, the `clicks`-th of a run of them: a
+    /// double (or later) click selects the word there; a single press
+    /// moves the cursor there, extending the selection when `extend`
+    /// (shift held). Returns whether moving the pointer with the button
+    /// down then extends the selection, which it does after a single press.
+    pub fn press(&mut self, offset: usize, clicks: usize, extend: bool) -> bool {
+        if clicks >= 2 {
+            self.select_word_at(offset);
+            false
+        } else {
+            self.move_to(offset, extend);
+            true
+        }
     }
 
     /// Deletes the selection, or the range from the cursor to `target`.
@@ -486,22 +553,17 @@ impl TextInput {
         if self.state.text().is_empty() {
             return 0;
         }
-        if position.y < bounds.top() {
-            return 0;
+        match hit_for_y(position.y, bounds.top(), bounds.bottom()) {
+            Hit::Start => 0,
+            Hit::End => self.state.text().len(),
+            Hit::Line => line.closest_index_for_x(position.x - self.text_origin_x),
         }
-        if position.y > bounds.bottom() {
-            return self.state.text().len();
-        }
-        line.closest_index_for_x(position.x - self.text_origin_x)
     }
 
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         focus_from_pointer(&self.focus_handle, window, cx);
         let offset = self.offset_for_position(e.position);
-        if e.click_count >= 2 {
-            self.state.select_word_at(offset);
-        } else {
-            self.state.move_to(offset, e.modifiers.shift);
+        if self.state.press(offset, e.click_count, e.modifiers.shift) {
             self.selecting = true;
         }
         cx.notify();
@@ -705,7 +767,7 @@ impl Element for TextInputElement {
         let state = &input.state;
         let style = window.text_style();
         let color = style.color;
-        let placeholder = state.text().is_empty() && state.marked().is_none();
+        let placeholder = state.shows_placeholder();
         let (text, text_color): (SharedString, _) = if placeholder {
             (input.placeholder.clone(), color.opacity(0.45))
         } else {
@@ -719,20 +781,23 @@ impl Element for TextInputElement {
             underline: None,
             strikethrough: None,
         };
-        let runs: Vec<TextRun> = match state.marked().filter(|_| !placeholder) {
-            Some(marked) => [
-                TextRun { len: marked.start, ..run.clone() },
-                TextRun {
-                    len: marked.end - marked.start,
-                    underline: Some(UnderlineStyle { color: Some(color), thickness: px(1.0), wavy: false }),
+        let runs: Vec<TextRun> = if placeholder {
+            vec![run]
+        } else {
+            state
+                .run_lens()
+                .into_iter()
+                .map(|(len, underline)| TextRun {
+                    len,
+                    underline: match underline {
+                        Underline::None => None,
+                        Underline::Composition => {
+                            Some(UnderlineStyle { color: Some(color), thickness: px(1.0), wavy: false })
+                        }
+                    },
                     ..run.clone()
-                },
-                TextRun { len: text.len() - marked.end, ..run },
-            ]
-            .into_iter()
-            .filter(|r| r.len > 0)
-            .collect(),
-            None => vec![run],
+                })
+                .collect()
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window.text_system().shape_line(text, font_size, &runs, None);
@@ -1047,5 +1112,67 @@ mod tests {
         let mut s = EditState::new("split");
         s.move_to(4, false);
         assert_eq!(s.describe(), "text=\"split\" cursor=4 selection=4..4");
+    }
+
+    /// b43 #2: the placeholder shows only for no text and no composition,
+    /// and the text's runs underline the composition alone, with no empty
+    /// run.
+    #[test]
+    fn runs_and_the_placeholder() {
+        use Underline::{Composition, None as Plain};
+        let marked = |text: &str, cursor: usize, composing: &str| {
+            let mut s = EditState::new(text);
+            s.move_to(cursor, false);
+            s.replace_and_mark(None, composing, None);
+            s
+        };
+        type Runs = &'static [(usize, Underline)];
+        let cases: [(EditState, bool, Runs); 6] = [
+            (EditState::new(""), true, &[]),
+            (EditState::new("ls"), false, &[(2, Plain)]),
+            (marked("", 0, "か"), false, &[(3, Composition)]),
+            (marked("ab", 1, "x"), false, &[(1, Plain), (1, Composition), (1, Plain)]),
+            (marked("ab", 0, "x"), false, &[(1, Composition), (2, Plain)]),
+            (marked("ab", 2, "xy"), false, &[(2, Plain), (2, Composition)]),
+        ];
+        for (state, placeholder, runs) in cases {
+            assert_eq!(state.shows_placeholder(), placeholder, "{state:?}");
+            assert_eq!(state.run_lens(), runs, "{state:?}");
+            assert_eq!(state.run_lens().iter().map(|(len, _)| len).sum::<usize>(), state.text().len());
+        }
+    }
+
+    /// b43 #3: above the line is the text's start, below it its end, and
+    /// on it (its edges included) the nearest character.
+    #[test]
+    fn where_a_press_hits() {
+        let (top, bottom) = (px(10.), px(30.));
+        for (y, hit) in [
+            (px(0.), Hit::Start),
+            (px(9.9), Hit::Start),
+            (px(10.), Hit::Line),
+            (px(20.), Hit::Line),
+            (px(30.), Hit::Line),
+            (px(30.1), Hit::End),
+            (px(400.), Hit::End),
+        ] {
+            assert_eq!(hit_for_y(y, top, bottom), hit, "{y:?}");
+        }
+    }
+
+    /// b43 #3: a single press moves the cursor (extending with shift) and
+    /// starts a drag selection; a double click selects the word and
+    /// doesn't.
+    #[test]
+    fn a_press_moves_the_cursor_or_selects_a_word() {
+        let mut s = at("echo hello| world");
+        assert!(s.press(2, 1, false));
+        assert_eq!(show(&s), "ec|ho hello world");
+        assert!(s.press(7, 1, true));
+        assert_eq!(show(&s), "ec[ho he]llo world");
+        assert!(!s.press(7, 2, false));
+        assert_eq!(s.selected_text(), "hello");
+        assert!(!s.press(1, 3, false));
+        assert_eq!(s.selected_text(), "echo");
     }
 }

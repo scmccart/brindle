@@ -188,4 +188,15 @@ mod tests {
         assert!(toggles(&SWITCH_KEYS, Some(KeyboardButton::Space)));
         assert!(toggles(&SWITCH_KEYS, Some(KeyboardButton::Enter)));
     }
+
+    /// A keyboard click carries its key, a mouse click none.
+    #[test]
+    fn a_click_names_its_key_or_none() {
+        use gpui::{Bounds, KeyboardClickEvent, MouseClickEvent};
+        for button in [KeyboardButton::Enter, KeyboardButton::Space] {
+            let click = ClickEvent::Keyboard(KeyboardClickEvent { button, bounds: Bounds::default() });
+            assert_eq!(click_key(&click), Some(button));
+        }
+        assert_eq!(click_key(&ClickEvent::Mouse(MouseClickEvent::default())), None);
+    }
 }

@@ -466,7 +466,7 @@ use gpui::{
 use super::{Btn, Section, SettingsDialog};
 use brindle_ui::{
     ActiveTheme as _, ButtonVariant, Combobox, ComboboxEvent, CommandGroup, CommandItem, FIELD_HEIGHT, Input, TextInput,
-    TextInputEvent,
+    TextInputEvent, item_keyed,
 };
 
 /// The fields typed as text.
@@ -536,14 +536,18 @@ impl SettingsDialog {
                     .with_empty_message("No font found.")
             });
             let changed = cx.subscribe_in(&combobox, window, move |this, combobox, event: &ComboboxEvent, _, cx| {
-                let ComboboxEvent::Changed(ix) = *event;
-                // Option 0 is "Default"; the others are families, by name.
-                let choice = match ix {
-                    0 => FamilyChoice::Default,
-                    _ => match combobox.read(cx).option(ix) {
+                let ComboboxEvent::Changed(key) = event;
+                // Items are keyed by their label; the key's option is found
+                // again by its index. Option 0 is "Default"; the others are
+                // families, by name.
+                let combobox = combobox.read(cx);
+                let choice = match item_keyed(combobox.groups(), key) {
+                    Some(0) => FamilyChoice::Default,
+                    Some(ix) => match combobox.option(ix) {
                         Some(item) => FamilyChoice::Family(item.label.to_string()),
                         None => return,
                     },
+                    None => return,
                 };
                 this.model.fonts.choose(field, choice);
                 this.model.error = None;

@@ -138,6 +138,17 @@ impl Typeahead {
     ) -> Option<usize> {
         typeahead_find(self.query(), labels, current, enabled)
     }
+
+    /// [`Typeahead::find`] over rows that may have no label; see
+    /// [`typeahead_find_labelled`].
+    pub fn find_labelled<S: AsRef<str>>(
+        &self,
+        labels: &[Option<S>],
+        current: Option<usize>,
+        enabled: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        typeahead_find_labelled(self.query(), labels, current, enabled)
+    }
 }
 
 /// The first enabled option whose label starts with `query`,
@@ -151,8 +162,31 @@ pub fn typeahead_find<S: AsRef<str>>(
     current: Option<usize>,
     enabled: impl Fn(usize) -> bool,
 ) -> Option<usize> {
+    find_in(query, labels.len(), |ix| Some(labels[ix].as_ref()), current, enabled)
+}
+
+/// [`typeahead_find`] over rows of which some have no label (a menu's
+/// separators): a row without one never matches.
+pub fn typeahead_find_labelled<S: AsRef<str>>(
+    query: &str,
+    labels: &[Option<S>],
+    current: Option<usize>,
+    enabled: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    find_in(query, labels.len(), |ix| labels[ix].as_ref().map(AsRef::as_ref), current, enabled)
+}
+
+/// The search both finds share, over `count` rows whose labels `label`
+/// gives.
+fn find_in<'a>(
+    query: &str,
+    count: usize,
+    label: impl Fn(usize) -> Option<&'a str>,
+    current: Option<usize>,
+    enabled: impl Fn(usize) -> bool,
+) -> Option<usize> {
     let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if query.is_empty() || labels.is_empty() {
+    if query.is_empty() || count == 0 {
         return None;
     }
     let start = match current {
@@ -160,10 +194,9 @@ pub fn typeahead_find<S: AsRef<str>>(
         Some(ix) => ix,
         None => 0,
     };
-    let count = labels.len();
     (0..count)
         .map(|step| (start + step) % count)
-        .find(|&ix| enabled(ix) && starts_with_ignoring_case(labels[ix].as_ref(), &query))
+        .find(|&ix| enabled(ix) && label(ix).is_some_and(|label| starts_with_ignoring_case(label, &query)))
 }
 
 fn starts_with_ignoring_case(label: &str, query_lowercase: &[char]) -> bool {
@@ -308,5 +341,18 @@ mod tests {
         assert_eq!(typeahead_find("f", &[] as &[&str], None, ALL), None);
         // With no highlight, the search starts at the top.
         assert_eq!(typeahead_find("f", &labels, None, ALL), Some(1));
+    }
+
+    /// b40 #3: a row without a label never matches, even one the caller
+    /// counts as enabled, and the search goes past it.
+    #[test]
+    fn rows_without_a_label_never_match() {
+        let labels = [Some("Alpha"), None, Some("Apple"), None];
+        assert_eq!(typeahead_find_labelled("a", &labels, Some(0), ALL), Some(2));
+        assert_eq!(typeahead_find_labelled("a", &labels, Some(2), ALL), Some(0));
+        assert_eq!(typeahead_find_labelled("ap", &labels, None, ALL), Some(2));
+        assert_eq!(typeahead_find_labelled("b", &labels, None, ALL), None);
+        assert_eq!(typeahead_find_labelled("a", &[None::<&str>, None], None, ALL), None);
+        assert_eq!(typeahead_find_labelled("a", &[] as &[Option<&str>], None, ALL), None);
     }
 }
