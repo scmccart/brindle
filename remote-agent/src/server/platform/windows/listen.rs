@@ -972,7 +972,8 @@ mod tests {
 
     #[test]
     fn a_refusal_flushed_before_the_drop_arrives_whole() {
-        // What the core does with a client it turns away: queue the error,
+        // What the core did with a client it turned away before refusals
+        // closed gracefully (the test above): queue the error,
         // flush for a moment, drop the connection.
         let (mut ev, listener, path) = listening("refusal", Identity::own());
         let client = connect(&path).unwrap();

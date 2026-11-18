@@ -1624,6 +1624,10 @@ mod tests {
             fn foreground(&mut self) {
                 self.0.send(Seen::Foreground).ok();
             }
+
+            fn broken(&mut self, reason: &str) {
+                self.0.send(Seen::Lost(format!("broken: {reason}"))).ok();
+            }
         }
 
         #[derive(Debug, PartialEq)]

@@ -79,16 +79,17 @@ impl Emulator {
     /// An emulator of `cols` (at least [`MIN_COLS`]) × `rows` (at least 1)
     /// keeping `scrollback` lines of history; 0 means [`DEFAULT_SCROLLBACK`].
     ///
-    /// It reads directory reports in [`PathStyle::Posix`] on every platform,
-    /// as the server always has: a Windows core's replays keep OSC 7's
-    /// `/C:/…` reports but drop `9;9` ones until the shell reports again.
-    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
+    /// It reads directory reports (OSC 7, 9;9) as `style` spells paths: the
+    /// style of the platform the session's program runs on, which the
+    /// caller knows and this crate doesn't. So a Windows core keeps a 9;9
+    /// `C:\src`, and its replays carry it.
+    pub fn new(cols: u16, rows: u16, scrollback: usize, style: PathStyle) -> Self {
         let titles = Titles::default();
         let scrolling_history = if scrollback == 0 { DEFAULT_SCROLLBACK } else { scrollback };
         let config = term::Config { scrolling_history, ..Default::default() };
         Self {
             term: Term::new(config, &size(cols, rows), titles.clone()),
-            parser: Parser::new(PathStyle::Posix),
+            parser: Parser::new(style),
             marks: Mutex::new(Marks::default()),
             records: Records::default(),
             scanner: osc::Scanner::new(),
@@ -167,6 +168,8 @@ fn size(cols: u16, rows: u16) -> Size {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use alacritty_terminal::index::{Column, Line};
 
     use super::*;
@@ -181,10 +184,10 @@ mod tests {
 
     #[test]
     fn a_render_rebuilds_the_screen_records_marks_and_title() {
-        let mut emulator = Emulator::new(40, 6, 100);
+        let mut emulator = Emulator::new(40, 6, 100, PathStyle::Posix);
         emulator.feed(b"\x1b]2;my title\x07\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
         emulator.feed(b"a b c\r\n\x1b]133;D;0\x07\x1b]7501;state=working:app=x\x1b\\");
-        let mut copy = Emulator::new(40, 6, 100);
+        let mut copy = Emulator::new(40, 6, 100, PathStyle::Posix);
         copy.feed(&emulator.render());
         assert_eq!(text(&copy, 0), "$ ls");
         assert_eq!(text(&copy, 1), "a b c");
@@ -196,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_one_column_emulator_fed_a_double_width_char_is_ten_columns_wide_and_does_not_panic() {
-        let mut emulator = Emulator::new(1, 4, 0);
+        let mut emulator = Emulator::new(1, 4, 0, PathStyle::Posix);
         emulator.feed("😀😀漢".as_bytes());
         assert_eq!(emulator.term().columns(), usize::from(MIN_COLS));
         emulator.resize(1, 4);
@@ -207,13 +210,13 @@ mod tests {
 
     #[test]
     fn a_zero_by_zero_emulator_is_min_cols_by_one_row() {
-        let emulator = Emulator::new(0, 0, 0);
+        let emulator = Emulator::new(0, 0, 0, PathStyle::Posix);
         assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (usize::from(MIN_COLS), 1));
     }
 
     #[test]
     fn queries_get_no_reply_and_the_title_resets() {
-        let mut emulator = Emulator::new(20, 4, 0);
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
         emulator.feed(b"\x1b]2;t\x07\x1b[6n\x1b[c\x1b]11;?\x07");
         assert_eq!(emulator.title().as_deref(), Some("t"));
         emulator.feed(b"\x1bc");
@@ -222,16 +225,16 @@ mod tests {
 
     #[test]
     fn a_pending_synchronized_update_is_in_the_render() {
-        let mut emulator = Emulator::new(20, 4, 0);
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
         emulator.feed(b"\x1b[?2026hinside");
-        let mut copy = Emulator::new(20, 4, 0);
+        let mut copy = Emulator::new(20, 4, 0, PathStyle::Posix);
         copy.feed(&emulator.render());
         assert_eq!(text(&copy, 0), "inside");
     }
 
     #[test]
     fn input_drops_done_records_and_resize_follows() {
-        let mut emulator = Emulator::new(20, 4, 0);
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
         emulator.feed(b"\x1b]7501;state=done\x07");
         assert!(emulator.records().get("").is_some());
         emulator.input_seen();
@@ -240,12 +243,40 @@ mod tests {
         assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (30, 5));
     }
 
+    /// Whether `render` holds `needle`.
+    fn replays(render: &[u8], needle: &[u8]) -> bool {
+        render.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[test]
-    fn the_emulator_reads_directory_reports_as_posix() {
-        let mut emulator = Emulator::new(20, 4, 0);
-        emulator.feed(b"\x1b]7;file://h/home/u\x1b\\");
+    fn a_windows_style_emulator_replays_a_9_9_directory() {
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Windows);
+        emulator.feed(b"\x1b]9;9;C:\\src\x1b\\");
+        assert_eq!(emulator.marks().reported_dir(), Some(Path::new(r"C:\src")));
         let render = emulator.render();
-        let needle = b"\x1b]7;file:///home/u\x1b\\";
-        assert!(render.windows(needle.len()).any(|w| w == needle), "{:?}", String::from_utf8_lossy(&render));
+        assert!(replays(&render, b"\x1b]7;file:///C:/src\x1b\\"), "{:?}", String::from_utf8_lossy(&render));
+    }
+
+    #[test]
+    fn a_posix_style_emulator_keeps_osc_7_and_drops_a_windows_9_9_path() {
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
+        emulator.feed(b"\x1b]7;file://host/home/me\x1b\\");
+        emulator.feed(b"\x1b]9;9;C:\\src\x1b\\");
+        assert_eq!(emulator.marks().reported_dir(), Some(Path::new("/home/me")));
+        let render = emulator.render();
+        assert!(replays(&render, b"\x1b]7;file:///home/me\x1b\\"), "{:?}", String::from_utf8_lossy(&render));
+        assert!(!replays(&render, b"C:"), "{:?}", String::from_utf8_lossy(&render));
+    }
+
+    #[test]
+    fn a_replayed_directory_survives_a_second_emulator() {
+        let mut first = Emulator::new(20, 4, 0, PathStyle::Windows);
+        first.feed(b"\x1b]9;9;C:\\src\x1b\\");
+        // As a new core rebuilds a session from its checkpoint.
+        let mut second = Emulator::new(20, 4, 0, PathStyle::Windows);
+        second.feed(&first.render());
+        assert_eq!(second.marks().reported_dir(), Some(Path::new(r"C:\src")));
+        let render = second.render();
+        assert!(replays(&render, b"\x1b]7;file:///C:/src\x1b\\"), "{:?}", String::from_utf8_lossy(&render));
     }
 }

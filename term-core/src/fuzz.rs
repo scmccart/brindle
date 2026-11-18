@@ -12,6 +12,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::emulator::Emulator;
 use crate::osc::{self, Found};
+use crate::shell_integration::PathStyle;
 use crate::status::{self, Message};
 
 /// A fixed-seed xorshift generator.
@@ -222,10 +223,12 @@ fn pieces<'a>(rng: &mut XorShift, bytes: &'a [u8]) -> Vec<&'a [u8]> {
 #[test]
 fn the_emulator_never_panics_on_random_streams() {
     let mut rng = XorShift::new(0x7e57_c0de_0000_0001);
-    for _ in 0..120 {
+    for round in 0..120 {
+        // Both path styles, every other round, without taking from `rng`.
+        let style = [PathStyle::Posix, PathStyle::Windows][round % 2];
         let (mut cols, mut rows) = (1 + rng.below(30) as u16, 1 + rng.below(10) as u16);
         let scrollback = 5 + rng.below(40);
-        let mut emulator = Emulator::new(cols, rows, scrollback);
+        let mut emulator = Emulator::new(cols, rows, scrollback, style);
         let count = 1 + rng.below(60);
         let bytes = stream(&mut rng, count);
         for piece in pieces(&mut rng, &bytes) {
@@ -244,7 +247,7 @@ fn the_emulator_never_panics_on_random_streams() {
             assert!(records <= status::MAX_RECORDS, "{records} records");
         }
         let replay = emulator.render();
-        let mut fresh = Emulator::new(cols, rows, scrollback);
+        let mut fresh = Emulator::new(cols, rows, scrollback, style);
         fresh.feed(&replay);
         assert!(fresh.records().iter().count() <= status::MAX_RECORDS);
     }

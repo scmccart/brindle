@@ -225,7 +225,10 @@ impl Conn {
     }
 
     /// Flushes the whole queue, waiting for the peer for at most `limit`.
-    /// Once it returns `Ok`, dropping the connection loses none of it.
+    /// Once it returns `Ok`, dropping the connection loses none of it. Only
+    /// the tests flush and drop: a server that turns a peer away closes
+    /// gracefully ([`Conn::close_for`]), so the peer can't read a reset.
+    #[cfg(test)]
     pub fn flush_for(&mut self, limit: Duration) -> io::Result<()> {
         let deadline = Instant::now() + limit;
         let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "the peer stopped reading");

@@ -52,7 +52,9 @@ impl Stream {
     }
 
     /// Waits up to `limit` until everything written has left this process:
-    /// at once here (see [`Stream::unsent`]).
+    /// at once here (see [`Stream::unsent`]). For `Conn::flush_for`, which
+    /// only the tests use.
+    #[cfg(test)]
     pub fn drain_for(&self, _limit: Duration) -> io::Result<bool> {
         Ok(true)
     }

@@ -12,7 +12,8 @@
 //!   once the pipe has taken its bytes, like a write to a socket.
 //! - **Dropping** the stream cancels what the pipe hadn't taken yet, as
 //!   closing a socket drops what the kernel hadn't accepted;
-//!   [`Stream::unsent`] counts it and [`Stream::drain_for`] waits for it.
+//!   [`Stream::unsent`] counts it, and a graceful close
+//!   (`Conn::close_for`) waits for it.
 //!   What the pipe has taken stays readable by the peer, also when this side leaves
 //!   input unread: a pipe has no reset.
 //! - **[`Stream::shutdown_write`]** can't half-close: a pipe handle is
@@ -131,7 +132,9 @@ impl Stream {
 
     /// Waits up to `limit` until the pipe has taken everything written, so
     /// that dropping the stream loses nothing. `Ok(false)` means the peer
-    /// didn't read that fast; an error is the write's.
+    /// didn't read that fast; an error is the write's. For
+    /// `Conn::flush_for`, which only the tests use.
+    #[cfg(test)]
     pub fn drain_for(&self, limit: Duration) -> io::Result<bool> {
         let start = Instant::now();
         loop {

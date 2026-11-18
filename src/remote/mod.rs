@@ -6,6 +6,9 @@
 //! launches the relay, and `local` keeps one connection per endpoint
 //! ([`Host`]) through it.
 
+// Only `local`, built on Linux and Windows, counts input against it.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub mod budget;
 // Only `local`, built on Linux and Windows, launches relays.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub mod client;

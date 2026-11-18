@@ -1,8 +1,9 @@
 //! Local tabs in the terminal server (Linux and Windows): where their
 //! programs run, that closing ends them and quitting keeps them, reattaching
 //! on the next launch, the sessions palette and `--attach`, the environment
-//! they get, reconnecting after the core restarts, sessions lost for good, a
-//! missing helper, an upgrade, and the management commands. Windows adds
+//! they get, reconnecting after the core restarts, sessions lost for good,
+//! an emulator failure confined to its zone, a missing helper, an upgrade,
+//! and the management commands. Windows adds
 //! the owner of a program's dialog, the inbox console host beside the
 //! packaged one, and the elevated server.
 //!
@@ -1317,6 +1318,66 @@ pub fn reused_id(ctx: &Ctx) -> Result<Outcome> {
         out.dump.screen
     );
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
+    Ok(Outcome::Pass)
+}
+
+/// What the case sets `BRINDLE_TEST_SINK_PANIC` to: Brindle's emulator
+/// panics on a read of a session's output that holds it. The switch exists
+/// only in debug builds, which is what the suite tests by default.
+const SINK_PANIC: &str = "brindle-test-sink-panic";
+
+/// Brindle's emulator failing on one zone's output (the fault switch
+/// `BRINDLE_TEST_SINK_PANIC`) lets go of that zone's session: the zone
+/// stays open and says Brindle can't show the session and that it can be
+/// attached again, and the session is listed detached with its shell still
+/// running. The other zone, whose session is on the same connection, keeps
+/// showing its program's output and taking input, attached. Quitting then
+/// leaves the let-go session running too.
+pub fn sink_panic(ctx: &Ctx) -> Result<Outcome> {
+    let srv = Server::of(ctx);
+    let checked = srv.clone();
+    let file = ctx.dir.join("broken-pid");
+    let watched = file.clone();
+    // One `printf` (one read), whose typed line doesn't show the marker
+    // whole. `\012` is a newline: `--send` would turn a `\n` into a key.
+    let print_marker = sh("printf '%s-%s\\012' brindle-test sink-panic", "'{0}-{1}' -f 'brindle-test','sink-panic'");
+    let out = Run::new(ctx, "run")
+        .keep_detached()
+        .env("BRINDLE_TEST_SINK_PANIC", SINK_PANIC)
+        .prompt()
+        .action("split_zone_right")
+        .wait_for(PROMPT_START)
+        .send(&format!("{}; {print_marker}\r", save_pid(&file)))
+        .wait_for("can't show this session")
+        .wait_for("attach it again")
+        .action("focus_zone_left")
+        .send(&format!("{}\r", echo_sum("fine", 1, 1)))
+        .wait_for("fine-2")
+        .call_at(later(3.0), move |_| {
+            let shell = checked.wait(20.0, "the right zone's shell", || Ok(read_pid(&watched)))?;
+            listed_when(&checked, 20.0, "the right zone's session detached and the left zone's attached", |sessions| {
+                sessions.len() == 2
+                    && sessions.iter().any(|s| !s.attached && s.pid == shell)
+                    && sessions.iter().any(|s| s.attached && s.pid != shell)
+            })?;
+            ensure!(alive(shell), "the let-go session's shell {shell} isn't running");
+            Ok(())
+        })
+        .dump_at(later(14.0))
+        .run()?;
+    ensure!(
+        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+        "waits that gave up: {:?}, still waiting: {:?} (the fault switch is in debug builds only)",
+        out.dump.wait_timeouts,
+        out.dump.wait_pending
+    );
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=1"), "zones: {:?}", out.dump.zones);
+    screen_has(&out, "fine-2")?;
+    let shell = read_pid(&file).ok_or("the right zone's shell never wrote its pid")?;
+    listed_when(&srv, 10.0, "the let-go session still listed after the quit", |sessions| {
+        sessions.iter().any(|s| !s.attached && s.pid == shell)
+    })?;
+    ensure!(alive(shell), "the let-go session's shell {shell} ended with Brindle");
     Ok(Outcome::Pass)
 }
 

@@ -633,10 +633,11 @@ impl Assembler {
         Ok(partial.bytes)
     }
 
-    /// Drops a session's partial blob, for a session that ended or a
-    /// connection that was lost.
-    pub fn abandon(&mut self, session: SessionId) {
-        self.open.remove(&session);
+    /// Drops a session's partial blob, for a session that ended, a
+    /// connection that was lost, or a receiver that failed while handling
+    /// one of its messages. Says whether one was open.
+    pub fn abandon(&mut self, session: SessionId) -> bool {
+        self.open.remove(&session).is_some()
     }
 
     pub fn is_open(&self, session: SessionId) -> bool {
@@ -1246,6 +1247,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(a.open_blobs(), MAX_OPEN_BLOBS);
+    }
+
+    #[test]
+    fn an_abandoned_blob_lets_the_next_begin_start_clean() {
+        let mut a = Assembler::new(MAX_CHECKPOINT_LEN);
+        assert!(!a.abandon(1), "nothing open");
+        a.begin(BlobBegin { session: 1, len: 6 }).unwrap();
+        a.chunk(&Data {
+            session: 1,
+            bytes: b"old".to_vec(),
+        })
+        .unwrap();
+        a.begin(BlobBegin { session: 2, len: 1 }).unwrap();
+        assert!(a.abandon(1));
+        assert!(!a.is_open(1));
+        assert!(a.is_open(2), "another session's blob stays");
+
+        // A BEGIN right after isn't one "before ending the last one", and
+        // the old chunk is no part of the new blob.
+        let (begin, chunks, end) = split(1, b"new", 2);
+        a.begin(begin).unwrap();
+        for chunk in &chunks {
+            a.chunk(chunk).unwrap();
+        }
+        assert_eq!(a.end(end).unwrap(), b"new");
+        assert!(!a.abandon(1), "ended, so nothing open");
     }
 
     #[test]

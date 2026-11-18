@@ -254,7 +254,7 @@ When Brindle's connection to the terminal server's core ends, Brindle SHALL reco
 - **THEN** reconnecting raises no bell dot and no notification
 
 ### Requirement: A session lost for good is reported in the tab
-When Brindle can't get a session back, because its holder ended, the core no longer has it, or no core is reachable within a bounded time, the tab SHALL keep its last screen and show a line saying the session was lost and why, instead of closing. A tab whose session was lost or exited SHALL NOT act on a session that later got the same id: its input, resizes and close SHALL NOT reach that session.
+When Brindle can't get a session back, because its holder ended, the core no longer has it, or no core is reachable within a bounded time, the tab SHALL keep its last screen and show a line saying the session was lost and why, instead of closing. A tab whose session was lost, exited or let go after an emulator failure SHALL NOT act on a session that later got the same id: its input, resizes and close SHALL NOT reach that session.
 
 #### Scenario: Holder killed
 - **WHEN** the holder of a local tab's session is killed with SIGKILL
@@ -309,3 +309,14 @@ On Linux and Windows, each local tab and zone SHALL run its program in a session
 #### Scenario: Titles and directories on Windows
 - **WHEN** the user runs `cd C:\Windows` in a local PowerShell tab with Brindle's integration script loaded, then `python`, and splits the zone while Python runs
 - **THEN** the tab title shows `python`, and the new zone starts in `C:\Windows`
+
+### Requirement: An emulator failure is confined to its tab
+When Brindle's emulator fails on a session's output, Brindle SHALL let go of that session without ending it, leaving it detached and running, and the tab SHALL stay open, showing in place of its screen that Brindle can't show the session and that it can be attached again. Closing that tab SHALL leave the session running. The other tabs, on the same endpoint too, SHALL keep working.
+
+#### Scenario: Emulator fails on one zone's output
+- **WHEN** a window has two local zones and Brindle's emulator fails on the output of one zone's session
+- **THEN** that zone stays open and says Brindle can't show the session any more and that it can be attached again, the session is listed as detached with its program still running, and the other zone keeps showing its program's output and taking input
+
+#### Scenario: Closing a tab whose emulator failed
+- **WHEN** Brindle's emulator failed on a tab's output and the user closes that tab
+- **THEN** the session stays listed as detached and its program keeps running

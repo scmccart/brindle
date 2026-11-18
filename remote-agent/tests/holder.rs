@@ -50,9 +50,18 @@ mod programs {
     /// Prints `one`, then `two:<line>` for the line it reads, then waits
     /// until [`release`] lets it go through `go` (a FIFO, made here) and
     /// exits with 0. Releasing it needs no core.
+    ///
+    /// It opens `go` (read-write, which doesn't wait for a writer) before
+    /// it prints `one`, and keeps it open until it reads: a byte written to
+    /// a FIFO that no one else has open is lost when the writer closes it,
+    /// so a program that opened `go` only when it got to its last `read`
+    /// could miss a [`release`] that came first, and never exit.
     pub fn echoes_a_line(session: SessionId, go: &Path) -> Spawn {
         make_fifo(go);
-        let script = format!("echo one; read x; echo \"two:$x\"; read y <'{}'", go.display());
+        let script = format!(
+            "exec 3<>'{}'; echo one; read x; echo \"two:$x\"; read y <&3",
+            go.display()
+        );
         shell(session, &script)
     }
 
@@ -1173,6 +1182,142 @@ fn a_paused_session_blocks_until_resumed() {
     let output = core.output_until(1, b"DONE\r\n");
     assert!(contains(&output, b"\r\n300000\r\n"));
     core.hang_up_and_wait(1);
+}
+
+/// The marker of the holder's fault switch in these tests: a `SPAWN` with
+/// it in an argument, or `INPUT` with it in its bytes, fails in the holder.
+const FAULT: &str = "brindle-test-holder-fault";
+
+/// A holder started with [`FAULT`] as its fault switch's marker, with a
+/// connected test core.
+fn faulty_holder(tag: &str) -> (TempDir, TestCore, u32) {
+    let mut dir = TempDir::new(tag);
+    start_holder_with(&dir.path, &[("BRINDLE_TEST_HOLDER_PANIC", FAULT)]);
+    let mut core = TestCore::connect_to(&dir);
+    let pid = core.hello(1).welcome().pid;
+    dir.track(pid);
+    (dir, core, pid)
+}
+
+/// Sends the line `word` to an [`programs::echoes_a_line`] session and
+/// waits for its answer.
+fn answers(core: &mut TestCore, session: u32, word: &str) {
+    core.input(session, word.as_bytes());
+    core.input(session, programs::ENTER);
+    core.output_until(session, format!("two:{word}\r\n").as_bytes());
+}
+
+#[test]
+fn a_holder_fault_while_spawning_fails_that_spawn_only() {
+    let (dir, mut core, holder_pid) = faulty_holder("fault-spawn");
+    let go = dir.path.join("go");
+    let pid = core.spawn(programs::echoes_a_line(1, &go));
+    core.output_until(1, b"one\r\n");
+
+    let mut faulty = programs::exits(2, 0);
+    faulty.args.push(FAULT.into());
+    core.send(ToHolder::Spawn(faulty));
+    match core.recv_skipping_output() {
+        ToCore::SpawnFailed(failed) => {
+            assert_eq!(failed.session, 2, "{}", failed.message);
+            assert!(
+                failed.message.contains("BRINDLE_TEST_HOLDER_PANIC matched"),
+                "{}",
+                failed.message
+            );
+        }
+        other => panic!("expected SPAWN_FAILED for session 2, got {other:?}"),
+    }
+
+    // The holder, the other session and the connection carry on, and the
+    // failed spawn left nothing behind under its id.
+    assert!(alive(holder_pid));
+    assert!(alive(pid));
+    answers(&mut core, 1, "abc");
+    core.spawn(programs::exits(2, 0));
+    assert_eq!(core.exit_code(2), Some(0));
+    programs::release(&go);
+    assert_eq!(core.exit_code(1), Some(0));
+}
+
+#[test]
+fn a_holder_fault_on_input_reports_an_error_and_both_sessions_keep_running() {
+    let (dir, mut core, holder_pid) = faulty_holder("fault-input");
+    let gos = [dir.path.join("go1"), dir.path.join("go2")];
+    // Each session's `one` before the next spawn, which drops output.
+    let mut pids = Vec::new();
+    for (session, go) in [(1, &gos[0]), (2, &gos[1])] {
+        pids.push(core.spawn(programs::echoes_a_line(session, go)));
+        core.output_until(session, b"one\r\n");
+    }
+
+    core.input(1, FAULT.as_bytes());
+    match core.recv_skipping_output() {
+        ToCore::Error(error) => {
+            assert_eq!(error.session, Some(1), "{}", error.message);
+            assert!(error.message.contains("INPUT"), "{}", error.message);
+            assert!(
+                error.message.contains("BRINDLE_TEST_HOLDER_PANIC matched"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected ERROR for session 1, got {other:?}"),
+    }
+
+    assert!(alive(holder_pid));
+    for pid in pids {
+        assert!(alive(pid));
+    }
+    answers(&mut core, 1, "abc");
+    answers(&mut core, 2, "def");
+    for (session, go) in [(1, &gos[0]), (2, &gos[1])] {
+        programs::release(go);
+        assert_eq!(core.exit_code(session), Some(0));
+    }
+}
+
+#[test]
+fn a_core_refused_for_its_first_message_reads_the_error_then_the_end() {
+    let (dir, _core, holder_pid) = holder("refuse-first");
+    let opening = ToHolder::Pause(h1::SessionRef { session: 1 })
+        .encode()
+        .unwrap();
+    let answer = refused(&dir.holder_endpoints()[0], &opening);
+    match ToCore::decode(&answer).unwrap() {
+        ToCore::Error(error) => {
+            assert_eq!(error.session, None);
+            assert!(error.message.contains("HELLO"), "{}", error.message);
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    assert!(alive(holder_pid));
+}
+
+#[test]
+fn a_core_refused_for_its_versions_reads_the_error_then_the_end() {
+    let (dir, _core, holder_pid) = holder("refuse-versions");
+    let opening = ToHolder::Hello(h1::Hello {
+        min: 900,
+        max: 901,
+        core_build: "test-core".into(),
+        instance: 2,
+    })
+    .encode()
+    .unwrap();
+    let answer = refused(&dir.holder_endpoints()[0], &opening);
+    match ToCore::decode(&answer).unwrap() {
+        ToCore::Error(error) => {
+            assert_eq!(error.session, None);
+            assert!(
+                error.message.contains("no common protocol version"),
+                "{}",
+                error.message
+            );
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    assert!(alive(holder_pid));
 }
 
 #[test]

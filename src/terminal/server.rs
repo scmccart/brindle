@@ -4,7 +4,8 @@
 //! The sink scans the bytes for the OSCs Brindle handles beside the parser
 //! and sends what it finds, parses them under the terminal's locks (parser,
 //! then term, then marks), and sends `Wakeup`, which advances the
-//! [`OutputMarker`] for latency probes.
+//! [`OutputMarker`] for latency probes. Everything it sends passes the
+//! terminal's event gate ([`Listener::send`]).
 //!
 //! [`OutputMarker`]: super::OutputMarker
 
@@ -55,7 +56,7 @@ impl Sink {
     }
 
     fn send(&self, event: ChannelEvent) {
-        self.listener.0.unbounded_send(event).ok();
+        self.listener.send(event);
     }
 
     /// Feeds a whole replay under the locks, so a resize from the UI can't
@@ -74,6 +75,7 @@ impl Sink {
         if let Some(size) = size {
             self.marks.lock().resize(&mut *term, size);
         }
+        inject_fault(bytes);
         parser.advance(&mut *term, &self.marks, bytes);
         if size.is_some() {
             self.marks.lock().resize(&mut *term, own);
@@ -94,6 +96,7 @@ impl SessionSink for Sink {
             // Lock order: parser, then term, then marks (taken by `advance`).
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
+            inject_fault(bytes);
             parser.advance(&mut *term, &self.marks, bytes);
         }
         // Always wake the UI, even when the bytes are held by a
@@ -147,22 +150,53 @@ impl SessionSink for Sink {
     fn foreground(&mut self) {
         self.send(ChannelEvent::Foreground);
     }
+
+    /// The emulator failed on the session's output, which the connection
+    /// let go: the terminal replaces its state and says so. Nothing is
+    /// parsed here, since the state may be half-changed.
+    fn broken(&mut self, reason: &str) {
+        self.replay = None;
+        self.send(ChannelEvent::Broken(reason.to_string()));
+    }
 }
+
+/// The debug-only fault switch `BRINDLE_TEST_SINK_PANIC` (`process R20`):
+/// parsing panics, under the terminal's locks as a real emulator failure
+/// would, when the bytes hold the marker it names. The e2e suite prints the
+/// marker with one `printf`, so it arrives in one read. It is read once.
+#[cfg(debug_assertions)]
+fn inject_fault(bytes: &[u8]) {
+    static MARKER: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let marker = MARKER.get_or_init(|| {
+        std::env::var_os("BRINDLE_TEST_SINK_PANIC").filter(|value| !value.is_empty()).map(|value| value.into_encoded_bytes())
+    });
+    if let Some(marker) = marker
+        && bytes.windows(marker.len()).any(|window| window == marker.as_slice())
+    {
+        panic!("BRINDLE_TEST_SINK_PANIC: the output held its marker");
+    }
+}
+
+/// A release build has no fault switch.
+#[cfg(not(debug_assertions))]
+fn inject_fault(_bytes: &[u8]) {}
 
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::term;
-    use futures::channel::mpsc::unbounded;
+    use futures::channel::mpsc::UnboundedReceiver;
 
     use super::*;
     use crate::notify::osc::Found;
+    use crate::terminal::events::{self, Merge};
     use crate::terminal::shell_integration::PathStyle;
     use crate::terminal::{GridSize, OutputMarker};
 
-    fn sink() -> (Sink, futures::channel::mpsc::UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
-        let (tx, rx) = unbounded();
-        let marker = Arc::new(OutputMarker::default());
-        let listener = Listener(tx, marker.clone());
+    /// A sink on a terminal whose events arrive on the receiver, through a
+    /// gate as a terminal's do.
+    fn sink() -> (Sink, UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
+        let (listener, rx) = Listener::channel();
+        let marker = listener.output.clone();
         let term = Term::new(term::Config::default(), &GridSize::default(), listener.clone());
         let sink = Sink::new(
             Arc::new(FairMutex::new(term)),
@@ -174,23 +208,29 @@ mod tests {
         (sink, rx, marker)
     }
 
-    /// What the terminal's event task gets, by kind, in order.
-    fn kinds(rx: &mut futures::channel::mpsc::UnboundedReceiver<ChannelEvent>) -> Vec<&'static str> {
-        std::iter::from_fn(|| rx.try_next().ok().flatten())
+    /// What the terminal's event task takes, by kind, in order; the gate
+    /// learns it was taken, as the task's chunks tell it.
+    fn kinds(sink: &Sink, rx: &mut UnboundedReceiver<ChannelEvent>) -> Vec<&'static str> {
+        let taken: Vec<ChannelEvent> = std::iter::from_fn(|| rx.try_next().ok().flatten()).collect();
+        sink.listener.gate.lock().took(taken.iter().map(events::kind_of));
+        taken
+            .iter()
             .map(|event| match event {
                 ChannelEvent::Replay(true) => "replay-start",
                 ChannelEvent::Replay(false) => "replay-end",
                 ChannelEvent::Osc(Found::Notice(_)) => "notice",
                 ChannelEvent::Osc(_) => "osc",
                 ChannelEvent::Alac(AlacEvent::Bell) => "bell",
-                ChannelEvent::Alac(AlacEvent::Wakeup) => "wakeup",
                 ChannelEvent::Alac(AlacEvent::Exit) => "exit",
                 ChannelEvent::Alac(_) => "alac",
+                ChannelEvent::Merged(Merge::Wakeup) => "wakeup",
+                ChannelEvent::Merged(_) => "merged",
                 ChannelEvent::Lost => "lost",
                 ChannelEvent::Failed => "failed",
                 ChannelEvent::Foreground => "foreground",
+                ChannelEvent::Broken(_) => "broken",
+                ChannelEvent::InputRefused => "input-refused",
             })
-
             .collect()
     }
 
@@ -198,11 +238,28 @@ mod tests {
     fn output_is_parsed_and_wakes_the_ui_like_a_pty_read() {
         let (mut sink, mut rx, marker) = sink();
         sink.output(b"hello\x1b]9;done\x07");
-        assert_eq!(kinds(&mut rx), ["notice", "wakeup"]);
+        assert_eq!(kinds(&sink, &mut rx), ["notice", "wakeup"]);
         assert_eq!(marker.generation(), 1);
         assert!(crate::terminal::screen_text(&sink.term.lock()).starts_with("hello\n"));
         sink.exited(Some(0));
-        assert_eq!(kinds(&mut rx), ["exit"]);
+        assert_eq!(kinds(&sink, &mut rx), ["exit"]);
+    }
+
+    /// A flood's reads each advance the latency marker, but only one
+    /// `Wakeup` waits for the UI thread at a time; once it is taken, the
+    /// next read queues another.
+    #[test]
+    fn many_reads_queue_one_wakeup_until_it_is_taken() {
+        let (mut sink, mut rx, marker) = sink();
+        for _ in 0..1000 {
+            sink.output(b"x");
+        }
+        assert_eq!(marker.generation(), 1000);
+        assert_eq!(kinds(&sink, &mut rx), ["wakeup"]);
+        sink.output(b"y");
+        sink.output(b"z");
+        assert_eq!(kinds(&sink, &mut rx), ["wakeup"]);
+        assert_eq!(kinds(&sink, &mut rx), Vec::<&str>::new());
     }
 
     #[test]
@@ -211,11 +268,22 @@ mod tests {
         sink.replay(true);
         sink.output(b"\x07\x1b]9;from the tail\x07");
         sink.replay(false);
+        assert_eq!(kinds(&sink, &mut rx), ["replay-start", "notice", "bell", "wakeup", "replay-end"]);
         sink.output(b"\x07");
-        assert_eq!(
-            kinds(&mut rx),
-            ["replay-start", "notice", "bell", "wakeup", "replay-end", "bell", "wakeup"]
-        );
+        assert_eq!(kinds(&sink, &mut rx), ["bell", "wakeup"]);
+    }
+
+    /// A broken sink tells its terminal, and parses nothing: a replay it
+    /// was holding is dropped.
+    #[test]
+    fn broken_sends_broken_and_drops_a_held_replay() {
+        let (mut sink, mut rx, _) = sink();
+        sink.replay(true);
+        sink.output(b"held");
+        sink.broken("the emulator failed");
+        assert_eq!(kinds(&sink, &mut rx), ["replay-start", "broken"]);
+        assert!(sink.replay.is_none());
+        assert!(!crate::terminal::screen_text(&sink.term.lock()).contains("held"));
     }
 
     /// A replay rendered at the session's 40x5, whose cursor is on its last
@@ -269,7 +337,7 @@ mod tests {
     fn a_failure_says_why_and_marks_the_terminal() {
         let (mut sink, mut rx, _) = sink();
         sink.failed(&anyhow::anyhow!("session 3 on A8 has ended"));
-        assert_eq!(kinds(&mut rx), ["wakeup", "failed"]);
+        assert_eq!(kinds(&sink, &mut rx), ["wakeup", "failed"]);
         let text = crate::terminal::screen_text(&sink.term.lock());
         assert!(text.contains("session 3 on A8 has ended"), "{text}");
     }
@@ -278,7 +346,7 @@ mod tests {
     fn a_lost_session_says_why_on_screen() {
         let (mut sink, mut rx, _) = sink();
         sink.lost("its holder ended");
-        assert_eq!(kinds(&mut rx), ["wakeup", "lost"]);
+        assert_eq!(kinds(&sink, &mut rx), ["wakeup", "lost"]);
         let text = crate::terminal::screen_text(&sink.term.lock());
         assert!(text.contains("Session lost: its holder ended"), "{text}");
     }

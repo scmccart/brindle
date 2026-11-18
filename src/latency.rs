@@ -21,10 +21,13 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use gpui::{App, EntityId, Global, Window};
+use gpui::{App, EntityId, Global};
 
 /// A probe with no paint by then is reported as a timeout.
 pub const TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many samples a [`Window`] keeps: about 1 MB of them.
+pub const SAMPLE_WINDOW: usize = 10_000;
 
 struct Probe {
     id: u64,
@@ -57,6 +60,41 @@ impl Outcome {
 pub struct Sample {
     pub label: String,
     pub outcome: Outcome,
+}
+
+/// The newest [`SAMPLE_WINDOW`] samples, and how many older ones were
+/// dropped to keep it at that, so a long run's summary describes its recent
+/// keys in bounded memory (`process R9`).
+#[derive(Debug, Default)]
+pub struct Window {
+    samples: VecDeque<Sample>,
+    dropped: u64,
+}
+
+impl Window {
+    /// Adds `sample`, dropping the oldest when the window is full.
+    pub fn push(&mut self, sample: Sample) {
+        if self.samples.len() == SAMPLE_WINDOW {
+            self.samples.pop_front();
+            self.dropped += 1;
+        }
+        self.samples.push_back(sample);
+    }
+
+    /// How many samples were pushed: those kept and those dropped.
+    pub fn taken(&self) -> usize {
+        self.samples.len() + self.dropped as usize
+    }
+}
+
+impl FromIterator<Sample> for Window {
+    fn from_iter<I: IntoIterator<Item = Sample>>(samples: I) -> Self {
+        let mut window = Window::default();
+        for sample in samples {
+            window.push(sample);
+        }
+        window
+    }
 }
 
 /// The probe life cycle, with time passed in so it can be tested.
@@ -181,10 +219,17 @@ fn ms(d: Duration) -> String {
     format!("{:.2}", d.as_secs_f64() * 1000.0)
 }
 
-/// The printed summary: a header, then min/p50/p95/p99/max per stage.
-pub fn summary(samples: &[Sample]) -> String {
+/// The printed summary of a window's samples: a header, which names the
+/// dropped samples only when there are some, then min/p50/p95/p99/max per
+/// stage.
+pub fn summary(window: &Window) -> String {
+    let samples = &window.samples;
     let timeouts = samples.iter().filter(|s| s.outcome == Outcome::Timeout).count();
-    let mut out = format!("--- latency samples={} timeouts={timeouts}\n", samples.len());
+    let mut out = format!("--- latency samples={} timeouts={timeouts}", samples.len());
+    if window.dropped > 0 {
+        out.push_str(&format!(" dropped={}", window.dropped));
+    }
+    out.push('\n');
     for (ix, name) in ["output", "paint", "frame"].into_iter().enumerate() {
         let mut values: Vec<Duration> = samples.iter().filter_map(|s| s.outcome.stages()).map(|t| t[ix]).collect();
         values.sort();
@@ -232,10 +277,11 @@ pub fn json_line(sample: &Sample) -> String {
 pub struct Latency {
     probes: Probes,
     log: Option<File>,
-    /// Every sample since the last [`Latency::reset`].
-    samples: Vec<Sample>,
-    /// Every sample since startup, for the log's summary.
-    all_samples: Vec<Sample>,
+    /// The newest samples since the last [`Latency::reset`].
+    samples: Window,
+    /// The newest samples since startup, for the log's summary (the log
+    /// itself gets every one).
+    all_samples: Window,
 }
 
 impl Global for Latency {}
@@ -246,7 +292,7 @@ impl Latency {
         let log = log
             .map(|path| std::fs::OpenOptions::new().create(true).append(true).open(path))
             .transpose()?;
-        cx.set_global(Latency { probes: Probes::default(), log, samples: Vec::new(), all_samples: Vec::new() });
+        cx.set_global(Latency { probes: Probes::default(), log, samples: Window::default(), all_samples: Window::default() });
         Ok(())
     }
 
@@ -274,7 +320,7 @@ impl Latency {
     }
 
     /// Hook: a terminal finished painting a grid as of `generation`.
-    pub fn painted(terminal: EntityId, generation: u64, output_at: Instant, window: &mut Window, cx: &mut App) {
+    pub fn painted(terminal: EntityId, generation: u64, output_at: Instant, window: &mut gpui::Window, cx: &mut App) {
         let Some(this) = Self::get(cx) else {
             return;
         };
@@ -303,12 +349,12 @@ impl Latency {
         }
     }
 
-    /// Expires and collects; returns how many samples there are and whether
-    /// any probe is still waiting.
+    /// Expires and collects; returns how many samples were taken since the
+    /// last reset (kept or dropped) and whether any probe is still waiting.
     pub fn poll(cx: &mut App) -> Option<(usize, bool)> {
         let this = Self::get(cx)?;
         this.collect(Instant::now());
-        Some((this.samples.len(), this.probes.is_idle()))
+        Some((this.samples.taken(), this.probes.is_idle()))
     }
 
     pub fn started(cx: &App) -> u64 {
@@ -318,7 +364,7 @@ impl Latency {
     /// Drops the samples gathered so far (benchmark warm-up).
     pub fn reset(cx: &mut App) {
         if let Some(this) = Self::get(cx) {
-            this.samples.clear();
+            this.samples = Window::default();
         }
     }
 
@@ -328,7 +374,7 @@ impl Latency {
         cx.try_global::<Latency>().map(|this| summary(&this.samples)).unwrap_or_default()
     }
 
-    /// The summary of every sample, for the log at quit.
+    /// The summary of the samples since startup, for the log at quit.
     pub fn log_summary(cx: &mut App) -> Option<String> {
         Self::poll(cx);
         let this = cx.try_global::<Latency>()?;
@@ -366,10 +412,12 @@ mod tests {
 
     #[test]
     fn summary_lists_each_stage() {
-        let samples = vec![
+        let samples: Window = [
             Sample { label: "x".into(), outcome: Outcome::Done { output: ms(1), paint: ms(3), frame: ms(5) } },
             Sample { label: "x".into(), outcome: Outcome::Timeout },
-        ];
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             summary(&samples),
             "--- latency samples=2 timeouts=1\n\
@@ -377,6 +425,40 @@ mod tests {
              paint  min=3.00 p50=3.00 p95=3.00 p99=3.00 max=3.00\n\
              frame  min=5.00 p50=5.00 p95=5.00 p99=5.00 max=5.00\n"
         );
+    }
+
+    /// A finished sample labelled `n`, its stages `n` ms each.
+    fn numbered(n: u64) -> Sample {
+        Sample { label: n.to_string(), outcome: Outcome::Done { output: ms(n), paint: ms(n), frame: ms(n) } }
+    }
+
+    #[test]
+    fn a_window_keeps_the_newest_samples_and_counts_the_dropped() {
+        let mut window = Window::default();
+        for n in 0..SAMPLE_WINDOW as u64 {
+            window.push(numbered(n));
+        }
+        assert_eq!((window.samples.len(), window.dropped), (SAMPLE_WINDOW, 0), "full, nothing dropped yet");
+        for n in SAMPLE_WINDOW as u64..SAMPLE_WINDOW as u64 + 5 {
+            window.push(numbered(n));
+        }
+        assert_eq!((window.samples.len(), window.dropped), (SAMPLE_WINDOW, 5));
+        assert_eq!(window.samples.front(), Some(&numbered(5)), "the oldest went");
+        assert_eq!(window.samples.back(), Some(&numbered(SAMPLE_WINDOW as u64 + 4)), "the newest stayed");
+        assert_eq!(window.taken(), SAMPLE_WINDOW + 5, "a benchmark counts every sample taken");
+    }
+
+    #[test]
+    fn the_summary_names_dropped_samples_only_when_there_are_some() {
+        let header = |window: &Window| summary(window).lines().next().unwrap_or_default().to_string();
+        let few: Window = (1..=3).map(numbered).collect();
+        assert_eq!(header(&few), "--- latency samples=3 timeouts=0");
+
+        let many: Window = (0..SAMPLE_WINDOW as u64 + 7).map(numbered).collect();
+        assert_eq!(header(&many), format!("--- latency samples={SAMPLE_WINDOW} timeouts=0 dropped=7"));
+        // The stages are the kept samples': the 7 smallest went.
+        let output = summary(&many).lines().nth(1).unwrap_or_default().to_string();
+        assert!(output.starts_with("output min=7.00 "), "{output}");
     }
 
     #[test]

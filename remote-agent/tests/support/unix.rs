@@ -19,6 +19,10 @@ use super::TIMEOUT;
 /// A connection to a server's endpoint.
 pub type Stream = UnixStream;
 
+/// Whether everything a refused peer sent reaches the server: a socket
+/// half-closes, so the server reads it to the end before closing.
+pub const REFUSED_WRITES_ARRIVE: bool = true;
+
 /// Connects to the server listening at `endpoint`.
 pub fn connect(endpoint: &Path) -> io::Result<Stream> {
     UnixStream::connect(endpoint)

@@ -8,8 +8,14 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Child;
 
+use brindle_term_core::shell_integration::PathStyle;
+
 use super::event_loop::{Source, Waker};
 use crate::pty::{self, PtyCommand};
+
+/// How the programs on these PTYs spell the directories they report (OSC
+/// 7), for the core's emulators.
+pub const PATH_STYLE: PathStyle = PathStyle::Posix;
 
 /// The master end of a session's PTY, non-blocking.
 pub struct Pty(OwnedFd);

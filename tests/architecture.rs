@@ -619,6 +619,35 @@ fn no_crate_names_a_forbidden_dependency() {
     }
 }
 
+/// process R3: a panic is confined to the session it came from (Brindle's
+/// guarded sink calls, the core's `Screen::guard`), which needs unwinding,
+/// so no profile in the root manifest, a package override included, sets
+/// `panic = "abort"`.
+#[test]
+fn no_profile_aborts_on_panic() {
+    fn aborting(path: String, table: &toml::Table, found: &mut Vec<String>) {
+        for (key, value) in table {
+            let path = format!("{path}.{key}");
+            match value {
+                toml::Value::Table(inner) => aborting(path, inner, found),
+                toml::Value::String(setting) if key == "panic" && setting == "abort" => {
+                    found.push(format!("{path} = \"abort\""))
+                }
+                _ => {}
+            }
+        }
+    }
+    let manifest = manifest(".");
+    let mut found = Vec::new();
+    if let Some(profiles) = manifest.get("profile").and_then(toml::Value::as_table) {
+        aborting("profile".into(), profiles, &mut found);
+    }
+    assert_none(
+        found,
+        "process R3: no profile may set panic = \"abort\"; the panic guards rely on unwinding",
+    );
+}
+
 /// fcis R4: `brindle-term-core` is pure as a crate.
 #[test]
 fn term_core_does_no_io_and_reads_no_clock() {
