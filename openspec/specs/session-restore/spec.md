@@ -33,7 +33,7 @@ A state file that cannot be read, is not valid, or has a format version Brindle 
 - **THEN** it is ignored with a log line, and a normal launch happens
 
 ### Requirement: State file location and writes
-The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and in `%LOCALAPPDATA%\brindle\` on Windows. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits. A state that can't be serialized SHALL NOT be written: the file SHALL keep what it last held, with one log line naming the problem.
+The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and in `%LOCALAPPDATA%\brindle\` on Windows. When none of these can be found, Brindle SHALL run on its own, neither restoring, reattaching nor writing state, and the window SHALL say why. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits. A state that can't be serialized SHALL NOT be written: the file SHALL keep what it last held, with one log line naming the problem.
 
 #### Scenario: Crash after a change
 - **WHEN** the user opens a tab, waits a few seconds, and Brindle is then killed
@@ -62,6 +62,10 @@ The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is
 #### Scenario: Writes resume once the state serializes
 - **WHEN** a tab's shell has been in a directory whose name isn't valid UTF-8 and then changes to `/tmp`
 - **THEN** within a few seconds `session.toml` is written with the current windows and tabs, that tab recorded in `/tmp`
+
+#### Scenario: No state directory
+- **WHEN** on Linux `BRINDLE_STATE_DIR`, `XDG_STATE_HOME` and `HOME` are unset, the user has no home directory, and Brindle starts in `/tmp`
+- **THEN** the window opens with a default tab and says the session can't be saved, and nothing is written to `/tmp`
 
 ### Requirement: One process owns the state
 Only one Brindle process at a time SHALL own the session state: the instance, which records and restores it and reattaches detached sessions. A launch while an instance runs SHALL hand its request to the instance, as defined by "A launch goes to the running Brindle" in `command-line`, and exit. A launch with debug options (`--send`, `--action`, `--dump-screen-after`, `--latency-log`, `--latency-bench`) while an instance runs SHALL instead run on its own, and SHALL neither restore, reattach, nor write the state file, and SHALL log that it doesn't.
@@ -251,12 +255,12 @@ A tab that was opened with a command (`-e`, or the config editor tab) SHALL come
 
 ### Requirement: Restoring falls back to defaults
 Restoring SHALL succeed even when the recorded state no longer matches the system:
-- a missing profile SHALL be replaced by the default profile, with a log line;
+- a missing profile SHALL be replaced by the default profile, and the restored local tab SHALL say, in one dim line, that its recorded profile is gone and which profile it uses, after any replay of its screen;
 - a missing directory for a tab or zone SHALL be replaced by the profile's own directory, else the home directory.
 
 #### Scenario: Profile removed from the config
 - **WHEN** a recorded tab's profile `Work` has been removed from the config
-- **THEN** the tab is restored with the default profile in its recorded directory
+- **THEN** the tab is restored with the default profile in its recorded directory, and says that profile `Work` is gone and the default profile is used
 
 #### Scenario: Directory deleted
 - **WHEN** a recorded tab's or zone's directory has been deleted since Brindle quit

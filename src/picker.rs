@@ -319,6 +319,10 @@ pub enum Listing {
     Connecting,
     /// It can't be reached, or didn't answer, and why.
     Offline(String),
+    /// It answered, but listing its sessions failed, and why: this machine,
+    /// whose server isn't offline when it can't be listed. It may have
+    /// sessions, so it never adds the note that nothing is detached.
+    Unlisted(String),
     /// It hasn't answered yet: [`SessionsModel`] starts every endpoint
     /// here, and [`session_palette`] lists it as `listing sessions…`.
     Pending,
@@ -334,8 +338,12 @@ pub enum SessionRow {
     /// A detached session of `host`'s core: enter attaches it, and
     /// `picker_kill` ends it, both on `host`'s connection.
     Session { host: Host, info: SessionInfo },
-    /// A row that does nothing: `host` being listed, connecting or offline.
+    /// A row that does nothing: `host` being listed, connecting, offline or
+    /// unlisted.
     Endpoint(Host),
+    /// A row that does nothing: a session on `host` that the palette
+    /// couldn't end, and why, until `host` answers again.
+    KillFailed(Host),
     /// A row that does nothing: the note that nothing is detached.
     Note,
 }
@@ -348,6 +356,8 @@ pub enum RowKey {
     Session { host: Host, id: u32, key: String },
     /// An endpoint's row.
     Endpoint(Host),
+    /// An endpoint's failed kill.
+    KillFailed(Host),
     /// The note.
     Note,
 }
@@ -357,7 +367,7 @@ impl SessionRow {
     pub fn session(&self) -> Option<(&Host, &SessionInfo)> {
         match self {
             Self::Session { host, info } => Some((host, info)),
-            Self::Endpoint(_) | Self::Note => None,
+            Self::Endpoint(_) | Self::KillFailed(_) | Self::Note => None,
         }
     }
 
@@ -365,6 +375,7 @@ impl SessionRow {
         match self {
             Self::Session { host, info } => RowKey::Session { host: host.clone(), id: info.session, key: info.key.clone() },
             Self::Endpoint(host) => RowKey::Endpoint(host.clone()),
+            Self::KillFailed(host) => RowKey::KillFailed(host.clone()),
             Self::Note => RowKey::Note,
         }
     }
@@ -397,14 +408,17 @@ pub const OPEN_GRACE: std::time::Duration = std::time::Duration::from_millis(250
 /// are newest first, under its name when any remote endpoint lists one
 /// ("This machine" over the local ones); with only this machine's, there is
 /// no heading. An endpoint still being listed, still connecting or offline
-/// gets one row that does nothing, saying so. When nothing is detached
-/// anywhere and no endpoint is still being listed, the palette says so: as
-/// its empty message, or, when an endpoint has a row, as a note row after
-/// every endpoint's (the command list shows its empty message only when it
-/// has no rows).
+/// gets one row that does nothing, saying so, and so does one that couldn't
+/// be listed (unlisted). A failed kill on an endpoint (`kill_failed`: the
+/// endpoint and why) is a row that does nothing after the endpoint's. When
+/// nothing is detached anywhere, no endpoint is still being listed and
+/// every endpoint could be listed, the palette says so: as its empty
+/// message, or, when there is a row, as a note row after every endpoint's
+/// (the command list shows its empty message only when it has no rows).
 pub fn session_palette(
     listed: &[(Host, Listing)],
     killed: &[(Host, u32, String)],
+    kill_failed: &[(Host, String)],
     config: &Config,
     now: u64,
 ) -> SessionPalette {
@@ -438,6 +452,10 @@ pub fn session_palette(
                     let why = why.lines().next().unwrap_or_default();
                     Err(inert(host.name(), Some(format!("offline: {why}"))))
                 }
+                Listing::Unlisted(why) => {
+                    let why = why.lines().next().unwrap_or_default();
+                    Err(inert(host.name(), Some(format!("could not list sessions: {why}"))))
+                }
             };
             (host, part)
         })
@@ -446,8 +464,12 @@ pub fn session_palette(
     let headings = parts.iter().any(|(host, part)| !host.is_local() && lists(part));
     let any_session = parts.iter().any(|(_, part)| lists(part));
 
-    let pending = listed.iter().any(|(_, listing)| *listing == Listing::Pending);
-    let endpoint_rows = parts.iter().any(|(_, part)| part.is_err());
+    // Not while an endpoint is still being listed (its sessions may be
+    // about to appear), nor when one couldn't be listed (it may have some).
+    let unknown = listed.iter().any(|(_, listing)| match listing {
+        Listing::Pending | Listing::Unlisted(_) => true,
+        Listing::Sessions(_) | Listing::Connecting | Listing::Offline(_) => false,
+    });
 
     let (mut groups, mut rows) = (Vec::new(), Vec::new());
     for (host, part) in parts {
@@ -467,10 +489,14 @@ pub fn session_palette(
                 rows.push(SessionRow::Endpoint(host.clone()));
             }
         }
+        for (_, why) in kill_failed.iter().filter(|(on, _)| on == host) {
+            let why = why.lines().next().unwrap_or_default();
+            groups.push(PaletteGroup::unnamed(vec![inert(host.name(), Some(why.to_string()))]));
+            rows.push(SessionRow::KillFailed(host.clone()));
+        }
     }
-    // After every endpoint's row, and not while one is still being listed:
-    // its sessions may be about to appear.
-    if !any_session && endpoint_rows && !pending {
+    // After every endpoint's row.
+    if !any_session && !rows.is_empty() && !unknown {
         groups.push(PaletteGroup::unnamed(vec![inert(NO_DETACHED.into(), None)]));
         rows.push(SessionRow::Note);
     }
@@ -498,7 +524,13 @@ struct Endpoint {
     listing: Listing,
     /// The round `listing` is from; 0 for none yet.
     answered: u64,
+    /// A kill on it that failed, and why, until its next answer.
+    kill_failed: Option<String>,
 }
+
+/// What ending a session from the palette gave: its id, and `Err` with why
+/// it couldn't be ended.
+pub type KillOutcome = (u32, Result<(), String>);
 
 /// The sessions palette's state, apart from GPUI: what each endpoint
 /// listed or that it hasn't answered yet, the round of listings they
@@ -542,23 +574,41 @@ impl SessionsModel {
             .into_iter()
             .map(|host| match known.iter().position(|endpoint| endpoint.host == host) {
                 Some(at) => known.swap_remove(at),
-                None => Endpoint { host, listing: Listing::Pending, answered: 0 },
+                None => Endpoint { host, listing: Listing::Pending, answered: 0, kill_failed: None },
             })
             .collect();
     }
 
-    /// `host`'s answer in `round`. Returns whether it applied: an answer
-    /// from another round, or from an endpoint the round doesn't have, is
-    /// dropped.
-    pub fn answer(&mut self, round: u64, host: &Host, listing: Listing) -> bool {
-        if round != self.round {
-            return false;
-        }
+    /// `host`'s answer in `round`, with the outcome of the kill made before
+    /// it, if any. Returns whether it applied: an answer from an endpoint
+    /// the round doesn't have is dropped, and so is one from another round,
+    /// except for a failed kill.
+    ///
+    /// A failed kill brings the session's row back and adds a row saying
+    /// why, which stays until the endpoint's next answer. It counts in any
+    /// round, since its row went at once: the kill's answer may be of a
+    /// round that another started meanwhile.
+    pub fn answer(&mut self, round: u64, host: &Host, listing: Listing, kill: Option<KillOutcome>) -> bool {
         let Some(endpoint) = self.endpoints.iter_mut().find(|endpoint| endpoint.host == *host) else {
             return false;
         };
+        let failed = match kill {
+            Some((id, Err(why))) => {
+                self.killed.retain(|(on, killed, _)| !(on == host && *killed == id));
+                Some(format!("could not end session {id}: {why}"))
+            }
+            Some((_, Ok(()))) | None => None,
+        };
+        if round != self.round {
+            let applied = failed.is_some();
+            if failed.is_some() {
+                endpoint.kill_failed = failed;
+            }
+            return applied;
+        }
         endpoint.listing = listing;
         endpoint.answered = round;
+        endpoint.kill_failed = failed;
         true
     }
 
@@ -595,7 +645,12 @@ impl SessionsModel {
     pub fn view(&mut self, config: &Config, now: u64) -> SessionsView {
         let listed: Vec<(Host, Listing)> =
             self.endpoints.iter().map(|endpoint| (endpoint.host.clone(), endpoint.listing.clone())).collect();
-        let shown = session_palette(&listed, &self.killed, config, now);
+        let kill_failed: Vec<(Host, String)> = self
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| Some((endpoint.host.clone(), endpoint.kill_failed.clone()?)))
+            .collect();
+        let shown = session_palette(&listed, &self.killed, &kill_failed, config, now);
         let enabled = |at: &usize| matches!(shown.rows[*at], SessionRow::Session { .. });
         let keep = self.highlighted.as_ref().and_then(|(key, place)| {
             shown.rows.iter().position(|row| row.key() == *key).or_else(|| {
@@ -704,7 +759,7 @@ mod tests {
             (Host::Local, Listing::Sessions(vec![info(1, "shell", 100), attached, info(2, "vim", 200)])),
             (b9(), Listing::Sessions(vec![info(7, "top", 100)])),
         ];
-        let palette = session_palette(&listed, &[], &config(), 400);
+        let palette = session_palette(&listed, &[], &[], &config(), 400);
         assert_eq!(
             labels(&palette),
             [
@@ -733,12 +788,12 @@ mod tests {
     #[test]
     fn this_machine_alone_has_no_heading_and_none_says_so() {
         let listed = [(Host::Local, Listing::Sessions(vec![info(1, "shell", 0)])), (a8(), Listing::Sessions(Vec::new()))];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["shell"])]);
         assert_eq!(palette.groups[0].rows[0].detail, None, "no directory and no start time");
         assert_eq!(palette.empty, None, "a filter matching none gets the command list's own message");
 
-        let palette = session_palette(&[(Host::Local, Listing::Sessions(Vec::new()))], &[], &config(), 0);
+        let palette = session_palette(&[(Host::Local, Listing::Sessions(Vec::new()))], &[], &[], &config(), 0);
         assert!(palette.rows.is_empty());
         assert_eq!(text(&palette.empty), Some(NO_DETACHED));
         assert_eq!(command_groups(&palette.groups).len(), 1, "the command list's one group");
@@ -754,7 +809,7 @@ mod tests {
             (a8(), Listing::Offline("ssh: connect to host A8 port 22: Connection refused\nmore".into())),
             (b9(), Listing::Connecting),
         ];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["B9"]), (None, vec!["A8"]), (None, vec![NO_DETACHED])]);
         assert_eq!(text(&palette.groups[0].rows[0].detail), Some("connecting…"));
         assert_eq!(
@@ -771,7 +826,7 @@ mod tests {
         // Beside a session the inert row is the endpoint's alone, and the
         // highlight starts on the session.
         let listed = [(a8(), Listing::Sessions(vec![info(4, "build", 0)])), (b9(), Listing::Offline("refused".into()))];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["B9"]), (Some("A8"), vec!["build"])]);
         assert_eq!(palette.rows[0], SessionRow::Endpoint(b9()));
         let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
@@ -799,7 +854,7 @@ mod tests {
         ];
         for (reason, row) in reasons {
             let listed = [(a8(), Listing::Offline(reason.into()))];
-            let palette = session_palette(&listed, &[], &config(), 0);
+            let palette = session_palette(&listed, &[], &[], &config(), 0);
             let offline = palette.groups.iter().flat_map(|group| &group.rows).find(|row| row.label.as_ref() == "A8").unwrap();
             assert_eq!(text(&offline.detail), Some(row), "{reason}");
         }
@@ -814,10 +869,10 @@ mod tests {
             (a8(), Listing::Sessions(vec![info(1, "shell", 0), info(2, "build", 0)])),
         ];
         let killed = [(a8(), 1, "shell-1".to_string())];
-        let palette = session_palette(&listed, &killed, &config(), 0);
+        let palette = session_palette(&listed, &killed, &[], &config(), 0);
         assert_eq!(labels(&palette), [(Some("This machine"), vec!["shell"]), (Some("A8"), vec!["build"])]);
         let killed = [(a8(), 1, "shell-1".to_string()), (a8(), 2, "build-2".to_string())];
-        assert_eq!(labels(&session_palette(&listed, &killed, &config(), 0)), [(None, vec!["shell"])]);
+        assert_eq!(labels(&session_palette(&listed, &killed, &[], &config(), 0)), [(None, vec!["shell"])]);
     }
 
     /// An endpoint still being listed is a row that does nothing, in its
@@ -825,7 +880,7 @@ mod tests {
     #[test]
     fn a_pending_endpoint_is_a_row_and_holds_back_the_note() {
         let listed = [(Host::Local, Listing::Sessions(Vec::new())), (a8(), Listing::Pending)];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert_eq!(labels(&palette), [(None, vec!["A8"])]);
         assert_eq!(text(&palette.groups[0].rows[0].detail), Some("listing sessions…"));
         assert_eq!(palette.rows, [SessionRow::Endpoint(a8())]);
@@ -835,12 +890,12 @@ mod tests {
 
         // Another endpoint's sessions list beside it.
         let listed = [(b9(), Listing::Sessions(vec![info(1, "top", 0)])), (a8(), Listing::Pending)];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert_eq!(labels(&palette), [(Some("B9"), vec!["top"]), (None, vec!["A8"])]);
 
         // Once it has answered with nothing, the note comes last.
         let listed = [(Host::Local, Listing::Sessions(Vec::new())), (a8(), Listing::Sessions(Vec::new()))];
-        let palette = session_palette(&listed, &[], &config(), 0);
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
         assert!(palette.rows.is_empty() && text(&palette.empty) == Some(NO_DETACHED), "no row to put a note after");
     }
 
@@ -854,7 +909,7 @@ mod tests {
         let mut model = SessionsModel::new(round, hosts());
         for (host, answer) in hosts().into_iter().zip(answers) {
             if let Some(listing) = answer {
-                assert!(model.answer(round, &host, listing));
+                assert!(model.answer(round, &host, listing, None));
             }
         }
         model
@@ -877,10 +932,10 @@ mod tests {
     fn an_answer_from_an_earlier_round_is_dropped() {
         let mut model = SessionsModel::new(1, hosts());
         model.start_round(2, hosts());
-        assert!(!model.answer(1, &Host::Local, Listing::Sessions(vec![info(1, "old", 0)])));
-        assert!(!model.answer(2, &Host::Remote(ssh("C7")), Listing::Connecting));
+        assert!(!model.answer(1, &Host::Local, Listing::Sessions(vec![info(1, "old", 0)]), None));
+        assert!(!model.answer(2, &Host::Remote(ssh("C7")), Listing::Connecting, None));
         assert!(!model.complete());
-        assert!(model.answer(2, &Host::Local, Listing::Sessions(vec![info(1, "new", 0)])));
+        assert!(model.answer(2, &Host::Local, Listing::Sessions(vec![info(1, "new", 0)]), None));
         assert_eq!(shown(&mut model).0, ["new", "B9", "A8"]);
     }
 
@@ -892,10 +947,10 @@ mod tests {
         let mut model = model(1, [sessions(&[]), None, None]);
         assert!(!model.complete(), "two endpoints are out");
         assert_eq!(shown(&mut model).0, ["B9", "A8"], "a row each, and no note");
-        assert!(model.answer(1, &b9(), Listing::Connecting));
+        assert!(model.answer(1, &b9(), Listing::Connecting, None));
         assert!(!model.complete());
         assert_eq!(shown(&mut model).0, ["B9", "A8"], "A8 is still out: no note");
-        assert!(model.answer(1, &a8(), Listing::Offline("refused".into())));
+        assert!(model.answer(1, &a8(), Listing::Offline("refused".into()), None));
         assert!(model.complete());
         assert_eq!(shown(&mut model).0, ["B9", "A8", NO_DETACHED], "all answered: the note comes last");
 
@@ -917,7 +972,7 @@ mod tests {
         assert!(!model.complete());
         assert_eq!(shown(&mut model).0, ["shell", "top"], "no flicker back to pending");
         for host in hosts() {
-            assert!(model.answer(2, &host, Listing::Sessions(Vec::new())));
+            assert!(model.answer(2, &host, Listing::Sessions(Vec::new()), None));
         }
         assert!(model.complete());
         assert_eq!(shown(&mut model).0, [] as [&str; 0]);
@@ -933,13 +988,13 @@ mod tests {
         assert_eq!(keep, None, "nothing was highlighted yet: the list's first");
         // The user moved to "b" (item 1), then B9 answers with sessions above A8's.
         model.highlight(Some(1));
-        assert!(model.answer(1, &b9(), Listing::Sessions(vec![info(7, "top", 500), info(8, "vim", 400)])));
+        assert!(model.answer(1, &b9(), Listing::Sessions(vec![info(7, "top", 500), info(8, "vim", 400)]), None));
         let (labels, keep) = shown(&mut model);
         assert_eq!(labels, ["a", "b", "c", "top", "vim", "x"].map(String::from));
         assert_eq!(keep, Some(1));
         // Rows now come in above it: a session is added to this machine's.
         model.highlight(keep);
-        assert!(model.answer(1, &Host::Local, Listing::Sessions(vec![info(9, "new", 900), info(1, "a", 99), info(2, "b", 98)])));
+        assert!(model.answer(1, &Host::Local, Listing::Sessions(vec![info(9, "new", 900), info(1, "a", 99), info(2, "b", 98)]), None));
         let (labels, keep) = shown(&mut model);
         assert_eq!(labels, ["new", "a", "b", "top", "vim", "x"].map(String::from));
         assert_eq!(keep, Some(2), "still \"b\"");
@@ -953,8 +1008,8 @@ mod tests {
     #[test]
     fn a_killed_row_passes_its_highlight_to_the_next_row_else_the_last() {
         let mut model = model(1, [sessions(&["a", "b", "c"]), None, None]);
-        model.answer(1, &b9(), Listing::Connecting);
-        model.answer(1, &a8(), Listing::Connecting);
+        model.answer(1, &b9(), Listing::Connecting, None);
+        model.answer(1, &a8(), Listing::Connecting, None);
         assert_eq!(shown(&mut model).0, ["a", "b", "c", "B9", "A8"].map(String::from));
 
         model.highlight(Some(1));
@@ -986,16 +1041,124 @@ mod tests {
     fn the_note_comes_after_every_endpoint_and_only_once_nothing_is_pending() {
         let mut model = model(1, [sessions(&[]), None, None]);
         assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()), "two are pending");
-        model.answer(1, &b9(), Listing::Offline("down".into()));
+        model.answer(1, &b9(), Listing::Offline("down".into()), None);
         assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()), "A8 is pending");
-        model.answer(1, &a8(), Listing::Connecting);
+        model.answer(1, &a8(), Listing::Connecting, None);
         let (labels, keep) = shown(&mut model);
         assert_eq!(labels, ["B9", "A8", NO_DETACHED].map(String::from));
         assert_eq!(keep, None);
         assert_eq!(model.rows().last(), Some(&SessionRow::Note));
         // A session anywhere replaces it.
         model.start_round(2, hosts());
-        model.answer(2, &a8(), Listing::Sessions(vec![info(1, "build", 0)]));
+        model.answer(2, &a8(), Listing::Sessions(vec![info(1, "build", 0)]), None);
         assert!(!shown(&mut model).0.contains(&NO_DETACHED.to_string()));
+    }
+
+    /// This machine answered but couldn't be listed: a row that does
+    /// nothing, with the first line of why, in this machine's place.
+    #[test]
+    fn an_unlisted_endpoint_is_a_disabled_row_with_its_cause() {
+        let why = "connecting to the terminal server: brindle-remote is missing\nmore";
+        let listed = [(a8(), Listing::Sessions(vec![info(4, "build", 0)])), (Host::Local, Listing::Unlisted(why.into()))];
+        let palette = session_palette(&listed, &[], &[], &config(), 0);
+        assert_eq!(labels(&palette), [(None, vec!["this machine"]), (Some("A8"), vec!["build"])]);
+        let row = &palette.groups[0].rows[0];
+        assert_eq!(
+            text(&row.detail),
+            Some("could not list sessions: connecting to the terminal server: brindle-remote is missing")
+        );
+        assert!(row.disabled);
+        assert_eq!(palette.rows[0], SessionRow::Endpoint(Host::Local));
+        let rows = CommandRows::build(&command_groups(&palette.groups), "", None);
+        assert_eq!(rows.highlighted_item(), Some(1), "the session, not the failure");
+    }
+
+    /// A failure to list isn't an answer that nothing is detached: no note,
+    /// alone or beside endpoints that list nothing.
+    #[test]
+    fn unlisted_does_not_add_the_no_sessions_note() {
+        let alone = [(Host::Local, Listing::Unlisted("refused".into()))];
+        let palette = session_palette(&alone, &[], &[], &config(), 0);
+        assert_eq!(labels(&palette), [(None, vec!["this machine"])]);
+        assert_eq!(palette.rows, [SessionRow::Endpoint(Host::Local)]);
+        assert_eq!(palette.empty, None);
+
+        let beside = [
+            (Host::Local, Listing::Unlisted("refused".into())),
+            (a8(), Listing::Sessions(Vec::new())),
+            (b9(), Listing::Offline("down".into())),
+        ];
+        let palette = session_palette(&beside, &[], &[], &config(), 0);
+        assert_eq!(labels(&palette), [(None, vec!["this machine"]), (None, vec!["B9"])]);
+        assert!(!palette.rows.contains(&SessionRow::Note));
+    }
+
+    /// The details of `model`'s rows, in order, by `view`.
+    fn details(model: &mut SessionsModel) -> Vec<Option<String>> {
+        let view = model.view(&config(), 200);
+        view.groups.iter().flat_map(|g| &g.rows).map(|row| row.detail.as_ref().map(ToString::to_string)).collect()
+    }
+
+    /// A kill that fails gives its session's row back, and a row after the
+    /// endpoint's says why. A failed kill counts in any round.
+    #[test]
+    fn a_failed_kill_brings_the_row_back_and_adds_its_note() {
+        let mut model = model(1, [sessions(&["a", "b", "c"]), sessions(&[]), sessions(&[])]);
+        model.kill(Host::Local, 2, "b-2".into());
+        assert_eq!(shown(&mut model).0, ["a", "c"]);
+
+        model.start_round(2, hosts());
+        let failed = Some((2, Err("the session is still starting".to_string())));
+        assert!(model.answer(2, &Host::Local, sessions(&["a", "b", "c"]).unwrap(), failed));
+        assert_eq!(shown(&mut model).0, ["a", "b", "c", "this machine"], "no note: sessions are listed");
+        assert_eq!(model.rows().last(), Some(&SessionRow::KillFailed(Host::Local)));
+        assert_eq!(details(&mut model).last(), Some(&Some("could not end session 2: the session is still starting".into())));
+
+        // A successful kill changes nothing, and neither does a stale round's.
+        let mut model = model_with_all_answered();
+        model.kill(Host::Local, 1, "shell-1".into());
+        model.start_round(2, hosts());
+        assert!(!model.answer(1, &Host::Local, sessions(&["shell"]).unwrap(), Some((1, Ok(())))));
+        // One that failed counts though the answer is of an older round.
+        assert!(model.answer(1, &Host::Local, sessions(&["shell"]).unwrap(), Some((1, Err("refused".into())))));
+        assert_eq!(shown(&mut model).0, ["shell", "this machine", "top"]);
+        assert!(!model.complete(), "the stale listing didn't count as this round's");
+    }
+
+    /// The failed kill's row stays through other endpoints' answers and
+    /// goes at its own endpoint's next.
+    #[test]
+    fn the_note_goes_at_the_endpoints_next_answer() {
+        let mut model = model(1, [sessions(&["a"]), sessions(&[]), sessions(&[])]);
+        model.kill(Host::Local, 1, "a-1".into());
+        model.start_round(2, hosts());
+        assert!(model.answer(2, &Host::Local, sessions(&["a"]).unwrap(), Some((1, Err("refused".into())))));
+        assert!(model.answer(2, &a8(), Listing::Sessions(Vec::new()), None));
+        assert_eq!(shown(&mut model).0, ["a", "this machine"]);
+
+        model.start_round(3, hosts());
+        assert_eq!(shown(&mut model).0, ["a", "this machine"], "until this machine answers again");
+        assert!(model.answer(3, &Host::Local, sessions(&["a"]).unwrap(), None));
+        assert_eq!(shown(&mut model).0, ["a"]);
+    }
+
+    /// The highlight follows the rows' identities through a failed kill: a
+    /// session highlighted below the killed one stays highlighted when the
+    /// killed one comes back above it.
+    #[test]
+    fn the_highlighted_row_stays_through_a_failed_kill() {
+        let mut model = model(1, [sessions(&["a", "b", "c"]), sessions(&[]), sessions(&[])]);
+        shown(&mut model);
+        model.highlight(Some(2));
+        model.kill(Host::Local, 2, "b-2".into());
+        let (labels, keep) = shown(&mut model);
+        assert_eq!((labels, keep), (vec!["a".to_string(), "c".to_string()], Some(1)), "still \"c\"");
+
+        model.highlight(keep);
+        model.start_round(2, hosts());
+        assert!(model.answer(2, &Host::Local, sessions(&["a", "b", "c"]).unwrap(), Some((2, Err("refused".into())))));
+        let (labels, keep) = shown(&mut model);
+        assert_eq!(labels, ["a", "b", "c", "this machine"]);
+        assert_eq!(keep, Some(2), "still \"c\"");
     }
 }

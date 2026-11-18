@@ -147,8 +147,11 @@ pub(crate) fn shared_with(host: &Host, helper: &HelperLookup) -> Result<Arc<Conn
         Host::Local => {
             let endpoint = Endpoint::from_env()?;
             let connected = connect(&endpoint, client_token())?;
-            let connected = upgrade::offer(&endpoint, client_token(), connected)?;
-            Connection::start(endpoint, client_token(), connected)
+            let offered = upgrade::offer(&endpoint, client_token(), connected)?;
+            if let upgrade::Offered::Kept { why, .. } = &offered {
+                log::warn!("keeping the running terminal server on {}: {why}", host.name());
+            }
+            Connection::start(endpoint, client_token(), offered.connected())
         }
         Host::Remote(target) => {
             let dial = relay::dial_with(host.name(), target, helper.clone());
@@ -228,12 +231,25 @@ pub fn keep_connected(hosts: Vec<Host>) {
                         connection.set_eager(true);
                     }
                 }
-                Err(error) => log::warn!("can't connect to {}: {error:#}", host.name()),
+                Err(error) => report_offline(&host, &error),
             }
         }
     });
     if let Err(error) = spawned {
         log::warn!("not connecting at launch: {error}");
+    }
+}
+
+/// Reports `host` offline to [`watch_hosts`]' callback, `error` being why
+/// no connection to it could be made, under a connection id of its own, so
+/// it is ordered with the reports of the connections before and after it
+/// (`Hosts`). The endpoint's row in the sessions palette then says why. It
+/// is logged too, for a process that watches no endpoint.
+fn report_offline(host: &Host, error: &anyhow::Error) {
+    let why = format!("connecting to {}: {error:#}", host.name());
+    log::warn!("{why}");
+    if let Some(watch) = WATCHER.get() {
+        watch(host, connection::next_connection_id(), LinkState::Offline(why));
     }
 }
 
@@ -257,7 +273,7 @@ pub fn when_listed(host: &Host, hook: ListingHook) {
         let connection = match shared(host) {
             Ok(connection) => connection,
             Err(error) => {
-                log::warn!("can't connect to {}: {error:#}", host.name());
+                report_offline(host, &error);
                 return;
             }
         };
@@ -921,7 +937,9 @@ mod tests {
             assert_ne!(std::fs::canonicalize(&image).unwrap(), std::fs::canonicalize(&helper).unwrap());
         }
         // The same build is no upgrade: the connection is kept.
-        let connected = upgrade::offer(&endpoint, "real-1", connected).unwrap();
+        let offered = upgrade::offer(&endpoint, "real-1", connected).unwrap();
+        assert!(matches!(offered, upgrade::Offered::Current(_)), "the same build is current");
+        let connected = offered.connected();
         assert_eq!(connected.welcome.pid, core);
         // A second client finds the running core and starts none.
         let second = connect(&endpoint, "real-2").unwrap();
@@ -940,7 +958,9 @@ mod tests {
             bytes.extend_from_slice(b"another build");
             std::fs::write(&newer, bytes).unwrap();
             let endpoint = Endpoint::at(newer.clone(), dir.clone());
-            let connected = upgrade::offer(&endpoint, "real-1", connected).unwrap();
+            let offered = upgrade::offer(&endpoint, "real-1", connected).unwrap();
+            assert!(matches!(offered, upgrade::Offered::Upgraded(_)), "a newer build upgrades");
+            let connected = offered.connected();
             let core = connected.welcome.pid;
             let image = sys::image_of(core).unwrap();
             assert!(image.starts_with(dir.join("bin")), "{}", image.display());

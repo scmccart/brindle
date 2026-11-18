@@ -23,11 +23,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use parking_lot::{Condvar, Mutex};
 use sha2::{Digest as _, Sha256};
 
 use super::{hide_window, wait_process};
@@ -41,38 +42,97 @@ const STDERR_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 /// keep it open indefinitely.
 const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
-/// Drains `stderr` on a thread and delivers the bounded text through a
-/// channel, so the caller can stop waiting if the pipe never closes.
-fn spawn_stderr_drain(stderr: impl Read + Send + 'static) -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    // If the thread can't start, `tx` is dropped with the closure and the
-    // receiver simply reports no output.
-    thread::Builder::new()
-        .name("remote-stderr".into())
-        .spawn(move || {
-            tx.send(drain_stderr(stderr)).ok();
-        })
-        .ok();
-    rx
+/// A command's stderr as it is read: its first [`STDERR_DIAGNOSTIC_LIMIT`]
+/// bytes, whether the pipe has ended, and why reading it failed, if it did.
+/// The draining thread and the caller share it, so the caller takes what
+/// has arrived even while the pipe stays open.
+#[derive(Clone, Default)]
+struct StderrDrain(Arc<(Mutex<Drained>, Condvar)>);
+
+#[derive(Default)]
+struct Drained {
+    bytes: Vec<u8>,
+    /// The pipe ended, or reading it failed.
+    done: bool,
+    /// Why reading it failed.
+    error: Option<String>,
 }
 
-/// Takes what the drain has collected, giving up (and leaving the thread to
-/// finish on its own) if the pipe stays open.
-fn await_stderr(rx: &mpsc::Receiver<String>) -> String {
-    rx.recv_timeout(STDERR_DRAIN_WAIT).unwrap_or_default()
-}
-
-fn drain_stderr(mut stderr: impl Read) -> String {
-    let mut retained = Vec::new();
-    let mut buffer = [0u8; 4096];
-    while let Ok(read) = stderr.read(&mut buffer) {
-        if read == 0 {
-            break;
-        }
-        let keep = (STDERR_DIAGNOSTIC_LIMIT - retained.len()).min(read);
-        retained.extend_from_slice(&buffer[..keep]);
+impl StderrDrain {
+    /// Keeps `read`, up to the limit.
+    fn keep(&self, read: &[u8]) {
+        let mut drained = self.0.0.lock();
+        let room = STDERR_DIAGNOSTIC_LIMIT.saturating_sub(drained.bytes.len());
+        drained.bytes.extend_from_slice(&read[..read.len().min(room)]);
     }
-    String::from_utf8_lossy(&retained).into_owned()
+
+    /// The pipe ended; `error` says why, when reading it failed.
+    fn end(&self, error: Option<String>) {
+        let mut drained = self.0.0.lock();
+        drained.done = true;
+        drained.error = error;
+        drop(drained);
+        self.0.1.notify_all();
+    }
+
+    /// What the command wrote, once the pipe has ended or `limit` passed,
+    /// with why reading it failed after it.
+    fn text(&self, limit: Duration) -> String {
+        let (drained, ended) = &*self.0;
+        let mut drained = drained.lock();
+        if !drained.done {
+            ended.wait_for(&mut drained, limit);
+        }
+        drained_text(&drained.bytes, drained.error.as_deref())
+    }
+}
+
+/// The text of what a command wrote, with why reading it failed after it on
+/// its last line, so that line still names the cause it wrote.
+fn drained_text(bytes: &[u8], error: Option<&str>) -> String {
+    let said = String::from_utf8_lossy(bytes);
+    match error {
+        None => said.into_owned(),
+        Some(error) => {
+            let said = said.trim_end();
+            let space = if said.is_empty() { "" } else { " " };
+            format!("{said}{space}(reading stderr failed: {error})")
+        }
+    }
+}
+
+/// Reads `stderr` into `drain` to its end or a read error.
+fn drain_into(mut stderr: impl Read, drain: &StderrDrain) {
+    let mut buffer = [0u8; 4096];
+    let error = loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break None,
+            Ok(read) => drain.keep(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => break Some(error.to_string()),
+        }
+    };
+    drain.end(error);
+}
+
+/// Drains `stderr` on a thread of its own, so the caller can stop waiting
+/// if the pipe never closes.
+fn spawn_stderr_drain(stderr: impl Read + Send + 'static) -> std::io::Result<StderrDrain> {
+    let drain = StderrDrain::default();
+    let draining = drain.clone();
+    thread::Builder::new().name("remote-stderr".into()).spawn(move || drain_into(stderr, &draining))?;
+    Ok(drain)
+}
+
+/// What a command wrote to stderr: what the drain has, once the pipe ended
+/// or [`STDERR_DRAIN_WAIT`] passed (the thread is left to finish on its
+/// own), or that it couldn't be read at all.
+fn await_stderr(drain: Option<std::io::Result<StderrDrain>>) -> String {
+    match drain {
+        None => String::new(),
+        Some(Ok(drain)) => drain.text(STDERR_DRAIN_WAIT),
+        Some(Err(error)) => format!("(no thread could read its stderr: {error})"),
+    }
 }
 
 fn agent_path() -> Result<PathBuf> {
@@ -201,7 +261,7 @@ impl Run for Commands<'_> {
                 .map_err(|_| anyhow::anyhow!("{what}: the thread sending its input panicked"))?,
             None => Ok(0),
         };
-        let stderr = stderr.map(|rx| await_stderr(&rx)).unwrap_or_default();
+        let stderr = await_stderr(stderr);
         // A command that failed says why itself. Under one that succeeded, a
         // pipe that broke is the failure.
         if status.success()
@@ -500,6 +560,53 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    // ---- a command's stderr ----
+
+    /// A pipe that stays open (an ssh mux master holding it) gives what had
+    /// arrived when the wait ended, not nothing.
+    #[test]
+    fn a_late_drain_keeps_what_was_read() {
+        let drain = StderrDrain::default();
+        drain.keep(b"ssh: connect to host a8 port 22: Connection refused\n");
+        let said = drain.text(Duration::ZERO);
+        assert_eq!(said, "ssh: connect to host a8 port 22: Connection refused\n");
+        assert_eq!(split_cause(&said).map(|(cause, _)| cause), Some("ssh: connect to host a8 port 22: Connection refused"));
+        // Kept up to the limit, whatever arrives after.
+        drain.keep(&vec![b'x'; STDERR_DIAGNOSTIC_LIMIT]);
+        assert_eq!(drain.0.0.lock().bytes.len(), STDERR_DIAGNOSTIC_LIMIT);
+    }
+
+    /// A read that fails ends the drain, and its error follows what was
+    /// read on the same line, so the line still names the cause.
+    #[test]
+    fn a_read_error_is_appended() {
+        struct Failing(Option<&'static [u8]>);
+        impl Read for Failing {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.take() {
+                    Some(said) => {
+                        buffer[..said.len()].copy_from_slice(said);
+                        Ok(said.len())
+                    }
+                    None => Err(std::io::Error::other("broken pipe")),
+                }
+            }
+        }
+        let drain = StderrDrain::default();
+        drain_into(Failing(Some(b"Warning: added a8.\nssh: boom\n")), &drain);
+        let said = drain.text(Duration::ZERO);
+        assert_eq!(said, "Warning: added a8.\nssh: boom (reading stderr failed: broken pipe)");
+        assert_eq!(split_cause(&said).map(|(cause, _)| cause), Some("ssh: boom (reading stderr failed: broken pipe)"));
+
+        let drain = StderrDrain::default();
+        drain_into(Failing(None), &drain);
+        assert_eq!(drain.text(Duration::ZERO), "(reading stderr failed: broken pipe)");
+        assert_eq!(
+            await_stderr(Some(Err(std::io::Error::other("no threads")))),
+            "(no thread could read its stderr: no threads)"
+        );
+    }
 
     // ---- the relay's launch and the deployment behind it ----
 
@@ -1248,7 +1355,7 @@ mod tests {
     /// ([`Session::start`] on the profile's [`Host`]).
     #[cfg(any(target_os = "linux", windows))]
     mod docker {
-        use std::sync::Mutex;
+        use std::sync::{Mutex, mpsc};
 
         use super::*;
         use crate::config::Profile;

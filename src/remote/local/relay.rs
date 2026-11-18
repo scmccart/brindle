@@ -156,7 +156,7 @@ pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
         child.wait().ok();
         return Err(unstarted(format!("{program} has no stdio")));
     };
-    let process = Process::watch(child);
+    let process = Process::watch(child, &program);
     let kept = keep_stderr(stderr);
 
     // Killed if the marker doesn't come in time, which ends the read below.
@@ -183,15 +183,15 @@ pub fn start(mut command: Command, limit: Duration) -> Result<Link, Unstarted> {
         // itself. Too much noise leaves it running, and a late one has been
         // killed already.
         let ending = error.kind() == io::ErrorKind::UnexpectedEof && !late;
-        let status = ending.then(|| process.wait_for(EXIT_WAIT)).flatten().or_else(|| {
+        let ended = ending.then(|| process.wait_for(EXIT_WAIT)).flatten().or_else(|| {
             process.kill();
             process.wait_for(EXIT_WAIT)
         });
         let problem = if late { format!("no frame marker within {} s", limit.as_secs()) } else { error.to_string() };
         let said = kept.text(EXIT_WAIT);
-        let exit = status.map(|status| format!("{program} {}", exit_text(status)));
+        let exit = ended.as_ref().map(|ended| ended.text(&program));
         let message = unstarted_message(&problem, exit.as_deref(), &said);
-        return Err(Unstarted { code: status.and_then(|status| status.code()), said, message });
+        return Err(Unstarted { code: ended.as_ref().and_then(Ended::code), said, message });
     }
     let wire = Arc::new(ChildWire { stdin: Mutex::new(Some(stdin)), process, stderr: kept, program });
     Ok(Link { reader: Box::new(stdout), wire })
@@ -224,6 +224,49 @@ fn exit_text(status: ExitStatus) -> String {
     }
 }
 
+/// How a relay's process ended, as far as Brindle could tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ended {
+    /// Its exit status.
+    Status(ExitStatus),
+    /// Its exit status couldn't be read, and why.
+    Unread(String),
+}
+
+impl Ended {
+    /// What waiting for `program` gave.
+    fn waited(program: &str, waited: io::Result<ExitStatus>) -> Self {
+        match waited {
+            Ok(status) => Self::Status(status),
+            Err(error) => Self::Unread(format!("couldn't read how {program} ended: {error}")),
+        }
+    }
+
+    /// The code it exited with, if it exited and that could be read.
+    fn code(&self) -> Option<i32> {
+        match self {
+            Self::Status(status) => status.code(),
+            Self::Unread(_) => None,
+        }
+    }
+
+    fn success(&self) -> bool {
+        match self {
+            Self::Status(status) => status.success(),
+            Self::Unread(_) => false,
+        }
+    }
+
+    /// What a message says of it: `ssh exited with 255`, how a signal ended
+    /// it, or why that couldn't be read.
+    fn text(&self, program: &str) -> String {
+        match self {
+            Self::Status(status) => format!("{program} {}", exit_text(*status)),
+            Self::Unread(why) => why.clone(),
+        }
+    }
+}
+
 /// A relay's process, waited for on a thread of its own.
 struct Process {
     pid: u32,
@@ -238,27 +281,34 @@ struct Exit {
     /// `wait()` reaps it before returning, so a kill between the two could
     /// reach a process that took the pid in that instant; nothing else
     /// reaps it, so the window is that short.
-    status: Option<ExitStatus>,
+    ended: Option<Ended>,
 }
 
+/// Runs a waiter on a thread of its own, or says why it can't.
+type SpawnWaiter = dyn FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>;
+
 impl Process {
-    fn watch(mut child: Child) -> Arc<Self> {
+    fn watch(child: Child, program: &str) -> Arc<Self> {
+        let spawn = |wait: Box<dyn FnOnce() + Send>| std::thread::Builder::new().name("relay-wait".into()).spawn(wait).map(drop);
+        Self::watch_with(child, program, Box::new(spawn))
+    }
+
+    /// [`Process::watch`], with the thread that waits started by `spawn`.
+    fn watch_with(mut child: Child, program: &str, spawn: Box<SpawnWaiter>) -> Arc<Self> {
         let process = Arc::new(Self { pid: child.id(), state: Mutex::new(Exit::default()), exited: Condvar::new() });
         let watching = process.clone();
-        let started = std::thread::Builder::new().name("relay-wait".into()).spawn(move || {
-            let status = child.wait();
-            {
-                let mut state = watching.state.lock();
-                // A failed wait leaves nothing to kill either.
-                state.status = Some(status.unwrap_or_else(|_| failed_status()));
-            }
+        let waiting = program.to_string();
+        let started = spawn(Box::new(move || {
+            let ended = Ended::waited(&waiting, child.wait());
+            // A failed wait leaves nothing to kill either.
+            watching.state.lock().ended = Some(ended);
             watching.exited.notify_all();
             drop(child);
-        });
-        if started.is_err() {
-            // Nothing will reap it: end it now and count it as exited.
+        }));
+        if let Err(error) = started {
+            // Nothing will reap it: end it now and count it as ended.
             sys::kill(process.pid);
-            process.state.lock().status = Some(failed_status());
+            process.state.lock().ended = Some(Ended::Unread(format!("no thread could wait for {program}: {error}")));
         }
         process
     }
@@ -266,30 +316,18 @@ impl Process {
     /// Ends the process, unless it has already exited.
     fn kill(&self) {
         let state = self.state.lock();
-        if state.status.is_none() {
+        if state.ended.is_none() {
             sys::kill(self.pid);
         }
     }
 
-    /// Its exit status, waiting up to `limit` for it.
-    fn wait_for(&self, limit: Duration) -> Option<ExitStatus> {
+    /// How it ended, waiting up to `limit` for it.
+    fn wait_for(&self, limit: Duration) -> Option<Ended> {
         let mut state = self.state.lock();
-        if state.status.is_none() {
+        if state.ended.is_none() {
             self.exited.wait_for(&mut state, limit);
         }
-        state.status
-    }
-}
-
-/// An exit status for a process whose own couldn't be read.
-fn failed_status() -> ExitStatus {
-    #[cfg(unix)]
-    {
-        std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
-    }
-    #[cfg(windows)]
-    {
-        std::os::windows::process::ExitStatusExt::from_raw(1)
+        state.ended.clone()
     }
 }
 
@@ -369,13 +407,13 @@ impl Wire for ChildWire {
     }
 
     fn why(&self) -> String {
-        let status = self.process.wait_for(EXIT_WAIT);
+        let ended = self.process.wait_for(EXIT_WAIT);
         let said = self.stderr.text(EXIT_WAIT);
-        let exit = status.map(|status| format!("{} {}", self.program, exit_text(status)));
+        let exit = ended.as_ref().map(|ended| ended.text(&self.program));
         match client::split_cause(&said) {
             // A process that exited 0 and wrote nothing has nothing to add
             // to a stream that ended.
-            None if status.is_some_and(|status| status.success()) => String::new(),
+            None if ended.as_ref().is_some_and(Ended::success) => String::new(),
             None => exit.unwrap_or_default(),
             // The cause first, as in a launch failure's message.
             Some((cause, rest)) => {
@@ -660,6 +698,42 @@ mod tests {
         assert_eq!(why("", 3), "sh exited with 3");
         assert_eq!(why("echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom");
         assert_eq!(why("echo warning >&2; echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom\nwarning");
+    }
+
+    /// A `wait()` that fails is an ending of its own, which names the
+    /// program and the error, and has no code: not an exit status made up.
+    #[test]
+    fn an_unread_exit_names_the_error() {
+        let ended = Ended::waited("ssh", Err(io::Error::other("no child processes")));
+        assert_eq!(ended, Ended::Unread("couldn't read how ssh ended: no child processes".into()));
+        assert_eq!(ended.text("ssh"), "couldn't read how ssh ended: no child processes");
+        assert_eq!((ended.code(), ended.success()), (None, false));
+        let message = unstarted_message("the stream ended before the frame marker", Some(&ended.text("ssh")), "");
+        assert_eq!(
+            message,
+            "the relay didn't start: the stream ended before the frame marker (couldn't read how ssh ended: no child processes)"
+        );
+    }
+
+    /// With no thread to wait for it, the process is ended at once and its
+    /// ending says why, so no reader waits for a status that never comes.
+    #[test]
+    fn a_watcher_that_cant_start_kills_and_reports() {
+        let child = silent().stdin(Stdio::null()).stdout(Stdio::null()).spawn().expect("the silent command runs");
+        let pid = child.id();
+        let process = Process::watch_with(child, "sleep", Box::new(|_| Err(io::Error::other("no threads"))));
+        assert_eq!(process.wait_for(Duration::ZERO), Some(Ended::Unread("no thread could wait for sleep: no threads".into())));
+        #[cfg(target_os = "linux")]
+        {
+            // Killed, and left unreaped: a zombie, or gone.
+            let dead = || match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')),
+                Err(_) => true,
+            };
+            assert!(crate::test_support::wait::eventually(Duration::from_secs(10), dead), "{pid} still runs");
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pid;
     }
 
     /// A launch whose output ends before it has exited isn't killed for it:

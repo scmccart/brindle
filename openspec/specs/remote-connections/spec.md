@@ -151,22 +151,22 @@ Remote terminals SHALL follow the same lifetime rules as local terminals:
 - **THEN** the `sleep` is still running on `A8`, and `brindle-remote list` there shows its session as detached
 
 ### Requirement: Lost connections reconnect
-Brindle SHALL notice a remote connection that has gone silent, even when the transport never closes, within about half a minute. It SHALL then show that the connection was lost in each of that endpoint's terminals, and reconnect with growing pauses (at most 30 s apart) for as long as any terminal uses the endpoint. Where Brindle reports the loss (its log, and the endpoint's row in the sessions palette), it SHALL say what ended the link:
-- the SSH or container engine process exiting, with its exit status and what it wrote;
+Brindle SHALL notice a remote connection that has gone silent, even when the transport never closes, within about half a minute. It SHALL then show that the connection was lost in each of that endpoint's terminals, and reconnect with growing pauses (at most 30 s apart) for as long as any terminal uses the endpoint. Where Brindle reports the loss (each terminal's line, its log, and the endpoint's row in the sessions palette), it SHALL say what ended the link:
+- the SSH or container engine process exiting, with its exit status and what it wrote, or that its exit status couldn't be read, and why;
 - nothing arriving within Brindle's own limit;
 - or the far end closing the link.
 
 #### Scenario: Network drop
 - **WHEN** the network to `A8` is cut for two minutes while a tab there runs `htop`, and then restored
-- **THEN** the tab says the connection was lost, and within 30 s of the restore it shows `htop` again, with the same pid
+- **THEN** the tab says the connection was lost and why, and within 30 s of the restore it shows `htop` again, with the same pid
 
 #### Scenario: ssh gives up
 - **WHEN** the network to `A8` is cut, and `ssh` exits because its keepalives go unanswered
-- **THEN** Brindle's log says the connection to `A8` ended because `ssh` exited, with its exit status and anything it wrote, and doesn't say that the terminal server closed the connection
+- **THEN** Brindle's log and the tab's line say the connection to `A8` ended because `ssh` exited, with its exit status and anything it wrote, and neither says that the terminal server closed the connection
 
 #### Scenario: Silent link
 - **WHEN** the link to `A8` delivers nothing for Brindle's limit, while `ssh` keeps running
-- **THEN** Brindle's log says that nothing was read from `A8` in that time, and the `ssh` process is ended
+- **THEN** Brindle's log and the tab's line say that nothing was read from `A8` in that time, and the `ssh` process is ended
 
 ### Requirement: Sessions come back after a reconnect
 On reconnecting, every session Brindle still owns on that endpoint SHALL come back with its replay, then live output. Input typed while disconnected SHALL be delivered after the reconnect, unless refused under the input bound. A session SHALL be shown as lost only when the reconnected endpoint no longer has it. The endpoint SHALL count as having it only when it lists the session's id with the session's key. An attach cut off by the drop SHALL NOT be answered with a different session.

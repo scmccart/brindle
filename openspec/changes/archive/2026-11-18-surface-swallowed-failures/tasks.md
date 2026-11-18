@@ -195,32 +195,32 @@ Needs change 2 (`Shown`, `State::shows`), change 9 (the event kinds), change 7 (
 
 Needs change 4 (textual: `local.rs`).
 
-- [ ] 4.1 `Listing::Unlisted(String)` in `picker.rs`. `session_palette` draws it, and every `match` on `Listing` names it.
+- [x] 4.1 `Listing::Unlisted(String)` in `picker.rs`. `session_palette` draws it, and every `match` on `Listing` names it.
   - Unit tests:
     - `an_unlisted_endpoint_is_a_disabled_row_with_its_cause`;
     - `unlisted_does_not_add_the_no_sessions_note`.
-- [ ] 4.2 `listing_from(host, state, Result<Vec<SessionInfo>, String>)`, and the action-naming texts (b07 #13, #16).
+- [x] 4.2 `listing_from(host, state, Result<Vec<SessionInfo>, String>)`, and the action-naming texts (b07 #13, #16).
   - Unit tests: `this_machines_failure_is_unlisted`, `a_remote_failure_is_offline`.
-- [ ] 4.3 `SessionsModel` takes a kill's outcome (decision 7).
+- [x] 4.3 `SessionsModel` takes a kill's outcome (decision 7).
   - Unit tests:
     - `a_failed_kill_brings_the_row_back_and_adds_its_note`;
     - `the_note_goes_at_the_endpoints_next_answer`;
     - `the_highlighted_row_stays_through_a_failed_kill`.
-- [ ] 4.4 `relay::Ended { Status, Unread }` (decision 8). Remove `failed_status` and its `cfg` blocks, and word `why()` and `start()` for each case.
+- [x] 4.4 `relay::Ended { Status, Unread }` (decision 8). Remove `failed_status` and its `cfg` blocks, and word `why()` and `start()` for each case.
   - Unit tests:
     - `an_unread_exit_names_the_error`;
     - `a_watcher_that_cant_start_kills_and_reports`, with the spawn injected.
-- [ ] 4.5 `client::StderrDrain`. `spawn_stderr_drain -> io::Result<StderrDrain>`, and `await_stderr` keeps what has arrived.
+- [x] 4.5 `client::StderrDrain`. `spawn_stderr_drain -> io::Result<StderrDrain>`, and `await_stderr` keeps what has arrived.
   - Unit tests on the pure part: `a_late_drain_keeps_what_was_read` and `a_read_error_is_appended`.
-- [ ] 4.6 `upgrade::Offered { Upgraded, Current, Kept }`. `shared` logs `Kept`'s reason at `warn`.
+- [x] 4.6 `upgrade::Offered { Upgraded, Current, Kept }`. `shared` logs `Kept`'s reason at `warn`.
   - A unit test on the decision that gives `Kept`: `a_failed_check_keeps_the_running_core_with_its_reason`.
-- [ ] 4.7 `local::report_offline(host, &error)`, with `next_connection_id()`. The eager-connect thread and `when_listed` call it.
+- [x] 4.7 `local::report_offline(host, &error)`, with `next_connection_id()`. The eager-connect thread and `when_listed` call it.
   - Unit test: `hosts_orders_an_offline_report_after_an_earlier_connection`, on `Hosts`'s pure update.
-- [ ] 4.8 `Workspace`: `list_sessions` returns `Listed { sessions, kill }`, and `sessions_answered` passes the kill's outcome to `SessionsModel`.
-- [ ] 4.9 e2e:
+- [x] 4.8 `Workspace`: `list_sessions` returns `Listed { sessions, kill }`, and `sessions_answered` passes the kill's outcome to `SessionsModel`.
+- [x] 4.9 e2e:
   - New case `local-server-palette-unlisted`: `BRINDLE_SERVER_HELPER` names a missing file, and the "Attach Session…" palette is dumped. Its row says this machine's sessions couldn't be listed, and there is no "No detached sessions" row.
   - Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server-palette`.
-- [ ] 4.10 Docs: CLAUDE.md's sessions palette paragraph names the `Unlisted` row and the failed-kill row.
+- [x] 4.10 Docs: CLAUDE.md's sessions palette paragraph names the `Unlisted` row and the failed-kill row.
 
 ## 5. Command line, latency and the state directory
 

@@ -1226,12 +1226,11 @@ const SEAMS: &[&str] = &[
 /// `ports R4`'s exception: the production files that still have platform
 /// `cfg`s outside a seam, listed again in `docs/architecture/README.md`'s
 /// `ports R4` row. It only shrinks, and ends with `port-to-macos`.
-const R4_EXCEPTION: [&str; 17] = [
+const R4_EXCEPTION: [&str; 16] = [
     "src/instance.rs",
     "src/main.rs",
     "src/notify/mod.rs",
     "src/remote/local.rs",
-    "src/remote/local/relay.rs",
     "src/remote/mod.rs",
     "src/session.rs",
     "src/settings.rs",
