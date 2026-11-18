@@ -193,6 +193,9 @@ pub struct Run<'a> {
     padding: Option<u32>,
     /// The steps' spacing in seconds before stretching, in place of 1.
     interval: Option<f64>,
+    /// Run with no state directory, from the case directory
+    /// ([`Run::no_state_dir`]).
+    no_state_dir: bool,
 }
 
 /// The case server's sessions as `brindle-remote list` prints them
@@ -307,7 +310,16 @@ impl<'a> Run<'a> {
             keep_detached: false,
             padding: None,
             interval: None,
+            no_state_dir: false,
         }
+    }
+
+    /// Runs with no state directory: without the `BRINDLE_STATE_DIR` every
+    /// other run gets, `HOME` and `XDG_STATE_HOME`, and from the case
+    /// directory, where the state went when Brindle fell back on `.`.
+    pub fn no_state_dir(mut self) -> Self {
+        self.no_state_dir = true;
+        self
     }
 
     /// Spaces the steps `secs` apart (stretched like the other delays)
@@ -571,6 +583,9 @@ impl<'a> Run<'a> {
         }
         for key in &self.env_remove {
             command.env_remove(key);
+        }
+        if self.no_state_dir {
+            command.env_remove("BRINDLE_STATE_DIR").env_remove("HOME").env_remove("XDG_STATE_HOME").current_dir(&ctx.dir);
         }
         let mut child = command
             .args(&self.args)

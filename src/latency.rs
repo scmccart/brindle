@@ -17,8 +17,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::Write as _;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{App, EntityId, Global};
@@ -273,10 +273,47 @@ pub fn json_line(sample: &Sample) -> String {
     }
 }
 
+/// Where `--latency-log` stands: still writing its file, or stopped by a
+/// write that failed, which the summary names.
+#[derive(Debug)]
+pub enum LogState<W = File> {
+    Writing { file: W, path: PathBuf },
+    Stopped { path: PathBuf, error: String },
+}
+
+impl<W: Write> LogState<W> {
+    /// Appends `line`; a failed write stops the log, keeping its error.
+    pub fn append(&mut self, line: &str) {
+        if let LogState::Writing { file, path } = self
+            && let Err(error) = file.write_all(line.as_bytes())
+        {
+            *self = LogState::Stopped { path: std::mem::take(path), error: error.to_string() };
+        }
+    }
+
+    /// The summary line saying the log stopped early, when it did.
+    pub fn stopped_line(&self) -> Option<String> {
+        match self {
+            LogState::Writing { .. } => None,
+            LogState::Stopped { path, error } => Some(format!("--- latency-log stopped \"{}\": {error}\n", path.display())),
+        }
+    }
+}
+
+/// The log's summary at quit: [`summary`] of `window`, with the line
+/// saying the log stopped early after its header when it did.
+pub fn log_summary<W: Write>(window: &Window, log: &LogState<W>) -> String {
+    let text = summary(window);
+    let Some(stopped) = log.stopped_line() else { return text };
+    let (header, stages) = text.split_once('\n').unwrap_or((&text, ""));
+    format!("{header}\n{stopped}{stages}")
+}
+
 /// The app-wide probe state; present only when probing is enabled.
-pub struct Latency {
+pub struct Latency<W = File> {
     probes: Probes,
-    log: Option<File>,
+    /// `--latency-log`'s file, when given.
+    log: Option<LogState<W>>,
     /// The newest samples since the last [`Latency::reset`].
     samples: Window,
     /// The newest samples since startup, for the log's summary (the log
@@ -290,9 +327,12 @@ impl Latency {
     /// Enables probing, appending samples to `log` if given.
     pub fn install(log: Option<&Path>, cx: &mut App) -> std::io::Result<()> {
         let log = log
-            .map(|path| std::fs::OpenOptions::new().create(true).append(true).open(path))
+            .map(|path| {
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                Ok::<_, std::io::Error>(LogState::Writing { file, path: path.to_path_buf() })
+            })
             .transpose()?;
-        cx.set_global(Latency { probes: Probes::default(), log, samples: Window::default(), all_samples: Window::default() });
+        cx.set_global(Latency::with_log(log));
         Ok(())
     }
 
@@ -334,21 +374,6 @@ impl Latency {
         }
     }
 
-    /// Expires old probes and moves finished samples into the totals and log.
-    fn collect(&mut self, now: Instant) {
-        self.probes.expire(now);
-        for sample in self.probes.take_finished() {
-            if let Some(log) = &mut self.log
-                && let Err(err) = log.write_all(json_line(&sample).as_bytes())
-            {
-                log::error!("--latency-log: {err}");
-                self.log = None;
-            }
-            self.samples.push(sample.clone());
-            self.all_samples.push(sample);
-        }
-    }
-
     /// Expires and collects; returns how many samples were taken since the
     /// last reset (kept or dropped) and whether any probe is still waiting.
     pub fn poll(cx: &mut App) -> Option<(usize, bool)> {
@@ -374,11 +399,31 @@ impl Latency {
         cx.try_global::<Latency>().map(|this| summary(&this.samples)).unwrap_or_default()
     }
 
-    /// The summary of the samples since startup, for the log at quit.
+    /// The summary of the samples since startup, for the log at quit, which
+    /// says when the log stopped early.
     pub fn log_summary(cx: &mut App) -> Option<String> {
         Self::poll(cx);
         let this = cx.try_global::<Latency>()?;
-        this.log.is_some().then(|| summary(&this.all_samples))
+        this.log.as_ref().map(|log| log_summary(&this.all_samples, log))
+    }
+}
+
+impl<W: Write> Latency<W> {
+    fn with_log(log: Option<LogState<W>>) -> Self {
+        Latency { probes: Probes::default(), log, samples: Window::default(), all_samples: Window::default() }
+    }
+
+    /// Expires old probes and moves finished samples into the totals and
+    /// log. A log that can't be written stops; the timing goes on.
+    fn collect(&mut self, now: Instant) {
+        self.probes.expire(now);
+        for sample in self.probes.take_finished() {
+            if let Some(log) = &mut self.log {
+                log.append(&json_line(&sample));
+            }
+            self.samples.push(sample.clone());
+            self.all_samples.push(sample);
+        }
     }
 }
 
@@ -459,6 +504,50 @@ mod tests {
         // The stages are the kept samples': the 7 smallest went.
         let output = summary(&many).lines().nth(1).unwrap_or_default().to_string();
         assert!(output.starts_with("output min=7.00 "), "{output}");
+    }
+
+    /// A log file whose writes fail, as on a full disk.
+    #[derive(Debug)]
+    struct Full;
+
+    impl Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no space left on device"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_write_stops_the_log_and_keeps_timing() {
+        let mut latency = Latency::with_log(Some(LogState::Writing { file: Full, path: "/full/lat.jsonl".into() }));
+        let t0 = Instant::now();
+        for key in ["a", "b"] {
+            latency.probes.start(terminal(), key.into(), 5, t0);
+            latency.collect(t0 + TIMEOUT);
+        }
+        assert_eq!(latency.all_samples.taken(), 2, "both keys are timed");
+        let Some(LogState::Stopped { path, error }) = &latency.log else { panic!("{:?}", latency.log) };
+        assert_eq!((path.as_path(), error.as_str()), (Path::new("/full/lat.jsonl"), "no space left on device"));
+
+        let mut writing = LogState::Writing { file: Vec::new(), path: "/l".into() };
+        writing.append("x\n");
+        assert!(matches!(&writing, LogState::Writing { file, .. } if file == b"x\n"));
+        assert_eq!(writing.stopped_line(), None);
+    }
+
+    #[test]
+    fn the_summary_names_the_stopped_log() {
+        let samples: Window = (1..=2).map(numbered).collect();
+        let stopped: LogState<Full> = LogState::Stopped { path: "/full/lat.jsonl".into(), error: "no space left on device".into() };
+        let text = log_summary(&samples, &stopped);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "--- latency samples=2 timeouts=0", "the header stays first, for the perf suite");
+        assert_eq!(lines[1], "--- latency-log stopped \"/full/lat.jsonl\": no space left on device");
+        assert!(lines[2].starts_with("output "), "{text}");
+        let writing = LogState::Writing { file: Vec::new(), path: "/l".into() };
+        assert_eq!(log_summary(&samples, &writing), summary(&samples), "a log still writing adds nothing");
     }
 
     #[test]

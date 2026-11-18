@@ -3,9 +3,9 @@
 //!
 //! The state lives in `session.toml` under `$BRINDLE_STATE_DIR`, else
 //! `$XDG_STATE_HOME/brindle` (`~/.local/state/brindle`), or
-//! `%LOCALAPPDATA%\brindle` on Windows. Only the process
-//! holding `session.lock` reads or writes it, so a second Brindle never
-//! duplicates the first one's tabs.
+//! `%LOCALAPPDATA%\brindle` on Windows; with none of them, nowhere. Only
+//! the process holding `session.lock` reads or writes it, so a second
+//! Brindle never duplicates the first one's tabs.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -265,19 +265,48 @@ impl State {
     }
 }
 
-/// Where the state file and lock live.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("BRINDLE_STATE_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    // `dirs::state_dir()` is Linux-only; Windows keeps state in %LOCALAPPDATA%.
-    let base = if cfg!(windows) {
-        dirs::data_local_dir()
-    } else {
-        dirs::state_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-    };
-    base.unwrap_or_else(|| PathBuf::from(".")).join("brindle")
+/// What [`state_dir`] decides from, read from the environment by
+/// [`StateEnv::read`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct StateEnv {
+    /// `BRINDLE_STATE_DIR`, when set and not empty.
+    pub named: Option<PathBuf>,
+    /// The platform's directory for state: `$XDG_STATE_HOME` (absolute) on
+    /// Linux, `%LOCALAPPDATA%` on Windows.
+    pub platform: Option<PathBuf>,
+    /// The home directory (`$HOME`), whose `.local/state` stands in for
+    /// `$XDG_STATE_HOME`; none on Windows, which always has the platform's.
+    pub home: Option<PathBuf>,
 }
+
+impl StateEnv {
+    /// The environment's values. On Linux both come from the environment
+    /// itself, never the password database, so a Brindle started without
+    /// `HOME` has no state directory rather than one it wasn't told about.
+    pub fn read() -> Self {
+        let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+        let named = set("BRINDLE_STATE_DIR");
+        if cfg!(windows) {
+            return StateEnv { named, platform: dirs::data_local_dir(), home: None };
+        }
+        StateEnv { named, platform: set("XDG_STATE_HOME").filter(|dir| dir.is_absolute()), home: set("HOME") }
+    }
+}
+
+/// Where the state file and lock live: `BRINDLE_STATE_DIR`, else `brindle`
+/// in the platform's directory for state, else in the home directory's
+/// `.local/state`. `None` when there is none of them: Brindle then runs on
+/// its own and saves nothing ([`NO_STATE_DIR`]).
+pub fn state_dir(env: &StateEnv) -> Option<PathBuf> {
+    if let Some(dir) = &env.named {
+        return Some(dir.clone());
+    }
+    let base = env.platform.clone().or_else(|| env.home.as_ref().map(|home| home.join(".local/state")))?;
+    Some(base.join("brindle"))
+}
+
+/// The window's notice when there is no state directory.
+pub const NO_STATE_DIR: &str = "Brindle can't save its session: no state directory (set BRINDLE_STATE_DIR)";
 
 pub fn state_path(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
@@ -835,6 +864,25 @@ mod tests {
             },
             WindowState { width: None, height: None, maximized: true, active: 0, tabs: vec![TabState::Local { profile: "x".into(), remote: None, cwd: None, title: None, zones: None, session: None }] },
         ])
+    }
+
+    #[test]
+    fn no_home_and_no_override_is_none() {
+        assert_eq!(state_dir(&StateEnv::default()), None);
+    }
+
+    #[test]
+    fn the_override_wins() {
+        let env = StateEnv {
+            named: Some("/tmp/s".into()),
+            platform: Some("/state".into()),
+            home: Some("/home/u".into()),
+        };
+        assert_eq!(state_dir(&env), Some(PathBuf::from("/tmp/s")));
+        let env = StateEnv { named: None, ..env };
+        assert_eq!(state_dir(&env), Some(PathBuf::from("/state/brindle")), "the platform's directory next");
+        let env = StateEnv { platform: None, ..env };
+        assert_eq!(state_dir(&env), Some(PathBuf::from("/home/u/.local/state/brindle")), "then the home's");
     }
 
     #[test]

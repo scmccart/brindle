@@ -119,16 +119,18 @@ const SHELL_SCRIPTS: &[(&str, &str)] = &[
 #[derive(Debug, Clone)]
 enum Step {
     Send(String),
+    /// `--action`: an action's name, checked against the action table when
+    /// the arguments were parsed.
     Action(String),
-    /// `--hover` / `--click`, or the reason the position didn't parse.
-    Pointer(Result<terminal_view::PointerStep, String>),
+    /// `--hover` / `--click`.
+    Pointer(terminal_view::PointerStep),
     Find(String),
     /// `--wait-for`: the text the active terminal must show before the
     /// steps after it run.
     WaitFor(String),
     /// `--key`: a keystroke through gpui's own key dispatch (bindings, key
     /// listeners, keystroke observers), as a real key press reaches them.
-    Key(String),
+    Key(Keystroke),
     /// `--modality`: how focus counts as moved in the window from now on,
     /// as after a pointer press on a control (`pointer`) or a key press
     /// (`keyboard`); it decides whether focus rings show.
@@ -252,14 +254,24 @@ impl Args {
 }
 
 fn parse_args() -> Args {
-    parse_args_from(std::env::args().skip(1), dirs::home_dir().as_deref())
+    parse_args_from(std::env::args().skip(1), dirs::home_dir().as_deref()).unwrap_or_else(|message| usage_error(&message))
 }
 
-/// The arguments, with a leading `~` in a path expanded to `home`.
-fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Args {
+/// The value `option` takes: the next argument, or a usage error naming
+/// the option and `what` it needs.
+fn value_of(it: &mut impl Iterator<Item = String>, option: &str, what: &str) -> Result<String, String> {
+    it.next().ok_or_else(|| format!("{option} needs {what}"))
+}
+
+/// The arguments, with a leading `~` in a path expanded to `home`, or the
+/// usage error to print: an unknown argument, an option without its value,
+/// or a value it can't use, each naming the option. The debug steps are
+/// checked here, so a run never starts with one it can't take.
+fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Result<Args, String> {
     let mut args = Args::default();
     let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
     while let Some(arg) = it.next() {
+        let it = &mut it;
         match arg.as_str() {
             "-h" | "--help" => {
                 console_output();
@@ -295,77 +307,83 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                     }
                     None => {
                         let names: Vec<&str> = SHELL_SCRIPTS.iter().map(|(name, _)| *name).collect();
-                        usage_error(&format!(
+                        return Err(format!(
                             "--shell-integration needs a shell: {} (got {shell:?})",
                             names.join(", ")
-                        ))
+                        ));
                     }
                 }
             }
             "-e" | "--command" => {
-                let rest: Vec<String> = it.by_ref().collect();
-                if let Some((program, rest)) = rest.split_first() {
-                    args.command = Some((program.clone(), rest.to_vec()));
-                }
+                let rest: Vec<String> = it.collect();
+                let Some((program, rest)) = rest.split_first() else {
+                    return Err(format!("{arg} needs a command"));
+                };
+                args.command = Some((program.clone(), rest.to_vec()));
             }
-            "-p" | "--profile" => args.profile = it.next(),
-            "-d" | "--working-directory" => args.cwd = it.next().map(|d| config::expand_tilde(&d, home)),
+            "-p" | "--profile" => args.profile = Some(value_of(it, &arg, "a profile name")?),
+            "-d" | "--working-directory" => {
+                args.cwd = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home));
+            }
             "--config" => {
-                if let Some(path) = it.next() {
-                    // SAFETY: single-threaded at this point.
-                    unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
-                }
+                let path = value_of(it, &arg, "a file")?;
+                // SAFETY: single-threaded at this point.
+                unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
             }
             "--no-restore" => args.no_restore = true,
             "--attach" if cfg!(not(any(target_os = "linux", windows))) => {
-                usage_error("--attach needs the terminal server, which runs only on Linux and Windows")
+                return Err("--attach needs the terminal server, which runs only on Linux and Windows".into());
             }
             "--attach" => match it.next().and_then(|id| id.parse().ok()) {
                 Some(id) => args.attach = Some(id),
-                None => usage_error("--attach needs a session id (brindle-remote list prints them)"),
+                None => return Err("--attach needs a session id (brindle-remote list prints them)".into()),
             },
-            "--send" => args.steps.extend(it.next().map(|s| Step::Send(unescape(&s)))),
-            "--action" => args.steps.extend(it.next().map(Step::Action)),
-            "--hover" | "--click" => {
-                let click = arg == "--click";
-                let pos = it.next().unwrap_or_default();
-                args.steps.push(Step::Pointer(terminal_view::PointerStep::parse(&pos, click)));
+            "--send" => args.steps.push(Step::Send(unescape(&value_of(it, &arg, "text to type")?))),
+            "--action" => {
+                let name = value_of(it, &arg, "an action name (see --list-actions)")?;
+                if actions::action_by_name(&name).is_none() {
+                    return Err(format!("{arg}: no action is named {name:?} (see --list-actions)"));
+                }
+                args.steps.push(Step::Action(name));
             }
-            "--find" => args.steps.extend(it.next().map(Step::Find)),
-            "--wait-for" => args.steps.extend(it.next().map(|s| Step::WaitFor(unescape(&s)))),
-            "--key" => args.steps.extend(it.next().map(Step::Key)),
+            "--hover" | "--click" => {
+                let pos = value_of(it, &arg, "a cell, [MODS-]COL,ROW")?;
+                let step = terminal_view::PointerStep::parse(&pos, arg == "--click").map_err(|why| format!("{arg}: {why}"))?;
+                args.steps.push(Step::Pointer(step));
+            }
+            "--find" => args.steps.push(Step::Find(value_of(it, &arg, "text to find")?)),
+            "--wait-for" => args.steps.push(Step::WaitFor(unescape(&value_of(it, &arg, "text to wait for")?))),
+            "--key" => {
+                let key = value_of(it, &arg, "a keystroke (e.g. shift-tab)")?;
+                let keystroke = Keystroke::parse(&key).map_err(|why| format!("{arg}: {why}"))?;
+                args.steps.push(Step::Key(keystroke));
+            }
             "--modality" => match it.next().as_deref() {
                 Some("pointer") => args.steps.push(Step::Modality(brindle_ui::Modality::Pointer)),
                 Some("keyboard") => args.steps.push(Step::Modality(brindle_ui::Modality::Keyboard)),
-                _ => usage_error("--modality needs pointer or keyboard"),
+                _ => return Err("--modality needs pointer or keyboard".into()),
             },
             "--step-interval" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
                 Some(secs) if secs > 0.0 && secs.is_finite() => args.step_interval = Some(secs),
-                _ => usage_error("--step-interval needs a positive number of seconds"),
+                _ => return Err("--step-interval needs a positive number of seconds".into()),
             },
-            "--dump-screen-after" => args.dump_after = it.next().and_then(|s| s.parse().ok()),
-            "--latency-log" => match it.next() {
-                Some(path) => args.latency_log = Some(config::expand_tilde(&path, home)),
-                None => usage_error("--latency-log needs a file"),
+            "--dump-screen-after" => match it.next().and_then(|s| s.parse::<f64>().ok()) {
+                Some(secs) if secs >= 0.0 && secs.is_finite() => args.dump_after = Some(secs),
+                _ => return Err("--dump-screen-after needs a number of seconds".into()),
             },
+            "--latency-log" => args.latency_log = Some(config::expand_tilde(&value_of(it, &arg, "a file")?, home)),
             "--latency-bench" => match it.next().and_then(|n| n.parse().ok()) {
                 Some(n) if n > 0 => args.latency_bench = Some(n),
-                _ => usage_error("--latency-bench needs a positive number of keystrokes"),
+                _ => return Err("--latency-bench needs a positive number of keystrokes".into()),
             },
             "--install-desktop" => install_desktop = true,
             "--uninstall-desktop" => uninstall_desktop = true,
-            "--prefix" => match it.next() {
-                Some(dir) => prefix = Some(config::expand_tilde(&dir, home)),
-                None => usage_error("--prefix needs a directory"),
-            },
-            other => usage_error(&format!("unknown argument {other:?}")),
+            "--prefix" => prefix = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home)),
+            other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    match desktop::request(install_desktop, uninstall_desktop, prefix) {
-        Ok(request) => args.desktop = request,
-        Err(message) => usage_error(message),
-    }
-    args
+    args.desktop = desktop::request(install_desktop, uninstall_desktop, prefix).map_err(str::to_string)?;
+    Ok(args)
 }
 
 fn usage_error(message: &str) -> ! {
@@ -477,8 +495,8 @@ fn bind_keys(cx: &mut App) {
 /// profiles renamed in the settings dialog, whose open tabs follow the new
 /// name.
 fn apply_config(config: Config, report: ConfigReport, renames: &[(String, String)], cx: &mut App) {
-    let zoom = Settings::get(cx).zoom;
-    let mut settings = Settings::from_platform(config, report, cx);
+    let (zoom, notices) = (Settings::get(cx).zoom, Settings::get(cx).notices().to_vec());
+    let mut settings = Settings::from_platform(config, report, cx).with_notices(notices);
     settings.zoom = zoom;
     cx.set_global(settings);
     Settings::apply_ui_theme(cx);
@@ -753,10 +771,10 @@ struct LaunchReads {
 
 /// The launch's blocking reads, on the `launch-list` thread: this machine's
 /// sessions when the launch restores or attaches, and the recorded window
-/// when it restores.
-fn read_launch(restoring: bool, attach: bool, state_dir: &Path) -> LaunchReads {
-    let listing = if restoring || attach { launch_listing() } else { Listing::Skipped };
-    let recorded = if restoring { recorded_window(state_dir) } else { None };
+/// when it restores (from the state directory `restore_from` names).
+fn read_launch(restore_from: Option<&Path>, attach: bool) -> LaunchReads {
+    let listing = if restore_from.is_some() || attach { launch_listing() } else { Listing::Skipped };
+    let recorded = restore_from.and_then(recorded_window);
     LaunchReads { listing, recorded }
 }
 
@@ -794,22 +812,18 @@ fn recorded_window(state_dir: &Path) -> Option<WindowState> {
 /// returned channel. When no thread can be started, the reads run here, on
 /// the main thread before GPUI starts, where nothing waits on them yet
 /// (design.md decision 1).
-fn start_launch_reads(
-    restoring: bool,
-    attach: bool,
-    state_dir: &Path,
-) -> futures::channel::oneshot::Receiver<LaunchReads> {
+fn start_launch_reads(restore_from: Option<&Path>, attach: bool) -> futures::channel::oneshot::Receiver<LaunchReads> {
     let (answer, answered) = futures::channel::oneshot::channel();
-    let dir = state_dir.to_path_buf();
+    let dir = restore_from.map(Path::to_path_buf);
     let spawned = std::thread::Builder::new().name("launch-list".into()).spawn(move || {
-        answer.send(read_launch(restoring, attach, &dir)).ok();
+        answer.send(read_launch(dir.as_deref(), attach)).ok();
     });
     match spawned {
         Ok(_) => answered,
         Err(error) => {
             log::warn!("no launch-list thread ({error}): listing sessions before the window can start");
             let (answer, answered) = futures::channel::oneshot::channel();
-            answer.send(read_launch(restoring, attach, state_dir)).ok();
+            answer.send(read_launch(restore_from, attach)).ok();
             answered
         }
     }
@@ -863,18 +877,15 @@ fn sweep_launch_hosts(window: gpui::WindowHandle<Workspace>, cx: &mut App) {
 /// and writes the state once
 /// more, synchronously, when Brindle quits, after each window still open
 /// has recorded itself and left its terminals' sessions (`Workspace::quit`).
-fn record_session(cx: &mut App) {
-    fn pending(cx: &mut App) -> Option<String> {
+fn record_session(state_dir: Option<PathBuf>, cx: &mut App) {
+    fn pending(file: &session::StateFile, cx: &mut App) -> Option<String> {
         let outcome = cx.update_global(|store: &mut SessionStore, _| {
             if store.is_owner() { store.pending_write() } else { PendingWrite::Nothing }
         });
         match outcome {
             PendingWrite::Write(text) => Some(text),
             PendingWrite::Unserializable(err) => {
-                log::warn!(
-                    "not writing session state to {}: it can't be serialized: {err}",
-                    session::state_path(&session::state_dir()).display()
-                );
+                log::warn!("not writing session state to {}: it can't be serialized: {err}", file.path().display());
                 None
             }
             PendingWrite::Nothing | PendingWrite::StillUnserializable => None,
@@ -885,8 +896,9 @@ fn record_session(cx: &mut App) {
             log::warn!("could not write session state to {}: {err}", file.path().display());
         }
     }
-    // One ordering for the tick's background writes and the last one.
-    let file = Arc::new(session::StateFile::new(session::state_dir()));
+    // One ordering for the tick's background writes and the last one. No
+    // state directory, no file: the layouts still go to the server.
+    let file = state_dir.map(|dir| Arc::new(session::StateFile::new(dir)));
     let ticking = file.clone();
     cx.spawn(async move |cx| {
         loop {
@@ -903,7 +915,8 @@ fn record_session(cx: &mut App) {
             if sent.is_err() {
                 break;
             }
-            let Ok(text) = cx.update(pending) else { break };
+            let Some(ticking) = &ticking else { continue };
+            let Ok(text) = cx.update(|cx| pending(ticking, cx)) else { break };
             if let Some(text) = text {
                 let (file, ticket) = (ticking.clone(), ticking.ticket());
                 cx.background_executor().spawn(async move { write(&file, &text, ticket) }).detach();
@@ -922,40 +935,27 @@ fn record_session(cx: &mut App) {
                 window.update(cx, |ws, window, cx| ws.quit(window, cx)).ok();
             }
         }
-        if let Some(text) = pending(cx) {
-            write(&file, &text, file.ticket());
+        if let Some(file) = &file
+            && let Some(text) = pending(file, cx)
+        {
+            write(file, &text, file.ticket());
         }
         async {}
     })
     .detach();
 }
 
-fn main() {
-    let started = Instant::now();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
-        .init();
-    let args = parse_args();
-    // Desktop registration needs no display, so it runs before GPUI starts.
-    if let Some(request) = &args.desktop {
-        console_output();
-        if let Err(err) = desktop::run(request) {
-            eprintln!("brindle: {err:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // One Brindle per state directory: the process that takes the session
-    // lock is the instance, and a later launch hands it its request and
-    // exits. A debug run beside it runs on its own instead.
-    let state_dir = session::state_dir();
-    let lock = match session::Lock::acquire(&state_dir) {
+/// Takes `state_dir`'s session lock, making this process the instance, or
+/// hands a launch that isn't a debug run to the running instance and exits.
+/// `None` when another Brindle holds the lock and this one runs beside it.
+fn session_lock(state_dir: &Path, args: &Args) -> Option<session::Lock> {
+    match session::Lock::acquire(state_dir) {
         Ok(lock) => Some(lock),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && !args.is_debug_run() => {
-            match instance::forward(&state_dir, &args.instance_request()) {
+            match instance::forward(state_dir, &args.instance_request()) {
                 Ok(()) => std::process::exit(0),
                 // The running Brindle may have quit meanwhile.
-                Err(why) => match session::Lock::acquire(&state_dir) {
+                Err(why) => match session::Lock::acquire(state_dir) {
                     Ok(lock) => {
                         log::info!("the running Brindle went away ({why}); starting");
                         Some(lock)
@@ -975,10 +975,42 @@ fn main() {
             );
             None
         }
+    }
+}
+
+fn main() {
+    let started = Instant::now();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
+        .init();
+    let args = parse_args();
+    // Desktop registration needs no display, so it runs before GPUI starts.
+    if let Some(request) = &args.desktop {
+        console_output();
+        if let Err(err) = desktop::run(request) {
+            eprintln!("brindle: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // One Brindle per state directory: the process that takes the session
+    // lock is the instance, and a later launch hands it its request and
+    // exits. A debug run beside it runs on its own instead, and so does a
+    // Brindle with no state directory, whose window says so.
+    let state_dir = session::state_dir(&session::StateEnv::read());
+    let lock = match &state_dir {
+        Some(state_dir) => session_lock(state_dir, &args),
+        None => {
+            log::warn!("no state directory: running on its own, without restoring or recording");
+            None
+        }
     };
+    let notices: Vec<String> = if state_dir.is_none() { vec![session::NO_STATE_DIR.to_string()] } else { Vec::new() };
     let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
     let mut socket = None;
-    if lock.is_some() {
+    if lock.is_some()
+        && let Some(state_dir) = &state_dir
+    {
         let handler = move |request: instance::Request| {
             // Listed here, off the UI thread.
             let listing = request.attach.map_or(Listing::Skipped, |_| running_sessions());
@@ -990,7 +1022,7 @@ fn main() {
                 .recv_timeout(instance::FORWARD_LIMIT)
                 .map_err(|_| "Brindle didn't take the request in time".to_string())?
         };
-        match instance::listen(&state_dir, Box::new(handler)) {
+        match instance::listen(state_dir, Box::new(handler)) {
             Ok(path) => {
                 log::debug!("taking launches at {}", path.display());
                 socket = Some(path);
@@ -1004,7 +1036,8 @@ fn main() {
     // thread of its own while GPUI starts, so the UI thread never waits on
     // the terminal server or the state file (`process R13`).
     let restoring = !args.no_restore && lock.is_some();
-    let reads = start_launch_reads(restoring, args.attach.is_some(), &state_dir);
+    let restore_from = state_dir.clone().filter(|_| restoring);
+    let reads = start_launch_reads(restore_from.as_deref(), args.attach.is_some());
     // A plain value, read before any event loop exists.
     let (config, report) = Config::load_or_default();
 
@@ -1017,7 +1050,7 @@ fn main() {
         // when it started.
         let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         let origin: gpui::SharedString = layout::origin_id(std::process::id(), since_epoch).into();
-        let settings = Settings::from_platform(config, report, cx);
+        let settings = Settings::from_platform(config, report, cx).with_notices(notices);
         let profile = match &args.profile {
             Some(name) => settings.config.profile_index(name).unwrap_or_else(|| {
                 log::warn!("no profile named {name:?}");
@@ -1101,11 +1134,9 @@ fn main() {
                     log::error!("{why}; not attaching detached sessions");
                     // Read again, so a bug in the listing can't cost the
                     // saved tabs, which the next record would overwrite.
-                    let recorded = if restoring {
-                        let dir = state_dir.clone();
-                        cx.background_executor().spawn(async move { recorded_window(&dir) }).await
-                    } else {
-                        None
+                    let recorded = match restore_from.clone() {
+                        Some(dir) => cx.background_executor().spawn(async move { recorded_window(&dir) }).await,
+                        None => None,
                     };
                     LaunchReads { listing: Listing::Failed(why.into()), recorded }
                 }
@@ -1114,8 +1145,8 @@ fn main() {
             cx.update(|cx| {
                 let startup = startup_launch(&reads.listing, reads.recorded, restoring, args.attach, asked, profile);
                 cx.set_global(reattach::Detached::new(startup.detached));
-                if let Launch::Restore(state) = &startup.first {
-                    log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(&state_dir).display());
+                if let (Launch::Restore(state), Some(dir)) = (&startup.first, &restore_from) {
+                    log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(dir).display());
                 }
                 let Some(window) = open_window(startup.first, origin, cx) else {
                     cx.quit();
@@ -1140,7 +1171,7 @@ fn main() {
                     sweep_launch_hosts(window, cx);
                 }
                 watch_config(cx);
-                record_session(cx);
+                record_session(state_dir.clone(), cx);
                 take_launches(window, requests, cx);
                 run_debug_steps(window, &args, cx);
             })
@@ -1176,15 +1207,12 @@ fn run_debug_steps(window: gpui::WindowHandle<Workspace>, args: &Args, cx: &mut 
                 wait_for_text(window, text, wait_for_limit(interval), &step_waits, cx).await;
                 continue;
             }
-            if let Step::Key(key) = &step {
+            if let Step::Key(keystroke) = &step {
                 // Not inside the workspace's update: the key's actions
                 // update it themselves.
-                let key = key.clone();
-                cx.update_window(window.into(), move |_, window, cx| match Keystroke::parse(&key) {
-                    Ok(keystroke) => {
-                        window.dispatch_keystroke(keystroke, cx);
-                    }
-                    Err(err) => log::error!("--key: bad keystroke {key:?}: {err:?}"),
+                let keystroke = keystroke.clone();
+                cx.update_window(window.into(), move |_, window, cx| {
+                    window.dispatch_keystroke(keystroke, cx);
                 })
                 .ok();
                 continue;
@@ -1193,12 +1221,11 @@ fn run_debug_steps(window: gpui::WindowHandle<Workspace>, args: &Args, cx: &mut 
                 .update(cx, |ws, window, cx| match &step {
                     Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
                     Step::Find(text) => ws.find_in_active(text, window, cx),
-                    Step::Action(name) => match actions::action_by_name(name) {
-                        Some(action) => window.dispatch_action(action, cx),
-                        None => log::error!("--action: unknown action {name:?}"),
-                    },
-                    Step::Pointer(Ok(step)) => ws.debug_pointer(step, window, cx),
-                    Step::Pointer(Err(why)) => log::error!("--hover/--click: {why}"),
+                    Step::Action(name) => {
+                        let action = actions::action_by_name(name).expect("checked when the arguments were parsed");
+                        window.dispatch_action(action, cx);
+                    }
+                    Step::Pointer(step) => ws.debug_pointer(step, window, cx),
                     Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
                     Step::WaitFor(_) | Step::Key(_) => {}
                 })
@@ -1320,6 +1347,72 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         parse_args_from(args.iter().map(|s| s.to_string()), Some(Path::new("/home/u")))
+            .unwrap_or_else(|why| panic!("{args:?}: {why}"))
+    }
+
+    /// The usage error `args` give.
+    fn refused(args: &[&str]) -> String {
+        match parse_args_from(args.iter().map(|s| s.to_string()), Some(Path::new("/home/u"))) {
+            Ok(parsed) => panic!("{args:?} parsed: {parsed:?}"),
+            Err(why) => why,
+        }
+    }
+
+    #[test]
+    fn an_option_without_its_value_is_a_usage_error() {
+        for option in [
+            "-p",
+            "--profile",
+            "-d",
+            "--working-directory",
+            "--config",
+            "--send",
+            "--action",
+            "--find",
+            "--wait-for",
+            "--key",
+            "--hover",
+            "--click",
+            "--dump-screen-after",
+            "--latency-log",
+            "--prefix",
+        ] {
+            let why = refused(&[option]);
+            assert!(why.starts_with(&format!("{option} needs ")), "{option}: {why}");
+        }
+        assert_eq!(refused(&["--dump-screen-after", "soon"]), "--dump-screen-after needs a number of seconds");
+        assert_eq!(refused(&["--dump-screen-after", "-1"]), "--dump-screen-after needs a number of seconds");
+        assert_eq!(parse(&["--dump-screen-after", "2.5"]).dump_after, Some(2.5));
+    }
+
+    #[test]
+    fn dash_e_without_a_command_is_a_usage_error() {
+        assert_eq!(refused(&["-e"]), "-e needs a command");
+        assert_eq!(refused(&["-p", "work", "--command"]), "--command needs a command");
+    }
+
+    #[test]
+    fn an_unknown_action_is_a_usage_error() {
+        let why = refused(&["--action", "split_zone_rihgt", "--dump-screen-after", "3"]);
+        assert!(why.contains("--action") && why.contains("\"split_zone_rihgt\""), "{why}");
+        assert!(matches!(&parse(&["--action", "split_zone_right"]).steps[..], [Step::Action(name)] if name == "split_zone_right"));
+    }
+
+    #[test]
+    fn a_bad_key_is_a_usage_error() {
+        let why = refused(&["--key", "ctrl-a-b"]);
+        assert!(why.starts_with("--key: ") && why.contains("ctrl-a-b"), "{why}");
+    }
+
+    #[test]
+    fn a_bad_pointer_position_is_a_usage_error() {
+        for (option, position) in [("--hover", "3"), ("--click", "hyper-3,0"), ("--click", "a,b")] {
+            let why = refused(&[option, position]);
+            assert!(why.starts_with(&format!("{option}: ")), "{option} {position}: {why}");
+        }
+        let args = parse(&["--click", "ctrl-3,1"]);
+        let [Step::Pointer(step)] = &args.steps[..] else { panic!("{:?}", args.steps) };
+        assert_eq!((step.col, step.row, step.click, step.modifiers.control), (3, 1, true, true));
     }
 
     #[test]
@@ -1383,10 +1476,18 @@ mod tests {
 
     #[test]
     fn key_and_modality_steps_keep_their_order() {
-        let args = parse(&["--key", "shift-tab", "--modality", "pointer", "--action", "x", "--modality", "keyboard"]);
+        let args =
+            parse(&["--key", "shift-tab", "--modality", "pointer", "--action", "new_tab", "--modality", "keyboard"]);
         assert!(args.is_debug_run());
-        let steps: Vec<String> = args.steps.iter().map(|s| format!("{s:?}")).collect();
-        assert_eq!(steps, [r#"Key("shift-tab")"#, "Modality(Pointer)", r#"Action("x")"#, "Modality(Keyboard)"]);
+        let steps: Vec<String> = args
+            .steps
+            .iter()
+            .map(|s| match s {
+                Step::Key(keystroke) => format!("Key({})", keystroke.unparse()),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(steps, ["Key(shift-tab)", "Modality(Pointer)", r#"Action("new_tab")"#, "Modality(Keyboard)"]);
     }
 
     #[test]

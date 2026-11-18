@@ -11,9 +11,13 @@ pub struct Settings {
     config_error: Option<String>,
     /// What the config's file says that Brindle didn't use as written.
     config_findings: Vec<ConfigFinding>,
-    /// The window's config line (the error and the findings, worded by
-    /// [`config_line`]), shown until the file is fixed. Built when the
-    /// settings are, so drawing only reads it.
+    /// Window notices that aren't about the config (Brindle can't save its
+    /// session), at the end of the config line. Set at launch and kept
+    /// across reloads.
+    notices: Vec<String>,
+    /// The window's config line (the error, the findings and the notices,
+    /// worded by [`config_line`]), shown until the file is fixed. Built
+    /// when the settings are, so drawing only reads it.
     pub config_line: Option<SharedString>,
     /// Font size change from ctrl-+ / ctrl-- (applies to all tabs).
     pub zoom: f32,
@@ -99,6 +103,7 @@ impl Settings {
             config,
             config_error: report.error,
             config_findings: report.findings,
+            notices: Vec::new(),
             config_line,
             zoom: 0.0,
             font,
@@ -123,8 +128,24 @@ impl Settings {
     /// made) to the config line.
     pub fn add_binding_findings(&mut self, findings: Vec<ConfigFinding>) {
         self.config_findings.extend(findings);
+        self.reword_config_line();
+    }
+
+    /// These settings with `notices` at the end of the config line.
+    pub fn with_notices(mut self, notices: Vec<String>) -> Self {
+        self.notices = notices;
+        self.reword_config_line();
+        self
+    }
+
+    /// The window notices on the config line ([`Settings::with_notices`]).
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    fn reword_config_line(&mut self) {
         self.config_line =
-            config_line(self.config_error.as_deref(), &self.config_findings, &[]).map(SharedString::from);
+            config_line(self.config_error.as_deref(), &self.config_findings, &self.notices).map(SharedString::from);
     }
 
     /// Makes the config's global theme the active `brindle-ui` token set,
@@ -415,6 +436,20 @@ mod tests {
         assert!(line.contains("unknown theme") && line.contains("ctrl-shift-y"), "{line}");
         let clean = Settings::new(Config::default(), ConfigReport::default(), names(&["DejaVu Sans Mono"]));
         assert_eq!(clean.config_line, None);
+    }
+
+    /// A window notice ends the config line, and stays there when bindings
+    /// add findings.
+    #[test]
+    fn notices_end_the_config_line() {
+        let notice = crate::session::NO_STATE_DIR.to_string();
+        let mut settings = Settings::new(Config::default(), ConfigReport::default(), names(&["DejaVu Sans Mono"]))
+            .with_notices(vec![notice.clone()]);
+        assert_eq!(settings.config_line.as_ref().map(|line| line.as_ref()), Some(notice.as_str()));
+        settings.add_binding_findings(vec![ConfigFinding::UnknownAction { keys: "ctrl-y".into(), action: "nope".into() }]);
+        let line: &str = settings.config_line.as_ref().unwrap();
+        assert!(line.starts_with("Config: ") && line.ends_with(&notice), "{line}");
+        assert_eq!(settings.notices(), [notice]);
     }
 
     /// Every Windows has Segoe UI; no machine has the made-up family.
