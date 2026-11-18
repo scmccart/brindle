@@ -37,9 +37,13 @@ rule, not a convenience.
     what had focus, pushes a layer, focuses the view's initial handle (else
     its first stop, else itself), wraps it in a `FocusScope`, turns Escape
     and outside presses into a `Dismiss` request, and gives focus back on
-    close. A non-modal slot can block the pointer outside its view while
-    open (`block_outside_pointer`, a select's menu): an outside press then
-    only requests dismissal and reaches nothing beneath.
+    close. Its kind is an `OverlayKind`: `Modal` (`Overlay::modal()`, a
+    backdrop that blocks the pointer) or `NonModal { blocks_outside }`
+    (`Overlay::non_modal()` for a popover). A non-modal slot can block the
+    pointer outside its view while open
+    (`Overlay::new(OverlayKind::NonModal { blocks_outside: true })`, a
+    select's menu): an outside press then only requests dismissal and
+    reaches nothing beneath.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
     view lists, and never leave it.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
@@ -98,7 +102,9 @@ rule, not a convenience.
       triggers and which one is active and is asked to change them:
       `on_activate(&TabActivate { index, by })` (`by` is the pointer or the
       keyboard, so the owner decides where focus goes), `on_close(&index)`
-      and `on_move(&TabMove { from, to })`; `on_trigger_bounds` reports where
+      and `on_move(&TabMove { from, to })` (`from` is the dragged trigger's
+      own `ElementId`, since triggers may move during a drag, and `to` the
+      index of the trigger it was dropped on); `on_trigger_bounds` reports where
       the triggers were laid out. One look, shadcn's default (pill) list
       (`tab_list_style`); shadcn's `line` variant is deliberately not
       offered. A trigger may carry its own `surface` and `text_color`, drawn
@@ -122,8 +128,9 @@ rule, not a convenience.
       (`trigger_label`, public for other one-line labels in a flex row,
       since gpui 0.2.2's `truncate` cuts nothing in a flex item).
       With `on_move`, a trigger dragged onto another of the same list
-      (`DraggedTab`, previewed as a pill with its label) asks to move there,
-      and a 2px primary bar marks the side it will land on (`drop_side`).
+      (`DraggedTab`, carrying the trigger's id and previewed as a pill with
+      its label) asks to move there, and a 2px primary bar marks the side it
+      will land on (`drop_target`, from where the dragged trigger is now).
 
     Three of the builders are not controls:
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
@@ -159,7 +166,23 @@ rule, not a convenience.
     (`SelectEvent::Changed`, only on a change), `Combobox`
     (`ComboboxEvent::Changed`, only on a change) and `Command`
     (`CommandEvent::Confirmed` / `Cancelled`), plus `TextInput`
-    (`TextInputEvent::Changed`). `Combobox` is shadcn's combobox, a popover
+    (`TextInputEvent::Changed`).
+    - **Keys:** every item of a list the owner can replace has an `ItemKey`,
+      its identity as shadcn's `value` is: `CommandItem`, `SelectOption`
+      and `MenuItem` take their label as the key unless given one
+      (`.key(..)`), which an owner whose labels can repeat does. A
+      component keeps an item by its key across a refresh and names the
+      chosen item by it: `SelectEvent::Changed(key)`,
+      `ComboboxEvent::Changed(key)` and `MenuEvent::Selected(key)`. A
+      select's or combobox's choice is kept by key (`set_options` keeps it
+      only if an option still has it, else the placeholder shows), and the
+      owner finds a key among its items as they are then (`option_keyed`,
+      `item_keyed`, `entry_keyed`). An index is valid only in the call that
+      computed it: `CommandEvent::Confirmed(index)` is read in the same
+      update, and an index an owner passes in (`Select::new`,
+      `set_selected`) is turned into the key at once.
+
+    `Combobox` is shadcn's combobox, a popover
     holding a `Command`: a trigger drawn as a select's that opens, below it
     and at least its width, a searchable list of options in
     `CommandGroup`s with the chosen one highlighted and checked
@@ -167,21 +190,27 @@ rule, not a convenience.
     press closes, and a character typed on the closed trigger opens it
     searching for that character. `Combobox::set_groups(groups, selected,
     cx)` replaces the options, and an open list keeps its search and
-    highlighted option. `Command::set_groups(groups, keep, cx)`
+    highlighted option, by its key. The panel is placed only once the
+    trigger has been measured (`panel_width(None, min)` is the least
+    width). `Command::set_groups(groups, keep, cx)`
     replaces the items and leaves the filter text alone: with `keep: None`
     the first enabled match is highlighted and the list returns to the top,
-    and with `keep: Some(ix)`, an index across the new groups, that item
+    and with `keep: Some(key)`, an `ItemKey` the new groups have, that item
     stays highlighted while it matches and is enabled (else the first enabled
     match is) and the list keeps its scroll offset, moving only as far as the
-    highlighted row needs to be in view. `CommandRows::build` takes the same
-    `keep`. The owner maps its own identities to the index. `Popover` is a `RenderOnce` whose open state
+    highlighted row needs to be in view (`CommandRows::scroll_after`, a
+    `Scroll`). A key the new groups don't have is as `None`.
+    `CommandRows::build` takes the kept item's index in the new groups.
+    `Popover` is a `RenderOnce` whose open state
     lives in keyed state; its trigger closure wires `PopoverTrigger::on_click`
     into the trigger's own click.
     - Menus: `Menu` is the content both openers show, a list of `MenuEntry`
       (`Item(MenuItem)` with a label, an optional `description` line under
       it in the muted colour, an optional `shortcut` drawn as `Kbd` keycaps
-      and `disabled`; or `Separator`). It emits `MenuEvent::Selected(index)`
-      (separators counted); Escape and an outside press only close it. It
+      and `disabled`; or `Separator`, which has no label and no key). It
+      emits `MenuEvent::Selected(key)`, the chosen item's `ItemKey`, which
+      the owner finds among its current entries (`entry_keyed`); Escape and
+      an outside press only close it. It
       blocks the pointer outside it, has its height capped at the room
       beside its anchor and scrolls, keeping the highlight in view. The
       highlight starts on nothing; up/down (and ctrl-p/ctrl-n) move over the
