@@ -1144,7 +1144,7 @@ mod tests {
             Connection::relay(dial, "tok", timings)
         };
         let request = || SpawnRequest {
-            command: String::new(),
+            command: None,
             args: Vec::new(),
             cwd: None,
             env: Default::default(),

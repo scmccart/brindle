@@ -242,7 +242,8 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// What a new session runs.
 pub struct SpawnRequest {
-    pub command: String,
+    /// The program, never empty; `None` runs the host's login shell.
+    pub command: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     /// The program's whole environment. On a relay connection, what goes
@@ -258,6 +259,27 @@ pub struct SpawnRequest {
     pub policy: Policy,
     /// The profile that started it, for whoever attaches it later.
     pub profile: Option<String>,
+}
+
+impl SpawnRequest {
+    /// The `SPAWN` asking for this under `req`, where no command is the
+    /// wire's empty field.
+    fn into_spawn(self, req: RequestId) -> client::Spawn {
+        client::Spawn {
+            req,
+            command: self.command,
+            args: self.args,
+            cwd: self.cwd,
+            env: self.env,
+            cols: self.cols,
+            rows: self.rows,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            scrollback: self.scrollback,
+            policy: self.policy,
+            profile: self.profile,
+        }
+    }
 }
 
 /// Which detached session to attach, and when.
@@ -1332,24 +1354,9 @@ impl Connection {
     /// to report its id and pid. `abandon` lets its tab withdraw it while it
     /// waits. Not on the UI thread: this blocks.
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest, sink: Sink, abandon: Option<&Abandon>) -> Result<Running> {
-        let command = Some(request.command).filter(|command| !command.is_empty());
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let started = self.ask("start the session", abandon, None, |req, reply| {
-            let message = Some(ToCore::Spawn(client::Spawn {
-                req,
-                command,
-                args: request.args,
-                cwd: request.cwd,
-                env: request.env,
-                cols: request.cols,
-                rows: request.rows,
-                cell_w: request.cell_w,
-                cell_h: request.cell_h,
-                scrollback: request.scrollback,
-                policy: request.policy,
-                profile: request.profile,
-            }));
-            (Waiting::Spawn { sink, reply }, message)
+            (Waiting::Spawn { sink, reply }, Some(ToCore::Spawn(request.into_spawn(req))))
         })?;
         let Started { session, pid, key } = started;
         Ok(Running::new(session, pid, key, self.clone()))
@@ -3096,7 +3103,7 @@ mod tests {
 
     fn spawn_request(env: &[(&str, &str)]) -> SpawnRequest {
         SpawnRequest {
-            command: String::new(),
+            command: None,
             args: Vec::new(),
             cwd: Some("~/src".into()),
             env: env.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect(),
@@ -3198,6 +3205,21 @@ mod tests {
         // Other messages go as they are.
         let list = ToCore::List(Request { req: 4 });
         assert_eq!(encode(&list, Some(&host)).unwrap(), list.encode().unwrap());
+    }
+
+    /// A request's `SPAWN` on the wire: no command is `null`, which the
+    /// core takes as the login shell, and a command goes as it is.
+    #[test]
+    fn a_spawn_request_encodes_its_command_as_the_wire_has_it() {
+        let encoded = |command: Option<&str>| {
+            let request = SpawnRequest { command: command.map(Into::into), ..spawn_request(&[("FOO", "1")]) };
+            let frame = ToCore::Spawn(request.into_spawn(3)).encode().unwrap();
+            assert_eq!(frame.msg_type, client::MSG_SPAWN);
+            String::from_utf8(frame.payload).unwrap()
+        };
+        let rest = r#""args":[],"cwd":"~/src","env":{"FOO":"1"},"cols":80,"rows":24,"cell_w":8,"cell_h":16,"scrollback":1000,"policy":"detach","profile":"A8"}"#;
+        assert_eq!(encoded(None), format!(r#"{{"req":3,"command":null,{rest}"#));
+        assert_eq!(encoded(Some("htop")), format!(r#"{{"req":3,"command":"htop",{rest}"#));
     }
 
     /// 5.4: `HELLO` asks for linger and process info, and a `SPAWN` with

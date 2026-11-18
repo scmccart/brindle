@@ -274,11 +274,12 @@ pub struct Terminal {
     marks: Arc<Mutex<Marks>>,
     size: GridSize,
     title: Option<String>,
-    exited: bool,
-    /// It shows a detached session it attached ([`Terminal::attach`]).
-    attaching: bool,
-    /// Its session never started or attached; it shows why.
-    failed: bool,
+    /// Whether its program runs, ended, or never started; moved on only by
+    /// [`Life::after`].
+    life: Life,
+    /// Whether it started its session or attached a detached one
+    /// ([`Terminal::attach`]).
+    origin: Origin,
     /// Notices ([`Terminal::note`]) due before the attached session's first
     /// replay ends, which would wipe them: `Some` until then, written when
     /// the replay ends, or after the line that says the attach failed or
@@ -370,8 +371,7 @@ impl Terminal {
                 self.release_notes(cx);
             }
             ChannelEvent::Failed => {
-                self.failed = true;
-                self.mark_lost(cx);
+                self.mark_failed(cx);
                 self.release_notes(cx);
             }
             ChannelEvent::Broken(reason) => self.broken(&reason, cx),
@@ -441,10 +441,9 @@ impl Terminal {
             marks,
             size,
             title: None,
-            exited: false,
-            attaching: false,
+            life: Life::Running,
+            origin: Origin::Spawned,
             held_notes: None,
-            failed: false,
             replaying: false,
             status: status::Records::default(),
             theme,
@@ -474,7 +473,15 @@ impl Terminal {
             // Brindle. Everything else keeps running when Brindle goes away
             // without closing it.
             let closing = Closing::new(command_override.is_some());
-            let (request, doing) = spawn_request(profile, host, command_override, cwd_override, config);
+            let (request, doing) = spawn_request(
+                profile,
+                host,
+                command_override,
+                cwd_override,
+                config,
+                dirs::home_dir(),
+                std::path::Path::is_dir,
+            );
             Self::start_session(host, request, doing, closing, theme, config, cx)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -562,7 +569,7 @@ impl Terminal {
         let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
         let theme = config.profile_theme(profile);
         let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
-        this.attaching = true;
+        this.origin = Origin::Attached;
         this.held_notes = Some(Vec::new());
         this
     }
@@ -660,27 +667,39 @@ impl Terminal {
         }
     }
 
+    /// The program exited: the terminal has ended, which its tab hears once.
     pub fn mark_exited(&mut self, cx: &mut Context<Self>) {
-        if !self.exited {
-            self.exited = true;
-            if self.status.end_activity() {
-                cx.emit(TerminalEvent::Status(None));
-            }
+        if self.end(LifeEvent::Exited, cx) {
             cx.emit(TerminalEvent::Exited);
         }
     }
 
-    /// The server session can't be got back (its line is on the screen): the
-    /// terminal has ended, but the tab stays open on its last screen, so no
-    /// `Exited`.
+    /// The server session can't be got back, or Brindle can't show it any
+    /// more (its line is on the screen): the terminal has ended, but the tab
+    /// stays open on its last screen, so no `Exited`.
     fn mark_lost(&mut self, cx: &mut Context<Self>) {
         self.replaying = false;
-        if !self.exited {
-            self.exited = true;
-            if self.status.end_activity() {
-                cx.emit(TerminalEvent::Status(None));
-            }
+        self.end(LifeEvent::Lost, cx);
+    }
+
+    /// The session never started or attached (its line is on the screen):
+    /// as [`Terminal::mark_lost`], and an attached terminal then shows only
+    /// that line ([`Terminal::shows_only_message`]).
+    fn mark_failed(&mut self, cx: &mut Context<Self>) {
+        self.replaying = false;
+        self.end(LifeEvent::Failed, cx);
+    }
+
+    /// Moves the terminal's life on by `event`. True when that ended a
+    /// running terminal, whose status activity then ends.
+    fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
+        let was = self.life;
+        self.life = was.after(event);
+        let ended = was == Life::Running;
+        if ended && self.status.end_activity() {
+            cx.emit(TerminalEvent::Status(None));
         }
+        ended
     }
 
     /// The program status records (OSC 7501).
@@ -1116,22 +1135,25 @@ impl Terminal {
         self.leave(false, layout);
     }
 
-    /// Ends the terminal's connection to its program: `close` ends the
-    /// program; otherwise a server session's program is left as its
-    /// [`Closing`] says. A message terminal has no program.
     /// Keeps the layout of the tab this terminal is in current on its
-    /// server session (`crate::layout`), as it changes; a message terminal
-    /// has none.
+    /// server session (`crate::layout`), as it changes, while its program
+    /// runs; a message terminal has none.
     pub fn set_layout(&self, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, closing: Closing::Keeps, .. } if !self.exited => session.set_layout(layout),
-            _ => {
-                let _ = layout;
+            Backend::Server { session, closing: Closing::Keeps, .. } if self.life == Life::Running => {
+                session.set_layout(layout)
             }
+            // Its program ended, or ends with Brindle: nothing restores it.
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { closing: Closing::Keeps | Closing::Ends, .. } => {}
+            Backend::Remote => drop(layout),
         }
     }
 
+    /// Ends the terminal's connection to its program: `close` ends the
+    /// program; otherwise a server session's program is left as its
+    /// [`Closing`] says. A message terminal has no program.
     fn leave(&mut self, close: bool, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
@@ -1155,7 +1177,7 @@ impl Terminal {
         &self,
     ) -> Option<(crate::remote::protocol::SessionId, Option<crate::remote::SessionKey>)> {
         match &self.backend {
-            Backend::Server { session, .. } if !self.exited => session.id_and_key(),
+            Backend::Server { session, .. } if self.life == Life::Running => session.id_and_key(),
             Backend::Server { .. } | Backend::Remote => None,
         }
     }
@@ -1163,7 +1185,61 @@ impl Terminal {
     /// An attach that failed (refused, or its session gone): the terminal
     /// only says why, and session restore doesn't record it.
     pub fn shows_only_message(&self) -> bool {
-        self.attaching && self.failed
+        self.origin.shows_only_message(self.life)
+    }
+}
+
+/// Where a terminal's program is in its life (`types R1`): one value, so a
+/// terminal can't be both failed and running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Life {
+    /// Its program runs, or its session is still starting or attaching.
+    Running,
+    /// Its program exited, or its session was lost or can't be shown.
+    Ended,
+    /// Its session never started or attached; the terminal says why.
+    Failed,
+}
+
+/// What ends a terminal's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifeEvent {
+    /// Its program exited.
+    Exited,
+    /// Its session can't be got back, or Brindle's emulator broke on it.
+    Lost,
+    /// Its session never started or attached.
+    Failed,
+}
+
+impl Life {
+    /// The life after `event`: any of them ends a running terminal, a
+    /// failure is final, and a session that failed after it ended failed.
+    fn after(self, event: LifeEvent) -> Self {
+        match self {
+            Self::Failed => Self::Failed,
+            Self::Running | Self::Ended => match event {
+                LifeEvent::Exited | LifeEvent::Lost => Self::Ended,
+                LifeEvent::Failed => Self::Failed,
+            },
+        }
+    }
+}
+
+/// How a terminal came by its session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// It started it (or shows a message, with no session).
+    Spawned,
+    /// It attached a detached one.
+    Attached,
+}
+
+impl Origin {
+    /// Whether a terminal of this origin, in `life`, only says why it has
+    /// no session: an attach that failed, which restore doesn't record.
+    fn shows_only_message(self, life: Life) -> bool {
+        self == Self::Attached && life == Life::Failed
     }
 }
 
@@ -1342,9 +1418,10 @@ fn broken_line(reason: &str) -> String {
 /// command, a directory as given (its holder expands `~` and falls back to
 /// home), and its own environment under the profile's
 /// ([`SpawnRequest::remote`](crate::remote::local::SpawnRequest::remote)).
-/// This machine's is resolved here: the program, a directory that exists,
-/// and Brindle's own environment under the profile's. Which one depends on
-/// `host` alone, not on what the profile targets.
+/// This machine's is resolved here: the program, a directory that exists
+/// (by `is_dir`: the asked one, else the profile's with `~` as `home`, else
+/// `home`), and Brindle's own environment under the profile's. Which one
+/// depends on `host` alone, not on what the profile targets.
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn spawn_request(
     profile: &Profile,
@@ -1352,6 +1429,8 @@ pub(crate) fn spawn_request(
     command_override: Option<(String, Vec<String>)>,
     cwd_override: Option<std::path::PathBuf>,
     config: &Config,
+    home: Option<std::path::PathBuf>,
+    is_dir: impl Fn(&std::path::Path) -> bool,
 ) -> (crate::remote::local::SpawnRequest, String) {
     let policy = Closing::new(command_override.is_some()).policy();
     let size = GridSize::default();
@@ -1359,9 +1438,9 @@ pub(crate) fn spawn_request(
     if !host.is_local() {
         let request =
             crate::remote::local::SpawnRequest::remote(profile, command_override, cwd_override, size, scrollback, policy);
-        let doing = match request.command.as_str() {
-            "" => format!("open a shell on {}", host.name()),
-            command => format!("start {command:?} on {}", host.name()),
+        let doing = match &request.command {
+            None => format!("open a shell on {}", host.name()),
+            Some(command) => format!("start {command:?} on {}", host.name()),
         };
         return (request, doing);
     }
@@ -1371,14 +1450,14 @@ pub(crate) fn spawn_request(
         Some(program) => (program.clone(), profile.args.clone()),
         None => default_program(&profile.args),
     });
-    let home = dirs::home_dir();
     let working_directory = cwd_override
         .or_else(|| profile.working_directory(home.as_deref()))
         .or(home)
-        .filter(|dir| dir.is_dir());
+        .filter(|dir| is_dir(dir));
     let doing = format!("start {program:?}");
     let request = crate::remote::local::SpawnRequest {
-        command: program,
+        // A profile's empty `command` is none.
+        command: Some(program).filter(|program| !program.is_empty()),
         args,
         cwd: working_directory.map(|dir| dir.to_string_lossy().into_owned()),
         env: server_env(std::env::vars_os(), profile),
@@ -1533,32 +1612,56 @@ mod tests {
         use crate::config::RemoteTarget;
         use crate::remote::protocol::client::Policy;
 
+        use std::path::{Path, PathBuf};
+
         let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false };
         let profile = Profile {
             name: "htop".into(),
             command: Some("htop".into()),
-            cwd: Some("/var/log/brindle-nowhere".into()),
+            cwd: Some("/srv/logs".into()),
             remote: Some(a8.clone()),
             ..Default::default()
         };
         let config = Config::default();
+        let remote_host = Host::Remote(a8);
+        // Which directories this machine has, as `is_dir` says.
+        let request = |profile: &Profile, host: &Host, command, cwd, here: &[&str]| {
+            let home = Some(PathBuf::from("/home/me"));
+            spawn_request(profile, host, command, cwd, &config, home, |dir: &Path| here.iter().any(|here| dir == Path::new(here)))
+        };
 
-        let (remote, doing) = spawn_request(&profile, &Host::Remote(a8.clone()), None, None, &config);
-        assert_eq!((remote.command.as_str(), doing.as_str()), ("htop", "start \"htop\" on A8"));
-        assert_eq!(remote.cwd.as_deref(), Some("/var/log/brindle-nowhere"));
+        let (remote, doing) = request(&profile, &remote_host, None, None, &[]);
+        assert_eq!((remote.command.as_deref(), doing.as_str()), (Some("htop"), "start \"htop\" on A8"));
+        assert_eq!(remote.cwd.as_deref(), Some("/srv/logs"));
         assert_eq!(remote.policy, Policy::Detach);
 
-        let (local, doing) = spawn_request(&profile, &Host::Local, None, None, &config);
-        assert_eq!((local.command.as_str(), doing.as_str()), ("htop", "start \"htop\""));
-        assert_eq!(local.cwd, None);
+        let (local, doing) = request(&profile, &Host::Local, None, None, &["/home/me"]);
+        assert_eq!((local.command.as_deref(), doing.as_str()), (Some("htop"), "start \"htop\""));
+        assert_eq!(local.cwd, None, "the profile's directory isn't here, and home isn't tried");
         assert_eq!(local.policy, Policy::Detach);
+        let (local, _) = request(&profile, &Host::Local, None, None, &["/srv/logs"]);
+        assert_eq!(local.cwd.as_deref(), Some("/srv/logs"));
+        let (split, _) = request(&profile, &Host::Local, None, Some("/srv/old".into()), &["/srv/old", "/srv/logs"]);
+        assert_eq!(split.cwd.as_deref(), Some("/srv/old"), "the asked directory wins");
+
+        // A local profile's `~` is this machine's home, and with no
+        // directory it starts in home, if there is one.
+        let local_profile = Profile { cwd: Some("~/src".into()), remote: None, ..profile.clone() };
+        let (local, _) = request(&local_profile, &Host::Local, None, None, &["/home/me/src"]);
+        assert_eq!(local.cwd.as_deref().map(Path::new), Some(Path::new("/home/me/src")));
+        let no_dir = Profile { cwd: None, ..local_profile };
+        assert_eq!(request(&no_dir, &Host::Local, None, None, &["/home/me"]).0.cwd.as_deref(), Some("/home/me"));
+        assert_eq!(request(&no_dir, &Host::Local, None, None, &[]).0.cwd, None);
 
         let shell = Profile { command: None, ..profile.clone() };
-        let (_, doing) = spawn_request(&shell, &Host::Remote(a8.clone()), None, None, &config);
+        let (_, doing) = request(&shell, &remote_host, None, None, &[]);
         assert_eq!(doing, "open a shell on A8");
+        let empty = Profile { command: Some(String::new()), ..profile.clone() };
+        let (empty, doing) = request(&empty, &remote_host, None, None, &[]);
+        assert_eq!((empty.command, doing.as_str()), (None, "open a shell on A8"));
 
-        let (command, _) = spawn_request(&profile, &Host::Remote(a8), Some(("top".into(), vec!["-b".into()])), None, &config);
-        assert_eq!((command.command.as_str(), command.args.as_slice()), ("top", ["-b".to_string()].as_slice()));
+        let (command, _) = request(&profile, &remote_host, Some(("top".into(), vec!["-b".into()])), None, &[]);
+        assert_eq!((command.command.as_deref(), command.args.as_slice()), (Some("top"), ["-b".to_string()].as_slice()));
         assert_eq!(command.policy, Policy::Kill);
     }
 
@@ -1720,6 +1823,45 @@ mod tests {
             use crate::remote::protocol::client::Policy;
             assert_eq!(Closing::Keeps.policy(), Policy::Detach);
             assert_eq!(Closing::Ends.policy(), Policy::Kill);
+        }
+    }
+
+    /// Any event ends a running terminal: an exit or a loss as ended, a
+    /// failure as failed. An ended terminal stays ended, unless its session
+    /// then failed, and a failure is final.
+    #[test]
+    fn a_terminals_life_moves_on_by_what_ended_it() {
+        use LifeEvent::{Exited, Failed, Lost};
+        let table = [
+            (Life::Running, Exited, Life::Ended),
+            (Life::Running, Lost, Life::Ended),
+            (Life::Running, Failed, Life::Failed),
+            (Life::Ended, Exited, Life::Ended),
+            (Life::Ended, Lost, Life::Ended),
+            (Life::Ended, Failed, Life::Failed),
+            (Life::Failed, Exited, Life::Failed),
+            (Life::Failed, Lost, Life::Failed),
+            (Life::Failed, Failed, Life::Failed),
+        ];
+        for (life, event, after) in table {
+            assert_eq!(life.after(event), after, "{life:?} after {event:?}");
+        }
+    }
+
+    /// Only an attach that failed counts as showing nothing but its
+    /// message, whatever else ended.
+    #[test]
+    fn only_a_failed_attach_shows_only_its_message() {
+        let table = [
+            (Origin::Spawned, Life::Running, false),
+            (Origin::Spawned, Life::Ended, false),
+            (Origin::Spawned, Life::Failed, false),
+            (Origin::Attached, Life::Running, false),
+            (Origin::Attached, Life::Ended, false),
+            (Origin::Attached, Life::Failed, true),
+        ];
+        for (origin, life, only) in table {
+            assert_eq!(origin.shows_only_message(life), only, "{origin:?} {life:?}");
         }
     }
 

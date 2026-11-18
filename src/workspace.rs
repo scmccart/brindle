@@ -2938,8 +2938,10 @@ mod tests {
         assert_eq!(request.command, Some(editor()));
         assert_eq!(request.cwd, None);
         let profile = &config.profiles[request.profile];
-        let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config);
-        assert_eq!((spawn.command, spawn.args), editor());
+        let nothing_here = |_: &std::path::Path| false;
+        let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config, None, nothing_here);
+        let (program, args) = editor();
+        assert_eq!((spawn.command, spawn.args), (Some(program), args));
         assert_eq!(doing, "start \"/bin/sh\"");
         assert_eq!(spawn.cwd, None, "no such directory on this machine");
         request.profile
@@ -3081,7 +3083,9 @@ mod tests {
         let reloaded = reloaded_profile(&before, &config).expect("the profile is still there");
         assert_eq!(reloaded.remote, moved.remote);
         let split = |profile: &Profile, host: &Host| {
-            crate::terminal::spawn_request(profile, host, None, Some("/var/log/brindle-nowhere".into()), &config)
+            let nothing_here = |_: &std::path::Path| false;
+            let cwd = Some("/var/log/brindle-nowhere".into());
+            crate::terminal::spawn_request(profile, host, None, cwd, &config, None, nothing_here)
         };
         let (request, doing) = split(&reloaded, &tab_host);
         assert_eq!(doing, "start \"htop\" on old-host");

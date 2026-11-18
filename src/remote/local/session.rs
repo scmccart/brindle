@@ -31,17 +31,84 @@ enum Leaving {
 }
 
 enum Phase {
-    /// The session isn't there yet.
-    Starting {
-        input: Vec<Vec<u8>>,
-        resize: Option<Size>,
-        /// The window to parent the session's console to (Windows).
-        parent: Option<u64>,
-        left: Option<Leaving>,
-    },
+    /// The session isn't there yet; what the tab did meanwhile waits.
+    Starting(Queued),
+    /// The tab let it go before it was there: once it is, the session's
+    /// thread ends or detaches it.
+    Left(Leaving),
     Running(Running),
     /// It never started (the sink has said why), or the tab let it go.
     Gone,
+}
+
+/// What the tab asked of a session still starting, for it once it runs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Queued {
+    /// Input, in the order it was typed.
+    input: Vec<Vec<u8>>,
+    /// The last size asked for.
+    resize: Option<Size>,
+    /// The window to parent the session's console to (Windows).
+    parent: Option<u64>,
+}
+
+/// One thing a starting session is handed once it runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Op {
+    Resize(Size),
+    Reparent(u64),
+    /// Input already counted against the session's budget.
+    Input(Vec<u8>),
+}
+
+impl Queued {
+    /// What the running session is handed, in order: its size, its window,
+    /// then the input as typed.
+    fn into_ops(self) -> Vec<Op> {
+        let Self { input, resize, parent } = self;
+        resize
+            .map(Op::Resize)
+            .into_iter()
+            .chain(parent.map(Op::Reparent))
+            .chain(input.into_iter().map(Op::Input))
+            .collect()
+    }
+
+    /// How many bytes of input wait.
+    fn held(&self) -> usize {
+        self.input.iter().map(Vec::len).sum()
+    }
+}
+
+/// What letting a session go leaves its tab to do.
+enum Departure {
+    /// It is still starting: its request is withdrawn, and the input it
+    /// held (this many bytes) no longer waits.
+    Withdraw { held: usize },
+    /// It runs: it is closed or detached now.
+    Now(Running),
+    /// It is gone already.
+    Nothing,
+}
+
+impl Phase {
+    /// The tab lets the session go, `how`: a session still starting is
+    /// left, one running is taken out to be ended now, and the last word
+    /// of a tab that lets go twice is the one kept.
+    fn leave(&mut self, how: Leaving) -> Departure {
+        match std::mem::replace(self, Self::Gone) {
+            Self::Starting(queued) => {
+                *self = Self::Left(how);
+                Departure::Withdraw { held: queued.held() }
+            }
+            Self::Left(_) => {
+                *self = Self::Left(how);
+                Departure::Withdraw { held: 0 }
+            }
+            Self::Running(running) => Departure::Now(running),
+            Self::Gone => Departure::Nothing,
+        }
+    }
 }
 
 /// What the session's thread asks the core for.
@@ -113,7 +180,7 @@ impl Session {
             Start::Attach(request) => Some((request.session, request.key.clone())),
             Start::Spawn(_) => None,
         };
-        let phase = Arc::new(Mutex::new(Phase::Starting { input: Vec::new(), resize: None, parent: None, left: None }));
+        let phase = Arc::new(Mutex::new(Phase::Starting(Queued::default())));
         let abandon = Arc::new(Abandon::default());
         let budget = Budget::default();
         let sink: Sink = Arc::new(Mutex::new(sink));
@@ -134,7 +201,7 @@ impl Session {
     pub fn pid(&self) -> Option<u32> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some(running.pid()),
-            Phase::Starting { .. } | Phase::Gone => None,
+            Phase::Starting(_) | Phase::Left(_) | Phase::Gone => None,
         }
     }
 
@@ -144,7 +211,7 @@ impl Session {
     pub fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)> {
         match &*self.phase.lock() {
             Phase::Running(running) => Some((running.id(), running.key().cloned())),
-            Phase::Starting { .. } => self.requested.clone(),
+            Phase::Starting(_) | Phase::Left(_) => self.requested.clone(),
             Phase::Gone => None,
         }
     }
@@ -154,7 +221,7 @@ impl Session {
     pub fn foreground(&self) -> Option<Foreground> {
         match &*self.phase.lock() {
             Phase::Running(running) => running.foreground(),
-            Phase::Starting { .. } | Phase::Gone => None,
+            Phase::Starting(_) | Phase::Left(_) | Phase::Gone => None,
         }
     }
 
@@ -163,19 +230,19 @@ impl Session {
     /// or that never started, discards it.
     pub fn input(&self, bytes: &[u8]) -> Delivery {
         match &mut *self.phase.lock() {
-            Phase::Starting { input, left: None, .. } => {
+            Phase::Starting(queued) => {
                 // Lock order: the phase, then the budget.
                 let offer = self.budget.lock().offer(bytes.len());
                 match offer {
                     Offer::Take => {
-                        input.push(bytes.to_vec());
+                        queued.input.push(bytes.to_vec());
                         Delivery::Queued
                     }
                     Offer::Refuse(refusal) => Delivery::Refused(refusal),
                 }
             }
             Phase::Running(running) => running.input(bytes),
-            Phase::Starting { .. } | Phase::Gone => Delivery::Discarded,
+            Phase::Left(_) | Phase::Gone => Delivery::Discarded,
         }
     }
 
@@ -187,9 +254,9 @@ impl Session {
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
         match &mut *self.phase.lock() {
-            Phase::Starting { resize, .. } => *resize = Some(Size { cols, rows, cell_w, cell_h }),
+            Phase::Starting(queued) => queued.resize = Some(Size { cols, rows, cell_w, cell_h }),
             Phase::Running(running) => running.resize(cols, rows, cell_w, cell_h),
-            Phase::Gone => {}
+            Phase::Left(_) | Phase::Gone => {}
         }
     }
 
@@ -200,9 +267,9 @@ impl Session {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn reparent(&self, hwnd: u64) {
         match &mut *self.phase.lock() {
-            Phase::Starting { parent, .. } => *parent = Some(hwnd),
+            Phase::Starting(queued) => queued.parent = Some(hwnd),
             Phase::Running(running) => running.reparent(hwnd),
-            Phase::Gone => {}
+            Phase::Left(_) | Phase::Gone => {}
         }
     }
 
@@ -231,23 +298,19 @@ impl Session {
     }
 
     fn leave(&self, how: Leaving, layout: Option<serde_json::Value>) {
+        // Held throughout: lock order, the phase then the budget.
         let mut phase = self.phase.lock();
-        match &mut *phase {
-            Phase::Starting { left, input, .. } => {
-                *left = Some(how);
-                let held: usize = input.drain(..).map(|bytes| bytes.len()).sum();
+        match phase.leave(how) {
+            Departure::Withdraw { held } => {
                 self.budget.lock().handled(held);
                 // A request still waiting for the connection is withdrawn.
                 self.abandon.abandon();
             }
-            Phase::Running(running) => {
-                match how {
-                    Leaving::End => running.close(),
-                    Leaving::Keep => running.detach(layout),
-                }
-                *phase = Phase::Gone;
-            }
-            Phase::Gone => {}
+            Departure::Now(running) => match how {
+                Leaving::End => running.close(),
+                Leaving::Keep => running.detach(layout),
+            },
+            Departure::Nothing => {}
         }
     }
 }
@@ -262,7 +325,7 @@ fn run(
     abandon: &Abandon,
     budget: Budget,
 ) {
-    let left = || matches!(&*phase.lock(), Phase::Starting { left: Some(_), .. });
+    let left = || matches!(&*phase.lock(), Phase::Left(_));
     let started = connect().and_then(|connection| {
         // A tab closed while connecting needs no session: a spawn doesn't
         // start one, and an attach leaves it detached.
@@ -277,7 +340,7 @@ fn run(
     let mut phase = phase.lock();
     let running = match started {
         Ok(running) => running.with_budget(budget),
-        Err(_) if matches!(&*phase, Phase::Starting { left: Some(_), .. }) => {
+        Err(_) if matches!(&*phase, Phase::Left(_)) => {
             *phase = Phase::Gone;
             return;
         }
@@ -289,23 +352,19 @@ fn run(
         }
     };
     // Under the lock, so later input waits for what was queued.
-    let Phase::Starting { input, resize, parent, left } = std::mem::replace(&mut *phase, Phase::Gone) else {
-        unreachable!("only this thread leaves Starting");
+    let queued = match std::mem::replace(&mut *phase, Phase::Gone) {
+        Phase::Starting(queued) => queued,
+        Phase::Left(Leaving::End) => return running.close(),
+        Phase::Left(Leaving::Keep) => return running.detach(None),
+        Phase::Running(_) | Phase::Gone => unreachable!("only this thread leaves Starting"),
     };
-    match left {
-        Some(Leaving::End) => return running.close(),
-        Some(Leaving::Keep) => return running.detach(None),
-        None => {}
-    }
-    if let Some(size) = resize {
-        running.resize(size.cols, size.rows, size.cell_w, size.cell_h);
-    }
-    if let Some(hwnd) = parent {
-        running.reparent(hwnd);
-    }
-    // Counted when it was held: not offered again.
-    for bytes in input {
-        running.held_input(&bytes);
+    for op in queued.into_ops() {
+        match op {
+            Op::Resize(size) => running.resize(size.cols, size.rows, size.cell_w, size.cell_h),
+            Op::Reparent(hwnd) => running.reparent(hwnd),
+            // Counted when it was held: not offered again.
+            Op::Input(bytes) => running.held_input(&bytes),
+        }
     }
     *phase = Phase::Running(running);
 }
@@ -357,7 +416,7 @@ mod tests {
 
     fn request() -> SpawnRequest {
         SpawnRequest {
-            command: "sh".into(),
+            command: Some("sh".into()),
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
@@ -1059,6 +1118,61 @@ mod tests {
         assert!(matches!(recv(&core), ToCore::Spawn(_)));
         assert_eq!(input_received(&core, held.len()), held);
         assert_eq!(settled(&connection, &core), [], "nothing refused is written");
+        session.close();
+    }
+
+    /// A running session is handed its size, then its window, then the
+    /// input as typed; whatever wasn't asked for is left out.
+    #[test]
+    fn a_started_session_is_handed_its_size_then_its_window_then_its_input() {
+        let size = Size { cols: 120, rows: 40, cell_w: 9, cell_h: 18 };
+        let input = vec![b"one".to_vec(), b"two".to_vec()];
+        let all = Queued { input: input.clone(), resize: Some(size), parent: Some(0x1234) };
+        assert_eq!(all.held(), 6);
+        assert_eq!(
+            all.into_ops(),
+            [Op::Resize(size), Op::Reparent(0x1234), Op::Input(b"one".to_vec()), Op::Input(b"two".to_vec())]
+        );
+        let input_only = Queued { input, ..Queued::default() };
+        assert_eq!(input_only.into_ops(), [Op::Input(b"one".to_vec()), Op::Input(b"two".to_vec())]);
+        assert_eq!(Queued { parent: Some(7), ..Queued::default() }.into_ops(), [Op::Reparent(7)]);
+        assert_eq!(Queued::default().into_ops(), []);
+    }
+
+    /// A session let go while it starts is left as the tab said, its held
+    /// input freed and its request withdrawn; letting go again changes how
+    /// and frees nothing more; a session gone already needs nothing.
+    #[test]
+    fn a_session_let_go_while_starting_is_left_and_frees_its_input() {
+        let mut phase = Phase::Starting(Queued { input: vec![vec![b'a'; 1024], b"x".to_vec()], ..Queued::default() });
+        assert!(matches!(phase.leave(Leaving::Keep), Departure::Withdraw { held: 1025 }));
+        assert!(matches!(phase, Phase::Left(Leaving::Keep)));
+        assert!(matches!(phase.leave(Leaving::End), Departure::Withdraw { held: 0 }));
+        assert!(matches!(phase, Phase::Left(Leaving::End)));
+
+        let mut gone = Phase::Gone;
+        assert!(matches!(gone.leave(Leaving::End), Departure::Nothing));
+        assert!(matches!(gone, Phase::Gone));
+    }
+
+    /// What the tab did while its session started goes out once it has, in
+    /// this order: the last size, the window, then the input in the order
+    /// it was typed.
+    #[test]
+    fn what_was_queued_while_starting_goes_out_size_then_window_then_input() {
+        let (_dir, connection, core, session, release) = held_start("handover-order");
+        session.input(b"one");
+        session.reparent(0x1234);
+        session.resize(100, 30, 9, 18);
+        session.input(b"two");
+        session.resize(120, 40, 9, 18);
+        release.send(()).unwrap();
+        assert!(matches!(recv(&core), ToCore::Spawn(_)));
+        let ToCore::Resize(resize) = recv(&core) else { panic!("not RESIZE") };
+        assert_eq!((resize.session, resize.cols, resize.rows, resize.cell_w, resize.cell_h), (7, 120, 40, 9, 18));
+        assert_eq!(recv(&core), ToCore::Reparent(client::Reparent { session: 7, hwnd: 0x1234 }));
+        assert_eq!(input_received(&core, 6), b"onetwo");
+        assert_eq!(settled(&connection, &core), []);
         session.close();
     }
 
