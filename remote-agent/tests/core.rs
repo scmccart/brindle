@@ -827,6 +827,9 @@ const PANIC_MARKER: &str = "brindle-test-panic-now";
 
 #[test]
 fn a_panicking_emulator_leaves_its_session_and_the_others_running() {
+    if skip_without_switch("BRINDLE_TEST_FEED_PANIC") {
+        return;
+    }
     let mut dir = TempDir::new("panic");
     start_core(&dir.path, &[("BRINDLE_TEST_FEED_PANIC", PANIC_MARKER)]).unwrap();
     let mut client = TestClient::hello(&dir.path, "t");
