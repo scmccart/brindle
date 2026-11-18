@@ -22,8 +22,45 @@
 //! end can't be waited for, since a process that another thread starts
 //! meanwhile can inherit the handle and keep the pipe open.
 
+use std::io;
+
 /// What a role writes to its ready pipe once it is listening.
 pub const BYTE: u8 = b'R';
+
+/// What a read of a role's ready pipe says.
+#[derive(Debug)]
+pub enum ReadyRead {
+    /// Nothing yet: the role hasn't written, or (Linux) the pipe hasn't
+    /// ended.
+    Pending,
+    /// The role is listening.
+    Listening,
+    /// The pipe ended, or held something other than the ready byte, before
+    /// the role listened.
+    Ended,
+    /// The pipe can't be read, so nothing says the role is listening.
+    Failed(io::Error),
+}
+
+/// The Windows starter's rule for one read of the pipe into `buffer`: the
+/// first byte says it (see the module's notes), and the end before any byte
+/// says the role ended first. A read that would block, or was interrupted,
+/// is still pending; any other error is kept.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enum: std::io::ErrorKind, whose other kinds all mean the pipe can't be read"
+)]
+pub fn ready_read(read: io::Result<usize>, buffer: &[u8]) -> ReadyRead {
+    match read {
+        Ok(0) => ReadyRead::Ended,
+        Ok(_) if buffer.first() == Some(&BYTE) => ReadyRead::Listening,
+        Ok(_) => ReadyRead::Ended,
+        Err(error) => match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => ReadyRead::Pending,
+            _ => ReadyRead::Failed(error),
+        },
+    }
+}
 
 /// What a starter has read from a role's ready pipe so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -92,6 +129,37 @@ mod tests {
         assert!(!read(&[b"R", b"R"]).is_ready());
         assert!(!read(&[b"R", b"\n"]).is_ready());
         assert!(!read(&[b"x", b"R"]).is_ready());
+    }
+
+    #[test]
+    fn one_byte_is_listening() {
+        assert!(matches!(ready_read(Ok(1), &[BYTE]), ReadyRead::Listening));
+        // Read into a larger buffer: the first byte says it.
+        assert!(matches!(ready_read(Ok(1), &[BYTE, 0, 0, 0]), ReadyRead::Listening));
+        // Another byte isn't the ready byte.
+        assert!(matches!(ready_read(Ok(1), b"r"), ReadyRead::Ended));
+    }
+
+    #[test]
+    fn the_end_without_a_byte_is_ended() {
+        assert!(matches!(ready_read(Ok(0), &[0; 16]), ReadyRead::Ended));
+        // A read that would block is no answer yet.
+        let would_block = io::Error::from(io::ErrorKind::WouldBlock);
+        assert!(matches!(ready_read(Err(would_block), &[]), ReadyRead::Pending));
+        let interrupted = io::Error::from(io::ErrorKind::Interrupted);
+        assert!(matches!(ready_read(Err(interrupted), &[]), ReadyRead::Pending));
+    }
+
+    #[test]
+    fn a_read_error_is_kept() {
+        let broken = io::Error::new(io::ErrorKind::BrokenPipe, "the pipe is being closed");
+        match ready_read(Err(broken), &[]) {
+            ReadyRead::Failed(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(error.to_string(), "the pipe is being closed");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -6,11 +6,15 @@
 //!
 //! Pure, so it is tested on every platform. `api` keeps the reads, the
 //! writes, the loading and the log lines, and passes the probe that
-//! compares a directory's files with the embedded ones.
+//! compares a directory's files with the embedded ones. [`cached_ok`] keeps
+//! a ConPTY that loaded, and not a failure, and [`missing`] names an export
+//! the DLL lacks.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// What the session's environment sets `BRINDLE_CONPTY` to for the ConPTY
 /// built into Windows.
@@ -73,11 +77,69 @@ pub fn shipped(
     }
 }
 
+/// The value `cell` holds, or else `load`'s, which `cell` keeps only when
+/// it loaded: a failure is the caller's to report, and the next call tries
+/// again (`railway R6`: a failure isn't cached).
+pub fn cached_ok<T>(
+    cell: &OnceLock<T>,
+    load: impl FnOnce() -> Result<T, String>,
+) -> Result<&T, String> {
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let value = load()?;
+    // Another thread's value may have got there first; either is good.
+    Ok(cell.get_or_init(|| value))
+}
+
+/// The error for a `conpty.dll` that lacks the export `name`.
+pub fn missing(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, format!("conpty.dll lacks {name}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
+
+    #[test]
+    fn a_failure_is_not_cached() {
+        let cell = OnceLock::new();
+        let calls = Cell::new(0);
+        let failing = || {
+            calls.set(calls.get() + 1);
+            Err::<u32, _>("not loadable yet".to_string())
+        };
+        assert_eq!(cached_ok(&cell, failing), Err("not loadable yet".to_string()));
+        assert_eq!(cached_ok(&cell, failing), Err("not loadable yet".to_string()));
+        assert_eq!(calls.get(), 2, "each call tried again");
+        // A later success is kept.
+        assert_eq!(cached_ok(&cell, || Ok(7)), Ok(&7));
+        assert_eq!(cell.get(), Some(&7));
+    }
+
+    #[test]
+    fn a_success_is_cached() {
+        let cell = OnceLock::new();
+        let calls = Cell::new(0);
+        let load = || {
+            calls.set(calls.get() + 1);
+            Ok::<u32, String>(calls.get())
+        };
+        assert_eq!(cached_ok(&cell, load), Ok(&1));
+        assert_eq!(cached_ok(&cell, load), Ok(&1));
+        assert_eq!(calls.get(), 1, "loaded once");
+        // Nor does a failure replace it: the cell answers first.
+        assert_eq!(cached_ok(&cell, || Err("broken".to_string())), Ok(&1));
+    }
+
+    #[test]
+    fn missing_names_the_export() {
+        let error = missing("ConptyCreatePseudoConsole");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "conpty.dll lacks ConptyCreatePseudoConsole");
+    }
 
     fn env(list: &[(&str, &str)]) -> BTreeMap<String, String> {
         list.iter()

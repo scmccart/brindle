@@ -32,12 +32,16 @@ impl Stream {
         Source::of(&self.0)
     }
 
-    /// Whether bytes are waiting in the socket.
-    pub fn input_waiting(&self) -> bool {
+    /// Whether bytes are waiting in the socket; an error when `FIONREAD`
+    /// fails.
+    pub fn input_waiting(&self) -> io::Result<bool> {
         let mut waiting: libc::c_int = 0;
         // SAFETY: FIONREAD writes one int, and the fd is open while `self` is.
         let result = unsafe { libc::ioctl(self.0.as_raw_fd(), libc::FIONREAD, &mut waiting) };
-        result == 0 && waiting > 0
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(waiting > 0)
     }
 
     /// Ends this side's output; the peer reads EOF after what was sent.

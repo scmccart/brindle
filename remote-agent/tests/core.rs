@@ -691,6 +691,77 @@ fn kill_sessions_whose_owner_doesnt_come_back_end_after_the_grace_period() {
     say(&mut owner, kept, "x");
 }
 
+/// A stored meta the next core can't read whole (here an owner that isn't
+/// a string, and nothing else) leaves the session detached with no owner
+/// and its program running, rather than a `kill` session nobody owns, which
+/// the grace period would end (`surface-swallowed-failures` 1.6).
+#[test]
+fn a_session_whose_meta_is_malformed_is_adopted_detached() {
+    use brindle_remote_protocol::holder::{SetMeta, ToHolder};
+    use brindle_remote_protocol::serde_json::json;
+
+    let mut dir = TempDir::new("malformed-meta");
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    let (session, pid) = client.spawn(programs::echoer());
+    dir.track(parent(pid).unwrap());
+    kill(client.core_pid());
+    assert!(client.closes());
+
+    // A test core stores the malformed meta in the holder.
+    let mut test_core = TestCore::connect_to(&dir);
+    test_core.hello(7);
+    test_core.send(ToHolder::SetMeta(SetMeta {
+        session,
+        meta: json!({ "owner": 7 }),
+    }));
+    // The holder handles its core's messages in order: once the input's
+    // echo is back, the meta is stored.
+    test_core.input(session, &[b"stored", programs::ENTER].concat());
+    test_core.output_until(session, &programs::echo_of("stored"));
+    drop(test_core);
+
+    start_core(&dir.path, &[]).unwrap();
+    let mut other = TestClient::hello(&dir.path, "other");
+    dir.track(other.core_pid());
+    // The grace period's decision for the session is the marker: then the
+    // session's fate is settled.
+    let prefix = format!("session {session}: ");
+    let decided = || {
+        core_messages(&dir)
+            .into_iter()
+            .find(|line| line.starts_with(&prefix) && line.contains("its owner didn't come back"))
+    };
+    assert!(eventually(TIMEOUT, || decided().is_some()), "{}", dir.logs());
+    assert_eq!(
+        decided().unwrap(),
+        format!("{prefix}detached; its owner didn't come back"),
+        "{}",
+        dir.logs()
+    );
+    let messages = core_messages(&dir);
+    let repaired = format!(
+        "{prefix}its stored meta is malformed (owner); adopted detached, with no owner"
+    );
+    assert!(messages.contains(&repaired), "{}", messages.join("\n"));
+    assert!(alive(pid), "the program was ended");
+
+    let listed = other.list();
+    let info = listed
+        .iter()
+        .find(|info| info.session == session)
+        .unwrap_or_else(|| panic!("not listed: {listed:?}"));
+    assert_eq!(info.pid, pid);
+    assert_eq!(info.policy, client::Policy::Detach, "{info:?}");
+    assert!(!info.attached && !info.owned, "{info:?}");
+
+    // Any client may take it: the attach replays it, and it answers.
+    let (start, replay) = other.attach(session, 80, 24).unwrap();
+    assert_eq!(start.pid, pid);
+    assert!(!replay.is_empty());
+    say(&mut other, session, "back");
+}
+
 #[test]
 fn kill_and_stop_end_sessions_whatever_their_policy() {
     let (dir, mut client) = core("stop");

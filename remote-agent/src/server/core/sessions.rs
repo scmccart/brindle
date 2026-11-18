@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{
     self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, Spawned, ToClient,
 };
-use brindle_remote_protocol::holder::{self as h1, HeldSession, SessionMeta, ToHolder};
+use brindle_remote_protocol::holder::{self as h1, HeldSession, MetaFault, SessionMeta, ToHolder};
 use brindle_remote_protocol::{RequestId, SessionId};
 
 use super::clients::error;
@@ -167,10 +167,13 @@ impl Session {
 
     /// A session reported in a holder's `WELCOME`, adopted at `now`. It has
     /// no client until its owner comes back. One that exited while no core
-    /// was connected is gone from the holder already.
-    pub(super) fn adopted(holder: Token, held: HeldSession, now: Instant) -> Self {
-        let meta = SessionMeta::from_value(&held.meta);
-        Self {
+    /// was connected is gone from the holder already. A malformed meta is
+    /// repaired ([`adopt_meta`]): then the `core.log` line that says so
+    /// comes with it, and the core stores the repaired meta.
+    pub(super) fn adopted(holder: Token, held: HeldSession, now: Instant) -> (Self, Option<String>) {
+        let (meta, repaired) =
+            adopt_meta(held.session, SessionMeta::from_value(&held.meta), session_key);
+        let session = Self {
             holder,
             pid: held.pid,
             screen: Screen::new(held.cols, held.rows, meta.scrollback),
@@ -191,8 +194,41 @@ impl Session {
             active: false,
             active_at: now,
             foreground: None,
-        }
+        };
+        (session, repaired)
     }
+}
+
+/// How an adopted session's meta, as [`SessionMeta::from_value`] read it,
+/// is taken: a good one as it is. A refused one keeps what was read, but
+/// with no owner, since an unreadable owner can't come back, and the
+/// `detach` policy, since `kill` with no owner would end the program when
+/// the grace period ends. A malformed key (or a meta that isn't an object)
+/// gets a fresh one from `fresh_key`. The second value is the `core.log`
+/// line naming the session and the fields, for a refused meta.
+pub(super) fn adopt_meta(
+    id: SessionId,
+    read: Result<SessionMeta, MetaFault>,
+    fresh_key: impl FnOnce() -> String,
+) -> (SessionMeta, Option<String>) {
+    let MetaFault { malformed, read } = match read {
+        Ok(meta) => return (meta, None),
+        Err(fault) => fault,
+    };
+    let key_lost = malformed.iter().any(|field| matches!(*field, "key" | "meta"));
+    let key = if key_lost { fresh_key() } else { read.key };
+    let line = format!(
+        "session {id}: its stored meta is malformed ({}); adopted detached, with no owner{}",
+        malformed.join(", "),
+        if key_lost { " and a new key" } else { "" }
+    );
+    let meta = SessionMeta {
+        key,
+        owner: String::new(),
+        policy: Policy::Detach,
+        ..read
+    };
+    (meta, Some(line))
 }
 
 /// The layout a client gave session `id` (`DETACH`, `SET_LAYOUT`), unless its
@@ -304,21 +340,20 @@ impl<L: EventLoop> Core<L> {
             scrollback: spawn.scrollback,
             started: unix_now(),
         };
-        self.send_holder(
-            holder,
-            ToHolder::Spawn(h1::Spawn {
-                session: id,
-                command: spawn.command.clone(),
-                args: spawn.args.clone(),
-                cwd: spawn.cwd.clone(),
-                env: spawn.env.clone(),
-                cols: spawn.cols,
-                rows: spawn.rows,
-                cell_w: spawn.cell_w,
-                cell_h: spawn.cell_h,
-                meta: meta.to_value(),
-            }),
-        );
+        let message = ToHolder::Spawn(h1::Spawn {
+            session: id,
+            command: spawn.command.clone(),
+            args: spawn.args.clone(),
+            cwd: spawn.cwd.clone(),
+            env: spawn.env.clone(),
+            cols: spawn.cols,
+            rows: spawn.rows,
+            cell_w: spawn.cell_w,
+            cell_h: spawn.cell_h,
+            meta: meta.to_value(),
+        });
+        // The session first: a `SPAWN` that can't be sent fails it, to its
+        // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(
             id,
             Session {
@@ -344,6 +379,7 @@ impl<L: EventLoop> Core<L> {
                 foreground: None,
             },
         );
+        self.send_holder(holder, message);
     }
 
     /// The session if it runs under `holder`; anything else is a stale or
@@ -980,7 +1016,7 @@ impl<L: EventLoop> Core<L> {
     /// it (`Session::storing`), a core killed now would leave the holder
     /// with the old meta, so the session's replays wait for that: a client
     /// is told it has a session only once the next core would agree.
-    fn store_meta(&mut self, id: SessionId) {
+    pub(super) fn store_meta(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -988,7 +1024,11 @@ impl<L: EventLoop> Core<L> {
         let meta = session.meta.to_value();
         match self.holders.get(&holder).and_then(|holder| holder.protocol()) {
             Some(protocol) if protocol >= 2 => {
-                self.send_holder(holder, ToHolder::SetMeta(h1::SetMeta { session: id, meta }));
+                // One that couldn't be sent leaves `storing` as it was: no
+                // replay waits on bytes that never went out.
+                if !self.send_holder(holder, ToHolder::SetMeta(h1::SetMeta { session: id, meta })) {
+                    return;
+                }
                 let end = self.holder_queue_end(holder);
                 if let Some(session) = self.sessions.get_mut(&id) {
                     session.storing = end;
@@ -1162,9 +1202,72 @@ mod tests {
     }
 
     #[test]
+    fn a_good_meta_is_adopted_as_it_is() {
+        let meta = SessionMeta {
+            key: "k1".into(),
+            owner: "tok".into(),
+            policy: Policy::Kill,
+            scrollback: 100,
+            ..SessionMeta::default()
+        };
+        let fresh = || -> String { panic!("a good meta keeps its key") };
+        assert_eq!(adopt_meta(3, Ok(meta.clone()), fresh), (meta, None));
+    }
+
+    #[test]
+    fn a_faulty_meta_is_adopted_detached_with_no_owner() {
+        // What was read of `{"command": "bash", "key": "k1", "owner": 7,
+        // "policy": "kill", "scrollback": 100}`.
+        let read = SessionMeta {
+            command: "bash".into(),
+            key: "k1".into(),
+            policy: Policy::Kill,
+            scrollback: 100,
+            ..SessionMeta::default()
+        };
+        let fault = MetaFault { malformed: vec!["owner"], read: read.clone() };
+        let fresh = || -> String { panic!("the key was well formed") };
+        let (meta, line) = adopt_meta(3, Err(fault), fresh);
+        assert_eq!(
+            meta,
+            SessionMeta {
+                owner: String::new(),
+                policy: Policy::Detach,
+                ..read
+            }
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("session 3: its stored meta is malformed (owner); adopted detached, with no owner")
+        );
+    }
+
+    #[test]
+    fn a_malformed_key_is_replaced() {
+        let read = SessionMeta {
+            owner: "tok".into(),
+            scrollback: 100,
+            ..SessionMeta::default()
+        };
+        let fault = MetaFault { malformed: vec!["key", "started"], read };
+        let (meta, line) = adopt_meta(4, Err(fault), || "fresh".to_string());
+        assert_eq!((meta.key.as_str(), meta.owner.as_str()), ("fresh", ""));
+        assert_eq!((meta.policy, meta.scrollback), (Policy::Detach, 100));
+        let line = line.unwrap();
+        assert!(line.starts_with("session 4: "), "{line}");
+        assert!(line.contains("(key, started)") && line.ends_with("and a new key"), "{line}");
+
+        // A meta that isn't an object has no key to keep either.
+        let fault = MetaFault { malformed: vec!["meta"], read: SessionMeta::default() };
+        let (meta, _) = adopt_meta(5, Err(fault), || "other".to_string());
+        assert_eq!(meta.key, "other");
+    }
+
+    #[test]
     fn an_adopted_session_is_detached_and_active_since_now() {
         let now = Instant::now();
-        let session = Session::adopted(7, held(true), now);
+        let (session, repaired) = Session::adopted(7, held(true), now);
+        assert_eq!(repaired, None);
         assert_eq!((session.holder, session.pid, session.cols, session.rows), (7, 42, 80, 24));
         assert_eq!((session.meta.key.as_str(), session.meta.owner.as_str()), ("k1", "tok"));
         // No client until its owner comes back, and detached since now.
@@ -1181,7 +1284,7 @@ mod tests {
     #[test]
     fn marking_activity_records_the_given_instant() {
         let adopted_at = Instant::now();
-        let mut session = Session::adopted(7, held(false), adopted_at);
+        let (mut session, _) = Session::adopted(7, held(false), adopted_at);
         let later = adopted_at + Duration::from_secs(5);
         session.mark_active(later);
         assert!(session.active);

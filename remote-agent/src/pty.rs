@@ -56,6 +56,19 @@ pub struct PtyCommand<'a> {
     pub exact_env: bool,
 }
 
+/// What a `REPARENT` came to: the session's console window has the owner
+/// it was given (or there is no session or console left to give one), or
+/// the platform, or the ConPTY in use, can't give it one.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only a Windows console window gets an owner")
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reparented {
+    Done,
+    Unsupported,
+}
+
 /// A session's foreground program, as the core reports it to clients that
 /// ask (client protocol 2's `PROCESS`).
 #[cfg_attr(

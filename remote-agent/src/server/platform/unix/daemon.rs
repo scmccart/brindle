@@ -18,7 +18,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::{ready, scope};
+use brindle_remote_protocol::ready::{self, ReadyRead};
+use brindle_remote_protocol::scope;
 
 use super::super::ready_arg::{self, ReadyArg};
 use super::event_loop::Source;
@@ -98,19 +99,15 @@ impl ReadyPipe {
         Source::of(&self.pipe)
     }
 
-    /// Whether the role is listening (`true`) or ended before it was
-    /// (`false`); `None` while neither is known, which is until the pipe
-    /// ends. Only then is the ready byte known to be all the pipe held: the
-    /// first bytes of a failed exec's error aren't a ready byte
-    /// ([`ready`]).
+    /// Whether the role is listening or ended before it was; `Pending`
+    /// while neither is known, which is until the pipe ends. Only then is
+    /// the ready byte known to be all the pipe held: the first bytes of a
+    /// failed exec's error aren't a ready byte ([`ready`]). A pipe that
+    /// can't be read is `Failed`, with the error.
     ///
     /// Each call reads once, and the loop calls again while there is more
     /// to read or the end to see.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "foreign enum: std::io::ErrorKind, whose other kinds all mean the end can't be read"
-    )]
-    pub fn read(&mut self) -> Option<bool> {
+    pub fn read(&mut self) -> ReadyRead {
         let mut buffer = [0u8; 16];
         let read = unsafe {
             libc::read(
@@ -120,31 +117,31 @@ impl ReadyPipe {
             )
         };
         match read {
-            0 => Some(self.signal.is_ready()),
+            0 if self.signal.is_ready() => ReadyRead::Listening,
+            0 => ReadyRead::Ended,
             1.. => {
                 self.signal.push(&buffer[..read as usize]);
-                None
+                ReadyRead::Pending
             }
-            _ => match io::Error::last_os_error().kind() {
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
-                // Its end can't be read, so nothing says it is listening.
-                _ => Some(false),
-            },
+            // A read that would block is still pending; another error is
+            // kept.
+            _ => ready::ready_read(Err(io::Error::last_os_error()), &[]),
         }
     }
 
     /// [`ReadyPipe::read`]'s answer, waiting up to `limit` for it: for a
-    /// starter with no event loop (the relay). `None` if the pipe hasn't
+    /// starter with no event loop (the relay). `Pending` if the pipe hasn't
     /// ended by then.
-    pub fn wait(&mut self, limit: Duration) -> Option<bool> {
+    pub fn wait(&mut self, limit: Duration) -> ReadyRead {
         let deadline = Instant::now() + limit;
         loop {
-            if let Some(ready) = self.read() {
-                return Some(ready);
+            let answer = self.read();
+            if !matches!(answer, ReadyRead::Pending) {
+                return answer;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return None;
+                return ReadyRead::Pending;
             }
             let mut pollfd = libc::pollfd {
                 fd: self.pipe.as_raw_fd(),
@@ -311,11 +308,23 @@ mod tests {
         assert_eq!(written, bytes.len() as isize);
     }
 
+    /// A read's answer as these tests compare it: whether the role is
+    /// listening, or `None` while the pipe hasn't ended. A failed read
+    /// fails the test.
+    fn listening(answer: ReadyRead) -> Option<bool> {
+        match answer {
+            ReadyRead::Pending => None,
+            ReadyRead::Listening => Some(true),
+            ReadyRead::Ended => Some(false),
+            ReadyRead::Failed(error) => panic!("reading the ready pipe failed: {error}"),
+        }
+    }
+
     /// Reads as a loop does, again while there is more to read: whether the
     /// role is listening, or `None` while the pipe hasn't ended.
     fn outcome(ready: &mut ReadyPipe) -> Option<bool> {
         // More reads than any of these pipes takes.
-        (0..8).find_map(|_| ready.read())
+        (0..8).find_map(|_| listening(ready.read()))
     }
 
     #[test]
@@ -323,7 +332,7 @@ mod tests {
         use std::os::fd::IntoRawFd;
 
         let (mut read, role) = ready_pipe();
-        assert_eq!(read.read(), None);
+        assert_eq!(listening(read.read()), None);
         let ready = Ready::from_fd(role.into_raw_fd()).unwrap();
         ready.signal().unwrap();
         // The byte and the pipe's end: the write end was closed with the
@@ -373,7 +382,7 @@ mod tests {
         // Nothing yet: the wait ends with the limit.
         let (mut read, role) = ready_pipe();
         let begin = Instant::now();
-        assert_eq!(read.wait(Duration::from_millis(50)), None);
+        assert_eq!(listening(read.wait(Duration::from_millis(50))), None);
         assert!(begin.elapsed() >= Duration::from_millis(50));
         // The byte and the end, the end coming later.
         write(&role, &[ready::BYTE]);
@@ -381,12 +390,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             drop(role);
         });
-        assert_eq!(read.wait(Duration::from_secs(30)), Some(true));
+        assert_eq!(listening(read.wait(Duration::from_secs(30))), Some(true));
         closer.join().unwrap();
         // A role that ended first.
         let (mut read, role) = ready_pipe();
         drop(role);
-        assert_eq!(read.wait(Duration::from_secs(30)), Some(false));
+        assert_eq!(listening(read.wait(Duration::from_secs(30))), Some(false));
     }
 
     #[test]
@@ -403,7 +412,7 @@ mod tests {
         write(&role, &[ready::BYTE]);
         ev.wait(&mut events, Some(Duration::from_secs(30))).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(read.read(), None);
+        assert_eq!(listening(read.read()), None);
         // The byte is taken, so until the pipe ends there is nothing to
         // wake up for.
         ev.wait(&mut events, Some(Duration::from_millis(20)))
@@ -412,6 +421,6 @@ mod tests {
         drop(role);
         ev.wait(&mut events, Some(Duration::from_secs(30))).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(read.read(), Some(true));
+        assert_eq!(listening(read.read()), Some(true));
     }
 }

@@ -6,7 +6,6 @@ use std::os::windows::io::{
     AsHandle as _, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle,
 };
 use std::path::Path;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
@@ -22,6 +21,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use super::api::{Api, api, wide};
 use super::cmdline::environment_block;
+use crate::pty::Reparented;
 
 /// Count cells per code point, as `unicode-width` (the grid) does. From the
 /// package's `conpty.h`; the built-in host accepts and ignores it.
@@ -132,25 +132,17 @@ impl Pseudoconsole {
 
     /// Makes the window `hwnd` the owner of the console window programs can
     /// ask for (`GetConsoleWindow`), so their dialogs belong to that window.
-    /// The host does it a moment later. Only the packaged host supports it;
-    /// with the built-in one this does nothing, and says so in the log the
-    /// first time.
-    pub fn reparent(&self, hwnd: u64) {
+    /// The host does it a moment later. Only the packaged host supports it:
+    /// with the built-in one this does nothing and is `Unsupported`, which
+    /// the caller logs.
+    pub fn reparent(&self, hwnd: u64) -> io::Result<Reparented> {
         let Some(reparent) = self.api.reparent else {
-            static LOGGED: Once = Once::new();
-            LOGGED.call_once(|| {
-                eprintln!(
-                    "conpty: the ConPTY built into Windows can't give a console window an \
-                     owner; ignoring that for window {hwnd:#x} and from now on"
-                );
-            });
-            return;
+            return Ok(Reparented::Unsupported);
         };
         let window = HWND(hwnd as usize as *mut c_void);
         // SAFETY: `handle` is open until drop; any HWND is accepted.
-        if let Err(err) = unsafe { reparent(self.handle, window) }.ok() {
-            eprintln!("conpty: parenting a console to window {hwnd:#x}: {err}");
-        }
+        unsafe { reparent(self.handle, window) }.ok()?;
+        Ok(Reparented::Done)
     }
 
     /// Starts the program of the command line `line` (see
@@ -488,9 +480,11 @@ mod tests {
     fn reparenting_to_no_window_is_harmless() {
         let (input_read, _input_write) = pipe();
         let (_output_read, output_write) = pipe();
-        for inbox in [false, true] {
-            console(inbox, &input_read, &output_write).reparent(0);
-        }
+        // The packaged host may refuse no window, but nothing breaks.
+        let _ = console(false, &input_read, &output_write).reparent(0);
+        // The built-in one can't do it, and says so.
+        let inbox = console(true, &input_read, &output_write).reparent(0);
+        assert_eq!(inbox.unwrap(), Reparented::Unsupported);
     }
 
     #[test]

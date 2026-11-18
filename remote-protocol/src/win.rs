@@ -531,13 +531,33 @@ fn place_copy(installed: &Path, temp: &Path, copy: &Path, build: &str) -> io::Re
     }
 }
 
+/// What [`prune_helper_copies`] did.
+#[derive(Debug, Default)]
+pub struct Pruned {
+    /// How many builds' directories it removed.
+    pub removed: usize,
+    /// What it kept, and why: a build's directory whose image is in use or
+    /// that couldn't be removed, or the copies' directory itself when it
+    /// couldn't be read.
+    pub kept: Vec<(PathBuf, String)>,
+}
+
 /// Removes every build's directory under `copies` except `keep`'s, where it
 /// can: Windows refuses to delete a running image, so a build that still
-/// has a role running keeps its directory. Nothing here fails; what can't
-/// be removed stays for a later call.
-pub fn prune_helper_copies(copies: &Path, keep: &str) {
-    let Ok(entries) = std::fs::read_dir(copies) else {
-        return;
+/// has a role running keeps its directory. What can't be removed stays for
+/// a later call, and is in [`Pruned::kept`] with its cause; no `copies` at
+/// all is nothing to prune.
+pub fn prune_helper_copies(copies: &Path, keep: &str) -> Pruned {
+    let mut pruned = Pruned::default();
+    let entries = match std::fs::read_dir(copies) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return pruned,
+        Err(error) => {
+            pruned
+                .kept
+                .push((copies.to_path_buf(), format!("can't read it: {error}")));
+            return pruned;
+        }
     };
     let entries = entries
         .flatten()
@@ -553,15 +573,27 @@ pub fn prune_helper_copies(copies: &Path, keep: &str) {
     for name in server_dir::pruned_builds(entries, keep) {
         let dir = copies.join(name);
         // The image first: while it runs, the directory is left whole.
-        let removal = match std::fs::remove_file(dir.join("brindle-remote.exe")) {
+        let removal = std::fs::remove_file(dir.join("brindle-remote.exe"));
+        let image = match &removal {
             Ok(()) => ImageRemoval::Removed,
             Err(error) if error.kind() == io::ErrorKind::NotFound => ImageRemoval::Missing,
             Err(_) => ImageRemoval::Failed,
         };
-        if server_dir::after_image_removal(removal) == PruneDir::Remove {
-            let _ = std::fs::remove_dir_all(&dir);
+        match server_dir::after_image_removal(image) {
+            PruneDir::Remove => match std::fs::remove_dir_all(&dir) {
+                Ok(()) => pruned.removed += 1,
+                Err(error) => pruned.kept.push((dir, format!("can't remove it: {error}"))),
+            },
+            PruneDir::Keep => {
+                let why = removal.err().map_or_else(
+                    || "its image stays".to_string(),
+                    |error| format!("its image can't be removed, so a role may run from it: {error}"),
+                );
+                pruned.kept.push((dir, why));
+            }
         }
     }
+    pruned
 }
 
 #[cfg(test)]
@@ -912,14 +944,20 @@ mod tests {
             .spawn()
             .unwrap();
 
-        prune_helper_copies(&copies, "kept");
+        let pruned = prune_helper_copies(&copies, "kept");
         assert_eq!(names(&copies), ["a-file", "kept", "running"]);
         assert!(kept.is_file());
-        // The directory in use is left whole, not half emptied.
+        // The directory in use is left whole, not half emptied, and kept
+        // with its reason.
         assert_eq!(
             names(running.parent().unwrap()),
             ["brindle-remote.exe", "extra.txt"]
         );
+        assert_eq!(pruned.removed, 1, "{pruned:?}");
+        assert_eq!(pruned.kept.len(), 1, "{pruned:?}");
+        let (held, why) = &pruned.kept[0];
+        assert_eq!(held.as_path(), running.parent().unwrap(), "{pruned:?}");
+        assert!(why.contains("its image can't be removed"), "{why}");
 
         child.kill().unwrap();
         child.wait().unwrap();
@@ -934,8 +972,9 @@ mod tests {
         );
         assert_eq!(names(&copies), ["a-file", "kept"]);
 
-        // No directory at all is nothing to prune.
-        prune_helper_copies(&dir.join("absent"), "kept");
+        // No directory at all is nothing to prune, and nothing kept.
+        let pruned = prune_helper_copies(&dir.join("absent"), "kept");
+        assert_eq!((pruned.removed, pruned.kept.len()), (0, 0), "{pruned:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

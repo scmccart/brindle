@@ -121,14 +121,20 @@ pub(crate) use log;
 /// Windows). Without it the core stays in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
     let ready = daemon::ready_from_args("serve", args)?;
-    let dir = dir::from_env().map_err(|error| error.to_string())?;
-    let paths = Paths::new(&dir).map_err(|error| error.to_string())?;
-    let lock = match claim(&paths).map_err(|error| error.to_string())? {
+    let dir =
+        dir::from_env().map_err(|error| format!("can't set up the server directory: {error}"))?;
+    let paths = Paths::new(&dir)
+        .map_err(|error| format!("can't name the core's endpoint in {}: {error}", dir.display()))?;
+    let claimed = claim(&paths)
+        .map_err(|error| format!("can't take the core's lock {}: {error}", paths.lock.display()))?;
+    let lock = match claimed {
         Claim::Core(lock) => lock,
         Claim::Running => {
             // Another core serves this directory; its starter can connect.
             if let Some(ready) = ready {
-                ready.signal().map_err(|error| error.to_string())?;
+                ready.signal().map_err(|error| {
+                    format!("can't tell the starter that another core is listening: {error}")
+                })?;
             }
             return Ok(());
         }
@@ -136,14 +142,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if ready.is_some() {
         let log = daemon::open_log(&paths.log)
             .map_err(|error| format!("can't open {}: {error}", paths.log.display()))?;
-        daemon::daemonize(&log).map_err(|error| error.to_string())?;
+        daemon::daemonize(&log)
+            .map_err(|error| format!("can't detach from the starter: {error}"))?;
     }
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
     prune_copies(&build);
-    let ev = Loop::new().map_err(|error| error.to_string())?;
+    let ev = Loop::new().map_err(|error| format!("can't create the event loop: {error}"))?;
     let core = Core::new(ev, dir, paths, lock, build, Identity::own()).map_err(|error| {
         log!("can't start: {error}");
-        error.to_string()
+        format!("can't start the core: {error}")
     })?;
     if let Some(ready) = ready
         && let Err(error) = ready.signal()
@@ -152,7 +159,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     core.run().map_err(|error| {
         log!("stopped: {error}");
-        error.to_string()
+        format!("the core stopped: {error}")
     })
 }
 
@@ -181,7 +188,8 @@ impl Paths {
 
 /// Removes the per-build helper copies of other builds, where nothing runs
 /// from them any more (Windows runs every role from a copy, since a running
-/// image can't be replaced). A copy still in use stays for a later core.
+/// image can't be replaced). A copy still in use stays for a later core,
+/// and the log says why.
 #[cfg(windows)]
 fn prune_copies(build: &str) {
     use brindle_remote_protocol::{server_dir, win};
@@ -193,7 +201,13 @@ fn prune_copies(build: &str) {
         return;
     };
     let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local));
-    win::prune_helper_copies(&copies, build);
+    let pruned = win::prune_helper_copies(&copies, build);
+    if pruned.removed > 0 {
+        log!("removed {} other build(s)' helper copies", pruned.removed);
+    }
+    for (path, why) in &pruned.kept {
+        log!("kept the helper copy {}: {why}", path.display());
+    }
 }
 
 /// Only Windows runs its roles from per-build copies.
@@ -951,7 +965,7 @@ mod tests {
             while let Some(frame) = holder.0.next_frame().unwrap() {
                 if let ToHolder::SetMeta(update) = ToHolder::decode(&frame).unwrap() {
                     assert_eq!(update.session, SESSION);
-                    owner = Some(SessionMeta::from_value(&update.meta).owner);
+                    owner = Some(SessionMeta::from_value(&update.meta).unwrap().owner);
                 }
             }
             assert_eq!(owner.as_deref(), Some("b"));

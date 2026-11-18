@@ -93,7 +93,8 @@ fn list(json: bool) -> Result<(), String> {
         return Err(unexpected(&reply));
     };
     if json {
-        let text = serde_json::to_string_pretty(&sessions.sessions).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string_pretty(&sessions.sessions)
+            .map_err(|error| format!("can't write the sessions as JSON: {error}"))?;
         println!("{text}");
     } else {
         let now = std::time::SystemTime::now()
@@ -207,12 +208,13 @@ fn status(json: bool) -> Result<(), String> {
 
 /// `status --json`: `SERVER_STATUS` without its `req`, and `running`.
 fn status_json(status: &ServerStatus) -> Result<String, String> {
-    let mut value = serde_json::to_value(status).map_err(|error| error.to_string())?;
+    let failed = |error: serde_json::Error| format!("can't write the status as JSON: {error}");
+    let mut value = serde_json::to_value(status).map_err(failed)?;
     if let Value::Object(object) = &mut value {
         object.remove("req");
         object.insert("running".into(), Value::Bool(true));
     }
-    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+    serde_json::to_string_pretty(&value).map_err(failed)
 }
 
 fn status_text(status: &ServerStatus) -> String {
@@ -266,13 +268,25 @@ struct Connection {
 }
 
 impl Connection {
-    /// Connects and says `HELLO`; `None` when no core is listening.
+    /// Connects and says `HELLO`; `None` when no core is listening, which
+    /// is so when there is no server directory.
     #[allow(
         clippy::wildcard_enum_match_arm,
         reason = "railway R3 exception: any answer but `Welcome` is a failure `unexpected` reports"
     )]
     fn open() -> Result<Option<Self>, String> {
-        let dir = dir::resolve_from_env().map_err(|error| error.to_string())?;
+        let dir = dir::resolve_from_env()
+            .map_err(|error| format!("can't find the server directory: {error}"))?;
+        // Nothing there is no server; something there that can't be read as
+        // a directory (a file) is an error, with the system's words for it.
+        let unreadable =
+            |error: io::Error| format!("can't read the server directory {}: {error}", dir.display());
+        match std::fs::metadata(&dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreadable(error)),
+        }
+        std::fs::read_dir(&dir).map_err(unreadable)?;
         let socket = match Endpoints::of(&dir) {
             Ok(endpoints) => endpoints.core(),
             // Without the directory (which names the pipe on Windows), no
@@ -294,7 +308,7 @@ impl Connection {
         };
         stream
             .set_read_timeout(Some(REPLY_LIMIT))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("can't set a read limit on the core connection: {error}"))?;
         let mut connection = Self {
             stream,
             next_req: 1,
@@ -321,7 +335,8 @@ impl Connection {
 
     fn recv(&mut self) -> Result<ToClient, String> {
         match Frame::read_from_or_eof(&mut self.stream) {
-            Ok(Some(frame)) => ToClient::decode(&frame).map_err(|error| error.to_string()),
+            Ok(Some(frame)) => ToClient::decode(&frame)
+                .map_err(|error| format!("can't read the core's answer: {error}")),
             Ok(None) => Err("the core closed the connection".into()),
             Err(error) => Err(format!("no answer from the core: {error}")),
         }

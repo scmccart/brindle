@@ -13,6 +13,8 @@
 //! - `every_message_variant_and_form_appears_in_a_transcript` checks that
 //!   every variant of the five message enums, and the nested forms named in
 //!   [`expected_forms`], is in some transcript.
+//! - `every_meta_in_the_fixtures_is_read_whole` reads every session meta
+//!   the fixtures carry, none of which may be refused.
 //!
 //! A change to any message's encoding fails the first two. A fixture that
 //! has shipped is frozen (process R5): a new message, field or form gets a
@@ -446,6 +448,32 @@ fn every_message_variant_and_form_appears_in_a_transcript() {
         "no transcript has {}",
         missing.join(", ")
     );
+}
+
+/// Every session meta the fixtures carry (in `SPAWN`, `SET_META` and
+/// `WELCOME`'s sessions) is one the next core reads whole: none is refused
+/// by `SessionMeta::from_value`.
+#[test]
+fn every_meta_in_the_fixtures_is_read_whole() {
+    let mut read = 0;
+    for (transcript, text) in read_fixtures() {
+        for step in parse(&transcript, &text) {
+            let metas: Vec<serde_json::Value> = match step {
+                Step::CoreToHolder(holder::ToHolder::Spawn(spawn)) => vec![spawn.meta],
+                Step::CoreToHolder(holder::ToHolder::SetMeta(update)) => vec![update.meta],
+                Step::Holder(holder::ToCore::Welcome(welcome)) => {
+                    welcome.sessions.into_iter().map(|held| held.meta).collect()
+                }
+                _ => Vec::new(),
+            };
+            for meta in metas {
+                let decoded = holder::SessionMeta::from_value(&meta);
+                assert!(decoded.is_ok(), "{}: {meta}: {decoded:?}", transcript.name);
+                read += 1;
+            }
+        }
+    }
+    assert!(read > 0, "the fixtures carry no meta");
 }
 
 // The transcripts.
