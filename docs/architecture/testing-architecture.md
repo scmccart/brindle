@@ -82,6 +82,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 - **R15.** Tests MUST be named for the behaviour they check, as a sentence (`drain_stops_at_the_budget`, `a_foreign_uid_is_closed_without_being_read`), and e2e cases by feature with their area's prefix (`local-server-*`, `remote-*`, `windows-*`).
 - **R16.** What automation can't reach (IME, wheel scrolling, drags, a real pointer press) MUST stay on the manual list in `CLAUDE.md` and be listed in the PR body. It is handed to the user with `scripts/run-throwaway`, not approximated with injected input.
 - **R17.** A test that can only compile or run on one platform SHOULD have its counterpart on the other where the property matters there, and its first run on that platform is treated as its first run: don't report it as verified from the other.
+- **R18.** A test or case that needs what a build or machine may lack (a fault switch, Docker, a user manager, the packaged ConPTY) MUST declare it and ask the binary or machine before it runs, never infer it from the harness's own build. Without it, it is skipped with a reason naming what is missing and how to get it, unless a require variable (`BRINDLE_TEST_REQUIRE`, `BRINDLE_E2E_SWITCHES_REQUIRED`, `BRINDLE_REMOTE_E2E_REQUIRED`) makes that a failure, and CI sets them for what its runners provide.
 
 ## Anti-patterns
 
@@ -101,6 +102,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 - Both harnesses hold R4 through `tests/common/server.rs`, which gives each case private directories and a hermetic environment, refuses a missing or stale `brindle-remote`, and fails a case that leaves a `serve` or `hold` running or ran one in a systemd scope.
 - CI runs `cargo test --workspace` and both harness self-tests on every push for Linux and Windows, `cargo clippy --workspace --all-targets -- -D warnings` on both, and the e2e suite in three advisory shards that upload `target/tmp/e2e/` on failure.
 - `tests/architecture.rs`: `test_waits_go_through_the_wait_helper` (R7: no `std::thread::sleep` in `remote-agent/tests/**` outside `support/wait.rs`, the one module that sleeps, scaled, and none in `tests/e2e/cases/**`, whose waits go through `Scale`; `every_allowed_sleeper_exists` and `a_sleep_in_a_test_is_found` test the search, which follows imports and renames), and `tests_set_no_process_environment` (R7, `ports R10`: no `std::env::set_var` or `remove_var` in `tests/**`, `remote-agent/tests/**` or the test code of any crate's `src/`, with `a_set_var_in_a_test_is_found`).
+- R18: the e2e runner asks each binary `--list-fault-switches` and gates a case on its `Case::needs` (`tests/e2e/switches.rs`, with its `--self-test`), `Run::env` refuses an undeclared `BRINDLE_TEST_*` variable, the real-process tests call `skip(Capability::FaultSwitches, …)`, and CI's `BRINDLE_TEST_REQUIRE` and `BRINDLE_E2E_SWITCHES_REQUIRED` turn a skip into a failure where the runner provides the capability.
 - R1, R2, R5–R17 otherwise rely on review. No lint keeps `std::thread::sleep` or `Instant::now` out of the `#[cfg(test)]` modules in `src/`.
 
 ## PR checklist

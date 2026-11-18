@@ -85,7 +85,7 @@ Protocols: client protocol versions 1–3 and core↔holder H1 at version 2, bot
 - **R17.** There MUST be one path for a tab with a program: a session of a terminal server, local or remote. No in-process PTY fallback and no switch that turns the server off; a server problem is shown in the tab (`railway R6`), not hidden by a second backend.
 - **R18.** Peer liveness MUST be stamped on the reader thread, which drops heartbeats itself. Never measure it where output is copied: a slow client blocks that path and healthy peers' frames go unread.
 - **R19.** The server core MUST NOT answer a terminal's queries. Its emulator's listener drops every event but title changes; the attached client answers. Two answerers would reply twice.
-- **R20.** A test-only switch MUST be an environment variable named `BRINDLE_TEST_…`, and one that injects a fault MUST exist only in debug builds (`BRINDLE_TEST_FEED_PANIC`).
+- **R20.** A test-only switch MUST be an environment variable named `BRINDLE_TEST_…`, and one that injects a fault MUST exist only in debug builds (`BRINDLE_TEST_FEED_PANIC`), and each binary lists the ones it honours with `--list-fault-switches`, so a test tells a missing switch from a broken feature.
 - **R21.** The five workspace crates MUST share one version: Brindle matches its helper by version. Versions are moved by release-please alone.
 
 ## Anti-patterns
