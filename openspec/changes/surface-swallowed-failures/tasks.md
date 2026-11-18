@@ -260,15 +260,15 @@ Needs change 8 (the launch code), change 4 (`StateFile`), change 1 (the state-fi
 
 Needs change 4 (`tests/common/winproc.rs`).
 
-- [ ] 6.1 `tests/e2e/brindle.rs`:
+- [x] 6.1 `tests/e2e/brindle.rs`:
   - the timeline thread's `join` error is an error;
   - `list()` checks `brindle-remote list`'s status;
   - the hang-up's kill status is checked.
 
   `capture.rs::save_ppm` returns `io::Result`, and callers `?` it.
-- [ ] 6.2 `tests/perf/main.rs`: a failed `summary.toml` write prints the error and exits 1.
-- [ ] 6.3 `tests/common/winproc.rs`: `all` and `elevated` return `io::Result`, and the leftover-role check fails on `Err`.
-- [ ] 6.4 Self-tests where the code is pure: `e2e --self-test` covers `list`'s status check through its parser, and `perf --self-test` covers the summary write's error path with an unwritable directory.
+- [x] 6.2 `tests/perf/main.rs`: a failed `summary.toml` write prints the error and exits 1.
+- [x] 6.3 `tests/common/winproc.rs`: `all` and `elevated` return `io::Result`, and the leftover-role check fails on `Err`.
+- [x] 6.4 Self-tests where the code is pure: `e2e --self-test` covers `list`'s status check through its parser, and `perf --self-test` covers the summary write's error path with an unwritable directory.
   - Verify with `BRINDLE_E2E=1 cargo test --test e2e -- --self-test` and `BRINDLE_PERF=1 cargo test --test perf -- --self-test`.
 
 ## 7. `brindle-ui` icon path

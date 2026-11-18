@@ -153,9 +153,7 @@ fn main() {
             // On Windows the server directory is the same one every run, so
             // roles an interrupted run left would be taken for this case's,
             // and their images would keep the directory from being emptied.
-            if cfg!(windows) {
-                end_roles(&server_dir);
-            }
+            let cleaned = if cfg!(windows) { end_roles(&server_dir) } else { Ok(()) };
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).expect("case directory");
             let ctx = Ctx {
@@ -167,7 +165,7 @@ fn main() {
                 server_dir,
                 scale: Scale::new(slow),
             };
-            let outcome = (case.run)(&ctx);
+            let outcome = cleaned.and_then(|()| (case.run)(&ctx));
             match common::server::stop(&ctx.helper, &ctx.server_dir, &ctx.dir) {
                 // A server left running fails a case that passed.
                 Err(why) if outcome.is_ok() => Err(why),
@@ -217,6 +215,7 @@ fn self_test() -> i32 {
         ("scaled waits", wait::self_test),
         ("dump after the last step", brindle::self_test_dump_after_last_step),
         ("dump parsing", brindle::self_test_dump),
+        ("session listing", brindle::self_test_list),
         ("query parsing", query::self_test),
         ("cell rectangles", capture::self_test),
         ("pixel scans", capture::self_test_scan),

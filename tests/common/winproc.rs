@@ -19,15 +19,21 @@ pub struct Process {
     pub name: String,
 }
 
-/// Every running process.
-pub fn all() -> Vec<Process> {
+/// A failed Windows call as an I/O error naming the call.
+fn failed(call: &str, error: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(format!("{call}: {error}"))
+}
+
+/// Every running process, or why the list couldn't be taken.
+pub fn all() -> std::io::Result<Vec<Process>> {
     let mut found = Vec::new();
     // SAFETY: a process snapshot, walked with a correctly sized entry and
     // closed afterwards.
     unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return found };
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).map_err(|e| failed("CreateToolhelp32Snapshot", e))?;
         let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        let first = Process32FirstW(snapshot, &mut entry);
+        let mut more = first.is_ok();
         while more {
             let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
             found.push(Process {
@@ -35,11 +41,13 @@ pub fn all() -> Vec<Process> {
                 parent: entry.th32ParentProcessID,
                 name: String::from_utf16_lossy(&entry.szExeFile[..len]),
             });
+            // The end of the list is also a failure of `Process32NextW`.
             more = Process32NextW(snapshot, &mut entry).is_ok();
         }
         CloseHandle(snapshot).ok();
+        first.map_err(|e| failed("Process32FirstW", e))?;
     }
-    found
+    Ok(found)
 }
 
 /// The image path of `pid`, if it is running and ours to ask about.
@@ -195,15 +203,15 @@ pub fn post_close(window: Window) -> crate::Result {
         .map_err(|e| format!("posting WM_CLOSE to {window:#x}: {e}"))
 }
 
-/// Whether this process runs elevated (its token is the full one).
-pub fn elevated() -> bool {
+/// Whether this process runs elevated (its token is the full one), or why
+/// its token couldn't be read.
+pub fn elevated() -> std::io::Result<bool> {
     use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     let mut token = HANDLE::default();
     // SAFETY: this process's own token, closed below.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
-        return false;
-    }
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    opened.map_err(|e| failed("OpenProcessToken", e))?;
     let mut elevation = TOKEN_ELEVATION::default();
     let mut used = 0;
     // SAFETY: `elevation` is the size passed.
@@ -218,7 +226,8 @@ pub fn elevated() -> bool {
     };
     // SAFETY: the token is ours and open.
     unsafe { CloseHandle(token) }.ok();
-    asked.is_ok() && elevation.TokenIsElevated != 0
+    asked.map_err(|e| failed("GetTokenInformation", e))?;
+    Ok(elevation.TokenIsElevated != 0)
 }
 
 /// Whether `token` is elevated (`TokenElevation`); an unreadable one counts
@@ -343,7 +352,7 @@ pub fn self_test() -> crate::Result {
     }
     let own = command_line(std::process::id()).ok_or("no command line for this process")?;
     ensure!(own.contains("--self-test"), "own command line: {own:?}");
-    let me = all().into_iter().find(|p| p.pid == std::process::id()).ok_or("this process isn't listed")?;
+    let me = all().map_err(|e| format!("listing processes: {e}"))?.into_iter().find(|p| p.pid == std::process::id()).ok_or("this process isn't listed")?;
     ensure!(image(me.pid).is_some_and(|path| path.file_name().is_some_and(|n| *n == *me.name)), "image of {}", me.name);
     ensure!(alive(me.pid), "this process isn't alive");
     ensure!(parent(me.pid) == Some(me.parent), "parent of this process: {:?}", parent(me.pid));
