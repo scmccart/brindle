@@ -20,12 +20,11 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::{ready, scope};
 
+use super::super::ready_arg::{self, ReadyArg};
 use super::event_loop::Source;
 
 /// The fd a started role's ready pipe gets.
 const READY_FD: libc::c_int = 3;
-/// Stands for [`READY_FD`] in a role's arguments.
-const READY_PLACEHOLDER: &str = "{ready_fd}";
 
 /// The pipe to write the ready byte to.
 pub struct Ready(OwnedFd);
@@ -66,31 +65,16 @@ impl Ready {
 /// N`, or nothing for a role that stays in the foreground. Nothing else is
 /// accepted.
 pub fn ready_from_args(role: &str, args: &[String]) -> Result<Option<Ready>, String> {
-    parse_ready_fd(role, args)?
+    ready_arg::parse_fd(role, args)?
         .map(Ready::from_fd)
         .transpose()
         .map_err(|error| error.to_string())
 }
 
-fn parse_ready_fd(role: &str, args: &[String]) -> Result<Option<RawFd>, String> {
-    match args {
-        [] => Ok(None),
-        [flag, fd] if flag == "--ready-fd" => fd
-            .parse::<RawFd>()
-            .ok()
-            .filter(|fd| *fd >= 0)
-            .map(Some)
-            .ok_or_else(|| {
-                format!("{role}: --ready-fd needs a file descriptor number, not {fd:?}")
-            }),
-        _ => Err(format!("usage: brindle-remote {role} [--ready-fd N]")),
-    }
-}
-
 /// The arguments that start `role` detached with [`start_role`]:
 /// `<role> --ready-fd {ready_fd}`.
 pub fn role_args(role: &str) -> Vec<String> {
-    vec![role.into(), "--ready-fd".into(), READY_PLACEHOLDER.into()]
+    ready_arg::role_args(ReadyArg::Fd, role)
 }
 
 /// The read end of a started role's ready pipe.
@@ -212,7 +196,10 @@ pub fn start_role_as(
 ) -> io::Result<Started> {
     let args: Vec<OsString> = args
         .iter()
-        .map(|arg| arg.replace(READY_PLACEHOLDER, &READY_FD.to_string()).into())
+        .map(|arg| {
+            arg.replace(ReadyArg::Fd.placeholder(), &READY_FD.to_string())
+                .into()
+        })
         .collect();
     let program = OsString::from(format!("/proc/{}/exe", std::process::id()));
     let mut command = scope::command(decision, &scope::new_unit_name(role), &program, &args);
@@ -308,26 +295,6 @@ pub fn daemonize(log: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|arg| arg.to_string()).collect()
-    }
-
-    #[test]
-    fn ready_fd_arguments() {
-        assert_eq!(parse_ready_fd("hold", &[]), Ok(None));
-        assert_eq!(
-            parse_ready_fd("hold", &args(&["--ready-fd", "3"])),
-            Ok(Some(3))
-        );
-        assert!(parse_ready_fd("hold", &args(&["--ready-fd", "-1"])).is_err());
-        assert!(parse_ready_fd("hold", &args(&["--ready-fd"])).is_err());
-        assert!(parse_ready_fd("hold", &args(&["--other", "3"])).is_err());
-        assert_eq!(
-            role_args("hold"),
-            args(&["hold", "--ready-fd", "{ready_fd}"])
-        );
-    }
 
     /// A new ready pipe: the end a starter reads, and the role's end.
     fn ready_pipe() -> (ReadyPipe, OwnedFd) {

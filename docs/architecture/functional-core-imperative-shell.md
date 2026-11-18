@@ -57,7 +57,7 @@ pub struct SessionsModel { … }
 
 **Owned mutation.** A model's methods take `&mut self` and change only the model. That is this repo's form of a state transition: ownership makes the change visible at the call site, and nothing else is touched.
 
-**The other platform's data.** A helper that reads Windows paths or command lines is plain string code, so it compiles and is tested on Linux: `conpty::cmdline::program_stem` splits on `/` and `\` itself, because `Path` splits only on `/` there.
+**The other platform's data.** A helper that reads Windows paths or command lines is plain string code, so it compiles and is tested on Linux: `conpty::cmdline::program_stem` splits on `/` and `\` itself, because `Path` splits only on `/` there, and `server_dir::check_pipe_name` reads a pipe name as text. Win32 codes and states are plain values too: `pipe_state` keeps a Windows pipe's read and write states with the error codes written as numbers, and a Windows-only test compares each with the `windows` crate's constant.
 
 ## How it applies here
 
@@ -69,13 +69,15 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
-| `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment |
+| `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment, the Unix default program |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
 | `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | filtering, where an overlay goes |
 | `remote-protocol/src/{client,holder,wire,version,relay,upgrade}.rs` | encoding, decoding, version negotiation, whether a build is newer |
-| `remote-agent/src/conpty/cmdline.rs` | launch-line quoting |
+| `remote-protocol/src/{access,hresult}.rs` | who may use a pipe, and an `HRESULT`'s Win32 code |
+| `remote-agent/src/conpty/cmdline.rs` | launch-line quoting, the program and environment a session starts with |
+| `remote-agent/src/server/platform/{ready_arg,ensure_dir,pipe_state}.rs`, `remote-agent/src/conpty/{choice,hosts}.rs`, `remote-agent/src/pty/{program,stat}.rs` | beside a platform seam: a role's ready argument, whether the server directory is used, made or refused, a pipe's read and write states, which ConPTY is loaded, which processes a console's hang-up ends, a Linux session's shell, home, start directory and `TERM`, and `/proc` stat fields |
 
 ### Pure items in shell modules (held by review)
 
@@ -88,6 +90,10 @@ These modules mix pure items with shell code, which a text search can't tell apa
 | `src/settings.rs` (`Settings::new`) | the fonts and sizes a config and a preview resolve to |
 | `src/picker.rs` (`SessionsModel`, `session_palette`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
 | `ui/src/text_input.rs` (`EditState`) | editing |
+| `src/workspace.rs` (`program_title`) | whether an OSC title is the program's own, by the path style of the programs' paths |
+| `src/desktop.rs` (`without_verbatim_prefix`) | a Windows path without its verbatim `\\?\` prefix |
+| `src/notify/mod.rs` (`escape_markup`) | a notification's text as D-Bus markup |
+| `src/instance.rs` (`socket_path_in`, `pipe_name_for`) | where the instance listens: its socket's path and its pipe's name |
 
 The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Palette`, the settings dialog), `TerminalElement`'s paint, the connection's reader and writer threads, the holder's and the server core's loop handlers, and `main.rs`.
 
@@ -118,7 +124,12 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 
 - `tests/architecture.rs` checks R4: `term_core_does_no_io_and_reads_no_clock` (source search) and `crates_below_the_app_name_only_their_allowed_dependencies` (the closed dependency list). `the_wire_modules_do_no_io` holds the same for the protocol's message modules.
 - `the_pure_modules_read_nothing_ambient` checks R2 and R3 for the whole pure modules (the first table in "How it applies here"). Their production code calls no clock, names nothing of `std::{fs, net, process, env, thread}`, declares no mutable static (`OnceLock`, `LazyLock`, `Mutex`, `RwLock`, `Cell`, `Atomic…`, `static mut`, `thread_local!`) and calls no file-system method (`.is_file()`, `.exists()`, `.metadata()` and the like), so a probe is passed in. The search follows `use` items (grouped, nested, renamed, globs) and full paths, as every source search in that file does, and skips test code. `the_pure_module_list_matches_the_fcis_table` keeps its list equal to the table, `every_pure_module_exists` keeps each file real, and `a_pure_module_reading_the_world_is_found` plants each kind of read and a test-only `Instant::now()` that must not count.
-- `platform_cfgs_stay_in_their_seams` (`ports R4`) holds R7's `cfg` half in production code: outside the seams and `ports R4`'s excepted files nothing is platform-gated, and `brindle-term-core` has no platform `cfg` at all. Testing on every platform, and keeping `Path` off another platform's paths, are review matters.
+- `platform_cfgs_stay_in_their_seams` (`ports R4`) holds R7's `cfg` half in production code: outside the seams and `ports R4`'s excepted files nothing is platform-gated, and `brindle-term-core` has no platform `cfg` at all.
+- `the_neutral_code_is_never_gated` holds R7's `cfg` half inside the seams too, for the code every platform calls, wherever it sits:
+  - **Modules:** the whole pure modules (`PURE_MODULES`, the first table) and `NEUTRAL_MODULES` (`remote-protocol/src/server_dir.rs`, which reads the working directory, so it isn't a whole pure module). A lint-only `cfg_attr` aside, their production code and their own `mod` declaration have no platform `cfg`, and each ancestor's declaration has none or exactly `cfg(any(target_os = "linux", windows))`, Brindle's two platforms.
+  - **Items:** `NEUTRAL_ITEMS`, the second table's items in files that have platform `cfg`s, a seam or a file on `ports R4`'s exception (`desktop::without_verbatim_prefix`, `notify::escape_markup`, `instance::{socket_path_in, pipe_name_for}`, `workspace::program_title`). Each `fn` is at column 0, so not inside an inline module, with no platform `cfg` among its attributes.
+  - `every_neutral_module_and_item_exists` keeps both lists real, and `a_gated_neutral_module_is_found`, `a_gated_neutral_item_is_found` and `a_lint_only_cfg_attr_and_test_code_do_not_count` plant each case.
+- Testing on every platform, keeping `Path` off another platform's paths, and keeping the other pure items in shell modules ungated are review matters.
 - R1 and R5–R10 otherwise rely on review, as do R2 and R3 for the pure items in shell modules (the second table). Only the reviewer stops an item row, such as `pace::step` or `session::resolve_tab`, from calling `Instant::now()`; the check stops a whole module.
 
 ## PR checklist

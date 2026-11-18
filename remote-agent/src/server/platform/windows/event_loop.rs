@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::hresult;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
@@ -77,14 +78,10 @@ const POLL: Duration = Duration::from_millis(10);
 const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 
 /// The Win32 code of an error from the `windows` crate, which wraps it as
-/// an `HRESULT`.
+/// an `HRESULT` ([`hresult::win32_code`]); any other code as it is.
 pub(super) fn win32(error: &windows::core::Error) -> u32 {
     let code = error.code().0 as u32;
-    if code & 0xffff_0000 == 0x8007_0000 {
-        code & 0xffff
-    } else {
-        code
-    }
+    hresult::win32_code(code).unwrap_or(code)
 }
 
 pub(super) fn os_error(code: u32) -> io::Error {

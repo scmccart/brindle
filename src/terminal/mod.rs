@@ -1356,12 +1356,11 @@ fn parser_for(host: &Host) -> Parser {
 }
 
 /// The program a profile with no `command` runs, with the profile's `args`:
-/// `$SHELL`, then `/bin/sh`.
+/// `$SHELL`, then `/bin/sh` (`cmdline::unix_default_program`).
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn default_program(args: &[String]) -> (String, Vec<String>) {
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    (program, args.to_vec())
+    cmdline::unix_default_program(std::env::var("SHELL").ok(), args)
 }
 
 /// The program a profile with no `command` runs, with the profile's `args`

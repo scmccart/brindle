@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use brindle_remote_protocol::server_dir::resolve_windows;
 use brindle_remote_protocol::win;
 
+use super::super::ensure_dir::{self, AfterCreate, First, Found, Protect};
+
 /// Where the server directory for this process's environment is, without
 /// creating it.
 pub fn resolve_from_env() -> io::Result<PathBuf> {
@@ -35,6 +37,7 @@ pub fn ensure(dir: &Path) -> io::Result<()> {
 }
 
 /// [`ensure`], re-protecting an existing `dir` when `protect_existing`.
+/// What it does with what it finds is [`ensure_dir`]'s.
 fn ensure_with(dir: &Path, protect_existing: bool) -> io::Result<()> {
     let refuse = |problem: &str| {
         Err(io::Error::new(
@@ -42,27 +45,44 @@ fn ensure_with(dir: &Path, protect_existing: bool) -> io::Result<()> {
             format!("refusing the server directory {}: {problem}", dir.display()),
         ))
     };
-    let failed = |what: &str, error: io::Error| {
+    let failed = |what: &str, error: Option<io::Error>| {
+        let error = error.unwrap_or_else(|| io::ErrorKind::Other.into());
         io::Error::new(
             error.kind(),
             format!("can't {what} the server directory {}: {error}", dir.display()),
         )
     };
-    match fs::symlink_metadata(dir) {
-        // A link (a symlink or a junction) is not a directory here.
-        Ok(metadata) if !metadata.is_dir() => refuse("it is not a directory"),
-        Ok(_) if protect_existing => win::protect_dir(dir).map_err(|error| failed("protect", error)),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create(dir).map_err(|error| failed("create", error))?;
-            // Whoever created it, it must be a directory now.
-            match fs::symlink_metadata(dir) {
-                Ok(metadata) if metadata.is_dir() => Ok(()),
-                Ok(_) => refuse("it is not a directory"),
-                Err(error) => Err(failed("create", error)),
+    let protect = if protect_existing {
+        Protect::Existing
+    } else {
+        Protect::AsFound
+    };
+    let (found, error) = look(dir);
+    match ensure_dir::first(found, protect) {
+        First::Refuse => refuse("it is not a directory"),
+        First::Protect => win::protect_dir(dir).map_err(|error| failed("protect", Some(error))),
+        First::Use => Ok(()),
+        First::Create => {
+            create(dir).map_err(|error| failed("create", Some(error)))?;
+            let (found, error) = look(dir);
+            match ensure_dir::after_create(found) {
+                AfterCreate::Use => Ok(()),
+                AfterCreate::Refuse => refuse("it is not a directory"),
+                AfterCreate::FailCreate => Err(failed("create", error)),
             }
         }
-        Err(error) => Err(failed("read", error)),
+        First::FailRead => Err(failed("read", error)),
+    }
+}
+
+/// What is at `dir`, its link not followed, with the error that said so
+/// when it is missing or can't be read.
+fn look(dir: &Path) -> (Found, Option<io::Error>) {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => (Found::Dir, None),
+        Ok(_) => (Found::NotDir, None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (Found::Missing, Some(error)),
+        Err(error) => (Found::Unreadable, Some(error)),
     }
 }
 

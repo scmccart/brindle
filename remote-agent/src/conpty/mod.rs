@@ -1,8 +1,12 @@
 //! The pseudoconsoles the terminal server's holder runs programs on
 //! (Windows), and the command lines it starts them with.
 //!
-//! - [`cmdline`] quotes command lines and builds environment blocks. It is
-//!   pure, so it builds and is tested on every platform.
+//! - [`cmdline`] quotes command lines, picks a session's program and
+//!   environment and builds environment blocks. [`choice`] says whether a
+//!   session asks for the built-in ConPTY and where the packaged one loads
+//!   from, and [`hosts`] which console host is a session's and which
+//!   processes a hang-up ends. Each is pure, so it builds and is tested on
+//!   every platform.
 //! - `api` resolves the ConPTY to use: the packaged one embedded in the
 //!   binary (`build.rs`), loaded by absolute path from beside the exe or
 //!   from an extracted copy, and only when its bytes match the embedded
@@ -32,6 +36,18 @@
     )
 )]
 pub mod cmdline;
+
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows holder chooses a ConPTY")
+)]
+pub mod choice;
+
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows holder ends a console's processes")
+)]
+pub mod hosts;
 
 #[cfg(windows)]
 mod api;

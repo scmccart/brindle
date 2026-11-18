@@ -235,6 +235,19 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// A Windows `path` without the `\\?\` that `canonicalize` puts before it:
+/// `\\?\UNC\server\share` becomes `\\server\share`, and `\\?\C:\x` becomes
+/// `C:\x`. `None` when it has no such prefix. The path is text, so this is
+/// tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn without_verbatim_prefix(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    Some(match rest.strip_prefix(r"UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => rest.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +363,29 @@ mod tests {
     }
 
     #[test]
+    fn a_verbatim_disk_path_loses_its_prefix() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\C:\Users\me\AppData\Local\brindle\brindle.exe").as_deref(),
+            Some(r"C:\Users\me\AppData\Local\brindle\brindle.exe")
+        );
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_unc_path() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share\brindle.exe").as_deref(),
+            Some(r"\\server\share\brindle.exe")
+        );
+    }
+
+    #[test]
+    fn a_plain_path_is_left_alone() {
+        for plain in [r"C:\Tools\brindle.exe", r"\\server\share\brindle.exe", r"\\.\pipe\x", "/usr/bin/brindle", ""] {
+            assert_eq!(without_verbatim_prefix(plain), None, "{plain}");
+        }
+    }
+
+    #[test]
     fn request_validation() {
         let request = |install, uninstall, prefix| request_on(install, uninstall, prefix, false);
         assert_eq!(request(false, false, None), Ok(None));
@@ -398,9 +434,8 @@ mod start_menu {
     /// `canonicalize` adds.
     fn resolved(exe: &Path) -> PathBuf {
         let Ok(path) = std::fs::canonicalize(exe) else { return exe.to_path_buf() };
-        match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
-            Some(unc) if unc.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &unc[4..])),
-            Some(disk) => PathBuf::from(disk),
+        match path.to_str().and_then(super::without_verbatim_prefix) {
+            Some(plain) => PathBuf::from(plain),
             None => path,
         }
     }

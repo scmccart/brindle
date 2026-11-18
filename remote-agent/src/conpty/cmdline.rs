@@ -3,6 +3,42 @@
 //! Pure, so they are tested on every platform; only the Windows
 //! pseudoconsole uses them.
 
+use std::collections::BTreeMap;
+
+/// The program a session runs: its `command`, else the command interpreter
+/// its environment names (`COMSPEC`, in any case, when not empty), else
+/// `cmd.exe`. Brindle always names the program.
+pub fn program<'a>(command: Option<&'a str>, env: &'a BTreeMap<String, String>) -> &'a str {
+    command
+        .or_else(|| {
+            env.iter()
+                .find(|(name, value)| name.eq_ignore_ascii_case("COMSPEC") && !value.is_empty())
+                .map(|(_, value)| value.as_str())
+        })
+        .unwrap_or("cmd.exe")
+}
+
+/// A session's environment: `given` when it is `exact`, else `own` (this
+/// process's) without the names `given` sets, whatever their case, followed
+/// by `given`.
+pub fn environment(
+    given: &BTreeMap<String, String>,
+    exact: bool,
+    own: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let given_vars = given
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()));
+    if exact {
+        return given_vars.collect();
+    }
+    let set = |name: &str| given.keys().any(|set| set.eq_ignore_ascii_case(name));
+    own.into_iter()
+        .filter(|(name, _)| !set(name))
+        .chain(given_vars)
+        .collect()
+}
+
 /// The command line for `program` and `args`, each argument quoted so that
 /// the MSVC runtime's `CommandLineToArgvW` rules give it back as written.
 pub fn command_line(program: &str, args: &[String]) -> String {
@@ -266,6 +302,68 @@ mod tests {
         assert_eq!(
             launch_line("pwsh.exe", &args(&["/S", "a b"])),
             r#"pwsh.exe /S "a b""#
+        );
+    }
+
+    fn vars(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn map(list: &[(&str, &str)]) -> BTreeMap<String, String> {
+        vars(list).into_iter().collect()
+    }
+
+    #[test]
+    fn the_program_is_the_command_else_a_nonempty_comspec_else_cmd() {
+        let mut env = BTreeMap::new();
+        assert_eq!(program(Some("pwsh.exe"), &env), "pwsh.exe");
+        assert_eq!(program(None, &env), "cmd.exe");
+        // An empty one counts as unset.
+        env.insert("COMSPEC".to_string(), String::new());
+        assert_eq!(program(None, &env), "cmd.exe");
+        env.insert(
+            "ComSpec".to_string(),
+            r"C:\Windows\System32\cmd.exe".to_string(),
+        );
+        assert_eq!(program(None, &env), r"C:\Windows\System32\cmd.exe");
+        // The command wins over it.
+        assert_eq!(program(Some("pwsh.exe"), &env), "pwsh.exe");
+    }
+
+    #[test]
+    fn an_exact_environment_is_the_given_one() {
+        let given = map(&[("Path", r"C:\tools"), ("TERM", "xterm-256color")]);
+        let own = vars(&[("PATH", r"C:\Windows"), ("USERNAME", "me")]);
+        assert_eq!(
+            environment(&given, true, own),
+            vars(&[("Path", r"C:\tools"), ("TERM", "xterm-256color")])
+        );
+    }
+
+    #[test]
+    fn given_names_replace_own_names_of_any_case() {
+        let given = map(&[("Path", r"C:\tools"), ("TERM", "xterm-256color")]);
+        let own = vars(&[
+            ("USERNAME", "me"),
+            ("PATH", r"C:\Windows"),
+            ("term", "dumb"),
+            ("windir", r"C:\Windows"),
+        ]);
+        // This process's own first, in its order, then the given ones.
+        assert_eq!(
+            environment(&given, false, own),
+            vars(&[
+                ("USERNAME", "me"),
+                ("windir", r"C:\Windows"),
+                ("Path", r"C:\tools"),
+                ("TERM", "xterm-256color"),
+            ])
+        );
+        assert_eq!(
+            environment(&BTreeMap::new(), false, vars(&[("A", "1")])),
+            vars(&[("A", "1")])
         );
     }
 }

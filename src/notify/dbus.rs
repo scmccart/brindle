@@ -111,7 +111,7 @@ async fn listen(mut stream: MessageStream, replies: UnboundedSender<Reply>) {
 }
 
 async fn notify(service: &Service, replaces: u32, summary: &str, body: &str) -> zbus::Result<u32> {
-    let body = if service.markup { escape_markup(body) } else { body.to_string() };
+    let body = if service.markup { super::escape_markup(body) } else { body.to_string() };
     // The default action is what a click on the notification invokes.
     let actions: Vec<&str> = if service.actions { vec!["default", "Show"] } else { Vec::new() };
     let mut hints: HashMap<&str, Value> = HashMap::new();
@@ -128,20 +128,4 @@ async fn notify(service: &Service, replaces: u32, summary: &str, body: &str) -> 
         )
         .await?;
     reply.body().deserialize::<u32>()
-}
-
-/// Servers with `body-markup` read the body as a small subset of HTML.
-pub fn escape_markup(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn markup_is_escaped() {
-        assert_eq!(escape_markup("a < b && c > d"), "a &lt; b &amp;&amp; c &gt; d");
-        assert_eq!(escape_markup("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;");
-    }
 }

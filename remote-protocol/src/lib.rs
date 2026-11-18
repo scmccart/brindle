@@ -14,6 +14,7 @@ pub mod client;
 pub mod endpoint;
 pub mod environment;
 pub mod holder;
+pub mod hresult;
 pub mod ready;
 pub mod relay;
 #[cfg(unix)]

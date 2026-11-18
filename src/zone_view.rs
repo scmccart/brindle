@@ -23,7 +23,7 @@ use crate::config::{Config, Profile};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
-use crate::terminal::process::Snapshot;
+use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
@@ -489,7 +489,7 @@ impl ZoneTreeView {
         self.focus_serial += 1;
         let initial_title: SharedString = {
             let t = terminal.read(cx);
-            terminal_automatic_title(t.title(), &self.profile.name, None).into()
+            terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
         };
         let status = terminal.read(cx).status().summary();
         let zone = Zone {
@@ -645,11 +645,12 @@ impl ZoneTreeView {
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
         // The process name costs a look at the processes: only when the
         // program set no title of its own.
-        let process_name = match program_title(terminal.title()) {
+        let process_name = match program_title(terminal.title(), LOCAL_PATH_STYLE) {
             Some(_) => None,
             None => terminal.foreground_process_name(snapshot),
         };
-        let title: SharedString = terminal_automatic_title(terminal.title(), &profile_name, process_name).into();
+        let title: SharedString =
+            terminal_automatic_title(terminal.title(), &profile_name, LOCAL_PATH_STYLE, process_name).into();
         let changed = zone.title != title;
         zone.title = title;
         changed

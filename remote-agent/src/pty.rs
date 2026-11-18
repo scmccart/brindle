@@ -2,9 +2,25 @@
 //! new PTY, the shutdown timings
 //! and a session's foreground program here, and the Linux PTY itself
 //! (spawning, resizing, signalling, `/proc` queries) in `unix`.
+//!
+//! What `unix` decides sits in modules of no platform, each pure and tested
+//! on every platform: `program` (the login shell, the home directory, `~`
+//! in the requested directory, the start directory and the default `TERM`)
+//! and `stat` (the fields of a `/proc/<pid>/stat` line).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "only the Linux PTY starts a login shell")
+)]
+mod program;
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "only the Linux core reads /proc")
+)]
+mod stat;
 
 #[cfg(target_os = "linux")]
 mod unix;

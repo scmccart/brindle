@@ -11,9 +11,14 @@
 //! on named pipes whose names come from the directory and the user's SID, and
 //! the helper runs from a per-build copy. The Windows functions here only
 //! compute names and paths from their arguments, so they are tested on every
-//! platform.
+//! platform. So are the rules the platforms' seams apply to what they read:
+//! which names are pipe names ([`check_pipe_name`]), which files show a
+//! Linux holder ([`holder_socket_stem`]), and which helper copy is current,
+//! how a lost race to place one ends and which builds a prune removes
+//! ([`after_lost_rename`], [`pruned_builds`], [`after_image_removal`]).
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -125,6 +130,51 @@ pub fn pty_pipe(holder_pid: u32, n: u64) -> String {
     format!(r"\\.\pipe\brindle-pty-{holder_pid}-{n}")
 }
 
+/// What every pipe name starts with.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// The most characters (UTF-16 units) a pipe name has, prefix included.
+pub const MAX_NAME: usize = 256;
+
+/// Why a path is not a pipe name a server can listen at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadPipeName {
+    /// It doesn't start with [`PIPE_PREFIX`].
+    NoPrefix,
+    /// The name after the prefix is empty, or has a backslash or a NUL.
+    BadName,
+    /// It is longer than [`MAX_NAME`].
+    TooLong,
+}
+
+impl fmt::Display for BadPipeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoPrefix => r"it doesn't start with \\.\pipe\",
+            Self::BadName => "the name after the prefix is empty or has a backslash",
+            Self::TooLong => "it is longer than 256 characters",
+        })
+    }
+}
+
+impl std::error::Error for BadPipeName {}
+
+/// Whether `name` is a pipe name a server can listen at: [`PIPE_PREFIX`]
+/// and a name without a backslash or a NUL, at most [`MAX_NAME`]
+/// characters in all. It is text, read the same way on every platform.
+pub fn check_pipe_name(name: &str) -> Result<(), BadPipeName> {
+    let after = name
+        .strip_prefix(PIPE_PREFIX)
+        .ok_or(BadPipeName::NoPrefix)?;
+    if after.is_empty() || after.contains(['\\', '\0']) {
+        return Err(BadPipeName::BadName);
+    }
+    if name.encode_utf16().count() > MAX_NAME {
+        return Err(BadPipeName::TooLong);
+    }
+    Ok(())
+}
+
 /// Where the per-build helper copies live: `<server_dir>\bin` when
 /// `BRINDLE_SERVER_DIR` was given, else `<local_app_data>\brindle\server`.
 pub fn helper_copies(server_dir: Option<&Path>, local_app_data: &Path) -> PathBuf {
@@ -139,6 +189,89 @@ pub fn helper_copy(copies: &Path, build: &str) -> PathBuf {
     copies.join(build).join("brindle-remote.exe")
 }
 
+/// The temporary name a copy is written under, beside where it goes, by
+/// process `pid`'s `n`th copy, so no two copies in flight share one.
+pub fn copy_temp_name(pid: u32, n: u64) -> String {
+    format!("brindle-remote.exe.{pid}-{n}.tmp")
+}
+
+/// Whether a copy whose build id is `copy_build` (`None`: it can't be read)
+/// is the copy of `build`.
+pub fn is_current(copy_build: Option<&str>, build: &str) -> bool {
+    copy_build == Some(build)
+}
+
+/// What a copy does after its rename into place failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostRename {
+    /// Another process won the rename with the same build: use its file.
+    UseWinner,
+    /// Something else is under the copy's name: replace it.
+    Replace,
+    /// Nothing is there: the rename's own error stands.
+    Fail,
+}
+
+/// What follows a failed rename of a copy of `build`, from what is under the
+/// copy's name now: its build id (`None` when it can't be read) and whether
+/// anything is there.
+pub fn after_lost_rename(copy_build: Option<&str>, build: &str, copy_exists: bool) -> LostRename {
+    if is_current(copy_build, build) {
+        LostRename::UseWinner
+    } else if copy_exists {
+        LostRename::Replace
+    } else {
+        LostRename::Fail
+    }
+}
+
+/// What an entry of the copies' directory is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A directory: one build's copy.
+    Dir,
+    /// Anything else, or an entry whose kind can't be read.
+    Other,
+}
+
+/// The build directories a prune removes, in the order listed: every
+/// directory but `keep`'s.
+pub fn pruned_builds(entries: Vec<(OsString, EntryKind)>, keep: &str) -> Vec<OsString> {
+    entries
+        .into_iter()
+        .filter(|(name, kind)| *kind == EntryKind::Dir && name != keep)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// How removing a build's image, its `brindle-remote.exe`, went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRemoval {
+    Removed,
+    /// There was none.
+    Missing,
+    /// It couldn't be removed: Windows refuses to delete a running image.
+    Failed,
+}
+
+/// What a prune does with a build's directory once its image is dealt
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneDir {
+    Remove,
+    /// Left whole for a later prune.
+    Keep,
+}
+
+/// Whether a prune removes a build's directory after `removal` of its
+/// image: a build that still has a role running keeps its directory whole.
+pub fn after_image_removal(removal: ImageRemoval) -> PruneDir {
+    match removal {
+        ImageRemoval::Removed | ImageRemoval::Missing => PruneDir::Remove,
+        ImageRemoval::Failed => PruneDir::Keep,
+    }
+}
+
 /// Splits a holder's lock file name, `holder-<build>-<n>.lock`, into the
 /// build and the holder's number. The build is everything between the prefix
 /// and the last `-`, so it may contain dashes itself.
@@ -149,6 +282,14 @@ pub fn parse_holder_lock(name: &str) -> Option<(String, u32)> {
         return None;
     }
     Some((build.to_string(), n.parse().ok()?))
+}
+
+/// The stem of a holder's socket file name on Linux, `holder-….sock`, which
+/// its lock file and log share: `holder-b1-0.sock` gives `holder-b1-0`.
+/// `None` for any other name.
+pub fn holder_socket_stem(name: &str) -> Option<&str> {
+    name.strip_suffix(".sock")
+        .filter(|stem| stem.starts_with("holder-"))
 }
 
 #[cfg(test)]
@@ -293,5 +434,135 @@ mod tests {
         ] {
             assert_eq!(parse_holder_lock(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_holder_socket_gives_its_stem() {
+        assert_eq!(
+            holder_socket_stem("holder-0.3.1-abc-2.sock"),
+            Some("holder-0.3.1-abc-2")
+        );
+        // Any name after the prefix, as the directory shows it.
+        assert_eq!(holder_socket_stem("holder-.sock"), Some("holder-"));
+        for other in [
+            "holder-b1-0.lock",
+            "holder-b1-0.log",
+            "core.sock",
+            "xholder-b1-0.sock",
+        ] {
+            assert_eq!(holder_socket_stem(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_name_needs_the_prefix_a_plain_name_and_at_most_256_characters() {
+        assert_eq!(
+            check_pipe_name(r"\\.\pipe\brindle-server-0123456789abcdef-core"),
+            Ok(())
+        );
+        let cases = [
+            (r"C:\Users\me\run\core.sock", BadPipeName::NoPrefix),
+            (r"\\server\pipe\name", BadPipeName::NoPrefix),
+            (r"\\.\pipe\", BadPipeName::BadName),
+            (r"\\.\pipe\a\b", BadPipeName::BadName),
+            ("\\\\.\\pipe\\a\0b", BadPipeName::BadName),
+        ];
+        for (name, problem) in cases {
+            assert_eq!(check_pipe_name(name), Err(problem), "{name:?}");
+        }
+        let longest = format!(r"\\.\pipe\{}", "n".repeat(MAX_NAME - PIPE_PREFIX.len()));
+        assert_eq!(longest.len(), 256);
+        assert_eq!(check_pipe_name(&longest), Ok(()));
+        assert_eq!(
+            check_pipe_name(&format!("{longest}n")),
+            Err(BadPipeName::TooLong)
+        );
+        // Characters are UTF-16 units, not bytes.
+        let wide = format!(r"\\.\pipe\{}", "é".repeat(MAX_NAME - PIPE_PREFIX.len()));
+        assert_eq!(check_pipe_name(&wide), Ok(()));
+        let beyond = format!(r"\\.\pipe\{}", "😀".repeat(124));
+        assert_eq!(check_pipe_name(&beyond), Err(BadPipeName::TooLong));
+
+        assert_eq!(
+            BadPipeName::NoPrefix.to_string(),
+            r"it doesn't start with \\.\pipe\"
+        );
+        assert_eq!(
+            BadPipeName::BadName.to_string(),
+            "the name after the prefix is empty or has a backslash"
+        );
+        assert_eq!(
+            BadPipeName::TooLong.to_string(),
+            "it is longer than 256 characters"
+        );
+    }
+
+    #[test]
+    fn every_pipe_the_server_names_is_a_pipe_name() {
+        let dir = Path::new(r"C:\Users\someone\AppData\Local\brindle\run-elevated");
+        let sid = "S-1-5-21-1234567890-1234567890-1234567890-1001";
+        let build = "b".repeat(64);
+        for name in [
+            core_pipe(dir, sid),
+            holder_pipe(dir, sid, &build, u32::MAX),
+            pty_pipe(u32::MAX, u64::MAX),
+        ] {
+            assert_eq!(check_pipe_name(&name), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_temporary_copy_is_named_by_pid_and_count() {
+        assert_eq!(copy_temp_name(4242, 0), "brindle-remote.exe.4242-0.tmp");
+        assert_eq!(copy_temp_name(7, 12), "brindle-remote.exe.7-12.tmp");
+        assert_ne!(copy_temp_name(7, 1), copy_temp_name(8, 1));
+    }
+
+    #[test]
+    fn a_lost_rename_uses_the_winner_replaces_another_file_or_fails() {
+        assert!(is_current(Some("b1"), "b1"));
+        assert!(!is_current(Some("b2"), "b1"));
+        assert!(!is_current(None, "b1"));
+
+        // Another process put the same build there first.
+        assert_eq!(
+            after_lost_rename(Some("b1"), "b1", true),
+            LostRename::UseWinner
+        );
+        // Something else is under the copy's name: a cut-short file, or one
+        // that can't be read.
+        assert_eq!(
+            after_lost_rename(Some("b2"), "b1", true),
+            LostRename::Replace
+        );
+        assert_eq!(after_lost_rename(None, "b1", true), LostRename::Replace);
+        // Nothing is there, so the rename failed for another reason.
+        assert_eq!(after_lost_rename(None, "b1", false), LostRename::Fail);
+    }
+
+    #[test]
+    fn pruning_keeps_the_current_build_and_skips_files() {
+        let entries = vec![
+            (OsString::from("old"), EntryKind::Dir),
+            (OsString::from("kept"), EntryKind::Dir),
+            (OsString::from("a-file"), EntryKind::Other),
+            (OsString::from("older"), EntryKind::Dir),
+            // A file named like the build is skipped too.
+            (OsString::from("kept"), EntryKind::Other),
+        ];
+        assert_eq!(
+            pruned_builds(entries, "kept"),
+            [OsString::from("old"), OsString::from("older")]
+        );
+        assert_eq!(pruned_builds(Vec::new(), "kept"), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn a_running_image_keeps_its_build_directory() {
+        assert_eq!(after_image_removal(ImageRemoval::Removed), PruneDir::Remove);
+        assert_eq!(after_image_removal(ImageRemoval::Missing), PruneDir::Remove);
+        // Windows refuses to delete a running image: the directory stays
+        // whole for a later prune.
+        assert_eq!(after_image_removal(ImageRemoval::Failed), PruneDir::Keep);
     }
 }

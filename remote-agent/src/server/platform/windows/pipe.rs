@@ -65,10 +65,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_OPERATION_ABORTED, ERROR_WRITE_FAULT, HANDLE, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::PeekNamedPipe;
@@ -77,18 +74,16 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
+use super::super::pipe_state::{
+    self, MORE_DATA, NO_ERROR, ReadState, Rotation, Sides, WriteState,
+};
+pub(super) use super::super::pipe_state::{Need, WRITE_MARK};
 use super::event_loop::{Port, Source, Watched, millis, os_error, win32};
 use crate::server::event_loop::{Event, Interest, Token};
 
 /// How much one read takes from a pipe, and so how much input a pipe holds
 /// for an owner that isn't reading.
 pub(super) const READ_BUFFER: usize = 64 * 1024;
-
-/// A pipe takes writes while fewer bytes than this wait for the pipe.
-pub(super) const WRITE_MARK: usize = 1024 * 1024;
-
-/// A write buffer that grew past this is freed once it is empty.
-const KEEP: usize = 64 * 1024;
 
 /// How long a cancelled operation gets to end before its memory is leaked
 /// instead of freed. A cancelled pipe operation ends at once.
@@ -101,13 +96,8 @@ const TURN: Duration = Duration::from_millis(10);
 /// The most handles one `WaitForMultipleObjects` takes.
 const MAX_WAIT_HANDLES: usize = 64;
 
-const NO_ERROR: u32 = 0;
 const IO_PENDING: u32 = ERROR_IO_PENDING.0;
 const IO_INCOMPLETE: u32 = ERROR_IO_INCOMPLETE.0;
-const MORE_DATA: u32 = ERROR_MORE_DATA.0;
-const BROKEN_PIPE: u32 = ERROR_BROKEN_PIPE.0;
-const HANDLE_EOF: u32 = ERROR_HANDLE_EOF.0;
-const OPERATION_ABORTED: u32 = ERROR_OPERATION_ABORTED.0;
 
 /// How an operation in flight reports its end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,18 +344,22 @@ impl Drop for Buffer {
     }
 }
 
+/// Whether a side's handle is still open, for its model.
+fn side(handle: &Option<Arc<OwnedHandle>>) -> pipe_state::Handle {
+    match handle {
+        Some(_) => pipe_state::Handle::Open,
+        None => pipe_state::Handle::Closed,
+    }
+}
+
 struct Reader {
     /// Closed (`None`) once the owner is gone or shut a duplex pipe down.
     handle: Option<Arc<OwnedHandle>>,
     op: Op,
     /// Freed with the reader, unless a read never ended.
     buffer: ManuallyDrop<Buffer>,
-    /// The bytes read and not yet taken are `buffer[start..end]`.
-    start: usize,
-    end: usize,
-    /// No read will be issued again: the buffer holds the last input.
-    eof: bool,
-    error: Option<u32>,
+    /// What `buffer` holds, and how the reads ended.
+    state: ReadState,
 }
 
 impl Reader {
@@ -374,15 +368,8 @@ impl Reader {
             handle: Some(handle),
             op: Op::new(Direction::Read),
             buffer: ManuallyDrop::new(Buffer::new(READ_BUFFER)),
-            start: 0,
-            end: 0,
-            eof: false,
-            error: None,
+            state: ReadState::default(),
         }
-    }
-
-    fn ready(&self) -> bool {
-        self.end > self.start || self.eof || self.error.is_some()
     }
 }
 
@@ -400,16 +387,10 @@ struct Writer {
     /// Closed (`None`) once the owner is gone or shut the writes down.
     handle: Option<Arc<OwnedHandle>>,
     op: Op,
-    /// The write in flight covers `sending[sent..]`; it isn't touched
-    /// meanwhile.
-    sending: Vec<u8>,
-    sent: usize,
-    /// What the next write takes.
-    queued: Vec<u8>,
-    error: Option<u32>,
-    /// [`Pipe::shutdown_write`] was called: the handle closes once
-    /// everything is sent.
-    shut: bool,
+    /// What is being sent and queued. The write in flight covers
+    /// `sending[sent..]`, which isn't touched meanwhile;
+    /// [`Pipe::shutdown_write`] sets `shut`.
+    state: WriteState,
 }
 
 impl Writer {
@@ -417,28 +398,8 @@ impl Writer {
         Self {
             handle: Some(handle),
             op: Op::new(Direction::Write),
-            sending: Vec::new(),
-            sent: 0,
-            queued: Vec::new(),
-            error: None,
-            shut: false,
+            state: WriteState::default(),
         }
-    }
-
-    /// Bytes the pipe hasn't taken yet.
-    fn unsent(&self) -> usize {
-        self.sending.len() - self.sent + self.queued.len()
-    }
-
-    fn ready(&self) -> bool {
-        self.unsent() < WRITE_MARK || self.error.is_some()
-    }
-
-    fn fail(&mut self, error: u32) {
-        self.error = Some(error);
-        self.sending = Vec::new();
-        self.sent = 0;
-        self.queued = Vec::new();
     }
 }
 
@@ -446,7 +407,7 @@ impl Drop for Writer {
     fn drop(&mut self) {
         // A write that couldn't be recalled may still read its bytes.
         if self.op.in_flight.is_some() {
-            mem::forget(mem::take(&mut self.sending));
+            mem::forget(mem::take(&mut self.state.sending));
         }
     }
 }
@@ -501,15 +462,15 @@ impl State {
         let Some(reader) = self.reader.as_mut() else {
             return;
         };
-        if reader.op.in_flight.is_some() || reader.ready() {
+        if reader.op.in_flight.is_some() || reader.state.ready() {
             return;
         }
         let Some(handle) = reader.handle.as_deref().map(raw) else {
-            reader.eof = true;
+            reader.state.eof = true;
             return;
         };
-        reader.start = 0;
-        reader.end = 0;
+        reader.state.start = 0;
+        reader.state.end = 0;
         let (pointer, capacity) = (reader.buffer.pointer.as_ptr(), reader.buffer.capacity);
         let port = packets(&self.port);
         let issued = reader.op.issue(port, me, |overlapped, count| {
@@ -531,18 +492,8 @@ impl State {
             return;
         };
         reader.op.in_flight = None;
-        match error {
-            NO_ERROR | MORE_DATA if bytes > 0 => reader.end = bytes as usize,
-            // A read of nothing is a message pipe's empty message, which
-            // stands for the end like `Read`'s `Ok(0)`.
-            NO_ERROR | MORE_DATA | BROKEN_PIPE | HANDLE_EOF => reader.eof = true,
-            // Cancelled: nothing was read, and a later read may follow.
-            OPERATION_ABORTED => {}
-            error => reader.error = Some(error),
-        }
-        if reader.handle.is_none() {
-            reader.eof = true;
-        }
+        let open = side(&reader.handle);
+        reader.state.apply(pipe_state::read_ended(bytes, error), open);
     }
 
     /// Issues writes while there is output and none is in flight. Once a
@@ -552,28 +503,22 @@ impl State {
             let Some(writer) = self.writer.as_mut() else {
                 return;
             };
-            if writer.op.in_flight.is_some() || writer.error.is_some() {
+            if writer.op.in_flight.is_some() {
                 return;
             }
-            if writer.sent == writer.sending.len() {
-                writer.sending.clear();
-                writer.sent = 0;
-                mem::swap(&mut writer.sending, &mut writer.queued);
-                if writer.queued.capacity() > KEEP {
-                    writer.queued = Vec::new();
-                }
-                if writer.sending.is_empty() {
-                    if writer.shut && writer.handle.is_some() {
-                        self.close_writer();
-                    }
+            match writer.state.rotate(side(&writer.handle)) {
+                Rotation::Send => {}
+                Rotation::Idle => return,
+                Rotation::Close => {
+                    self.close_writer();
                     return;
                 }
             }
+            // Open: the writer would have failed otherwise.
             let Some(handle) = writer.handle.as_deref().map(raw) else {
-                writer.fail(BROKEN_PIPE);
                 return;
             };
-            let unsent = &writer.sending[writer.sent..];
+            let unsent = &writer.state.sending[writer.state.sent..];
             let (pointer, length) = (unsent.as_ptr(), unsent.len());
             let port = packets(&self.port);
             let issued = writer.op.issue(port, me, |overlapped, count| {
@@ -596,13 +541,7 @@ impl State {
             return;
         };
         writer.op.in_flight = None;
-        let left = writer.sending.len() - writer.sent;
-        match error {
-            NO_ERROR if bytes > 0 => writer.sent += left.min(bytes as usize),
-            // A write that took nothing would be issued again for ever.
-            NO_ERROR => writer.fail(ERROR_WRITE_FAULT.0),
-            error => writer.fail(error),
-        }
+        writer.state.apply(pipe_state::write_ended(bytes, error));
     }
 
     /// Closes the handle writes go to. For a duplex pipe that is the handle
@@ -624,9 +563,9 @@ impl State {
                 Recalled::Ended { bytes, error } => self.read_done(bytes, error),
                 // Its packet ends the input, or nothing was in flight.
                 Recalled::Not if reader.op.in_flight.is_some() => {}
-                Recalled::Not => reader.eof = true,
+                Recalled::Not => reader.state.eof = true,
                 // Never polled again: the handle to poll it with is gone.
-                Recalled::Stuck => reader.eof = true,
+                Recalled::Stuck => reader.state.eof = true,
             }
         }
     }
@@ -652,38 +591,30 @@ impl State {
         }
     }
 
-    fn readable(&self) -> bool {
-        self.reader.as_ref().is_some_and(Reader::ready)
-    }
-
-    fn writable(&self) -> bool {
-        self.writer.as_ref().is_some_and(Writer::ready)
-    }
-
-    /// Whether the pipe has taken everything written, or never will.
-    fn sent(&self) -> bool {
-        self.writer
-            .as_ref()
-            .is_none_or(|writer| writer.unsent() == 0 || writer.error.is_some())
-    }
-
-    /// The peer is gone or the pipe failed: a read returns the end or an
-    /// error (for a pipe with nothing to read from, a write fails). So a
-    /// handler that reads when told of it always gets one of the two.
-    fn hung_up(&self) -> bool {
-        match (&self.reader, &self.writer) {
-            (Some(reader), _) => reader.eof || reader.error.is_some(),
-            (None, Some(writer)) => writer.error.is_some(),
-            (None, None) => false,
+    /// The two sides' models, for the readiness they decide.
+    fn sides(&self) -> Sides<'_> {
+        Sides {
+            reader: self.reader.as_ref().map(|reader| &reader.state),
+            writer: self.writer.as_ref().map(|writer| &writer.state),
         }
     }
 
-    /// Whether a wait for `need` is over. A hang-up ends it too: the peer
-    /// closing ends the input, and fails a write that is waiting.
+    fn readable(&self) -> bool {
+        self.sides().readable()
+    }
+
+    fn writable(&self) -> bool {
+        self.sides().writable()
+    }
+
+    /// See [`Sides::hung_up`].
+    fn hung_up(&self) -> bool {
+        self.sides().hung_up()
+    }
+
+    /// See [`Sides::meets`].
     fn meets(&self, need: Need) -> bool {
-        (need.readable && self.readable())
-            || (need.writable && self.writable())
-            || (need.sent && self.sent())
+        self.sides().meets(need)
     }
 
     /// What a wait for `need` waits on: the ports and events of the
@@ -692,7 +623,7 @@ impl State {
         let read = self.reader.as_ref().map(|reader| &reader.op);
         let write = self.writer.as_ref().map(|writer| &writer.op);
         // A shut writer's last write closes the handle, which ends input.
-        let shutting = self.writer.as_ref().is_some_and(|writer| writer.shut);
+        let shutting = self.writer.as_ref().is_some_and(|writer| writer.state.shut);
         let wanted = [
             read.filter(|_| need.readable),
             write.filter(|_| need.writable || need.sent || (need.readable && shutting)),
@@ -890,17 +821,6 @@ unsafe fn complete(overlapped: *mut OVERLAPPED, bytes: u32, error: u32) {
     // now that the packet is taken.
 }
 
-/// What a wait on a pipe is for.
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Need {
-    /// Input, its end, or an error to read.
-    pub readable: bool,
-    /// Room for a write.
-    pub writable: bool,
-    /// The pipe having taken everything written.
-    pub sent: bool,
-}
-
 impl From<Interest> for Need {
     fn from(interest: Interest) -> Self {
         Self {
@@ -981,23 +901,24 @@ impl Pipe {
                         "the pipe has no end to read from",
                     ));
                 };
-                if reader.end > reader.start {
-                    let count = buffer.len().min(reader.end - reader.start);
+                let held = &mut reader.state;
+                if held.end > held.start {
+                    let count = buffer.len().min(held.end - held.start);
                     // SAFETY: no read is in flight while the buffer holds
                     // bytes, so they are initialised and nothing writes to
                     // them.
                     unsafe {
-                        let from = reader.buffer.pointer.as_ptr().add(reader.start);
+                        let from = reader.buffer.pointer.as_ptr().add(held.start);
                         ptr::copy_nonoverlapping(from, buffer.as_mut_ptr(), count);
                     }
-                    reader.start += count;
+                    held.start += count;
                     state.start_read(&self.shared);
                     return Ok(count);
                 }
-                if let Some(error) = reader.error {
+                if let Some(error) = held.error {
                     return Err(os_error(error));
                 }
-                if reader.eof {
+                if held.eof {
                     return Ok(0);
                 }
                 if reader.op.in_flight.is_none() {
@@ -1029,22 +950,22 @@ impl Pipe {
                         "the pipe has no end to write to",
                     ));
                 };
-                if let Some(error) = writer.error {
+                if let Some(error) = writer.state.error {
                     return Err(os_error(error));
                 }
-                if writer.shut {
+                if writer.state.shut {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "the pipe's write side was shut down",
                     ));
                 }
-                let unsent = writer.unsent();
+                let unsent = writer.state.unsent();
                 if unsent < WRITE_MARK {
                     let count = bytes.len().min(WRITE_MARK - unsent);
-                    writer.queued.extend_from_slice(&bytes[..count]);
+                    writer.state.queued.extend_from_slice(&bytes[..count]);
                     state.send(&self.shared);
                     // A write to a pipe whose peer is gone fails at once.
-                    return match state.writer.as_ref().and_then(|writer| writer.error) {
+                    return match state.writer.as_ref().and_then(|writer| writer.state.error) {
                         Some(error) => Err(os_error(error)),
                         None => Ok(count),
                     };
@@ -1066,7 +987,7 @@ impl Pipe {
             state
                 .reader
                 .as_ref()
-                .is_some_and(|reader| reader.end > reader.start)
+                .is_some_and(|reader| reader.state.end > reader.state.start)
         };
         let port = {
             let mut state = self.shared.lock();
@@ -1100,7 +1021,10 @@ impl Pipe {
     /// How many bytes written here the pipe hasn't taken yet.
     pub(super) fn unsent(&self) -> usize {
         let state = self.shared.lock();
-        state.writer.as_ref().map_or(0, Writer::unsent)
+        state
+            .writer
+            .as_ref()
+            .map_or(0, |writer| writer.state.unsent())
     }
 
     /// Whether the pipe has taken everything written. An error is the
@@ -1116,9 +1040,9 @@ impl Pipe {
         }
         let state = self.shared.lock();
         match state.writer.as_ref() {
-            Some(writer) => match writer.error {
+            Some(writer) => match writer.state.error {
                 Some(error) => Err(os_error(error)),
-                None => Ok(writer.unsent() == 0),
+                None => Ok(writer.state.unsent() == 0),
             },
             None => Ok(true),
         }
@@ -1130,7 +1054,7 @@ impl Pipe {
     pub(super) fn shutdown_write(&self) {
         let mut state = self.shared.lock();
         if let Some(writer) = state.writer.as_mut() {
-            writer.shut = true;
+            writer.state.shut = true;
         }
         state.settle(&self.shared);
     }
@@ -1336,6 +1260,21 @@ mod tests {
 
     fn state_of(pipe: &Pipe) -> Weak<Shared> {
         Arc::downgrade(&pipe.shared)
+    }
+
+    #[test]
+    fn the_win32_codes_match_the_windows_crate() {
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED,
+            ERROR_SUCCESS, ERROR_WRITE_FAULT,
+        };
+
+        assert_eq!(pipe_state::NO_ERROR, ERROR_SUCCESS.0);
+        assert_eq!(pipe_state::WRITE_FAULT, ERROR_WRITE_FAULT.0);
+        assert_eq!(pipe_state::HANDLE_EOF, ERROR_HANDLE_EOF.0);
+        assert_eq!(pipe_state::BROKEN_PIPE, ERROR_BROKEN_PIPE.0);
+        assert_eq!(pipe_state::MORE_DATA, ERROR_MORE_DATA.0);
+        assert_eq!(pipe_state::OPERATION_ABORTED, ERROR_OPERATION_ABORTED.0);
     }
 
     /// Has `ev` take what has completed until `done`.

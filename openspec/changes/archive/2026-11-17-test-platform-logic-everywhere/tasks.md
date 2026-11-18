@@ -13,13 +13,13 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
 
 ## 1. Shared contracts in `brindle-remote-protocol`
 
-- [ ] 1.1 `remote-protocol/src/hresult.rs` (design §5.5):
+- [x] 1.1 `remote-protocol/src/hresult.rs` (design §5.5):
   - add `pub mod hresult;` (ungated) and `pub fn win32_code(hresult: u32) -> Option<u32>`, which is `Some(code & 0xffff)` for `0x8007xxxx` and `None` otherwise;
   - tests: `a_win32_hresult_gives_its_code` (`0x8007_0005` gives 5, `0x8007_00E7` gives 231), `another_facility_gives_none` (`0x8004_0005`, `0x8000_4005`) and `a_plain_code_gives_none` (0, 5);
   - switch `win::os` to it, falling back to `io::Error::other(error)` as today.
 
   Verify: `cargo test --locked -p brindle-remote-protocol hresult::`.
-- [ ] 1.2 DACLs (b21 #1, #2; design §5.5):
+- [x] 1.2 DACLs (b21 #1, #2; design §5.5):
   - move `Ace`, `Dacl`, `Dacl::allows_only` and `SYSTEM_SID` from `win.rs:322-353,587` into `access.rs`;
   - `win.rs` keeps `impl Dacl { read, of_handle, of_path }` and adds `pub use crate::access::{Ace, Dacl, SYSTEM_SID};`, so `win::SYSTEM_SID`'s users don't change;
   - add `a_dacl_allows_only_the_named_sids`, built from values: one that passes, plus the five refusals (unprotected, `others > 0`, an extra SID, a missing SID, a duplicated SID).
@@ -27,24 +27,24 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-protocol access::`;
   - on Windows, `a_server_pipe_allows_only_the_user_and_system` and `a_private_directory_allows_only_the_user_and_system` pass unchanged.
-- [ ] 1.3 The server's client check (b14 #1; design §5.4):
+- [x] 1.3 The server's client check (b14 #1; design §5.4):
   - add `access::admit_client(own: &Principal, client: io::Result<Principal>) -> io::Result<()>`, with the body of `windows/listen.rs:237` `check`: `PermissionDenied`, "refused a connection whose user can't be told: …" and "refused a connection: …", through `peer_allowed(.., Side::Server)`;
   - move the value assertions of `listen.rs`'s `the_client_must_be_the_same_user_at_no_lower_integrity` here, asserting the whole message texts. The listener's switch is task 2.4.
 
   Verify: `cargo test --locked -p brindle-remote-protocol access::`.
-- [ ] 1.4 The pipe-name check (b14 #1; design §5.4):
+- [x] 1.4 The pipe-name check (b14 #1; design §5.4):
   - add to `server_dir.rs` `pub fn check_pipe_name(name: &str) -> Result<(), BadPipeName>`, with `pub enum BadPipeName { NoPrefix, BadName, TooLong }`, whose `Display` gives `listen.rs:104`'s three problem texts;
   - `PIPE_PREFIX` and `MAX_NAME` (256) move with it, and the length is counted with `encode_utf16`;
   - tests: `a_pipe_name_needs_the_prefix_a_plain_name_and_at_most_256_characters` (the cases of `paths_are_pipe_names`: a socket path, an empty name, `a\b`, `\\server\pipe\name`, a NUL, 256 and 257 characters) and `every_pipe_the_server_names_is_a_pipe_name` (`core_pipe`, `holder_pipe` with a 64-character build id, `pty_pipe`).
 
   Verify: `cargo test --locked -p brindle-remote-protocol server_dir::`.
-- [ ] 1.5 Holder sockets (b20 #3; design §5.5):
+- [x] 1.5 Holder sockets (b20 #3; design §5.5):
   - add `server_dir::holder_socket_stem(name: &str) -> Option<&str>`: the stem of `holder-….sock`, else `None`;
   - the `#[cfg(not(windows))]` `Endpoint::shown` builds the socket, lock and log paths from it;
   - test `a_holder_socket_gives_its_stem` covers a socket, a lock file, a log, `holder-.sock` and a name without the prefix.
 
   Verify: `cargo test --locked -p brindle-remote-protocol server_dir:: endpoint::` (`sockets_are_in_the_directory_and_show_the_holders` passes unchanged).
-- [ ] 1.6 Helper copies (b21 #3; design §5.5):
+- [x] 1.6 Helper copies (b21 #3; design §5.5):
   - add to `server_dir.rs`:
     - `copy_temp_name(pid, n)`;
     - `is_current(copy_build: Option<&str>, build: &str) -> bool`;
@@ -61,7 +61,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-protocol server_dir::`;
   - on Windows, `the_copy_is_named_by_build_and_keeps_the_last_write_time`, `a_wrong_file_under_the_copys_name_is_replaced`, `racing_copies_end_with_one_valid_copy` and `pruning_skips_a_build_whose_helper_is_running` pass unchanged.
-- [ ] 1.7 Docs for this group (design §7):
+- [x] 1.7 Docs for this group (design §7):
   - `functional-core-imperative-shell.md`'s "Whole pure modules" table gains `remote-protocol/src/{access,hresult}.rs` (who may use a pipe, and an `HRESULT`'s Win32 code), and change 7's `PURE_MODULES` gains both;
   - `ports-and-adapters.md` R7's examples add `access::admit_client`.
 
@@ -69,7 +69,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
 
 ## 2. Neutral modules beside the agent's seams (`brindle-remote-agent`)
 
-- [ ] 2.1 `server/platform/ready_arg.rs` (b13 #1 and the Linux twin; design §5.1):
+- [x] 2.1 `server/platform/ready_arg.rs` (b13 #1 and the Linux twin; design §5.1):
   - add `pub enum ReadyArg { Fd, Handle }` (`flag()`, `placeholder()`), `role_args(arg, role)`, `parse_fd(role, args) -> Result<Option<i32>, String>` (`>= 0`) and `parse_handle(role, args) -> Result<Option<usize>, String>` (`!= 0`);
   - declare it in `server/platform/mod.rs` with lint-only `cfg_attr`s;
   - tests:
@@ -83,7 +83,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   - `ready_from_args`, `role_args` and `start` in both `daemon.rs` files call the new module; the trampoline's `inherited_ready` takes `ReadyArg::Handle.flag()`.
 
   Verify: `cargo test --locked -p brindle-remote-agent ready_arg:: platform::daemon::`.
-- [ ] 2.2 `server/platform/ensure_dir.rs` (b13 #6; design §5.2):
+- [x] 2.2 `server/platform/ensure_dir.rs` (b13 #6; design §5.2):
   - add `Found`, `Protect`, `First`, `AfterCreate`, `first(found, protect)` and `after_create(found)`;
   - tests:
     - `an_existing_directory_is_used_or_protected_as_asked`;
@@ -96,7 +96,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent ensure_dir::`;
   - on Windows, `dir::` (`an_existing_directory_is_protected_only_when_it_is_the_default`, `a_file_is_refused_and_a_failed_create_names_the_directory`) passes unchanged.
-- [ ] 2.3 `server/platform/pipe_state.rs` (b14 #7; design §5.3):
+- [x] 2.3 `server/platform/pipe_state.rs` (b14 #7; design §5.3):
   - add:
     - the Win32 constants;
     - `ReadEnd`, `read_ended`, `WriteEnd` and `write_ended`;
@@ -123,13 +123,13 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent pipe_state::`;
   - on Windows, `pipe::`, `listen::` and `event_loop::` (the flood, graceful-close and cancel tests) pass unchanged.
-- [ ] 2.4 The listener and the loop (b14 #1; design §5.4, §5.5):
+- [x] 2.4 The listener and the loop (b14 #1; design §5.4, §5.5):
   - `windows/listen.rs`'s `pipe_name` calls `server_dir::check_pipe_name`, keeping `to_str` (not UTF-8 is `NoPrefix`), `encode_wide` and the `InvalidInput` wrapping;
   - `check` becomes a call to `access::admit_client`, and its test moved in 1.3 goes from here;
   - `event_loop::win32` returns `hresult::win32_code(code).unwrap_or(code)`.
 
   Verify: on Windows, `paths_are_pipe_names`, `a_client_of_another_user_or_lower_integrity_is_closed_unread` and `a_taken_name_fails_the_bind` pass unchanged.
-- [ ] 2.5 The program and environment (b15; design §5.6):
+- [x] 2.5 The program and environment (b15; design §5.6):
   - add to `conpty/cmdline.rs` `program(command, env) -> &str` and `environment(given, exact, own) -> Vec<(String, String)>`;
   - tests:
     - `the_program_is_the_command_else_a_nonempty_comspec_else_cmd` (moved from `pty.rs`'s `the_program_is_the_command_or_the_command_interpreter`);
@@ -141,7 +141,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent conpty::cmdline::`;
   - on Windows, `the_sessions_environment_picks_the_host` passes unchanged.
-- [ ] 2.6 `conpty/choice.rs` (b09 #3, b15; design §5.6):
+- [x] 2.6 `conpty/choice.rs` (b09 #3, b15; design §5.6):
   - add `INBOX`, `wants_inbox(env)`, `extract_dir(local_app_data, version)` and `shipped(exe_dir, extract_dir, holds_embedded) -> Shipped { Beside, Extracted, ToExtract, Nowhere }`;
   - tests:
     - `only_inbox_asks_for_the_builtin_host` (the name in any case, the value exactly `inbox`; moved from `pty.rs:1332`);
@@ -155,7 +155,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent conpty::choice::`;
   - on Windows, `api::` (`matching_files_beside_the_exe_are_used`, `a_different_dll_beside_the_exe_is_ignored`, `a_stale_extraction_is_rewritten`, `no_candidates_is_an_error`) passes unchanged.
-- [ ] 2.7 `conpty/hosts.rs` (b15; design §5.7):
+- [x] 2.7 `conpty/hosts.rs` (b15; design §5.7):
   - add `Listed`, `HostSeen`, `is_session_host`, `is_ours`, `candidates` and `ends`;
   - tests:
     - `a_host_that_started_after_the_root_is_not_the_sessions`;
@@ -169,7 +169,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent conpty::hosts::`;
   - on Windows, `a_kill_ends_the_sessions_processes_and_no_others`, the three `a_hang_up_…` tests and `a_kill_after_the_grace_ends_a_root_that_left_its_console` pass unchanged.
-- [ ] 2.8 `pty/program.rs` and `pty/stat.rs` (b10 #3, #4; design §4, §5.8):
+- [x] 2.8 `pty/program.rs` and `pty/stat.rs` (b10 #3, #4; design §4, §5.8):
   - add `shell_from_env`, `passwd_shell`, `home_from_env`, `expand_home`, `start_dir` and `default_term` to `program.rs`, and `STAT_PGRP`, `STAT_TPGID` and `parse_stat_field` to `stat.rs`;
   - declare both ungated in `pty.rs`, with `cfg_attr(windows, allow(dead_code, …))`;
   - tests:
@@ -186,7 +186,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle-remote-agent pty::`;
   - `cargo test --locked -p brindle-remote-agent --test holder` (Linux spawns, the login shell and the home fallback).
-- [ ] 2.9 Docs for this group (design §7):
+- [x] 2.9 Docs for this group (design §7):
   - the module docs of `server/platform/mod.rs`, `conpty/mod.rs` and `pty.rs` name the new modules and say each is pure and tested on every platform;
   - the "Whole pure modules" table gains `remote-agent/src/server/platform/{ready_arg,ensure_dir,pipe_state}.rs`, `remote-agent/src/conpty/{choice,hosts}.rs` and `remote-agent/src/pty/{program,stat}.rs`, and `PURE_MODULES` gains them;
   - `ports-and-adapters.md` R7's examples add `ready_arg::role_args` and `pty::program`;
@@ -198,16 +198,16 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
 
 ## 3. Neutral items in the app (`brindle`)
 
-- [ ] 3.1 `desktop.rs` (b01 #7; design §5.9):
+- [x] 3.1 `desktop.rs` (b01 #7; design §5.9):
   - add at module level `without_verbatim_prefix(path: &str) -> Option<String>`, with `cfg_attr(not(windows), allow(dead_code))`;
   - tests: `a_verbatim_disk_path_loses_its_prefix`, `a_verbatim_unc_path_becomes_a_unc_path`, `a_plain_path_is_left_alone`;
   - `start_menu::resolved` calls it.
 
   Verify: `cargo test --locked -p brindle desktop::`.
-- [ ] 3.2 `escape_markup` (b02 #4): move it and `markup_is_escaped` from `notify/dbus.rs` to `notify/mod.rs` beside `toast_xml`, with `cfg_attr(not(target_os = "linux"), allow(dead_code))`; `dbus.rs:114` calls `super::escape_markup`.
+- [x] 3.2 `escape_markup` (b02 #4): move it and `markup_is_escaped` from `notify/dbus.rs` to `notify/mod.rs` beside `toast_xml`, with `cfg_attr(not(target_os = "linux"), allow(dead_code))`; `dbus.rs:114` calls `super::escape_markup`.
 
   Verify: `cargo test --locked -p brindle notify::`.
-- [ ] 3.3 Console titles (b07 #10; design §5.9):
+- [x] 3.3 Console titles (b07 #10; design §5.9):
   - `workspace::program_title` (change 7's) takes `style: PathStyle` and drops a console title only for `PathStyle::Windows`;
   - `zone_view.rs:491`, `:613` and `workspace.rs:118` pass `terminal::process::LOCAL_PATH_STYLE`;
   - add `a_console_title_is_dropped_only_for_windows_paths`, run with both styles on every platform.
@@ -216,13 +216,13 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle workspace::`;
   - `windows-title-child` in `windows-e2e` (task 5.2).
-- [ ] 3.4 The Unix default program (b28 #3):
+- [x] 3.4 The Unix default program (b28 #3):
   - add `terminal::cmdline::unix_default_program(shell: Option<String>, args: &[String]) -> (String, Vec<String>)`, with `cfg_attr(windows, allow(dead_code))`;
   - test `the_default_program_is_shell_as_given_else_bin_sh` covers an empty `SHELL`, kept as today;
   - the `#[cfg(unix)]` `default_program` passes `env::var("SHELL").ok()`.
 
   Verify: `cargo test --locked -p brindle terminal::cmdline::`.
-- [ ] 3.5 Instance names (b23; design §5.9):
+- [x] 3.5 Instance names (b23; design §5.9):
   - add ungated `socket_path_in(runtime_dir, cache_dir, temp_dir, state_dir) -> PathBuf` and `pipe_name_for(user, state_dir) -> String` to `instance.rs`;
   - tests:
     - `the_socket_is_in_the_runtime_dir_else_the_cache_else_temp`;
@@ -234,7 +234,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
   Verify:
   - `cargo test --locked -p brindle instance::`;
   - `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- instance` (headless).
-- [ ] 3.6 Docs for this group: `fcis`'s "Pure items in shell modules" table gains:
+- [x] 3.6 Docs for this group: `fcis`'s "Pure items in shell modules" table gains:
   - `desktop::without_verbatim_prefix`;
   - `notify::escape_markup`;
   - `instance::{socket_path_in, pipe_name_for}`;
@@ -246,7 +246,7 @@ Code under `cfg(windows)` builds only on Windows. Those tasks are verified by th
 
 ## 4. The never-gated check, with its docs in the same commit
 
-- [ ] 4.1 Write the planted tests first and watch them fail (`testing R13`):
+- [x] 4.1 Write the planted tests first and watch them fail (`testing R13`):
   - `a_gated_neutral_module_is_found`: a production `#[cfg(windows)] fn`, a `#[cfg(unix)] mod x;`, and an ancestor gated `cfg(windows)`;
   - `a_gated_neutral_item_is_found`: an item inside `#[cfg(windows)] mod imp {`, and one under `#[cfg(unix)]`;
   - `a_lint_only_cfg_attr_and_test_code_do_not_count`.

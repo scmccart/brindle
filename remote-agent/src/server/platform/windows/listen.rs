@@ -42,7 +42,9 @@ use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::win::{self, Principal, Side};
+use brindle_remote_protocol::access;
+use brindle_remote_protocol::server_dir::{self, BadPipeName};
+use brindle_remote_protocol::win::{self, Principal};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
     ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
@@ -62,12 +64,6 @@ use windows::core::PCWSTR;
 use super::conn::Stream;
 use super::event_loop::{Port, Source, Watched, millis, os_error, win32};
 use crate::server::event_loop::{Event, Interest, Token};
-
-/// What every pipe name starts with.
-const PIPE_PREFIX: &str = r"\\.\pipe\";
-
-/// The most characters a pipe name has, prefix included.
-const MAX_NAME: usize = 256;
 
 /// Each instance's own buffers, each way.
 const PIPE_BUFFER: u32 = 64 * 1024;
@@ -99,29 +95,22 @@ impl Identity {
     }
 }
 
-/// The name in `path`, checked: `\\.\pipe\` and a name without a backslash,
-/// at most 256 characters in all.
+/// The name in `path`, checked ([`server_dir::check_pipe_name`]):
+/// `\\.\pipe\` and a name without a backslash, at most 256 characters in
+/// all. NUL-terminated, for the calls that take it.
 fn pipe_name(path: &Path) -> io::Result<Vec<u16>> {
-    let invalid = |problem: &str| {
+    let checked = match path.to_str() {
+        Some(name) => server_dir::check_pipe_name(name),
+        // A name that isn't UTF-8 has no prefix that reads.
+        None => Err(BadPipeName::NoPrefix),
+    };
+    checked.map_err(|problem| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a pipe name: {problem}", path.display()),
         )
-    };
-    let Some(name) = path
-        .to_str()
-        .and_then(|text| text.strip_prefix(PIPE_PREFIX))
-    else {
-        return Err(invalid(r"it doesn't start with \\.\pipe\"));
-    };
-    if name.is_empty() || name.contains(['\\', '\0']) {
-        return Err(invalid("the name after the prefix is empty or has a backslash"));
-    }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    if wide.len() - 1 > MAX_NAME {
-        return Err(invalid("it is longer than 256 characters"));
-    }
-    Ok(wide)
+    })?;
+    Ok(path.as_os_str().encode_wide().chain([0]).collect())
 }
 
 /// Fails if a server can't listen at `path`, which must be a pipe name.
@@ -231,19 +220,6 @@ fn client_pid(pipe: &OwnedHandle) -> io::Result<u32> {
     Ok(pid)
 }
 
-/// Accepts a client only when it runs as `own`'s user and not below its
-/// integrity level. `client` is who it runs as, or why that can't be told,
-/// which refuses it too. Every refusal is `PermissionDenied`.
-fn check(own: &Principal, client: io::Result<Principal>) -> io::Result<()> {
-    let refused = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
-    let client = client.map_err(|error| {
-        refused(format!(
-            "refused a connection whose user can't be told: {error}"
-        ))
-    })?;
-    win::peer_allowed(own, &client, Side::Server)
-        .map_err(|refusal| refused(format!("refused a connection: {refusal}")))
-}
 
 /// What Windows is given for the connect in flight. Its packet names it by
 /// the address of its `OVERLAPPED`, which is this block's address.
@@ -541,7 +517,7 @@ impl Listener {
             ));
         }
         // Dropping `connected` closes the instance, unread.
-        check(
+        access::admit_client(
             &self.identity,
             client_pid(&connected).and_then(win::principal_of),
         )?;
@@ -571,6 +547,7 @@ mod tests {
     use std::thread;
 
     use brindle_remote_protocol::Frame;
+    use brindle_remote_protocol::server_dir::{MAX_NAME, PIPE_PREFIX};
     use brindle_remote_protocol::win::{Dacl, Integrity};
 
     use super::super::conn::tests::{check as check_pattern, pattern, send_pattern};
@@ -617,13 +594,6 @@ mod tests {
         listener.accept()
     }
 
-    fn principal(sid: &str, integrity: Integrity) -> Principal {
-        Principal {
-            sid: sid.into(),
-            integrity,
-        }
-    }
-
     #[test]
     fn paths_are_pipe_names() {
         check_path(Path::new(r"\\.\pipe\brindle-server-0123456789abcdef-core")).unwrap();
@@ -644,33 +614,6 @@ mod tests {
         // "not running".
         let error = connect(&name("nobody")).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-    }
-
-    #[test]
-    fn the_client_must_be_the_same_user_at_no_lower_integrity() {
-        let own = principal("S-1-5-21-1-2-3-1001", Integrity::MEDIUM);
-        check(&own, Ok(own.clone())).unwrap();
-        // A client above the server is the server's to accept; the client
-        // itself refuses a server at another level.
-        check(&own, Ok(principal(&own.sid, Integrity::HIGH))).unwrap();
-
-        let other_user = check(&own, Ok(principal("S-1-5-21-1-2-3-1002", Integrity::MEDIUM)))
-            .unwrap_err();
-        assert_eq!(other_user.kind(), io::ErrorKind::PermissionDenied);
-        assert!(other_user.to_string().contains("another user"), "{other_user}");
-
-        let lower = check(&own, Ok(principal(&own.sid, Integrity::LOW))).unwrap_err();
-        assert_eq!(lower.kind(), io::ErrorKind::PermissionDenied);
-        assert!(lower.to_string().contains("low integrity"), "{lower}");
-        let elevated = principal(&own.sid, Integrity::HIGH);
-        assert!(check(&elevated, Ok(own.clone())).is_err());
-
-        // A token that can't be opened is refused, whatever the reason.
-        let unreadable = check(&own, Err(io::Error::from_raw_os_error(5))).unwrap_err();
-        assert_eq!(unreadable.kind(), io::ErrorKind::PermissionDenied);
-        assert!(unreadable.to_string().contains("can't be told"), "{unreadable}");
-        let gone = check(&own, Err(io::ErrorKind::NotFound.into())).unwrap_err();
-        assert_eq!(gone.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

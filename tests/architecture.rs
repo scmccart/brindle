@@ -1,9 +1,10 @@
 //! Architecture checks for the rules in `docs/architecture/`: the crate
 //! boundaries (closed dependency lists, no patches), the few source rules a
 //! text search can hold (its needles follow `use` items), `fcis R2` and
-//! `R3` for the whole pure modules, the opt-in suites' runners, and
-//! `ports R4`, which keeps production code's platform `cfg`s in their seams
-//! (the `platform_cfgs` scanner and the tree checks after it). Part of plain
+//! `R3` for the whole pure modules, the opt-in suites' runners, `ports R4`,
+//! which keeps production code's platform `cfg`s in their seams (the
+//! `platform_cfgs` scanner and the tree checks after it), and `fcis R7`'s
+//! `cfg` half, which keeps neutral code ungated even there. Part of plain
 //! `cargo test`; it reads manifests and sources and runs nothing.
 //!
 //! Each test names the doc rules it enforces. When one fails, change the
@@ -911,8 +912,9 @@ fn f() {
 /// table (`docs/architecture/functional-core-imperative-shell.md`), whose
 /// term-core row `term_core_does_no_io_and_reads_no_clock` covers. The pure
 /// items in shell modules are review's. This mirrors that table and changes
-/// with it, in the same commit.
-const PURE_MODULES: [&str; 15] = [
+/// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
+/// same files to `fcis R7`.
+const PURE_MODULES: [&str; 24] = [
     "src/terminal/keys.rs",
     "src/terminal/mouse.rs",
     "src/terminal/cmdline.rs",
@@ -927,7 +929,16 @@ const PURE_MODULES: [&str; 15] = [
     "remote-protocol/src/version.rs",
     "remote-protocol/src/relay.rs",
     "remote-protocol/src/upgrade.rs",
+    "remote-protocol/src/access.rs",
+    "remote-protocol/src/hresult.rs",
     "remote-agent/src/conpty/cmdline.rs",
+    "remote-agent/src/server/platform/ready_arg.rs",
+    "remote-agent/src/server/platform/ensure_dir.rs",
+    "remote-agent/src/server/platform/pipe_state.rs",
+    "remote-agent/src/conpty/choice.rs",
+    "remote-agent/src/conpty/hosts.rs",
+    "remote-agent/src/pty/program.rs",
+    "remote-agent/src/pty/stat.rs",
 ];
 
 /// The type names that make a `static` mutable state (a name containing
@@ -2110,4 +2121,449 @@ fn a_declared_module_resolves_as_rustc_resolves_it() {
         "a/b/y.rs"
     );
     assert_eq!(module_file("a/lib.rs", "m", None, &files), "a/m/mod.rs");
+}
+
+// fcis R7: neutral code, which the code of every platform calls, is never
+// platform-gated, so it builds and is tested on every platform. It may sit
+// in a seam (ports R4 allows a seam its `cfg`s), but no `cfg` reaches it.
+
+/// Modules of no platform that aren't whole pure modules (they read the
+/// world), so aren't in `PURE_MODULES`. Like the whole pure modules, they
+/// are never platform-gated.
+const NEUTRAL_MODULES: [&str; 1] = ["remote-protocol/src/server_dir.rs"];
+
+/// Pure items in seam and shell files that one platform's code calls, as
+/// (file, `fn` name), from `fcis`'s "Pure items in shell modules" table:
+/// each is a `fn` at the top of its file with no platform `cfg` on it.
+const NEUTRAL_ITEMS: [(&str, &str); 5] = [
+    ("src/desktop.rs", "without_verbatim_prefix"),
+    ("src/notify/mod.rs", "escape_markup"),
+    ("src/instance.rs", "socket_path_in"),
+    ("src/instance.rs", "pipe_name_for"),
+    ("src/workspace.rs", "program_title"),
+];
+
+/// The one gate a neutral module's ancestor may carry, as written without
+/// whitespace: Brindle's two platforms together, on both of which a module
+/// under it builds and is tested.
+const BOTH_PLATFORMS: &str = r#"cfg(any(target_os="linux",windows))"#;
+
+/// Whether `byte` can be part of a word (non-ASCII bytes counted in, so a
+/// word never starts inside a character).
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+/// The outer attributes on each item in `code`, by the item's offset.
+fn attributes_by_item(code: &str) -> BTreeMap<usize, Vec<Attribute>> {
+    let mut found = BTreeMap::new();
+    let mut at = 0;
+    while at < code.len() {
+        match attribute_at(code, at) {
+            Some(attribute) if attribute.inner => at = attribute.end,
+            Some(first) => {
+                let (attributes, item) = outer_attributes(code, first);
+                found.insert(item, attributes);
+                at = item;
+            }
+            None => at += 1,
+        }
+    }
+    found
+}
+
+/// The name of the `fn` item starting at `at` (after any visibility and
+/// `const`, `async`, `unsafe` or `extern "ABI"`), or `None` for any other
+/// item.
+fn fn_item(code: &str, at: usize) -> Option<&str> {
+    let mut at = skip_space(code, at);
+    if let Some(end) = keyword(code, at, "pub") {
+        at = skip_space(code, end);
+        if code[at..].starts_with('(') {
+            at = skip_space(code, closing(code, at)? + 1);
+        }
+    }
+    while let Some(end) = ["const", "async", "unsafe", "extern"]
+        .into_iter()
+        .find_map(|word| keyword(code, at, word))
+    {
+        at = skip_space(code, end);
+        if code[at..].starts_with('"') {
+            at = skip_space(code, at + 1 + code[at + 1..].find('"')? + 1);
+        }
+    }
+    let start = skip_space(code, keyword(code, at, "fn")?);
+    let end = code[start..]
+        .find(|c: char| !is_word(c))
+        .map_or(code.len(), |n| start + n);
+    (end > start).then(|| &code[start..end])
+}
+
+/// Each item of `code` that `item` recognises at a word's start, with its
+/// offset and the name `item` gives it. The words up to that name belong
+/// to the same item, so they aren't tried again.
+fn items_named<'a>(
+    code: &'a str,
+    item: impl Fn(&'a str, usize) -> Option<&'a str>,
+) -> Vec<(usize, &'a str)> {
+    let bytes = code.as_bytes();
+    let (mut found, mut next) = (Vec::new(), 0);
+    for at in 0..bytes.len() {
+        let starts_word = (bytes[at].is_ascii_alphabetic() || bytes[at] == b'_')
+            && !at
+                .checked_sub(1)
+                .is_some_and(|before| is_word_byte(bytes[before]));
+        if at < next || !starts_word {
+            continue;
+        }
+        if let Some(name) = item(code, at) {
+            found.push((at, name));
+            next = name.as_ptr() as usize - code.as_ptr() as usize + name.len();
+        }
+    }
+    found
+}
+
+/// `path:line: text` for `offset` in `text`, the form each check here
+/// reports a site in.
+fn site(path: &str, text: &str, offset: usize) -> String {
+    let line = text[..offset].matches('\n').count();
+    let shown = text.lines().nth(line).unwrap_or_default().trim();
+    format!("{path}:{}: {shown}", line + 1)
+}
+
+/// Whether `offset` starts a line of `code`: an item there is at the top of
+/// its file, not inside an inline module.
+fn at_column_zero(code: &str, offset: usize) -> bool {
+    offset == 0 || code.as_bytes()[offset - 1] == b'\n'
+}
+
+/// Whether `attribute` gates what it is on by platform: a `cfg` that names
+/// one, or a `cfg_attr` that names one and does more than set lint levels.
+fn gates(code: &str, text: &str, attribute: &Attribute) -> bool {
+    match meta(code, text, attribute) {
+        Meta::Cfg(cfg) => predicate(cfg) == Predicate::Platform,
+        Meta::CfgAttr(cfg, set) => predicate(cfg) == Predicate::Platform && !lint_only(&set),
+        Meta::Path(_) | Meta::Other => false,
+    }
+}
+
+/// `attribute` as written in `text`, literals included, without whitespace.
+fn written(text: &str, attribute: &Attribute) -> String {
+    text[attribute.body.clone()]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// A `mod NAME;` declaration, as the never-gated check reads it.
+struct Declaration {
+    /// The file it is in.
+    declaring: String,
+    /// The platform gates among its attributes ([`gates`]), each as its
+    /// site and as written ([`written`]).
+    gates: Vec<(String, String)>,
+    /// Its site when it isn't at the top of its file: inside an inline
+    /// module, whose gates and path this check doesn't follow.
+    nested: Option<String>,
+}
+
+/// Every `mod NAME;` in the production code of `texts` (each file's text by
+/// its path), by the file it declares ([`module_file`]).
+fn module_declarations(texts: &BTreeMap<String, String>) -> BTreeMap<String, Vec<Declaration>> {
+    let files: BTreeSet<String> = texts.keys().cloned().collect();
+    let mut found: BTreeMap<String, Vec<Declaration>> = BTreeMap::new();
+    for (path, text) in texts {
+        let code = production(text).code;
+        let attributes = attributes_by_item(&code);
+        for (at, name) in items_named(&code, mod_declaration) {
+            let on_item = attributes.get(&at).map_or(&[][..], Vec::as_slice);
+            let start = on_item.first().map_or(at, |attribute| attribute.start);
+            let file = on_item
+                .iter()
+                .find_map(|attribute| match meta(&code, text, attribute) {
+                    Meta::Path(file) => Some(file),
+                    Meta::Cfg(_) | Meta::CfgAttr(..) | Meta::Other => None,
+                });
+            found
+                .entry(module_file(path, name, file, &files))
+                .or_default()
+                .push(Declaration {
+                    declaring: path.clone(),
+                    gates: on_item
+                        .iter()
+                        .filter(|attribute| gates(&code, text, attribute))
+                        .map(|attribute| {
+                            (site(path, text, attribute.start), written(text, attribute))
+                        })
+                        .collect(),
+                    nested: (!at_column_zero(&code, start)).then(|| site(path, text, at)),
+                });
+        }
+    }
+    found
+}
+
+/// Whether `file` is a crate's root, which nothing declares.
+fn is_crate_root(file: &str) -> bool {
+    matches!(file.rsplit('/').next(), Some("lib.rs" | "main.rs"))
+}
+
+/// Where the neutral `modules` are platform-gated (`fcis R7`), as
+/// `path:line: text`, sorted, given every production file's text by its
+/// path: a platform `cfg` in a module's production code (a lint-only
+/// `cfg_attr` aside), any platform gate on its own `mod` declaration, and
+/// one on an ancestor's other than [`BOTH_PLATFORMS`]. A module that no
+/// declaration at the top of a file declares is reported too, since the
+/// check can't follow it.
+fn gated_neutral_modules(modules: &[&str], texts: &BTreeMap<String, String>) -> Vec<String> {
+    let files: BTreeSet<String> = texts.keys().cloned().collect();
+    let declarations = module_declarations(texts);
+    let mut found = BTreeSet::new();
+    for module in modules {
+        match texts.get(*module) {
+            Some(text) => found.extend(platform_cfgs(module, text, &[], &files).sites),
+            None => {
+                found.insert(format!("{module}: not a production file"));
+            }
+        }
+        // Its own declaration first, then each ancestor's.
+        let (mut pending, mut seen) = (vec![(module.to_string(), true)], BTreeSet::new());
+        while let Some((file, own)) = pending.pop() {
+            if !seen.insert(file.clone()) {
+                continue;
+            }
+            let Some(declared) = declarations.get(&file) else {
+                if !is_crate_root(&file) {
+                    found.insert(format!(
+                        "{file}: no `mod` declaration at the top of its parent declares it"
+                    ));
+                }
+                continue;
+            };
+            for declaration in declared {
+                found.extend(declaration.nested.clone());
+                found.extend(
+                    declaration
+                        .gates
+                        .iter()
+                        .filter(|(_, written)| own || written != BOTH_PLATFORMS)
+                        .map(|(site, _)| site.clone()),
+                );
+                pending.push((declaration.declaring.clone(), false));
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Where the neutral item `fn name` in `text` (the file at `path`) is
+/// gated, as `path:line: text`: each production `fn` of that name that
+/// isn't at the top of the file (it is inside an inline module), and each
+/// platform gate ([`gates`]) on it.
+fn gated_neutral_item(path: &str, text: &str, name: &str) -> Vec<String> {
+    let code = production(text).code;
+    let attributes = attributes_by_item(&code);
+    let mut found = Vec::new();
+    for (at, _) in items_named(&code, fn_item)
+        .into_iter()
+        .filter(|(_, found)| *found == name)
+    {
+        let on_item = attributes.get(&at).map_or(&[][..], Vec::as_slice);
+        let start = on_item.first().map_or(at, |attribute| attribute.start);
+        if !at_column_zero(&code, start) {
+            found.push(site(path, text, at));
+        }
+        found.extend(
+            on_item
+                .iter()
+                .filter(|attribute| gates(&code, text, attribute))
+                .map(|attribute| site(path, text, attribute.start)),
+        );
+    }
+    found
+}
+
+/// Every production file's text, by its path ([`production_files`]).
+fn production_texts() -> BTreeMap<String, String> {
+    production_files()
+        .into_iter()
+        .map(|file| {
+            let path = root().join(&file);
+            let text =
+                fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            (file, text)
+        })
+        .collect()
+}
+
+/// fcis R7: the whole pure modules, `NEUTRAL_MODULES` and `NEUTRAL_ITEMS`
+/// are never platform-gated, so they build and are tested on every
+/// platform, whichever platform's code calls them.
+#[test]
+fn the_neutral_code_is_never_gated() {
+    let texts = production_texts();
+    let modules: Vec<&str> = PURE_MODULES.into_iter().chain(NEUTRAL_MODULES).collect();
+    let mut found = gated_neutral_modules(&modules, &texts);
+    for (file, name) in NEUTRAL_ITEMS {
+        let text = texts
+            .get(file)
+            .unwrap_or_else(|| panic!("{file} is not a production file"));
+        found.extend(gated_neutral_item(file, text, name));
+    }
+    assert_none(
+        found,
+        "neutral code builds and is tested on every platform, so no platform `cfg` reaches it \
+         (docs/architecture/functional-core-imperative-shell.md R7): none in a whole pure module's or \
+         NEUTRAL_MODULES' production code (a lint-only `cfg_attr` aside), none on its `mod` declaration, \
+         and none on an ancestor's but `cfg(any(target_os = \"linux\", windows))`; each NEUTRAL_ITEMS `fn` \
+         is at the top of its file with none on it. Keep the platform part in the seam that calls it",
+    );
+}
+
+/// fcis R7: `NEUTRAL_MODULES` names files there are, and `NEUTRAL_ITEMS`
+/// functions in their files' production code.
+#[test]
+fn every_neutral_module_and_item_exists() {
+    let mut missing: Vec<String> = NEUTRAL_MODULES
+        .into_iter()
+        .filter(|file| !root().join(file).is_file())
+        .map(String::from)
+        .collect();
+    missing.extend(
+        NEUTRAL_ITEMS
+            .into_iter()
+            .filter(|(file, name)| {
+                fs::read_to_string(root().join(file)).map_or(true, |text| {
+                    let code = production(&text).code;
+                    !items_named(&code, fn_item)
+                        .iter()
+                        .any(|(_, found)| found == name)
+                })
+            })
+            .map(|(file, name)| format!("{file}: fn {name}")),
+    );
+    assert!(
+        missing.is_empty(),
+        "NEUTRAL_MODULES and NEUTRAL_ITEMS name modules or functions that don't exist; change them \
+         with fcis's tables (docs/architecture/functional-core-imperative-shell.md): {missing:?}"
+    );
+}
+
+/// `texts` as a map of owned paths and texts, for [`gated_neutral_modules`].
+fn texts(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+    files
+        .iter()
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .collect()
+}
+
+/// The never-gated check finds a platform `cfg` in a neutral module's
+/// production code, on its own declaration, and on an ancestor's, where
+/// only Brindle's two platforms together are allowed.
+#[test]
+fn a_gated_neutral_module_is_found() {
+    let texts = texts(&[
+        (
+            "a/lib.rs",
+            "#[cfg(windows)]\nmod gated;\n#[cfg(any(target_os = \"linux\", windows))]\nmod both;\n",
+        ),
+        ("a/gated.rs", "pub mod inner;\n"),
+        ("a/gated/inner.rs", "pub fn f() {}\n"),
+        ("a/both.rs", "#[cfg(unix)]\nmod x;\npub mod y;\n"),
+        ("a/both/x.rs", "pub fn f() {}\n"),
+        ("a/both/y.rs", "#[cfg(windows)]\nfn f() {}\npub fn g() {}\n"),
+        ("a/stray.rs", "pub fn f() {}\n"),
+    ]);
+    assert_eq!(
+        gated_neutral_modules(&["a/both/y.rs"], &texts),
+        ["a/both/y.rs:1: #[cfg(windows)]"]
+    );
+    assert_eq!(
+        gated_neutral_modules(&["a/both/x.rs"], &texts),
+        ["a/both.rs:1: #[cfg(unix)]"]
+    );
+    assert_eq!(
+        gated_neutral_modules(&["a/gated/inner.rs"], &texts),
+        ["a/lib.rs:1: #[cfg(windows)]"]
+    );
+    // Both platforms together are an ancestor's allowance, not the module's;
+    // and a module it declares under a platform `cfg` is in its code.
+    assert_eq!(
+        gated_neutral_modules(&["a/both.rs"], &texts),
+        [
+            "a/both.rs:1: #[cfg(unix)]",
+            r#"a/lib.rs:3: #[cfg(any(target_os = "linux", windows))]"#
+        ]
+    );
+    assert_eq!(
+        gated_neutral_modules(&["a/stray.rs"], &texts),
+        ["a/stray.rs: no `mod` declaration at the top of its parent declares it"]
+    );
+}
+
+/// The never-gated check finds a neutral item inside an inline module (its
+/// `fn` isn't at column 0) and one under a platform `cfg`.
+#[test]
+fn a_gated_neutral_item_is_found() {
+    let text = "#[cfg(windows)]
+mod imp {
+    pub fn inside() {}
+}
+#[cfg(unix)]
+pub(crate) fn under() {}
+pub fn plain() {}
+";
+    assert_eq!(
+        gated_neutral_item("a/lib.rs", text, "inside"),
+        ["a/lib.rs:3: pub fn inside() {}"]
+    );
+    assert_eq!(
+        gated_neutral_item("a/lib.rs", text, "under"),
+        ["a/lib.rs:5: #[cfg(unix)]"]
+    );
+    assert_eq!(
+        gated_neutral_item("a/lib.rs", text, "plain"),
+        Vec::<String>::new()
+    );
+}
+
+/// A lint-only `cfg_attr`, on a declaration, an item or in a module's code,
+/// and platform `cfg`s in test code don't count as gates.
+#[test]
+fn a_lint_only_cfg_attr_and_test_code_do_not_count() {
+    let module = "#[cfg_attr(windows, allow(dead_code))]
+pub fn f() {}
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = \"only Windows calls it\")
+)]
+pub(crate) fn g() {}
+#[cfg(all(test, windows))]
+fn helper() {}
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    fn g() {}
+    #[test]
+    fn t() {
+        if cfg!(unix) {}
+    }
+}
+";
+    let texts = texts(&[
+        (
+            "a/lib.rs",
+            "#[cfg_attr(not(windows), allow(dead_code))]\nmod m;\n#[cfg(all(test, unix))]\nmod helpers;\n",
+        ),
+        ("a/m.rs", module),
+    ]);
+    assert_eq!(
+        gated_neutral_modules(&["a/m.rs"], &texts),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        gated_neutral_item("a/m.rs", module, "g"),
+        Vec::<String>::new()
+    );
 }

@@ -15,6 +15,8 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::core::{HRESULT, PCSTR, PCWSTR, s, w};
 
+use super::choice::{self, Shipped};
+
 /// The packaged ConPTY embedded by `build.rs`: `VERSION` and `FILES`.
 pub(super) mod bundle {
     include!(concat!(env!("OUT_DIR"), "/conpty.rs"));
@@ -76,14 +78,7 @@ fn packaged() -> Option<Api> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let extract_dir = std::env::var_os("LOCALAPPDATA")
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| {
-            PathBuf::from(dir)
-                .join("brindle")
-                .join("conpty")
-                .join(version)
-        });
+    let extract_dir = choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version);
     let loaded =
         shipped_dir(exe_dir.as_deref(), extract_dir.as_deref(), files).and_then(|dir| {
             load(&dir)
@@ -112,24 +107,26 @@ fn packaged() -> Option<Api> {
 /// are the embedded ones (an installed helper, or one in the build
 /// directory), else `extract_dir`, after writing the embedded files there if
 /// they differ. The current directory and `PATH` are never candidates.
+/// Which one is [`choice::shipped`]'s.
 fn shipped_dir(
     exe_dir: Option<&Path>,
     extract_dir: Option<&Path>,
     (dll, host): (&[u8], &[u8]),
 ) -> Result<PathBuf, String> {
     let matches = |dir: &Path| same(&dir.join(DLL), dll) && same(&dir.join(HOST), host);
-    if let Some(dir) = exe_dir.filter(|dir| matches(dir)) {
-        return Ok(dir.to_path_buf());
-    }
-    let dir = extract_dir.ok_or("no local app data directory")?;
-    if !matches(dir) {
-        std::fs::create_dir_all(dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
-        for (name, bytes) in [(DLL, dll), (HOST, host)] {
-            write_replacing(&dir.join(name), bytes)
-                .map_err(|err| format!("writing {}: {err}", dir.join(name).display()))?;
+    match choice::shipped(exe_dir, extract_dir, matches) {
+        Shipped::Beside(dir) | Shipped::Extracted(dir) => Ok(dir),
+        Shipped::ToExtract(dir) => {
+            std::fs::create_dir_all(&dir)
+                .map_err(|err| format!("creating {}: {err}", dir.display()))?;
+            for (name, bytes) in [(DLL, dll), (HOST, host)] {
+                write_replacing(&dir.join(name), bytes)
+                    .map_err(|err| format!("writing {}: {err}", dir.join(name).display()))?;
+            }
+            Ok(dir)
         }
+        Shipped::Nowhere => Err("no local app data directory".into()),
     }
-    Ok(dir.to_path_buf())
 }
 
 fn same(path: &Path, bytes: &[u8]) -> bool {

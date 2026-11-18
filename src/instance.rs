@@ -4,6 +4,7 @@
 //! its request there as one JSON line and exits once the instance answers
 //! `ok`; the instance raises its window and opens what was asked for.
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -72,6 +73,33 @@ pub fn name(state_dir: &Path) -> String {
     format!("brindle-instance-{:016x}", fnv1a(state_dir.as_os_str().as_encoded_bytes()))
 }
 
+/// The instance's socket on Unix: `<name>.sock` in `runtime_dir`
+/// (`$XDG_RUNTIME_DIR`, unset when empty), else in `brindle/run` under
+/// `cache_dir`, else under `temp_dir`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn socket_path_in(
+    runtime_dir: Option<OsString>,
+    cache_dir: Option<PathBuf>,
+    temp_dir: PathBuf,
+    state_dir: &Path,
+) -> PathBuf {
+    let dir = runtime_dir
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cache_dir.unwrap_or(temp_dir).join("brindle/run"));
+    dir.join(format!("{}.sock", name(state_dir)))
+}
+
+/// The instance's pipe on Windows: `\\.\pipe\<name>-<user>`, where each
+/// character of `user` (`%USERNAME%`) that isn't an ASCII letter or digit
+/// becomes `_`, and a missing user leaves that part empty.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pipe_name_for(user: Option<String>, state_dir: &Path) -> String {
+    let user: String =
+        user.unwrap_or_default().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    format!(r"\\.\pipe\{}-{user}", name(state_dir))
+}
+
 /// Writes `reply` (`ok`, or `error: …`) as the answer to one request.
 fn answer(mut stream: impl Write, reply: &Result<(), String>) -> io::Result<()> {
     let line = match reply {
@@ -119,13 +147,10 @@ mod imp {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    /// `$XDG_RUNTIME_DIR/<name>.sock`, else under `~/.cache/brindle/run`.
+    /// `$XDG_RUNTIME_DIR/<name>.sock`, else under `~/.cache/brindle/run`
+    /// ([`socket_path_in`]).
     pub fn socket_path(state_dir: &Path) -> PathBuf {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("brindle/run"));
-        dir.join(format!("{}.sock", name(state_dir)))
+        socket_path_in(std::env::var_os("XDG_RUNTIME_DIR"), dirs::cache_dir(), std::env::temp_dir(), state_dir)
     }
 
     pub fn listen(state_dir: &Path, handler: Handler) -> io::Result<PathBuf> {
@@ -251,15 +276,10 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::HSTRING;
 
-    /// `\\.\pipe\<name>-<user>`. The pipe's default security lets only its
-    /// owner (and administrators) write to it.
+    /// `\\.\pipe\<name>-<user>` ([`pipe_name_for`]). The pipe's default
+    /// security lets only its owner (and administrators) write to it.
     pub fn pipe_name(state_dir: &Path) -> String {
-        let user: String = std::env::var("USERNAME")
-            .unwrap_or_default()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        format!(r"\\.\pipe\{}-{user}", name(state_dir))
+        pipe_name_for(std::env::var("USERNAME").ok(), state_dir)
     }
 
     fn create(name: &HSTRING, first: bool) -> io::Result<File> {
@@ -406,6 +426,41 @@ mod tests {
         // Pinned: another Brindle version must find the same socket.
         assert_eq!(name(Path::new("")), "brindle-instance-cbf29ce484222325");
         assert!(a.len() < 40);
+    }
+
+    #[test]
+    fn the_socket_is_in_the_runtime_dir_else_the_cache_else_temp() {
+        let state = Path::new("/home/u/.local/state/brindle");
+        let socket = format!("{}.sock", name(state));
+        let at = |runtime: Option<&str>, cache: Option<&str>| {
+            socket_path_in(runtime.map(OsString::from), cache.map(PathBuf::from), PathBuf::from("/tmp"), state)
+        };
+        assert_eq!(at(Some("/run/user/1000"), Some("/home/u/.cache")), PathBuf::from("/run/user/1000").join(&socket));
+        assert_eq!(at(None, Some("/home/u/.cache")), PathBuf::from("/home/u/.cache").join("brindle/run").join(&socket));
+        assert_eq!(at(None, None), PathBuf::from("/tmp").join("brindle/run").join(&socket));
+    }
+
+    #[test]
+    fn an_empty_runtime_dir_counts_as_unset() {
+        let state = Path::new("/home/u/.local/state/brindle");
+        assert_eq!(
+            socket_path_in(Some(OsString::new()), Some(PathBuf::from("/home/u/.cache")), PathBuf::from("/tmp"), state),
+            socket_path_in(None, Some(PathBuf::from("/home/u/.cache")), PathBuf::from("/tmp"), state)
+        );
+    }
+
+    #[test]
+    fn the_pipe_names_its_user_in_letters_digits_and_underscores() {
+        let state = Path::new(r"C:\Users\me\AppData\Local\brindle\state");
+        assert_eq!(pipe_name_for(Some("me".into()), state), format!(r"\\.\pipe\{}-me", name(state)));
+        assert_eq!(pipe_name_for(Some("J. Doe-2\\é".into()), state), format!(r"\\.\pipe\{}-J__Doe_2__", name(state)));
+    }
+
+    #[test]
+    fn a_missing_user_leaves_the_user_part_empty() {
+        let state = Path::new(r"C:\Users\me\AppData\Local\brindle\state");
+        assert_eq!(pipe_name_for(None, state), format!(r"\\.\pipe\{}-", name(state)));
+        assert_eq!(pipe_name_for(Some(String::new()), state), pipe_name_for(None, state));
     }
 
     #[cfg(unix)]
