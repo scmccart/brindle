@@ -69,12 +69,7 @@ impl Sink {
         let mut parser = self.parser.lock();
         let mut term = self.term.lock_unfair();
         let own = GridSize { cols: term.columns() as u16, rows: term.screen_lines() as u16, ..GridSize::default() };
-        let size = self
-            .replay_size
-            .take()
-            .filter(|s| s.cols > 0 && s.rows > 0)
-            .map(GridSize::clamped)
-            .filter(|s| (s.cols, s.rows) != (own.cols, own.rows));
+        let size = replay_resize(own, self.replay_size.take());
         if let Some(size) = size {
             self.marks.lock().resize(&mut *term, size);
         }
@@ -84,6 +79,16 @@ impl Sink {
             self.marks.lock().resize(&mut *term, own);
         }
     }
+}
+
+/// The size a replay rendered at `recorded` is fed at, by a terminal whose
+/// grid is `own`: the recorded size, no narrower than any grid
+/// ([`GridSize::clamped`]), when its columns or rows differ from the
+/// grid's; `None` when nothing was recorded or the grid already has it.
+/// The recorded size is a session's decoded one (`ListedSession::size`, or
+/// the default grid for a core that lists none), never zero.
+fn replay_resize(own: GridSize, recorded: Option<GridSize>) -> Option<GridSize> {
+    recorded.map(GridSize::clamped).filter(|size| (size.cols, size.rows) != (own.cols, own.rows))
 }
 
 impl Sink {
@@ -337,6 +342,30 @@ mod tests {
         sink.replay(false);
         let term = sink.term.lock();
         assert_eq!((term.columns(), term.screen_lines()), (80, 24));
+    }
+
+    /// A replay is fed at its recorded size only when that differs from
+    /// the grid's, in columns or rows, after the clamp; the cell size never
+    /// counts.
+    #[test]
+    fn a_replay_is_resized_for_only_when_its_recorded_size_differs() {
+        let size = |cols, rows| GridSize { cols, rows, ..GridSize::default() };
+        let own = size(80, 24);
+        let other_cells = GridSize { cell_width: own.cell_width * 2, cell_height: own.cell_height * 2, ..own };
+        let min = crate::terminal::MIN_COLS;
+        let cases = [
+            ("nothing recorded", own, None, None),
+            ("the grid's own size", own, Some(own), None),
+            ("only the cells differ", own, Some(other_cells), None),
+            ("other columns", own, Some(size(40, 24)), Some(size(40, 24))),
+            ("other rows", own, Some(size(80, 5)), Some(size(80, 5))),
+            ("both", own, Some(size(40, 5)), Some(size(40, 5))),
+            ("one column, clamped", own, Some(size(1, 5)), Some(size(min, 5))),
+            ("clamped to the grid's own", size(min, 5), Some(size(1, 5)), None),
+        ];
+        for (case, own, recorded, expected) in cases {
+            assert_eq!(replay_resize(own, recorded), expected, "{case}");
+        }
     }
 
     /// 7.1: a recorded session's replay is fed at the size its listing

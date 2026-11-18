@@ -104,12 +104,11 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         finished.send(()).ok();
     })?;
 
-    let ready = signalled.recv_timeout(limit).ok();
-    // By the core's doing (its byte, or the end of the pipe as it and the
-    // trampoline exited), not by the time limit.
-    let signalled = ready.is_some();
+    // `Some` by the core's doing (`true` for its byte, `false` for the end of
+    // the pipe as it and the trampoline exited), `None` by the time limit.
+    let answer: Option<bool> = signalled.recv_timeout(limit).ok();
     let mut status = "still running".to_string();
-    if signalled {
+    if answer.is_some() {
         // A core that never signals keeps the stderr pipe, so its end is
         // only waited for here.
         stderr_ended.recv_timeout(SETTLE).ok();
@@ -125,14 +124,17 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         }
     }
     let stderr = String::from_utf8_lossy(&said.lock()).into_owned();
-    let ready = ready == Some(true);
-    if ready {
-        // The trampoline's one line when Brindle's job forbids breakaway.
-        for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
-            log::warn!("starting the terminal server: {}", line.trim());
+    Ok(match answer {
+        Some(true) => {
+            // The trampoline's one line when Brindle's job forbids breakaway.
+            for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+                log::warn!("starting the terminal server: {}", line.trim());
+            }
+            Start::Ready
         }
-    }
-    Ok(Start { ready, signalled, status, stderr })
+        Some(false) => Start::Exited { status, stderr },
+        None => Start::TimedOut { stderr },
+    })
 }
 
 fn spawn_reader(name: &str, read: impl FnOnce() + Send + 'static) -> Result<()> {

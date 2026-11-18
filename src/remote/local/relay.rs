@@ -406,15 +406,16 @@ impl Wire for ChildWire {
         self.process.kill();
     }
 
-    fn why(&self) -> String {
+    fn why(&self) -> Option<String> {
         let ended = self.process.wait_for(EXIT_WAIT);
         let said = self.stderr.text(EXIT_WAIT);
         let exit = ended.as_ref().map(|ended| ended.text(&self.program));
         match client::split_cause(&said) {
             // A process that exited 0 and wrote nothing has nothing to add
             // to a stream that ended.
-            None if ended.as_ref().is_some_and(Ended::success) => String::new(),
-            None => exit.unwrap_or_default(),
+            None if ended.as_ref().is_some_and(Ended::success) => None,
+            // How it ended, if it did in time.
+            None => exit,
             // The cause first, as in a launch failure's message.
             Some((cause, rest)) => {
                 let mut why = match exit {
@@ -425,7 +426,7 @@ impl Wire for ChildWire {
                     why.push('\n');
                     why.push_str(&rest);
                 }
-                why
+                Some(why)
             }
         }
     }
@@ -694,10 +695,10 @@ mod tests {
             link.reader.read_to_end(&mut rest).ok();
             link.wire.why()
         };
-        assert_eq!(why("", 0), "");
-        assert_eq!(why("", 3), "sh exited with 3");
-        assert_eq!(why("echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom");
-        assert_eq!(why("echo warning >&2; echo ssh: boom >&2", 255), "sh exited with 255: ssh: boom\nwarning");
+        assert_eq!(why("", 0), None);
+        assert_eq!(why("", 3).as_deref(), Some("sh exited with 3"));
+        assert_eq!(why("echo ssh: boom >&2", 255).as_deref(), Some("sh exited with 255: ssh: boom"));
+        assert_eq!(why("echo warning >&2; echo ssh: boom >&2", 255).as_deref(), Some("sh exited with 255: ssh: boom\nwarning"));
     }
 
     /// A `wait()` that fails is an ending of its own, which names the
@@ -782,7 +783,7 @@ mod tests {
         let ended = read.recv_timeout(crate::test_support::wait::limit(Duration::from_secs(10))).expect("the read ended");
         assert!(matches!(ended, Ok(0) | Err(io::ErrorKind::BrokenPipe)), "{ended:?}");
         // It was killed: it says how, and writes fail.
-        assert!(!link.wire.why().is_empty());
+        assert!(link.wire.why().is_some());
         let frame = Frame::new(1, b"x".to_vec()).unwrap();
         let failing = || link.wire.send(&frame).is_err();
         assert!(crate::test_support::wait::eventually(Duration::from_secs(10), failing), "writes still succeed");

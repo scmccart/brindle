@@ -339,9 +339,7 @@ impl Registry {
             return Ok(connection.clone());
         }
         let connection = make()?;
-        let (map, host, made) = (Arc::downgrade(&self.0), host.clone(), Arc::as_ptr(&connection) as usize);
-        // Runs on the thread ending it, which is alive until then, so no
-        // other connection has its address meanwhile.
+        let (map, host, made) = (Arc::downgrade(&self.0), host.clone(), connection.id());
         connection.on_end(Box::new(move || {
             if let Some(map) = map.upgrade() {
                 forget(&map, &host, made);
@@ -384,14 +382,15 @@ impl Registry {
     }
 }
 
-/// Takes the connection at address `ended` out of `host`'s slot, and the
-/// slot out of `map`, unless a newer connection has replaced it. Locks the
-/// map, then the slot, as [`Registry::get`] does (it never holds both).
-fn forget(map: &Mutex<HashMap<Host, Slot>>, host: &Host, ended: usize) {
+/// Takes the connection whose [`Connection::id`] is `ended` out of `host`'s
+/// slot, and the slot out of `map`, unless a newer connection has replaced
+/// it. Locks the map, then the slot, as [`Registry::get`] does (it never
+/// holds both).
+fn forget(map: &Mutex<HashMap<Host, Slot>>, host: &Host, ended: u64) {
     let Some(slot) = map.lock().get(host).cloned() else { return };
     {
         let mut current = slot.lock();
-        if !current.as_ref().is_some_and(|connection| Arc::as_ptr(connection) as usize == ended) {
+        if !current.as_ref().is_some_and(|connection| connection.id() == ended) {
             return;
         }
         *current = None;
@@ -598,18 +597,40 @@ fn connect_started(endpoint: &Endpoint) -> Result<Stream> {
     }
 }
 
-/// How starting a core went.
-struct Start {
+/// How starting a core went, the same on every platform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Start {
     /// The core wrote its ready byte. On Linux that is all it wrote before
     /// its ready pipe ended (`protocol::ready`).
-    ready: bool,
-    /// The wait ended by the core's doing (its byte, or its exit) and not
-    /// by the time limit. On Linux, that is its ready pipe ending.
-    signalled: bool,
-    /// How the starter exited.
-    status: String,
-    /// What the starter and the core said before the core had its log.
-    stderr: String,
+    Ready,
+    /// The wait ended by the core's doing without its ready byte: it exited
+    /// (with its starter), or on Linux wrote something else into the pipe.
+    Exited {
+        /// How the starter exited.
+        status: String,
+        /// What the starter and the core said before the core had its log.
+        stderr: String,
+    },
+    /// Neither its ready byte nor its end came within the time limit.
+    TimedOut {
+        /// What the starter and the core said meanwhile.
+        stderr: String,
+    },
+}
+
+/// Why a start that waited up to `limit` failed, as the tab and the log say
+/// it: what the starter and the core wrote, else how the start ended. `None`
+/// for a core that is ready.
+fn start_failure(start: &Start, limit: Duration) -> Option<String> {
+    let (said, ended) = match start {
+        Start::Ready => return None,
+        Start::Exited { status, stderr } => (stderr, format!("it exited ({status})")),
+        Start::TimedOut { stderr } => (stderr, format!("no ready signal within {} s", limit.as_secs())),
+    };
+    Some(match said.trim() {
+        "" => ended,
+        text => text.to_string(),
+    })
 }
 
 /// Starts a core from the helper and waits up to [`START_LIMIT`] for its
@@ -618,13 +639,8 @@ struct Start {
 /// Windows: `launch serve --ready-handle N` from the per-build copy).
 pub fn start_core(endpoint: &Endpoint) -> Result<()> {
     let start = sys::start(endpoint, START_LIMIT)?;
-    if start.ready {
+    let Some(reason) = start_failure(&start, START_LIMIT) else {
         return Ok(());
-    }
-    let reason = match start.stderr.trim() {
-        "" if !start.signalled => format!("no ready signal within {} s", START_LIMIT.as_secs()),
-        "" => format!("it exited ({})", start.status),
-        text => text.to_string(),
     };
     bail!(
         "terminal server didn't start ({} serve): {reason}; its log is {}",
@@ -896,6 +912,53 @@ mod tests {
         let endpoint = Endpoint::at(helper, dir.clone());
         assert!(connect(&endpoint, "t").is_err());
         assert_eq!(std::fs::read_to_string(&said).unwrap(), format!("{} 1", dir.display()));
+    }
+
+    /// A failed start says what the starter and the core wrote, else how it
+    /// ended: they exited (Windows: or the trampoline was still running), or
+    /// nothing came within the limit, in whole seconds.
+    #[test]
+    fn a_failed_start_says_what_was_written_else_how_it_ended() {
+        let limit = Duration::from_millis(10_500);
+        let exited = |status: &str, stderr: &str| Start::Exited { status: status.into(), stderr: stderr.into() };
+        let timed_out = |stderr: &str| Start::TimedOut { stderr: stderr.into() };
+        let cases = [
+            (Start::Ready, None),
+            (exited("exit status: 1", ""), Some("it exited (exit status: 1)")),
+            (exited("exit code: 3", " \n"), Some("it exited (exit code: 3)")),
+            (exited("still running", ""), Some("it exited (still running)")),
+            (exited("exit status: 1", "serve: the directory is refused\n"), Some("serve: the directory is refused")),
+            (timed_out(""), Some("no ready signal within 10 s")),
+            (timed_out("\r\n"), Some("no ready signal within 10 s")),
+            (timed_out("  launch: breakaway refused\n"), Some("launch: breakaway refused")),
+        ];
+        for (start, expected) in cases {
+            assert_eq!(start_failure(&start, limit).as_deref(), expected, "{start:?}");
+        }
+    }
+
+    /// An ended connection takes itself out of its slot by its id, and
+    /// leaves a slot that holds another connection alone.
+    #[test]
+    fn an_ended_connection_is_forgotten_only_from_its_own_slot() {
+        use crate::config::RemoteTarget;
+        use connection::fake;
+
+        let host = Host::Remote(RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        let registry = Registry::default();
+        let (dial, _plan) = fake::dialer("A8");
+        let connection = registry.get(&host, || Connection::relay(dial, "tok", fake::quick())).unwrap();
+        forget(&registry.0, &host, connection.id() + 1);
+        assert!(Arc::ptr_eq(&registry.existing(&host).unwrap(), &connection), "another's id");
+        forget(&registry.0, &host, connection.id());
+        assert!(!registry.has(&host));
     }
 
     #[cfg(windows)]
