@@ -16,7 +16,7 @@ Brindle reads bytes from other processes, other machines and other versions of i
 // remote-protocol/src/version.rs: one error type for one workflow, with data to branch on.
 pub fn negotiate(offered: VersionRange, supported: VersionRange) -> Result<u32, NegotiationError>
 
-// src/picker.rs: several shapes, none of them a failure of the palette.
+// src/picker/sessions.rs: several shapes, none of them a failure of the palette.
 pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pending }
 ```
 

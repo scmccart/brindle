@@ -48,9 +48,9 @@ pub fn windows_default_program(path_dirs: impl IntoIterator<Item = PathBuf>, com
 **A model under a view.** The model owns the state and every rule about it; the view owns focus, entities and painting.
 
 ```rust
-// src/picker.rs: pure. `answer` applies one endpoint's listing; `view` builds the rows and the row to keep.
+// src/picker/sessions.rs: pure. `answer` applies one endpoint's listing; `view` builds the rows and the row to keep.
 pub struct SessionsModel { … }
-// The palette entity holds it in PaletteKind::Sessions { model } and only passes answers in and rows out.
+// The workspace holds it in PaletteKind::Sessions { model } and only passes answers in and rows out.
 ```
 
 `FontsState` (settings dialog), `EditState` (`brindle-ui`'s text input) and `layout::group` follow the same shape.
@@ -73,6 +73,8 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
+| `src/workspace/{tabs,launch,overlays,previews}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them |
+| `src/picker/sessions.rs` | the sessions palette's state and rows: what each endpoint listed, the sessions killed from it and the failed kills, the highlighted row, whether every endpoint has answered |
 | `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | filtering, where an overlay goes |
 | `remote-protocol/src/{client,holder,wire,version,relay,upgrade}.rs` | encoding, decoding, version negotiation, whether a build is newer |
 | `remote-protocol/src/{access,hresult}.rs` | who may use a pipe, and an `HRESULT`'s Win32 code |
@@ -88,8 +90,8 @@ These modules mix pure items with shell code, which a text search can't tell apa
 | --- | --- |
 | `src/terminal/pace.rs` (`step`) | when the event task waits |
 | `src/session.rs` (`merge_windows`, `drop_lost_zones`, `record_zones`, `resolve_tab`) | which windows, tabs and zones a launch restores, and the zones a tab is saved with |
-| `src/settings.rs` (`Settings::new`) | the fonts and sizes a config and a preview resolve to |
-| `src/picker.rs` (`SessionsModel`, `session_palette`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
+| `src/settings.rs` (`Settings::new`, `Settings::zoomed`) | the fonts and sizes a config and a preview resolve to, and the zoom a key leaves |
+| `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
 | `ui/src/text_input.rs` (`EditState`) | editing |
 | `src/workspace.rs` (`program_title`) | whether an OSC title is the program's own, by the path style of the programs' paths |
 | `src/desktop.rs` (`without_verbatim_prefix`) | a Windows path without its verbatim `\\?\` prefix |
