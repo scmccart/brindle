@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
+use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use gpui::{
     Action, AnyElement, AppContext as _, Context, Entity, Focusable as _, Hsla, InteractiveElement, IntoElement,
@@ -15,7 +16,7 @@ use gpui::{
 };
 
 use crate::actions::*;
-use crate::terminal::search::{self, COUNT_CAP, Count, SearchOptions, Step};
+use crate::terminal::search::{self, COUNT_CAP, Count, SearchOptions, Step, VisibleMatches};
 use crate::terminal_view::TerminalView;
 use crate::workspace::shortcut;
 use brindle_ui::{
@@ -50,6 +51,19 @@ pub struct FindBar {
     /// The last edit's search was limited to nearby lines and found
     /// nothing; the next count searches the whole buffer once.
     full_search_pending: bool,
+    /// The matches in view, found when the query, the options, the output
+    /// or the view changed, for `prepaint` to draw without a scan
+    /// (`process R14`). `None` until searched, and for no regex.
+    visible: Option<VisibleMatches>,
+}
+
+/// Finds the matches in `term`'s view for `bar`'s regex, and keeps them
+/// with that view.
+fn refresh_visible<T>(bar: &mut FindBar, term: &Term<T>) {
+    bar.visible = bar.regex.as_mut().map(|regex| VisibleMatches {
+        key: search::view_key(term),
+        matches: search::visible_matches(term, regex).into(),
+    });
 }
 
 /// What a closed bar leaves behind for the next one.
@@ -59,9 +73,10 @@ pub struct LastFind {
     options: SearchOptions,
 }
 
-/// The highlights a frame draws: matches in view and the current match.
+/// The highlights a frame draws: the cached matches in view (for the view
+/// they were found in) and the current match.
 pub struct Highlights {
-    pub matches: Vec<Match>,
+    pub visible: Option<VisibleMatches>,
     pub focused: Option<Match>,
 }
 
@@ -96,6 +111,7 @@ impl TerminalView {
                 count: None,
                 recount: None,
                 full_search_pending: false,
+                visible: None,
             });
             self.research(cx);
         }
@@ -128,6 +144,7 @@ impl TerminalView {
         bar.count = None;
         bar.recount = None;
         bar.full_search_pending = false;
+        bar.visible = None;
         if let Some(regex) = &mut bar.regex {
             let mut term = self.terminal.read(cx).term().lock();
             bar.focused = search::find_from(&term, regex, bar.origin, Some(search::MAX_LINES_WHILE_TYPING));
@@ -135,6 +152,7 @@ impl TerminalView {
                 Some(m) => search::scroll_to(&mut term, m),
                 None => bar.full_search_pending = true,
             }
+            refresh_visible(bar, &term);
             drop(term);
             self.schedule_count(COUNT_AFTER_EDIT, cx);
         }
@@ -157,6 +175,7 @@ impl TerminalView {
         bar.count = Some(search::count(&term, regex, bar.focused.as_ref(), COUNT_CAP));
         bar.recount = None;
         bar.full_search_pending = false;
+        refresh_visible(bar, &term);
         drop(term);
         cx.notify();
     }
@@ -183,6 +202,7 @@ impl TerminalView {
             }
         }
         let count = search::count(&term, regex, bar.focused.as_ref(), COUNT_CAP);
+        refresh_visible(bar, &term);
         drop(term);
         if bar.focused.is_some() && count.index.is_none() && !count.capped {
             bar.focused = None;
@@ -191,14 +211,29 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// The terminal has new content: recount soon, once.
+    /// The terminal has new content, or its view moved: finds the matches
+    /// in view again now, and recounts soon, once.
     pub fn find_terminal_changed(&mut self, cx: &mut Context<Self>) {
-        if let Some(bar) = &self.find
-            && bar.regex.is_some()
-            && bar.recount.is_none()
-        {
+        let Some(bar) = &mut self.find else { return };
+        if bar.regex.is_none() {
+            return;
+        }
+        refresh_visible(bar, &self.terminal.read(cx).term().lock());
+        if bar.recount.is_none() {
             self.schedule_count(COUNT_AFTER_OUTPUT, cx);
         }
+    }
+
+    /// `prepaint` found the cached matches were for another view (a resize,
+    /// or output that moved a scrolled-back view before its notify came):
+    /// finds them for this one and draws again.
+    pub fn find_view_moved(&mut self, cx: &mut Context<Self>) {
+        let Some(bar) = &mut self.find else { return };
+        if bar.regex.is_none() {
+            return;
+        }
+        refresh_visible(bar, &self.terminal.read(cx).term().lock());
+        cx.notify();
     }
 
     pub fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -250,14 +285,13 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// The matches to draw this frame. Called from prepaint; the work is
-    /// bounded by the view (see `search::visible_matches`).
-    pub fn find_highlights(&mut self, cx: &mut Context<Self>) -> Option<Highlights> {
-        let bar = self.find.as_mut()?;
-        let regex = bar.regex.as_mut()?;
-        let term = self.terminal.read(cx).term().lock();
-        let matches = search::visible_matches(&term, regex);
-        Some(Highlights { matches, focused: bar.focused.clone() })
+    /// The matches to draw this frame: the cache, with no lock and no scan,
+    /// since it is called from `prepaint`. `prepaint` checks that the cache
+    /// is for the view it draws (`search::cached`).
+    pub fn find_highlights(&self) -> Option<Highlights> {
+        let bar = self.find.as_ref()?;
+        bar.regex.as_ref()?;
+        Some(Highlights { visible: bar.visible.clone(), focused: bar.focused.clone() })
     }
 
     /// The bar's state for `--dump-screen-after`.

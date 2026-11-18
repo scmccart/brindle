@@ -112,7 +112,7 @@ When Brindle quits, including by closing its window, the window and tabs open at
 - **THEN** the next launch opens a single default-profile tab
 
 ### Requirement: Restored zones get their sessions back
-Each recorded zone, local on Linux and Windows or remote, SHALL record which terminal server session it showed. On a restoring launch, a local zone whose recorded session is still running and detached SHALL be attached to it, showing its screen and scrollback, without bells or notifications from the replayed output. A local zone whose recorded session is gone, attached elsewhere, or not the recorded one (the server was restarted in between and reused its id) SHALL NOT be restored: its split's sibling takes its place, a tab with no zone left SHALL NOT be restored, and a launch left with nothing to restore SHALL open one default-profile tab. A recorded zone without a session record SHALL restore as "Local tabs restore their profile, zones and directory" says.
+Each recorded zone, local on Linux and Windows or remote, SHALL record which terminal server session it showed. On a restoring launch whose listing of this machine's terminal server answered (see "Launch reattaches detached terminals"), a local zone whose recorded session is still running and detached SHALL be attached to it, showing its screen and scrollback, without bells or notifications from the replayed output. A local zone whose recorded session is gone, attached elsewhere, or not the recorded one (the server was restarted in between and reused its id) SHALL NOT be restored: its split's sibling takes its place, a tab with no zone left SHALL NOT be restored, and a launch left with nothing to restore SHALL open one default-profile tab. When that listing failed, nothing tells a lost session from a live one, so no local zone SHALL be dropped: each local zone with a session record SHALL start its profile's program in its recorded directory, and its recorded session, if it still runs, SHALL stay detached. A recorded zone without a session record SHALL restore as "Local tabs restore their profile, zones and directory" says.
 
 A remote zone with a session record SHALL be restored without waiting for its endpoint. It SHALL show that it is connecting, and attach once its endpoint answers. If the session is gone, attached elsewhere or not the recorded one, the zone SHALL say so and stay open until the user closes it. A zone that only shows such a message SHALL NOT be recorded.
 
@@ -140,6 +140,10 @@ A remote zone with a session record SHALL be restored without waiting for its en
 - **WHEN** the server stopped after Brindle quit, and a new server gave the recorded id to a different session
 - **THEN** the zone is not restored, and that other session opens as its own tab
 
+#### Scenario: Server not listed at launch
+- **WHEN** Brindle quit with a local tab in `/tmp` whose session stayed detached, and the next launch can't list this machine's terminal server
+- **THEN** the tab is restored with a new shell in `/tmp`, and the recorded session is still running and detached
+
 #### Scenario: Remote programs survive a quit
 - **WHEN** a split SSH tab on `A8` runs `htop` and a shell, and the user quits and relaunches
 - **THEN** the restored tab shows the same `htop` and shell processes on `A8`, with their pids and scrollback
@@ -156,6 +160,8 @@ A remote zone with a session record SHALL be restored without waiting for its en
 On every restoring launch, Brindle SHALL attach every detached local terminal server session it doesn't restore into a zone, each as a new tab, in the order the sessions were started. Each tab SHALL use the profile its session was started with, or the default profile when that profile is gone or isn't local. The same SHALL happen for each remote endpoint the launch connects to: the endpoints of restored remote zones and of profiles that connect at launch. When such an endpoint first connects during the launch, its detached sessions SHALL open as new tabs at the end of the strip. Each SHALL use the first of these profiles that exists: the profile it was started with, when that profile targets the endpoint; the first profile that targets the endpoint; the profile of the first tab on the endpoint; the default profile. It SHALL run on that endpoint, whatever its profile targets. Brindle SHALL stop waiting for an endpoint's first connection once the window has no tab on it, unless a profile connects to it at launch; that endpoint's sessions SHALL then not be attached this way. Local or remote, a session whose owner left without detaching it less than 5 minutes earlier SHALL NOT be attached this way, since its owner may be reconnecting; it stays in the sessions palette. The active tab SHALL stay the one the launch would otherwise make active. Replayed output SHALL raise no bells or notifications.
 
 Sessions attached this way whose layouts name one tab (see "Brindle records each tab with its sessions") SHALL open together as that tab: its split tree without the zones whose sessions aren't attached this way (a split's sibling takes a missing zone's place), its recorded active zone focused, or its first zone when that one is missing, and its manual title. The tab SHALL use the profile its active zone's session gives it by the rules above. Tabs recorded by the same Brindle SHALL keep their recorded order, together at the place of the oldest session among them; a session without a usable layout SHALL open as a tab of its own.
+
+A restoring launch SHALL list this machine's terminal server's sessions once before its window opens, without starting a server. The window SHALL open once that listing has answered or failed, and SHALL show the tabs and active tab these rules give for that answer, whether it came at once or late. When the listing fails, no detached session of this machine SHALL open as a tab this way, a log line SHALL name the failure, and those sessions SHALL stay detached; remote endpoints SHALL be swept as above.
 
 #### Scenario: Session left by a skipped launch
 - **WHEN** a session is detached because the last launch was `--no-restore`, and the user quits and launches `brindle`
@@ -208,6 +214,14 @@ Sessions attached this way whose layouts name one tab (see "Brindle records each
 #### Scenario: One session of a split attached elsewhere
 - **WHEN** one session of a recorded split was attached through the sessions palette by another Brindle that still shows it
 - **THEN** the launch opens the other session as a single-zone tab
+
+#### Scenario: Slow listing
+- **WHEN** Brindle quit with a tab whose session stayed detached, a `--no-restore` launch then left another session detached, and at the next launch this machine's terminal server takes 3 seconds to answer the listing
+- **THEN** the window opens once the server has answered, showing the recorded tab, still active, followed by a tab showing the other session, as when the server answers at once
+
+#### Scenario: Listing fails
+- **WHEN** a session is detached because the last launch was `--no-restore`, and the next launch can't list this machine's terminal server
+- **THEN** the window shows the recorded tabs and no tab for that session, the log names the failure, and a later launch whose listing answers opens that session as a tab
 
 ### Requirement: Local tabs restore their profile, zones and directory
 A restored local tab SHALL restore its recorded zone split tree, with each zone running the tab's recorded profile in that zone's recorded working directory, and focus the tab's recorded active zone. Each zone's recorded directory SHALL be the working directory of that zone's foreground process, the same directory a new tab or split would inherit. A recorded local tab without a split tree SHALL restore as a single zone in the tab's recorded working directory. When a recorded local tab has a manual title, that title SHALL be restored with the tab. A zone with a recorded terminal server session SHALL instead be attached to that session, or not restored, as defined by "Restored zones get their sessions back".

@@ -1653,11 +1653,9 @@ impl Workspace {
             // Deferred by GPUI, so the reload sees this window idle.
             SettingsEvent::ProfilePreview(preview) => this.set_profile_preview(preview.clone(), cx),
             SettingsEvent::FontPreview(preview) => this.set_font_preview(preview.clone(), cx),
-            // Deferred, so the reload sees this window idle (as ReloadConfig).
-            SettingsEvent::ConfigWritten(renames) => {
-                let renames = renames.clone();
-                cx.defer(move |cx| crate::reload_config_renaming(cx, &renames));
-            }
+            // Queued: the reload worker applies it outside this window's
+            // update, after the reloads asked for before.
+            SettingsEvent::ConfigWritten(renames) => crate::request_config_reload(renames.clone(), cx),
         });
         // The slot closes itself on the dialog's `DismissEvent`; this ends
         // the previews, as closing it any other way does.
