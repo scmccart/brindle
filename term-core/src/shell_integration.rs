@@ -967,6 +967,29 @@ mod tests {
     }
 
     #[test]
+    fn reported_dirs_are_absolute_in_either_path_style_for_any_body() {
+        use crate::fuzz::{XorShift, osc_body};
+        let mut rng = XorShift::new(0x7e57_c0de_0000_0004);
+        let (mut posix, mut windows) = (0usize, 0usize);
+        for _ in 0..5000 {
+            let body = osc_body(&mut rng);
+            if let Some(dir) = reported_dir(&body, false) {
+                assert!(dir.starts_with('/'), "{dir:?} from {body:?}");
+                posix += 1;
+            }
+            if let Some(dir) = reported_dir(&body, true) {
+                let b = dir.as_bytes();
+                let drive = matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+                assert!(drive || dir.starts_with("\\\\"), "{dir:?} from {body:?}");
+                windows += 1;
+            }
+            // Any body, a mark or not, must come back as a value.
+            let _ = parse_osc133(&body);
+        }
+        assert!(posix > 0 && windows > 0, "the generator never produced a directory ({posix}, {windows})");
+    }
+
+    #[test]
     fn osc7_drive_paths_on_windows() {
         assert_eq!(reported_dir(b"7;file://pc/C:/My%20Files", true).as_deref(), Some("C:\\My Files"));
         assert_eq!(reported_dir(b"7;file://pc/d:/src/", true).as_deref(), Some("d:\\src\\"));

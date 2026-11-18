@@ -1,10 +1,15 @@
 //! A dependency-free decoder fuzz test: a fixed-seed xorshift generator
 //! feeds random, truncated and mutated frames to every decoder, which must
-//! return `Ok` or `Err` and never panic.
+//! return `Ok` or `Err` and never panic. The other parsers of outside bytes
+//! (the relay's preamble, a held session's meta, versions, holder lock
+//! names) get the same, with a property of what they return.
 
 use std::io;
+use std::time::{Duration, SystemTime};
 
-use crate::{Frame, client, holder, relay};
+use crate::{
+    FRAME_STREAM_MARKER, Frame, MAX_PREAMBLE_NOISE, client, holder, relay, server_dir, upgrade,
+};
 
 pub(crate) struct XorShift(u64);
 
@@ -178,13 +183,16 @@ fn the_frame_reader_never_panics_on_random_streams() {
     }
 }
 
+/// Session ids range past [`holder::MAX_OPEN_BLOBS`], so a sequence can try
+/// to open more blobs than the bound allows; it never holds more.
 #[test]
 fn the_assembler_never_panics_on_random_sequences() {
     let mut rng = XorShift::new(0x00a5_5e4b_1e00_0003);
+    let mut at_the_bound = 0usize;
     for _ in 0..2000 {
         let mut assembler = holder::Assembler::new(rng.below(64) as u64);
-        for _ in 0..rng.below(24) {
-            let session = rng.below(3) as u32;
+        for _ in 0..rng.below(160) {
+            let session = rng.below(64) as u32;
             let _ = match rng.below(4) {
                 0 => assembler.begin(holder::BlobBegin {
                     session,
@@ -199,8 +207,13 @@ fn the_assembler_never_panics_on_random_sequences() {
                 }
                 _ => assembler.end(holder::BlobEnd { session }).map(drop),
             };
+            let open = assembler.open_blobs();
+            assert!(open <= holder::MAX_OPEN_BLOBS, "{open} blobs open");
+            at_the_bound += usize::from(open == holder::MAX_OPEN_BLOBS);
         }
     }
+    // The generator does reach the bound.
+    assert!(at_the_bound > 0, "never {} blobs open", holder::MAX_OPEN_BLOBS);
 }
 
 /// The fields added in protocol 2 (`HELLO`'s `linger_secs` and
@@ -261,4 +274,377 @@ fn the_protocol_2_fields_and_relay_frames_reject_bad_values_without_panicking() 
         payload: br#"{"min":1,"max":2,"client_token":"t","linger_secs":4294967295,"process_info":true}"#.to_vec(),
     };
     assert!(client::ToCore::decode(&frame).is_ok());
+}
+
+/// An in-memory stream that hands out short reads and is now and then
+/// interrupted, as a pipe from `ssh` can be.
+struct Choppy<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    rng: XorShift,
+}
+
+impl io::Read for Choppy<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.rng.below(4) == 0 {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let len = buffer
+            .len()
+            .min(1 + self.rng.below(7))
+            .min(self.bytes.len() - self.at);
+        buffer[..len].copy_from_slice(&self.bytes[self.at..self.at + len]);
+        self.at += len;
+        Ok(len)
+    }
+}
+
+/// Shell output before the frame marker: random bytes, line ends, NULs and
+/// pieces of the marker that never complete it on their own.
+fn preamble_noise(rng: &mut XorShift, len: usize) -> Vec<u8> {
+    let mut noise = Vec::with_capacity(len + FRAME_STREAM_MARKER.len());
+    while noise.len() < len {
+        match rng.below(4) {
+            0 => noise
+                .extend_from_slice(&FRAME_STREAM_MARKER[..rng.below(FRAME_STREAM_MARKER.len())]),
+            1 => noise.push(*b"\n\0\r"[..].get(rng.below(3)).unwrap()),
+            _ => {
+                let count = 1 + rng.below(16);
+                noise.extend(rng.bytes(count));
+            }
+        }
+    }
+    noise.truncate(len);
+    // A piece of the marker and a line end can make a whole one: break it
+    // at its NUL, which can't start another.
+    while let Some(at) = noise
+        .windows(FRAME_STREAM_MARKER.len())
+        .position(|window| window == FRAME_STREAM_MARKER)
+    {
+        noise[at] = b'x';
+    }
+    noise
+}
+
+/// A relay's stdout: noise, then the marker whole, partial, broken,
+/// repeated or missing, then whatever follows.
+fn preamble_stream(rng: &mut XorShift) -> Vec<u8> {
+    let marker = FRAME_STREAM_MARKER;
+    // Near the bound now and then, to check it to the byte.
+    let noise_len = match rng.below(8) {
+        0 => MAX_PREAMBLE_NOISE - 2 + rng.below(5),
+        _ => rng.below(200),
+    };
+    let mut stream = preamble_noise(rng, noise_len);
+    match rng.below(6) {
+        0 => stream.extend_from_slice(marker),
+        1 => {}
+        2 => stream.extend_from_slice(&marker[..rng.below(marker.len())]),
+        3 => {
+            // A byte of it changed, or noise spliced into it.
+            let mut broken = marker.to_vec();
+            let at = rng.below(broken.len());
+            if rng.below(2) == 0 {
+                broken[at] = rng.next() as u8;
+            } else {
+                let count = 1 + rng.below(4);
+                broken.splice(at..at, rng.bytes(count));
+            }
+            stream.extend(broken);
+        }
+        _ => {
+            stream.extend_from_slice(marker);
+            stream.extend_from_slice(marker);
+        }
+    }
+    let after = rng.below(32);
+    stream.extend(rng.bytes(after));
+    stream
+}
+
+#[test]
+fn skip_preamble_finds_the_first_marker_or_fails_within_its_bound() {
+    let marker = FRAME_STREAM_MARKER;
+    let bound = MAX_PREAMBLE_NOISE + marker.len();
+    let mut rng = XorShift::new(0x9e3a_1b5c_0d00_0004);
+    let mut found = 0usize;
+    for _ in 0..600 {
+        let stream = preamble_stream(&mut rng);
+        let mut reader = Choppy {
+            bytes: &stream,
+            at: 0,
+            rng: XorShift::new(rng.next()),
+        };
+        let result = crate::skip_preamble(&mut reader);
+        assert!(
+            reader.at <= bound,
+            "read {} bytes; the bound is {bound}",
+            reader.at
+        );
+        let first = stream
+            .windows(marker.len())
+            .position(|window| window == marker);
+        match (result, first) {
+            (Ok(noise), Some(at)) if at <= MAX_PREAMBLE_NOISE => {
+                assert_eq!(
+                    noise,
+                    stream[..at],
+                    "the noise is what precedes the first marker"
+                );
+                assert_eq!(reader.at, at + marker.len(), "left just past the marker");
+                found += 1;
+            }
+            (Ok(noise), first) => {
+                panic!(
+                    "Ok with {} bytes of noise; the first marker is at {first:?}",
+                    noise.len()
+                )
+            }
+            (Err(error), first) => {
+                let within = first.is_some_and(|at| at <= MAX_PREAMBLE_NOISE);
+                assert!(!within, "{error}, though a marker is at {first:?}");
+                let expected = if stream.len() < bound {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::InvalidData
+                };
+                assert_eq!(error.kind(), expected, "{error}");
+                assert_eq!(reader.at, stream.len().min(bound), "read up to the bound");
+            }
+        }
+    }
+    assert!(found > 0, "the generator never placed a marker");
+}
+
+/// `SessionMeta`'s field names, so random objects hit its parsers.
+const META_FIELDS: [&str; 9] = [
+    "command",
+    "cwd",
+    "key",
+    "layout",
+    "owner",
+    "policy",
+    "profile",
+    "scrollback",
+    "started",
+];
+
+fn random_string(rng: &mut XorShift) -> String {
+    match rng.below(4) {
+        0 => ["kill", "detach", "Kill", "", "/home/u", "bash -l"][rng.below(6)].to_string(),
+        1 => META_FIELDS[rng.below(META_FIELDS.len())].to_string(),
+        _ => {
+            let len = rng.below(12);
+            String::from_utf8_lossy(&rng.bytes(len)).into_owned()
+        }
+    }
+}
+
+fn random_number(rng: &mut XorShift) -> serde_json::Value {
+    match rng.below(8) {
+        0 => serde_json::json!(-1 - rng.below(1 << 20) as i64),
+        1 => serde_json::json!(u64::MAX - rng.below(2) as u64),
+        2 => serde_json::json!(u64::from(u32::MAX) + rng.below(2) as u64),
+        3 => serde_json::json!(i64::MIN),
+        4 => {
+            let float = [1.5, -0.0, 1e300, -2.5e-7][rng.below(4)];
+            serde_json::json!(float)
+        }
+        _ => serde_json::json!(rng.below(100_000)),
+    }
+}
+
+/// A random JSON value at most `depth` levels deep, whose object keys are
+/// `SessionMeta`'s field names more often than not.
+fn random_json(rng: &mut XorShift, depth: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match rng.below(if depth == 0 { 4 } else { 6 }) {
+        0 => Value::Null,
+        1 => Value::Bool(rng.below(2) == 0),
+        2 => random_number(rng),
+        3 => Value::String(random_string(rng)),
+        4 => Value::Array(
+            (0..rng.below(4))
+                .map(|_| random_json(rng, depth - 1))
+                .collect(),
+        ),
+        _ => Value::Object(
+            (0..rng.below(6))
+                .map(|_| (random_string(rng), random_json(rng, depth - 1)))
+                .collect(),
+        ),
+    }
+}
+
+/// `holder::samples::meta()` with fields replaced, dropped or added.
+fn mutated_meta(rng: &mut XorShift) -> serde_json::Value {
+    let mut meta = holder::samples::meta();
+    let object = meta.as_object_mut().expect("the sample is an object");
+    for _ in 0..1 + rng.below(4) {
+        let field = META_FIELDS[rng.below(META_FIELDS.len())].to_string();
+        match rng.below(3) {
+            0 => {
+                object.remove(&field);
+            }
+            1 => {
+                let key = random_string(rng);
+                object.insert(key, random_json(rng, 2));
+            }
+            _ => {
+                object.insert(field, random_json(rng, 2));
+            }
+        }
+    }
+    meta
+}
+
+#[test]
+fn session_meta_reads_any_value_and_round_trips_what_it_returns() {
+    let mut rng = XorShift::new(0x3e7a_0b1d_c0de_0005);
+    let mut kept = 0usize;
+    for _ in 0..3000 {
+        let value = match rng.below(3) {
+            0 => random_json(&mut rng, 3),
+            1 => mutated_meta(&mut rng),
+            _ => serde_json::Value::Object(
+                (0..rng.below(8))
+                    .map(|_| {
+                        let field = META_FIELDS[rng.below(META_FIELDS.len())].to_string();
+                        (field, random_json(&mut rng, 2))
+                    })
+                    .collect(),
+            ),
+        };
+        let meta = holder::SessionMeta::from_value(&value);
+        assert_eq!(
+            holder::SessionMeta::from_value(&meta.to_value()),
+            meta,
+            "read from {value}"
+        );
+        kept += usize::from(meta != holder::SessionMeta::default());
+    }
+    // The generator reaches the fields' parsers, not only the defaults.
+    assert!(kept > 0, "every meta read was the default");
+}
+
+/// Random version text: digits, dots, `-`, `+`, whitespace, a pre-release
+/// word and random bytes.
+fn random_version(rng: &mut XorShift) -> String {
+    const VERSIONISH: &[u8] = b"0123456789...-+ \t\nrc";
+    match rng.below(4) {
+        0 => {
+            let len = rng.below(14);
+            (0..len)
+                .map(|_| char::from(VERSIONISH[rng.below(VERSIONISH.len())]))
+                .collect()
+        }
+        1 => {
+            let suffix = ["", "-rc.1", "+b1", "-", " ", "\n", ".4"][rng.below(7)];
+            format!("{}.{}.{}{suffix}", rng.below(3), rng.below(3), rng.below(3))
+        }
+        2 => {
+            // Past u64.
+            let len = 18 + rng.below(4);
+            let digits: String = (0..len)
+                .map(|_| char::from(b'0' + rng.below(10) as u8))
+                .collect();
+            format!("{digits}.0.1")
+        }
+        _ => {
+            let len = rng.below(12);
+            String::from_utf8_lossy(&rng.bytes(len)).into_owned()
+        }
+    }
+}
+
+#[test]
+fn versions_parse_without_panicking_and_newer_is_never_mutual() {
+    let mut rng = XorShift::new(0x0e75_10a5_0000_0006);
+    let mut parsed = 0usize;
+    for _ in 0..5000 {
+        let version = random_version(&mut rng);
+        if let Some((a, b, c)) = upgrade::semver(&version) {
+            assert_eq!(
+                upgrade::semver(&format!("{a}.{b}.{c}")),
+                Some((a, b, c)),
+                "{version:?}"
+            );
+            parsed += 1;
+        }
+    }
+    assert!(parsed > 0, "no version parsed");
+
+    let build = |rng: &mut XorShift| upgrade::Build {
+        version: match rng.below(3) {
+            0 => random_version(rng),
+            _ => ["0.3.0", "0.3.0-rc.1", "0.3.1", "1.0.0", "dev"][rng.below(5)].to_string(),
+        },
+        build: ["a", "b", ""][rng.below(3)].to_string(),
+        mtime: match rng.below(4) {
+            0 => None,
+            _ => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(rng.below(3) as u64)),
+        },
+    };
+    let mut newer = 0usize;
+    for _ in 0..5000 {
+        let (x, y) = (build(&mut rng), build(&mut rng));
+        let (forward, back) = (upgrade::is_newer(&x, &y), upgrade::is_newer(&y, &x));
+        assert!(
+            !(forward && back),
+            "each newer than the other: {x:?}, {y:?}"
+        );
+        assert!(!upgrade::is_newer(&x, &x), "newer than itself: {x:?}");
+        newer += usize::from(forward || back);
+    }
+    assert!(newer > 0, "no pair had a newer build");
+}
+
+/// Random lock file names: pieces of `holder-<build>-<n>.lock` and random
+/// bytes.
+fn random_lock_name(rng: &mut XorShift) -> String {
+    const PIECES: [&str; 8] = ["holder-", ".lock", "-", "0", "42", "b1", ".", "4294967296"];
+    let mut name = String::new();
+    for _ in 0..rng.below(7) {
+        if rng.below(4) == 0 {
+            let len = 1 + rng.below(4);
+            name.push_str(&String::from_utf8_lossy(&rng.bytes(len)));
+        } else {
+            name.push_str(PIECES[rng.below(PIECES.len())]);
+        }
+    }
+    name
+}
+
+#[test]
+fn holder_lock_names_parse_without_panicking_and_round_trip() {
+    let mut rng = XorShift::new(0x10c4_f11e_0000_0007);
+    let mut parsed = 0usize;
+    for _ in 0..5000 {
+        let name = random_lock_name(&mut rng);
+        if let Some((build, n)) = server_dir::parse_holder_lock(&name) {
+            let rendered = format!("holder-{build}-{n}.lock");
+            assert_eq!(
+                server_dir::parse_holder_lock(&rendered),
+                Some((build, n)),
+                "{name:?}"
+            );
+            parsed += 1;
+        }
+    }
+    assert!(parsed > 0, "no random name parsed");
+
+    for _ in 0..5000 {
+        // Any non-empty build: dashes, dots, digits and random text included.
+        let mut build = random_lock_name(&mut rng);
+        if build.is_empty() {
+            build.push('b');
+        }
+        let n = rng.next() as u32;
+        let name = format!("holder-{build}-{n}.lock");
+        assert_eq!(
+            server_dir::parse_holder_lock(&name),
+            Some((build.clone(), n)),
+            "{name:?}"
+        );
+    }
 }

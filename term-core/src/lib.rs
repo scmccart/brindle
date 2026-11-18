@@ -4,6 +4,8 @@
 //! per-session emulator.
 
 pub mod emulator;
+#[cfg(test)]
+mod fuzz;
 pub mod notice;
 pub mod osc;
 pub mod replay;

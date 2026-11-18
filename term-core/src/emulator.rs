@@ -40,6 +40,13 @@ impl EventListener for Titles {
     }
 }
 
+/// The fewest columns any grid Brindle creates or resizes has, on the
+/// client and in the server's emulators alike, so their grids and replays
+/// agree. `alacritty_terminal` 0.26 panics (`grid/mod.rs:439`) when a grid
+/// 1 column wide is fed a double-width character, and nothing useful fits
+/// in less than this anyway. Rows are clamped to 1 only.
+pub const MIN_COLS: u16 = 10;
+
 /// A grid size, for `Term::new` and resizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
@@ -69,8 +76,8 @@ pub struct Emulator {
 }
 
 impl Emulator {
-    /// An emulator of `cols` × `rows` (each at least 1) keeping `scrollback`
-    /// lines of history; 0 means [`DEFAULT_SCROLLBACK`].
+    /// An emulator of `cols` (at least [`MIN_COLS`]) × `rows` (at least 1)
+    /// keeping `scrollback` lines of history; 0 means [`DEFAULT_SCROLLBACK`].
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
         let titles = Titles::default();
         let scrolling_history = if scrollback == 0 { DEFAULT_SCROLLBACK } else { scrollback };
@@ -151,7 +158,7 @@ impl Emulator {
 }
 
 fn size(cols: u16, rows: u16) -> Size {
-    Size { cols: usize::from(cols.max(1)), rows: usize::from(rows.max(1)) }
+    Size { cols: usize::from(cols.max(MIN_COLS)), rows: usize::from(rows.max(1)) }
 }
 
 #[cfg(test)]
@@ -181,6 +188,23 @@ mod tests {
         assert_eq!(copy.records().get("").map(|r| r.state), Some(State::Working));
         assert_eq!(copy.marks().commands().len(), 1);
         assert_eq!(copy.term().grid().cursor.point, emulator.term().grid().cursor.point);
+    }
+
+    #[test]
+    fn a_one_column_emulator_fed_a_double_width_char_is_ten_columns_wide_and_does_not_panic() {
+        let mut emulator = Emulator::new(1, 4, 0);
+        emulator.feed("😀😀漢".as_bytes());
+        assert_eq!(emulator.term().columns(), usize::from(MIN_COLS));
+        emulator.resize(1, 4);
+        emulator.feed("😀😀".as_bytes());
+        assert_eq!(emulator.term().columns(), usize::from(MIN_COLS));
+        assert_eq!(emulator.term().screen_lines(), 4);
+    }
+
+    #[test]
+    fn a_zero_by_zero_emulator_is_min_cols_by_one_row() {
+        let emulator = Emulator::new(0, 0, 0);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (usize::from(MIN_COLS), 1));
     }
 
     #[test]

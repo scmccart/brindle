@@ -14,7 +14,7 @@ Each kind of test answers one question and has one home:
 | --- | --- | --- |
 | unit tests on pure code | does this function or model decide correctly? | `#[cfg(test)] mod tests` in the same file, every crate |
 | transcript tests | is this message's encoding still byte for byte? | `remote-protocol/` |
-| fuzz tests | does any input make a decoder panic? | `remote-protocol/src/fuzz.rs` |
+| fuzz tests | does any input make a decoder or parser panic? | `remote-protocol/src/fuzz.rs`, `term-core/src/fuzz.rs` |
 | architecture tests | do the crates still point the right way? | `tests/architecture.rs` |
 | real-process tests | do the real holder, core and relay cooperate? | `remote-agent/tests/` |
 | end-to-end cases | does the shipped app behave, seen from outside? | `tests/e2e/` (opt-in) |

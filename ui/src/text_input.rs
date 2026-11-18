@@ -275,7 +275,10 @@ impl EditState {
     }
 
     pub fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.from_utf16(range.start)..self.from_utf16(range.end)
+        // A platform may hand over a reversed range; order it so every
+        // caller can slice the text with it.
+        let (a, b) = (self.from_utf16(range.start), self.from_utf16(range.end));
+        a.min(b)..a.max(b)
     }
 
     /// Debug description for `--dump-screen-after`.
@@ -976,6 +979,26 @@ mod tests {
         assert_eq!(s.from_utf16(99), 8);
         assert_eq!(s.range_from_utf16(&(1..4)), 1..7);
         assert_eq!(s.range_to_utf16(&(1..7)), 1..4);
+    }
+
+    #[test]
+    fn a_reversed_utf16_range_is_ordered() {
+        let s = EditState::new("aé😀b");
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = 4..1;
+        assert_eq!(s.range_from_utf16(&reversed), 1..7);
+    }
+
+    #[test]
+    fn every_utf16_range_slices_the_text() {
+        let s = EditState::new("aé😀b");
+        for a in 0..=8 {
+            for b in 0..=8 {
+                let range = s.range_from_utf16(&Range { start: a, end: b });
+                assert!(range.start <= range.end, "{a}..{b} gave {range:?}");
+                assert!(s.text().get(range.clone()).is_some(), "{a}..{b} gave {range:?}");
+            }
+        }
     }
 
     #[test]

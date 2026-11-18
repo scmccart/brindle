@@ -174,6 +174,13 @@ The same staleness is fixed in two other places:
   - `process-architecture.md`'s Enforcement bullet says transcripts are checked per variant, and that regeneration never rewrites an existing fixture.
 - **`CLAUDE.md`:** its protocol paragraph gains the open-blob bound, and its Tests paragraph gains the term-core fuzz tests.
 
+### 9. No grid is narrower than `MIN_COLS = 10`
+
+- **Why:** the emulator fuzz test found a panic inside `alacritty_terminal` 0.26 (`grid/mod.rs:439`): a double-width character fed to a 1-column grid. Per the Risks rule the generator isn't narrowed. The fix is in the code that builds sizes, so no grid Brindle makes can be that narrow.
+- **Where:** one constant, `brindle_term_core::emulator::MIN_COLS`, used by the server emulators' `size()` (`new` and `resize`), the client's `Terminal::resize` and replay size (`GridSize::clamped`), `fit_grid` and `can_split_zone`. Client and core clamp alike, so their grids and replays stay identical. Rows keep their own minimums.
+- **Wire:** unchanged. A size from a listing or a request is clamped where it is used; the PTY gets the clamped size.
+- **Spec:** the `zones` requirement "Minimum size for splitting" named 2 columns; its delta here says 10 and adds the scenario "a pane narrower than 10 columns is laid out as 10 columns wide".
+
 ## Risks / Trade-offs
 
 - **[A fuzz test finds a real panic]** → If it is in Brindle's code, fix it in this change, since finding it is the point. If it is inside `alacritty_terminal`, stop and raise it, and don't narrow the generator to hide it (`testing R9`). The core already confines a feed panic per session (`screen.rs`), and change 9 adds the same to the client.

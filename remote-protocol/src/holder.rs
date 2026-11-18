@@ -38,10 +38,12 @@
 //! plus its session id does too. Each is sent as `*_BEGIN` with the total
 //! length, any number of `*_CHUNK`s whose lengths add up to it, and `*_END`.
 //! Chunks of one blob may interleave with other sessions' messages, but not
-//! with another blob of the same kind for the same session. The holder
-//! replaces its stored checkpoint only on `CHECKPOINT_END`; a connection
-//! lost mid-blob leaves the previous one in place. [`split`] cuts a blob
-//! into messages and [`Assembler`] rebuilds it.
+//! with another blob of the same kind for the same session. A receiver
+//! keeps at most [`MAX_OPEN_BLOBS`] blobs of one kind open per connection
+//! and refuses a `*_BEGIN` past that; every shipped sender has at most one
+//! open. The holder replaces its stored checkpoint only on
+//! `CHECKPOINT_END`; a connection lost mid-blob leaves the previous one in
+//! place. [`split`] cuts a blob into messages and [`Assembler`] rebuilds it.
 //!
 //! **What a checkpoint covers.** Output the holder read may still be on its
 //! way to the core when the core renders a checkpoint, so the core's
@@ -118,6 +120,10 @@ pub const MAX_CHUNK_LEN: usize = crate::MAX_FRAME_PAYLOAD_SIZE - wire::SESSION_P
 pub const TAIL_LIMIT: u64 = 1024 * 1024;
 /// The largest checkpoint either side accepts.
 pub const MAX_CHECKPOINT_LEN: u64 = 64 * 1024 * 1024;
+/// The most blobs of one kind an [`Assembler`] keeps open at once: a
+/// `*_BEGIN` past it is refused. Every shipped sender has one open at a
+/// time; the bound keeps a peer from reserving memory per session id.
+pub const MAX_OPEN_BLOBS: usize = 16;
 
 /// Bytes for one session: `INPUT`, `OUTPUT`, or a blob's chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,7 +539,9 @@ pub fn split(
 
 /// Rebuilds chunked blobs of one kind (checkpoints, or tails), per session.
 /// Every violation of the begin/chunk/end sequence is an `InvalidData`
-/// error, after which that session's partial blob is dropped.
+/// error, after which that session's partial blob is dropped. At most
+/// [`MAX_OPEN_BLOBS`] blobs are open at once; a `*_BEGIN` past that is
+/// refused and leaves the open ones alone.
 #[derive(Debug)]
 pub struct Assembler {
     limit: u64,
@@ -567,6 +575,13 @@ impl Assembler {
             return Err(wire::invalid(format!(
                 "session {}'s blob is {} bytes; the limit is {}",
                 begin.session, begin.len, self.limit
+            )));
+        }
+        if self.open.len() >= MAX_OPEN_BLOBS {
+            return Err(wire::invalid(format!(
+                "session {} began a blob while {} are open; the limit is {MAX_OPEN_BLOBS}",
+                begin.session,
+                self.open.len()
             )));
         }
         // Don't trust the announced length for the allocation up front.
@@ -626,6 +641,11 @@ impl Assembler {
 
     pub fn is_open(&self, session: SessionId) -> bool {
         self.open.contains_key(&session)
+    }
+
+    /// How many blobs are open: never more than [`MAX_OPEN_BLOBS`].
+    pub fn open_blobs(&self) -> usize {
+        self.open.len()
     }
 }
 
@@ -1157,6 +1177,75 @@ mod tests {
         a.chunk(&chunk(5, b"b")).unwrap();
         assert_eq!(a.end(BlobEnd { session: 6 }).unwrap(), b"z");
         assert_eq!(a.end(BlobEnd { session: 5 }).unwrap(), b"ab");
+    }
+
+    /// Session `session`'s blob in [`a_blob_past_the_open_limit_is_refused_and_the_others_stay_open`].
+    fn blob_of(session: SessionId) -> Vec<u8> {
+        format!("blob {session}").into_bytes()
+    }
+
+    #[test]
+    fn a_blob_past_the_open_limit_is_refused_and_the_others_stay_open() {
+        let mut a = Assembler::new(MAX_CHECKPOINT_LEN);
+        let sessions: Vec<SessionId> = (1..=MAX_OPEN_BLOBS as SessionId).collect();
+        for &session in &sessions {
+            let len = blob_of(session).len() as u64;
+            a.begin(BlobBegin { session, len }).unwrap();
+        }
+        assert_eq!(a.open_blobs(), MAX_OPEN_BLOBS);
+
+        let past = MAX_OPEN_BLOBS as SessionId + 1;
+        let error = a
+            .begin(BlobBegin {
+                session: past,
+                len: 1,
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "session {past} began a blob while {MAX_OPEN_BLOBS} are open"
+            )),
+            "{error}"
+        );
+        assert!(!a.is_open(past));
+        assert_eq!(a.open_blobs(), MAX_OPEN_BLOBS);
+
+        for &session in &sessions {
+            let (_, chunks, end) = split(session, &blob_of(session), 3);
+            for chunk in &chunks {
+                a.chunk(chunk).unwrap();
+            }
+            assert_eq!(a.end(end).unwrap(), blob_of(session));
+        }
+        assert_eq!(a.open_blobs(), 0);
+    }
+
+    #[test]
+    fn ending_a_blob_makes_room_for_another() {
+        let mut a = Assembler::new(TAIL_LIMIT);
+        for session in 0..MAX_OPEN_BLOBS as SessionId {
+            a.begin(BlobBegin { session, len: 0 }).unwrap();
+        }
+        let next = BlobBegin {
+            session: MAX_OPEN_BLOBS as SessionId,
+            len: 0,
+        };
+        assert!(a.begin(next).is_err(), "past the limit");
+
+        assert_eq!(a.end(BlobEnd { session: 0 }).unwrap(), b"");
+        a.begin(next).unwrap();
+        assert!(a.is_open(next.session));
+        assert_eq!(a.open_blobs(), MAX_OPEN_BLOBS);
+
+        // An abandoned blob makes room too.
+        a.abandon(1);
+        a.begin(BlobBegin {
+            session: next.session + 1,
+            len: 0,
+        })
+        .unwrap();
+        assert_eq!(a.open_blobs(), MAX_OPEN_BLOBS);
     }
 
     #[test]

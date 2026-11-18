@@ -19,6 +19,8 @@ use gpui::{
     outline, point, px, relative, size,
 };
 
+use brindle_term_core::emulator::MIN_COLS;
+
 use crate::latency::Latency;
 use crate::settings::Settings;
 use crate::terminal::{DIM_FACTOR, GridSize, resolve_color};
@@ -48,11 +50,15 @@ pub fn cell_metrics(font_size_override: Option<f32>, window: &Window, cx: &App) 
     CellMetrics { font, font_size, cell_width, line_height }
 }
 
-/// How many whole cells fit in `size` after `padding` on every side.
+/// How many whole cells fit in `size` after `padding` on every side, at
+/// least [`MIN_COLS`] columns and 2 rows.
 pub fn fit_grid(size: gpui::Size<Pixels>, padding: Pixels, cell_width: Pixels, line_height: Pixels) -> (usize, usize) {
     let width = size.width - padding * 2.0;
     let height = size.height - padding * 2.0;
-    (((width / cell_width).floor() as usize).max(2), ((height / line_height).floor() as usize).max(2))
+    (
+        ((width / cell_width).floor() as usize).max(usize::from(MIN_COLS)),
+        ((height / line_height).floor() as usize).max(2),
+    )
 }
 
 /// Which highlight a cell gets; the earlier variants win.
@@ -841,6 +847,15 @@ pub mod box_drawing {
 
         fn cell() -> Bounds<Pixels> {
             Bounds::new(point(px(100.0), px(200.0)), size(px(8.0), px(20.0)))
+        }
+
+        #[test]
+        fn a_tiny_width_fits_min_cols_and_two_rows() {
+            use super::super::{MIN_COLS, fit_grid};
+            let tiny = size(px(5.0), px(5.0));
+            assert_eq!(fit_grid(tiny, px(4.0), px(8.0), px(16.0)), (usize::from(MIN_COLS), 2));
+            let roomy = size(px(808.0), px(400.0));
+            assert_eq!(fit_grid(roomy, px(4.0), px(8.0), px(16.0)), (100, 24));
         }
 
         #[test]

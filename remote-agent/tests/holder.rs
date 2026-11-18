@@ -1053,6 +1053,61 @@ fn a_tail_past_its_limit_is_truncated() {
     core.hung_up(1);
 }
 
+/// A core that opens more checkpoints at once than H1 allows
+/// (`MAX_OPEN_BLOBS`) gets an `ERROR` for the one past the bound, and
+/// nothing else changes: the session runs on, and the next core gets the
+/// checkpoint it had before.
+#[test]
+fn a_core_past_the_open_blob_limit_gets_an_error_and_the_sessions_keep_running() {
+    let (dir, mut core, holder_pid) = holder("open-blobs");
+    let go = dir.path.join("go");
+    let pid = core.spawn(programs::echoes_a_line(1, &go));
+    let seen = core.output_until(1, b"one\r\n");
+    for message in ToHolder::checkpoint(1, b"CP", seen.len() as u64) {
+        core.send(message);
+    }
+
+    // Blobs begun for sessions the holder doesn't have and never ended,
+    // then one for the session it has, past the bound.
+    for session in 100..100 + h1::MAX_OPEN_BLOBS as u32 {
+        core.send(ToHolder::CheckpointBegin(h1::BlobBegin { session, len: 4 }));
+    }
+    core.send(ToHolder::CheckpointBegin(h1::BlobBegin {
+        session: 1,
+        len: 4,
+    }));
+    match core.recv_skipping_output() {
+        ToCore::Error(error) => {
+            assert_eq!(error.session, Some(1), "{}", error.message);
+            let limit = format!("the limit is {}", h1::MAX_OPEN_BLOBS);
+            assert!(error.message.contains(&limit), "{}", error.message);
+        }
+        other => panic!("expected ERROR for session 1, got {other:?}"),
+    }
+
+    // The session still answers.
+    core.input(1, b"abc");
+    core.input(1, programs::ENTER);
+    core.output_until(1, b"two:abc\r\n");
+
+    // A core that reconnects adopts it with the checkpoint it had.
+    drop(core);
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    let welcome = adopted.welcome();
+    assert_eq!(
+        (welcome.pid, welcome.previous),
+        (holder_pid, Previous::Crash)
+    );
+    assert_eq!(welcome.sessions.len(), 1);
+    let held = &welcome.sessions[0];
+    assert_eq!((held.session, held.pid, held.exit), (1, pid, None));
+    assert_eq!(adopted.checkpoints[&1], b"CP");
+
+    programs::release(&go);
+    assert_eq!(core.exit_code(1), Some(0));
+}
+
 #[cfg(unix)]
 #[test]
 fn without_a_core_a_program_blocks_instead_of_losing_output() {
