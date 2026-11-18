@@ -274,11 +274,12 @@ pub struct Terminal {
     marks: Arc<Mutex<Marks>>,
     size: GridSize,
     title: Option<String>,
-    exited: bool,
-    /// It shows a detached session it attached ([`Terminal::attach`]).
-    attaching: bool,
-    /// Its session never started or attached; it shows why.
-    failed: bool,
+    /// Whether its program runs, ended, or never started; moved on only by
+    /// [`Life::after`].
+    life: Life,
+    /// Whether it started its session or attached a detached one
+    /// ([`Terminal::attach`]).
+    origin: Origin,
     /// Notices ([`Terminal::note`]) due before the attached session's first
     /// replay ends, which would wipe them: `Some` until then, written when
     /// the replay ends, or after the line that says the attach failed or
@@ -370,8 +371,7 @@ impl Terminal {
                 self.release_notes(cx);
             }
             ChannelEvent::Failed => {
-                self.failed = true;
-                self.mark_lost(cx);
+                self.mark_failed(cx);
                 self.release_notes(cx);
             }
             ChannelEvent::Broken(reason) => self.broken(&reason, cx),
@@ -441,10 +441,9 @@ impl Terminal {
             marks,
             size,
             title: None,
-            exited: false,
-            attaching: false,
+            life: Life::Running,
+            origin: Origin::Spawned,
             held_notes: None,
-            failed: false,
             replaying: false,
             status: status::Records::default(),
             theme,
@@ -562,7 +561,7 @@ impl Terminal {
         let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
         let theme = config.profile_theme(profile);
         let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
-        this.attaching = true;
+        this.origin = Origin::Attached;
         this.held_notes = Some(Vec::new());
         this
     }
@@ -660,27 +659,39 @@ impl Terminal {
         }
     }
 
+    /// The program exited: the terminal has ended, which its tab hears once.
     pub fn mark_exited(&mut self, cx: &mut Context<Self>) {
-        if !self.exited {
-            self.exited = true;
-            if self.status.end_activity() {
-                cx.emit(TerminalEvent::Status(None));
-            }
+        if self.end(LifeEvent::Exited, cx) {
             cx.emit(TerminalEvent::Exited);
         }
     }
 
-    /// The server session can't be got back (its line is on the screen): the
-    /// terminal has ended, but the tab stays open on its last screen, so no
-    /// `Exited`.
+    /// The server session can't be got back, or Brindle can't show it any
+    /// more (its line is on the screen): the terminal has ended, but the tab
+    /// stays open on its last screen, so no `Exited`.
     fn mark_lost(&mut self, cx: &mut Context<Self>) {
         self.replaying = false;
-        if !self.exited {
-            self.exited = true;
-            if self.status.end_activity() {
-                cx.emit(TerminalEvent::Status(None));
-            }
+        self.end(LifeEvent::Lost, cx);
+    }
+
+    /// The session never started or attached (its line is on the screen):
+    /// as [`Terminal::mark_lost`], and an attached terminal then shows only
+    /// that line ([`Terminal::shows_only_message`]).
+    fn mark_failed(&mut self, cx: &mut Context<Self>) {
+        self.replaying = false;
+        self.end(LifeEvent::Failed, cx);
+    }
+
+    /// Moves the terminal's life on by `event`. True when that ended a
+    /// running terminal, whose status activity then ends.
+    fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
+        let was = self.life;
+        self.life = was.after(event);
+        let ended = was == Life::Running;
+        if ended && self.status.end_activity() {
+            cx.emit(TerminalEvent::Status(None));
         }
+        ended
     }
 
     /// The program status records (OSC 7501).
@@ -1116,22 +1127,25 @@ impl Terminal {
         self.leave(false, layout);
     }
 
-    /// Ends the terminal's connection to its program: `close` ends the
-    /// program; otherwise a server session's program is left as its
-    /// [`Closing`] says. A message terminal has no program.
     /// Keeps the layout of the tab this terminal is in current on its
-    /// server session (`crate::layout`), as it changes; a message terminal
-    /// has none.
+    /// server session (`crate::layout`), as it changes, while its program
+    /// runs; a message terminal has none.
     pub fn set_layout(&self, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, closing: Closing::Keeps, .. } if !self.exited => session.set_layout(layout),
-            _ => {
-                let _ = layout;
+            Backend::Server { session, closing: Closing::Keeps, .. } if self.life == Life::Running => {
+                session.set_layout(layout)
             }
+            // Its program ended, or ends with Brindle: nothing restores it.
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { closing: Closing::Keeps | Closing::Ends, .. } => {}
+            Backend::Remote => drop(layout),
         }
     }
 
+    /// Ends the terminal's connection to its program: `close` ends the
+    /// program; otherwise a server session's program is left as its
+    /// [`Closing`] says. A message terminal has no program.
     fn leave(&mut self, close: bool, layout: Option<serde_json::Value>) {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
@@ -1155,7 +1169,7 @@ impl Terminal {
         &self,
     ) -> Option<(crate::remote::protocol::SessionId, Option<crate::remote::SessionKey>)> {
         match &self.backend {
-            Backend::Server { session, .. } if !self.exited => session.id_and_key(),
+            Backend::Server { session, .. } if self.life == Life::Running => session.id_and_key(),
             Backend::Server { .. } | Backend::Remote => None,
         }
     }
@@ -1163,7 +1177,61 @@ impl Terminal {
     /// An attach that failed (refused, or its session gone): the terminal
     /// only says why, and session restore doesn't record it.
     pub fn shows_only_message(&self) -> bool {
-        self.attaching && self.failed
+        self.origin.shows_only_message(self.life)
+    }
+}
+
+/// Where a terminal's program is in its life (`types R1`): one value, so a
+/// terminal can't be both failed and running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Life {
+    /// Its program runs, or its session is still starting or attaching.
+    Running,
+    /// Its program exited, or its session was lost or can't be shown.
+    Ended,
+    /// Its session never started or attached; the terminal says why.
+    Failed,
+}
+
+/// What ends a terminal's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifeEvent {
+    /// Its program exited.
+    Exited,
+    /// Its session can't be got back, or Brindle's emulator broke on it.
+    Lost,
+    /// Its session never started or attached.
+    Failed,
+}
+
+impl Life {
+    /// The life after `event`: any of them ends a running terminal, a
+    /// failure is final, and a session that failed after it ended failed.
+    fn after(self, event: LifeEvent) -> Self {
+        match self {
+            Self::Failed => Self::Failed,
+            Self::Running | Self::Ended => match event {
+                LifeEvent::Exited | LifeEvent::Lost => Self::Ended,
+                LifeEvent::Failed => Self::Failed,
+            },
+        }
+    }
+}
+
+/// How a terminal came by its session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// It started it (or shows a message, with no session).
+    Spawned,
+    /// It attached a detached one.
+    Attached,
+}
+
+impl Origin {
+    /// Whether a terminal of this origin, in `life`, only says why it has
+    /// no session: an attach that failed, which restore doesn't record.
+    fn shows_only_message(self, life: Life) -> bool {
+        self == Self::Attached && life == Life::Failed
     }
 }
 
@@ -1720,6 +1788,45 @@ mod tests {
             use crate::remote::protocol::client::Policy;
             assert_eq!(Closing::Keeps.policy(), Policy::Detach);
             assert_eq!(Closing::Ends.policy(), Policy::Kill);
+        }
+    }
+
+    /// Any event ends a running terminal: an exit or a loss as ended, a
+    /// failure as failed. An ended terminal stays ended, unless its session
+    /// then failed, and a failure is final.
+    #[test]
+    fn a_terminals_life_moves_on_by_what_ended_it() {
+        use LifeEvent::{Exited, Failed, Lost};
+        let table = [
+            (Life::Running, Exited, Life::Ended),
+            (Life::Running, Lost, Life::Ended),
+            (Life::Running, Failed, Life::Failed),
+            (Life::Ended, Exited, Life::Ended),
+            (Life::Ended, Lost, Life::Ended),
+            (Life::Ended, Failed, Life::Failed),
+            (Life::Failed, Exited, Life::Failed),
+            (Life::Failed, Lost, Life::Failed),
+            (Life::Failed, Failed, Life::Failed),
+        ];
+        for (life, event, after) in table {
+            assert_eq!(life.after(event), after, "{life:?} after {event:?}");
+        }
+    }
+
+    /// Only an attach that failed counts as showing nothing but its
+    /// message, whatever else ended.
+    #[test]
+    fn only_a_failed_attach_shows_only_its_message() {
+        let table = [
+            (Origin::Spawned, Life::Running, false),
+            (Origin::Spawned, Life::Ended, false),
+            (Origin::Spawned, Life::Failed, false),
+            (Origin::Attached, Life::Running, false),
+            (Origin::Attached, Life::Ended, false),
+            (Origin::Attached, Life::Failed, true),
+        ];
+        for (origin, life, only) in table {
+            assert_eq!(origin.shows_only_message(life), only, "{origin:?} {life:?}");
         }
     }
 
