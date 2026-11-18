@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::local_server;
 use crate::brindle::Dump;
+use crate::common::server::{Isolation, isolate};
 use crate::{Case, Ctx, Outcome, Result, ensure, winproc};
 
 pub fn all() -> Vec<Case> {
@@ -343,14 +344,17 @@ fn run_keeping(
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     // `-p` alone restores the previous run's tabs too; such runs start clean.
     let no_restore: &[&str] = if args.contains(&"-p") { &["--no-restore"] } else { &[] };
-    let mut child = Command::new(&ctx.bin)
+    let mut command = Command::new(&ctx.bin);
+    let state = crate::brindle::state_dir(ctx);
+    isolate(
+        &mut command,
+        &Isolation { config: &config, state_dir: &state, server_dir: &ctx.server_dir, display: &ctx.display },
+    );
+    let mut child = command
         .args(args)
         .args(no_restore)
         .args(ctx.step_interval())
         .args(["--dump-screen-after", &ctx.secs(dump_at).to_string()])
-        .env("BRINDLE_CONFIG", &config)
-        .env("BRINDLE_STATE_DIR", ctx.dir.join("state"))
-        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
         .env("RUST_LOG", "brindle=info,warn")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())

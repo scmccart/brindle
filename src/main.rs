@@ -30,6 +30,7 @@ mod workspace;
 mod zone_view;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
@@ -677,12 +678,14 @@ fn record_session(cx: &mut App) {
             PendingWrite::Nothing | PendingWrite::StillUnserializable => None,
         }
     }
-    fn write(text: &str, generation: u64) {
-        let dir = session::state_dir();
-        if let Err(err) = session::write_atomic(&dir, text, generation) {
-            log::warn!("could not write session state to {}: {err}", session::state_path(&dir).display());
+    fn write(file: &session::StateFile, text: &str, ticket: u64) {
+        if let Err(err) = file.write(text, ticket) {
+            log::warn!("could not write session state to {}: {err}", file.path().display());
         }
     }
+    // One ordering for the tick's background writes and the last one.
+    let file = Arc::new(session::StateFile::new(session::state_dir()));
+    let ticking = file.clone();
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -700,13 +703,13 @@ fn record_session(cx: &mut App) {
             }
             let Ok(text) = cx.update(pending) else { break };
             if let Some(text) = text {
-                let generation = session::next_generation();
-                cx.background_executor().spawn(async move { write(&text, generation) }).detach();
+                let (file, ticket) = (ticking.clone(), ticking.ticket());
+                cx.background_executor().spawn(async move { write(&file, &text, ticket) }).detach();
             }
         }
     })
     .detach();
-    cx.on_app_quit(|cx| {
+    cx.on_app_quit(move |cx| {
         // The windows still open now are the ones to keep. Each detaches
         // its tabs' sessions (`-e` ones close) itself, every debug run's
         // included, rather than leaving it to the terminals' drops, which
@@ -718,7 +721,7 @@ fn record_session(cx: &mut App) {
             }
         }
         if let Some(text) = pending(cx) {
-            write(&text, session::next_generation());
+            write(&file, &text, file.ticket());
         }
         async {}
     })

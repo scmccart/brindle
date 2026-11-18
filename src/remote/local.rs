@@ -52,11 +52,12 @@ pub use super::Host;
 #[cfg(test)]
 pub(super) use {
     link::Link,
-    relay::{dial as dial_relay, start as start_relay},
+    relay::{dial_with, start as start_relay},
 };
 pub use session::Session;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -65,6 +66,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use parking_lot::Mutex;
 
+use super::client::{HelperLookup, default_helper};
 use super::hosts::LinkState;
 use super::protocol::client::{self, Hello, ToClient, ToCore, Welcome};
 use super::protocol::{Frame, server_dir};
@@ -133,6 +135,14 @@ static WATCHER: OnceLock<Watcher> = OnceLock::new();
 /// it is eager from the start when the process keeps `host` connected, and
 /// reports to [`watch_hosts`]' callback.
 pub fn shared(host: &Host) -> Result<Arc<Connection>> {
+    shared_with(host, &default_helper())
+}
+
+/// [`shared`], where a remote endpoint's relay deploys the helper `helper`
+/// finds (production's is [`default_helper`]: `BRINDLE_REMOTE_AGENT`, else
+/// the one beside Brindle). Only a connection made now uses it: one the
+/// process already has for `host` is returned as it is.
+pub(crate) fn shared_with(host: &Host, helper: &HelperLookup) -> Result<Arc<Connection>> {
     CONNECTIONS.get(host, || match host {
         Host::Local => {
             let endpoint = Endpoint::from_env()?;
@@ -141,7 +151,7 @@ pub fn shared(host: &Host) -> Result<Arc<Connection>> {
             Connection::start(endpoint, client_token(), connected)
         }
         Host::Remote(target) => {
-            let dial = relay::dial(host.name(), target);
+            let dial = relay::dial_with(host.name(), target, helper.clone());
             let eager = EAGER.lock().contains(host);
             let report = WATCHER.get().map(|_| {
                 let host = host.clone();
@@ -374,13 +384,18 @@ fn forget(map: &Mutex<HashMap<Host, Slot>>, host: &Host, ended: usize) {
     }
 }
 
-/// The sessions of a core that is already running, attached or not, for a
-/// launch to attach: none when no core is listening (it never starts one).
-/// It blocks, for about `limit` at most past the `HELLO`; it runs once,
-/// before any window opens.
+/// The sessions of this process's environment's core, if it is already
+/// running ([`running_sessions_at`]): none when no core is listening (it
+/// never starts one). It runs once, before any window opens.
 pub fn running_sessions(limit: Duration) -> Result<Vec<client::SessionInfo>> {
-    let endpoint = Endpoint::from_env()?;
-    let Some(stream) = try_connect_within(&endpoint, limit)? else {
+    running_sessions_at(&Endpoint::from_env()?, limit)
+}
+
+/// The sessions of `endpoint`'s core that is already running, attached or
+/// not, for a launch to attach: none when no core is listening (it never
+/// starts one). It blocks, for about `limit` at most past the `HELLO`.
+pub fn running_sessions_at(endpoint: &Endpoint, limit: Duration) -> Result<Vec<client::SessionInfo>> {
+    let Some(stream) = try_connect_within(endpoint, limit)? else {
         return Ok(Vec::new());
     };
     // A token of its own: this connection owns nothing and gets no replays.
@@ -417,6 +432,10 @@ pub struct Endpoint {
     /// tests' stand-in cores never become units.
     #[cfg(not(windows))]
     pub(crate) scope: bool,
+    /// The variables set on every role this endpoint starts, beside this
+    /// process's environment, which the role inherits. Empty for the
+    /// environment's own server, whose roles find everything there.
+    role_env: Vec<(&'static str, OsString)>,
 }
 
 impl Endpoint {
@@ -448,17 +467,25 @@ impl Endpoint {
             copies,
             #[cfg(not(windows))]
             scope: true,
+            role_env: Vec::new(),
         })
     }
 
     /// The server in `dir`, as if `BRINDLE_SERVER_DIR` had named it. A core
-    /// it starts never runs in a scope, whatever the environment says.
+    /// it starts never runs in a scope, whatever the environment says, and
+    /// is told so: it gets `BRINDLE_SERVER_DIR=<dir>` and
+    /// `BRINDLE_NO_SCOPE=1`, so it serves `dir` and starts its holders
+    /// without scopes too.
     #[cfg(test)]
     pub fn at(helper: PathBuf, dir: PathBuf) -> Self {
         Self {
             helper,
             #[cfg(windows)]
             copies: server_dir::helper_copies(Some(&dir), std::path::Path::new("")),
+            role_env: vec![
+                ("BRINDLE_SERVER_DIR", dir.clone().into_os_string()),
+                ("BRINDLE_NO_SCOPE", "1".into()),
+            ],
             dir,
             #[cfg(not(windows))]
             scope: false,
@@ -802,6 +829,24 @@ mod tests {
         assert!(error.starts_with("terminal server didn't start"), "{error}");
     }
 
+    // As above. A core started for a given endpoint serves that endpoint's
+    // directory and starts its holders without scopes, whatever this
+    // process's environment says.
+    #[cfg(unix)]
+    #[test]
+    fn a_given_endpoint_tells_the_core_its_directory_and_no_scope() {
+        let temp = TempDir::new("role-env");
+        let said = temp.0.join("said");
+        let helper = temp.script(&format!(
+            r#"printf '%s %s' "$BRINDLE_SERVER_DIR" "$BRINDLE_NO_SCOPE" > '{}'; exit 1"#,
+            said.display()
+        ));
+        let dir = temp.0.join("server");
+        let endpoint = Endpoint::at(helper, dir.clone());
+        assert!(connect(&endpoint, "t").is_err());
+        assert_eq!(std::fs::read_to_string(&said).unwrap(), format!("{} 1", dir.display()));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_helper_that_is_not_there_shows_why() {
@@ -814,23 +859,19 @@ mod tests {
 
     /// Starts a real core in a private server directory from the helper
     /// `BRINDLE_TEST_SERVER_HELPER` names (a built `brindle-remote`), talks
-    /// to it, and stops it. Ignored: it needs that helper, and it sets this
-    /// process's environment, so it runs alone:
-    /// `cargo test -p brindle a_real_core -- --ignored`.
+    /// to it, and stops it. The endpoint tells the core its directory and to
+    /// use no scopes, so the test leaves this process's environment alone
+    /// and runs beside the others. Ignored only because it needs that
+    /// helper: `cargo test -p brindle a_real_core -- --ignored`.
     #[test]
     #[ignore = "needs BRINDLE_TEST_SERVER_HELPER, a built brindle-remote"]
     fn a_real_core_starts_from_a_copy_and_answers() {
         let helper = PathBuf::from(std::env::var_os("BRINDLE_TEST_SERVER_HELPER").expect("the helper"));
         let temp = TempDir::new("real");
-        let dir = temp.server();
-        // SAFETY: no other test runs beside this one (see above).
-        unsafe {
-            std::env::set_var("BRINDLE_SERVER_HELPER", &helper);
-            std::env::set_var("BRINDLE_SERVER_DIR", &dir);
-            std::env::set_var("BRINDLE_NO_SCOPE", "1");
-        }
-        let endpoint = Endpoint::from_env().unwrap();
-        assert_eq!(endpoint.dir, dir);
+        // Left for the core to make: a Linux core refuses a directory that
+        // isn't private. On Windows the per-build copy makes it first.
+        let dir = temp.0.join("server");
+        let endpoint = Endpoint::at(helper.clone(), dir.clone());
         assert!(try_connect(&endpoint).unwrap().is_none(), "no core yet");
 
         let connected = connect(&endpoint, "real-1").unwrap();
@@ -850,7 +891,7 @@ mod tests {
         // A second client finds the running core and starts none.
         let second = connect(&endpoint, "real-2").unwrap();
         assert_eq!(second.welcome.pid, core);
-        assert!(running_sessions(Duration::from_secs(5)).unwrap().is_empty());
+        assert!(running_sessions_at(&endpoint, Duration::from_secs(5)).unwrap().is_empty());
 
         // A newer build of the helper (other bytes, a later file) replaces
         // the core, which then runs from that build's copy. Only Windows
@@ -863,9 +904,7 @@ mod tests {
             let mut bytes = std::fs::read(&helper).unwrap();
             bytes.extend_from_slice(b"another build");
             std::fs::write(&newer, bytes).unwrap();
-            // SAFETY: as above.
-            unsafe { std::env::set_var("BRINDLE_SERVER_HELPER", &newer) };
-            let endpoint = Endpoint::from_env().unwrap();
+            let endpoint = Endpoint::at(newer.clone(), dir.clone());
             let connected = upgrade::offer(&endpoint, "real-1", connected).unwrap();
             let core = connected.welcome.pid;
             let image = sys::image_of(core).unwrap();

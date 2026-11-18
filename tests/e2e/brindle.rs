@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::capture::{self, Image};
+use crate::common::server::{Isolation, isolate};
 use crate::common::trim_screen;
 use crate::{Ctx, Result, ensure};
 
@@ -463,9 +464,14 @@ impl<'a> Run<'a> {
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
         let mut command = Command::new(self.bin.as_ref().unwrap_or(&ctx.bin));
-        // Every run has its own state directory: every launch records the
-        // session now, and must never touch the real one.
-        command.env("BRINDLE_STATE_DIR", state_dir(ctx));
+        // Every run has its own config, state and server directories (every
+        // launch records the session, and must never touch the real one);
+        // the case's own removals and additions come after.
+        let state = state_dir(ctx);
+        isolate(
+            &mut command,
+            &Isolation { config: &config_path, state_dir: &state, server_dir: &ctx.server_dir, display: &ctx.display },
+        );
         if !self.restore {
             // `-p` alone restores too; these runs start clean.
             command.args(["-p", self.profile, "--no-restore"]);
@@ -483,11 +489,6 @@ impl<'a> Run<'a> {
             .args(["--dump-screen-after", &ctx.secs(self.dump_at).to_string()])
             .args(if self.command.is_empty() { &[][..] } else { &["-e"][..] })
             .args(&self.command)
-            .env("BRINDLE_CONFIG", &config_path)
-            .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
-            .env("BRINDLE_NO_SCOPE", "1")
-            .env("DISPLAY", &ctx.display)
-            .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdout(Stdio::piped())
             .stderr(log)

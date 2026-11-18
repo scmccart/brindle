@@ -33,10 +33,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -108,13 +108,12 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     ])?;
 
     let mut config = format!(
-        "{}\n[[profiles]]\n\
+        "\n[[profiles]]\n\
          name = {profile:?}\n\
          command = \"/bin/bash\"\n\
          args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
          env = {{ SHELL = \"/bin/bash\", PS1 = \"REMOTE_CONTAINER_READY> \", BRINDLE_E2E_MARKER = \"container-exec\" }}\n\
          remote = {{ type = \"container\", engine = \"docker\", container = {container_name:?}, user = \"remote\" }}\n",
-        brindle::config_with("e2e", CONTAINER_PROFILE, ""),
         profile = CONTAINER_PROFILE,
         container_name = container.name,
     );
@@ -133,31 +132,23 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
         "printf 'REMOTE_%s' CONTAINER_STATUS_READY; echo; sleep 30\\r"
     )
     .to_string();
-    let steps = vec![
-        "--wait-for".into(),
-        "REMOTE_CONTAINER_READY>".into(),
-        "--send".into(),
-        set_cwd,
-        "--wait-for".into(),
-        "REMOTE_CWD_SET".into(),
-        "--action".into(),
-        "split_zone_right".into(),
-        "--wait-for".into(),
-        "REMOTE_CONTAINER_READY>".into(),
-        "--send".into(),
-        exercise,
-        "--wait-for".into(),
-        "REMOTE_CONTAINER_STATUS_READY".into(),
-    ];
-    let dump = run_brindle(
-        ctx,
-        "container-pty",
-        &config,
-        CONTAINER_PROFILE,
-        &steps,
-        &agent,
-        16.0,
-    )?;
+    let label = "container-pty";
+    let dump = Run::new(ctx, label)
+        .profile(CONTAINER_PROFILE)
+        .default_profile(CONTAINER_PROFILE)
+        .config(&config)
+        .env("BRINDLE_REMOTE_AGENT", &agent.to_string_lossy())
+        .env("BRINDLE_NOTIFY_LOG", &notify_log(ctx, label))
+        .wait_for("REMOTE_CONTAINER_READY>")
+        .send(&set_cwd)
+        .wait_for("REMOTE_CWD_SET")
+        .action("split_zone_right")
+        .wait_for("REMOTE_CONTAINER_READY>")
+        .send(&exercise)
+        .wait_for("REMOTE_CONTAINER_STATUS_READY")
+        .dump_at(16.0)
+        .run()?
+        .dump;
     ensure!(
         dump.zones.as_deref() == Some("count=2 active=2"),
         "remote split zones: {:?}",
@@ -223,28 +214,19 @@ pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {
     let cache_dir = "/root/.cache/brindle";
     ssh.container.assert_absent(cache_dir)?;
 
-    let config = format!(
-        "{}{}",
-        brindle::config_with("e2e", SSH_PROFILE, ""),
-        ssh.profile(SSH_PROFILE, "ssh-upload", false),
-    );
-    let steps = vec![
-        "--wait-for".into(),
-        SSH_PROMPT.into(),
-        "--send".into(),
-        "printf 'SSH_REMOTE_IO:%s' \"$BRINDLE_E2E_MARKER\"; echo\\r".into(),
-        "--wait-for".into(),
-        "SSH_REMOTE_IO:ssh-upload".into(),
-    ];
-    let dump = run_brindle(
-        ctx,
-        "ssh-pty",
-        &config,
-        SSH_PROFILE,
-        &steps,
-        &needs.agent,
-        12.0,
-    )?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-upload", false);
+    let label = "ssh-pty";
+    let dump = needs
+        .run(ctx, label, &config)
+        .profile(SSH_PROFILE)
+        .default_profile(SSH_PROFILE)
+        .env("BRINDLE_NOTIFY_LOG", &notify_log(ctx, label))
+        .wait_for(SSH_PROMPT)
+        .send("printf 'SSH_REMOTE_IO:%s' \"$BRINDLE_E2E_MARKER\"; echo\\r")
+        .wait_for("SSH_REMOTE_IO:ssh-upload")
+        .dump_at(12.0)
+        .run()?
+        .dump;
     ensure!(
         dump.screen
             .iter()
@@ -1938,91 +1920,10 @@ fn ssh_command(identity: &Path, port: u16) -> Command {
     command
 }
 
-fn run_brindle(
-    ctx: &Ctx,
-    label: &str,
-    config: &str,
-    profile: &str,
-    steps: &[String],
-    agent: &Path,
-    dump_after: f64,
-) -> Result<Dump> {
-    let config_path = ctx.dir.join(format!("{label}.toml"));
-    fs::write(&config_path, config)
-        .map_err(|error| format!("writing {}: {error}", config_path.display()))?;
-    let log_path = ctx.dir.join(format!("{label}.log"));
-    let log = fs::File::create(&log_path)
-        .map_err(|error| format!("creating {}: {error}", log_path.display()))?;
-    let dump_after = ctx.secs(dump_after);
-    let mut command = Command::new(&ctx.bin);
-    let child = command
-        .args(["-p", profile])
-        .args(steps)
-        .args(ctx.step_interval())
-        .args(["--dump-screen-after", &dump_after.to_string()])
-        .env("BRINDLE_CONFIG", &config_path)
-        .env("BRINDLE_STATE_DIR", crate::brindle::state_dir(ctx))
-        .env("BRINDLE_REMOTE_AGENT", agent)
-        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
-        .env(
-            "BRINDLE_NOTIFY_LOG",
-            ctx.dir.join(format!("{label}.notify")),
-        )
-        .env("DISPLAY", &ctx.display)
-        .env_remove("WAYLAND_DISPLAY")
-        .stdout(Stdio::piped())
-        .stderr(log)
-        .spawn()
-        .map_err(|error| format!("starting {}: {error}", ctx.bin.display()))?;
-    let mut child = ChildGuard { child };
-    let deadline = Instant::now() + Duration::from_secs_f64(dump_after + 30.0);
-    let status = loop {
-        if let Some(status) = child
-            .child
-            .try_wait()
-            .map_err(|error| format!("waiting for Brindle: {error}"))?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("Brindle did not exit; see {}", log_path.display()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let mut stdout = String::new();
-    child
-        .child
-        .stdout
-        .take()
-        .ok_or_else(|| "Brindle stdout was not piped".to_string())?
-        .read_to_string(&mut stdout)
-        .map_err(|error| format!("reading Brindle screen dump: {error}"))?;
-    ctx.save(&format!("{label}.dump"), &stdout);
-    ensure!(
-        status.success(),
-        "Brindle exited with {status}; see {}",
-        log_path.display()
-    );
-    let dump = Dump::parse(&stdout);
-    ensure!(
-        dump.size.is_some(),
-        "no screen in {label}.dump; see {}",
-        log_path.display()
-    );
-    Ok(dump)
-}
-
-struct ChildGuard {
-    child: Child,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            self.child.kill().ok();
-            self.child.wait().ok();
-        }
-    }
+/// Where a run labelled `label` logs its notifications
+/// (`BRINDLE_NOTIFY_LOG`): `<label>.notify` in the case's directory.
+fn notify_log(ctx: &Ctx, label: &str) -> String {
+    ctx.dir.join(format!("{label}.notify")).to_string_lossy().into_owned()
 }
 
 fn output_message(output: &Output) -> String {

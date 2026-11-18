@@ -31,7 +31,8 @@ pub fn connect(dir: &Path, _busy: Duration) -> io::Result<Stream> {
     UnixStream::connect(dir.join(server_dir::CORE_SOCKET))
 }
 
-/// Runs `<helper> serve --ready-fd 3` and waits up to `limit` for it to be
+/// Runs `<helper> serve --ready-fd 3`, with the endpoint's role variables
+/// over this process's environment, and waits up to `limit` for it to be
 /// ready: for its ready pipe to end, having held the ready byte and nothing
 /// else ([`ready`]). The core detaches itself (double fork, `setsid`), so it
 /// is never Brindle's child and outlives it.
@@ -54,6 +55,7 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
     let args = ["serve".into(), "--ready-fd".into(), "3".into()];
     let mut command = scope::command(&decision, "serve", endpoint.helper.as_os_str(), &args);
     command
+        .envs(endpoint.role_env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

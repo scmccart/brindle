@@ -121,42 +121,17 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Runs a plain restore launch whose steps close its only window, so it
-/// quits without ever dumping, and waits for it to exit.
-fn run_until_window_closes(ctx: &Ctx, label: &str, steps: &[&str]) -> Result {
-    let config = ctx.dir.join("config.toml");
-    std::fs::write(&config, crate::brindle::config("e2e")).map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
-    let mut child = std::process::Command::new(&ctx.bin)
-        .args(steps)
-        .args(ctx.step_interval())
-        // Only reached if the window doesn't close.
-        .args(["--dump-screen-after", &ctx.secs(20.0).to_string()])
-        .env("BRINDLE_CONFIG", &config)
-        .env("BRINDLE_STATE_DIR", state_dir(ctx))
-        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
-        .env("DISPLAY", &ctx.display)
-        .env_remove("WAYLAND_DISPLAY")
-        .stdout(std::process::Stdio::null())
-        .stderr(log)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(ctx.secs(12.0));
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-        if std::time::Instant::now() > deadline {
-            child.kill().ok();
-            return Err(format!("{label}: Brindle didn't quit when its window closed"));
-        }
-        ctx.sleep(0.1);
-    }
-    Ok(())
+/// A plain restore launch whose steps close its only window, so it quits
+/// without ever dumping: the dump is due only if the window doesn't close.
+fn until_window_closes<'a>(ctx: &'a Ctx, label: &'static str) -> Run<'a> {
+    Run::new(ctx, label).restore().dump_at(20.0).expect_exit()
 }
 
 /// The only tab exiting closes the window and quits: nothing is left to
 /// restore, and the next launch is a normal one without complaints.
 pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
     write_state(ctx, &state(0, &[local("Shell", &ctx.dir)]))?;
-    run_until_window_closes(ctx, "exit", &["--send", "exit\\r"])?;
+    until_window_closes(ctx, "exit").send("exit\r").run()?;
     let text = state_text(ctx)?;
     ctx.save("after-exit.toml", &text);
     ensure!(!text.contains("[[windows"), "a window is still recorded:\n{text}");
@@ -173,8 +148,9 @@ pub fn forget_on_exit(ctx: &Ctx) -> Result<Outcome> {
 pub fn close_window(ctx: &Ctx) -> Result<Outcome> {
     let kept = dir(ctx, "kept")?;
     // cd at ~1.5 s, recorded by the 2 s poll, window closed at ~2.5 s.
-    let cd = format!("cd '{}'\\r", kept.display());
-    run_until_window_closes(ctx, "close", &["--send", &cd, "--action", "close_window"])?;
+    let cd = format!("cd '{}'\r", kept.display());
+    // The next run, `reopen`, attaches the session this quit left detached.
+    until_window_closes(ctx, "close").keep_detached().send(&cd).action("close_window").run()?;
     let text = state_text(ctx)?;
     ctx.save("after-close.toml", &text);
     ensure!(text.matches("kind = \"local\"").count() == 1, "recorded tabs:\n{text}");

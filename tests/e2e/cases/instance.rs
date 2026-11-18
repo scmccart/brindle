@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::brindle::{Run, state_dir};
+use crate::common::server::{Isolation, isolate};
 use crate::{Ctx, Outcome, Result, ensure};
 
 /// A later launch from `cwd`, sharing the case's state directory.
@@ -16,6 +17,9 @@ struct Launcher {
     state: PathBuf,
     config: PathBuf,
     server_dir: PathBuf,
+    /// The case's display, so a launch that fails to hand itself over opens
+    /// there, never on the user's desktop.
+    display: String,
     log: PathBuf,
     limit: f64,
 }
@@ -27,21 +31,30 @@ impl Launcher {
             state: state_dir(ctx),
             config: ctx.dir.join("config.toml"),
             server_dir: ctx.server_dir.clone(),
+            display: ctx.display.clone(),
             log: ctx.dir.join("launches.log"),
             limit: ctx.secs(8.0),
         }
     }
 
     /// Runs `brindle ARGS` in `cwd` and waits for it to exit, which it must
-    /// do with status 0 within the limit.
+    /// do with status 0 within the limit. It passes no debug option, so it
+    /// hands itself to the running Brindle.
     fn launch(&self, cwd: &std::path::Path, args: &[&str]) -> Result {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(&self.log).map_err(|e| e.to_string())?;
-        let mut child = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        isolate(
+            &mut command,
+            &Isolation {
+                config: &self.config,
+                state_dir: &self.state,
+                server_dir: &self.server_dir,
+                display: &self.display,
+            },
+        );
+        let mut child = command
             .args(args)
             .current_dir(cwd)
-            .env("BRINDLE_STATE_DIR", &self.state)
-            .env("BRINDLE_CONFIG", &self.config)
-            .env("BRINDLE_SERVER_DIR", &self.server_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(log)

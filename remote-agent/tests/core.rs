@@ -1734,6 +1734,12 @@ fn unit_of(pid: u32) -> String {
 #[cfg(unix)]
 #[test]
 fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
+    // Opt-in: it starts scopes in this user's own systemd manager, which a
+    // developer's run shouldn't do unasked. CI's disposable runner sets it.
+    if std::env::var("BRINDLE_SCOPE_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set BRINDLE_SCOPE_TEST=1 to start scopes in this user's systemd manager");
+        return;
+    }
     // `start_core` sets BRINDLE_NO_SCOPE=1 for the starter; "0" overrides it
     // for the roles the core and holder start.
     if let brindle_remote_protocol::scope::Decision::Plain(reason) =

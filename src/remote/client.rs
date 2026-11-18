@@ -23,7 +23,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -84,6 +84,15 @@ fn agent_path() -> Result<PathBuf> {
     )
 }
 
+/// Where the Linux helper a relay's launch deploys is, asked at each launch
+/// ([`launch`]), so a rebuilt or newly named helper is the next launch's.
+pub(crate) type HelperLookup = Arc<dyn Fn() -> Result<PathBuf> + Send + Sync>;
+
+/// The helper `BRINDLE_REMOTE_AGENT` names, else the one beside Brindle.
+pub(crate) fn default_helper() -> HelperLookup {
+    Arc::new(agent_path)
+}
+
 /// What a relay's launch exits with when the endpoint has no helper of this
 /// build that it may run (design decision 8). A helper never exits with it,
 /// so before the relay's frame marker it always means: deploy, then launch
@@ -104,10 +113,9 @@ struct Helper {
 }
 
 impl Helper {
-    /// The helper beside Brindle (or `BRINDLE_REMOTE_AGENT`), hashed as it
-    /// is now: a rebuilt helper is another build.
-    fn find() -> Result<Self> {
-        let local = agent_path()?;
+    /// The helper at `local`, hashed as it is now: a rebuilt helper is
+    /// another build.
+    fn of(local: PathBuf) -> Result<Self> {
         let digest = file_sha256(&local)?;
         Ok(Self { local, version: env!("CARGO_PKG_VERSION"), digest })
     }
@@ -352,14 +360,16 @@ fn launch_command(target: &RemoteTarget, helper: &Helper) -> Result<Command> {
 
 /// Starts the relay at `target`, where `start` runs a launch command up to
 /// the relay's frame marker (`local::relay::start`). The warm path is that
-/// one command. When it exits [`NOT_CACHED`], the helper is deployed and the
-/// launch run once more. Any other failure is the endpoint's or the
-/// transport's own (ssh's 255 among them), which deploying wouldn't mend.
+/// one command. When it exits [`NOT_CACHED`], the helper `helper` finds now
+/// is deployed and the launch run once more. Any other failure is the
+/// endpoint's or the transport's own (ssh's 255 among them), which deploying
+/// wouldn't mend.
 pub(crate) fn launch<L>(
     target: &RemoteTarget,
+    helper: &HelperLookup,
     start: impl Fn(Command) -> std::result::Result<L, Unstarted>,
 ) -> Result<L> {
-    let helper = Helper::find()?;
+    let helper = Helper::of(helper()?)?;
     // Nothing cancels a relay's launch: its commands end by their limits.
     let never = AtomicBool::new(false);
     launch_with(&Commands { cancel: &never }, target, &helper, start)
@@ -762,6 +772,32 @@ mod tests {
         let devbox = Scripted::new([Err(exited(255, "boom"))], []);
         let error = devbox.launch(&container_of("docker", None)).unwrap_err();
         assert!(error.downcast_ref::<Unstarted>().is_some(), "{error}");
+    }
+
+    /// The relay's launch hashes the helper its lookup names, so an endpoint
+    /// caches that file, and the lookup is asked at the launch.
+    #[test]
+    fn a_relay_launch_deploys_the_helper_its_lookup_names() {
+        let dir = std::env::temp_dir().join(format!("brindle-lookup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("brindle-remote");
+        std::fs::write(&file, "a helper of known bytes\n").unwrap();
+        let named = file.clone();
+        let lookup: HelperLookup = Arc::new(move || Ok(named.clone()));
+        let launched = RefCell::new(Vec::new());
+        let error = launch(&container_of("docker", None), &lookup, |command| {
+            launched.borrow_mut().push(line(&command));
+            Err::<(), _>(exited(1, "no such container"))
+        })
+        .unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(error.downcast_ref::<Unstarted>().is_some(), "{error}");
+        let digest = "0f39ba63db5203814a6b8f623897a84840ada2bbdbab67462d4c9685cfc0913b";
+        let cache = format!("/tmp/brindle-helper-{}-{digest}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            launched.take(),
+            [strings(&["docker", "exec", "-i", "devbox", "sh", "-c", CONTAINER_LAUNCH, "sh", &cache])]
+        );
     }
 
     /// A failure's first line names its cause, which is the last line of
@@ -1220,7 +1256,7 @@ mod tests {
         use super::*;
         use crate::config::Profile;
         use crate::remote::Host;
-        use crate::remote::local::{Link, Session, SessionSink, SpawnRequest, dial_relay, start_relay};
+        use crate::remote::local::{self, Link, Session, SessionSink, SpawnRequest, dial_with, start_relay};
         use crate::remote::protocol::Frame;
         use crate::remote::protocol::client::Policy;
         use crate::remote::protocol::relay::{RelayHost, RelayMessage};
@@ -1228,31 +1264,37 @@ mod tests {
 
         type Scenario = std::result::Result<(), String>;
 
-        /// The Docker tests change `BRINDLE_REMOTE_AGENT`, so they take turns.
+        /// The Docker tests take turns: `ssh_transport_scenarios` and
+        /// `relay_launch_scenarios` both build and run the SSH fixture's
+        /// image ([`FIXTURE_TAG`]).
         static DOCKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-        /// With the opt-in set: this test's turn, with `BRINDLE_REMOTE_AGENT`
-        /// naming the static helper, whose path it returns.
-        fn opted_in() -> Option<(std::sync::MutexGuard<'static, ()>, PathBuf)> {
+        /// The static helper the tests deploy, built with the docker command
+        /// in README.md. They pass it to the relay's dial, never through the
+        /// environment.
+        fn static_helper() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/x86_64-unknown-linux-musl/release/brindle-remote")
+        }
+
+        /// A lookup that always names `path`.
+        fn lookup_of(path: PathBuf) -> HelperLookup {
+            Arc::new(move || Ok(path.clone()))
+        }
+
+        /// With the opt-in set: this test's turn, once the static helper is
+        /// known to be there.
+        fn opted_in() -> Option<std::sync::MutexGuard<'static, ()>> {
             if std::env::var_os("BRINDLE_REMOTE_DOCKER_TEST").is_none_or(|v| v != "1") {
                 return None;
             }
             let turn = DOCKER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/x86_64-unknown-linux-musl/release/brindle-remote");
+            let helper = static_helper();
             assert!(
                 helper.is_file(),
                 "{} not found; build it with the docker command in README.md",
                 helper.display()
             );
-            // SAFETY: only with `BRINDLE_REMOTE_DOCKER_TEST=1`, a run filtered
-            // to `remote::client`, and under `DOCKER_TEST_LOCK`, which every
-            // Docker test here holds while it uses `BRINDLE_REMOTE_AGENT`.
-            // Another test in the same process that reads it
-            // (`find_server_helper`) would see the helper, so the opt-in run
-            // stays filtered.
-            unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
-            Some((turn, helper))
+            Some(turn)
         }
 
         /// A directory for the test's files, under target/ rather than the
@@ -1504,17 +1546,23 @@ mod tests {
         }
 
         /// Connects as the relay transport does: the production dial, with
-        /// the deployment it needs. The error is what a new tab would show.
+        /// the deployment it needs, of the static helper. The error is what
+        /// a new tab would show.
         fn connect(target: &RemoteTarget) -> std::result::Result<RelayHost, String> {
-            let link = dial_relay("test".into(), target).launch().map_err(|e| format!("{e:#}"))?;
+            connect_with(target, static_helper())
+        }
+
+        /// [`connect`], deploying the helper at `path`.
+        fn connect_with(target: &RemoteTarget, path: PathBuf) -> std::result::Result<RelayHost, String> {
+            let link = dial_with("test".into(), target, lookup_of(path)).launch().map_err(|e| format!("{e:#}"))?;
             host_of(link)
         }
 
-        /// Checks that the container keeps the helper `BRINDLE_REMOTE_AGENT`
-        /// names, in root's own directory, and nothing else of Brindle's: no
-        /// other build, no copy left under a temporary name.
-        fn scenario_one_helper_kept(c: &Container) -> Scenario {
-            let directory = Helper::find().map_err(|e| format!("{e:#}"))?.container_dir();
+        /// Checks that the container keeps the helper at `helper` (the one
+        /// deployed last), in root's own directory, and nothing else of
+        /// Brindle's: no other build, no copy left under a temporary name.
+        fn scenario_one_helper_kept(c: &Container, helper: PathBuf) -> Scenario {
+            let directory = Helper::of(helper).map_err(|e| format!("{e:#}"))?.container_dir();
             let expected = format!("{directory} 0 755\n{directory}/brindle-remote 0 755\n");
             let kept = c.exec_sh("stat -c '%n %u %a' /tmp/brindle-* /tmp/brindle-*/* 2>&1");
             if kept == expected {
@@ -1524,14 +1572,17 @@ mod tests {
             }
         }
 
+        /// The file [`scenario_bad_helper`] deploys, in `dir`.
+        fn bad_helper(dir: &Path) -> PathBuf {
+            dir.join("not-a-helper")
+        }
+
         /// A helper that isn't one is deployed as any other build is, and the
         /// relay it can't run is an error that shows what the endpoint said.
         fn scenario_bad_helper(c: &Container, dir: &Path) -> Scenario {
-            let bad = dir.join("not-a-helper");
+            let bad = bad_helper(dir);
             std::fs::write(&bad, b"this is not an executable\n").map_err(|e| e.to_string())?;
-            // SAFETY: as in `opted_in`, whose turn this scenario runs in.
-            unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &bad) };
-            match connect(&container_target(c, None)) {
+            match connect_with(&container_target(c, None), bad) {
                 Ok(host) => Err(format!("connected: {host:?}")),
                 Err(error) if error.contains("/brindle-remote: ") => Ok(()),
                 Err(error) => Err(error),
@@ -1609,7 +1660,9 @@ mod tests {
                 let size = GridSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
                 let request = SpawnRequest::remote(profile, command, cwd.map(PathBuf::from), size, 1000, Policy::Kill);
                 let (tx, seen) = mpsc::channel();
-                let session = Session::start(Host::of(profile), request, Box::new(Sink(tx)));
+                let (host, lookup) = (Host::of(profile), lookup_of(static_helper()));
+                let session =
+                    Session::start_with(move || local::shared_with(&host, &lookup), request, Box::new(Sink(tx)));
                 Self { session, seen, output: String::new(), received: 0 }
             }
 
@@ -1766,7 +1819,7 @@ mod tests {
 
         #[test]
         fn docker_transport_scenarios() {
-            let Some((_turn, helper)) = opted_in() else { return };
+            let Some(_turn) = opted_in() else { return };
             let started = Instant::now();
             let scratch = scratch("client");
             let ubuntu = Container::start("ubuntu:24.04", "main").unwrap();
@@ -1790,17 +1843,21 @@ mod tests {
                 ),
                 Err(e) => failures.record("default shell, missing cwd", Err(e)),
             }
-            failures.record("d the one helper is kept, root's own", scenario_one_helper_kept(&ubuntu));
+            failures.record("d the one helper is kept, root's own", scenario_one_helper_kept(&ubuntu, static_helper()));
             failures.record("g bad helper", scenario_bad_helper(&ubuntu, &scratch));
             // Deploying another build removed the first one's directory.
-            failures.record("g the other build is all that is kept", scenario_one_helper_kept(&ubuntu));
-            // SAFETY: as in `opted_in`, whose turn this test holds.
-            unsafe { std::env::set_var("BRINDLE_REMOTE_AGENT", &helper) };
+            failures.record(
+                "g the other build is all that is kept",
+                scenario_one_helper_kept(&ubuntu, bad_helper(&scratch)),
+            );
             match Container::start("alpine", "alpine") {
                 Ok(alpine) => {
                     // busybox's sh, stat, mkdir and mv run the scripts here.
                     failures.record("h alpine run", scenario_clean_exit(&container_profile(&alpine.0), 1));
-                    failures.record("h alpine keeps the helper, root's own", scenario_one_helper_kept(&alpine));
+                    failures.record(
+                        "h alpine keeps the helper, root's own",
+                        scenario_one_helper_kept(&alpine, static_helper()),
+                    );
                 }
                 Err(e) => eprintln!("scenario h skipped: {e}"),
             }
@@ -1841,7 +1898,7 @@ mod tests {
 
         #[test]
         fn ssh_transport_scenarios() {
-            let Some((_turn, _helper)) = opted_in() else { return };
+            let Some(_turn) = opted_in() else { return };
             let scratch = scratch("ssh");
             let fx = SshFixture::start(&scratch, "ssh").expect("ssh fixture");
             let profile = profile_for(&fx.target);
@@ -1874,13 +1931,13 @@ mod tests {
         /// and for every user; later ones, root's or another user's, run that
         /// same copy.
         fn scenario_container_helper_is_reused(c: &Container) -> Scenario {
-            let directory = Helper::find().map_err(|e| format!("{e:#}"))?.container_dir();
+            let directory = Helper::of(static_helper()).map_err(|e| format!("{e:#}"))?.container_dir();
             let path = format!("{directory}/brindle-remote");
             if !c.exec_sh("ls -d /tmp/brindle-* 2>/dev/null").is_empty() {
                 return Err("a helper was there before the first connection".into());
             }
             let first = connect(&container_target(c, None))?;
-            scenario_one_helper_kept(c)?;
+            scenario_one_helper_kept(c, static_helper())?;
             let copied = helper_file(c, &path);
             // Later than any second copy's time could equal.
             thread::sleep(Duration::from_millis(1200));
@@ -1890,7 +1947,7 @@ mod tests {
             if copied != after {
                 return Err(format!("the helper was copied again: {copied:?} then {after:?}"));
             }
-            scenario_one_helper_kept(c)?;
+            scenario_one_helper_kept(c, static_helper())?;
             if first.home != "/root" || second.home != "/root" || other.home != "/home/remote" {
                 return Err(format!("homes: {:?} {:?} {:?}", first.home, second.home, other.home));
             }
@@ -1900,7 +1957,7 @@ mod tests {
         /// A directory another user of the container made where the helper
         /// would go is refused by name, and nothing in it runs or changes.
         fn scenario_taken_directory_is_refused(c: &Container) -> Scenario {
-            let directory = Helper::find().map_err(|e| format!("{e:#}"))?.container_dir();
+            let directory = Helper::of(static_helper()).map_err(|e| format!("{e:#}"))?.container_dir();
             let planted = exec_as(
                 c,
                 "remote",
@@ -1950,7 +2007,7 @@ mod tests {
         fn counted_launch(
             target: &RemoteTarget,
         ) -> std::result::Result<(Vec<Vec<String>>, Vec<Vec<String>>), String> {
-            let helper = Helper::find().map_err(|e| format!("{e:#}"))?;
+            let helper = Helper::of(static_helper()).map_err(|e| format!("{e:#}"))?;
             let never = AtomicBool::new(false);
             let counted = Counted { commands: Commands { cancel: &never }, ran: RefCell::default() };
             let launched = RefCell::new(Vec::new());
@@ -2003,7 +2060,7 @@ mod tests {
 
         #[test]
         fn relay_launch_scenarios() {
-            let Some((_turn, _helper)) = opted_in() else { return };
+            let Some(_turn) = opted_in() else { return };
             let scratch = scratch("relay");
             // The fixture's image has a second user, `remote`.
             let fx = SshFixture::start(&scratch, "relay-ssh").expect("ssh fixture");

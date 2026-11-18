@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::common::server::{Isolation, isolate};
 use crate::report::{LatencyResult, ThroughputResult, parse_dat, parse_latency};
 use crate::{Ctx, Measured, Result, ensure};
 
@@ -28,13 +29,16 @@ fn spawn(ctx: &Ctx, label: &str, args: &[&str]) -> Result<Child> {
     let config_path = ctx.dir.join("config.toml");
     std::fs::write(&config_path, CONFIG).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
-    Command::new(&ctx.bin)
+    let mut command = Command::new(&ctx.bin);
+    // Every launch records the session and runs its tab in a terminal
+    // server: never the user's directories or server.
+    let state = ctx.dir.join("state");
+    isolate(
+        &mut command,
+        &Isolation { config: &config_path, state_dir: &state, server_dir: &ctx.server_dir, display: &ctx.display },
+    );
+    command
         .args(args)
-        .env("BRINDLE_CONFIG", &config_path)
-        // Every launch records the session; never in the real directory.
-        .env("BRINDLE_STATE_DIR", ctx.dir.join("state"))
-        .env("DISPLAY", &ctx.display)
-        .env_remove("WAYLAND_DISPLAY")
         .stdout(Stdio::piped())
         .stderr(log)
         .spawn()

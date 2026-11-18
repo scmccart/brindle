@@ -22,12 +22,15 @@ mod common;
 mod capture;
 mod cases;
 mod query;
-#[cfg(windows)]
-mod winproc;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use common::server::under;
+use common::server::{Suite, check_helper, end_roles, helper, helper_name, private_dir, server_processes};
+#[cfg(windows)]
+use common::winproc;
 pub use common::Result;
 
 pub enum Outcome {
@@ -136,7 +139,8 @@ fn main() {
     // Local tabs run in the terminal server, so every case that runs
     // Brindle needs the helper.
     if cfg!(any(target_os = "linux", windows)) && has_display && selected.iter().any(|case| case.display) {
-        if let Err(why) = check_helper(&helper) {
+        let default = PathBuf::from(env!("CARGO_BIN_EXE_brindle")).with_file_name(helper_name());
+        if let Err(why) = check_helper(&helper, &default) {
             eprintln!("e2e: {why}");
             std::process::exit(1);
         }
@@ -149,7 +153,7 @@ fn main() {
             Ok(Outcome::Skip(format!("no X display at {display}")))
         } else {
             let dir = root.join(case.name);
-            let server_dir = server_dir(&dir, n);
+            let server_dir = private_dir(Suite::E2e, &dir, n);
             // On Windows the server directory is the same one every run, so
             // roles an interrupted run left would be taken for this case's,
             // and their images would keep the directory from being emptied.
@@ -168,7 +172,7 @@ fn main() {
                 slow,
             };
             let outcome = (case.run)(&ctx);
-            match stop_server(&ctx) {
+            match common::server::stop(&ctx.helper, &ctx.server_dir, &ctx.dir) {
                 // A server left running fails a case that passed.
                 Err(why) if !matches!(outcome, Err(_)) => Err(why),
                 Err(why) => {
@@ -200,203 +204,6 @@ fn main() {
         println!("failed: {}", failed.join(" "));
         std::process::exit(1);
     }
-}
-
-/// The variable that names another terminal server helper. On Windows
-/// `BRINDLE_REMOTE_AGENT` is the Linux helper the `remote-*` cases deploy,
-/// and Brindle doesn't read it for the local server.
-const HELPER_VARIABLE: &str = if cfg!(windows) { "BRINDLE_SERVER_HELPER" } else { "BRINDLE_REMOTE_AGENT" };
-
-/// The helper's file name beside a binary.
-fn helper_name() -> String {
-    format!("brindle-remote{}", std::env::consts::EXE_SUFFIX)
-}
-
-/// The helper Brindle runs its terminal server with: [`HELPER_VARIABLE`],
-/// else the `brindle-remote` beside the binary, as Brindle looks for it.
-fn helper(bin: &std::path::Path) -> PathBuf {
-    std::env::var_os(HELPER_VARIABLE).map(PathBuf::from).unwrap_or_else(|| bin.with_file_name(helper_name()))
-}
-
-/// Case number `n`'s terminal server directory, given its directory `dir`.
-fn server_dir(dir: &std::path::Path, n: usize) -> PathBuf {
-    if cfg!(windows) {
-        dir.join("server")
-    } else {
-        std::env::temp_dir().join(format!("brindle-e2e-{}-{n}", std::process::id()))
-    }
-}
-
-/// The helper must be there, and when it is this build's, no older than
-/// its sources (`cargo test --test e2e` doesn't rebuild it).
-fn check_helper(helper: &std::path::Path) -> Result {
-    let built = std::fs::metadata(helper).and_then(|m| m.modified()).map_err(|_| {
-        format!(
-            "the terminal server helper isn't built ({} is missing): run `cargo build`, which builds it, \
-             or set {HELPER_VARIABLE}",
-            helper.display()
-        )
-    })?;
-    let own = PathBuf::from(env!("CARGO_BIN_EXE_brindle")).with_file_name(helper_name());
-    if helper != own {
-        return Ok(());
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let newer = ["remote-agent/src", "remote-protocol/src", "term-core/src"]
-        .iter()
-        .flat_map(|dir| files(&root.join(dir)))
-        .find(|file| std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|time| time > built));
-    match newer {
-        Some(file) => Err(format!(
-            "{} is older than {}: run `cargo build` (the e2e target doesn't rebuild it)",
-            helper.display(),
-            file.display()
-        )),
-        None => Ok(()),
-    }
-}
-
-fn files(dir: &std::path::Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    entries
-        .flatten()
-        .flat_map(|entry| {
-            let path = entry.path();
-            if path.is_dir() { files(&path) } else { vec![path] }
-        })
-        .collect()
-}
-
-/// Stops the case's terminal server, if one started, and removes its
-/// directory, keeping its logs in the case's directory. Fails when a core
-/// or holder of the case's is still running afterwards, killing it.
-fn stop_server(ctx: &Ctx) -> Result {
-    if !ctx.server_dir.exists() {
-        return Ok(());
-    }
-    let stopped = std::process::Command::new(&ctx.helper)
-        .arg("stop")
-        .env("BRINDLE_SERVER_DIR", &ctx.server_dir)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let mut problem = match stopped {
-        Err(error) => Some(format!("can't stop the server with {}: {error}", ctx.helper.display())),
-        Ok(_) => None,
-    };
-    // Holders hang their sessions up first (SIGHUP, then SIGKILL after 1 s).
-    let left = roles_left(&ctx.server_dir, Duration::from_secs(5));
-    if !left.is_empty() {
-        let names: Vec<String> = left.iter().map(|(pid, role)| format!("{role} {pid}")).collect();
-        problem.get_or_insert(format!("left running after `brindle-remote stop`: {}", names.join(", ")));
-        end_roles(&ctx.server_dir);
-    }
-    save_logs(ctx);
-    // Windows keeps a role's image (its copy under the directory's `bin`)
-    // from being deleted for a moment after the role is gone.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while let Err(error) = std::fs::remove_dir_all(&ctx.server_dir) {
-        if !cfg!(windows) {
-            break;
-        }
-        if Instant::now() > deadline {
-            problem.get_or_insert(format!("can't remove {}: {error}", ctx.server_dir.display()));
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    problem.map_or(Ok(()), Err)
-}
-
-/// Copies the core's log to `server-core.log` in the case's directory, and
-/// on Windows each holder's to `server-holder-….log`: a holder's says which
-/// console host its sessions got.
-fn save_logs(ctx: &Ctx) {
-    std::fs::copy(ctx.server_dir.join("core.log"), ctx.dir.join("server-core.log")).ok();
-    if cfg!(windows) {
-        for log in files(&ctx.server_dir) {
-            let name = log.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            if log.parent() == Some(&ctx.server_dir) && name.starts_with("holder-") && name.ends_with(".log") {
-                std::fs::copy(&log, ctx.dir.join(format!("server-{name}"))).ok();
-            }
-        }
-    }
-}
-
-/// The roles still using `dir` once `limit` has passed; none as soon as
-/// they are all gone.
-fn roles_left(dir: &std::path::Path, limit: Duration) -> Vec<(u32, String)> {
-    let deadline = Instant::now() + limit;
-    let mut left = server_processes(dir);
-    while !left.is_empty() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-        left = server_processes(dir);
-    }
-    left
-}
-
-/// Kills the roles using `dir`, and on Windows waits for them to be gone.
-fn end_roles(dir: &std::path::Path) {
-    for (pid, _) in server_processes(dir) {
-        #[cfg(unix)]
-        std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().ok();
-        #[cfg(windows)]
-        winproc::kill(pid);
-    }
-    if cfg!(windows) {
-        roles_left(dir, Duration::from_secs(5));
-    }
-}
-
-/// The `serve` and `hold` processes using `dir` (their environment names
-/// it), with their roles.
-#[cfg(unix)]
-pub fn server_processes(dir: &std::path::Path) -> Vec<(u32, String)> {
-    let wanted = format!("BRINDLE_SERVER_DIR={}", dir.display());
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
-            let role = cmdline.split(|&b| b == 0).nth(1).map(|arg| String::from_utf8_lossy(arg).into_owned())?;
-            if role != "serve" && role != "hold" {
-                return None;
-            }
-            let environ = std::fs::read(entry.path().join("environ")).ok()?;
-            environ.split(|&b| b == 0).any(|var| var == wanted.as_bytes()).then_some((pid, role))
-        })
-        .collect()
-}
-
-/// The `serve` and `hold` processes using `dir`, with their roles: on
-/// Windows a role runs from its build's copy of the helper under the
-/// directory's `bin`. A copy running as anything else (the `launch` that
-/// starts a role, a role whose arguments can't be read) is listed under the
-/// helper's name, so nothing from the directory goes unnoticed.
-#[cfg(windows)]
-pub fn server_processes(dir: &std::path::Path) -> Vec<(u32, String)> {
-    let copies = dir.join("bin");
-    let name = helper_name();
-    winproc::all()
-        .into_iter()
-        .filter(|process| process.name.eq_ignore_ascii_case(&name))
-        .filter(|process| winproc::image(process.pid).is_some_and(|image| under(&image, &copies)))
-        .map(|process| {
-            let line = winproc::command_line(process.pid);
-            let role = line.as_deref().and_then(winproc::first_argument).filter(|role| ["serve", "hold"].contains(role));
-            (process.pid, role.map_or_else(|| name.clone(), str::to_string))
-        })
-        .collect()
-}
-
-/// Whether the Windows path `path` is under `dir`, however each is spelled.
-#[cfg(windows)]
-fn under(path: &std::path::Path, dir: &std::path::Path) -> bool {
-    let spelled = |path: &std::path::Path| {
-        let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
-        text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
-    };
-    spelled(path).strip_prefix(&spelled(dir)).is_some_and(|rest| rest.starts_with('\\'))
 }
 
 fn usage(why: &str) -> ! {
@@ -431,16 +238,6 @@ fn self_test_shard() -> Result {
     Ok(())
 }
 
-#[cfg(windows)]
-fn self_test_under() -> Result {
-    let under = |path: &str, dir: &str| under(std::path::Path::new(path), std::path::Path::new(dir));
-    ensure!(under(r"C:\Case\server\bin\b1\brindle-remote.exe", r"c:\case/server\bin"), "another spelling");
-    ensure!(under(r"\\?\C:\case\server\bin\b1\x.exe", r"C:\case\server\bin"), "a verbatim path");
-    ensure!(!under(r"C:\case\server\binary\x.exe", r"C:\case\server\bin"), "a sibling with the same prefix");
-    ensure!(!under(r"C:\case\server\bin", r"C:\case\server\bin"), "the directory itself");
-    Ok(())
-}
-
 /// The harness's own unit tests (`--self-test`); there is no libtest here.
 fn self_test() -> i32 {
     let tests: &[(&str, fn() -> Result)] = &[
@@ -450,10 +247,11 @@ fn self_test() -> i32 {
         ("cell rectangles", capture::self_test),
         ("pixel scans", capture::self_test_scan),
         ("remote parsing", cases::self_test_remote),
+        ("server helpers", common::server::self_test),
         #[cfg(windows)]
         ("windows processes", winproc::self_test),
         #[cfg(windows)]
-        ("windows paths", self_test_under),
+        ("windows paths", common::server::self_test_under),
     ];
     let mut failed = 0;
     for (name, test) in tests {
