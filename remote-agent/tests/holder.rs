@@ -50,9 +50,18 @@ mod programs {
     /// Prints `one`, then `two:<line>` for the line it reads, then waits
     /// until [`release`] lets it go through `go` (a FIFO, made here) and
     /// exits with 0. Releasing it needs no core.
+    ///
+    /// It opens `go` (read-write, which doesn't wait for a writer) before
+    /// it prints `one`, and keeps it open until it reads: a byte written to
+    /// a FIFO that no one else has open is lost when the writer closes it,
+    /// so a program that opened `go` only when it got to its last `read`
+    /// could miss a [`release`] that came first, and never exit.
     pub fn echoes_a_line(session: SessionId, go: &Path) -> Spawn {
         make_fifo(go);
-        let script = format!("echo one; read x; echo \"two:$x\"; read y <'{}'", go.display());
+        let script = format!(
+            "exec 3<>'{}'; echo one; read x; echo \"two:$x\"; read y <&3",
+            go.display()
+        );
         shell(session, &script)
     }
 
@@ -1235,12 +1244,12 @@ fn a_holder_fault_while_spawning_fails_that_spawn_only() {
 fn a_holder_fault_on_input_reports_an_error_and_both_sessions_keep_running() {
     let (dir, mut core, holder_pid) = faulty_holder("fault-input");
     let gos = [dir.path.join("go1"), dir.path.join("go2")];
-    let pids = [
-        core.spawn(programs::echoes_a_line(1, &gos[0])),
-        core.spawn(programs::echoes_a_line(2, &gos[1])),
-    ];
-    core.output_until(1, b"one\r\n");
-    core.output_until(2, b"one\r\n");
+    // Each session's `one` before the next spawn, which drops output.
+    let mut pids = Vec::new();
+    for (session, go) in [(1, &gos[0]), (2, &gos[1])] {
+        pids.push(core.spawn(programs::echoes_a_line(session, go)));
+        core.output_until(session, b"one\r\n");
+    }
 
     core.input(1, FAULT.as_bytes());
     match core.recv_skipping_output() {

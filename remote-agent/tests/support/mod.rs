@@ -322,7 +322,9 @@ impl TestCore {
         adopted
     }
 
-    /// Sends a `SPAWN` and returns the program's pid.
+    /// Sends a `SPAWN` and returns the program's pid. Output that arrives
+    /// meanwhile is dropped, other sessions' too: a test that waits for an
+    /// earlier session's output does so before the next spawn.
     pub fn spawn(&mut self, spawn: Spawn) -> u32 {
         let session = spawn.session;
         self.send(ToHolder::Spawn(spawn));
