@@ -885,6 +885,29 @@ mod tests {
         assert_eq!(state_dir(&env), Some(PathBuf::from("/home/u/.local/state/brindle")), "then the home's");
     }
 
+    /// Every combination of the three: the override, else `brindle` in the
+    /// platform's directory, else in the home's `.local/state`, else none.
+    #[test]
+    fn the_state_dir_is_the_first_of_the_override_the_platform_and_the_home() {
+        let named = || Some(PathBuf::from("/tmp/s"));
+        let platform = || Some(PathBuf::from("/state"));
+        let home = || Some(PathBuf::from("/home/u"));
+        let cases = [
+            (named(), platform(), home(), Some("/tmp/s")),
+            (named(), platform(), None, Some("/tmp/s")),
+            (named(), None, home(), Some("/tmp/s")),
+            (named(), None, None, Some("/tmp/s")),
+            (None, platform(), home(), Some("/state/brindle")),
+            (None, platform(), None, Some("/state/brindle")),
+            (None, None, home(), Some("/home/u/.local/state/brindle")),
+            (None, None, None, None),
+        ];
+        for (named, platform, home, expected) in cases {
+            let env = StateEnv { named, platform, home };
+            assert_eq!(state_dir(&env), expected.map(PathBuf::from), "{env:?}");
+        }
+    }
+
     #[test]
     fn round_trip() {
         let text = sample().to_text().expect("serializes");

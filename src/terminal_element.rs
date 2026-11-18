@@ -224,9 +224,9 @@ impl Element for TerminalElement {
         let content = term.renderable_content();
         let colors = content.colors;
         let display_offset = content.display_offset as i32;
-        let default_bg = resolve_color(ansi::Color::Named(NamedColor::Background), colors, terminal);
-        let default_fg = resolve_color(ansi::Color::Named(NamedColor::Foreground), colors, terminal);
-        let cursor_color = resolve_color(ansi::Color::Named(NamedColor::Cursor), colors, terminal);
+        let default_bg = resolve_color(ansi::Color::Named(NamedColor::Background), colors, theme);
+        let default_fg = resolve_color(ansi::Color::Named(NamedColor::Foreground), colors, theme);
+        let cursor_color = resolve_color(ansi::Color::Named(NamedColor::Cursor), colors, theme);
         let cursor_text = theme.cursor_text.map(Rgb::from).unwrap_or(default_bg);
         let selection_bg = Rgb::from(theme.selection_background);
         let selection_fg = theme.selection_foreground.map(Rgb::from);
@@ -307,8 +307,8 @@ impl Element for TerminalElement {
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            let mut fg_rgb = resolve_color(fg, colors, terminal);
-            let mut bg_rgb = resolve_color(bg, colors, terminal);
+            let mut fg_rgb = resolve_color(fg, colors, theme);
+            let mut bg_rgb = resolve_color(bg, colors, theme);
             if cell.flags.contains(Flags::DIM) {
                 fg_rgb = mix(fg_rgb, bg_rgb, DIM_FACTOR);
             }
@@ -371,7 +371,7 @@ impl Element for TerminalElement {
 
             let underline_color = cell
                 .underline_color()
-                .map(|c| rgb_hsla(resolve_color(c, colors, terminal)))
+                .map(|c| rgb_hsla(resolve_color(c, colors, theme)))
                 .unwrap_or(fg_hsla);
             let in_link = hovered_link.as_ref().is_some_and(|l| l.contains(indexed.point));
             let underline = if in_link {
@@ -456,7 +456,7 @@ impl Element for TerminalElement {
             if !spans.is_empty() {
                 let width = if f32::from(padding) >= 6.0 { px(3.0) } else { px(2.0) };
                 let x = if padding >= width + px(1.0) { origin.x - width - px(1.0) } else { origin.x };
-                let color = rgb_hsla(resolve_color(ansi::Color::Named(NamedColor::Red), colors, terminal));
+                let color = rgb_hsla(resolve_color(ansi::Color::Named(NamedColor::Red), colors, theme));
                 for (first, last) in spans {
                     let first = (first - top).max(0) as usize;
                     let last = ((last - top) as usize).min(rows.saturating_sub(1));
@@ -924,5 +924,49 @@ pub mod box_drawing {
             assert!(rects('a').is_none());
             assert!(rects('░').is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{px, size};
+
+    use super::{MIN_COLS, fit_grid};
+
+    /// The padding comes off both sides of each axis: 816 - 2 × 8 is 800
+    /// wide, 100 cells of 8, where once would leave 101.
+    #[test]
+    fn fit_grid_takes_the_padding_off_both_sides() {
+        assert_eq!(fit_grid(size(px(816.0), px(416.0)), px(8.0), px(8.0), px(16.0)), (100, 25));
+        assert_eq!(fit_grid(size(px(800.0), px(400.0)), px(0.0), px(8.0), px(16.0)), (100, 25));
+    }
+
+    /// Only whole cells count: a part of a cell or a line is dropped.
+    #[test]
+    fn fit_grid_rounds_down() {
+        let fit = |width: f32, height: f32| fit_grid(size(px(width), px(height)), px(4.0), px(8.0), px(16.0));
+        // 807 / 8 = 100.875 and 399 / 16 = 24.94.
+        assert_eq!(fit(815.0, 407.0), (100, 24));
+        // 799 / 8 = 99.875 and 384 / 16 = 24 exactly.
+        assert_eq!(fit(807.0, 392.0), (99, 24));
+        // A fractional cell width: 100 / 8.4 = 11.9.
+        assert_eq!(fit_grid(size(px(100.0), px(100.0)), px(0.0), px(8.4), px(16.0)), (11, 6));
+    }
+
+    /// No grid is narrower than `MIN_COLS` or shorter than 2 rows, also
+    /// when the padding leaves nothing, or less than nothing.
+    #[test]
+    fn fit_grid_keeps_min_cols_and_two_rows() {
+        let fit = |width: f32, height: f32, padding: f32| fit_grid(size(px(width), px(height)), px(padding), px(8.0), px(16.0));
+        let floor = (usize::from(MIN_COLS), 2);
+        // 5 columns and 0 rows fit.
+        assert_eq!(fit(48.0, 23.0, 4.0), floor);
+        // Exactly one row fits: still two.
+        assert_eq!(fit(800.0, 24.0, 4.0), (99, 2));
+        // Padding wider than the size.
+        assert_eq!(fit(10.0, 10.0, 20.0), floor);
+        assert_eq!(fit(0.0, 0.0, 0.0), floor);
+        // Exactly `MIN_COLS` and 3 rows fit: kept as they are.
+        assert_eq!(fit(f32::from(MIN_COLS) * 8.0, 48.0, 0.0), (usize::from(MIN_COLS), 3));
     }
 }

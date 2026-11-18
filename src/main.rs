@@ -161,36 +161,49 @@ enum WaitState {
 /// that finds its text, or whose window closed, leaves no entry.
 #[derive(Debug, Default, Clone)]
 struct WaitLog {
-    entries: std::sync::Arc<std::sync::Mutex<Vec<(u64, String, WaitState)>>>,
+    waits: std::sync::Arc<std::sync::Mutex<Waits>>,
+}
+
+/// What a [`WaitLog`] holds: its entries, and the handle the next wait
+/// gets. Handles are never given out twice, so a wait that ended can't
+/// reach a later one.
+#[derive(Debug, Default)]
+struct Waits {
+    next: u64,
+    entries: Vec<(u64, String, WaitState)>,
 }
 
 impl WaitLog {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Waits> {
+        self.waits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Records a wait as pending, and returns its handle for [`Self::set`]
     /// and [`Self::clear`].
     fn begin(&self, text: &str) -> u64 {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let id = entries.last().map_or(0, |(id, ..)| id + 1);
-        entries.push((id, text.to_string(), WaitState::Pending));
+        let mut waits = self.lock();
+        let id = waits.next;
+        waits.next += 1;
+        waits.entries.push((id, text.to_string(), WaitState::Pending));
         id
     }
 
     fn set(&self, id: u64, state: WaitState) {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = entries.iter_mut().find(|(i, ..)| *i == id) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|(i, ..)| *i == id) {
             entry.2 = state;
         }
     }
 
     fn clear(&self, id: u64) {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, ..)| *i != id);
+        self.lock().entries.retain(|(i, ..)| *i != id);
     }
 
     /// The dump's lines: `--- wait-for timeout "TEXT"` for each wait that
     /// timed out and `--- wait-for pending "TEXT"` for one still waiting,
     /// the text escaped onto one line as the selection line is.
     fn describe(&self) -> String {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
+        self.lock()
+            .entries
             .iter()
             .map(|(_, text, state)| {
                 let state = match state {
@@ -1468,6 +1481,41 @@ mod tests {
             "--- wait-for timeout \"NEVER\"\n--- wait-for pending \"two\\nlines \\\"q\\\"\"\n",
             "text is escaped onto one line"
         );
+    }
+
+    /// A handle is given out once: a wait that ended, its entry cleared,
+    /// can't mark or clear a later wait, even the next one begun.
+    #[test]
+    fn the_wait_log_never_reuses_a_handle() {
+        let waits = WaitLog::default();
+        let first = waits.begin("one");
+        waits.clear(first);
+        let second = waits.begin("two");
+        assert_ne!(first, second);
+        waits.set(first, WaitState::TimedOut);
+        waits.clear(first);
+        assert_eq!(waits.describe(), "--- wait-for pending \"two\"\n");
+        waits.clear(second);
+        let third = waits.begin("three");
+        assert!(third != first && third != second);
+        waits.set(third, WaitState::TimedOut);
+        assert_eq!(waits.describe(), "--- wait-for timeout \"three\"\n");
+    }
+
+    /// `--send` and `--wait-for` text: `\r`, `\n`, `\e` and `\t` become
+    /// the controls; a lone backslash and any other text stay as they are.
+    #[test]
+    fn step_text_turns_four_escapes_into_controls() {
+        assert_eq!(unescape(r"echo hi\r"), "echo hi\r");
+        assert_eq!(unescape(r"one\ntwo"), "one\ntwo");
+        assert_eq!(unescape(r"\e[A"), "\x1b[A");
+        assert_eq!(unescape(r"a\tb"), "a\tb");
+        assert_eq!(unescape(r"\r\n\e\t"), "\r\n\x1b\t");
+        assert_eq!(unescape("\\"), "\\");
+        assert_eq!(unescape(r"C:\Users"), r"C:\Users");
+        assert_eq!(unescape(r"\a \x41 \0"), r"\a \x41 \0");
+        assert_eq!(unescape("plain text, ünïcode"), "plain text, ünïcode");
+        assert_eq!(unescape(""), "");
     }
 
     #[test]
