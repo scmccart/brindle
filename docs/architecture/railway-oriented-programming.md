@@ -52,7 +52,7 @@ pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pend
 | `term-core` parser and scanner | none: malformed sequences are skipped | nothing; the stream continues; the fuzz tests check no input panics |
 | `remote-agent` roles | `io::Result`, protocol `ERROR` frames, exit codes (0 for a lost start race, 97 for "deploy the helper") | the role's log; the client's tab, which also gets the `ERROR` the core sends a session's client for a message it couldn't send (a spawn's request fails with it) |
 | `src/remote/` (connecting, launching, upgrading) | `anyhow::Result`, `Refused`, `LinkState`, `HostState` | `Terminal::message`, the dim "reconnecting…" line, the red "session lost" line, a disabled palette row |
-| config and settings | findings collected per field (`invalid=[…]`), defaults with a shown reason | the settings dialog; the config warning |
+| config and settings | findings collected per field (`invalid=[…]`), defaults with a shown reason | the settings dialog; the window's config line, which lists each finding (a clamp, an unknown theme, a rejected keybinding, a removed key, a default that couldn't be written) with what was used instead |
 
 ## Rules
 
