@@ -125,13 +125,13 @@ Needs change 7 (textual: `config.rs`) and change 9 (`config::write_replacing`).
 
 Needs change 2 (`Shown`, `State::shows`), change 9 (the event kinds), change 7 (`missing_profile`) and change 8 (the launch code).
 
-- [ ] 3.1 `src/terminal/tab_note.rs` (decision 1): `line(text)` and `NoteGate`.
+- [x] 3.1 `src/terminal/tab_note.rs` (decision 1): `line(text)` and `NoteGate`.
   - Write the unit tests first:
     - `controls_are_dropped`, covering C0, C1, `ESC` and `BEL`;
     - `lines_are_joined`;
     - `a_repeat_without_output_is_refused`;
     - `a_repeat_after_output_is_admitted`.
-- [ ] 3.2 Pure helpers in `connection.rs`:
+- [x] 3.2 Pure helpers in `connection.rs`:
   - `reconnect_gave_up(limit, last: Option<&str>)`;
   - `lost_line(name, reason)`;
   - `layout_to_send(layout) -> Result<Option<Value>, LayoutTooLarge>`;
@@ -142,17 +142,17 @@ Needs change 2 (`Shown`, `State::shows`), change 9 (the event kinds), change 7 (
   - `only_timeouts_keep_todays_text`;
   - `the_lost_line_carries_the_first_line_of_the_reason`;
   - `a_layout_over_max_layout_is_too_large`.
-- [ ] 3.3 `links::OpenError` and the pure `failure_text` (decision 3).
+- [x] 3.3 `links::OpenError` and the pure `failure_text` (decision 3).
   - Unit tests: `no_scheme_says_so`, `a_missing_program_names_it_and_the_error`, `an_exit_status_is_named`.
-- [ ] 3.4 `profile_for(config, name) -> Chosen` and the notice text, pure, in `workspace.rs`.
+- [x] 3.4 `profile_for(config, name) -> Chosen` and the notice text, pure, in `workspace.rs`.
   - Unit tests: `a_name_matches_case_insensitively`, `an_unknown_name_gives_the_default_and_names_it`, `no_name_is_the_default_without_a_notice`.
   - The first launch and `forwarded_launch` both call it, which closes b01 #10.
-- [ ] 3.5 The sink:
+- [x] 3.5 The sink:
   - `SessionSink::note`, and `Sink::note` through the gate and `output`, so a held replay keeps it after;
   - `Sink::output` calls `gate.output()`.
 
   Unit test in `terminal/server.rs`: `a_notice_during_a_held_replay_is_written_after_it`.
-- [ ] 3.6 `Connection`:
+- [x] 3.6 `Connection`:
   - a session `ERROR` with no request goes to the shown session's sink as `note`, else is logged at `warn`;
   - an encode failure in `write` is noted in the session `ToCore::session` names;
   - `Running::set_layout` records `LayoutSent`;
@@ -165,14 +165,14 @@ Needs change 2 (`Shown`, `State::shows`), change 9 (the event kinds), change 7 (
   - `an_error_for_a_session_not_shown_is_not_delivered`;
   - `a_too_large_layout_is_not_sent_and_detach_still_goes`;
   - `a_remote_loss_names_its_cause`.
-- [ ] 3.7 `Terminal::note` writes through parser, then term, then marks. It holds notes while `attaching` and writes them on `Replay(false)`, and writes after a `Lost` or `Failed` line.
+- [x] 3.7 `Terminal::note` writes through parser, then term, then marks. It holds notes while `attaching` and writes them on `Replay(false)`, and writes after a `Lost` or `Failed` line.
   - This is entity code with no decision of its own beyond `attaching`, so the e2e cases hold it: `restore-fallbacks` (a note due before a replay) and `local-server-session-error`.
-- [ ] 3.8 Callers:
+- [x] 3.8 Callers:
   - **Links.** `TerminalView`'s ctrl-click awaits `links::open`'s receiver and calls `note` on the clicked terminal on `Err`, so `links::open` returns the receiver.
   - **Launches.** `LaunchRequest.note` is set from `Chosen` and handed to the new tab's terminal.
   - **Missing indexes.** `Workspace::launch` with a missing index opens `open_message_tab` (b07 #15).
   - **Restores.** `Workspace::restore` calls `note` with `missing_profile` on the restored zone's terminal.
-- [ ] 3.9 e2e cases:
+- [x] 3.9 e2e cases:
   - **`links-opener-fails`** (`tests/e2e/cases/links.rs`, modelled on `links-local-click`): `BRINDLE_LINK_OPENER` names a missing program, and a `--click ctrl-…` on a printed URL. The screen shows `couldn't open` and the URL.
   - **`local-server-session-error`** (`local_server.rs`):
     1. `BRINDLE_TEST_HOLDER_PANIC=<marker>`; send the marker as input.
@@ -187,7 +187,7 @@ Needs change 2 (`Shown`, `State::shows`), change 9 (the event kinds), change 7 (
   - **Extend `restore-fallbacks`:** the restored `Removed` tab says its profile is gone.
   - **Extend `remote-ssh-network`:** the tab's lost line names `ssh` or `nothing was read`.
   - Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- links local-server profile launch restore remote-ssh-network`, and show each new case fails on a build without this group.
-- [ ] 3.10 Docs:
+- [x] 3.10 Docs:
   - CLAUDE.md's `terminal/` paragraph names the notice line and `Terminal::note`;
   - the railway doc's `src/remote/` row adds "the dim notice line".
 

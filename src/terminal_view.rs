@@ -507,12 +507,26 @@ impl TerminalView {
         }
     }
 
+    /// Opens `uri`, and says in this tab why it couldn't be (a notice
+    /// line), if the view still exists when the opener has answered.
+    fn open_link(&mut self, uri: String, cx: &mut Context<Self>) {
+        let opened = links::open(&uri);
+        cx.spawn(async move |this, cx| {
+            if let Ok(Err(error)) = opened.await {
+                let text = links::failure_text(&uri, &error);
+                log::warn!("{text}");
+                this.update(cx, |this, cx| this.terminal.update(cx, |terminal, cx| terminal.note(&text, cx))).ok();
+            }
+        })
+        .detach();
+    }
+
     pub fn mouse_up(&mut self, e: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if e.button == gpui::MouseButton::Left
             && let Some(pressed) = self.mouse.pending_link.take()
         {
             if self.link_under(e.position, cx).is_some_and(|link| link.uri == pressed.uri) {
-                links::open(&pressed.uri);
+                self.open_link(pressed.uri, cx);
             }
             return;
         }

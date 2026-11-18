@@ -19,6 +19,7 @@ pub mod mouse;
 pub mod pace;
 pub mod process;
 pub mod search;
+pub mod tab_note;
 #[cfg(any(target_os = "linux", windows))]
 mod server;
 // Moved to `brindle-term-core`, which the server core shares.
@@ -278,6 +279,11 @@ pub struct Terminal {
     attaching: bool,
     /// Its session never started or attached; it shows why.
     failed: bool,
+    /// Notices ([`Terminal::note`]) due before the attached session's first
+    /// replay ends, which would wipe them: `Some` until then, written when
+    /// the replay ends, or after the line that says the attach failed or
+    /// the session was lost.
+    held_notes: Option<Vec<String>>,
     /// Between a server replay's start and end: events that would raise
     /// attention are dropped ([`quiet`]).
     replaying: bool,
@@ -353,11 +359,20 @@ impl Terminal {
             ChannelEvent::Merged(merge) => self.merged(merge, cx),
             // Never queued as itself: the gate turns it into its marker.
             ChannelEvent::Foreground => self.merged(Merge::Foreground, cx),
-            ChannelEvent::Replay(active) => self.replaying = active,
-            ChannelEvent::Lost => self.mark_lost(cx),
+            ChannelEvent::Replay(active) => {
+                self.replaying = active;
+                if !active {
+                    self.release_notes(cx);
+                }
+            }
+            ChannelEvent::Lost => {
+                self.mark_lost(cx);
+                self.release_notes(cx);
+            }
             ChannelEvent::Failed => {
                 self.failed = true;
                 self.mark_lost(cx);
+                self.release_notes(cx);
             }
             ChannelEvent::Broken(reason) => self.broken(&reason, cx),
             ChannelEvent::InputRefused => self.show(INPUT_REFUSED, cx),
@@ -428,6 +443,7 @@ impl Terminal {
             title: None,
             exited: false,
             attaching: false,
+            held_notes: None,
             failed: false,
             replaying: false,
             status: status::Records::default(),
@@ -547,6 +563,7 @@ impl Terminal {
         let theme = config.profile_theme(profile);
         let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
         this.attaching = true;
+        this.held_notes = Some(Vec::new());
         this
     }
 
@@ -752,6 +769,24 @@ impl Terminal {
 
     /// Writes Brindle's own `text` into the terminal as output is written,
     /// under parser → term → marks, so it lands between the program's reads.
+    /// Shows `text` as one dim line (`tab_note`): a failure that belongs to
+    /// this tab and doesn't end its session. While an attached session's
+    /// first replay is still to come, it is held and written after it.
+    pub fn note(&mut self, text: &str, cx: &mut Context<Self>) {
+        match &mut self.held_notes {
+            Some(held) => held.push(text.to_string()),
+            None => self.show(&tab_note::line(text), cx),
+        }
+    }
+
+    /// Writes the notices [`Terminal::note`] held, after what the terminal
+    /// shows now.
+    fn release_notes(&mut self, cx: &mut Context<Self>) {
+        for text in self.held_notes.take().unwrap_or_default() {
+            self.show(&tab_note::line(&text), cx);
+        }
+    }
+
     fn show(&mut self, text: &str, cx: &mut Context<Self>) {
         {
             let mut parser = self.parser.lock();

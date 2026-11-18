@@ -1604,6 +1604,8 @@ mod tests {
                 self.0.send(Seen::Output(bytes.to_vec())).ok();
             }
 
+            fn note(&mut self, _text: &str) {}
+
             fn replay(&mut self, _active: bool) {}
 
             fn exited(&mut self, code: Option<i32>) {
@@ -1764,7 +1766,7 @@ mod tests {
             tab.input("echo up-$((1+1))\n");
             tab.wait_for("up-2\r\n")?;
             Command::new("docker").args(["kill", &c.0]).output().ok();
-            tab.wait_for("lost; reconnecting")
+            tab.wait_for("; reconnecting")
         }
 
         /// Input, output, a resize, the foreground program the host reports

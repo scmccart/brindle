@@ -17,6 +17,7 @@ use alacritty_terminal::term::Term;
 use parking_lot::Mutex;
 
 use super::shell_integration::{Marks, Parser};
+use super::tab_note::{self, NoteGate};
 use super::{ChannelEvent, GridSize, Listener};
 use alacritty_terminal::grid::Dimensions as _;
 use crate::notify::osc::Scanner;
@@ -35,6 +36,8 @@ pub struct Sink {
     replay_size: Option<GridSize>,
     /// A replay's bytes, held until it ends.
     replay: Option<Vec<u8>>,
+    /// Which notice was shown last, until the session prints again.
+    gate: NoteGate,
 }
 
 impl Sink {
@@ -45,7 +48,7 @@ impl Sink {
         listener: Listener,
         doing: String,
     ) -> Self {
-        Self { term, parser, marks, listener, scanner: Scanner::new(), doing, replay_size: None, replay: None }
+        Self { term, parser, marks, listener, scanner: Scanner::new(), doing, replay_size: None, replay: None, gate: NoteGate::default() }
     }
 
     /// The first replay was rendered at `size` (an attached session's), so
@@ -83,8 +86,12 @@ impl Sink {
     }
 }
 
-impl SessionSink for Sink {
-    fn output(&mut self, bytes: &[u8]) {
+impl Sink {
+    /// Scans, holds or parses `bytes`, and wakes the UI. A notice writes
+    /// through here too, so one that arrives during a replay lands after
+    /// the replayed screen; only the program's own output
+    /// ([`SessionSink::output`]) lets the next repeat of a notice through.
+    fn write(&mut self, bytes: &[u8]) {
         for found in self.scanner.scan(bytes) {
             self.send(ChannelEvent::Osc(found));
         }
@@ -102,6 +109,20 @@ impl SessionSink for Sink {
         // Always wake the UI, even when the bytes are held by a
         // synchronized update: it schedules the update's timeout flush.
         self.listener.send_event(AlacEvent::Wakeup);
+    }
+}
+
+impl SessionSink for Sink {
+    fn output(&mut self, bytes: &[u8]) {
+        self.gate.output();
+        self.write(bytes);
+    }
+
+    /// One dim line, once until the session prints again.
+    fn note(&mut self, text: &str) {
+        if self.gate.admit(text) {
+            self.write(tab_note::line(text).as_bytes());
+        }
     }
 
     fn replay(&mut self, active: bool) {
@@ -331,6 +352,29 @@ mod tests {
         let text = crate::terminal::screen_text(&term);
         let prompt = text.lines().position(|line| line.starts_with('$')).expect("the prompt is on screen");
         assert_eq!(term.grid().cursor.point.line.0 as usize, prompt, "{text}");
+    }
+
+    /// A notice that arrives while a replay is held is written after the
+    /// replayed screen, not before it, where its `ESC c` would wipe it; and
+    /// a repeat is shown once until the session prints again.
+    #[test]
+    fn a_notice_during_a_held_replay_is_written_after_it() {
+        let (mut sink, mut rx, _) = sink();
+        sink.replay(true);
+        sink.output(b"\x1bcreplayed screen");
+        sink.note("the terminal server: no");
+        sink.replay(false);
+        let text = crate::terminal::screen_text(&sink.term.lock());
+        let screen = text.find("replayed screen").expect("the replayed screen");
+        let note = text.find("the terminal server: no").expect("the notice");
+        assert!(screen < note, "{text}");
+        kinds(&sink, &mut rx);
+        sink.note("the terminal server: no");
+        assert_eq!(kinds(&sink, &mut rx), Vec::<&str>::new(), "a repeat is refused");
+        sink.output(b"x");
+        sink.note("the terminal server: no");
+        let text = crate::terminal::screen_text(&sink.term.lock());
+        assert_eq!(text.matches("the terminal server: no").count(), 2, "{text}");
     }
 
     #[test]
