@@ -78,7 +78,8 @@ use super::super::pipe_state::{
     self, MORE_DATA, NO_ERROR, ReadState, Rotation, Sides, WriteState,
 };
 pub(super) use super::super::pipe_state::{Need, WRITE_MARK};
-use super::event_loop::{Port, Source, Watched, millis, os_error, win32};
+use super::super::wait::millis;
+use super::event_loop::{Port, Source, Watched, os_error, win32};
 use crate::server::event_loop::{Event, Interest, Token};
 
 /// How much one read takes from a pipe, and so how much input a pipe holds

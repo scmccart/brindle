@@ -113,4 +113,77 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
     }
+
+    /// A control message as the protocols' messages are: a required field
+    /// and a defaulted one.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct Sample {
+        name: String,
+        #[serde(default)]
+        count: u32,
+    }
+
+    fn frame(payload: &[u8]) -> Frame {
+        Frame::new(1, payload.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn a_control_message_is_one_json_object_in_its_type() {
+        let sample = Sample {
+            name: "a".into(),
+            count: 2,
+        };
+        let frame = json(12, &sample).unwrap();
+        assert_eq!(frame.msg_type, 12);
+        assert_eq!(frame.payload, br#"{"name":"a","count":2}"#);
+        assert_eq!(from_json::<Sample>("SAMPLE", &frame).unwrap(), sample);
+    }
+
+    /// Fields a later version adds are ignored, and optional fields an
+    /// earlier version leaves out take their defaults (`process R5`).
+    #[test]
+    fn decoding_ignores_unknown_fields_and_defaults_missing_ones() {
+        let later = frame(br#"{"name":"a","count":2,"added":{"x":[1]}}"#);
+        let sample = Sample {
+            name: "a".into(),
+            count: 2,
+        };
+        assert_eq!(from_json::<Sample>("SAMPLE", &later).unwrap(), sample);
+        let earlier = frame(br#"{"name":"b"}"#);
+        let sample = Sample {
+            name: "b".into(),
+            count: 0,
+        };
+        assert_eq!(from_json::<Sample>("SAMPLE", &earlier).unwrap(), sample);
+    }
+
+    /// Anything that isn't the message, malformed or missing a required
+    /// field, is `InvalidData` naming the message.
+    #[test]
+    fn a_bad_message_is_invalid_data_naming_it() {
+        for payload in [
+            &b""[..],
+            b"{",
+            b"[]",
+            b"null",
+            b"\xff\xfe",
+            br#"{"count":1}"#,
+            br#"{"name":5}"#,
+            br#"{"name":"a"} trailing"#,
+        ] {
+            let error = from_json::<Sample>("SAMPLE", &frame(payload)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{payload:?}");
+            assert!(
+                error.to_string().starts_with("bad SAMPLE: "),
+                "{payload:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_type_is_invalid_data_naming_the_protocol_and_number() {
+        let error = unknown_type("core-to-client", 200);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "unknown core-to-client message type 200");
+    }
 }

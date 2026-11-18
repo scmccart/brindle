@@ -56,6 +56,7 @@ use windows::Win32::System::Threading::{
     INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEONLYONCE,
 };
 
+use super::super::wait::millis;
 use crate::server::event_loop::{Event, EventLoop, Interest, Token};
 
 /// The completion key of a wake packet. I/O packets carry the key their
@@ -86,15 +87,6 @@ pub(super) fn win32(error: &windows::core::Error) -> u32 {
 
 pub(super) fn os_error(code: u32) -> io::Error {
     io::Error::from_raw_os_error(code as i32)
-}
-
-/// A timeout in milliseconds for a Win32 wait, rounded up so that a short
-/// one doesn't spin at 0 ms, and never `INFINITE`.
-pub(super) fn millis(timeout: Duration) -> u32 {
-    timeout
-        .as_nanos()
-        .div_ceil(1_000_000)
-        .min(u128::from(INFINITE - 1)) as u32
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -727,5 +719,12 @@ mod tests {
         drop(ev);
         slow.wait().unwrap();
         drop(late);
+    }
+
+    /// The waits' timeouts stop short of the `windows` crate's `INFINITE`.
+    #[test]
+    fn the_wait_limit_is_win32s_infinite() {
+        assert_eq!(super::super::super::wait::INFINITE, INFINITE);
+        assert_eq!(millis(Duration::MAX), INFINITE - 1);
     }
 }
