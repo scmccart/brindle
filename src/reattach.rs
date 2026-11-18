@@ -336,7 +336,7 @@ mod tests {
              [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n\
              [[profiles]]\nname = \"Work\"\n",
         )
-        .unwrap()
+        .unwrap().config
     }
 
     fn started_with(profile: Option<&str>) -> SessionInfo {
@@ -500,7 +500,7 @@ mod tests {
              [[profiles]]\nname = \"B9\"\nremote = { type = \"ssh\", host = \"B9\" }\n\
              [[profiles]]\nname = \"devbox again\"\nremote = { type = \"container\", container = \"devbox\", connect_at_launch = true }\n",
         )
-        .unwrap();
+        .unwrap().config;
         let connects: Vec<bool> = config.profiles.iter().map(connects_at_launch).collect();
         assert_eq!(connects, [false, true, false, true, false, true]);
         let (devbox, a8, b9) = (Host::of(&config.profiles[1]), Host::of(&config.profiles[2]), Host::of(&config.profiles[4]));

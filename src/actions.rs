@@ -2,6 +2,7 @@
 
 use gpui::{Action, App, KeyBinding, NoAction, actions};
 
+use crate::config::ConfigFinding;
 use crate::settings::Settings;
 
 actions!(
@@ -431,7 +432,10 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     bindings
 }
 
-pub fn bind_keys(cx: &mut App) {
+/// Binds the default keys, then the config's `[keybindings]` over them, and
+/// returns what it couldn't bind (an unknown action, keys that don't parse)
+/// for the window's config line.
+pub fn bind_keys(cx: &mut App) -> Vec<ConfigFinding> {
     cx.clear_key_bindings();
     cx.bind_keys(default_bindings());
     let user: Vec<(String, String)> = Settings::get(cx)
@@ -440,30 +444,68 @@ pub fn bind_keys(cx: &mut App) {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let (bindings, findings) = user_bindings(&user);
+    cx.bind_keys(bindings);
+    findings
+}
+
+/// The bindings for the config's `(keys, action name)` pairs, in the
+/// innermost context so they beat the defaults, and a finding for each pair
+/// that can't be bound. Binding a key to `none` is a binding (it frees the
+/// key for the program), not a finding.
+pub fn user_bindings(user: &[(String, String)]) -> (Vec<KeyBinding>, Vec<ConfigFinding>) {
+    let mut bindings = Vec::new();
+    let mut findings = Vec::new();
     for (keys, name) in user {
-        let Some(action) = action_by_name(&name) else {
-            log::warn!("unknown action {name:?} bound to {keys:?}");
+        let Some(action) = action_by_name(name) else {
+            findings.push(ConfigFinding::UnknownAction { keys: keys.clone(), action: name.clone() });
             continue;
         };
-        // Bound in the innermost context so user bindings beat the defaults.
         let context = gpui::KeyBindingContextPredicate::parse("Terminal").unwrap();
-        match KeyBinding::load(
-            &keys,
-            action,
-            Some(context.into()),
-            false,
-            None,
-            &gpui::DummyKeyboardMapper,
-        ) {
-            Ok(binding) => cx.bind_keys([binding]),
-            Err(err) => log::warn!("invalid keybinding {keys:?}: {err}"),
+        match KeyBinding::load(keys, action, Some(context.into()), false, None, &gpui::DummyKeyboardMapper) {
+            Ok(binding) => bindings.push(binding),
+            Err(err) => findings.push(ConfigFinding::InvalidKeys { keys: keys.clone(), error: err.to_string() }),
         }
     }
+    (bindings, findings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    #[test]
+    fn an_unknown_action_is_a_finding() {
+        let (bindings, findings) =
+            user_bindings(&pairs(&[("ctrl-shift-y", "split_zone_rihgt"), ("ctrl-shift-u", "split_zone_right")]));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            findings,
+            [ConfigFinding::UnknownAction { keys: "ctrl-shift-y".into(), action: "split_zone_rihgt".into() }]
+        );
+    }
+
+    #[test]
+    fn invalid_keys_are_a_finding() {
+        let (bindings, findings) = user_bindings(&pairs(&[("ctrl-a-b", "split_zone_right")]));
+        assert!(bindings.is_empty());
+        assert!(
+            matches!(findings.as_slice(), [ConfigFinding::InvalidKeys { keys, .. }] if keys == "ctrl-a-b"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn none_unbinds_and_is_not_a_finding() {
+        let (bindings, findings) = user_bindings(&pairs(&[("ctrl-shift-t", "none")]));
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].action().partial_eq(&NoAction));
+    }
 
     #[test]
     fn every_listed_action_resolves() {

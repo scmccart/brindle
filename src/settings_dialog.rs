@@ -10,7 +10,7 @@
 //! so it is unit-tested; [`SettingsDialog`] is the view around it.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -67,6 +67,27 @@ pub struct ThemeEntry {
     pub custom: bool,
     /// A custom theme that can't be read carries its error.
     pub theme: Result<Theme, String>,
+}
+
+/// The Theme section's list: every built-in theme, then the file's custom
+/// themes in name order. When the file (`path`, read as `read`) can't be
+/// read as themes, the custom themes are the `fallback` (the config in
+/// effect's), and the message says why: it names the file and the cause.
+fn theme_entries(
+    path: &Path,
+    read: Result<toml_edit::DocumentMut, String>,
+    fallback: &BTreeMap<String, Theme>,
+) -> (Vec<ThemeEntry>, Option<String>) {
+    let (customs, note) = match read.and_then(|doc| config_edit::custom_themes(&doc).map_err(|shape| shape.describe(path))) {
+        Ok(customs) => (customs, None),
+        Err(note) => (fallback.iter().map(|(name, theme)| (name.clone(), Ok(theme.clone()))).collect(), Some(note)),
+    };
+    let entries = BUILTIN_THEMES
+        .iter()
+        .map(|name| ThemeEntry { name: name.to_string(), custom: false, theme: Ok(builtin_theme(name).unwrap()) })
+        .chain(customs.into_iter().map(|(name, theme)| ThemeEntry { name, custom: true, theme }))
+        .collect();
+    (entries, note)
 }
 
 /// A color a theme editor field edits.
@@ -326,6 +347,9 @@ pub struct Model {
     mode: Mode,
     /// The last failure to show (save errors, refused deletes).
     error: Option<String>,
+    /// Why the file's themes couldn't be read, when they couldn't: the
+    /// Theme section's error line says it whenever it has nothing newer.
+    themes_note: Option<String>,
     /// Custom themes to list when the file can't be parsed.
     fallback: BTreeMap<String, Theme>,
     section: Section,
@@ -355,6 +379,7 @@ impl Model {
             selected: 0,
             mode: Mode::List,
             error: None,
+            themes_note: None,
             fallback,
             section: Section::Profiles,
             profiles,
@@ -378,17 +403,17 @@ impl Model {
         self
     }
 
-    /// Rereads the custom themes from the config file.
+    /// Rereads the custom themes from the config file. When it can't be
+    /// read as themes, the Theme section says why (`themes_note`), in its
+    /// error line, and lists the themes of the config in effect.
     fn reload_entries(&mut self) {
-        let customs = match std::fs::read_to_string(&self.config_path).map_err(|e| e.to_string()).and_then(|t| config_edit::parse(&t)) {
-            Ok(doc) => config_edit::custom_themes(&doc),
-            Err(_) => self.fallback.iter().map(|(n, t)| (n.clone(), Ok(t.clone()))).collect(),
-        };
-        self.entries = BUILTIN_THEMES
-            .iter()
-            .map(|name| ThemeEntry { name: name.to_string(), custom: false, theme: Ok(builtin_theme(name).unwrap()) })
-            .chain(customs.into_iter().map(|(name, theme)| ThemeEntry { name, custom: true, theme }))
-            .collect();
+        let read = config_edit::read_document(&self.config_path);
+        let (entries, note) = theme_entries(&self.config_path, read, &self.fallback);
+        self.entries = entries;
+        self.themes_note = note;
+        if self.section == Section::Theme {
+            self.error = self.themes_note.clone();
+        }
     }
 
     /// The index of the readable entry `name` (custom themes shadow
@@ -845,7 +870,7 @@ impl Model {
             Section::Theme => {}
         }
         self.section = section;
-        self.error = None;
+        self.error = (section == Section::Theme).then(|| self.themes_note.clone()).flatten();
         true
     }
 
@@ -2142,6 +2167,54 @@ background = "nope"
         assert_eq!(f.text(), CONFIG.replace("theme = \"mine\"", "theme = \"spare\""));
     }
 
+    /// A file that can't be read as themes lists the config in effect's
+    /// themes, and the message names the file and the cause.
+    #[test]
+    fn theme_entries_name_the_path_and_cause() {
+        let path = Path::new("/c/config.toml");
+        let fallback = BTreeMap::from([("mine".to_string(), Theme::default())]);
+        let customs = |entries: &[ThemeEntry]| -> Vec<String> {
+            entries.iter().filter(|e| e.custom).map(|e| e.name.clone()).collect()
+        };
+
+        let (entries, note) = theme_entries(path, config_edit::parse("themes = 3\n"), &fallback);
+        assert_eq!(note.as_deref(), Some("themes in /c/config.toml is not a table"));
+        assert_eq!(customs(&entries), ["mine"]);
+        assert_eq!(entries.len(), BUILTIN_THEMES.len() + 1, "the built-ins are listed too");
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (entries, note) = theme_entries(path, config_edit::document_from(path, Err(denied)), &BTreeMap::new());
+        assert!(note.as_deref().unwrap().starts_with("reading /c/config.toml: "), "{note:?}");
+        assert!(customs(&entries).is_empty());
+
+        let (entries, note) = theme_entries(path, config_edit::document_from(path, Ok("[oops\n".into())), &fallback);
+        assert!(note.as_deref().unwrap().starts_with("/c/config.toml isn't valid TOML: "), "{note:?}");
+        assert_eq!(customs(&entries), ["mine"]);
+
+        // A file that doesn't exist, or that holds its own themes, has no note.
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let (entries, note) = theme_entries(path, config_edit::document_from(path, Err(missing)), &fallback);
+        assert_eq!((note, customs(&entries)), (None, Vec::<String>::new()));
+        let (entries, note) =
+            theme_entries(path, config_edit::parse("[themes.own]\nbackground = \"#000000\"\n"), &fallback);
+        assert_eq!((note, customs(&entries)), (None, vec!["own".to_string()]));
+    }
+
+    /// The Theme section's error line shows the note once the section is
+    /// selected, and drops it on leaving.
+    #[test]
+    fn the_theme_section_shows_why_its_themes_couldnt_be_read() {
+        let f = Fixture::new("themes-not-a-table", "themes = 3\n");
+        let mut model = f.opened("brindle-dark");
+        assert_eq!(model.error, None, "the Profiles section is shown first");
+        model.select_section(Section::Theme);
+        let error = model.error.clone().unwrap();
+        assert!(error.starts_with("themes in ") && error.ends_with(" is not a table"), "{error}");
+        assert!(model.describe_open("", None).contains("is not a table"));
+        model.select_section(Section::Profiles);
+        assert_eq!(model.error, None);
+    }
+
     #[test]
     fn apply_on_a_malformed_file_keeps_the_dialog() {
         let f = Fixture::new("malformed", "theme = \"mine\"\n[oops\n");
@@ -2238,7 +2311,7 @@ background = "nope"
         assert_eq!(model.confirm(), Outcome::Written);
         assert!(model.in_list());
         assert_eq!(model.selected_entry().unwrap().name, "spare-custom");
-        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap();
+        let config = crate::config::Config::parse(&f.text().replace("background = \"nope\"", "")).unwrap().config;
         assert_eq!(config.theme, "mine");
         assert_eq!(config.themes["spare-custom"].background, Color::hex(0x111111));
         assert_eq!(model.preview().unwrap().background, Color::hex(0x111111));

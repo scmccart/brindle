@@ -941,7 +941,7 @@ mod tests {
             cwd = "/"
             "#,
         )
-        .unwrap()
+        .unwrap().config
     }
 
     /// A probe that answers yes for `dirs` alone: the directories that exist.
@@ -1075,7 +1075,7 @@ mod tests {
         let config = Config::parse(
             "[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"R\"\nremote = { type = \"ssh\", host = \"h\" }\n",
         )
-        .unwrap();
+        .unwrap().config;
         let home = Path::new("/home/u");
         let Some(RestoredTab::Local { session: kept, host, .. }) =
             resolve_tab(&state.windows[0].tabs[0], &config, home, &none_exist)
@@ -1125,7 +1125,7 @@ mod tests {
             "default_profile = \"Local\"\n[[profiles]]\nname = \"Local\"\n\
              [[profiles]]\nname = \"Remote\"\ncwd = \"/home/new\"\nremote = { type = \"ssh\", host = \"new-host\" }\n",
         )
-        .unwrap();
+        .unwrap().config;
         let old = Host::Remote(ssh("old-host"));
 
         // A single zone: the profile now points to new-host.
@@ -1197,7 +1197,7 @@ mod tests {
         let config = Config::parse(
             "default_profile = \"Remote\"\n[[profiles]]\nname = \"Remote\"\ncwd = \"/home/current\"\nremote = { type = \"ssh\", host = \"new-host\" }\n"
         )
-        .unwrap();
+        .unwrap().config;
         let tab = TabState::Local {
             profile: "Remote".into(),
             remote: Some(ssh("old-host")),

@@ -120,17 +120,70 @@ pub fn theme_references(doc: &mut DocumentMut, name: &str) -> Vec<String> {
     refs
 }
 
+/// Each custom theme by name, with the error of one that can't be read.
+pub type CustomThemes = Vec<(String, Result<Theme, String>)>;
+
 /// The `[themes.*]` tables, each read on its own so one bad theme (or an
 /// error elsewhere in the file) doesn't hide the others. Sorted by name.
-pub fn custom_themes(doc: &DocumentMut) -> Vec<(String, Result<Theme, String>)> {
-    // The document is valid TOML, so the plain parser accepts it too.
-    let Ok(root) = toml::from_str::<toml::Table>(&doc.to_string()) else { return Vec::new() };
-    let Some(toml::Value::Table(themes)) = root.get("themes") else { return Vec::new() };
+///
+/// A missing `themes` key is no themes; one that isn't a table is a
+/// [`Shape`] error, as is a document the plain parser refuses.
+pub fn custom_themes(doc: &DocumentMut) -> Result<CustomThemes, Shape> {
+    let root = root_table(doc)?;
+    let themes = match root.get("themes") {
+        None => return Ok(Vec::new()),
+        Some(toml::Value::Table(themes)) => themes,
+        Some(_) => return Err(Shape::NotATable("themes")),
+    };
     // toml::Table is a BTreeMap by default, so this is already sorted.
-    themes
+    Ok(themes
         .iter()
         .map(|(name, value)| (name.clone(), value.clone().try_into::<Theme>().map_err(|e| e.message().to_string())))
-        .collect()
+        .collect())
+}
+
+/// Why a section of the config file can't be read as the settings dialog
+/// needs: the file's own shape isn't what the section edits.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// The plain TOML parser refuses the document.
+    Unparsable(String),
+    /// The named key is set, but not to a table.
+    NotATable(&'static str),
+    /// The named key is set, but not to an array.
+    NotAnArray(&'static str),
+}
+
+impl Shape {
+    /// The message for a section that read the file at `path`.
+    pub fn describe(&self, path: &Path) -> String {
+        match self {
+            Self::Unparsable(why) => format!("{} isn't valid TOML: {why}", path.display()),
+            Self::NotATable(key) => format!("{key} in {} is not a table", path.display()),
+            Self::NotAnArray(key) => format!("{key} in {} is not an array", path.display()),
+        }
+    }
+}
+
+fn root_table(doc: &DocumentMut) -> Result<toml::Table, Shape> {
+    toml::from_str::<toml::Table>(&doc.to_string()).map_err(|e| Shape::Unparsable(e.message().to_string()))
+}
+
+/// The config file at `path` as a document, for a section of the settings
+/// dialog. A file that doesn't exist reads as an empty one, as
+/// `Config::load` treats it; any other failure is a message naming what was
+/// being done, the file and the cause.
+pub fn read_document(path: &Path) -> Result<DocumentMut, String> {
+    document_from(path, std::fs::read_to_string(path))
+}
+
+/// [`read_document`] for what reading `path` gave.
+pub fn document_from(path: &Path, read: std::io::Result<String>) -> Result<DocumentMut, String> {
+    match read {
+        Ok(text) => text.parse::<DocumentMut>().map_err(|e| Shape::Unparsable(e.to_string()).describe(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
 }
 
 /// Checks a custom theme name. `others` are the other custom themes' names.
@@ -185,19 +238,30 @@ pub struct ProfileRef {
 /// The name used when the config defines no profiles (see `Config::normalized`).
 pub const IMPLICIT_PROFILE: &str = "Shell";
 
+/// Each profile entry's raw `name` key and the profile read from it, or
+/// the error that made it unreadable.
+pub type ProfileReads = Vec<(Option<String>, Result<Profile, String>)>;
+
 /// The `profiles` entries in file order, each with its raw `name` key (for
 /// a [`ProfileRef`]) and read on its own, so one bad profile (or an error
 /// elsewhere in the file) doesn't hide the others.
-pub fn profiles(doc: &DocumentMut) -> Vec<(Option<String>, Result<Profile, String>)> {
-    let Ok(root) = toml::from_str::<toml::Table>(&doc.to_string()) else { return Vec::new() };
-    let Some(toml::Value::Array(entries)) = root.get("profiles") else { return Vec::new() };
-    entries
+///
+/// A missing `profiles` key is no profiles; one that isn't an array is a
+/// [`Shape`] error, as is a document the plain parser refuses.
+pub fn profiles(doc: &DocumentMut) -> Result<ProfileReads, Shape> {
+    let root = root_table(doc)?;
+    let entries = match root.get("profiles") {
+        None => return Ok(Vec::new()),
+        Some(toml::Value::Array(entries)) => entries,
+        Some(_) => return Err(Shape::NotAnArray("profiles")),
+    };
+    Ok(entries
         .iter()
         .map(|v| {
             let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
             (name, v.clone().try_into::<Profile>().map_err(|e| e.message().to_string()))
         })
-        .collect()
+        .collect())
 }
 
 /// The `profiles` array in either form.
@@ -615,7 +679,7 @@ background = "nope"
     }
 
     fn reparse(doc: &DocumentMut) -> crate::config::Config {
-        crate::config::Config::parse(&doc.to_string()).unwrap_or_else(|e| panic!("{e:#}\n{doc}"))
+        crate::config::Config::parse(&doc.to_string()).unwrap_or_else(|e| panic!("{e:#}\n{doc}")).config
     }
 
     #[test]
@@ -716,11 +780,56 @@ background = "nope"
         // An unknown top-level key makes the whole Config invalid, but the
         // themes are still listed.
         let doc = parse(&format!("fontsize = 3\n{SAMPLE}")).unwrap();
-        let themes = custom_themes(&doc);
+        let themes = custom_themes(&doc).unwrap();
         let names: Vec<&str> = themes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["broken", "mine"]);
         assert!(themes[0].1.as_ref().unwrap_err().contains("invalid color"));
         assert_eq!(themes[1].1.as_ref().unwrap().background, Color::hex(0));
+    }
+
+    #[test]
+    fn themes_that_are_not_a_table_are_a_shape_error() {
+        let doc = parse("themes = 3\n").unwrap();
+        assert_eq!(custom_themes(&doc).unwrap_err(), Shape::NotATable("themes"));
+        let doc = parse("themes = [\"a\"]\n").unwrap();
+        assert_eq!(custom_themes(&doc).unwrap_err(), Shape::NotATable("themes"));
+        assert_eq!(
+            Shape::NotATable("themes").describe(Path::new("/c/config.toml")),
+            "themes in /c/config.toml is not a table"
+        );
+    }
+
+    #[test]
+    fn profiles_that_are_not_an_array_are_a_shape_error() {
+        let doc = parse("profiles = \"x\"\n").unwrap();
+        assert_eq!(profiles(&doc).unwrap_err(), Shape::NotAnArray("profiles"));
+        let doc = parse("[profiles]\nname = \"x\"\n").unwrap();
+        assert_eq!(profiles(&doc).unwrap_err(), Shape::NotAnArray("profiles"));
+        assert_eq!(
+            Shape::NotAnArray("profiles").describe(Path::new("/c/config.toml")),
+            "profiles in /c/config.toml is not an array"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_is_empty() {
+        let doc = parse("theme = \"x\"\n").unwrap();
+        assert!(custom_themes(&doc).unwrap().is_empty());
+        assert!(profiles(&doc).unwrap().is_empty());
+        // A file that doesn't exist reads as an empty document.
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let doc = document_from(Path::new("/c/config.toml"), Err(missing)).unwrap();
+        assert!(profiles(&doc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_document_that_cant_be_read_names_the_path_and_cause() {
+        let path = Path::new("/c/config.toml");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = document_from(path, Err(denied)).unwrap_err();
+        assert!(err.starts_with("reading /c/config.toml: ") && err.contains("ermission denied"), "{err}");
+        let err = document_from(path, Ok("[broken\n".into())).unwrap_err();
+        assert!(err.starts_with("/c/config.toml isn't valid TOML: "), "{err}");
     }
 
     #[test]
@@ -826,13 +935,13 @@ background = "nope"
     }
 
     fn names_of(doc: &DocumentMut) -> Vec<String> {
-        profiles(doc).into_iter().map(|(_, p)| p.map(|p| p.name).unwrap_or_else(|e| format!("error: {e}"))).collect()
+        profiles(doc).unwrap().into_iter().map(|(_, p)| p.map(|p| p.name).unwrap_or_else(|e| format!("error: {e}"))).collect()
     }
 
     #[test]
     fn profiles_are_read_one_by_one() {
         let doc = parse("fontsize = 3\n[[profiles]]\nname = \"A\"\n[[profiles]]\nname = 3\n[[profiles]]\nname = \"C\"\ntmux = \"control\"\n").unwrap();
-        let read = profiles(&doc);
+        let read = profiles(&doc).unwrap();
         assert_eq!(read.len(), 3);
         assert_eq!(read[0].0.as_deref(), Some("A"));
         assert_eq!(read[0].1.as_ref().unwrap().name, "A");
@@ -842,7 +951,7 @@ background = "nope"
         assert_eq!(read[2].1.as_ref().unwrap().name, "C");
         let inline = parse("profiles = [{ name = \"X\" }, { name = \"Y\", args = [\"-l\"] }]\n").unwrap();
         assert_eq!(names_of(&inline), ["X", "Y"]);
-        assert!(profiles(&parse("").unwrap()).is_empty());
+        assert!(profiles(&parse("").unwrap()).unwrap().is_empty());
     }
 
     #[test]
@@ -1068,7 +1177,7 @@ background = "nope"
         let text = doc.to_string();
         let config = reparse(&doc);
         assert_eq!(config.ui_font.family, ["Inter"]);
-        assert_eq!(config.font, crate::config::Config::parse(DEFAULT_CONFIG).unwrap().font);
+        assert_eq!(config.font, crate::config::Config::parse(DEFAULT_CONFIG).unwrap().config.font);
         assert!(text.contains("line_height = 1.25\n\n[ui_font]\nfamily = [\"Inter\"]\n"), "{text}");
         // Every comment of the default config is still there.
         for line in DEFAULT_CONFIG.lines().filter(|l| l.starts_with('#')) {

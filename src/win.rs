@@ -79,8 +79,9 @@ pub fn unregister_app_id() -> windows::core::Result<()> {
 }
 
 /// Whether DirectWrite's system font collection (the one GPUI lists) has a
-/// family named `family`, in any of its localized names.
-pub fn has_font_family(family: &str) -> bool {
+/// family named `family`, in any of its localized names. An `Err` is
+/// DirectWrite failing to answer, not a family that isn't there.
+pub fn has_font_family(family: &str) -> std::io::Result<bool> {
     use windows::Win32::Graphics::DirectWrite::{DWRITE_FACTORY_TYPE_SHARED, DWriteCreateFactory, IDWriteFactory};
     let found = || -> windows::core::Result<bool> {
         // SAFETY: plain DirectWrite calls with valid out-pointers.
@@ -94,7 +95,7 @@ pub fn has_font_family(family: &str) -> bool {
             Ok(exists.as_bool())
         }
     };
-    found().unwrap_or(false)
+    found().map_err(|error| std::io::Error::other(format!("DirectWrite: {error}")))
 }
 
 /// The window's HWND.

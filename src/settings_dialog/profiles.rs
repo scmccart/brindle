@@ -161,13 +161,27 @@ impl Field {
     }
 }
 
-/// Words joined so `shlex::split` gives them back.
-fn join_words(words: &[String]) -> String {
-    shlex::try_join(words.iter().map(String::as_str)).unwrap_or_else(|_| words.join(" "))
+/// A word from the file that can't be written as a shell word (one with a
+/// NUL character), so the field showing it can't give it back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unquotable {
+    word: String,
 }
 
-fn quote(word: &str) -> String {
-    shlex::try_quote(word).map(|q| q.into_owned()).unwrap_or_else(|_| word.to_string())
+impl std::fmt::Display for Unquotable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} can't be written as a shell word", self.word)
+    }
+}
+
+/// Words joined so `shlex::split` gives them back, or the first word that
+/// can't be.
+fn join_words(words: &[String]) -> Result<String, Unquotable> {
+    words.iter().map(|word| quote(word)).collect::<Result<Vec<_>, _>>().map(|quoted| quoted.join(" "))
+}
+
+fn quote(word: &str) -> Result<String, Unquotable> {
+    shlex::try_quote(word).map(|q| q.into_owned()).map_err(|_| Unquotable { word: word.to_string() })
 }
 
 fn is_env_name(key: &str) -> bool {
@@ -197,14 +211,33 @@ struct Values {
 }
 
 impl Values {
-    fn from_profile(p: &Profile, default: bool) -> Self {
-        let env: Vec<String> = p.env.iter().map(|(k, v)| format!("{k}={}", quote(v))).collect();
+    /// The values `p` shows, and the fields whose words can't be written as
+    /// shell words: those show the words joined plainly, and can't be saved
+    /// as they are (see [`ProfileEditor::result`]).
+    fn from_profile(p: &Profile, default: bool) -> (Self, Vec<(Field, Unquotable)>) {
+        let mut unquotable = Vec::new();
+        let mut shown = |field: Field, words: Result<String, Unquotable>, plain: String| match words {
+            Ok(words) => words,
+            Err(reason) => {
+                unquotable.push((field, reason));
+                plain
+            }
+        };
+        let env = p
+            .env
+            .iter()
+            .map(|(k, v)| quote(v).map(|v| format!("{k}={v}")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|env| env.join(" "));
+        let env_plain = p.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+        let args = shown(Field::Args, join_words(&p.args), p.args.join(" "));
+        let env = shown(Field::Env, env, env_plain);
         let mut texts = [
             p.name.clone(),
             p.command.clone().unwrap_or_default(),
-            join_words(&p.args),
+            args,
             p.cwd.clone().unwrap_or_default(),
-            env.join(" "),
+            env,
             p.font_size.map(|s| s.to_string()).unwrap_or_default(),
             String::new(),
             String::new(),
@@ -224,7 +257,7 @@ impl Values {
                 texts[at(Field::SshUser)] = user.clone().unwrap_or_default();
                 texts[at(Field::SshPort)] = port.map(|p| p.to_string()).unwrap_or_default();
                 texts[at(Field::SshIdentity)] = identity_file.clone().unwrap_or_default();
-                texts[at(Field::SshArgs)] = join_words(ssh_args);
+                texts[at(Field::SshArgs)] = shown(Field::SshArgs, join_words(ssh_args), ssh_args.join(" "));
                 RemoteKind::Ssh
             }
             Some(RemoteTarget::Container { engine: e, container, user, connect_at_launch: _ }) => {
@@ -234,7 +267,7 @@ impl Values {
                 RemoteKind::Container
             }
         };
-        Self { texts, theme: p.theme.clone(), remote: kind, engine, connect_at_launch, default }
+        (Self { texts, theme: p.theme.clone(), remote: kind, engine, connect_at_launch, default }, unquotable)
     }
 
     fn text(&self, field: Field) -> &str {
@@ -253,6 +286,10 @@ pub struct ProfileEditor {
     return_to: usize,
     initial: Values,
     values: Values,
+    /// The fields whose words from the file can't be written as shell
+    /// words, until the field is edited. Each blocks saving, since the text
+    /// it shows isn't what the file has.
+    unquotable: Vec<(Field, Unquotable)>,
     /// "Follow global" (`None`), then every theme by name.
     pub theme_choices: Vec<Option<String>>,
 }
@@ -265,7 +302,7 @@ impl ProfileEditor {
         return_to: usize,
         themes: &[String],
     ) -> Self {
-        let values = Values::from_profile(profile, default);
+        let (values, unquotable) = Values::from_profile(profile, default);
         let mut theme_choices: Vec<Option<String>> = std::iter::once(None).chain(themes.iter().cloned().map(Some)).collect();
         // A theme that no longer exists stays choosable, so opening and
         // saving doesn't change it.
@@ -281,6 +318,7 @@ impl ProfileEditor {
             return_to,
             initial: values.clone(),
             values,
+            unquotable,
             theme_choices,
         }
     }
@@ -289,8 +327,13 @@ impl ProfileEditor {
         self.values.text(field)
     }
 
+    /// Sets a text field. Editing a field whose words couldn't be written
+    /// as shell words replaces them, so it is valid again.
     pub fn set_text(&mut self, field: Field, text: &str) {
         if let Some(ix) = field.text_index() {
+            if self.values.texts[ix] != text {
+                self.unquotable.retain(|(unquotable, _)| *unquotable != field);
+            }
             self.values.texts[ix] = text.to_string();
         }
     }
@@ -412,11 +455,17 @@ impl ProfileEditor {
         let mut errors = Vec::new();
         let text = |f: Field| self.values.text(f).trim();
         let optional = |f: Field| Some(text(f).to_string()).filter(|t| !t.is_empty());
-        let words = |f: Field, errors: &mut Vec<(Field, String)>| match split_words(self.values.text(f)) {
-            Ok(words) => words,
-            Err(e) => {
-                errors.push((f, e));
-                Vec::new()
+        let words = |f: Field, errors: &mut Vec<(Field, String)>| {
+            if let Some((_, reason)) = self.unquotable.iter().find(|(unquotable, _)| *unquotable == f) {
+                errors.push((f, reason.to_string()));
+                return Vec::new();
+            }
+            match split_words(self.values.text(f)) {
+                Ok(words) => words,
+                Err(e) => {
+                    errors.push((f, e));
+                    Vec::new()
+                }
             }
         };
 
@@ -565,14 +614,18 @@ impl ProfilesState {
     }
 
     /// Rereads the profiles from the file, or lists `fallback` read-only
-    /// when it can't be parsed.
+    /// when it can't be read: the message names the file and the cause. A
+    /// file that doesn't exist reads as an empty one.
     pub fn reload(&mut self, path: &Path, fallback: &[Profile], fallback_default: Option<String>) {
-        let doc = std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| config_edit::parse(&t));
-        let read = match doc {
-            Ok(doc) => {
+        let read = config_edit::read_document(path).and_then(|doc| {
+            let read = config_edit::profiles(&doc).map_err(|shape| shape.describe(path))?;
+            Ok((doc, read))
+        });
+        let read = match read {
+            Ok((doc, read)) => {
                 self.read_only = None;
                 self.default_name = doc.get("default_profile").and_then(|i| i.as_str()).map(str::to_string);
-                config_edit::profiles(&doc)
+                read
             }
             Err(e) => {
                 self.read_only = Some(e);
@@ -1391,7 +1444,7 @@ theme = "gone"
         }
 
         fn config(&self) -> Config {
-            Config::parse(&self.text()).unwrap()
+            Config::parse(&self.text()).unwrap().config
         }
     }
 
@@ -1451,8 +1504,65 @@ theme = "gone"
         let f = Fixture::new("broken", "[oops\n");
         let mut state = ProfilesState::new(&f.path, &[Profile { name: "Loaded".into(), ..Default::default() }], None);
         assert_eq!(names(&state), ["Loaded"]);
-        assert!(state.start_edit(&themes()).unwrap_err().contains("not valid TOML"));
+        assert!(state.start_edit(&themes()).unwrap_err().contains("isn't valid TOML"));
         assert!(state.start_new(&themes()).is_err());
+    }
+
+    /// What the read-only text says, and that a missing file isn't one.
+    #[test]
+    fn the_read_only_text_names_the_file_and_the_cause() {
+        let f = Fixture::new("not-an-array", "profiles = 3\n");
+        let state = ProfilesState::new(&f.path, &[], None);
+        let why = state.read_only.clone().unwrap();
+        assert!(why.starts_with("profiles in ") && why.ends_with("config.toml is not an array"), "{why}");
+
+        // A path that can't be read at all: a directory.
+        let state = ProfilesState::new(&f.dir, &[], None);
+        let why = state.read_only.clone().unwrap();
+        assert!(why.starts_with(&format!("reading {}: ", f.dir.display())), "{why}");
+
+        // No file reads as an empty document: the implicit profile, editable.
+        std::fs::remove_file(&f.path).unwrap();
+        let mut state = ProfilesState::new(&f.path, &[], None);
+        assert_eq!(state.read_only, None);
+        assert_eq!(names(&state), [IMPLICIT_PROFILE]);
+        assert!(state.start_edit(&themes()).is_ok());
+    }
+
+    #[test]
+    fn a_word_with_nul_is_unquotable() {
+        assert_eq!(join_words(&["-c".into(), "a b".into()]).unwrap(), "-c 'a b'");
+        let nul = "a\0b".to_string();
+        assert_eq!(quote(&nul), Err(Unquotable { word: nul.clone() }));
+        assert_eq!(join_words(&["-c".into(), nul.clone()]), Err(Unquotable { word: nul }));
+        assert!(quote("a\0b").unwrap_err().to_string().contains("can't be written as a shell word"));
+    }
+
+    /// Arguments from the file that can't be written as shell words are
+    /// marked invalid, saying so, and block Save until the field is edited:
+    /// the text shown wouldn't be what the file has.
+    #[test]
+    fn an_unquotable_argument_blocks_save() {
+        let f = Fixture::new(
+            "unquotable",
+            "[[profiles]]\nname = \"Odd\"\nargs = [\"-c\", \"a\\u0000b\"]\nenv = { K = \"x\\u0000y\" }\n",
+        );
+        let mut state = f.state();
+        edit(&mut state, "Odd");
+        assert_eq!(invalid(&state), [Field::Args, Field::Env]);
+        let Err(errors) = state.editor_result().unwrap() else { panic!("saving must be refused") };
+        assert!(errors.iter().all(|(_, why)| why.contains("can't be written as a shell word")), "{errors:?}");
+        // The file is untouched by a refused save.
+        let before = f.text();
+        assert!(state.save(&f.path, &[]).is_err());
+        assert_eq!(f.text(), before);
+        // Editing the field replaces the words, so it is valid again.
+        let editor = state.editor_mut().unwrap();
+        editor.set_text(Field::Args, "-c ok");
+        assert_eq!(invalid(&state), [Field::Env]);
+        let editor = state.editor_mut().unwrap();
+        editor.set_text(Field::Env, "K=v");
+        assert_eq!(invalid(&state), []);
     }
 
     #[test]
