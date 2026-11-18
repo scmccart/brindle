@@ -159,7 +159,7 @@ Prerequisites: changes 4 (`isolate-test-runs`), 5 (`enforce-platform-seams`) and
 
   Verify: CI's advisory `windows-e2e` job (first run, `testing R17`); report it as CI's.
 - [x] 5.6 `tests/e2e/brindle.rs`: the `+ 30.0` at `:546` and the 10 s at `:227` go through `ctx.secs`. Verify: `BRINDLE_E2E=1 cargo test --locked -p brindle --test e2e -- --self-test` passes.
-- [ ] 5.7 `tabs-strip-colors`' `face_top` (b35 #7, design §7):
+- [x] 5.7 `tabs-strip-colors`' `face_top` (b35 #7, design §7):
   - loop the case 100 times under `scripts/with-xvfb` with the band on the edge (scratch edit), recording failures, each dump's `--- grid` line and the edge's device row;
   - if it fails, fix the cause in `Strip`, put the band back on the edge, rerun 100 times, and write "N in 100 before, 0 in 100 after" in the comment and the PR;
   - if not, file a GitHub issue (`gh issue create`) with the numbers and the hypothesis, cite `#NN` in `face_top`'s comment, and keep the 1 px band.

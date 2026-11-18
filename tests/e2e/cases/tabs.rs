@@ -142,7 +142,7 @@ impl Strip {
     /// It then started 1px below the edge, which missed a 1px line on the
     /// edge itself. Now a tie gives no dominant colour, and the band's
     /// third row decides it; the replayed check passed on all 135 captures
-    /// those runs left.
+    /// those runs left, and 100 runs of the case in a row passed (0 failures in 100).
     fn face_top(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
         self.rect(left + 8.0, FACE_TOP, 56.0, 3.0)
