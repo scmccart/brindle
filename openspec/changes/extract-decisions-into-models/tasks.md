@@ -112,20 +112,20 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 6. Workspace
 
-- [ ] 6.1 Add the pure `src/workspace/tabs.rs`, with table tests over orders of 0–4 tabs for each method:
+- [x] 6.1 Add the pure `src/workspace/tabs.rs`, with table tests over orders of 0–4 tabs for each method:
   - `TabId` and `TabTarget`;
   - `Tabs` with `active_in`, `insert_at`, `removed`, `pick` and `shift`.
 
   Verify with `cargo test --locked -p brindle workspace::tabs::` (b07 #2, #3, #4, #19).
-- [ ] 6.2 `Workspace` keeps `Tabs` instead of `active: usize`, and `reorder_keeping` goes. `ActivateTab(TabTarget)` is built by `last_tab`, `activate_tab_N` and alt-N. Verify with `actions::` tests and with the e2e tab cases (b00 #3, b07 #22).
-- [ ] 6.3 Add `ProfileKey` with `Config::profile_key` and `find_profile`. The `NewTab` palette and the profile menu resolve their items by key. Verify with unit tests over duplicate names (b07 #19's profile half).
-- [ ] 6.4 Add the pure `src/workspace/launch.rs` `new_tab_cwd`. Verify with table tests over host kinds, requested paths and pins (b07 #1).
-- [ ] 6.5 Add the pure `src/workspace/overlays.rs` `OverlayKind` and `toggle`, and the shell's `overlay: Overlay`, with `MenuFor`. `ActionMenu` is keyed by action name and takes shortcuts as values. Verify with table tests of `toggle`, and with the e2e palette, menu and settings cases (b07 #17, #18, b00 #5).
-- [ ] 6.6 Add the pure `src/workspace/previews.rs` `Previews` and `Settings::zoomed`. Verify with unit tests, including zoom's clamp (b07 #5, #7).
-- [ ] 6.7 Move `SessionsModel` to `src/picker/sessions.rs`, with `Endpoint::answered: Option<u64>`. The kill carries `SessionRef` to the listing. Verify with the moved tests and a round-0 test (b02 #6, b07 #20 in part).
-- [ ] 6.8 `TAB_BAR_HEIGHT` uses `rems_at_default`. Verify that the e2e tab-strip geometry cases pass (b07 #21).
-- [ ] 6.9 Add the four `workspace/` modules and `picker/sessions.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name the models in `CLAUDE.md`'s `Workspace` paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
-- [ ] 6.10 Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (the whole suite). Then hand group 1's manual checks to the user again.
+- [x] 6.2 `Workspace` keeps `Tabs` instead of `active: usize`, and `reorder_keeping` goes. `ActivateTab(TabTarget)` is built by `last_tab`, `activate_tab_N` and alt-N. Verify with `actions::` tests and with the e2e tab cases (b00 #3, b07 #22).
+- [x] 6.3 Add `ProfileKey` with `Config::profile_key` and `find_profile`. The `NewTab` palette and the profile menu resolve their items by key. Verify with unit tests over duplicate names (b07 #19's profile half).
+- [x] 6.4 Add the pure `src/workspace/launch.rs` `new_tab_cwd`. Verify with table tests over host kinds, requested paths and pins (b07 #1).
+- [x] 6.5 Add the pure `src/workspace/overlays.rs` `OverlayKind` and `toggle`, and the shell's `overlay: Overlay`, with `MenuFor`. `ActionMenu` is keyed by action name and takes shortcuts as values. Verify with table tests of `toggle`, and with the e2e palette, menu and settings cases (b07 #17, #18, b00 #5).
+- [x] 6.6 Add the pure `src/workspace/previews.rs` `Previews` and `Settings::zoomed`. Verify with unit tests, including zoom's clamp (b07 #5, #7).
+- [x] 6.7 Move `SessionsModel` to `src/picker/sessions.rs`, with `Endpoint::answered: Option<u64>`. The kill carries `SessionRef` to the listing. Verify with the moved tests and a round-0 test (b02 #6, b07 #20 in part).
+- [x] 6.8 `TAB_BAR_HEIGHT` uses `rems_at_default`. Verify that the e2e tab-strip geometry cases pass (b07 #21).
+- [x] 6.9 Add the four `workspace/` modules and `picker/sessions.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name the models in `CLAUDE.md`'s `Workspace` paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
+- [x] 6.10 Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` (the whole suite). Then hand group 1's manual checks to the user again.
 
 ## 7. Settings dialog
 

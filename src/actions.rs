@@ -1,9 +1,10 @@
 //! Actions and default keybindings.
 
-use gpui::{Action, App, KeyBinding, NoAction, actions};
+use gpui::{Action, App, KeyBinding, NoAction, SharedString, actions};
 
 use crate::config::ConfigFinding;
 use crate::settings::Settings;
+use crate::workspace::TabTarget;
 
 actions!(
     brindle,
@@ -91,10 +92,10 @@ actions!(
     ]
 );
 
-/// Activate the tab at a 0-based index (`usize::MAX` = last tab).
+/// Activate a tab: the nth from the left (from 0), or the last.
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = brindle, no_json)]
-pub struct ActivateTab(pub usize);
+pub struct ActivateTab(pub TabTarget);
 
 /// Open a new tab using the profile at a 0-based index.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -114,7 +115,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("close_tab", Some("Close Tab"), || Box::new(CloseTab)),
     ("next_tab", Some("Next Tab"), || Box::new(NextTab)),
     ("prev_tab", Some("Previous Tab"), || Box::new(PrevTab)),
-    ("last_tab", Some("Go to Last Tab"), || Box::new(ActivateTab(usize::MAX))),
+    ("last_tab", Some("Go to Last Tab"), || Box::new(ActivateTab(TabTarget::Last))),
     ("move_tab_left", Some("Move Tab Left"), || Box::new(MoveTabLeft)),
     ("move_tab_right", Some("Move Tab Right"), || Box::new(MoveTabRight)),
     ("rename_tab", Some("Rename Tab"), || Box::new(RenameTab)),
@@ -232,7 +233,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
 
 /// Actions taking a 1-based number, written as `<prefix><N>`.
 const NUMBERED_ACTIONS: &[(&str, NumberedBuilder)] = &[
-    ("activate_tab_", |n| Box::new(ActivateTab(n))),
+    ("activate_tab_", |n| Box::new(ActivateTab(TabTarget::Nth(n)))),
     ("new_tab_with_profile_", |n| Box::new(NewTabWithProfile(n))),
 ];
 
@@ -277,6 +278,14 @@ impl ActionRow {
     pub fn item(action: impl Action, enabled: bool) -> Self {
         Self::Item { action: Box::new(action), enabled }
     }
+
+    /// The action an item runs; a separator runs none.
+    pub fn action(&self) -> Option<&dyn Action> {
+        match self {
+            Self::Item { action, .. } => Some(&**action),
+            Self::Separator => None,
+        }
+    }
 }
 
 impl Clone for ActionRow {
@@ -289,25 +298,26 @@ impl Clone for ActionRow {
 }
 
 /// A menu of actions: its entries, each item labelled from the `ACTIONS`
-/// table ([`menu_label`]) and keyed by that label, with the keys bound to
-/// its action, and, by entry index (separators counted, as
-/// `brindle_ui::entry_keyed` finds the key of a `MenuEvent::Selected`), the
-/// action each item runs.
+/// table ([`menu_label`]) and keyed by its action's name, with the keys
+/// bound to its action, and, by entry index (separators counted), the
+/// action each item runs. A `MenuEvent::Selected`'s key is resolved with
+/// [`ActionMenu::chosen`].
 pub struct ActionMenu {
     pub entries: Vec<brindle_ui::MenuEntry>,
     pub actions: Vec<Option<Box<dyn Action>>>,
 }
 
 impl ActionMenu {
-    /// The menu of `rows`, each item showing `shortcut(action)`.
-    pub fn new(rows: Vec<ActionRow>, shortcut: impl Fn(&dyn Action) -> Option<gpui::SharedString>) -> Self {
+    /// The menu of `rows`, item `i` showing `shortcuts[i]` (the keys the
+    /// owner found bound to its action; a row past the slice shows none).
+    pub fn new(rows: Vec<ActionRow>, shortcuts: &[Option<SharedString>]) -> Self {
         let mut menu = Self { entries: Vec::with_capacity(rows.len()), actions: Vec::with_capacity(rows.len()) };
-        for row in rows {
+        for (ix, row) in rows.into_iter().enumerate() {
             match row {
                 ActionRow::Item { action, enabled } => {
                     let label = menu_label(&*action).unwrap_or_else(|| action.name());
-                    let mut item = brindle_ui::MenuItem::new(label).disabled(!enabled);
-                    item.shortcut = shortcut(&*action);
+                    let mut item = brindle_ui::MenuItem::new(label).key(action.name()).disabled(!enabled);
+                    item.shortcut = shortcuts.get(ix).cloned().flatten();
                     menu.entries.push(item.into());
                     menu.actions.push(Some(action));
                 }
@@ -324,6 +334,12 @@ impl ActionMenu {
     pub fn action(&self, ix: usize) -> Option<&dyn Action> {
         self.entries.get(ix).filter(|entry| entry.is_enabled())?;
         self.actions.get(ix)?.as_deref()
+    }
+
+    /// The action of the enabled item keyed `key`, as a
+    /// `MenuEvent::Selected` names it.
+    pub fn chosen(&self, key: &brindle_ui::ItemKey) -> Option<&dyn Action> {
+        self.action(brindle_ui::entry_keyed(&self.entries, key)?)
     }
 }
 
@@ -426,8 +442,8 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     // The text inputs' keys, in the `TextInput` context.
     bindings.extend(brindle_ui::default_bindings());
     for n in 1..=9 {
-        let index = if n == 9 { usize::MAX } else { n - 1 };
-        bindings.push(KeyBinding::new(&format!("alt-{n}"), ActivateTab(index), w));
+        let target = if n == 9 { TabTarget::Last } else { TabTarget::Nth(n - 1) };
+        bindings.push(KeyBinding::new(&format!("alt-{n}"), ActivateTab(target), w));
         bindings.push(KeyBinding::new(&format!("ctrl-alt-{n}"), NewTabWithProfile(n - 1), w));
     }
     bindings
@@ -524,7 +540,7 @@ mod tests {
         assert!(action_names().all(|n| !n.starts_with("tmux_")));
         assert_eq!(
             action_by_name("activate_tab_2").unwrap().as_any().downcast_ref::<ActivateTab>(),
-            Some(&ActivateTab(1))
+            Some(&ActivateTab(TabTarget::Nth(1)))
         );
     }
 
@@ -555,7 +571,7 @@ mod tests {
 
         let menu = ActionMenu::new(
             vec![ActionRow::item(RenameTab, true), ActionRow::Separator, ActionRow::item(CloseTab, false)],
-            |action| action.partial_eq(&RenameTab).then(|| "ctrl-shift-r".into()),
+            &[Some("ctrl-shift-r".into()), None, None],
         );
         let labels: Vec<Option<&str>> = menu.entries.iter().map(|e| e.label()).collect();
         assert_eq!(labels, [Some("Rename Tab"), None, Some("Close Tab")]);
@@ -564,6 +580,47 @@ mod tests {
         assert!(menu.action(0).is_some_and(|a| a.partial_eq(&RenameTab)));
         // A separator and a disabled item run nothing.
         assert!(menu.action(1).is_none() && menu.action(2).is_none() && menu.action(3).is_none());
+    }
+
+    /// Items are keyed by their action's name, so a chosen key finds its
+    /// action whatever its label or place; a disabled item's or an unknown
+    /// key runs nothing. Shortcuts are taken as given, by row.
+    #[test]
+    fn action_menu_items_are_keyed_by_action_name() {
+        let rows = vec![ActionRow::item(RenameTab, true), ActionRow::Separator, ActionRow::item(CloseTab, false)];
+        let shortcuts: Vec<Option<SharedString>> = rows.iter().map(|row| row.action().map(|a| a.name().into())).collect();
+        let menu = ActionMenu::new(rows, &shortcuts);
+        let keys: Vec<Option<&str>> = menu.entries.iter().map(|e| e.key().map(|k| k.as_str())).collect();
+        assert_eq!(keys, [Some(RenameTab.name()), None, Some(CloseTab.name())]);
+        let shown: Vec<Option<SharedString>> = menu.entries.iter().map(|e| e.item().and_then(|i| i.shortcut.clone())).collect();
+        assert_eq!(shown, shortcuts);
+        assert!(menu.chosen(&RenameTab.name().into()).is_some_and(|a| a.partial_eq(&RenameTab)));
+        assert!(menu.chosen(&CloseTab.name().into()).is_none(), "disabled");
+        assert!(menu.chosen(&"Rename Tab".into()).is_none(), "a label isn't a key");
+        // Fewer shortcuts than rows: the rest show none.
+        let menu = ActionMenu::new(vec![ActionRow::item(RenameTab, true), ActionRow::item(CloseTab, true)], &[]);
+        assert!(menu.entries.iter().all(|e| e.item().is_some_and(|i| i.shortcut.is_none())));
+    }
+
+    /// alt-1 to alt-8 go to the nth tab, alt-9 and `last_tab` to the last;
+    /// `activate_tab_N` to the Nth.
+    #[test]
+    fn tab_keys_name_their_target() {
+        let bindings = default_bindings();
+        let target = |keys: &str| {
+            bindings
+                .iter()
+                .filter(|b| b.keystrokes().iter().map(|k| k.unparse()).eq([keys.to_string()]))
+                .find_map(|b| b.action().as_any().downcast_ref::<ActivateTab>().cloned())
+        };
+        for n in 1..=8 {
+            assert_eq!(target(&format!("alt-{n}")), Some(ActivateTab(TabTarget::Nth(n - 1))), "alt-{n}");
+        }
+        assert_eq!(target("alt-9"), Some(ActivateTab(TabTarget::Last)));
+        let built = |name: &str| action_by_name(name).and_then(|a| a.as_any().downcast_ref::<ActivateTab>().cloned());
+        assert_eq!(built("last_tab"), Some(ActivateTab(TabTarget::Last)));
+        assert_eq!(built("activate_tab_1"), Some(ActivateTab(TabTarget::Nth(0))));
+        assert_eq!(built("activate_tab_12"), Some(ActivateTab(TabTarget::Nth(11))));
     }
 
     #[test]

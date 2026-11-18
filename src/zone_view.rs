@@ -766,7 +766,7 @@ impl ZoneTreeView {
         let (_, rect) = self.tree.rects().into_iter().find(|(zid, _)| *zid == id)?;
         let win_size = window.inner_window_bounds().get_bounds().size;
         let content_w = (f32::from(win_size.width) - ZONE_GAP * 2.0).max(0.0);
-        let content_h = (f32::from(win_size.height) - crate::workspace::TAB_BAR_HEIGHT - ZONE_GAP * 2.0).max(0.0);
+        let content_h = (f32::from(win_size.height) - crate::workspace::tab_bar_height() - ZONE_GAP * 2.0).max(0.0);
         Some(size(px(content_w * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
@@ -1208,9 +1208,15 @@ mod tests {
     /// spec's "Too small to split": both disabled, Close Zone enabled).
     #[test]
     fn zone_menu_items() {
-        let shortcut = |action: &dyn gpui::Action| action.partial_eq(&CloseZone).then(|| "ctrl-shift-x".into());
+        let menu_of = |rows: Vec<ActionRow>| {
+            let shortcuts: Vec<Option<gpui::SharedString>> = rows
+                .iter()
+                .map(|row| row.action().filter(|a| a.partial_eq(&CloseZone)).map(|_| "ctrl-shift-x".into()))
+                .collect();
+            ActionMenu::new(rows, &shortcuts)
+        };
         let describe = |right, down| {
-            let menu = ActionMenu::new(zone_menu_rows(right, down), shortcut);
+            let menu = menu_of(zone_menu_rows(right, down));
             menu.entries
                 .iter()
                 .map(|e| match e.item() {
@@ -1225,7 +1231,7 @@ mod tests {
         assert_eq!(describe(false, true), "[Split Zone Right]|Split Zone Down|-|Close Zone");
         assert_eq!(describe(true, false), "Split Zone Right|[Split Zone Down]|-|Close Zone");
         assert_eq!(describe(false, false), "[Split Zone Right]|[Split Zone Down]|-|Close Zone");
-        let menu = ActionMenu::new(zone_menu_rows(true, false), shortcut);
+        let menu = menu_of(zone_menu_rows(true, false));
         assert!(menu.action(0).is_some_and(|a| a.partial_eq(&SplitZoneRight)));
         assert!(menu.action(1).is_none(), "a disabled split runs nothing");
         assert!(menu.action(3).is_some_and(|a| a.partial_eq(&CloseZone)));

@@ -58,6 +58,14 @@ struct Preview {
     ui_font_family: Option<SharedString>,
 }
 
+/// A change to the zoom ([`Settings::zoomed`]): by some points (ctrl-+,
+/// ctrl--), or back to none (ctrl-0).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Zoom {
+    By(f32),
+    Reset,
+}
+
 /// See [`Settings::chrome_theme`]; set with the tokens.
 struct ChromeTheme(Theme);
 
@@ -110,6 +118,15 @@ impl Settings {
             ui_font_family: ui_font_family.into(),
             installed,
             preview: None,
+        }
+    }
+
+    /// The zoom after `change` from `zoom`, kept within −10 to 60 points
+    /// (a terminal's size is clamped again, in [`Settings::font_size`]).
+    pub fn zoomed(zoom: f32, change: Zoom) -> f32 {
+        match change {
+            Zoom::By(points) => (zoom + points).clamp(-10.0, 60.0),
+            Zoom::Reset => 0.0,
         }
     }
 
@@ -627,5 +644,24 @@ mod tests {
         settings.zoom = -20.0;
         assert_eq!(settings.font_size(Some(12.0)), px(5.0));
         assert_eq!(settings.font_size(Some(200.0)), px(96.0));
+    }
+
+    /// ctrl-+ and ctrl-- step the zoom a point, kept within −10 to 60
+    /// (`Workspace::change_font_size` before this function); ctrl-0 resets.
+    #[test]
+    fn the_zoom_steps_within_its_bounds_and_resets() {
+        let before = |zoom: f32, delta: Option<f32>| match delta {
+            Some(d) => (zoom + d).clamp(-10.0, 60.0),
+            None => 0.0,
+        };
+        for zoom in [-10.0, -9.0, 0.0, 3.0, 59.0, 60.0] {
+            for (change, delta) in [(Zoom::By(1.0), Some(1.0)), (Zoom::By(-1.0), Some(-1.0)), (Zoom::Reset, None)] {
+                assert_eq!(Settings::zoomed(zoom, change), before(zoom, delta), "{zoom} {change:?}");
+            }
+        }
+        assert_eq!(Settings::zoomed(0.0, Zoom::By(1.0)), 1.0);
+        assert_eq!(Settings::zoomed(60.0, Zoom::By(1.0)), 60.0, "the top");
+        assert_eq!(Settings::zoomed(-10.0, Zoom::By(-1.0)), -10.0, "the bottom");
+        assert_eq!(Settings::zoomed(-3.0, Zoom::Reset), 0.0);
     }
 }

@@ -32,7 +32,7 @@ fn alt_profile() -> String {
     )
 }
 
-/// The strip's height (`TAB_BAR_HEIGHT`: the 36px tab list under the
+/// The strip's height (`tab_bar_height()`: the 36px tab list under the
 /// strip's 6px (`ZONE_GAP`) top padding, with no border under it; its
 /// background runs on into the cards' margin) and the test config's
 /// terminal padding, in logical pixels.

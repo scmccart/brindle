@@ -326,6 +326,31 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A profile's identity across a reload, where its index may name another
+/// profile: profiles have no ids and their names may repeat, so it is the
+/// `nth` (from 0) of the profiles named `name`, names matching ignoring case
+/// as profile lookups do ([`Config::profile_key`], [`Config::find_profile`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProfileKey {
+    pub name: String,
+    pub nth: usize,
+}
+
+impl ProfileKey {
+    /// The key as [`fmt::Display`] writes it (`1:Shell`), which a menu
+    /// item's key carries; `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (nth, name) = text.split_once(':')?;
+        Some(Self { name: name.to_string(), nth: nth.parse().ok()? })
+    }
+}
+
+impl fmt::Display for ProfileKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.nth, self.name)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
@@ -548,6 +573,31 @@ impl Config {
         self.profile_index(name).map(|ix| &self.profiles[ix])
     }
 
+    /// The key of profile `ix`: its name, and how many profiles before it
+    /// have that name. `None` past the last profile.
+    pub fn profile_key(&self, ix: usize) -> Option<ProfileKey> {
+        let name = &self.profiles.get(ix)?.name;
+        let nth = self.profiles[..ix].iter().filter(|p| p.name.eq_ignore_ascii_case(name)).count();
+        Some(ProfileKey { name: name.clone(), nth })
+    }
+
+    /// Every profile's key, in configuration order.
+    pub fn profile_keys(&self) -> Vec<ProfileKey> {
+        (0..self.profiles.len()).filter_map(|ix| self.profile_key(ix)).collect()
+    }
+
+    /// The index of the profile `key` names in this config: the key's
+    /// `nth` profile of its name. `None` when the config has none (it was
+    /// renamed or removed).
+    pub fn find_profile(&self, key: &ProfileKey) -> Option<usize> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.name.eq_ignore_ascii_case(&key.name))
+            .nth(key.nth)
+            .map(|(ix, _)| ix)
+    }
+
     pub fn profile_theme(&self, profile: &Profile) -> Theme {
         self.theme(profile.theme.as_deref())
     }
@@ -691,6 +741,50 @@ mod tests {
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(config.profiles[0].name, "Shell");
         assert_eq!(config.theme, "brindle-dark");
+    }
+
+    /// Profiles named alike are told apart by how many came before, names
+    /// matching ignoring case; a key finds its profile again after another
+    /// is added before it under another name, and nothing once it is gone.
+    #[test]
+    fn profile_keys_tell_duplicate_names_apart() {
+        let names = |names: &[&str]| {
+            let profiles = names.iter().map(|name| Profile { name: (*name).into(), ..Default::default() }).collect();
+            Config { profiles, ..Config::default() }
+        };
+        let key = |name: &str, nth| ProfileKey { name: name.into(), nth };
+        let config = names(&["Shell", "Work", "shell", "Shell"]);
+        assert_eq!(config.profile_keys(), [key("Shell", 0), key("Work", 0), key("shell", 1), key("Shell", 2)]);
+        assert_eq!(config.profile_key(4), None);
+        for (ix, key) in config.profile_keys().iter().enumerate() {
+            assert_eq!(config.find_profile(key), Some(ix), "{key}");
+        }
+        assert_eq!(config.find_profile(&key("SHELL", 1)), Some(2), "ignoring case");
+        assert_eq!(config.find_profile(&key("Shell", 3)), None);
+        assert_eq!(config.find_profile(&key("Logs", 0)), None);
+
+        // A reload: a profile is added first, and the second Shell is removed.
+        let reloaded = names(&["Logs", "Shell", "Work", "Shell"]);
+        assert_eq!(reloaded.find_profile(&key("Work", 0)), Some(2), "found by name, not place");
+        assert_eq!(reloaded.find_profile(&key("Shell", 0)), Some(1));
+        assert_eq!(reloaded.find_profile(&key("shell", 1)), Some(3));
+        assert_eq!(reloaded.find_profile(&key("Shell", 2)), None, "gone");
+    }
+
+    /// A key as a menu item carries it, and back.
+    #[test]
+    fn a_profile_key_reads_back_its_text() {
+        for key in [
+            ProfileKey { name: "Shell".into(), nth: 0 },
+            ProfileKey { name: "logs: prod".into(), nth: 2 },
+            ProfileKey { name: String::new(), nth: 1 },
+        ] {
+            assert_eq!(ProfileKey::parse(&key.to_string()), Some(key.clone()), "{key}");
+        }
+        assert_eq!(ProfileKey { name: "Work".into(), nth: 1 }.to_string(), "1:Work");
+        for text in ["Shell", "x:Shell", "-1:Shell", ""] {
+            assert_eq!(ProfileKey::parse(text), None, "{text:?}");
+        }
     }
 
     #[test]
