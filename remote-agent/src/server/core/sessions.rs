@@ -151,24 +151,24 @@ impl Session {
         self.is_running() && !self.hung_up && self.pending_replay.is_none()
     }
 
-    /// Output or input: the next look at its foreground program includes
-    /// it.
-    fn mark_active(&mut self) {
+    /// Output or input at `now`: the next look at its foreground program
+    /// includes it.
+    fn mark_active(&mut self, now: Instant) {
         self.active = true;
-        self.active_at = Instant::now();
+        self.active_at = now;
     }
 
-    /// Started or attached: its client is told of its foreground program
-    /// at the next look, changed or not.
-    fn tell_foreground(&mut self) {
-        self.mark_active();
+    /// Started or attached at `now`: its client is told of its foreground
+    /// program at the next look, changed or not.
+    fn tell_foreground(&mut self, now: Instant) {
+        self.mark_active(now);
         self.foreground = None;
     }
 
-    /// A session reported in a holder's `WELCOME`. It has no client until
-    /// its owner comes back. One that exited while no core was connected
-    /// is gone from the holder already.
-    pub(super) fn adopted(holder: Token, held: HeldSession) -> Self {
+    /// A session reported in a holder's `WELCOME`, adopted at `now`. It has
+    /// no client until its owner comes back. One that exited while no core
+    /// was connected is gone from the holder already.
+    pub(super) fn adopted(holder: Token, held: HeldSession, now: Instant) -> Self {
         let meta = SessionMeta::from_value(&held.meta);
         Self {
             holder,
@@ -187,9 +187,9 @@ impl Session {
             storing: None,
             pending_replay: None,
             linger_until: None,
-            detached_since: Some(Instant::now()),
+            detached_since: Some(now),
             active: false,
-            active_at: Instant::now(),
+            active_at: now,
             foreground: None,
         }
     }
@@ -361,11 +361,12 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn session_spawned(&mut self, holder: Token, id: SessionId, pid: u32) {
+        let now = Instant::now();
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
         session.pid = pid;
-        session.tell_foreground();
+        session.tell_foreground(now);
         let req = session.spawning.take().map(|spawn| spawn.req);
         let client = session.attached;
         let key = session.meta.key.clone();
@@ -435,13 +436,14 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn session_output(&mut self, holder: Token, id: SessionId, bytes: Vec<u8>) {
+        let now = Instant::now();
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
         // Attached or not, so a detached session's screen stays current.
         // Checkpoints wait for the end of the read (`checkpoint_due`).
         session.screen.feed(id, &bytes);
-        session.mark_active();
+        session.mark_active(now);
         // A client still waiting for its replay gets this output in it.
         if let Some(client) = session.attached
             && session.pending_replay.is_none()
@@ -817,11 +819,12 @@ impl<L: EventLoop> Core<L> {
     }
 
     pub(super) fn client_input(&mut self, client: Token, data: Data) {
+        let now = Instant::now();
         let Some(session) = self.client_session(client, data.session) else {
             return;
         };
         session.screen.input_seen(data.session);
-        session.mark_active();
+        session.mark_active(now);
         let holder = session.holder;
         self.send_holder(
             holder,
@@ -1051,6 +1054,7 @@ impl<L: EventLoop> Core<L> {
         req: Option<RequestId>,
         size: Option<(u16, u16)>,
     ) {
+        let now = Instant::now();
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -1058,7 +1062,7 @@ impl<L: EventLoop> Core<L> {
         session.linger_until = None;
         session.attached = Some(client);
         session.detached_since = None;
-        session.tell_foreground();
+        session.tell_foreground(now);
         if session.rebuilding.is_some() || session.storing.is_some() {
             session.pending_replay = Some(PendingReplay { req, size });
             return;
@@ -1144,5 +1148,54 @@ mod tests {
         assert!(!is_due(CHECKPOINT_AFTER + 1, true));
         assert!(!is_due(CHECKPOINT_AFTER_BEHIND, true));
         assert!(is_due(CHECKPOINT_AFTER_BEHIND + 1, true));
+    }
+
+    fn held(truncated: bool) -> HeldSession {
+        let meta = SessionMeta {
+            key: "k1".into(),
+            owner: "tok".into(),
+            scrollback: 100,
+            ..SessionMeta::default()
+        };
+        let meta = meta.to_value();
+        HeldSession { session: 3, pid: 42, cols: 80, rows: 24, exit: None, meta, truncated }
+    }
+
+    #[test]
+    fn an_adopted_session_is_detached_and_active_since_now() {
+        let now = Instant::now();
+        let session = Session::adopted(7, held(true), now);
+        assert_eq!((session.holder, session.pid, session.cols, session.rows), (7, 42, 80, 24));
+        assert_eq!((session.meta.key.as_str(), session.meta.owner.as_str()), ("k1", "tok"));
+        // No client until its owner comes back, and detached since now.
+        assert_eq!(session.attached, None);
+        assert!(session.awaiting_owner);
+        assert_eq!(session.detached_since, Some(now));
+        // Not active, as of now: its first output marks it.
+        assert!(!session.active);
+        assert_eq!(session.active_at, now);
+        assert_eq!(session.rebuilding, Some(true));
+        assert!(session.is_running());
+    }
+
+    #[test]
+    fn marking_activity_records_the_given_instant() {
+        let adopted_at = Instant::now();
+        let mut session = Session::adopted(7, held(false), adopted_at);
+        let later = adopted_at + Duration::from_secs(5);
+        session.mark_active(later);
+        assert!(session.active);
+        assert_eq!(session.active_at, later);
+
+        // Telling the foreground program again also forgets the one told.
+        session.active = false;
+        session.foreground = Some(Foreground { name: Some("vim".into()), cwd: None });
+        let latest = later + Duration::from_millis(250);
+        session.tell_foreground(latest);
+        assert!(session.active);
+        assert_eq!(session.active_at, latest);
+        assert_eq!(session.foreground, None);
+        // It doesn't touch when its client left.
+        assert_eq!(session.detached_since, Some(adopted_at));
     }
 }

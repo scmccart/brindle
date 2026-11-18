@@ -14,6 +14,7 @@
 //! sessions it doesn't take are grouped here.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +28,8 @@ pub const VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub v: u32,
-    /// The Brindle process that recorded it ([`origin_id`]); with `index`,
-    /// the tab.
+    /// The id of the Brindle process that recorded it (its pid and start
+    /// time, made once in `main.rs` by [`origin_id`]); with `index`, the tab.
     pub origin: String,
     /// The tab's place in the strip when recorded.
     pub index: u32,
@@ -63,37 +64,31 @@ impl Node {
     }
 }
 
-/// The id of this Brindle process, shared by the layouts of all its tabs
-/// (made once: its pid and the time it was first asked for): unique enough to
-/// keep two Brindles' tabs apart.
-pub fn origin_id() -> &'static str {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        format!("{:x}-{nanos:x}", std::process::id())
-    })
+/// The id of a Brindle process, shared by the layouts of all its tabs: its
+/// `pid` and the time it started, `since_epoch`, in hex nanoseconds. Unique
+/// enough to keep two Brindles' tabs apart. `main.rs` makes it once.
+pub fn origin_id(pid: u32, since_epoch: Duration) -> String {
+    format!("{pid:x}-{:x}", since_epoch.as_nanos())
 }
 
 /// The layout a tab's sessions are detached with: `tree` with each zone's
-/// session key from `key_of`. A zone without one (a message, a session not
+/// session key from `keys`. A zone without one (a message, a session not
 /// started yet) is left out, its split's sibling taking its place; the first
 /// zone left is active when `active` was left out. `None` when no zone has a
 /// session.
 pub fn record(
     tree: &ZoneTree,
     active: ZoneId,
-    key_of: &mut impl FnMut(ZoneId) -> Option<String>,
+    keys: &HashMap<ZoneId, String>,
     origin: &str,
     index: usize,
     title: Option<&str>,
 ) -> Option<serde_json::Value> {
-    fn node(tree: &ZoneTree, active: ZoneId, key_of: &mut impl FnMut(ZoneId) -> Option<String>) -> Option<Node> {
+    fn node(tree: &ZoneTree, active: ZoneId, keys: &HashMap<ZoneId, String>) -> Option<Node> {
         match tree {
-            ZoneTree::Leaf(id) => key_of(*id).map(|key| Node::Leaf { key, active: *id == active }),
+            ZoneTree::Leaf(id) => keys.get(id).map(|key| Node::Leaf { key: key.clone(), active: *id == active }),
             ZoneTree::Split { axis, first, second } => {
-                match (node(first, active, key_of), node(second, active, key_of)) {
+                match (node(first, active, keys), node(second, active, keys)) {
                     (Some(first), Some(second)) => {
                         Some(Node::Split { split: *axis, first: Box::new(first), second: Box::new(second) })
                     }
@@ -102,7 +97,7 @@ pub fn record(
             }
         }
     }
-    let mut zones = node(tree, active, key_of)?;
+    let mut zones = node(tree, active, keys)?;
     if !node_has_active(&zones) {
         activate_first(&mut zones);
     }
@@ -333,15 +328,24 @@ mod tests {
         ZoneTree::Split { axis, first: Box::new(first), second: Box::new(second) }
     }
 
-    fn key_of(id: ZoneId) -> Option<String> {
-        // Zone 3 shows only a message.
-        (id.0 != 3).then(|| format!("k{}", id.0))
+    /// The session keys of zones 1, 2 and 4, `k<id>`: zone 3 shows only a
+    /// message.
+    fn zone_keys() -> HashMap<ZoneId, String> {
+        [1, 2, 4].into_iter().map(|id| (ZoneId(id), format!("k{id}"))).collect()
+    }
+
+    #[test]
+    fn origin_ids_are_the_pid_and_nanoseconds_in_hex() {
+        // 1 s and 42 ns is 1_000_000_042 ns, 0x3b9aca2a.
+        assert_eq!(origin_id(0x4d2, std::time::Duration::new(1, 42)), "4d2-3b9aca2a");
+        assert_eq!(origin_id(7, std::time::Duration::ZERO), "7-0");
     }
 
     #[test]
     fn the_blob_has_the_documented_shape() {
+        let keys = zone_keys();
         let tree = split(SplitAxis::Horizontal, ZoneTree::Leaf(ZoneId(1)), ZoneTree::Leaf(ZoneId(2)));
-        let recorded = record(&tree, ZoneId(2), &mut key_of, "q1", 4, Some(" logs ")).unwrap();
+        let recorded = record(&tree, ZoneId(2), &keys, "q1", 4, Some(" logs ")).unwrap();
         assert_eq!(
             recorded,
             json!({
@@ -356,7 +360,7 @@ mod tests {
                 },
             })
         );
-        let single = record(&ZoneTree::Leaf(ZoneId(1)), ZoneId(1), &mut key_of, "q1", 0, Some("  ")).unwrap();
+        let single = record(&ZoneTree::Leaf(ZoneId(1)), ZoneId(1), &keys, "q1", 0, Some("  ")).unwrap();
         assert_eq!(single, json!({"v": 1, "origin": "q1", "index": 0, "zones": {"key": "k1", "active": true}}));
     }
 
@@ -368,14 +372,14 @@ mod tests {
             split(SplitAxis::Horizontal, ZoneTree::Leaf(ZoneId(1)), ZoneTree::Leaf(ZoneId(3))),
             ZoneTree::Leaf(ZoneId(2)),
         );
-        let recorded = record(&tree, ZoneId(3), &mut key_of, "q", 0, None).unwrap();
+        let keys = zone_keys();
+        let recorded = record(&tree, ZoneId(3), &keys, "q", 0, None).unwrap();
         assert_eq!(
             recorded["zones"],
             json!({"split": "vertical", "first": {"key": "k1", "active": true}, "second": {"key": "k2"}})
         );
-        assert_eq!(record(&ZoneTree::Leaf(ZoneId(3)), ZoneId(3), &mut key_of, "q", 0, None), None);
-        assert!(!origin_id().is_empty());
-        assert_eq!(origin_id(), origin_id(), "made once per process");
+        assert_eq!(record(&ZoneTree::Leaf(ZoneId(3)), ZoneId(3), &keys, "q", 0, None), None);
+        assert_eq!(record(&tree, ZoneId(1), &HashMap::new(), "q", 0, None), None);
     }
 
     fn info(session: u32, key: &str, started: u64) -> SessionInfo {
@@ -477,7 +481,7 @@ mod tests {
             ZoneTree::Leaf(ZoneId(1)),
             split(SplitAxis::Horizontal, ZoneTree::Leaf(ZoneId(2)), ZoneTree::Leaf(ZoneId(4))),
         );
-        let layout = record(&tree, ZoneId(4), &mut key_of, "q", 0, None).unwrap();
+        let layout = record(&tree, ZoneId(4), &zone_keys(), "q", 0, None).unwrap();
         let tabs = group((1..=4).filter(|n| *n != 3).map(|n| laid_out(n, &format!("k{n}"), n.into(), layout.clone())).collect());
         assert_eq!(tabs.len(), 1);
         let (rebuilt, leaves, active) = tabs[0].clone().into_tree();

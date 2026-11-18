@@ -1,9 +1,26 @@
 //! What Brindle asks the terminal server to run on Windows: the default
 //! program, the config editor's command and the merged environment, plus
 //! program names and console titles. The holder builds the command line
-//! itself (`remote-agent/src/conpty/cmdline.rs`).
+//! itself (`remote-agent/src/conpty/cmdline.rs`). It also builds the Unix
+//! config editor's command.
 //!
 //! Pure, so they are tested on every platform.
+
+/// `/bin/sh -c "<editor> '<path>'"`: the editor command (from `$VISUAL`,
+/// else `$EDITOR`, else nano) run through the shell so values like
+/// `code -w` work, with `path` quoted. An empty `$VISUAL` is used as given,
+/// unlike in [`windows_editor_command`], which treats a blank one as unset.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn unix_editor_command(visual: Option<&str>, editor: Option<&str>, path: &str) -> (String, Vec<String>) {
+    let editor = visual.or(editor).unwrap_or("nano");
+    ("/bin/sh".into(), vec!["-c".into(), format!("{editor} {}", shell_quote(path))])
+}
+
+/// `s` in single quotes for a POSIX shell, each `'` written as `'\''`.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 /// `cmd.exe /D /S /C "<editor> "<path>""`: the editor command (from
 /// `%VISUAL%`, else `%EDITOR%`, else Notepad) run by cmd so values like
@@ -37,15 +54,17 @@ pub fn is_console_title(title: &str) -> bool {
 /// The program a Windows tab runs when its profile names none: `pwsh.exe`
 /// in one of `path_dirs` (the `PATH` entries), then `powershell.exe`, then
 /// `comspec` (`%COMSPEC%`), then `cmd.exe`. PowerShell starts without its
-/// logo.
+/// logo. `is_file` is the probe for each candidate (the shell passes
+/// `Path::is_file`).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_default_program(
     path_dirs: impl IntoIterator<Item = std::path::PathBuf>,
     comspec: Option<&str>,
+    is_file: impl Fn(&std::path::Path) -> bool,
 ) -> (String, Vec<String>) {
     let dirs: Vec<std::path::PathBuf> = path_dirs.into_iter().collect();
     for exe in ["pwsh.exe", "powershell.exe"] {
-        if let Some(found) = dirs.iter().map(|dir| dir.join(exe)).find(|path| path.is_file()) {
+        if let Some(found) = dirs.iter().map(|dir| dir.join(exe)).find(|path| is_file(path)) {
             return (found.display().to_string(), vec!["-NoLogo".to_string()]);
         }
     }
@@ -71,6 +90,7 @@ pub fn merge_environment<V>(inherited: Vec<(String, V)>, overrides: Vec<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn editor_runs_through_cmd_with_the_path_quoted() {
@@ -86,6 +106,27 @@ mod tests {
             cmd(r#"""C:\Program Files\Vim\gvim.exe" "C:\Users\me\App Data\brindle\config.toml"""#)
         );
         assert_eq!(windows_editor_command(Some(" "), None, r"C:\c.toml"), cmd(r#""notepad.exe "C:\c.toml"""#));
+    }
+
+    #[test]
+    fn the_unix_editor_is_visual_then_editor_then_nano() {
+        let sh = |script: &str| ("/bin/sh".to_string(), vec!["-c".to_string(), script.to_string()]);
+        let path = "/home/u/.config/brindle/config.toml";
+        assert_eq!(
+            unix_editor_command(Some("vim"), Some("code -w"), path),
+            sh("vim '/home/u/.config/brindle/config.toml'")
+        );
+        assert_eq!(unix_editor_command(None, Some("code -w"), path), sh("code -w '/home/u/.config/brindle/config.toml'"));
+        assert_eq!(unix_editor_command(None, None, path), sh("nano '/home/u/.config/brindle/config.toml'"));
+        // The path is quoted for the shell.
+        assert_eq!(unix_editor_command(Some("vi"), None, "/a b/c'd"), sh("vi '/a b/c'\\''d'"));
+        // An empty $VISUAL is used as given, as it always was.
+        assert_eq!(unix_editor_command(Some(""), Some("vim"), "/c"), sh(" '/c'"));
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("/a b/c'd"), "'/a b/c'\\''d'");
     }
 
     #[test]
@@ -115,57 +156,41 @@ mod tests {
         }
     }
 
-    /// Removes a test's directory tree when dropped, so a failing assertion still cleans up.
-    struct RemoveOnDrop(std::path::PathBuf);
-
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).ok();
-        }
+    /// The default program for `PATH` entries `dirs` when the only files are
+    /// `files`, each written as `<dir>/<name>` and built with `join`.
+    fn default_with(dirs: &[&str], files: &[(&str, &str)], comspec: Option<&str>) -> (String, Vec<String>) {
+        let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+        let files: Vec<PathBuf> = files.iter().map(|(dir, name)| Path::new(dir).join(name)).collect();
+        windows_default_program(dirs, comspec, |path: &Path| files.iter().any(|file| file == path))
     }
 
-    fn bin_dirs(name: &str, exes: &[&[&str]]) -> (Vec<std::path::PathBuf>, RemoveOnDrop) {
-        let root = std::env::temp_dir().join(format!("brindle-default-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let guard = RemoveOnDrop(root.clone());
-        let dirs = exes
-            .iter()
-            .enumerate()
-            .map(|(i, files)| {
-                let dir = root.join(i.to_string());
-                std::fs::create_dir_all(&dir).unwrap();
-                for file in *files {
-                    std::fs::write(dir.join(file), b"").unwrap();
-                }
-                dir
-            })
-            .collect();
-        (dirs, guard)
+    fn found(dir: &str, name: &str) -> (String, Vec<String>) {
+        (Path::new(dir).join(name).display().to_string(), vec!["-NoLogo".to_string()])
     }
 
     #[test]
-    fn default_program_prefers_pwsh_then_powershell() {
-        let (dirs, _both) = bin_dirs("both",&[&["powershell.exe"], &["pwsh.exe"]]);
-        let (program, args) = windows_default_program(dirs.clone(), Some("C:\\Windows\\system32\\cmd.exe"));
-        assert_eq!(program, dirs[1].join("pwsh.exe").display().to_string());
-        assert_eq!(args, ["-NoLogo"]);
-
-        let (dirs, _ps51) = bin_dirs("ps51",&[&["notepad.exe"], &["powershell.exe"]]);
-        let (program, args) = windows_default_program(dirs.clone(), None);
-        assert_eq!(program, dirs[1].join("powershell.exe").display().to_string());
-        assert_eq!(args, ["-NoLogo"]);
+    fn default_program_prefers_pwsh_in_any_directory_then_powershell() {
+        let cmd = Some(r"C:\Windows\system32\cmd.exe");
+        let dirs = ["a", "b", "c"];
+        // pwsh anywhere on PATH wins over an earlier powershell.
+        assert_eq!(default_with(&dirs, &[("a", "powershell.exe"), ("b", "pwsh.exe")], cmd), found("b", "pwsh.exe"));
+        // PATH order within each program.
+        assert_eq!(default_with(&dirs, &[("c", "pwsh.exe"), ("b", "pwsh.exe")], cmd), found("b", "pwsh.exe"));
+        assert_eq!(
+            default_with(&dirs, &[("a", "notepad.exe"), ("c", "powershell.exe"), ("b", "powershell.exe")], None),
+            found("b", "powershell.exe")
+        );
+        // A file in a directory that isn't on PATH doesn't count.
+        assert_eq!(default_with(&dirs, &[("d", "pwsh.exe"), ("c", "powershell.exe")], None), found("c", "powershell.exe"));
     }
 
     #[test]
     fn default_program_falls_back_to_comspec_then_cmd() {
-        let (dirs, _none) = bin_dirs("none",&[&["notepad.exe"]]);
-        assert_eq!(windows_default_program(dirs.clone(), Some("C:\\tcc\\tcc.exe")), ("C:\\tcc\\tcc.exe".to_string(), vec![]));
-        assert_eq!(windows_default_program(dirs.clone(), Some(" ")), ("cmd.exe".to_string(), vec![]));
-        assert_eq!(windows_default_program(dirs, None), ("cmd.exe".to_string(), vec![]));
-        // A directory named like the program doesn't count.
-        let (dirs, _dir_named) = bin_dirs("dir-named",&[&[]]);
-        std::fs::create_dir_all(dirs[0].join("pwsh.exe")).unwrap();
-        assert_eq!(windows_default_program(dirs, None).0, "cmd.exe");
+        let none = [("a", "notepad.exe")];
+        assert_eq!(default_with(&["a"], &none, Some(r"C:\tcc\tcc.exe")), (r"C:\tcc\tcc.exe".to_string(), vec![]));
+        assert_eq!(default_with(&["a"], &none, Some(" ")), ("cmd.exe".to_string(), vec![]));
+        assert_eq!(default_with(&["a"], &none, None), ("cmd.exe".to_string(), vec![]));
+        assert_eq!(default_with(&[], &[("a", "pwsh.exe")], None), ("cmd.exe".to_string(), vec![]));
     }
 
     #[test]

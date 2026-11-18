@@ -29,7 +29,7 @@ use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
 use crate::terminal_view::TerminalView;
 use crate::theme::Theme;
-use crate::workspace::{shortcut, terminal_automatic_title};
+use crate::workspace::{program_title, shortcut, terminal_automatic_title};
 
 /// Height of a zone card's header bar, shown when a tab has 2+ zones, its
 /// bottom line included (`brindle_ui::CARD_HEADER_HEIGHT`).
@@ -489,7 +489,7 @@ impl ZoneTreeView {
         self.focus_serial += 1;
         let initial_title: SharedString = {
             let t = terminal.read(cx);
-            terminal_automatic_title(t.title(), &self.profile.name, || None).into()
+            terminal_automatic_title(t.title(), &self.profile.name, None).into()
         };
         let status = terminal.read(cx).status().summary();
         let zone = Zone {
@@ -579,15 +579,27 @@ impl ZoneTreeView {
         zone.content.as_terminal_view().read(cx).terminal.read(cx).working_directory()
     }
 
-    /// What session restore records for zone `id` (its directory and its
-    /// session), or `None` for a zone that only shows a message: an attach
-    /// that failed.
-    pub fn zone_record(&self, id: ZoneId, cx: &App) -> Option<(Option<PathBuf>, Option<crate::session::ServerSession>)> {
-        let message = self
-            .zones
-            .get(&id)
-            .is_some_and(|zone| zone.content.as_terminal_view().read(cx).terminal.read(cx).shows_only_message());
-        (!message).then(|| (self.zone_working_directory(id, cx), self.zone_server_session(id, cx)))
+    /// What session restore records for each zone (its directory and its
+    /// session), for `session::record_zones`. A zone that only shows a
+    /// message (an attach that failed) has no entry.
+    pub fn zone_records(&self, cx: &App) -> HashMap<ZoneId, crate::session::ZoneRecord> {
+        let shows_only_message = |id: &ZoneId| {
+            self.zones
+                .get(id)
+                .is_some_and(|zone| zone.content.as_terminal_view().read(cx).terminal.read(cx).shows_only_message())
+        };
+        self.tree
+            .leaves()
+            .into_iter()
+            .filter(|id| !shows_only_message(id))
+            .map(|id| {
+                let record = crate::session::ZoneRecord {
+                    cwd: self.zone_working_directory(id, cx),
+                    session: self.zone_server_session(id, cx),
+                };
+                (id, record)
+            })
+            .collect()
     }
 
     /// The terminal server session zone `id` shows, for session restore.
@@ -607,13 +619,14 @@ impl ZoneTreeView {
         }
     }
 
-    /// Automatic title for the active zone (used for the tab's automatic title).
-    pub fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
-        let Some(zone) = self.zones.get(&self.active) else {
-            return self.profile.name.clone();
-        };
-        let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        terminal_automatic_title(terminal.title(), &self.profile.name, || terminal.foreground_process_name(snapshot))
+    /// The active zone's title as [`ZoneTreeView::refresh_titles`] last
+    /// cached it, or the profile name when there is no active zone: the
+    /// tab's automatic title.
+    pub fn active_title(&self) -> SharedString {
+        match self.zones.get(&self.active) {
+            Some(zone) => zone.title.clone(),
+            None => self.profile.name.clone().into(),
+        }
     }
 
     /// Refreshes cached zone header titles for all zones in this tab.
@@ -630,8 +643,13 @@ impl ZoneTreeView {
         let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        let title: SharedString =
-            terminal_automatic_title(terminal.title(), &profile_name, || terminal.foreground_process_name(snapshot)).into();
+        // The process name costs a look at the processes: only when the
+        // program set no title of its own.
+        let process_name = match program_title(terminal.title()) {
+            Some(_) => None,
+            None => terminal.foreground_process_name(snapshot),
+        };
+        let title: SharedString = terminal_automatic_title(terminal.title(), &profile_name, process_name).into();
         let changed = zone.title != title;
         zone.title = title;
         changed
@@ -670,41 +688,47 @@ impl ZoneTreeView {
         }
     }
 
-    /// Leaves every zone's program as its terminal's `Closing` says, when
-    /// Brindle quits ([`Terminal::quit_with`]).
     /// Brindle is quitting: every terminal leaves its program as its
-    /// `Closing` says, a kept session detached with this tab's layout (its
-    /// split tree with the zones' session keys, `quit`'s `index`th tab,
-    /// titled `title`), so a launch that sweeps it rebuilds the tab.
-    pub fn quit_all(&mut self, index: usize, title: Option<&str>, cx: &mut Context<Self>) {
+    /// `Closing` says ([`Terminal::quit_with`]), a kept session detached
+    /// with this tab's layout (its split tree with the zones' session keys,
+    /// the `index`th tab of the Brindle `origin`, titled `title`), so a
+    /// launch that sweeps it rebuilds the tab.
+    pub fn quit_all(&mut self, origin: &str, index: usize, title: Option<&str>, cx: &mut Context<Self>) {
         self.shutting_down = true;
-        let layout = self.layout(index, title, cx);
+        let layout = self.layout(origin, index, title, cx);
         for terminal in self.terminals(cx) {
             let layout = layout.clone();
             terminal.update(cx, |t, _| t.quit_with(layout));
         }
     }
 
-    /// This tab's layout as the strip's `index`th tab titled `title`
-    /// ([`crate::layout::record`]); `None` when no zone has a session.
-    pub fn layout(&self, index: usize, title: Option<&str>, cx: &App) -> Option<serde_json::Value> {
-        crate::layout::record(
-            &self.tree,
-            self.active,
-            &mut |id| self.zone_server_session(id, cx).map(|session| session.key).filter(|key| !key.is_empty()),
-            crate::layout::origin_id(),
-            index,
-            title,
-        )
+    /// This tab's layout as the `index`th tab of the Brindle `origin`
+    /// (`layout::origin_id`), titled `title` ([`crate::layout::record`]);
+    /// `None` when no zone has a session.
+    pub fn layout(&self, origin: &str, index: usize, title: Option<&str>, cx: &App) -> Option<serde_json::Value> {
+        crate::layout::record(&self.tree, self.active, &self.session_keys(cx), origin, index, title)
+    }
+
+    /// The session key of each zone that shows a session with one, for
+    /// [`crate::layout::record`]. A zone without one (a message, a session
+    /// not started yet, a core that predates keys) has no entry.
+    pub fn session_keys(&self, cx: &App) -> HashMap<ZoneId, String> {
+        self.zones
+            .keys()
+            .filter_map(|&id| {
+                let key = self.zone_server_session(id, cx)?.key;
+                (!key.is_empty()).then_some((id, key))
+            })
+            .collect()
     }
 
     /// Keeps every zone's session's copy of this tab's layout current
     /// (`Terminal::set_layout`), the session recorder's once-a-second tick.
-    pub fn send_layout(&self, index: usize, title: Option<&str>, cx: &App) {
+    pub fn send_layout(&self, origin: &str, index: usize, title: Option<&str>, cx: &App) {
         if self.shutting_down {
             return;
         }
-        let layout = self.layout(index, title, cx);
+        let layout = self.layout(origin, index, title, cx);
         for terminal in self.terminals(cx) {
             terminal.read(cx).set_layout(layout.clone());
         }

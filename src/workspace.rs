@@ -2,7 +2,7 @@
 //! active tab's content, and the palettes.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
@@ -105,25 +105,18 @@ impl Tab {
         tab
     }
 
-    /// Recomputes the title: the program's OSC title, else the foreground
-    /// process name, else the profile name. On Windows a title the console
-    /// built from a program's path counts as none (`cmdline::is_console_title`).
-    /// Returns whether it changed.
+    /// Recomputes the zones' titles, then the tab's: its manual title, else
+    /// its active zone's title (the program's own title, else the
+    /// foreground process name, else the profile name; see
+    /// [`terminal_automatic_title`]). Returns whether either changed.
     /// `snapshot` is the processes running, for the foreground name, taken
     /// only when a title needs it (a program's own title, which can change
     /// thousands of times a second, never does).
     fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
         let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(snapshot, cx));
-        let mut displayed = std::mem::take(&mut self.title);
-        let changed = refresh_displayed_title(&mut displayed, self.manual_title.as_deref(), || {
-            self.automatic_title(snapshot, cx)
-        });
-        self.title = displayed;
+        let automatic = self.zones.read(cx).active_title();
+        let changed = refresh_displayed_title(&mut self.title, self.manual_title.as_deref(), &automatic);
         changed || zone_changed
-    }
-
-    fn automatic_title(&self, snapshot: &mut Option<Snapshot>, cx: &App) -> String {
-        self.zones.read(cx).automatic_title(snapshot, cx)
     }
 
     fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
@@ -356,10 +349,15 @@ pub struct Workspace {
     /// ([`Workspace::quit`]): nothing is recorded any more, since the zones
     /// no longer know their sessions.
     quitting: bool,
+    /// This Brindle's id in its tabs' layouts (`layout::origin_id`), made
+    /// once in `main.rs`.
+    origin: SharedString,
 }
 
 impl Workspace {
-    pub fn new(launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// The window's workspace, opening what `launch` asks for. `origin` is
+    /// this Brindle's id in its tabs' layouts ([`crate::layout::origin_id`]).
+    pub fn new(launch: Launch, origin: SharedString, window: &mut Window, cx: &mut Context<Self>) -> Self {
         static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let focus_handle = cx.focus_handle();
         let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
@@ -403,6 +401,7 @@ impl Workspace {
             restored_hosts: Vec::new(),
             restored_sessions: Vec::new(),
             quitting: false,
+            origin,
         };
         // A close the window manager or Windows asks for (its close button,
         // alt-F4, the taskbar) quits too.
@@ -471,9 +470,12 @@ impl Workspace {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
-            match session::resolve_tab(entry, &config, &home) {
+            match session::resolve_tab(entry, &config, &home, &|dir: &Path| dir.is_dir()) {
                 None => {}
-                Some(RestoredTab::Local { profile, host, cwd, title, zones, session }) => {
+                Some(RestoredTab::Local { profile, host, cwd, title, zones, session, missing_profile }) => {
+                    if let Some(name) = missing_profile {
+                        log::warn!("session restore: no profile named {name:?}, using the default profile");
+                    }
                     if !host.is_local() && !self.restored_hosts.contains(&host) {
                         self.restored_hosts.push(host.clone());
                     }
@@ -548,7 +550,7 @@ impl Workspace {
                     let z = tab.zones.read(cx);
                     // Zones that only show a message (a failed attach) aren't
                     // recorded, and neither is a tab of nothing else.
-                    match session::record_zones(z.tree(), z.active_id(), &mut |id| z.zone_record(id, cx)) {
+                    match session::record_zones(z.tree(), z.active_id(), &z.zone_records(cx)) {
                         None => SnapshotTab::Skip,
                         Some(recorded) => SnapshotTab::Local {
                             profile: tab.profile.name.clone(),
@@ -609,7 +611,7 @@ impl Workspace {
         // Each tab's kept sessions are detached with its layout.
         for (index, tab) in self.tabs.iter().enumerate() {
             let title = tab.manual_title.clone();
-            tab.zones.update(cx, |zones, cx| zones.quit_all(index, title.as_deref(), cx));
+            tab.zones.update(cx, |zones, cx| zones.quit_all(&self.origin, index, title.as_deref(), cx));
         }
     }
 
@@ -623,7 +625,7 @@ impl Workspace {
         }
         for (index, tab) in self.tabs.iter().enumerate() {
             if tab.origin == TabOrigin::Local {
-                tab.zones.read(cx).send_layout(index, tab.manual_title.as_deref(), cx);
+                tab.zones.read(cx).send_layout(&self.origin, index, tab.manual_title.as_deref(), cx);
             }
         }
     }
@@ -1280,7 +1282,10 @@ impl Workspace {
     /// ([`profile_rows`]), with the keys that open each in the active tab.
     fn profile_rows(&self, window: &Window, cx: &App) -> Vec<PaletteRow> {
         let focus = self.tabs.get(self.active).map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
-        profile_rows(&Self::settings(cx).profiles, |ix| shortcut(&NewTabWithProfile(ix), &focus, window))
+        let profiles = &Self::settings(cx).profiles;
+        let shortcuts: Vec<Option<SharedString>> =
+            (0..profiles.len()).map(|ix| shortcut(&NewTabWithProfile(ix), &focus, window)).collect();
+        profile_rows(profiles, &shortcuts)
     }
 
     /// Gives the profile menu the picker's rows as they are now, for its
@@ -1391,8 +1396,11 @@ impl Workspace {
         window.focus(&tab_focus);
         let types: std::collections::HashSet<std::any::TypeId> =
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
-        let commands =
-            palette_commands(|a| types.contains(&a.as_any().type_id()) || window.is_action_available(a, cx));
+        // The palette lists what the tab can run: GPUI's answer, applied.
+        let commands: Vec<_> = palette_commands()
+            .into_iter()
+            .filter(|(_, a)| types.contains(&a.as_any().type_id()) || window.is_action_available(&**a, cx))
+            .collect();
         let rows = commands
             .iter()
             .map(|(label, action)| PaletteRow {
@@ -2256,36 +2264,32 @@ fn parse_manual_title(text: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Automatic title for a local tab: the program's OSC title (ignoring empty
-/// strings and Windows' default console path titles), else the foreground
-/// process name, else the profile name.
-pub(crate) fn terminal_automatic_title(
-    osc_title: Option<&str>,
-    profile_name: &str,
-    foreground_process: impl FnOnce() -> Option<String>,
-) -> String {
-    let own = osc_title.filter(|t| {
-        !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t))
-    });
-    match own {
+/// The program's own title: its OSC title, unless that is empty or blank,
+/// or on Windows a title the console built from a program's path
+/// (`cmdline::is_console_title`). When there is none, a zone's title needs
+/// the foreground process's name ([`terminal_automatic_title`]).
+pub(crate) fn program_title(osc_title: Option<&str>) -> Option<&str> {
+    osc_title.filter(|t| !t.trim().is_empty() && !(cfg!(windows) && crate::terminal::cmdline::is_console_title(t)))
+}
+
+/// Automatic title for a zone: the program's own title ([`program_title`]),
+/// else the foreground process's name (`process_name`, which the caller
+/// looks up only when there is no program title), else the profile name.
+pub(crate) fn terminal_automatic_title(osc_title: Option<&str>, profile_name: &str, process_name: Option<String>) -> String {
+    match program_title(osc_title) {
         Some(title) => title.to_string(),
-        None => foreground_process().unwrap_or_else(|| profile_name.to_string()),
+        None => process_name.unwrap_or_else(|| profile_name.to_string()),
     }
 }
 
-/// Updates `displayed` from `manual_title` when set, else from `automatic_title`.
+/// Updates `displayed` to `manual_title` when set, else to `automatic_title`.
 /// Returns whether `displayed` changed.
-fn refresh_displayed_title(
-    displayed: &mut SharedString,
-    manual_title: Option<&str>,
-    automatic_title: impl FnOnce() -> String,
-) -> bool {
-    let title: SharedString = match manual_title {
-        Some(manual) => manual.to_string().into(),
-        None => automatic_title().into(),
-    };
-    let changed = title != *displayed;
-    *displayed = title;
+fn refresh_displayed_title(displayed: &mut SharedString, manual_title: Option<&str>, automatic_title: &str) -> bool {
+    let title = manual_title.unwrap_or(automatic_title);
+    let changed = displayed.as_ref() != title;
+    if changed {
+        *displayed = title.to_string().into();
+    }
     changed
 }
 
@@ -2343,15 +2347,16 @@ fn recorded_size(known: Size<Pixels>, outer: Size<Pixels>, inner: Size<Pixels>) 
 
 /// The profiles as the profile picker and the profile menu list them, in
 /// configuration order: each one's name, what it runs and the keys bound to
-/// opening it (`shortcut(ix)`, the keymap's ctrl-alt-N for the first nine).
-fn profile_rows(profiles: &[Profile], shortcut: impl Fn(usize) -> Option<SharedString>) -> Vec<PaletteRow> {
+/// opening it (`shortcuts[ix]`, the keymap's ctrl-alt-N for the first nine;
+/// none for a profile past the end of `shortcuts`).
+fn profile_rows(profiles: &[Profile], shortcuts: &[Option<SharedString>]) -> Vec<PaletteRow> {
     profiles
         .iter()
         .enumerate()
         .map(|(ix, profile)| PaletteRow {
             label: profile.name.clone().into(),
             detail: Some(profile.description().into()),
-            shortcut: shortcut(ix),
+            shortcut: shortcuts.get(ix).cloned().flatten(),
             disabled: false,
         })
         .collect()
@@ -2512,8 +2517,8 @@ fn keys_text(binding: &gpui::KeyBinding) -> SharedString {
 /// through the shell so values like `code -w` work.
 #[cfg(unix)]
 fn editor_command(path: &str) -> (String, Vec<String>) {
-    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "nano".into());
-    ("/bin/sh".into(), vec!["-c".into(), format!("{editor} {}", shell_quote(path))])
+    let (visual, editor) = (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
+    crate::terminal::cmdline::unix_editor_command(visual.as_deref(), editor.as_deref(), path)
 }
 
 /// The command that opens `path` in `%VISUAL%`, else `%EDITOR%`, else
@@ -2522,11 +2527,6 @@ fn editor_command(path: &str) -> (String, Vec<String>) {
 fn editor_command(path: &str) -> (String, Vec<String>) {
     let (visual, editor) = (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok());
     crate::terminal::cmdline::windows_editor_command(visual.as_deref(), editor.as_deref(), path)
-}
-
-#[cfg(unix)]
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn resize_edge(pos: Point<Pixels>, inset: Pixels, size: Size<Pixels>) -> Option<ResizeEdge> {
@@ -2957,6 +2957,13 @@ mod tests {
         s.as_ref().map(|s| s.as_ref())
     }
 
+    /// The keys that open each of `count` profiles in the default bindings,
+    /// as `Workspace::profile_rows` gathers them from the window's keymap.
+    fn profile_shortcuts(count: usize) -> Vec<Option<SharedString>> {
+        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
+        (0..count).map(|ix| default_keys(&keymap, &NewTabWithProfile(ix))).collect()
+    }
+
     /// The picker's rows and the menu's items: names in configuration
     /// order, what each runs and ctrl-alt-N from the keymap.
     #[test]
@@ -2966,8 +2973,8 @@ mod tests {
              [[profiles]]\nname = \"htop\"\ncommand = \"htop\"\n[[profiles]]\nname = \"work\"\n",
         )
         .unwrap();
-        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
-        let build = || profile_rows(&config.profiles, |ix| default_keys(&keymap, &NewTabWithProfile(ix)));
+        let shortcuts = profile_shortcuts(config.profiles.len());
+        let build = || profile_rows(&config.profiles, &shortcuts);
         let rows = build();
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
         assert_eq!(labels, ["Shell", "htop", "work"]);
@@ -2976,6 +2983,10 @@ mod tests {
         assert_eq!(text(&rows[2].detail), Some("default shell"));
         let keys: Vec<Option<&str>> = rows.iter().map(|r| text(&r.shortcut)).collect();
         assert_eq!(keys, [Some("ctrl-alt-1"), Some("ctrl-alt-2"), Some("ctrl-alt-3")]);
+        // A profile without a gathered shortcut is listed with no keys.
+        let unbound = profile_rows(&config.profiles, &shortcuts[..1]);
+        let keys: Vec<Option<&str>> = unbound.iter().map(|r| text(&r.shortcut)).collect();
+        assert_eq!(keys, [Some("ctrl-alt-1"), None, None]);
 
         // One item per row, in the same order, with nothing between them, so
         // `MenuEvent::Selected(ix)` is profile `ix`.
@@ -2996,10 +3007,7 @@ mod tests {
     fn only_the_first_nine_profiles_have_keys() {
         let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
         let config = Config::parse(&toml).unwrap();
-        let keymap = gpui::Keymap::new(crate::actions::default_bindings());
-        let entries = profile_menu_entries(profile_rows(&config.profiles, |ix| {
-            default_keys(&keymap, &NewTabWithProfile(ix))
-        }));
+        let entries = profile_menu_entries(profile_rows(&config.profiles, &profile_shortcuts(config.profiles.len())));
         assert_eq!(entries.len(), 11);
         for (ix, entry) in entries.iter().enumerate() {
             let item = entry.item().unwrap();
@@ -3125,12 +3133,6 @@ mod tests {
         assert_eq!(recorded_size(known, size(px(1200.0), px(760.0)), inner), inner);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn quoting() {
-        assert_eq!(shell_quote("/a b/c'd"), "'/a b/c'\\''d'");
-    }
-
     #[test]
     fn renamed_profiles_match_ignoring_case() {
         let renames = vec![("Work".to_string(), "Job".to_string())];
@@ -3140,52 +3142,55 @@ mod tests {
         assert_eq!(renamed("Work", &[]), None);
     }
 
+    /// The program's own title is its OSC title when that has text; on
+    /// Windows, a title the console built from a program's path isn't one.
+    #[test]
+    fn a_programs_own_title_is_not_empty_or_blank() {
+        assert_eq!(program_title(Some("vim: Cargo.toml")), Some("vim: Cargo.toml"));
+        assert_eq!(program_title(Some("  padded  ")), Some("  padded  "));
+        assert_eq!(program_title(Some("")), None);
+        assert_eq!(program_title(Some(" \t ")), None);
+        assert_eq!(program_title(None), None);
+        let console = r"C:\WINDOWS\system32\cmd.exe";
+        assert_eq!(program_title(Some(console)), (!cfg!(windows)).then_some(console));
+    }
+
+    /// A zone's automatic title: the program's own title, else the
+    /// foreground process's name, else the profile's name.
+    #[test]
+    fn the_automatic_title_is_the_programs_then_the_process_then_the_profile() {
+        let htop = || Some("htop".to_string());
+        assert_eq!(terminal_automatic_title(Some("vim: Cargo.toml"), "Shell", htop()), "vim: Cargo.toml");
+        assert_eq!(terminal_automatic_title(None, "Shell", htop()), "htop");
+        assert_eq!(terminal_automatic_title(Some("  "), "Shell", htop()), "htop");
+        assert_eq!(terminal_automatic_title(None, "Shell", None), "Shell");
+        assert_eq!(terminal_automatic_title(Some(""), "Shell", None), "Shell");
+    }
+
     #[test]
     fn title_refresh_automatic_manual_and_clear() {
         let mut displayed = SharedString::default();
         let mut manual = None;
 
-        // Unset manual title: automatic title precedence (OSC -> foreground -> profile).
-        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            terminal_automatic_title(None, "Shell", || None)
-        }));
+        // No manual title: the automatic one.
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), "Shell"));
         assert_eq!(displayed.as_ref(), "Shell");
-        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            terminal_automatic_title(None, "Shell", || None)
-        }));
-
-        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            terminal_automatic_title(None, "Shell", || Some("htop".into()))
-        }));
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), "Shell"));
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), "htop"));
         assert_eq!(displayed.as_ref(), "htop");
 
-        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            terminal_automatic_title(Some("vim: Cargo.toml"), "Shell", || Some("htop".into()))
-        }));
-        assert_eq!(displayed.as_ref(), "vim: Cargo.toml");
-
-        // Manual title trims input and overrides OSC, foreground and profile changes.
+        // A manual title is trimmed and wins over every automatic change.
         manual = parse_manual_title("  prod logs  ");
         assert_eq!(manual.as_deref(), Some("prod logs"));
-        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || "ignored".into()));
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), "htop"));
+        assert_eq!(displayed.as_ref(), "prod logs");
+        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), "python"));
         assert_eq!(displayed.as_ref(), "prod logs");
 
-        let mut probed = false;
-        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            probed = true;
-            terminal_automatic_title(Some("new-osc"), "RenamedProfile", || Some("python".into()))
-        }));
-        assert!(!probed, "automatic source is not even queried while manual title is set");
-        assert_eq!(displayed.as_ref(), "prod logs");
-        assert!(!refresh_displayed_title(&mut displayed, manual.as_deref(), || "other-title".into()));
-        assert_eq!(displayed.as_ref(), "prod logs");
-
-        // Clearing with empty/whitespace input resumes automatic title calculation.
+        // Clearing it with blank input brings back the automatic title.
         manual = parse_manual_title("   \t ");
         assert_eq!(manual, None);
-        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), || {
-            terminal_automatic_title(None, "Shell", || Some("bash".into()))
-        }));
+        assert!(refresh_displayed_title(&mut displayed, manual.as_deref(), "bash"));
         assert_eq!(displayed.as_ref(), "bash");
     }
 }

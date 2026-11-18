@@ -434,16 +434,16 @@ impl State {
         !self.sessions.is_empty() || !self.requests.is_empty() || !self.on_listing.is_empty() || !self.closing.is_empty()
     }
 
-    /// Queues `session`'s `CLOSE`, which keeps the connection in use.
-    fn closing(&mut self, session: SessionId) {
-        self.closing.push((session, Instant::now()));
+    /// Queues `session`'s `CLOSE` at `now`, which keeps the connection in use.
+    fn closing(&mut self, session: SessionId, now: Instant) {
+        self.closing.push((session, now));
     }
 
-    /// The `CLOSE`s given up, taken out: all of them once the oldest was
-    /// queued `limit` ago with no link up, else none.
-    fn give_up_closes(&mut self, limit: Duration) -> Vec<SessionId> {
+    /// The `CLOSE`s given up at `now`, taken out: all of them once the
+    /// oldest was queued `limit` ago with no link up, else none.
+    fn give_up_closes(&mut self, limit: Duration, now: Instant) -> Vec<SessionId> {
         match self.closing.first() {
-            Some(&(_, queued)) if !self.linked && queued.elapsed() >= limit => {
+            Some(&(_, queued)) if !self.linked && now.saturating_duration_since(queued) >= limit => {
                 self.closing.drain(..).map(|(session, _)| session).collect()
             }
             _ => Vec::new(),
@@ -734,7 +734,8 @@ impl Connection {
             if state.ended.is_some() {
                 return;
             }
-            let sessions = state.give_up_closes(close_limit);
+            let now = Instant::now();
+            let sessions = state.give_up_closes(close_limit, now);
             if !sessions.is_empty() {
                 let text = not_ending(&sessions, &self.name(), close_limit);
                 log::warn!("{text}");
@@ -743,7 +744,7 @@ impl Connection {
             if self.eager.load(Ordering::Acquire) || state.in_use() {
                 state.idle_since = None;
                 given_up = None;
-            } else if state.idle_since.get_or_insert_with(Instant::now).elapsed() >= idle {
+            } else if now.saturating_duration_since(*state.idle_since.get_or_insert(now)) >= idle {
                 // Under the lock, so no request slips in to wait on it.
                 let reason = given_up.take().unwrap_or_else(|| "the connection was no longer used".to_string());
                 state.ended = Some(reason.clone());
@@ -751,7 +752,7 @@ impl Connection {
                 log::info!("closing the unused connection to {}", self.name());
                 return self.ended(&reason);
             }
-            let due = state.closes_due(close_limit).map(|due| due.saturating_duration_since(Instant::now()));
+            let due = state.closes_due(close_limit).map(|due| due.saturating_duration_since(now));
             let wait = due.map_or(look, |due| due.min(look)).max(Duration::from_millis(1));
             self.wake.wait_for(&mut state, wait);
         }
@@ -826,7 +827,7 @@ impl Connection {
     /// Sends `CLOSE` for `session`, which keeps the connection in use until
     /// it is written or given up ([`State::in_use`]).
     fn send_close(&self, session: SessionId) {
-        self.state.lock().closing(session);
+        self.state.lock().closing(session, Instant::now());
         self.send(ToCore::Close(SessionRef { session }));
     }
 
@@ -838,7 +839,7 @@ impl Connection {
         let mut state = self.state.lock();
         let shown = state.forget(session, key).is_some();
         if shown && closing {
-            state.closing(session);
+            state.closing(session, Instant::now());
         }
         shown
     }
@@ -1051,7 +1052,13 @@ impl Connection {
                     if self.is_dead() {
                         return;
                     }
-                    let reason = relay_link_ended(&name, timings.dead, stamp.expired(), &ending, || wire.why());
+                    // `why` may wait for the process to exit: asked only when
+                    // the watchdog didn't end the link.
+                    let account = match stamp.expired() {
+                        true => RelayAccount::Silent(timings.dead),
+                        false => RelayAccount::Said(wire.why()),
+                    };
+                    let reason = relay_link_ended(&name, &ending, account);
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
                     self.lost_link(&name);
@@ -1840,30 +1847,32 @@ fn not_ending(sessions: &[SessionId], name: &str, limit: Duration) -> String {
     )
 }
 
+/// What the reader knows of a relay link's end besides the stream: the
+/// watchdog's verdict or the relay process's own account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayAccount {
+    /// The watchdog ended the link after this long without a read. The
+    /// process was killed, so what it says would only report that, and it
+    /// isn't asked.
+    Silent(Duration),
+    /// What the relay's process says ([`Wire::why`]: its status and what it
+    /// wrote to stderr), empty when it said nothing.
+    Said(String),
+}
+
 /// Why a relay link ended, in the order that tells the most (design
-/// decision 2): the watchdog ended it for silence (`expired`; the process
-/// was killed, so what it says would only report that); else what the relay's
-/// process says (`why`, asked only then, since it may wait for the exit: its
-/// status and what it wrote to stderr); else how the stream ended. A
-/// process that exited 0 with nothing to say is a relay that closed the
-/// connection, as it does when its core connection closes.
-fn relay_link_ended(
-    name: &str,
-    dead: Duration,
-    expired: bool,
-    ending: &Ending,
-    why: impl FnOnce() -> String,
-) -> String {
-    if expired {
-        return format!("nothing read from {name} for {}", span_text(dead));
-    }
-    let why = why();
-    if !why.is_empty() {
-        return why;
-    }
-    match ending {
-        Ending::Closed => "the relay closed the connection".to_string(),
-        Ending::Failed(error) => format!("reading from the relay failed: {error}"),
+/// decision 2): the watchdog ended it for silence; else what the relay's
+/// process says; else how the stream ended. A process that exited 0 with
+/// nothing to say is a relay that closed the connection, as it does when
+/// its core connection closes.
+fn relay_link_ended(name: &str, ending: &Ending, account: RelayAccount) -> String {
+    match account {
+        RelayAccount::Silent(dead) => format!("nothing read from {name} for {}", span_text(dead)),
+        RelayAccount::Said(why) if !why.is_empty() => why,
+        RelayAccount::Said(_) => match ending {
+            Ending::Closed => "the relay closed the connection".to_string(),
+            Ending::Failed(error) => format!("reading from the relay failed: {error}"),
+        },
     }
 }
 
@@ -3417,20 +3426,19 @@ mod tests {
     /// come in.
     #[test]
     fn a_relay_links_reason_is_the_silence_then_the_process_then_the_stream() {
-        let dead = Duration::from_secs(30);
-        let ending = |ending: &Ending, expired: bool, why: &str| {
-            relay_link_ended("A8", dead, expired, ending, || why.to_string())
-        };
+        let said = |ending: &Ending, why: &str| relay_link_ended("A8", ending, RelayAccount::Said(why.to_string()));
         let failed = Ending::Failed(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
-        // Silence wins, and never asks the process (a kill's status).
-        let never = || -> String { panic!("asked the process") };
-        assert_eq!(relay_link_ended("A8", dead, true, &Ending::Closed, never), "nothing read from A8 for 30 s");
+        // Silence wins, whatever the stream did (the process isn't asked:
+        // its status would only report the kill).
+        let silent = RelayAccount::Silent(Duration::from_secs(30));
+        assert_eq!(relay_link_ended("A8", &Ending::Closed, silent.clone()), "nothing read from A8 for 30 s");
+        assert_eq!(relay_link_ended("A8", &failed, silent), "nothing read from A8 for 30 s");
         // The process's own account.
-        assert_eq!(ending(&Ending::Closed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
-        assert_eq!(ending(&failed, false, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        assert_eq!(said(&Ending::Closed, "ssh exited with 255: boom"), "ssh exited with 255: boom");
+        assert_eq!(said(&failed, "ssh exited with 255: boom"), "ssh exited with 255: boom");
         // Nothing from the process: how the stream ended.
-        assert_eq!(ending(&Ending::Closed, false, ""), "the relay closed the connection");
-        assert_eq!(ending(&failed, false, ""), "reading from the relay failed: reset");
+        assert_eq!(said(&Ending::Closed, ""), "the relay closed the connection");
+        assert_eq!(said(&failed, ""), "reading from the relay failed: reset");
         // The local core's text is its own.
         assert_eq!(Ending::Closed.local_text(), "the terminal server closed the connection");
         assert_eq!(failed.local_text(), "reading from the terminal server failed: reset");
@@ -3885,6 +3893,28 @@ mod tests {
         assert!(Arc::ptr_eq(&forgotten.sink, &sinks[0]));
         assert!(state.sessions.is_empty());
         assert!(state.forget(1, Some(&key("k1b"))).is_none(), "once");
+    }
+
+    #[test]
+    fn closes_are_given_up_once_the_oldest_waited_the_limit_unlinked() {
+        let limit = Duration::from_secs(300);
+        let queued = Instant::now();
+        let mut state = State::default();
+        state.closing(7, queued);
+        state.closing(3, queued + Duration::from_secs(10));
+        assert!(state.in_use());
+        assert_eq!(state.closes_due(limit), Some(queued + limit));
+        // None before the limit.
+        assert!(state.give_up_closes(limit, queued + limit - Duration::from_millis(1)).is_empty());
+        // None while a link is up, however long they waited.
+        state.linked = true;
+        assert_eq!(state.closes_due(limit), None);
+        assert!(state.give_up_closes(limit, queued + limit * 2).is_empty());
+        // All of them, oldest first, once the oldest waited the limit.
+        state.linked = false;
+        assert_eq!(state.give_up_closes(limit, queued + limit), [7, 3]);
+        assert!(!state.in_use());
+        assert!(state.give_up_closes(limit, queued + limit * 2).is_empty(), "once");
     }
 
     #[test]

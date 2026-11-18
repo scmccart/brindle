@@ -1,7 +1,9 @@
 //! Architecture checks for the rules in `docs/architecture/`: the crate
-//! boundaries, the few source rules a text search can hold, and `ports R4`,
-//! which keeps production code's platform `cfg`s in their seams (the
-//! `platform_cfgs` scanner and the tree checks after it). Part of plain
+//! boundaries (closed dependency lists, no patches), the few source rules a
+//! text search can hold (its needles follow `use` items), `fcis R2` and
+//! `R3` for the whole pure modules, the opt-in suites' runners, and
+//! `ports R4`, which keeps production code's platform `cfg`s in their seams
+//! (the `platform_cfgs` scanner and the tree checks after it). Part of plain
 //! `cargo test`; it reads manifests and sources and runs nothing.
 //!
 //! Each test names the doc rules it enforces. When one fails, change the
@@ -67,34 +69,84 @@ fn manifest(dir: &str) -> toml::Table {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// The root manifest's `[workspace.dependencies]`, which a member's
+/// `{ workspace = true }` entries name.
+fn workspace_dependencies(root: &toml::Table) -> Option<&toml::Table> {
+    root.get("workspace")?.get("dependencies")?.as_table()
+}
+
+/// The package name of the dependency entry `value` under `key`: its
+/// `package = "…"` rename, else the key.
+fn package(key: &str, value: &toml::Value) -> String {
+    value
+        .get("package")
+        .and_then(|package| package.as_str())
+        .unwrap_or(key)
+        .to_string()
+}
+
 /// The package names in one dependency table (`package = "…"` renames
-/// included).
-fn names(table: &toml::Table, section: &str) -> Vec<String> {
+/// included). A `{ workspace = true }` entry is read from `workspace`, the
+/// root's `[workspace.dependencies]`, so a rename written there counts.
+fn names(table: &toml::Table, section: &str, workspace: Option<&toml::Table>) -> Vec<String> {
     let Some(deps) = table.get(section).and_then(|deps| deps.as_table()) else {
         return Vec::new();
     };
     deps.iter()
         .map(|(key, value)| {
-            value
-                .get("package")
-                .and_then(|package| package.as_str())
-                .unwrap_or(key)
-                .to_string()
+            let inherited =
+                value.get("workspace").and_then(|inherit| inherit.as_bool()) == Some(true);
+            let entry = workspace
+                .filter(|_| inherited)
+                .and_then(|workspace| workspace.get(key))
+                .unwrap_or(value);
+            package(key, entry)
+        })
+        .collect()
+}
+
+/// A manifest's dependencies of the given kinds, for every target, with
+/// `workspace` the root's `[workspace.dependencies]`.
+fn dependency_names(
+    manifest: &toml::Table,
+    workspace: Option<&toml::Table>,
+    sections: &[&str],
+) -> BTreeSet<String> {
+    let mut tables = vec![manifest];
+    if let Some(targets) = manifest.get("target").and_then(|target| target.as_table()) {
+        tables.extend(targets.values().filter_map(|target| target.as_table()));
+    }
+    tables
+        .iter()
+        .flat_map(|table| {
+            sections
+                .iter()
+                .flat_map(|section| names(table, section, workspace))
         })
         .collect()
 }
 
 /// A crate's dependencies of the given kinds, for every target.
 fn dependencies(dir: &str, sections: &[&str]) -> BTreeSet<String> {
-    let manifest = manifest(dir);
-    let mut tables = vec![&manifest];
-    if let Some(targets) = manifest.get("target").and_then(|target| target.as_table()) {
-        tables.extend(targets.values().filter_map(|target| target.as_table()));
-    }
-    tables
-        .iter()
-        .flat_map(|table| sections.iter().flat_map(|section| names(table, section)))
-        .collect()
+    let root = manifest(".");
+    dependency_names(&manifest(dir), workspace_dependencies(&root), sections)
+}
+
+/// Every crate a manifest patches or replaces, by package name: the entries
+/// of each `[patch.<source>]` table (`package = "…"` followed) and the
+/// `name:version` (or `name@version`) keys of `[replace]`.
+fn patched(manifest: &toml::Table) -> Vec<String> {
+    let table = |name: &str| manifest.get(name).and_then(|table| table.as_table());
+    let patches = table("patch")
+        .into_iter()
+        .flat_map(|sources| sources.values())
+        .filter_map(|source| source.as_table())
+        .flat_map(|source| source.iter().map(|(key, value)| package(key, value)));
+    let replaced = table("replace")
+        .into_iter()
+        .flat_map(|replace| replace.keys())
+        .map(|spec| spec.split([':', '@']).next().unwrap_or(spec).to_string());
+    patches.chain(replaced).collect()
 }
 
 const EVERY_KIND: [&str; 3] = ["dependencies", "build-dependencies", "dev-dependencies"];
@@ -133,40 +185,265 @@ enum Scope {
     BeforeTests,
 }
 
-/// Whether `line` has `needle` as a path of its own, not as the tail of a
-/// longer name (`prefs::` is not `fs::`).
-fn names_path(line: &str, needle: &str) -> bool {
-    line.match_indices(needle).any(|(at, _)| {
-        !line[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|before| before.is_alphanumeric() || before == '_')
+/// Whether `text` has `needle` as a path of its own: not the tail of a
+/// longer name (`prefs::` is not `fs::`), nor, when the needle ends in a
+/// name, its head (`std::environment` is not `std::env`).
+fn names_path(text: &str, needle: &str) -> bool {
+    let open_ended = !needle.ends_with(is_word);
+    text.match_indices(needle).any(|(at, _)| {
+        !text[..at].ends_with(is_word)
+            && (open_ended || !text[at + needle.len()..].starts_with(is_word))
     })
 }
 
-/// The lines of `files` that name one of `needles`, comments aside, as
+/// One name a `use` item brings into scope: `local` as the code writes it
+/// (`*` for a glob) and the path it stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Import {
+    local: String,
+    path: String,
+}
+
+/// The names the use tree `tree` imports below `prefix`: a path, `path as
+/// name`, `self`, a glob, or a `{…}` group of these, nested to any depth.
+fn use_tree(prefix: &str, tree: &str, imports: &mut Vec<Import>) {
+    let below = |path: &str| match (prefix, path) {
+        (prefix, "") => prefix.to_string(),
+        ("", path) => path.to_string(),
+        (prefix, path) => format!("{prefix}::{path}"),
+    };
+    let tree = tree.trim();
+    if let Some(open) = tree.find('{')
+        && let Some(inside) = tree[open + 1..].strip_suffix('}')
+    {
+        let head: String = tree[..open].split_whitespace().collect();
+        let base = below(head.trim_start_matches("::").trim_end_matches("::"));
+        for part in arguments(inside) {
+            use_tree(&base, part, imports);
+        }
+        return;
+    }
+    let words: Vec<&str> = tree.split_whitespace().collect();
+    let (path, alias) = match words.as_slice() {
+        [path @ .., "as", alias] => (path.concat(), Some(*alias)),
+        path => (path.concat(), None),
+    };
+    let path = path.trim_start_matches("::");
+    let path = match path.strip_suffix("self") {
+        Some(head) if head.is_empty() || head.ends_with("::") => head.trim_end_matches("::"),
+        Some(_) | None => path,
+    };
+    let full = below(path);
+    if full.is_empty() {
+        return;
+    }
+    let (local, path) = match full.strip_suffix('*') {
+        Some(glob) => ("*".to_string(), glob.trim_end_matches("::").to_string()),
+        None => {
+            let last = full.rsplit("::").next().unwrap_or(&full);
+            (alias.unwrap_or(last).to_string(), full.clone())
+        }
+    };
+    imports.push(Import { local, path });
+}
+
+/// The `use` items in `code` (code only, as [`code_of`] gives it), each as
+/// the offset of its `use` and the names it imports. A `use` item runs to
+/// its `;`, across lines; `use<…>` (precise capturing) isn't one.
+fn use_items(code: &str) -> Vec<(usize, Vec<Import>)> {
+    let mut items = Vec::new();
+    let mut from = 0;
+    while let Some(found) = code[from..].find("use") {
+        let at = from + found;
+        from = at + "use".len();
+        let Some(after) = keyword(code, at, "use") else {
+            continue;
+        };
+        if code[..at].ends_with(|c: char| is_word(c) || c == '#')
+            || code[skip_space(code, after)..].starts_with('<')
+        {
+            continue;
+        }
+        let Some(end) = code[after..].find(';').map(|n| after + n) else {
+            break;
+        };
+        let mut imports = Vec::new();
+        use_tree("", &code[after..end], &mut imports);
+        items.push((at, imports));
+        from = end + 1;
+    }
+    items
+}
+
+/// Every name the `use` items in `text` import, in order.
+fn use_paths(text: &str) -> Vec<Import> {
+    use_items(&code_of(text))
+        .into_iter()
+        .flat_map(|(_, imports)| imports)
+        .collect()
+}
+
+/// The paths written on `line` (two segments or more, or rooted at `::`),
+/// each with whether it was rooted, segments joined by `::`.
+fn paths_in(line: &str) -> Vec<(bool, String)> {
+    let bytes = line.as_bytes();
+    // Names are ASCII here, so every offset taken is a character boundary.
+    let ascii_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let word = |at: usize| bytes.get(at).copied().is_some_and(ascii_word);
+    let starts_name = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+    };
+    let mut paths = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let before = at.checked_sub(1).map(|before| bytes[before]);
+        if before.is_some_and(|b| ascii_word(b) || b == b':') {
+            at += 1;
+            continue;
+        }
+        let rooted = bytes[at..].starts_with(b"::") && before != Some(b'>');
+        let start = if rooted { at + 2 } else { at };
+        if !starts_name(start) {
+            at += 1;
+            continue;
+        }
+        let (mut segments, mut end) = (Vec::new(), start);
+        loop {
+            let segment = end;
+            while word(end) {
+                end += 1;
+            }
+            segments.push(&line[segment..end]);
+            if bytes[end..].starts_with(b"::") && starts_name(end + 2) {
+                end += 2;
+            } else {
+                break;
+            }
+        }
+        if rooted || segments.len() > 1 {
+            paths.push((rooted, segments.join("::")));
+        }
+        at = end;
+    }
+    paths
+}
+
+/// The paths on `line` as `imports` resolve them: a path whose first
+/// segment an import names starts with that import's path instead
+/// (`Clock::now` after `use std::time::Instant as Clock` is
+/// `std::time::Instant::now`); one that no import names stays as written,
+/// and is also taken under each glob import's path. A rooted path, or one
+/// from `std`, `core`, `crate`, `self` or `super`, is taken as written.
+fn resolved_paths(line: &str, imports: &[Import]) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for (rooted, path) in paths_in(line) {
+        let (first, rest) = path.split_once("::").unwrap_or((&path, ""));
+        if rooted || ["std", "core", "crate", "self", "super"].contains(&first) {
+            resolved.push(path);
+            continue;
+        }
+        let named: Vec<String> = imports
+            .iter()
+            .filter(|import| import.local == first)
+            .map(|import| format!("{}::{rest}", import.path))
+            .collect();
+        if named.is_empty() {
+            resolved.extend(
+                imports
+                    .iter()
+                    .filter(|import| import.local == "*")
+                    .map(|glob| format!("{}::{path}", glob.path)),
+            );
+            resolved.push(path);
+        } else {
+            resolved.extend(named);
+        }
+    }
+    resolved
+}
+
+/// The numbers of the lines among `lines` (numbered code, as [`code_lines`]
+/// and [`production_lines`] give it) that name one of `needles`
+/// ([`names_path`]): written on the line, through a path on it resolved by
+/// the imports among `lines` ([`resolved_paths`]), or as an import of a
+/// `use` item that starts on it. Today's short needles (`env::`) still match
+/// the line as written, so the imports only add sites.
+fn needle_lines(lines: &[(usize, String)], needles: &[&str]) -> Vec<usize> {
+    let code = lines
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let names = |path: &str| needles.iter().any(|needle| names_path(path, needle));
+    let items = use_items(&code);
+    let imports: Vec<Import> = items
+        .iter()
+        .flat_map(|(_, imports)| imports.iter().cloned())
+        .collect();
+    let importing: BTreeSet<usize> = items
+        .iter()
+        .filter(|(_, imports)| imports.iter().any(|import| names(&import.path)))
+        .map(|(at, _)| code[..*at].matches('\n').count())
+        .collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, line))| {
+            importing.contains(index)
+                || names(line)
+                || resolved_paths(line, &imports)
+                    .iter()
+                    .any(|path| names(path))
+        })
+        .map(|(_, (number, _))| *number)
+        .collect()
+}
+
+/// The lines of `code` that have code, numbered from 1 and trimmed.
+fn numbered(code: &str) -> Vec<(usize, String)> {
+    code.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            (!line.is_empty()).then(|| (index + 1, line.to_string()))
+        })
+        .collect()
+}
+
+/// The code lines of `text` ([`numbered`] over [`code_of`]), up to its
+/// `#[cfg(test)] mod tests` for `Scope::BeforeTests`.
+fn code_lines(text: &str, scope: Scope) -> Vec<(usize, String)> {
+    let lines = numbered(&code_of(text));
+    match scope {
+        Scope::All => lines,
+        Scope::BeforeTests => {
+            let tests = lines
+                .windows(2)
+                .position(|pair| pair[0].1 == "#[cfg(test)]" && pair[1].1.starts_with("mod tests"));
+            match tests {
+                Some(attribute) => lines[..attribute].to_vec(),
+                None => lines,
+            }
+        }
+    }
+}
+
+/// The lines of `files` that name one of `needles` ([`needle_lines`]), as
 /// `path:line: text`.
 fn offenders(files: &[PathBuf], scope: Scope, needles: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
     for file in files {
         let path = root().join(file);
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let mut previous = "";
-        for (index, line) in text.lines().enumerate() {
-            let code = line.trim();
-            if matches!(scope, Scope::BeforeTests)
-                && previous == "#[cfg(test)]"
-                && code.starts_with("mod tests")
-            {
-                break;
-            }
-            previous = code;
-            if code.starts_with("//") {
-                continue;
-            }
-            if needles.iter().any(|needle| names_path(code, needle)) {
-                found.push(format!("{}:{}: {code}", file.display(), index + 1));
-            }
+        let original: Vec<&str> = text.lines().collect();
+        for number in needle_lines(&code_lines(&text, scope), needles) {
+            found.push(format!(
+                "{}:{number}: {}",
+                file.display(),
+                original[number - 1].trim()
+            ));
         }
     }
     found
@@ -200,7 +477,11 @@ fn the_workspace_is_the_five_crates_these_rules_cover() {
     }
 }
 
-/// ports R1, R2, R3; fcis R4; railway R2 (no `anyhow` below the app).
+/// ports R1, R2, R3; fcis R4. `{ workspace = true }` entries count by the
+/// package the root's `[workspace.dependencies]` names. `railway R2`'s
+/// dependency half (no `anyhow` below the app) holds only through these
+/// closed lists, because `anyhow` is on none of them; its other half, that
+/// each crate returns its own error types, is review's.
 #[test]
 fn crates_below_the_app_name_only_their_allowed_dependencies() {
     for (dir, allowed) in ALLOWED {
@@ -216,6 +497,89 @@ fn crates_below_the_app_name_only_their_allowed_dependencies() {
              but also names {extra:?}"
         );
     }
+}
+
+/// ports R3: no manifest patches or replaces a crate. A patch swaps the
+/// code behind a name that the closed lists vouch for.
+#[test]
+fn no_dependency_is_patched_or_replaced() {
+    let found: Vec<String> = CRATES
+        .iter()
+        .flat_map(|(dir, _)| {
+            patched(&manifest(dir))
+                .into_iter()
+                .map(move |name| format!("{dir}/Cargo.toml: {name}"))
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "a [patch] or [replace] of any crate is a change to docs/architecture/ports-and-adapters.md R3 \
+         and to this test, as adding a dependency is: {found:?}"
+    );
+}
+
+/// The manifest reading: a `{ workspace = true }` entry counts as the crate
+/// the root's `[workspace.dependencies]` names, its rename included.
+#[test]
+fn a_workspace_dependency_counts_by_its_package() {
+    let root: toml::Table = r#"
+[workspace]
+members = ["ui"]
+
+[workspace.dependencies]
+term = { package = "alacritty_terminal", version = "0.26" }
+serde = "1"
+"#
+    .parse()
+    .expect("a manifest");
+    let member: toml::Table = r#"
+[dependencies]
+term = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+json = { package = "serde_json", version = "1" }
+
+[target.'cfg(windows)'.build-dependencies]
+resources = { workspace = true }
+"#
+    .parse()
+    .expect("a manifest");
+    assert_eq!(
+        dependency_names(&member, workspace_dependencies(&root), &EVERY_KIND),
+        BTreeSet::from(
+            ["alacritty_terminal", "resources", "serde", "serde_json"].map(String::from)
+        )
+    );
+}
+
+/// The manifest reading: every `[patch.*]` entry, by its package, and every
+/// `[replace]` entry, by its name.
+#[test]
+fn a_patch_or_replacement_is_found() {
+    let manifest: toml::Table = r#"
+[dependencies]
+gpui = "0.2.2"
+
+[patch.crates-io]
+libc = { git = "https://example.invalid/libc" }
+attrs = { path = "vendor/xattr", package = "xattr" }
+
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "../gpui" }
+
+[replace]
+"num-bigint-dig:0.8.4" = { path = "vendor/num-bigint-dig" }
+"#
+    .parse()
+    .expect("a manifest");
+    let found: BTreeSet<String> = patched(&manifest).into_iter().collect();
+    assert_eq!(
+        found,
+        BTreeSet::from(["gpui", "libc", "num-bigint-dig", "xattr"].map(String::from))
+    );
+    let plain: toml::Table = "[dependencies]\nlibc = \"0.2\"\n"
+        .parse()
+        .expect("a manifest");
+    assert_eq!(patched(&plain), Vec::<String>::new());
 }
 
 /// ports R1: the positive direction, so the rule can't hold vacuously.
@@ -314,22 +678,99 @@ fn the_server_core_and_holder_name_no_platform_type() {
     );
 }
 
+/// The opt-in suites (`testing R3`), by `[[test]]` target name.
+const OPT_IN_SUITES: [&str; 2] = ["e2e", "perf"];
+
+/// The root manifest's `[[test]]` target named `suite`.
+fn test_target<'a>(manifest: &'a toml::Table, suite: &str) -> &'a toml::Value {
+    manifest["test"]
+        .as_array()
+        .expect("[[test]] targets")
+        .iter()
+        .find(|test| test.get("name").and_then(|name| name.as_str()) == Some(suite))
+        .unwrap_or_else(|| panic!("no [[test]] target named {suite}"))
+}
+
 /// testing R3: the opt-in suites keep their own runner.
 #[test]
 fn the_opt_in_suites_are_harness_false_targets() {
     let manifest = manifest(".");
-    let tests = manifest["test"].as_array().expect("[[test]] targets");
-    for suite in ["e2e", "perf"] {
-        let target = tests
-            .iter()
-            .find(|test| test.get("name").and_then(|name| name.as_str()) == Some(suite))
-            .unwrap_or_else(|| panic!("no [[test]] target named {suite}"));
+    for suite in OPT_IN_SUITES {
         assert_eq!(
-            target.get("harness").and_then(|harness| harness.as_bool()),
+            test_target(&manifest, suite)
+                .get("harness")
+                .and_then(|harness| harness.as_bool()),
             Some(false),
             "{suite} must be a harness = false target"
         );
     }
+}
+
+/// What `testing R3` asks of an opt-in suite's runner that its source
+/// `text` doesn't name as a string literal in code (not in a comment): the
+/// variable that enables it (`BRINDLE_<SUITE>`), `--list` and
+/// `--self-test`. (`--shard` is not asked yet: perf has none.)
+fn runner_gaps(suite: &str, text: &str) -> Vec<&'static str> {
+    let code = code_of(text);
+    let in_code = |literal: &str| {
+        text.match_indices(literal)
+            .any(|(at, _)| code.as_bytes()[at] == b'"')
+    };
+    let variable = format!("\"BRINDLE_{}\"", suite.to_uppercase());
+    [
+        (variable.as_str(), "its variable, BRINDLE_<SUITE>"),
+        ("\"--list\"", "--list"),
+        ("\"--self-test\"", "--self-test"),
+    ]
+    .into_iter()
+    .filter(|(literal, _)| !in_code(literal))
+    .map(|(_, gap)| gap)
+    .collect()
+}
+
+/// testing R3: each opt-in suite's runner has its enabling variable,
+/// `--list` and a `--self-test` (which holds the harness's own pure helpers,
+/// `fcis R8` binding production code only).
+#[test]
+fn each_opt_in_runner_has_its_variable_list_and_self_test() {
+    let manifest = manifest(".");
+    for suite in OPT_IN_SUITES {
+        let path = test_target(&manifest, suite)
+            .get("path")
+            .and_then(|path| path.as_str())
+            .unwrap_or_else(|| panic!("the {suite} target names its runner's path"));
+        let file = root().join(path);
+        let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let gaps = runner_gaps(suite, &text);
+        assert!(
+            gaps.is_empty(),
+            "{path}, the {suite} runner, lacks {gaps:?} \
+             (docs/architecture/testing-architecture.md R3)"
+        );
+    }
+}
+
+/// The runner check: a runner missing a feature is found, and one written
+/// only in a comment doesn't count.
+#[test]
+fn a_runner_without_a_self_test_is_found() {
+    let runner = r#"//! BRINDLE_SOAK=1 cargo test --test soak -- --self-test
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // "--self-test" comes later.
+    if std::env::var("BRINDLE_SOAK").as_deref() != Ok("1") {
+        return;
+    }
+    if args.iter().any(|a| a == "--list") {
+        list();
+    }
+}
+"#;
+    assert_eq!(runner_gaps("soak", runner), ["--self-test"]);
+    assert_eq!(
+        runner_gaps("other", runner),
+        ["its variable, BRINDLE_<SUITE>", "--self-test"]
+    );
 }
 
 /// The search itself: a path of its own counts, the tail of a longer name
@@ -341,6 +782,313 @@ fn a_needle_matches_only_a_path_of_its_own() {
     assert!(names_path("(env::var_os(name))", "env::"));
     assert!(!names_path("prefs::load()", "fs::"));
     assert!(!names_path("self.subprocess::<T>()", "process::"));
+}
+
+/// The needles follow `use` items: grouped, nested over several lines, and
+/// renamed. An import of a needle is itself a site.
+#[test]
+fn a_needle_follows_grouped_nested_and_renamed_imports() {
+    let text = "use std::{fs, env};
+use std::{
+    time::{Instant, SystemTime},
+    env as vars,
+};
+use std::time::Instant as Clock;
+pub(crate) use std::process::*;
+fn f() {
+    let now = Clock::now();
+    let id = id();
+}
+";
+    let imports = use_paths(text);
+    let import = |local: &str, path: &str| Import {
+        local: local.to_string(),
+        path: path.to_string(),
+    };
+    assert_eq!(
+        imports,
+        [
+            import("fs", "std::fs"),
+            import("env", "std::env"),
+            import("Instant", "std::time::Instant"),
+            import("SystemTime", "std::time::SystemTime"),
+            import("vars", "std::env"),
+            import("Clock", "std::time::Instant"),
+            import("*", "std::process"),
+        ]
+    );
+    assert_eq!(
+        resolved_paths("let now = Clock::now();", &imports),
+        ["std::time::Instant::now"]
+    );
+    assert_eq!(
+        resolved_paths("vars::var(name)", &imports),
+        ["std::env::var"]
+    );
+    let lines = numbered(&code_of(text));
+    assert_eq!(needle_lines(&lines, &["std::env"]), [1, 2]);
+    assert_eq!(needle_lines(&lines, &["std::fs"]), [1]);
+    assert_eq!(needle_lines(&lines, &["std::time::Instant::now"]), [9]);
+    assert_eq!(needle_lines(&lines, &["Instant::now"]), [9]);
+    assert_eq!(needle_lines(&lines, &["std::process"]), [7]);
+}
+
+/// A path written in full is a site without any import, rooted or not.
+#[test]
+fn a_needle_matches_a_path_written_in_full() {
+    let text = "fn f() {
+    let started = std::time::SystemTime::now();
+    let home = ::std::env::var(\"HOME\");
+}
+";
+    assert_eq!(
+        resolved_paths("let home = ::std::env::var(\"HOME\");", &[]),
+        ["std::env::var"]
+    );
+    let lines = numbered(&code_of(text));
+    assert_eq!(needle_lines(&lines, &["std::time::SystemTime::now"]), [2]);
+    assert_eq!(needle_lines(&lines, &["SystemTime::now"]), [2]);
+    assert_eq!(needle_lines(&lines, &["std::env"]), [3]);
+}
+
+/// A needle is a whole path segment: not the head of a longer name, not
+/// the tail of one, and not in a comment.
+#[test]
+fn a_needle_does_not_match_a_longer_name() {
+    let text = "use std::environment;
+use crate::terminal::process;
+fn f() {
+    prefs::load();
+    process::name();
+    // use std::env;
+    /* use std::fs; */
+    let path = \"std::fs\";
+}
+";
+    let lines = numbered(&code_of(text));
+    assert_eq!(needle_lines(&lines, &["std::env"]), Vec::<usize>::new());
+    assert_eq!(
+        needle_lines(&lines, &["fs::", "std::fs"]),
+        Vec::<usize>::new()
+    );
+    assert_eq!(needle_lines(&lines, &["std::process"]), Vec::<usize>::new());
+    assert!(!names_path("std::environment", "std::env"));
+    assert!(!names_path("Instant::now_or_never()", "Instant::now"));
+}
+
+// fcis R2, R3: the whole pure modules read nothing ambient.
+
+/// The whole pure modules: the files of `fcis`'s "Whole pure modules"
+/// table (`docs/architecture/functional-core-imperative-shell.md`), whose
+/// term-core row `term_core_does_no_io_and_reads_no_clock` covers. The pure
+/// items in shell modules are review's. This mirrors that table and changes
+/// with it, in the same commit.
+const PURE_MODULES: [&str; 15] = [
+    "src/terminal/keys.rs",
+    "src/terminal/mouse.rs",
+    "src/terminal/cmdline.rs",
+    "src/notify/policy.rs",
+    "src/layout.rs",
+    "src/reattach.rs",
+    "ui/src/filter.rs",
+    "ui/src/primitives/placement.rs",
+    "remote-protocol/src/client.rs",
+    "remote-protocol/src/holder.rs",
+    "remote-protocol/src/wire.rs",
+    "remote-protocol/src/version.rs",
+    "remote-protocol/src/relay.rs",
+    "remote-protocol/src/upgrade.rs",
+    "remote-agent/src/conpty/cmdline.rs",
+];
+
+/// The type names that make a `static` mutable state (a name containing
+/// one counts: `RefCell`, `AtomicU64`).
+const MUTABLE_STATICS: [&str; 6] = ["OnceLock", "LazyLock", "Mutex", "RwLock", "Cell", "Atomic"];
+
+/// File-system calls a pure module never makes: a probe is passed in
+/// (`fcis R5`), never called as a method.
+const FS_METHODS: [&str; 9] = [
+    ".is_file()",
+    ".is_dir()",
+    ".exists()",
+    ".try_exists(",
+    ".metadata()",
+    ".symlink_metadata()",
+    ".canonicalize()",
+    ".read_dir()",
+    ".read_link()",
+];
+
+/// The numbers of the lines among `lines` (numbered code) that declare
+/// mutable state: a `static mut`, a `static` whose type names one of
+/// `MUTABLE_STATICS`, or `thread_local!`. A `'static` lifetime isn't one.
+fn mutable_static_lines(lines: &[(usize, String)]) -> Vec<usize> {
+    let code = lines
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut found = BTreeSet::new();
+    for (at, _) in code.match_indices("static") {
+        let Some(after) = keyword(&code, at, "static") else {
+            continue;
+        };
+        if code[..at].ends_with(|c: char| is_word(c) || c == '\'') {
+            continue;
+        }
+        let rest = &code[after..];
+        let declaration = &rest[..rest.find(['=', ';']).unwrap_or(rest.len())];
+        let mutable = keyword(declaration, skip_space(declaration, 0), "mut").is_some()
+            || declaration
+                .split_once(':')
+                .is_some_and(|(_, kind)| MUTABLE_STATICS.iter().any(|name| kind.contains(name)));
+        if mutable {
+            found.insert(code[..at].matches('\n').count());
+        }
+    }
+    for (at, _) in code.match_indices("thread_local!") {
+        if !code[..at].ends_with(is_word) {
+            found.insert(code[..at].matches('\n').count());
+        }
+    }
+    found.into_iter().map(|index| lines[index].0).collect()
+}
+
+/// The numbers of the lines of `text`'s production code ([`production_lines`])
+/// that read something ambient (`fcis R2`, `R3`): the IO and clock needles,
+/// imports followed ([`needle_lines`]), a mutable static, or a file-system
+/// method (`FS_METHODS`).
+fn ambient_reads(text: &str) -> Vec<usize> {
+    let lines = production_lines(text);
+    let needles = [&IO[..], &CLOCK_AND_THREADS[..]].concat();
+    let mut found: BTreeSet<usize> = needle_lines(&lines, &needles).into_iter().collect();
+    found.extend(mutable_static_lines(&lines));
+    found.extend(
+        lines
+            .iter()
+            .filter(|(_, line)| FS_METHODS.iter().any(|method| line.contains(method)))
+            .map(|(number, _)| *number),
+    );
+    found.into_iter().collect()
+}
+
+/// fcis R2, R3: a whole pure module's production code reads no clock,
+/// environment, file, process, thread, network or mutable static. Its
+/// tests may (`fcis R8` asks only that they need none).
+#[test]
+fn the_pure_modules_read_nothing_ambient() {
+    let mut found = Vec::new();
+    for file in PURE_MODULES {
+        let path = root().join(file);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let original: Vec<&str> = text.lines().collect();
+        found.extend(
+            ambient_reads(&text)
+                .into_iter()
+                .map(|number| format!("{file}:{number}: {}", original[number - 1].trim())),
+        );
+    }
+    assert_none(
+        found,
+        "a whole pure module takes time, the environment and facts about the system as \
+         arguments (docs/architecture/functional-core-imperative-shell.md R2, R3, R5): \
+         read them in the shell and pass them in, or pass a probe",
+    );
+}
+
+/// fcis: every whole pure module is a file there is.
+#[test]
+fn every_pure_module_exists() {
+    let missing: Vec<&str> = PURE_MODULES
+        .into_iter()
+        .filter(|file| !root().join(file).is_file())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "PURE_MODULES names files that don't exist; change it with fcis's \
+         \"Whole pure modules\" table: {missing:?}"
+    );
+}
+
+/// `path` with each `{a,b}` group expanded, in order.
+fn expand_braces(path: &str) -> Vec<String> {
+    let Some((head, rest)) = path.split_once('{') else {
+        return vec![path.to_string()];
+    };
+    let Some((group, tail)) = rest.split_once('}') else {
+        return vec![path.to_string()];
+    };
+    group
+        .split(',')
+        .flat_map(|choice| expand_braces(&format!("{head}{}{tail}", choice.trim())))
+        .collect()
+}
+
+/// The files of `fcis`'s "Whole pure modules" table: the backticked `.rs`
+/// paths in its first column, `{a,b}` expanded. The term-core row names a
+/// crate, not a file, so it gives none.
+fn fcis_whole_modules(doc: &str) -> BTreeSet<String> {
+    doc.lines()
+        .skip_while(|line| !line.starts_with("### Whole pure modules"))
+        .skip(1)
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| line.starts_with('|'))
+        .skip(2)
+        .filter_map(|row| row.split('|').nth(1))
+        .flat_map(|cell| {
+            cell.split('`')
+                .skip(1)
+                .step_by(2)
+                .flat_map(expand_braces)
+                .collect::<Vec<_>>()
+        })
+        .filter(|path| path.ends_with(".rs"))
+        .collect()
+}
+
+/// fcis: `PURE_MODULES` and the doc's table list the same files.
+#[test]
+fn the_pure_module_list_matches_the_fcis_table() {
+    let path = root().join("docs/architecture/functional-core-imperative-shell.md");
+    let doc = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(
+        fcis_whole_modules(&doc),
+        PURE_MODULES.iter().map(|file| file.to_string()).collect(),
+        "fcis's \"Whole pure modules\" table and PURE_MODULES must list the same files"
+    );
+}
+
+/// The pure-module check finds each kind of ambient read in production
+/// code, and nothing in test code.
+#[test]
+fn a_pure_module_reading_the_world_is_found() {
+    let text = "use std::{env, fs};
+use std::time::Instant as Clock;
+static ID: OnceLock<String> = OnceLock::new();
+fn candidate(path: &Path) -> bool {
+    path.is_file()
+}
+fn started() -> SystemTime {
+    std::time::SystemTime::now()
+}
+fn elapsed(since: Instant) -> Duration {
+    Clock::now() - since
+}
+static NAMES: &[&'static str] = &[\"static mut\"];
+fn probe(is_file: impl Fn(&Path) -> bool, path: &Path) -> bool {
+    is_file(path)
+}
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+    static LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn t() {
+        let _ = Instant::now();
+    }
+}
+";
+    assert_eq!(ambient_reads(text), [1, 3, 5, 8, 11]);
 }
 
 // ports R4: a platform `cfg` in production code stays in the seam that owns
@@ -537,6 +1285,15 @@ fn predicate(text: &str) -> Predicate {
     }
 }
 
+/// `code[range]` as spaces, newlines kept.
+fn blank(code: &mut [u8], range: Range<usize>) {
+    for byte in &mut code[range] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
 /// `text` with its comments and the insides of its string and character
 /// literals blanked (newlines kept), so that only code is searched while
 /// every offset and line number still matches `text`. Quotes stay, so a
@@ -544,13 +1301,6 @@ fn predicate(text: &str) -> Predicate {
 fn code_of(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut code = bytes.to_vec();
-    let blank = |code: &mut [u8], range: Range<usize>| {
-        for byte in &mut code[range] {
-            if *byte != b'\n' {
-                *byte = b' ';
-            }
-        }
-    };
     let word_at = |at: Option<usize>| at.is_some_and(|at| is_word(char::from(bytes[at])));
     let mut at = 0;
     while at < bytes.len() {
@@ -714,14 +1464,14 @@ enum Meta<'a> {
     Other,
 }
 
-/// The parts of `text` between commas outside brackets, trimmed, without
-/// empty ones.
+/// The parts of `text` between commas outside brackets (a `cfg_attr`'s
+/// arguments, a `use` group's trees), trimmed, without empty ones.
 fn arguments(text: &str) -> Vec<&str> {
     let (mut parts, mut depth, mut start) = (Vec::new(), 0, 0);
     for (at, c) in text.char_indices() {
         match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => {
                 parts.push(&text[start..at]);
                 start = at + 1;
@@ -870,6 +1620,87 @@ fn in_seams(file: &str, seams: &[&str]) -> bool {
     })
 }
 
+/// The outer attributes starting at `at` (on one item), and the offset of
+/// that item.
+fn outer_attributes(code: &str, first: Attribute) -> (Vec<Attribute>, usize) {
+    let mut item = skip_space(code, first.end);
+    let mut attributes = vec![first];
+    while let Some(next) = attribute_at(code, item).filter(|next| !next.inner) {
+        item = skip_space(code, next.end);
+        attributes.push(next);
+    }
+    (attributes, item)
+}
+
+/// A file's production code, as `ports R4` and `fcis R8` read it.
+struct Production {
+    /// The file's code ([`code_of`]) with its test code blanked too, so that
+    /// offsets and line numbers still match the text.
+    code: String,
+    /// The `mod NAME;` declarations in its test code, each with its
+    /// `#[path]`: their files are test code too.
+    test_modules: Vec<(String, Option<String>)>,
+}
+
+/// `text`'s production code. Test code is an item under a test-only `cfg`
+/// (`#[cfg(test)]`, `#[cfg(all(test, …))]`), read to its `;` or to the
+/// brace that closes its first `{`, and everything after an inner
+/// `#![cfg(test)]`.
+fn production(text: &str) -> Production {
+    let mut code = code_of(text);
+    let (mut tests, mut test_modules) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    while at < code.len() {
+        if let Some(attribute) = attribute_at(&code, at).filter(|attribute| attribute.inner) {
+            match meta(&code, text, &attribute) {
+                Meta::Cfg(cfg) if predicate(cfg) == Predicate::TestOnly => {
+                    // The rest of the module is test code.
+                    tests.push(attribute.start..code.len());
+                    break;
+                }
+                Meta::Cfg(_) | Meta::CfgAttr(..) | Meta::Path(_) | Meta::Other => {}
+            }
+            at = attribute.end;
+        } else if let Some(first) = attribute_at(&code, at) {
+            let start = first.start;
+            let (attributes, item) = outer_attributes(&code, first);
+            let (mut test, mut file) = (false, None);
+            for attribute in &attributes {
+                match meta(&code, text, attribute) {
+                    Meta::Cfg(cfg) => test |= predicate(cfg) == Predicate::TestOnly,
+                    Meta::Path(path) => file = Some(path.to_string()),
+                    Meta::CfgAttr(..) | Meta::Other => {}
+                }
+            }
+            if test {
+                if let Some(name) = mod_declaration(&code, item) {
+                    test_modules.push((name.to_string(), file));
+                }
+                at = item_end(&code, item);
+                tests.push(start..at);
+            } else {
+                at = item;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    let mut bytes = std::mem::take(&mut code).into_bytes();
+    for range in tests {
+        blank(&mut bytes, range);
+    }
+    Production {
+        code: String::from_utf8(bytes).expect("blanking whole items keeps UTF-8"),
+        test_modules,
+    }
+}
+
+/// The production code lines of `text` ([`production`]), numbered from 1
+/// and trimmed, without the empty ones.
+fn production_lines(text: &str) -> Vec<(usize, String)> {
+    numbered(&production(text).code)
+}
+
 /// What scanning one file for platform `cfg`s found.
 #[derive(Debug, Default)]
 struct Scan {
@@ -882,9 +1713,8 @@ struct Scan {
 /// The platform `cfg`s in `text`, the file at `path` (`ports R4`): every
 /// `cfg(…)` and `cfg!(…)` whose predicate names a platform, and every
 /// `cfg_attr(…)` whose first argument does, outer or inner, except
-/// - test code: an item under a test-only `cfg`, read to its `;` or to the
-///   brace that closes its first `{` (a `mod NAME;` there is returned as a
-///   test module, whose file is test code too);
+/// - test code, as [`production`] finds it (a `mod NAME;` there is returned
+///   as a test module, whose file is test code too);
 /// - a seam's module declaration: a platform `cfg` on `mod NAME;`, among
 ///   any other attributes, whose file is in `seams`;
 /// - a lint-only `cfg_attr`, which sets only `allow`, `expect`, `warn` or
@@ -893,21 +1723,17 @@ struct Scan {
 /// Comments and the insides of literals are skipped. `files` are the files
 /// there are, for finding a module's (`/`-separated, as `path` is).
 fn platform_cfgs(path: &str, text: &str, seams: &[&str], files: &BTreeSet<String>) -> Scan {
-    let code = code_of(text);
+    let Production { code, test_modules } = production(text);
     let bytes = code.as_bytes();
-    let (mut found, mut test_modules) = (Vec::new(), Vec::new());
+    let mut found = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         if let Some(attribute) = attribute_at(&code, at).filter(|attribute| attribute.inner) {
             match meta(&code, text, &attribute) {
                 Meta::Cfg(cfg) => match predicate(cfg) {
-                    // The rest of the module is test code.
-                    Predicate::TestOnly => {
-                        at = code.len();
-                        continue;
-                    }
                     Predicate::Platform => found.push(attribute.start),
-                    Predicate::Neither => {}
+                    // Test code is blanked already.
+                    Predicate::TestOnly | Predicate::Neither => {}
                 },
                 Meta::CfgAttr(cfg, set) => match predicate(cfg) {
                     Predicate::Platform if !lint_only(&set) => found.push(attribute.start),
@@ -918,19 +1744,13 @@ fn platform_cfgs(path: &str, text: &str, seams: &[&str], files: &BTreeSet<String
             at = attribute.end;
         } else if let Some(first) = attribute_at(&code, at) {
             // The outer attributes on one item, then the item.
-            let mut item = skip_space(&code, first.end);
-            let mut attributes = vec![first];
-            while let Some(next) = attribute_at(&code, item).filter(|next| !next.inner) {
-                item = skip_space(&code, next.end);
-                attributes.push(next);
-            }
-            let (mut test, mut gates, mut others, mut file) = (false, Vec::new(), Vec::new(), None);
+            let (attributes, item) = outer_attributes(&code, first);
+            let (mut gates, mut others, mut file) = (Vec::new(), Vec::new(), None);
             for attribute in &attributes {
                 match meta(&code, text, attribute) {
                     Meta::Cfg(cfg) => match predicate(cfg) {
-                        Predicate::TestOnly => test = true,
                         Predicate::Platform => gates.push(attribute.start),
-                        Predicate::Neither => {}
+                        Predicate::TestOnly | Predicate::Neither => {}
                     },
                     Meta::CfgAttr(cfg, set) => match predicate(cfg) {
                         Predicate::Platform if !lint_only(&set) => others.push(attribute.start),
@@ -942,16 +1762,11 @@ fn platform_cfgs(path: &str, text: &str, seams: &[&str], files: &BTreeSet<String
             }
             let module =
                 mod_declaration(&code, item).map(|name| module_file(path, name, file, files));
-            if test {
-                test_modules.extend(module);
-                at = item_end(&code, item);
-            } else {
-                if !module.is_some_and(|module| in_seams(&module, seams)) {
-                    found.extend(gates);
-                }
-                found.extend(others);
-                at = item;
+            if !module.is_some_and(|module| in_seams(&module, seams)) {
+                found.extend(gates);
             }
+            found.extend(others);
+            at = item;
         } else if bytes[at..].starts_with(b"cfg!")
             && !at
                 .checked_sub(1)
@@ -982,7 +1797,10 @@ fn platform_cfgs(path: &str, text: &str, seams: &[&str], files: &BTreeSet<String
         .collect();
     Scan {
         sites,
-        test_modules,
+        test_modules: test_modules
+            .iter()
+            .map(|(name, file)| module_file(path, name, file.as_deref(), files))
+            .collect(),
     }
 }
 

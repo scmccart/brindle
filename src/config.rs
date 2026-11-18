@@ -275,19 +275,23 @@ impl Profile {
         format!("{target_prefix}{base}")
     }
 
-    pub fn working_directory(&self) -> Option<PathBuf> {
+    /// The profile's `cwd`, with a leading `~` expanded to `home` for a local
+    /// profile. A remote profile's is the endpoint's to expand.
+    pub fn working_directory(&self, home: Option<&Path>) -> Option<PathBuf> {
         self.cwd.as_deref().map(|path| {
-            if self.remote.is_some() { PathBuf::from(path) } else { expand_tilde(path) }
+            if self.remote.is_some() { PathBuf::from(path) } else { expand_tilde(path, home) }
         })
     }
 }
 
-pub fn expand_tilde(path: &str) -> PathBuf {
+/// `path` with a leading `~` or `~/` replaced by `home`; as written when
+/// there is no home directory.
+pub fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
     if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+        return home.map_or_else(|| PathBuf::from(path), Path::to_path_buf);
     }
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = home
     {
         return home.join(rest);
     }
@@ -495,10 +499,23 @@ mod tests {
         assert_eq!(config.default_profile_index(), 1);
         let work = &config.profiles[1];
         assert_eq!(work.env.get("FOO").map(String::as_str), Some("bar"));
-        assert!(work.working_directory().unwrap().ends_with("src"));
+        assert_eq!(work.working_directory(Some(Path::new("/home/u"))), Some(PathBuf::from("/home/u/src")));
         assert_eq!(config.font.size, 96.0);
         let theme = config.theme(None);
         assert_eq!(theme.background.to_string(), "#000000");
+    }
+
+    #[test]
+    fn a_tilde_without_a_home_stays_as_written() {
+        let home = Some(Path::new("/home/u"));
+        assert_eq!(expand_tilde("~", home), PathBuf::from("/home/u"));
+        assert_eq!(expand_tilde("~/src", home), PathBuf::from("/home/u/src"));
+        assert_eq!(expand_tilde("~", None), PathBuf::from("~"));
+        assert_eq!(expand_tilde("~/src", None), PathBuf::from("~/src"));
+        // Only a leading `~` or `~/` is the home directory.
+        for as_written in ["~other/src", "/srv/~/x", "src"] {
+            assert_eq!(expand_tilde(as_written, home), PathBuf::from(as_written));
+        }
     }
 
     #[test]
@@ -539,7 +556,7 @@ mod tests {
         }
         assert_eq!(config.profiles[0].description(), "ssh:A8 · default shell");
         assert_eq!(config.profiles[1].description(), "container:rust-box · default shell");
-        assert_eq!(config.profiles[0].working_directory(), Some(PathBuf::from("~/src")));
+        assert_eq!(config.profiles[0].working_directory(Some(Path::new("/home/u"))), Some(PathBuf::from("~/src")));
         assert!(Config::parse(
             "[[profiles]]\nname = \"bad\"\nremote = { type = \"ssh\", host = \"A8\", password = \"secret\" }"
         )

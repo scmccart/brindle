@@ -53,7 +53,12 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         log::info!("starting the terminal server without a scope of its own: {reason}");
     }
     let args = ["serve".into(), "--ready-fd".into(), "3".into()];
-    let mut command = scope::command(&decision, "serve", endpoint.helper.as_os_str(), &args);
+    let mut command = scope::command(
+        &decision,
+        &scope::new_unit_name("serve"),
+        endpoint.helper.as_os_str(),
+        &args,
+    );
     command
         .envs(endpoint.role_env.iter().cloned())
         .stdin(Stdio::null())

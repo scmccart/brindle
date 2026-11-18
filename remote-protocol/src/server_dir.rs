@@ -22,54 +22,72 @@ pub const CORE_SOCKET: &str = "core.sock";
 /// The core's log, in the server directory.
 pub const CORE_LOG: &str = "core.log";
 
-/// Where the server directory is, from the variables' values (empty counts
-/// as unset). Relative paths are made absolute, since the server changes
-/// its working directory to `/`.
-pub fn resolve(
+/// Which directory is the server's, from the variables' values (empty counts
+/// as unset). The path comes back as given, so a relative variable gives a
+/// relative path; [`resolve`] makes it absolute.
+pub fn choose(
     server_dir: Option<OsString>,
     runtime_dir: Option<OsString>,
     home: Option<PathBuf>,
 ) -> io::Result<PathBuf> {
     let set = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    let dir = if let Some(dir) = set(server_dir) {
-        PathBuf::from(dir)
+    if let Some(dir) = set(server_dir) {
+        Ok(PathBuf::from(dir))
     } else if let Some(runtime) = set(runtime_dir) {
-        PathBuf::from(runtime).join("brindle")
+        Ok(PathBuf::from(runtime).join("brindle"))
     } else if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
-        home.join(".cache/brindle/run")
+        Ok(home.join(".cache/brindle/run"))
     } else {
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::NotFound,
             "no server directory: BRINDLE_SERVER_DIR, XDG_RUNTIME_DIR and HOME are all unset",
-        ));
-    };
-    std::path::absolute(dir)
+        ))
+    }
 }
 
-/// Where the server directory is on Windows, from the variables' values
+/// Where the server directory is: [`choose`]'s path made absolute, since the
+/// server changes its working directory to `/`. Reads the working directory.
+pub fn resolve(
+    server_dir: Option<OsString>,
+    runtime_dir: Option<OsString>,
+    home: Option<PathBuf>,
+) -> io::Result<PathBuf> {
+    choose(server_dir, runtime_dir, home).and_then(std::path::absolute)
+}
+
+/// Which directory is the server's on Windows, from the variables' values
 /// (empty counts as unset). `BRINDLE_SERVER_DIR` is used as given, elevated
 /// or not; otherwise the directory is under `%LOCALAPPDATA%\brindle`, and an
-/// elevated process gets its own, `run-elevated`. Relative paths are made
-/// absolute.
-pub fn resolve_windows(
+/// elevated process gets its own, `run-elevated`. The path comes back as
+/// given; [`resolve_windows`] makes it absolute.
+pub fn choose_windows(
     server_dir: Option<OsString>,
     local_app_data: Option<OsString>,
     elevated: bool,
 ) -> io::Result<PathBuf> {
     let set = |value: Option<OsString>| value.filter(|value| !value.is_empty());
-    let dir = if let Some(dir) = set(server_dir) {
-        PathBuf::from(dir)
+    if let Some(dir) = set(server_dir) {
+        Ok(PathBuf::from(dir))
     } else if let Some(base) = set(local_app_data) {
-        PathBuf::from(base)
+        Ok(PathBuf::from(base)
             .join("brindle")
-            .join(if elevated { "run-elevated" } else { "run" })
+            .join(if elevated { "run-elevated" } else { "run" }))
     } else {
-        return Err(io::Error::new(
+        Err(io::Error::new(
             io::ErrorKind::NotFound,
             "no server directory: BRINDLE_SERVER_DIR and LOCALAPPDATA are both unset",
-        ));
-    };
-    std::path::absolute(dir)
+        ))
+    }
+}
+
+/// Where the server directory is on Windows: [`choose_windows`]'s path made
+/// absolute. Reads the working directory (and its drive).
+pub fn resolve_windows(
+    server_dir: Option<OsString>,
+    local_app_data: Option<OsString>,
+    elevated: bool,
+) -> io::Result<PathBuf> {
+    choose_windows(server_dir, local_app_data, elevated).and_then(std::path::absolute)
 }
 
 /// FNV-1a (64-bit) over the directory's encoded bytes, then the SID's, so
@@ -141,53 +159,68 @@ mod tests {
         Some(OsString::from(value))
     }
 
-    // Unix paths: on Windows, `std::path::absolute` adds the current drive.
-    #[cfg(unix)]
     #[test]
     fn the_variables_are_used_in_order() {
         let home = Some(PathBuf::from("/home/u"));
         assert_eq!(
-            resolve(os("/srv/b"), os("/run/user/1"), home.clone()).unwrap(),
+            choose(os("/srv/b"), os("/run/user/1"), home.clone()).unwrap(),
             PathBuf::from("/srv/b")
         );
         assert_eq!(
-            resolve(None, os("/run/user/1"), home.clone()).unwrap(),
-            PathBuf::from("/run/user/1/brindle")
+            choose(None, os("/run/user/1"), home.clone()).unwrap(),
+            PathBuf::from("/run/user/1").join("brindle")
         );
         assert_eq!(
-            resolve(os(""), os(""), home.clone()).unwrap(),
-            PathBuf::from("/home/u/.cache/brindle/run")
+            choose(os(""), os(""), home.clone()).unwrap(),
+            PathBuf::from("/home/u").join(".cache/brindle/run")
         );
     }
 
     #[test]
-    fn nothing_set_is_an_error_and_relative_paths_become_absolute() {
-        assert!(resolve(None, None, None).is_err());
+    fn nothing_set_is_an_error_and_a_relative_directory_comes_back_as_given() {
+        assert!(choose(None, None, None).is_err());
+        assert!(choose(os(""), os(""), Some(PathBuf::new())).is_err());
+        assert_eq!(
+            choose(os("rel/dir"), None, None).unwrap(),
+            PathBuf::from("rel/dir")
+        );
+    }
+
+    #[test]
+    fn resolving_makes_the_chosen_directory_absolute() {
         let relative = resolve(os("rel/dir"), None, None).unwrap();
         assert!(relative.is_absolute() && relative.ends_with("rel/dir"));
     }
 
-    // Windows-style values are only compared as strings or built with `join`,
-    // so these hold on any host; `resolve_windows` is checked through
-    // `ends_with`, since `std::path::absolute` differs per platform.
+    // Windows-style values are only built with `join`, so these hold on any
+    // host.
     #[test]
     fn windows_directory_follows_the_variables() {
         let base = || os(r"C:\Users\u\AppData\Local");
-        let plain = resolve_windows(None, base(), false).unwrap();
-        assert!(plain.ends_with(Path::new("brindle").join("run")));
-        let elevated = resolve_windows(os(""), base(), true).unwrap();
-        assert!(elevated.ends_with(Path::new("brindle").join("run-elevated")));
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        assert_eq!(
+            choose_windows(None, base(), false).unwrap(),
+            local.join("brindle").join("run")
+        );
+        assert_eq!(
+            choose_windows(os(""), base(), true).unwrap(),
+            local.join("brindle").join("run-elevated")
+        );
         // BRINDLE_SERVER_DIR is used as given, even when elevated.
-        let named = resolve_windows(os("rel/dir"), base(), true).unwrap();
-        assert!(named.is_absolute() && named.ends_with("rel/dir"));
-        let named = resolve_windows(os("srv"), None, true).unwrap();
-        assert!(named.ends_with("srv"));
+        assert_eq!(
+            choose_windows(os("rel/dir"), base(), true).unwrap(),
+            PathBuf::from("rel/dir")
+        );
+        assert_eq!(
+            choose_windows(os("srv"), None, true).unwrap(),
+            PathBuf::from("srv")
+        );
     }
 
     #[test]
     fn windows_directory_with_nothing_set_names_both_variables() {
         for local in [None, os("")] {
-            let message = resolve_windows(None, local, false).unwrap_err().to_string();
+            let message = choose_windows(None, local, false).unwrap_err().to_string();
             assert!(message.contains("BRINDLE_SERVER_DIR") && message.contains("LOCALAPPDATA"));
         }
     }

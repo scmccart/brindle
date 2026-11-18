@@ -34,6 +34,17 @@ pub fn age(started: u64, now: u64) -> Option<String>
 impl RateLimiter { pub fn allow(&mut self, tab: u64, source: Source, now: Instant) -> bool }
 ```
 
+**A probe for a path the function derived.** When the decision is "the first candidate that exists", the function builds the candidates and asks a read-only probe about each (R5); the shell passes the real check, and tests pass a closure over a set.
+
+```rust
+// remote-protocol/src/scope.rs: whether the user manager's socket exists, whether a PATH entry's systemd-run is executable
+pub fn decide(no_scope: Option<&OsStr>, runtime_dir: Option<&OsStr>, path: Option<&OsStr>,
+              exists: impl Fn(&Path) -> bool, executable: impl Fn(&Path) -> bool) -> Outcome
+// src/terminal/cmdline.rs: pwsh, then powershell, in each PATH entry; the shell passes `|path| path.is_file()`
+pub fn windows_default_program(path_dirs: impl IntoIterator<Item = PathBuf>, comspec: Option<&str>,
+                               is_file: impl Fn(&Path) -> bool) -> (String, Vec<String>)
+```
+
 **A model under a view.** The model owns the state and every rule about it; the view owns focus, entities and painting.
 
 ```rust
@@ -50,19 +61,33 @@ pub struct SessionsModel { … }
 
 ## How it applies here
 
+### Whole pure modules (checked by `tests/architecture.rs`)
+
+Every line of production code in these is pure. `the_pure_modules_read_nothing_ambient` holds each file to R2 and R3, and its list is this table's.
+
 | Pure code | What it decides |
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
-| `src/terminal/pace.rs` (`step`) | when the event task waits |
-| `src/terminal/cmdline.rs` | the Windows default program, the editor command, the merged environment |
+| `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
-| `src/layout.rs` (`record`, `group`), `src/session.rs` (`merge_windows`, `drop_lost_zones`) | which tabs and splits a launch rebuilds |
+| `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
-| `src/picker.rs` (`SessionsModel`, `session_palette`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
-| `ui/src/text_input.rs` (`EditState`), `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | editing, filtering, where an overlay goes |
-| `remote-protocol/src/{client,holder,wire,version,relay}.rs`, `upgrade::is_newer` | encoding, decoding, version negotiation, whether a build is newer |
+| `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | filtering, where an overlay goes |
+| `remote-protocol/src/{client,holder,wire,version,relay,upgrade}.rs` | encoding, decoding, version negotiation, whether a build is newer |
 | `remote-agent/src/conpty/cmdline.rs` | launch-line quoting |
+
+### Pure items in shell modules (held by review)
+
+These modules mix pure items with shell code, which a text search can't tell apart, so review holds the items to R2, R3 and R5.
+
+| Pure code | What it decides |
+| --- | --- |
+| `src/terminal/pace.rs` (`step`) | when the event task waits |
+| `src/session.rs` (`merge_windows`, `drop_lost_zones`, `record_zones`, `resolve_tab`) | which windows, tabs and zones a launch restores, and the zones a tab is saved with |
+| `src/settings.rs` (`Settings::new`) | the fonts and sizes a config and a preview resolve to |
+| `src/picker.rs` (`SessionsModel`, `session_palette`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows |
+| `ui/src/text_input.rs` (`EditState`) | editing |
 
 The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Palette`, the settings dialog), `TerminalElement`'s paint, the connection's reader and writer threads, the holder's and the server core's loop handlers, and `main.rs`.
 
@@ -72,11 +97,11 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 - **R2.** Pure code MUST take time as an argument (`now: Instant`, seconds as `u64`) and MUST NOT call `Instant::now()` or `SystemTime::now()`. Random values (tokens, session keys) are made in the shell and passed in.
 - **R3.** Pure code MUST NOT read the environment, files, `/proc`, sockets, GPUI globals or mutable statics. The caller reads them and passes values.
 - **R4.** `brindle-term-core` MUST stay pure as a crate: no filesystem, network, process, environment, thread or clock call, and no dependency beyond `alacritty_terminal`, `base64` and `parking_lot`. It is what makes the server core's emulator and the app's agree.
-- **R5.** Pure functions and models MUST take and return plain values: no `Entity`, `Window`, `App` or `Context`, no `Task`, no socket or handle, no callback that reaches the world. A view holds its model; the model never holds the view.
+- **R5.** Pure functions and models MUST take and return plain values: no `Entity`, `Window`, `App` or `Context`, no `Task`, no socket or handle, no callback that reaches the world. A view holds its model; the model never holds the view. A probe is allowed: a read-only `Fn(&Path) -> bool` (or a check of the same kind) that answers one question about a path the function itself derived, such as whether a candidate is a file. The shell passes the real check; tests pass a closure over plain values. A callback that acts, waits, or reads an entity, a window or a process is not a probe.
 - **R6.** Parsing, marks, status and replay logic MUST live in `brindle-term-core` and be used by both the app and the server core. Never fork that logic into `src/` or `remote-agent/`: the two would drift, and replays would differ from what the client drew.
 - **R7.** A pure helper MUST compile and be tested on every platform, whichever platform's data it handles. Don't `cfg`-gate logic; `cfg` belongs to the seam that calls it (`ports R4`). Don't use `Path` on another platform's paths.
-- **R8.** Every pure function and model MUST ship with unit tests in its own file's `#[cfg(test)] mod tests` that need no display, server, clock or sleep (`testing R1`).
-- **R9.** A function that decides *and* acts SHOULD be split: return what to do as data (rows and the index to keep, the tabs to open, the frame to send), and let the caller do it. Reach for a callback parameter only when the output must interleave with a stream in order.
+- **R8.** Every pure function and model MUST ship with unit tests in its own file's `#[cfg(test)] mod tests` that need no display, server, clock or sleep (`testing R1`). R8 binds production code (as `ports R4` defines it: each crate's `src/` and build scripts). Test code is out of its scope: the e2e and perf harnesses' own pure helpers are held by the harness's `--self-test` (`testing R3`).
+- **R9.** A function that decides *and* acts SHOULD be split: return what to do as data (rows and the index to keep, the tabs to open, the frame to send), and let the caller do it. Reach for a callback parameter only when the output must interleave with a stream in order, or for a probe (R5).
 - **R10.** A new conditional in a view, a thread or a loop handler SHOULD be questioned in review. If it chooses between outcomes from state, it moves into the model or a pure function, and the shell dispatches on a richer return value.
 
 ## Anti-patterns
@@ -84,6 +109,7 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 - **A view method that compares fields to decide what a palette lists or which tab opens.** Instead: the model returns the rows or the choice (R1).
 - **`Instant::now()` inside a policy or a limiter.** Instead: `now` is a parameter (R2).
 - **`std::env::var` inside a helper that picks a program or a path.** Instead: the caller passes the values (R3), as `windows_editor_command` takes `visual` and `editor`.
+- **A callback that reads an entity, a window or a process inside pure code.** It is not a probe. Instead: the shell gathers the value (R5).
 - **A copy of an OSC or mark rule in the app "because the server doesn't need it".** Instead: one implementation in `brindle-term-core` (R6).
 - **A helper behind `#[cfg(windows)]` that only manipulates strings.** Instead: ungated and tested everywhere (R7).
 - **Checking a rule through the e2e suite because the rule lives in a view.** Instead: move the rule into a model and unit-test it; keep one e2e case for the wiring.
@@ -91,8 +117,9 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 ## Enforcement
 
 - `tests/architecture.rs` checks R4: `term_core_does_no_io_and_reads_no_clock` (source search) and `crates_below_the_app_name_only_their_allowed_dependencies` (the closed dependency list). `the_wire_modules_do_no_io` holds the same for the protocol's message modules.
+- `the_pure_modules_read_nothing_ambient` checks R2 and R3 for the whole pure modules (the first table in "How it applies here"). Their production code calls no clock, names nothing of `std::{fs, net, process, env, thread}`, declares no mutable static (`OnceLock`, `LazyLock`, `Mutex`, `RwLock`, `Cell`, `Atomic…`, `static mut`, `thread_local!`) and calls no file-system method (`.is_file()`, `.exists()`, `.metadata()` and the like), so a probe is passed in. The search follows `use` items (grouped, nested, renamed, globs) and full paths, as every source search in that file does, and skips test code. `the_pure_module_list_matches_the_fcis_table` keeps its list equal to the table, `every_pure_module_exists` keeps each file real, and `a_pure_module_reading_the_world_is_found` plants each kind of read and a test-only `Instant::now()` that must not count.
 - `platform_cfgs_stay_in_their_seams` (`ports R4`) holds R7's `cfg` half in production code: outside the seams and `ports R4`'s excepted files nothing is platform-gated, and `brindle-term-core` has no platform `cfg` at all. Testing on every platform, and keeping `Path` off another platform's paths, are review matters.
-- R1–R3 and R5–R10 otherwise rely on review. Nothing stops a pure module in `src/` from calling `Instant::now()` except the reviewer.
+- R1 and R5–R10 otherwise rely on review, as do R2 and R3 for the pure items in shell modules (the second table). Only the reviewer stops an item row, such as `pace::step` or `session::resolve_tab`, from calling `Instant::now()`; the check stops a whole module.
 
 ## PR checklist
 

@@ -83,13 +83,11 @@ pub const BUILTIN_UI_FAMILIES: &[&str] = &[
 pub const SYSTEM_UI_FONT: &str = ".SystemUIFont";
 
 impl Settings {
-    pub fn new(config: Config, config_error: Option<String>, cx: &App) -> Self {
-        let installed = installed_families(cx);
-        let font_family = resolve_family(&config.font.family, &installed);
-        log::info!("using font family {font_family:?}");
-        let font = terminal_font(font_family, &installed);
+    /// The settings for `config`, its fonts resolved against the
+    /// `installed` families.
+    pub fn new(config: Config, config_error: Option<String>, installed: Vec<String>) -> Self {
+        let font = terminal_font(resolve_family(&config.font.family, &installed), &installed);
         let ui_font_family = resolve_ui_family(&config.ui_font.family, &installed);
-        log::info!("using UI font family {ui_font_family:?}");
         Self {
             config,
             config_error,
@@ -99,6 +97,16 @@ impl Settings {
             installed,
             preview: None,
         }
+    }
+
+    /// [`Settings::new`] with the families the platform has installed
+    /// ([`installed_families`]), logging the two it resolved.
+    pub fn from_platform(config: Config, config_error: Option<String>, cx: &App) -> Self {
+        let settings = Self::new(config, config_error, installed_families(cx));
+        let (font_family, ui_font_family): (&str, &str) = (&settings.font.family, &settings.ui_font_family);
+        log::info!("using font family {font_family:?}");
+        log::info!("using UI font family {ui_font_family:?}");
+        settings
     }
 
     /// Makes the config's global theme the active `brindle-ui` token set,
@@ -417,7 +425,7 @@ mod tests {
         in_headless_app(|cx| {
             let config = Config::default();
             let config_theme = config.theme(None);
-            cx.set_global(Settings::new(config, None, cx));
+            cx.set_global(Settings::from_platform(config, None, cx));
 
             Settings::apply_ui_theme(cx);
             let before = *cx.ui_theme();
@@ -442,41 +450,60 @@ mod tests {
     /// wins over its size, and clearing it brings back the config's fonts.
     #[test]
     fn a_font_preview_overrides_the_config_until_cleared() {
-        in_headless_app(|cx| {
-            let mut settings = Settings::new(Config::default(), None, cx);
-            settings.installed = names(&["Cascadia Mono", "Consolas", "Arial", "Segoe UI"]);
-            let (font, ui) = (settings.font(), settings.ui_font_family());
-            settings.set_font_preview(Some(FontPreview {
-                terminal_family: Some(FamilyChoice::Family("Consolas".into())),
-                size: Some(20.0),
-                line_height: Some(1.5),
-                ui_family: Some(FamilyChoice::Family("Arial".into())),
-            }));
-            assert_eq!(settings.font().family.as_ref(), "Consolas");
-            assert_eq!(settings.font_size(None), px(20.0));
-            assert_eq!(settings.font_size(Some(11.0)), px(11.0));
-            assert_eq!(settings.line_height(), 1.5);
-            assert_eq!(settings.ui_font_family().as_ref(), "Arial");
-            assert!(settings.font_preview().is_some());
+        let mut settings =
+            Settings::new(Config::default(), None, names(&["Cascadia Mono", "Consolas", "Arial", "Segoe UI"]));
+        let (font, ui) = (settings.font(), settings.ui_font_family());
+        // The config's lists, resolved against the installed families.
+        assert_eq!(font.family.as_ref(), "Cascadia Mono");
+        assert_eq!(ui.as_ref(), "Segoe UI");
+        settings.set_font_preview(Some(FontPreview {
+            terminal_family: Some(FamilyChoice::Family("Consolas".into())),
+            size: Some(20.0),
+            line_height: Some(1.5),
+            ui_family: Some(FamilyChoice::Family("Arial".into())),
+        }));
+        assert_eq!(settings.font().family.as_ref(), "Consolas");
+        assert_eq!(settings.font_size(None), px(20.0));
+        assert_eq!(settings.font_size(Some(11.0)), px(11.0));
+        assert_eq!(settings.line_height(), 1.5);
+        assert_eq!(settings.ui_font_family().as_ref(), "Arial");
+        assert!(settings.font_preview().is_some());
 
-            // Only what the preview changes is overridden.
-            settings.set_font_preview(Some(FontPreview { size: Some(18.0), ..Default::default() }));
-            assert_eq!(settings.font(), font);
-            assert_eq!(settings.ui_font_family(), ui);
-            assert_eq!(settings.line_height(), 1.25);
-            settings.set_font_preview(Some(FontPreview {
-                ui_family: Some(FamilyChoice::Default),
-                ..Default::default()
-            }));
-            assert_eq!(settings.ui_font_family().as_ref(), "Segoe UI");
+        // Only what the preview changes is overridden.
+        settings.set_font_preview(Some(FontPreview { size: Some(18.0), ..Default::default() }));
+        assert_eq!(settings.font(), font);
+        assert_eq!(settings.ui_font_family(), ui);
+        assert_eq!(settings.line_height(), 1.25);
+        settings.set_font_preview(Some(FontPreview {
+            ui_family: Some(FamilyChoice::Default),
+            ..Default::default()
+        }));
+        assert_eq!(settings.ui_font_family().as_ref(), "Segoe UI");
 
-            settings.set_font_preview(None);
-            assert_eq!(settings.font(), font);
-            assert_eq!(settings.font_size(None), px(14.0));
-            assert_eq!(settings.ui_font_family(), ui);
-            // A preview that changes nothing is none.
-            settings.set_font_preview(Some(FontPreview::default()));
-            assert!(settings.font_preview().is_none());
-        });
+        settings.set_font_preview(None);
+        assert_eq!(settings.font(), font);
+        assert_eq!(settings.font_size(None), px(14.0));
+        assert_eq!(settings.ui_font_family(), ui);
+        // A preview that changes nothing is none.
+        settings.set_font_preview(Some(FontPreview::default()));
+        assert!(settings.font_preview().is_none());
+    }
+
+    /// A terminal's size, its profile's or the config's plus the zoom,
+    /// stays within 5 to 96 pixels.
+    #[test]
+    fn font_sizes_are_clamped_to_5_to_96() {
+        let mut settings = Settings::new(Config::default(), None, names(&["DejaVu Sans Mono"]));
+        assert_eq!(settings.font_size(Some(1.0)), px(5.0));
+        assert_eq!(settings.font_size(Some(200.0)), px(96.0));
+        assert_eq!(settings.font_size(Some(12.0)), px(12.0));
+
+        settings.zoom = 10.0;
+        assert_eq!(settings.font_size(Some(1.0)), px(11.0));
+        assert_eq!(settings.font_size(Some(90.0)), px(96.0));
+        assert_eq!(settings.font_size(None), px(24.0));
+        settings.zoom = -20.0;
+        assert_eq!(settings.font_size(Some(12.0)), px(5.0));
+        assert_eq!(settings.font_size(Some(200.0)), px(96.0));
     }
 }
