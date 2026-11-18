@@ -442,7 +442,7 @@ pub fn ssh_network(ctx: &Ctx) -> Result<Outcome> {
         .wait_for(SSH_PROMPT)
         .send(&format!("echo $$ > {PID_FILE}; echo before-$((1+1)) $$\r"))
         .wait_for("before-2")
-        .wait_for("lost; reconnecting")
+        .wait_for("); reconnecting")
         // Typed while the link is down: queued, and run once it is back.
         .send("echo queued-$((40+2))\r")
         .wait_for("queued-42")
@@ -454,6 +454,15 @@ pub fn ssh_network(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(50.0)
         .run()?;
     no_waits_left(&out.dump)?;
+    // The lost line the run waited for names why the link ended in
+    // parentheses (it is gone from the screen by now, the reconnect's replay
+    // having redrawn it): ssh's own account, or that nothing was read for
+    // the dead-link limit, which the log says in the same words.
+    let log = fs::read_to_string(ctx.dir.join("run.log")).unwrap_or_default();
+    ensure!(
+        log.contains("ended (ssh") || log.contains("ended (nothing read"),
+        "the link's end doesn't name its cause: {log:?}"
+    );
     let before = shown_pid(&out.dump, "before-2 ")?;
     let after = shown_pid(&out.dump, "after-2 ")?;
     ensure!(

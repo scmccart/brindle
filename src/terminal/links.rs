@@ -106,34 +106,76 @@ pub fn has_scheme(uri: &str) -> bool {
         && !uri.chars().any(char::is_control)
 }
 
+/// Why a link wasn't opened.
+#[derive(Debug)]
+pub enum OpenError {
+    /// Refused before anything ran.
+    NoScheme,
+    /// The opener thread couldn't start.
+    NoThread(std::io::Error),
+    /// The opener program couldn't be run.
+    NotStarted { program: String, error: std::io::Error },
+    /// The opener ran and failed: its exit code, or none when a signal
+    /// ended it.
+    Failed { program: String, code: Option<i32> },
+    /// `ShellExecuteW` returned `code`, which is 32 or less (Windows).
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows opener makes it; the text is tested everywhere"))]
+    Shell { code: usize },
+}
+
+/// What a failed open says in the tab where the link was clicked
+/// (`railway R8`: the action, then the cause).
+pub fn failure_text(uri: &str, error: &OpenError) -> String {
+    let why = match error {
+        OpenError::NoScheme => "it has no URI scheme".to_string(),
+        OpenError::NoThread(error) => format!("the opener's thread couldn't start: {error}"),
+        OpenError::NotStarted { program, error } => format!("couldn't run {program}: {error}"),
+        OpenError::Failed { program, code: Some(code) } => format!("{program} exited with status {code}"),
+        OpenError::Failed { program, code: None } => format!("{program} was ended by a signal"),
+        OpenError::Shell { code } => format!("the shell couldn't open it (ShellExecute returned {code})"),
+    };
+    format!("couldn't open {uri}: {why}")
+}
+
+/// What opening a link answers: `Ok` once the opener has run and succeeded.
+pub type Opened = futures::channel::oneshot::Receiver<Result<(), OpenError>>;
+
+/// An answer already known.
+fn answered(result: Result<(), OpenError>) -> Opened {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    tx.send(result).ok();
+    rx
+}
+
 /// Opens `uri` with `$BRINDLE_LINK_OPENER`, or else `xdg-open` (on Windows,
-/// the shell's handler for it), without waiting.
-pub fn open(uri: &str) {
+/// the shell's handler for it), without waiting: the receiver answers when
+/// the opener has finished, or at once when it can't run. A uri with no
+/// scheme is refused ([`OpenError::NoScheme`]).
+pub fn open(uri: &str) -> Opened {
+    if !has_scheme(uri) {
+        return answered(Err(OpenError::NoScheme));
+    }
     match std::env::var(OPENER_ENV).ok().filter(|p| !p.is_empty()) {
-        Some(program) => drop(open_with(program, uri.to_string())),
+        Some(program) => open_with(program, uri.to_string()),
         None => open_default(uri.to_string()),
     }
 }
 
 #[cfg(not(windows))]
-fn open_default(uri: String) {
-    open_with(DEFAULT_OPENER.into(), uri);
+fn open_default(uri: String) -> Opened {
+    open_with(DEFAULT_OPENER.into(), uri)
 }
 
 /// Has the shell open `uri` with its default handler (the browser, for a
 /// web link), on its own thread: handlers can take a while to start.
 #[cfg(windows)]
-fn open_default(uri: String) {
+fn open_default(uri: String) -> Opened {
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::{HSTRING, w};
 
-    if !has_scheme(&uri) {
-        log::warn!("not opening {uri:?}: it has no URI scheme");
-        return;
-    }
-    let spawned = std::thread::Builder::new().name("link-opener".into()).spawn(move || {
+    on_opener_thread(move || {
         log::info!("opening {uri}");
         // SAFETY: COM is initialized once for this short-lived thread, as
         // ShellExecute asks of its callers; the strings outlive the call.
@@ -142,37 +184,59 @@ fn open_default(uri: String) {
             ShellExecuteW(None, w!("open"), &HSTRING::from(uri.as_str()), None, None, SW_SHOWNORMAL)
         };
         // Values up to 32 are errors.
-        if result.0 as usize <= 32 {
-            log::warn!("could not open {uri}: ShellExecute returned {}", result.0 as usize);
-        }
-    });
-    if let Err(err) = spawned {
-        log::warn!("could not start the link opener thread: {err}");
-    }
+        let code = result.0 as usize;
+        if code <= 32 { Err(OpenError::Shell { code }) } else { Ok(()) }
+    })
 }
 
-/// Runs `program uri` on its own thread (spawning and reaping it there), so
-/// the UI never waits for the opener and it never lingers as a zombie.
-fn open_with(program: String, uri: String) -> Option<std::thread::JoinHandle<()>> {
-    if !has_scheme(&uri) {
-        log::warn!("not opening {uri:?}: it has no URI scheme");
-        return None;
-    }
+/// Runs `work` on a thread of its own, so the UI never waits for the opener
+/// and it never lingers as a zombie, and answers with its result; or with
+/// [`OpenError::NoThread`] when the thread can't start.
+fn on_opener_thread(work: impl FnOnce() -> Result<(), OpenError> + Send + 'static) -> Opened {
+    use std::sync::Arc;
+
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let slot = Arc::new(parking_lot::Mutex::new(Some(tx)));
+    let for_thread = slot.clone();
     let spawned = std::thread::Builder::new().name("link-opener".into()).spawn(move || {
-        log::info!("opening {uri} with {program}");
-        let mut command = Command::new(&program);
-        command.arg(&uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        crate::remote::hide_window(&mut command);
-        let child = command.spawn();
-        match child.and_then(|mut child| child.wait()) {
-            Ok(status) if !status.success() => log::warn!("{program} {uri}: {status}"),
-            Ok(_) => {}
-            Err(err) => log::warn!("could not run {program} to open {uri}: {err}"),
+        let result = work();
+        if let Some(tx) = for_thread.lock().take() {
+            tx.send(result).ok();
         }
     });
-    spawned.map_err(|err| log::warn!("could not start the link opener thread: {err}")).ok()
+    if let Err(error) = spawned
+        && let Some(tx) = slot.lock().take()
+    {
+        tx.send(Err(OpenError::NoThread(error))).ok();
+    }
+    rx
+}
+
+/// Runs `program uri` on its own thread (spawning and reaping it there).
+fn open_with(program: String, uri: String) -> Opened {
+    if !has_scheme(&uri) {
+        return answered(Err(OpenError::NoScheme));
+    }
+    on_opener_thread(move || run_opener(&program, &uri))
+}
+
+/// Runs `program uri` and waits for it, with the uri as the one argument.
+fn run_opener(program: &str, uri: &str) -> Result<(), OpenError> {
+    log::info!("opening {uri} with {program}");
+    let mut command = Command::new(program);
+    command.arg(uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    crate::remote::hide_window(&mut command);
+    let status = command
+        .spawn()
+        .and_then(|mut child| child.wait())
+        .map_err(|error| OpenError::NotStarted { program: program.to_string(), error })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OpenError::Failed { program: program.to_string(), code: status.code() })
+    }
 }
 
 #[cfg(test)]
@@ -299,11 +363,12 @@ mod tests {
 ", out.display())).unwrap();
 
         let uri = "https://example.com/a b?c=1&d='e'";
-        open_with(script.display().to_string(), uri.into()).unwrap().join().unwrap();
+        run_opener(&script.display().to_string(), uri).unwrap();
         let recorded = std::fs::read_to_string(&out).unwrap();
         assert_eq!(recorded.trim_end(), format!("\"{uri}\"|"));
 
-        assert!(open_with(script.display().to_string(), "-rf".into()).is_none());
+        let mut refused = open_with(script.display().to_string(), "-rf".into());
+        assert!(matches!(refused.try_recv(), Ok(Some(Err(OpenError::NoScheme)))));
     }
 
     #[cfg(unix)]
@@ -318,9 +383,51 @@ mod tests {
         );
 
         let uri = "https://example.com/a b?c=1&d='e'";
-        open_with(script.display().to_string(), uri.into()).unwrap().join().unwrap();
+        run_opener(&script.display().to_string(), uri).unwrap();
         assert_eq!(std::fs::read_to_string(&out).unwrap(), format!("1|{uri}"));
 
-        assert!(open_with(script.display().to_string(), "-rf".into()).is_none());
+        let mut refused = open_with(script.display().to_string(), "-rf".into());
+        assert!(matches!(refused.try_recv(), Ok(Some(Err(OpenError::NoScheme)))));
+    }
+
+    #[test]
+    fn no_scheme_says_so() {
+        assert_eq!(failure_text("-rf", &OpenError::NoScheme), "couldn't open -rf: it has no URI scheme");
+    }
+
+    #[test]
+    fn a_missing_program_names_it_and_the_error() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory");
+        let text = failure_text("https://example.com", &OpenError::NotStarted { program: "xdg-open".into(), error });
+        assert_eq!(text, "couldn't open https://example.com: couldn't run xdg-open: no such file or directory");
+    }
+
+    #[test]
+    fn an_exit_status_is_named() {
+        let failed = |code| OpenError::Failed { program: "xdg-open".into(), code };
+        assert_eq!(
+            failure_text("https://example.com", &failed(Some(4))),
+            "couldn't open https://example.com: xdg-open exited with status 4"
+        );
+        assert_eq!(
+            failure_text("https://example.com", &failed(None)),
+            "couldn't open https://example.com: xdg-open was ended by a signal"
+        );
+        assert_eq!(
+            failure_text("https://example.com", &OpenError::Shell { code: 31 }),
+            "couldn't open https://example.com: the shell couldn't open it (ShellExecute returned 31)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_opener_answers_with_its_status() {
+        let dir = crate::test_support::TempDir::new("opener-fails");
+        let script = dir.join("fail");
+        crate::test_support::write_executable(&script, "#!/bin/sh\nexit 4\n");
+        let error = run_opener(&script.display().to_string(), "https://example.com").unwrap_err();
+        assert!(matches!(error, OpenError::Failed { code: Some(4), .. }), "{error:?}");
+        let error = run_opener(&dir.join("missing").display().to_string(), "https://example.com").unwrap_err();
+        assert!(matches!(error, OpenError::NotStarted { .. }), "{error:?}");
     }
 }

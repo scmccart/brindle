@@ -14,6 +14,7 @@ mod dump;
 mod fonts;
 mod input;
 mod instance;
+mod launch;
 mod links;
 mod local_server;
 mod multi_window;
@@ -94,6 +95,9 @@ fn unix() -> Vec<Case> {
         display("input-prompt-preselected", input::prompt_preselected),
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
+        display("links-opener-fails", links::opener_fails),
+        display("launch-unknown-profile", launch::unknown_profile),
+        display("profile-shortcut-missing", launch::shortcut_missing),
         display("restore-local-tabs", restore::local_tabs),
         display("restore-fallbacks", restore::fallbacks),
         display("restore-no-state-dir", restore::no_state_dir),
@@ -180,6 +184,10 @@ fn unix() -> Vec<Case> {
         display("local-server-holder-lost", local_server::holder_lost),
         display("local-server-reused-id", local_server::reused_id),
         display("local-server-sink-panic", local_server::sink_panic),
+        display("local-server-session-error", local_server::session_error),
+        // Unix only: the case makes the server directory unreadable with a mode.
+        #[cfg(unix)]
+        display("local-server-no-core-back", local_server::no_core_back),
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),

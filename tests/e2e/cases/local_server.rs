@@ -1466,6 +1466,81 @@ pub fn sink_panic(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// What the case sets `BRINDLE_TEST_HOLDER_PANIC` to: a holder panics, in
+/// a debug build, handling an `INPUT` whose bytes hold it.
+const HOLDER_FAULT: &str = "brindle-test-holder-panic";
+
+/// A failure of the session's holder on one input (the fault switch
+/// `BRINDLE_TEST_HOLDER_PANIC`) is reported in the tab as a notice line,
+/// and the session keeps taking input: a command typed after it runs, and
+/// the line is on the screen once.
+pub fn session_error(ctx: &Ctx) -> Result<Outcome> {
+    let out = Run::new(ctx, "run")
+        .env("BRINDLE_TEST_HOLDER_PANIC", HOLDER_FAULT)
+        .prompt()
+        .send(HOLDER_FAULT)
+        .wait_for("the holder failed handling INPUT")
+        .send(&format!("{}\r", echo_sum("ok", 1, 1)))
+        .wait_for("ok-2")
+        .dump_at(later(8.0))
+        .run()?;
+    ensure!(
+        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+        "waits that gave up: {:?}, still waiting: {:?} (the fault switch is in debug builds only)",
+        out.dump.wait_timeouts,
+        out.dump.wait_pending
+    );
+    let text = out.dump.screen.join("\n");
+    let notices = text.matches("the terminal server: the holder failed handling INPUT").count();
+    ensure!(notices == 1, "the notice is on the screen {notices} times: {text:?}");
+    Ok(Outcome::Pass)
+}
+
+/// The core and the holder of a tab's session killed while the server's
+/// directory can't be read, so no core comes back: the tab's lost line says
+/// why (the error the last attempt met), not only that none came back. The
+/// directory's mode is restored before the case ends.
+#[cfg(unix)]
+pub fn no_core_back(ctx: &Ctx) -> Result<Outcome> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let srv = Server::of(ctx);
+    let dir = ctx.server_dir.clone();
+    let set_mode = move |mode: u32| {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod {mode:o} {}: {e}", dir.display()))
+    };
+    let lock = set_mode.clone();
+    let unlock = set_mode;
+    let run = Run::new(ctx, "run")
+        // The sessions are gone, and the directory can't be listed.
+        .keep_detached()
+        .prompt()
+        .call_at(later(2.0), move |_| {
+            let listed = srv.attached(10.0)?;
+            let holder = parent(listed.pid)?.filter(|&pid| is_holder(pid)).ok_or("no holder")?;
+            let core = srv.core().ok_or("no core running")?;
+            lock(0o000)?;
+            // The core first, so none is left to tell the tab its holder
+            // ended: the session is lost with no server to come back.
+            kill(core)?;
+            kill(holder)
+        })
+        .wait_for("Session lost:")
+        .dump_at(later(40.0))
+        .run();
+    // Whatever the run did: the harness removes the directory afterwards.
+    let restored = unlock(0o700);
+    let out = run?;
+    restored?;
+    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    let text = out.dump.screen.join("\n");
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {text:?}", out.dump.wait_timeouts);
+    ensure!(text.contains("no terminal server came back within 15 s:"), "no cause after the timeout: {text:?}");
+    ensure!(text.contains("Permission denied"), "the lost line doesn't name the system's error: {text:?}");
+    Ok(Outcome::Pass)
+}
+
 /// Brindle with no helper beside it shows the missing-helper error; a tab
 /// opened once the helper is installed beside it runs in the server. On
 /// Windows, `BRINDLE_SERVER_HELPER` names the helper's place while it is

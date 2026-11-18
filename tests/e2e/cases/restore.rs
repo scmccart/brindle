@@ -104,6 +104,12 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(titles(&out.dump.tabs) == ["bash*", "bash"], "restored tabs {:?}", out.dump.tabs);
     ensure!(printed_pwd(&out.dump.screen, &home), "pwd: {:?}", out.dump.screen);
+    // The restored tab of the removed profile (the active one) says so.
+    let text = out.dump.screen.join("\n");
+    ensure!(
+        text.contains("this tab's profile \"Removed\" is gone from the config; using Shell"),
+        "the restored tab doesn't say its profile is gone: {text:?}"
+    );
 
     for (label, text, log) in [
         ("corrupt", "this is [not a state file", "not a valid state file"),

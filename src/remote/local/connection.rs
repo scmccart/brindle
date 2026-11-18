@@ -125,6 +125,7 @@ use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
 use crate::remote::protocol::{Frame, RequestId, SessionId};
 use crate::remote::{ListedSession, SessionKey};
+use crate::terminal::tab_note;
 
 /// How long a request waits for its answer (a spawn's `SPAWNED`, an
 /// attach's `REPLAY_START`) on the local core, a reconnect included.
@@ -171,6 +172,11 @@ static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 pub trait SessionSink: Send {
     /// Output from the program, or from a replay.
     fn output(&mut self, bytes: &[u8]);
+    /// A failure that belongs to this tab but doesn't end the session: one
+    /// dim line after what the terminal shows (`tab_note`). It is held back
+    /// while a replay is, and a repeat is shown once until the session
+    /// prints again.
+    fn note(&mut self, text: &str);
     /// A replay starts (`true`) or ends.
     fn replay(&mut self, active: bool);
     /// The program exited.
@@ -1140,7 +1146,7 @@ impl Connection {
                     let reason = relay_link_ended(&name, &ending, account);
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
                     self.disconnected(&reason);
-                    self.lost_link(&name);
+                    self.lost_link(&name, &reason);
                     self.report_now(LinkState::Offline(format!("connection lost: {reason}")));
                 }
                 Err(_) if self.is_dead() => return,
@@ -1327,7 +1333,13 @@ impl Connection {
                 let pending = error.req.and_then(|req| self.state.lock().requests.remove(&req));
                 match pending {
                     Some(pending) => pending.waiting.fail(error.message),
-                    None => log::debug!("terminal server: {}", error.message),
+                    None => match error.session {
+                        // An answer to no request, about one session: its
+                        // tab says so (the holder's fault reports, a refused
+                        // input), once until the session prints again.
+                        Some(session) if error.req.is_none() => self.session_error(session, &error.message),
+                        Some(_) | None => log::debug!("terminal server: {}", error.message),
+                    },
                 }
             }
             ToClient::Sessions(sessions) if self.state.lock().list.is_none_or(|listing| listing.req != sessions.req) => {
@@ -1466,6 +1478,27 @@ impl Connection {
         }
     }
 
+    /// A server `ERROR` about `session`, with no request: its tab shows it
+    /// as a notice while the session is shown here; otherwise it is logged
+    /// (the core sends these only for sessions this client has attached, so
+    /// this is a session already forgotten).
+    fn session_error(&self, session: SessionId, message: &str) {
+        self.note_session(session, &format!("the terminal server: {message}"), || {
+            log::warn!("terminal server, about session {session} on {}: {message}", self.name());
+        });
+    }
+
+    /// Shows `text` in the tab of `session`, or calls `unshown` when no
+    /// session by that id is shown. Called without the state lock.
+    fn note_session(&self, session: SessionId, text: &str, unshown: impl FnOnce()) {
+        match self.sink(session) {
+            Some(sink) => {
+                self.deliver(session, &sink, |sink| sink.note(text));
+            }
+            None => unshown(),
+        }
+    }
+
     fn sink(&self, session: SessionId) -> Option<Sink> {
         self.state.lock().sessions.get(&session).map(|shown| shown.sink.clone())
     }
@@ -1571,11 +1604,12 @@ impl Connection {
         }
     }
 
-    /// A relay link was lost: each of the endpoint's terminals says so.
-    fn lost_link(&self, name: &str) {
+    /// A relay link was lost, for `reason`: each of the endpoint's
+    /// terminals says so.
+    fn lost_link(&self, name: &str, reason: &str) {
         let sinks: Vec<(SessionId, Sink)> =
             self.state.lock().sessions.iter().map(|(&session, shown)| (session, shown.sink.clone())).collect();
-        let line = lost_line(name);
+        let line = lost_line(name, reason);
         for (session, sink) in sinks {
             self.deliver(session, &sink, |sink| sink.output(line.as_bytes()));
         }
@@ -1707,26 +1741,35 @@ impl Connection {
     fn reconnect_local(&self, endpoint: &Endpoint) -> std::result::Result<Box<dyn Read + Send>, String> {
         let started = Instant::now();
         let mut next_start = START_AFTER;
+        // The latest error of an attempt, for the line that says it gave up.
+        let mut last: Option<String> = None;
         loop {
             let elapsed = started.elapsed();
             if elapsed >= RECONNECT_LIMIT {
-                return Err(format!("no terminal server came back within {} s", RECONNECT_LIMIT.as_secs()));
+                return Err(reconnect_gave_up(RECONNECT_LIMIT, last.as_deref()));
             }
             match super::try_connect(endpoint) {
                 Ok(Some(stream)) => match super::hello(stream, &self.token) {
                     Ok(connected) => return self.resume_local(connected).map_err(|error| format!("{error:#}")),
                     Err(error) if error.downcast_ref::<Refused>().is_some() => return Err(format!("{error:#}")),
-                    Err(error) => log::debug!("reconnecting: {error:#}"),
+                    Err(error) => {
+                        log::debug!("reconnecting: {error:#}");
+                        last = Some(format!("{error:#}"));
+                    }
                 },
                 Ok(None) if elapsed >= next_start => {
                     next_start += START_AFTER;
                     if let Err(error) = super::start_core(endpoint) {
                         log::warn!("reconnecting: {error:#}");
+                        last = Some(format!("{error:#}"));
                     }
                     continue;
                 }
                 Ok(None) => {}
-                Err(error) => log::debug!("reconnecting: {error:#}"),
+                Err(error) => {
+                    log::debug!("reconnecting: {error:#}");
+                    last = Some(format!("{error:#}"));
+                }
             }
             std::thread::sleep(RECONNECT_POLL);
         }
@@ -1885,10 +1928,16 @@ impl Connection {
                 Err(error) => {
                     log::warn!("terminal server message not sent: {error}");
                     // Its answer would never come.
-                    if let Some(req) = request
-                        && let Some(pending) = self.state.lock().requests.remove(&req)
-                    {
-                        pending.waiting.fail(format!("the request can't be sent: {error}"));
+                    let pending = request.and_then(|req| self.state.lock().requests.remove(&req));
+                    match (pending, session_of(message)) {
+                        (Some(pending), _) => pending.waiting.fail(format!("the request can't be sent: {error}")),
+                        // A message of a shown session: its tab says so.
+                        (None, Some((session, kind))) => self.note_session(
+                            session,
+                            &format!("Brindle couldn't send this session's {kind}: {error}"),
+                            || {},
+                        ),
+                        (None, None) => {}
                     }
                     return true;
                 }
@@ -2043,9 +2092,97 @@ fn encode(message: &ToCore, host: Option<&RelayHost>) -> io::Result<Frame> {
 /// reconnect's listing lacks it with its key, or another session took its id.
 const NO_LONGER_LISTED: &str = "the terminal server no longer has this session";
 
-/// What a relay's loss writes into each of its terminals: one dim line.
-fn lost_line(name: &str) -> String {
-    format!("\r\n\x1b[2mconnection to {name} lost; reconnecting…\x1b[22m\r\n")
+/// What a relay's loss writes into each of its terminals: one dim line,
+/// with the first line of why (`railway R8`), through the notice line's
+/// control filter, since the reason may carry what a relay or the host
+/// printed.
+fn lost_line(name: &str, reason: &str) -> String {
+    let first = reason.lines().map(str::trim).find(|line| !line.is_empty());
+    match first {
+        Some(first) => tab_note::line(&format!("connection to {name} lost ({first}); reconnecting…")),
+        None => tab_note::line(&format!("connection to {name} lost; reconnecting…")),
+    }
+}
+
+/// Why reconnecting to the local terminal server gave up after `limit`:
+/// the latest error it met, or, when nothing failed and no server came
+/// back, only the timeout.
+fn reconnect_gave_up(limit: Duration, last: Option<&str>) -> String {
+    let timeout = format!("no terminal server came back within {} s", limit.as_secs());
+    match last {
+        Some(last) => format!("{timeout}: {last}"),
+        None => timeout,
+    }
+}
+
+/// A layout whose JSON is over [`client::MAX_LAYOUT`], which the core would
+/// drop anyway.
+#[derive(Debug, PartialEq, Eq)]
+struct LayoutTooLarge {
+    size: usize,
+}
+
+impl std::fmt::Display for LayoutTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "its layout is {} bytes, over the {} the terminal server keeps", self.size, client::MAX_LAYOUT)
+    }
+}
+
+/// The layout to send with a `SET_LAYOUT` or `DETACH`: itself, unless it is
+/// too large for the core to keep.
+fn layout_to_send(layout: Option<serde_json::Value>) -> std::result::Result<Option<serde_json::Value>, LayoutTooLarge> {
+    let Some(value) = &layout else { return Ok(None) };
+    let size = serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+    if size > client::MAX_LAYOUT {
+        return Err(LayoutTooLarge { size });
+    }
+    Ok(layout)
+}
+
+/// The layout a session's handle last dealt with, so an unchanged one isn't
+/// sent (or complained about) again.
+#[derive(Debug, PartialEq)]
+enum LayoutSent {
+    /// Sent with `SET_LAYOUT` (nothing yet: no layout).
+    Sent(Option<serde_json::Value>),
+    /// Too large to send, logged once; the next change is tried again.
+    TooLarge(Option<serde_json::Value>),
+}
+
+impl Default for LayoutSent {
+    fn default() -> Self {
+        Self::Sent(None)
+    }
+}
+
+impl LayoutSent {
+    fn layout(&self) -> &Option<serde_json::Value> {
+        match self {
+            Self::Sent(layout) | Self::TooLarge(layout) => layout,
+        }
+    }
+}
+
+/// The session a message is about, and what the message is (for the line a
+/// failure to send it puts in that session's tab). None for the messages
+/// that name no session: a request's failure is its own answer.
+fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
+    match message {
+        ToCore::Data(data) => Some((data.session, "input")),
+        ToCore::Resize(resize) => Some((resize.session, "resize")),
+        ToCore::Close(close) => Some((close.session, "close")),
+        ToCore::Detach(detach) => Some((detach.session, "detach")),
+        ToCore::Reparent(reparent) => Some((reparent.session, "window")),
+        ToCore::SetLayout(layout) => Some((layout.session, "layout")),
+        ToCore::Hello(_)
+        | ToCore::Spawn(_)
+        | ToCore::Attach(_)
+        | ToCore::List(_)
+        | ToCore::Kill(_)
+        | ToCore::Status(_)
+        | ToCore::Stop(_)
+        | ToCore::StepDown(_) => None,
+    }
 }
 
 /// What an attach waiting on a relay's first link is told once.
@@ -2137,8 +2274,8 @@ pub struct Running {
     key: Option<SessionKey>,
     conn: Arc<Connection>,
     /// The layout last sent with `SET_LAYOUT`, so an unchanged one isn't
-    /// sent again.
-    layout: Mutex<Option<serde_json::Value>>,
+    /// sent again (nor a too-large one complained about again).
+    layout: Mutex<LayoutSent>,
     /// What bounds the session's waiting input; the [`super::Session`]'s
     /// own once it hands over ([`Running::with_budget`]).
     budget: Budget,
@@ -2270,11 +2407,20 @@ impl Running {
             return;
         }
         let mut sent = self.layout.lock();
-        if *sent == layout {
+        if sent.layout() == &layout {
             return;
         }
-        *sent = layout.clone();
-        self.conn.send(ToCore::SetLayout(SetLayout { session: self.id, layout }));
+        match layout_to_send(layout.clone()) {
+            Ok(to_send) => {
+                *sent = LayoutSent::Sent(to_send.clone());
+                self.conn.send(ToCore::SetLayout(SetLayout { session: self.id, layout: to_send }));
+            }
+            Err(too_large) => {
+                // Logged once: only a different layout is tried again.
+                log::warn!("not sending session {}'s layout: {too_large}", self.id);
+                *sent = LayoutSent::TooLarge(layout);
+            }
+        }
     }
 
     /// Leaves the session running with no client (`DETACH`), with the
@@ -2282,6 +2428,12 @@ impl Running {
     /// unless it already exited or was lost.
     pub fn detach(&self, layout: Option<serde_json::Value>) {
         if self.conn.forget(self.id, self.key.as_ref(), false) {
+            // A layout the core would drop leaves the session its own tab
+            // next time, as with none; the session still leaves.
+            let layout = layout_to_send(layout).unwrap_or_else(|too_large| {
+                log::warn!("detaching session {} without its layout: {too_large}", self.id);
+                None
+            });
             self.conn.send(ToCore::Detach(Detach { session: self.id, layout }));
         }
     }
@@ -2549,6 +2701,9 @@ pub(super) mod fake {
         fn output(&mut self, bytes: &[u8]) {
             self.0.send(format!("output {}", String::from_utf8_lossy(bytes))).ok();
         }
+        fn note(&mut self, text: &str) {
+            self.0.send(format!("note {text}")).ok();
+        }
         fn replay(&mut self, active: bool) {
             self.0.send(format!("replay {active}")).ok();
         }
@@ -2587,6 +2742,9 @@ pub(super) mod fake {
                 panic!("the emulator failed on {}", self.marker);
             }
             self.seen.output(bytes);
+        }
+        fn note(&mut self, text: &str) {
+            self.seen.note(text);
         }
         fn replay(&mut self, active: bool) {
             self.seen.replay(active);
@@ -3005,7 +3163,7 @@ mod tests {
         first.next();
 
         first.out.cut();
-        let line = "output \r\n\x1b[2mconnection to A8 lost; reconnecting…\x1b[22m\r\n";
+        let line = "output \r\n\x1b[2mconnection to A8 lost (the relay closed the connection); reconnecting…\x1b[22m\r\n";
         assert_eq!(seen(&kept_tab), line);
         assert_eq!(seen(&gone_tab), line);
         kept.input(b"ls\r");
@@ -3264,6 +3422,129 @@ mod tests {
         assert_eq!(settled(&connection, &second), []);
         told_nothing_more(&lost_tab);
         told_nothing_more(&fresh_tab);
+    }
+
+    /// A server `ERROR` about a shown session, with no request, reaches its
+    /// tab as a notice, once.
+    #[test]
+    fn a_session_error_is_noticed_once_in_its_tab() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+
+        let error = |session, message: &str| {
+            ToClient::Error(client::ErrorMessage { req: None, session: Some(session), message: message.into() })
+        };
+        far.out.send(error(running.id(), "its holder failed on this input"));
+        assert_eq!(seen(&tab), "note the terminal server: its holder failed on this input");
+        assert_eq!(settled(&connection, &far), []);
+        told_nothing_more(&tab);
+    }
+
+    /// An `ERROR` about a session this client doesn't show goes to no tab.
+    #[test]
+    fn an_error_for_a_session_not_shown_is_not_delivered() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+
+        far.out.send(ToClient::Error(client::ErrorMessage {
+            req: None,
+            session: Some(running.id() + 1),
+            message: "another session's failure".into(),
+        }));
+        assert_eq!(settled(&connection, &far), []);
+        told_nothing_more(&tab);
+    }
+
+    /// A layout over `MAX_LAYOUT` isn't sent with `SET_LAYOUT` (once, however
+    /// often it is recorded), and a `DETACH` leaves without it.
+    #[test]
+    fn a_too_large_layout_is_not_sent_and_detach_still_goes() {
+        let (connection, plan) = steady_relay("A8");
+        let (link, far) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, _tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        connection.state.lock().protocol = 3;
+
+        let big = serde_json::json!({ "tab": "x".repeat(client::MAX_LAYOUT + 1) });
+        let small = serde_json::json!({ "tab": "x" });
+        running.set_layout(Some(big.clone()));
+        running.set_layout(Some(big.clone()));
+        assert_eq!(settled(&connection, &far), []);
+        // A different one is tried again.
+        running.set_layout(Some(small.clone()));
+        assert_eq!(far.next(), ToCore::SetLayout(SetLayout { session: running.id(), layout: Some(small) }));
+        running.set_layout(Some(big.clone()));
+        assert_eq!(settled(&connection, &far), []);
+
+        running.detach(Some(big));
+        assert_eq!(far.next(), ToCore::Detach(Detach { session: running.id(), layout: None }));
+    }
+
+    /// A relay's loss says why in each tab: the process's own account.
+    #[test]
+    fn a_remote_loss_names_its_cause() {
+        let (connection, plan) = relay("A8");
+        let (link, first) = fake::link(&[], fake::spawning);
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        first.next();
+
+        first.out.set_why("ssh exited with 255: connect to host a8 port 22: Connection timed out");
+        first.out.cut();
+        assert_eq!(
+            seen(&tab),
+            "output \r\n\x1b[2mconnection to A8 lost (ssh exited with 255: connect to host a8 port 22: Connection timed out); reconnecting…\x1b[22m\r\n"
+        );
+    }
+
+    /// What the notice line and the lost line say, as plain functions.
+    #[test]
+    fn the_last_error_is_named() {
+        assert_eq!(
+            reconnect_gave_up(Duration::from_secs(15), Some("starting the terminal server: no such file")),
+            "no terminal server came back within 15 s: starting the terminal server: no such file"
+        );
+    }
+
+    #[test]
+    fn only_timeouts_keep_todays_text() {
+        assert_eq!(reconnect_gave_up(Duration::from_secs(15), None), "no terminal server came back within 15 s");
+    }
+
+    #[test]
+    fn the_lost_line_carries_the_first_line_of_the_reason() {
+        assert_eq!(
+            lost_line("A8", "ssh exited with 255: boom\nsecond line"),
+            "\r\n\x1b[2mconnection to A8 lost (ssh exited with 255: boom); reconnecting…\x1b[22m\r\n"
+        );
+        // Controls in what a host printed can't escape the dim line.
+        assert_eq!(
+            lost_line("A8", "boom\x1b]0;x\x07"),
+            "\r\n\x1b[2mconnection to A8 lost (boom]0;x); reconnecting…\x1b[22m\r\n"
+        );
+        assert_eq!(lost_line("A8", ""), "\r\n\x1b[2mconnection to A8 lost; reconnecting…\x1b[22m\r\n");
+    }
+
+    #[test]
+    fn a_layout_over_max_layout_is_too_large() {
+        let small = serde_json::json!({ "tab": "x" });
+        assert_eq!(layout_to_send(None), Ok(None));
+        assert_eq!(layout_to_send(Some(small.clone())), Ok(Some(small)));
+        let big = serde_json::json!({ "tab": "x".repeat(client::MAX_LAYOUT) });
+        let size = serde_json::to_vec(&big).unwrap().len();
+        assert!(size > client::MAX_LAYOUT);
+        assert_eq!(layout_to_send(Some(big)), Err(LayoutTooLarge { size }));
     }
 
     /// What [`fake::failing_sink`]s fail on, as `BRINDLE_TEST_SINK_PANIC`

@@ -332,6 +332,9 @@ mod tests {
         fn output(&mut self, bytes: &[u8]) {
             self.0.send(format!("output {}", String::from_utf8_lossy(bytes))).ok();
         }
+        fn note(&mut self, text: &str) {
+            self.0.send(format!("note {text}")).ok();
+        }
         fn replay(&mut self, active: bool) {
             self.0.send(format!("replay {active}")).ok();
         }

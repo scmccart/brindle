@@ -166,12 +166,59 @@ pub struct LaunchRequest {
     pub profile: usize,
     pub command: Option<(String, Vec<String>)>,
     pub cwd: Option<PathBuf>,
+    /// What the new tab says on its first line: why it isn't what was
+    /// asked for (`-p` named no profile).
+    pub note: Option<String>,
 }
 
 impl LaunchRequest {
     pub fn profile(profile: usize) -> Self {
-        Self { profile, command: None, cwd: None }
+        Self { profile, command: None, cwd: None, note: None }
     }
+}
+
+/// The profile a launch opens: the one `-p` names, else the default one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chosen {
+    pub index: usize,
+    /// The name `-p` gave that no profile has; the default one was used.
+    pub missing: Option<String>,
+}
+
+impl Chosen {
+    /// What the new tab says when `-p` named no profile.
+    pub fn note(&self, config: &Config) -> Option<String> {
+        let name = self.missing.as_deref()?;
+        let used = config.profiles.get(self.index).map_or("the default profile", |profile| profile.name.as_str());
+        Some(format!("no profile is named \"{name}\"; using {used}"))
+    }
+}
+
+/// The profile for `-p name` (matched without regard to case), or the
+/// default one when there is no name or no profile has it: the one rule for
+/// a launch's first window and a later launch forwarded to it.
+pub fn profile_for(config: &Config, name: Option<&str>) -> Chosen {
+    let default = config.default_profile_index();
+    match name {
+        None => Chosen { index: default, missing: None },
+        Some(name) => match config.profile_index(name) {
+            Some(index) => Chosen { index, missing: None },
+            None => Chosen { index: default, missing: Some(name.to_string()) },
+        },
+    }
+}
+
+/// What a message tab says when a shortcut or a stale menu named profile
+/// `index` (from 0) and the config has `count`.
+fn no_such_profile_text(index: usize, count: usize) -> String {
+    let profiles = if count == 1 { "1 profile".to_string() } else { format!("{count} profiles") };
+    format!("There is no profile {}: the config has {profiles}.\r\n", index + 1)
+}
+
+/// What a restored tab says when the profile it was recorded with is gone
+/// from the config, and `used` took its place.
+fn missing_profile_text(name: &str, used: &str) -> String {
+    format!("this tab's profile \"{name}\" is gone from the config; using {used}")
 }
 
 /// What a launch opens: the window's first content, or a tab a later
@@ -474,9 +521,10 @@ impl Workspace {
             match session::resolve_tab(entry, &config, &home, &|dir: &Path| dir.is_dir()) {
                 None => {}
                 Some(RestoredTab::Local { profile, host, cwd, title, zones, session, missing_profile }) => {
-                    if let Some(name) = missing_profile {
+                    let missing_note = missing_profile.map(|name| {
                         log::warn!("session restore: no profile named {name:?}, using the default profile");
-                    }
+                        missing_profile_text(&name, &config.profiles[profile].name)
+                    });
                     if !host.is_local() && !self.restored_hosts.contains(&host) {
                         self.restored_hosts.push(host.clone());
                     }
@@ -488,9 +536,16 @@ impl Workspace {
                             self.insert_terminal_tab(profile, host, terminal, true, window, cx);
                         }
                         // No record: the tab follows its profile.
-                        (None, None) => self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx),
+                        (None, None) => {
+                            self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd), note: None }, window, cx)
+                        }
                     }
                     let Some(tab) = self.tabs.get_mut(self.active) else { continue };
+                    if let Some(note) = &missing_note
+                        && let Some(terminal) = tab.active_terminal(cx)
+                    {
+                        terminal.update(cx, |terminal, cx| terminal.note(note, cx));
+                    }
                     if let Some(title) = title {
                         tab.set_manual_title(&title, &mut None, cx);
                     }
@@ -655,7 +710,13 @@ impl Workspace {
     /// Opens a tab for the request on its profile's endpoint.
     pub fn launch(&mut self, request: LaunchRequest, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = Self::settings(cx).profiles.get(request.profile).map(Host::of) else {
-            log::warn!("no profile #{}", request.profile + 1);
+            // A shortcut past the last profile, or a menu choice a reload
+            // made stale: a message tab says so.
+            let config = Self::settings(cx);
+            let text = no_such_profile_text(request.profile, config.profiles.len());
+            log::warn!("{}", text.trim_end());
+            let profile = config.profiles[config.default_profile_index()].clone();
+            self.open_message_tab(profile, &text, window, cx);
             return;
         };
         self.launch_on(request, host, window, cx);
@@ -687,6 +748,9 @@ impl Workspace {
         });
 
         let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
+        if let Some(note) = &request.note {
+            terminal.update(cx, |terminal, cx| terminal.note(note, cx));
+        }
         let font_size = profile.font_size;
         let theme = self.tab_theme(&profile, &config);
         let p_clone = profile.clone();
@@ -2327,7 +2391,7 @@ fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (Laun
     let default = config.default_profile_index();
     let local = |index: &usize| config.profiles.get(*index).is_some_and(|profile| Host::of(profile).is_local());
     let profile = Some(default).filter(local).or_else(|| (0..config.profiles.len()).find(local)).unwrap_or(default);
-    (LaunchRequest { profile, command: Some(editor), cwd: None }, Host::Local)
+    (LaunchRequest { profile, command: Some(editor), cwd: None, note: None }, Host::Local)
 }
 
 /// A tab's profile once the config is reloaded: the config's profile of
@@ -2761,6 +2825,47 @@ mod tests {
         config.profiles = profiles;
         config.default_profile = Some(default.into());
         config
+    }
+
+    /// A config with profiles `Shell` (the default) and `Work`.
+    fn shell_and_work() -> Config {
+        let mut config = Config::default();
+        config.profiles = vec![
+            Profile { name: "Shell".into(), ..Default::default() },
+            Profile { name: "Work".into(), ..Default::default() },
+        ];
+        config.default_profile = Some("Shell".into());
+        config
+    }
+
+    #[test]
+    fn a_name_matches_case_insensitively() {
+        let chosen = profile_for(&shell_and_work(), Some("wORK"));
+        assert_eq!(chosen, Chosen { index: 1, missing: None });
+        assert_eq!(chosen.note(&shell_and_work()), None);
+    }
+
+    #[test]
+    fn an_unknown_name_gives_the_default_and_names_it() {
+        let config = shell_and_work();
+        let chosen = profile_for(&config, Some("wrk"));
+        assert_eq!(chosen, Chosen { index: 0, missing: Some("wrk".into()) });
+        assert_eq!(chosen.note(&config).as_deref(), Some("no profile is named \"wrk\"; using Shell"));
+    }
+
+    #[test]
+    fn no_name_is_the_default_without_a_notice() {
+        let config = shell_and_work();
+        let chosen = profile_for(&config, None);
+        assert_eq!(chosen, Chosen { index: 0, missing: None });
+        assert_eq!(chosen.note(&config), None);
+    }
+
+    #[test]
+    fn a_missing_index_and_a_missing_restored_profile_are_worded() {
+        assert_eq!(no_such_profile_text(4, 1), "There is no profile 5: the config has 1 profile.\r\n");
+        assert_eq!(no_such_profile_text(4, 3), "There is no profile 5: the config has 3 profiles.\r\n");
+        assert_eq!(missing_profile_text("Work", "Shell"), "this tab's profile \"Work\" is gone from the config; using Shell");
     }
 
     /// An editor command as `editor_command` makes one, without reading the

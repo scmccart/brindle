@@ -636,17 +636,14 @@ fn forwarded_launch(request: &instance::Request, listing: &Listing, config: &Con
     if request.profile.is_none() && request.cwd.is_none() && request.command.is_none() {
         return None;
     }
-    let profile = match &request.profile {
-        Some(name) => config.profile_index(name).unwrap_or_else(|| {
-            log::warn!("no profile named {name:?}");
-            config.default_profile_index()
-        }),
-        None => config.default_profile_index(),
-    };
+    let chosen = workspace::profile_for(config, request.profile.as_deref());
+    if let Some(note) = chosen.note(config) {
+        log::warn!("{note}");
+    }
     let command = request.command.as_ref().and_then(|c| c.split_first()).map(|(p, rest)| (p.clone(), rest.to_vec()));
     // A command starts where it was typed, unless `-d` says otherwise.
     let cwd = request.cwd.clone().or_else(|| command.as_ref().and(request.launch_dir.clone()));
-    Some(Launch::Request(LaunchRequest { profile, command, cwd }))
+    Some(Launch::Request(LaunchRequest { profile: chosen.index, command, cwd, note: chosen.note(config) }))
 }
 
 /// What a launch opens ([`startup_launch`]).
@@ -1051,13 +1048,12 @@ fn main() {
         let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         let origin: gpui::SharedString = layout::origin_id(std::process::id(), since_epoch).into();
         let settings = Settings::from_platform(config, report, cx).with_notices(notices);
-        let profile = match &args.profile {
-            Some(name) => settings.config.profile_index(name).unwrap_or_else(|| {
-                log::warn!("no profile named {name:?}");
-                settings.config.default_profile_index()
-            }),
-            None => settings.config.default_profile_index(),
-        };
+        let chosen = workspace::profile_for(&settings.config, args.profile.as_deref());
+        if let Some(note) = chosen.note(&settings.config) {
+            log::warn!("{note}");
+        }
+        let note = chosen.note(&settings.config);
+        let profile = chosen.index;
         cx.set_global(settings);
         Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
@@ -1120,7 +1116,7 @@ fn main() {
         // What the launch asked for opens as the active tab.
         let asked = args
             .asks_for_a_tab()
-            .then(|| LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone() });
+            .then(|| LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone(), note });
         // Before the wait: the endpoints of profiles that connect at launch
         // start connecting while this machine's listing runs.
         watch_hosts(cx);
@@ -1556,7 +1552,7 @@ mod tests {
 
     fn opens(launch: Launch) -> Opens {
         match launch {
-            Launch::Request(LaunchRequest { profile, command, cwd }) => Opens::Tab(profile, command, cwd),
+            Launch::Request(LaunchRequest { profile, command, cwd, .. }) => Opens::Tab(profile, command, cwd),
             Launch::Restore(window) => Opens::Restore(window),
             Launch::Attach { session, target } => Opens::Attach(session, target),
         }
@@ -1595,7 +1591,7 @@ mod tests {
     }
 
     fn htop() -> LaunchRequest {
-        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None }
+        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None, note: None }
     }
 
     #[test]

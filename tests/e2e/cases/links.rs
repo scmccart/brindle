@@ -123,3 +123,23 @@ pub fn mouse_mode(ctx: &Ctx) -> Result<Outcome> {
     ensure!(!text.contains(";6;1M") && !text.contains(";6;1m"), "the link click was reported: {text:?}");
     Ok(Outcome::Pass)
 }
+
+/// An opener that can't run: ctrl-click on a link says in the tab that it
+/// couldn't be opened, with the link and the cause.
+pub fn opener_fails(ctx: &Ctx) -> Result<Outcome> {
+    let missing = ctx.dir.join("no-such-opener");
+    let show = script(ctx, "show", "clear\nprintf 'see https://example.com/fails\\n'\n")?;
+    let out = Run::new(ctx, "run")
+        .profile("Shell")
+        .env("BRINDLE_LINK_OPENER", &missing.display().to_string())
+        .send(&format!("sh {}\r", show.display()))
+        .click("ctrl-10,0")
+        .wait_for("couldn't open")
+        .dump_at(6.0)
+        .run()?;
+    let text = out.dump.screen.join("\n");
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {text:?}", out.dump.wait_timeouts);
+    ensure!(text.contains("couldn't open https://example.com/fails"), "the tab doesn't name the link: {text:?}");
+    ensure!(text.contains("no-such-opener"), "the tab doesn't name the opener: {text:?}");
+    Ok(Outcome::Pass)
+}
