@@ -226,7 +226,7 @@ Needs change 4 (textual: `local.rs`).
 
 Needs change 8 (the launch code), change 4 (`StateFile`), change 1 (the state-file text), change 9 (`latency::Window`) and group 2 (the config line's `notices`).
 
-- [ ] 5.1 `parse_args_from` (decision 10):
+- [x] 5.1 `parse_args_from` (decision 10):
   - every option without its value, and `-e` without a command, is a usage error naming the option;
   - so is `--dump-screen-after` without a number;
   - `--action`, `--key`, `--hover` and `--click` are checked at parse time;
@@ -240,13 +240,13 @@ Needs change 8 (the launch code), change 4 (`StateFile`), change 1 (the state-fi
   - `a_bad_pointer_position_is_a_usage_error`.
 
   Remove the run loop's `log::error!` arms.
-- [ ] 5.2 `latency::LogState { Writing, Stopped { path, error } }`. The summary adds `--- latency-log stopped "<path>": <error>`.
+- [x] 5.2 `latency::LogState { Writing, Stopped { path, error } }`. The summary adds `--- latency-log stopped "<path>": <error>`.
   - Unit tests: `a_failed_write_stops_the_log_and_keeps_timing`, `the_summary_names_the_stopped_log`.
   - Run `BRINDLE_PERF=1 cargo test --test perf -- --self-test` to show `parse_latency` still reads the header.
-- [ ] 5.3 `session::state_dir() -> Option<PathBuf>`, with the environment injected as change 7 shapes it.
+- [x] 5.3 `session::state_dir() -> Option<PathBuf>`, with the environment injected as change 7 shapes it.
   - Unit tests: `no_home_and_no_override_is_none`, `the_override_wins`.
-- [ ] 5.4 `main`: with no state directory, run alone, with no `session.lock`, restore, reattach or recording. Add the window notice to `Settings`' config line `notices`.
-- [ ] 5.5 e2e:
+- [x] 5.4 `main`: with no state directory, run alone, with no `session.lock`, restore, reattach or recording. Add the window notice to `Settings`' config line `notices`.
+- [x] 5.5 e2e:
   - Extend `restore-fallbacks` (or add `restore-no-state-dir`) with a run under `env -u HOME -u XDG_STATE_HOME`, without `BRINDLE_STATE_DIR`, started in the case directory:
     - its `--- config` line says the session can't be saved;
     - no `session.toml` appears in the case directory.
@@ -254,7 +254,7 @@ Needs change 8 (the launch code), change 4 (`StateFile`), change 1 (the state-fi
     The harness sets `BRINDLE_STATE_DIR` for every run, so this one needs a `Run` option that unsets it.
   - Add a no-display case `cli-usage-errors`, which runs the binary with `-p`, `--action split_zone_rihgt` and `--dump-screen-after soon`. Each exits 2 naming the option, without a window.
   - Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- restore cli-usage`.
-- [ ] 5.6 Docs: CLAUDE.md's debug-hook paragraph says bad steps are usage errors at launch.
+- [x] 5.6 Docs: CLAUDE.md's debug-hook paragraph says bad steps are usage errors at launch.
 
 ## 6. Test harnesses
 

@@ -122,6 +122,36 @@ pub fn fallbacks(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The files under `dir` (recursively) named `session.toml` or
+/// `session.lock`.
+fn state_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| format!("reading {}: {e}", dir.display()))?.path();
+        if path.is_dir() {
+            found.extend(state_files(&path)?);
+        } else if path.file_name().is_some_and(|name| name == "session.toml" || name == "session.lock") {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// With no state directory (no `BRINDLE_STATE_DIR`, `XDG_STATE_HOME` or
+/// `HOME`), a plain launch opens a default tab, its window says the session
+/// can't be saved, and nothing is written where it started.
+pub fn no_state_dir(ctx: &Ctx) -> Result<Outcome> {
+    let out = Run::new(ctx, "no-state").restore().default_profile("Shell").no_state_dir().dump_at(4.0).run()?;
+    ensure!(out.dump.tabs.len() == 1, "tabs {:?}", out.dump.tabs);
+    let line = out.dump.config.as_deref().unwrap_or_default();
+    ensure!(line.contains("can't save its session"), "config line {:?}", out.dump.config);
+    // The dump came after several of the once-a-second records, and the
+    // quit records once more.
+    let written = state_files(&ctx.dir)?;
+    ensure!(written.is_empty(), "state written without a state directory: {written:?}");
+    Ok(Outcome::Pass)
+}
+
 /// A plain restore launch whose steps close its only window, so it quits
 /// without ever dumping: the dump is due only if the window doesn't close.
 fn until_window_closes<'a>(ctx: &'a Ctx, label: &'static str) -> Run<'a> {

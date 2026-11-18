@@ -7,6 +7,7 @@
 #[cfg(windows)]
 mod win;
 mod cards;
+mod cli;
 mod colors;
 mod commands;
 mod dump;
@@ -47,6 +48,7 @@ pub fn all() -> Vec<Case> {
 fn unix() -> Vec<Case> {
     let display = |name, run| Case { name, display: true, run };
     vec![
+        Case { name: "cli-usage-errors", display: false, run: cli::usage_errors },
         display("dump-grid-geometry", dump::grid_geometry),
         display("dump-wait-for-timeout", dump::wait_for_timeout),
         display("dump-wait-for-pending", dump::wait_for_pending),
@@ -94,6 +96,7 @@ fn unix() -> Vec<Case> {
         display("links-mouse-mode", links::mouse_mode),
         display("restore-local-tabs", restore::local_tabs),
         display("restore-fallbacks", restore::fallbacks),
+        display("restore-no-state-dir", restore::no_state_dir),
         display("restore-merge-windows", restore::merge_windows),
         display("restore-forget-on-exit", restore::forget_on_exit),
         display("restore-close-window", restore::close_window),
