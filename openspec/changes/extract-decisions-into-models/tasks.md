@@ -46,17 +46,18 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 2. Untested pure code and small extractions
 
-- [ ] 2.1 Add unit tests for `fit_grid` and `wants_links`. Verify with `cargo test --locked -p brindle -- terminal_element:: terminal_view::` (b06).
-- [ ] 2.2 Add unit tests for `Theme::indexed`, `Color::mix`, `luminance`, and `Display` round-tripping `parse`. Verify with `cargo test --locked -p brindle theme::` (b06).
-- [ ] 2.3 Add unit tests for `unescape` and `terminal_font`. Verify with `cargo test --locked -p brindle -- main:: settings::` (b01 #12, b03 #9).
-- [ ] 2.4 `resolve_color` takes the `Theme`, not `&Terminal`. Add unit tests for it, for `term_config` and for `parser_for`, as change 5 leaves it. Verify with `cargo test --locked -p brindle terminal::` (b28 #14).
-- [ ] 2.5 Add unit tests for `cli.rs`'s `status_text`, `status_json`, `json_flag`, `no_args` and `unexpected`. Verify with `cargo test --locked -p brindle-remote-agent server::cli::` (b10 #9).
-- [ ] 2.6 Add unit tests for `wire.rs`'s `unknown_type`, `json` and `from_json`, and for `notice::Source::name`. Verify with `cargo test --locked -p brindle-remote-protocol wire::` and `cargo test --locked -p brindle-term-core notice::` (b21 #5, b30 #3).
-- [ ] 2.7 Move `millis` to an ungated `server/platform/wait.rs`, with tests for zero, rounding up and the cap. Verify on Linux, and on the Windows CI job (b13 #2).
-- [ ] 2.8 Add unit tests for `relay::no_listener` and `timed_out`. Extract `relay::login_shell` and `relay::stat_runs`, with tests. `Reached::host` maps `None` to the wire's empty field. Verify with `cargo test --locked -p brindle-remote-agent server::relay::`, and with `tests/relay.rs` unchanged (b15 `relay.rs:221-245`, `:449`, `:502`, `:560`).
-- [ ] 2.9 Extract `session::state_dir_from(over, platform, home) -> Option<PathBuf>`, unless change 12's task 5.3 already did. Add its table test. Verify with `cargo test --locked -p brindle session::` (b27 #10).
-- [ ] 2.10 `WaitLog` never reuses a handle. Verify with a unit test that begins, clears and begins again (b01 #17).
-- [ ] 2.11 Add `server/platform/wait.rs` to `fcis`'s whole-module table and to `PURE_MODULES`. Verify with `cargo test --locked -p brindle --test architecture`.
+- [x] 2.1 Add unit tests for `fit_grid` and `wants_links`. Verify with `cargo test --locked -p brindle -- terminal_element:: terminal_view::` (b06).
+- [x] 2.2 Add unit tests for `Theme::indexed`, `Color::mix`, `luminance`, and `Display` round-tripping `parse`. Verify with `cargo test --locked -p brindle theme::` (b06).
+- [x] 2.3 Add unit tests for `unescape` and `terminal_font`. Verify with `cargo test --locked -p brindle -- main:: settings::` (b01 #12, b03 #9).
+- [x] 2.4 `resolve_color` takes the `Theme`, not `&Terminal`. Add unit tests for it, for `term_config` and for `parser_for`, as change 5 leaves it. Verify with `cargo test --locked -p brindle terminal::` (b28 #14).
+- [x] 2.5 Add unit tests for `cli.rs`'s `status_text`, `status_json`, `json_flag`, `no_args` and `unexpected`. Verify with `cargo test --locked -p brindle-remote-agent server::cli::` (b10 #9).
+- [x] 2.6 Add unit tests for `wire.rs`'s `unknown_type`, `json` and `from_json`, and for `notice::Source::name`. Verify with `cargo test --locked -p brindle-remote-protocol wire::` and `cargo test --locked -p brindle-term-core notice::` (b21 #5, b30 #3).
+- [x] 2.7 Move `millis` to an ungated `server/platform/wait.rs`, with tests for zero, rounding up and the cap. Verify on Linux, and on the Windows CI job (b13 #2).
+- [x] 2.8 Add unit tests for `relay::no_listener` and `timed_out`. Extract `relay::login_shell` and `relay::stat_runs`, with tests. `Reached::host` maps `None` to the wire's empty field. Verify with `cargo test --locked -p brindle-remote-agent server::relay::`, and with `tests/relay.rs` unchanged (b15 `relay.rs:221-245`, `:449`, `:502`, `:560`).
+- [x] 2.9 Extract `session::state_dir_from(over, platform, home) -> Option<PathBuf>`, unless change 12's task 5.3 already did. Add its table test. Verify with `cargo test --locked -p brindle session::` (b27 #10).
+  - Change 12's task 5.3 did: `state_dir(&StateEnv)` takes the three values, which `StateEnv::read` gathers. This group adds the table test over every combination.
+- [x] 2.10 `WaitLog` never reuses a handle. Verify with a unit test that begins, clears and begins again (b01 #17).
+- [x] 2.11 Add `server/platform/wait.rs` to `fcis`'s whole-module table and to `PURE_MODULES`. Verify with `cargo test --locked -p brindle --test architecture`.
 
 ## 3. Server roles
 
