@@ -295,7 +295,7 @@ impl AttachRequest {
             Awaits::Replay => Some(ToCore::Attach(attach.clone())),
             Awaits::Listing => None,
         };
-        (Waiting::Attach { sink, reply, attach, key: self.key, awaits }, message)
+        (Waiting::Attach { sink, reply, attach, key: self.key, awaits, told: false }, message)
     }
 }
 
@@ -316,6 +316,7 @@ enum Awaits {
 }
 
 /// What `SPAWNED` reports, its key decoded where it was read.
+#[derive(Debug, PartialEq, Eq)]
 struct Started {
     session: SessionId,
     pid: u32,
@@ -330,8 +331,17 @@ enum Waiting {
     /// the map, with `key`, before the replay's first `DATA` is read. A
     /// reconnect's replay of the session answers it too, and `attach` is
     /// sent again when the reconnected core lists the session with `key`
-    /// and didn't give it back ([`carried_attaches`]).
-    Attach { sink: Sink, reply: Reply<u32>, attach: client::Attach, key: Option<SessionKey>, awaits: Awaits },
+    /// and didn't give it back ([`carried_attaches`]). `told`: while it
+    /// waits for a relay's first link, it was told why it can't connect
+    /// yet ([`State::connect_failed`]).
+    Attach {
+        sink: Sink,
+        reply: Reply<u32>,
+        attach: client::Attach,
+        key: Option<SessionKey>,
+        awaits: Awaits,
+        told: bool,
+    },
     /// `SESSIONS`.
     List(Reply<Vec<SessionInfo>>),
     /// `OK`.
@@ -349,21 +359,64 @@ impl Waiting {
     }
 }
 
+/// Where a request's message stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// Not on the current link: queued for the writer, or to go out again
+    /// on the next link after a write failed.
+    Queued,
+    /// Written on the current link: if that ends, the answer is lost with
+    /// it.
+    Written,
+    /// An attach the next `LIST` decides ([`carried_attaches`]): one that
+    /// went out on a link that ended before its answer
+    /// ([`State::link_lost`]), or a recorded one not sent yet
+    /// ([`Pending::recorded`]). Nothing else makes one.
+    Carried,
+}
+
 struct Pending {
     waiting: Waiting,
-    /// Its request went out on the current link: if that ends, the answer
-    /// is lost with it.
-    written: bool,
-    /// An attach waiting for a relay's first link was told why it can't
-    /// connect yet.
-    told: bool,
-    /// An attach that went out on a link that ended before its answer, or
-    /// a recorded one not sent yet. The next `LIST` says what becomes of
-    /// it.
-    carried: bool,
+    sent: Sent,
 }
 
 impl Pending {
+    /// A request whose message goes to the writer now.
+    fn queued(waiting: Waiting) -> Self {
+        Self { waiting, sent: Sent::Queued }
+    }
+
+    /// A recorded attach, which sends nothing until a listing confirms its
+    /// session.
+    fn recorded(waiting: Waiting) -> Self {
+        Self { waiting, sent: Sent::Carried }
+    }
+
+    /// Its message went out on the current link (`true`), or writing it
+    /// failed and it goes out on the next (`false`). A carried attach whose
+    /// write failed stays carried: the next listing decides it.
+    fn mark_written(&mut self, written: bool) {
+        self.sent = match (self.sent, written) {
+            (Sent::Queued | Sent::Written | Sent::Carried, true) => Sent::Written,
+            (Sent::Queued | Sent::Written, false) => Sent::Queued,
+            (Sent::Carried, false) => Sent::Carried,
+        };
+    }
+
+    fn is_written(&self) -> bool {
+        match self.sent {
+            Sent::Written => true,
+            Sent::Queued | Sent::Carried => false,
+        }
+    }
+
+    fn is_carried(&self) -> bool {
+        match self.sent {
+            Sent::Carried => true,
+            Sent::Queued | Sent::Written => false,
+        }
+    }
+
     fn is_attach(&self) -> bool {
         matches!(self.waiting, Waiting::Attach { .. })
     }
@@ -423,18 +476,18 @@ struct State {
     list: Option<Listing>,
     /// What the next listing goes to ([`Connection::on_listing`]).
     on_listing: Vec<ListingHook>,
-    /// A link has been up.
-    connected: bool,
-    /// A link is up now.
-    linked: bool,
+    /// Whether a link is up, has been, or never was, and the client
+    /// protocol the current (or last) link's `WELCOME` agreed on.
+    link: LinkPhase,
     /// A new tab's request wants a relay attempt now, not after the pause.
     hurry: bool,
     /// The sessions whose `CLOSE`s went to the writer and aren't written
     /// yet, with when each was queued, oldest first. The writer skips one
     /// that is no longer here: it was given up ([`State::give_up_closes`]).
     closing: Vec<(SessionId, Instant)>,
-    /// Since when a relay connection has been out of use ([`State::in_use`]).
-    idle_since: Option<Instant>,
+    /// Whether a relay connection is in use ([`State::in_use`]), as its idle
+    /// thread last looked ([`State::idle_step`]).
+    idle: Idle,
     /// When [`Connection::end_when_unused`] last took its idle decision. An
     /// observation for tests, which decides nothing: a look at or after
     /// `idle` past the moment a connection became idle-eligible shows that
@@ -448,9 +501,135 @@ struct State {
     on_end: Option<Box<dyn FnOnce() + Send>>,
     /// What was last reported ([`Connection::report`]).
     reported: Option<LinkState>,
-    /// The client protocol the current (or last) link's `WELCOME` agreed
-    /// on; 0 before the first.
-    protocol: u32,
+}
+
+/// The client protocol a link's `WELCOME` agreed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Negotiated(u32);
+
+impl Negotiated {
+    /// Whether the core takes `SET_LAYOUT`, which client protocol 3 added.
+    fn sets_layout(self) -> bool {
+        self.0 >= 3
+    }
+}
+
+/// Where a connection's links stand. An up link carries the protocol its
+/// `WELCOME` agreed on, and a link that went down keeps it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LinkPhase {
+    /// No link has been up yet.
+    #[default]
+    NeverUp,
+    /// A link is up.
+    Up(Negotiated),
+    /// The last link went down; the next is a reconnect.
+    Down(Negotiated),
+}
+
+impl LinkPhase {
+    /// A link is up now.
+    fn is_up(self) -> bool {
+        match self {
+            Self::Up(_) => true,
+            Self::NeverUp | Self::Down(_) => false,
+        }
+    }
+
+    /// A link has been up, and may be down again.
+    fn has_been_up(self) -> bool {
+        match self {
+            Self::Up(_) | Self::Down(_) => true,
+            Self::NeverUp => false,
+        }
+    }
+
+    /// The protocol of the link that is up, else of the last one; none
+    /// before the first.
+    fn protocol(self) -> Option<Negotiated> {
+        match self {
+            Self::Up(protocol) | Self::Down(protocol) => Some(protocol),
+            Self::NeverUp => None,
+        }
+    }
+
+    /// The link that was up went down. Before the first there is none to
+    /// lose.
+    fn down(self) -> Self {
+        match self {
+            Self::Up(protocol) | Self::Down(protocol) => Self::Down(protocol),
+            Self::NeverUp => Self::NeverUp,
+        }
+    }
+}
+
+/// Whether a relay connection is in use, as its idle thread last looked.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum Idle {
+    /// In use, or not looked at yet.
+    #[default]
+    InUse,
+    /// Out of use since `at`. `given_up` says which `CLOSE`s were given up
+    /// meanwhile ([`not_ending`]), which is then why the connection ends.
+    Since { at: Instant, given_up: Option<String> },
+}
+
+/// What a failed relay attempt does to what waits on the connection
+/// ([`State::connect_failed`]).
+struct ConnectFailed {
+    /// New tabs' requests, to fail with the attempt's message.
+    failed: Vec<Pending>,
+    /// The attaches to tell the message, once, with their sessions.
+    told: Vec<(SessionId, Sink)>,
+    next: Next,
+}
+
+/// Whether a relay connection tries again after a failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    Retry,
+    /// It ended, with the attempt's message as its reason.
+    End,
+}
+
+/// What a relay connection's idle thread does after a look
+/// ([`State::idle_step`]).
+#[derive(Debug, PartialEq, Eq)]
+struct IdleStep {
+    /// The sessions whose `CLOSE`s were given up at this look.
+    given_up: Vec<SessionId>,
+    then: Then,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Then {
+    /// Look again after this long.
+    Wait(Duration),
+    /// The connection ended for this reason, now its [`State::ended`].
+    End(String),
+}
+
+/// What the reader does with an answer that would show a session: `SPAWNED`
+/// ([`State::route_spawned`]), or the `REPLAY_START` that answers an
+/// `ATTACH` ([`State::route_replay_start`]).
+enum Routed<T> {
+    /// Its request waited for it: the session is shown here with `sink`,
+    /// displacing `displaced` (whose tab is to be told it is lost), and the
+    /// requester is answered `answer` through `reply`.
+    Shown { sink: Sink, reply: Reply<T>, answer: T, displaced: Option<Shown> },
+    /// Nobody here waits for this new session: it is ended (`CLOSE`). A
+    /// request of another kind under its id fails, saying what answered it.
+    Close { session: SessionId, fail: Option<(Waiting, &'static str)> },
+    /// Nobody here waits for this attached session: it is left detached
+    /// (`DETACH`), as it was. A request of another kind under its id fails,
+    /// saying what answered it.
+    Detach { session: SessionId, fail: Option<(Waiting, &'static str)> },
+}
+
+/// The longest pause between relay attempts: longer for an eager
+/// connection that nothing waits on (no session shown, no request).
+fn retry_cap(eager: bool, nothing_waits: bool, timings: &Timings) -> Duration {
+    if eager && nothing_waits { timings.eager_cap } else { timings.retry_cap }
 }
 
 impl State {
@@ -519,7 +698,7 @@ impl State {
     /// oldest was queued `limit` ago with no link up, else none.
     fn give_up_closes(&mut self, limit: Duration, now: Instant) -> Vec<SessionId> {
         match self.closing.first() {
-            Some(&(_, queued)) if !self.linked && now.saturating_duration_since(queued) >= limit => {
+            Some(&(_, queued)) if !self.link.is_up() && now.saturating_duration_since(queued) >= limit => {
                 self.closing.drain(..).map(|(session, _)| session).collect()
             }
             _ => Vec::new(),
@@ -528,13 +707,156 @@ impl State {
 
     /// When the `CLOSE`s are given up if no link comes up first.
     fn closes_due(&self, limit: Duration) -> Option<Instant> {
-        let (_, queued) = self.closing.first().filter(|_| !self.linked)?;
+        let (_, queued) = self.closing.first().filter(|_| !self.link.is_up())?;
         Some(*queued + limit)
     }
 
     /// A recorded attach or a listing hook waits for the core's `LIST`.
     fn waits_for_listing(&self) -> bool {
         !self.on_listing.is_empty() || self.requests.values().any(Pending::is_check)
+    }
+
+    /// No session is shown and no request waits: what an eager relay's
+    /// pauses are longer for ([`retry_cap`]).
+    fn nothing_waits(&self) -> bool {
+        self.sessions.is_empty() && self.requests.is_empty()
+    }
+
+    /// A relay attempt failed with `message`; `refused` when the core
+    /// refused this Brindle ([`Refused`]). Before the first link, new tabs'
+    /// requests fail with it, and the attaches that wait on are told it
+    /// once; after a refusal, new tabs' requests fail with it after a first
+    /// link too, since retrying won't clear it soon. Attaches carried over a
+    /// lost link aren't told: their tabs say the link was lost.
+    ///
+    /// It tries again: after a refusal only while the connection is
+    /// `eager`; otherwise always once a link has been up, and before that
+    /// while an attach or a listing hook waits or it is `eager`. When it
+    /// doesn't, it ends here, so no attach can start to wait on a
+    /// connection that has stopped trying.
+    fn connect_failed(&mut self, refused: bool, eager: bool, message: &str) -> ConnectFailed {
+        if self.link.has_been_up() && !refused {
+            return ConnectFailed { failed: Vec::new(), told: Vec::new(), next: Next::Retry };
+        }
+        let new_tabs: Vec<RequestId> =
+            self.requests.iter().filter(|(_, pending)| !pending.is_attach()).map(|(&req, _)| req).collect();
+        let failed: Vec<Pending> = new_tabs.into_iter().filter_map(|req| self.requests.remove(&req)).collect();
+        // This attempt answered them: only a later tab hurries the next.
+        self.hurry = false;
+        let first = !self.link.has_been_up();
+        let told: Vec<(SessionId, Sink)> = self
+            .requests
+            .values_mut()
+            .filter(|_| first)
+            .filter_map(|pending| match &mut pending.waiting {
+                Waiting::Attach { sink, attach, told, .. } if !*told => {
+                    *told = true;
+                    Some((attach.session, sink.clone()))
+                }
+                Waiting::Spawn { .. } | Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_) => None,
+            })
+            .collect();
+        let keep =
+            eager || (!refused && (self.requests.values().any(Pending::is_attach) || !self.on_listing.is_empty()));
+        let next = match keep {
+            true => Next::Retry,
+            false => {
+                self.ended = Some(message.to_string());
+                Next::End
+            }
+        };
+        ConnectFailed { failed, told, next }
+    }
+
+    /// The idle thread's look at `now`, at a relay connection whose endpoint
+    /// is `name`. With no link up, the `CLOSE`s not written are given up
+    /// `close_limit` after the oldest was queued ([`State::give_up_closes`]),
+    /// eager or not. The connection ends `idle` after it was last in use
+    /// ([`State::in_use`]), unless it is `eager`, with the closes given up
+    /// meanwhile as its reason, if any, else that it was no longer used.
+    /// Otherwise the thread looks again a fifth of `idle` later, or when the
+    /// closes are due if sooner, so it ends at most a fifth of `idle` late.
+    fn idle_step(&mut self, now: Instant, eager: bool, idle: Duration, close_limit: Duration, name: &str) -> IdleStep {
+        let given_up = self.give_up_closes(close_limit, now);
+        let reason = (!given_up.is_empty()).then(|| not_ending(&given_up, name, close_limit));
+        if eager || self.in_use() {
+            self.idle = Idle::InUse;
+        } else {
+            let since = match std::mem::take(&mut self.idle) {
+                Idle::InUse => Idle::Since { at: now, given_up: reason },
+                Idle::Since { at, given_up: before } => Idle::Since { at, given_up: reason.or(before) },
+            };
+            match since {
+                Idle::Since { at, given_up: why } if now.saturating_duration_since(at) >= idle => {
+                    let why = why.unwrap_or_else(|| "the connection was no longer used".to_string());
+                    // Here, so no request slips in to wait on it.
+                    self.ended = Some(why.clone());
+                    return IdleStep { given_up, then: Then::End(why) };
+                }
+                Idle::InUse | Idle::Since { .. } => self.idle = since,
+            }
+        }
+        let look = (idle / 5).max(Duration::from_millis(1));
+        let due = self.closes_due(close_limit).map(|due| due.saturating_duration_since(now));
+        let wait = due.map_or(look, |due| due.min(look)).max(Duration::from_millis(1));
+        IdleStep { given_up, then: Then::Wait(wait) }
+    }
+
+    /// The link went down. The requests written on it are taken out and
+    /// given back to fail, since their answers are gone, except attaches,
+    /// which are carried over for the next link's listing to decide
+    /// ([`carried_attaches`]). The listing waited for is gone with it.
+    fn link_lost(&mut self) -> Vec<Pending> {
+        self.list = None;
+        self.link = self.link.down();
+        let lost: Vec<RequestId> =
+            self.requests.iter().filter(|(_, pending)| pending.is_written()).map(|(&req, _)| req).collect();
+        let mut failed = Vec::new();
+        for req in lost {
+            let Some(pending) = self.requests.get_mut(&req) else { continue };
+            if pending.is_attach() {
+                pending.sent = Sent::Carried;
+            } else if let Some(pending) = self.requests.remove(&req) {
+                failed.push(pending);
+            }
+        }
+        failed
+    }
+
+    /// What `SPAWNED` does: the session is shown with its spawn's sink when
+    /// the spawn still waits for it, its key decoded here. Otherwise its
+    /// spawner gave up, nobody shows it, and it is ended; a request of
+    /// another kind under that `req` fails.
+    fn route_spawned(&mut self, spawned: &client::Spawned) -> Routed<Started> {
+        let session = spawned.session;
+        match self.requests.remove(&spawned.req).map(|pending| pending.waiting) {
+            Some(Waiting::Spawn { sink, reply }) => {
+                let key = SessionKey::from_wire(&spawned.key);
+                let displaced = self.show(session, Shown::new(sink.clone(), key.clone()));
+                Routed::Shown { sink, reply, answer: Started { session, pid: spawned.pid, key }, displaced }
+            }
+            Some(other @ (Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_))) => {
+                Routed::Close { session, fail: Some((other, "answered with SPAWNED")) }
+            }
+            None => Routed::Close { session, fail: None },
+        }
+    }
+
+    /// What a `REPLAY_START` answering request `req` does: the session is
+    /// shown with its attach's sink and key when the attach still waits for
+    /// it. Otherwise its attacher gave up, and the session is left detached,
+    /// as it was; a request of another kind under that `req` fails.
+    fn route_replay_start(&mut self, req: RequestId, session: SessionId, pid: u32) -> Routed<u32> {
+        match self.requests.remove(&req).map(|pending| pending.waiting) {
+            Some(Waiting::Attach { sink, reply, key, .. }) => {
+                let displaced = self.show(session, Shown::new(sink.clone(), key));
+                Routed::Shown { sink, reply, answer: pid, displaced }
+            }
+            Some(other @ (Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_))) => {
+                Routed::Detach { session, fail: Some((other, "answered with REPLAY_START")) }
+            }
+            None => Routed::Detach { session, fail: None },
+        }
     }
 }
 
@@ -570,15 +892,18 @@ struct Stamp {
 impl Stamp {
     const HELD: u64 = u64::MAX;
 
-    fn new(limit: Duration) -> Self {
-        let stamp = Self { epoch: Instant::now(), deadline: AtomicU64::new(0), expired: AtomicBool::new(false) };
-        stamp.touch(limit);
+    /// A stamp made at `now`, dead `limit` later.
+    fn new(now: Instant, limit: Duration) -> Self {
+        let stamp = Self { epoch: now, deadline: AtomicU64::new(0), expired: AtomicBool::new(false) };
+        stamp.touch(now, limit);
         stamp
     }
 
-    /// Dead if nothing more is read within `limit`.
-    fn touch(&self, limit: Duration) {
-        let at = (self.epoch.elapsed() + limit).as_millis();
+    /// Read at `now`: dead if nothing more is read within `limit`. The
+    /// deadline is kept in whole milliseconds from the epoch, rounded down,
+    /// and one too far for them is the furthest short of [`Stamp::HELD`].
+    fn touch(&self, now: Instant, limit: Duration) {
+        let at = (now.saturating_duration_since(self.epoch) + limit).as_millis();
         self.deadline.store(u64::try_from(at).unwrap_or(Self::HELD - 1), Ordering::Release);
     }
 
@@ -638,7 +963,8 @@ pub struct Connection {
     token: String,
     /// Keep connecting while nothing waits (a profile connects at launch).
     eager: AtomicBool,
-    /// This connection's own, for its reports.
+    /// This connection's own, never another's in this process: for its
+    /// reports and the registry ([`Connection::id`]).
     id: u64,
     report: Option<Report>,
 }
@@ -770,6 +1096,12 @@ impl Connection {
         self.state.lock().ended.is_some()
     }
 
+    /// This connection's id, given to no other in this process, so a
+    /// registry slot tells its own connection from a newer one by it.
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Takes the connection for another terminal; false once it has ended.
     /// A relay out of use starts its idle time over, so it can't end
     /// between this and the terminal's request.
@@ -778,8 +1110,8 @@ impl Connection {
         if state.ended.is_some() {
             return false;
         }
-        if state.idle_since.is_some() {
-            state.idle_since = Some(Instant::now());
+        if let Idle::Since { at, .. } = &mut state.idle {
+            *at = Instant::now();
         }
         true
     }
@@ -796,42 +1128,35 @@ impl Connection {
     }
 
     /// Ends a relay connection `idle` ([`Timings::idle`]) after it was last
-    /// in use ([`State::in_use`]), unless it is eager. With no link up, it
-    /// gives the `CLOSE`s not written up `close_limit` after the oldest was
-    /// queued, eager or not, and logs the sessions left running; that is
-    /// then the end's reason, unless the connection is used again first. It
-    /// looks five times per `idle`, and when the closes are due, so it ends
-    /// at most a fifth of `idle` late.
+    /// in use, unless it is eager, and gives up the `CLOSE`s not written
+    /// `close_limit` after the oldest was queued, logging the sessions left
+    /// running ([`State::idle_step`] decides both). It reads the clock and
+    /// waits.
     fn end_when_unused(&self, idle: Duration, close_limit: Duration) {
-        let look = (idle / 5).max(Duration::from_millis(1));
-        let mut given_up: Option<String> = None;
+        let name = self.name();
         let mut state = self.state.lock();
         loop {
             if state.ended.is_some() {
                 return;
             }
-            let now = Instant::now();
-            let sessions = state.give_up_closes(close_limit, now);
-            if !sessions.is_empty() {
-                let text = not_ending(&sessions, &self.name(), close_limit);
-                log::warn!("{text}");
-                given_up = Some(text);
-            }
+            let eager = self.eager.load(Ordering::Acquire);
+            // Under the lock, so no request slips in to wait on a connection
+            // that ends.
+            let step = state.idle_step(Instant::now(), eager, idle, close_limit, &name);
             state.last_look = Some(Instant::now());
-            if self.eager.load(Ordering::Acquire) || state.in_use() {
-                state.idle_since = None;
-                given_up = None;
-            } else if now.saturating_duration_since(*state.idle_since.get_or_insert(now)) >= idle {
-                // Under the lock, so no request slips in to wait on it.
-                let reason = given_up.take().unwrap_or_else(|| "the connection was no longer used".to_string());
-                state.ended = Some(reason.clone());
-                drop(state);
-                log::info!("closing the unused connection to {}", self.name());
-                return self.ended(&reason);
+            if !step.given_up.is_empty() {
+                log::warn!("{}", not_ending(&step.given_up, &name, close_limit));
             }
-            let due = state.closes_due(close_limit).map(|due| due.saturating_duration_since(now));
-            let wait = due.map_or(look, |due| due.min(look)).max(Duration::from_millis(1));
-            self.wake.wait_for(&mut state, wait);
+            match step.then {
+                Then::Wait(wait) => {
+                    self.wake.wait_for(&mut state, wait);
+                }
+                Then::End(reason) => {
+                    drop(state);
+                    log::info!("closing the unused connection to {name}");
+                    return self.ended(&reason);
+                }
+            }
         }
     }
 
@@ -955,12 +1280,13 @@ impl Connection {
                 bail!("{reason}");
             }
             // A new tab tries the endpoint now, not after the pause.
-            if self.is_relay() && !state.connected && !matches!(waiting, Waiting::Attach { .. }) {
+            if self.is_relay() && !state.link.has_been_up() && !matches!(waiting, Waiting::Attach { .. }) {
                 state.hurry = true;
                 self.wake.notify_all();
             }
             let listed = message.is_none();
-            state.requests.insert(req, Pending { waiting, written: false, told: false, carried: listed });
+            let pending = if listed { Pending::recorded(waiting) } else { Pending::queued(waiting) };
+            state.requests.insert(req, pending);
             if listed {
                 self.request_list(&mut state);
             }
@@ -993,8 +1319,8 @@ impl Connection {
         let pending = {
             let mut state = self.state.lock();
             match state.requests.get(&req) {
-                Some(pending) if !pending.written => state.requests.remove(&req),
-                _ => None,
+                Some(pending) if !pending.is_written() => state.requests.remove(&req),
+                Some(_) | None => None,
             }
         };
         if let Some(pending) = pending {
@@ -1105,7 +1431,7 @@ impl Connection {
     /// ([`Connection::up`]); while reconnecting, the writer holds it and the
     /// next link's own `LIST` replaces it.
     fn request_list(&self, state: &mut State) {
-        if !state.connected || state.list.is_some() {
+        if !state.link.has_been_up() || state.list.is_some() {
             return;
         }
         let req = self.req();
@@ -1147,8 +1473,8 @@ impl Connection {
                     // `why` may wait for the process to exit: asked only when
                     // the watchdog didn't end the link.
                     let account = match stamp.expired() {
-                        true => RelayAccount::Silent(timings.dead),
-                        false => RelayAccount::Said(wire.why()),
+                        true => Some(RelayAccount::Silent(timings.dead)),
+                        false => wire.why().map(RelayAccount::Said),
                     };
                     let reason = relay_link_ended(&name, &ending, account);
                     log::warn!("connection to {name} ended ({reason}); reconnecting");
@@ -1161,14 +1487,16 @@ impl Connection {
                     let message = format!("can't connect to {name}: {error:#}");
                     log::warn!("{message}");
                     let refused = error.downcast_ref::<Refused>().is_some();
-                    if !self.failed_to_connect(&message, refused) {
-                        return self.ended(&message);
+                    match self.failed_to_connect(&message, refused) {
+                        Next::Retry => {}
+                        Next::End => return self.ended(&message),
                     }
                     self.report_now(LinkState::Offline(format!("{error:#}")));
                     failures += 1;
                 }
             }
-            let cap = self.retry_cap(timings);
+            let nothing_waits = self.state.lock().nothing_waits();
+            let cap = retry_cap(self.eager.load(Ordering::Acquire), nothing_waits, timings);
             if !self.pause(relay::backoff(failures, timings.first_retry, cap)) {
                 return;
             }
@@ -1179,14 +1507,14 @@ impl Connection {
     /// ending a link that takes longer than [`Timings::bootstrap`].
     fn open_relay(&self, dial: &dyn Dial, timings: &Timings) -> Result<GreetedRelay> {
         let Link { reader, wire } = dial.launch()?;
-        let stamp = Arc::new(Stamp::new(timings.bootstrap));
+        let stamp = Arc::new(Stamp::new(Instant::now(), timings.bootstrap));
         self.watch_link(&wire, &stamp);
         let mut reader = BufReader::with_capacity(READ_BUFFER, reader);
         let greeted = self.greet(&dial.name(), &mut reader, wire.as_ref());
         match greeted.and_then(|(host, protocol)| self.up(wire.clone(), Some(host), protocol)) {
             Ok(()) => {
                 // Sooner than the bootstrap's deadline the watchdog waits for.
-                stamp.touch(timings.dead);
+                stamp.touch(Instant::now(), timings.dead);
                 self.watch_changed.notify_all();
                 self.report_now(LinkState::Connected);
                 Ok((reader, stamp, wire))
@@ -1252,12 +1580,10 @@ impl Connection {
                 // It ended while this link was starting.
                 bail!("{reason}");
             }
-            state.protocol = protocol;
-            let after_loss = state.connected;
+            let after_loss = state.link.has_been_up();
             let wanted = after_loss || state.waits_for_listing();
             // Under the same lock: what registers after this asks itself.
-            state.connected = true;
-            state.linked = true;
+            state.link = LinkPhase::Up(Negotiated(protocol));
             wanted.then(|| {
                 let listing = Listing { req: self.req(), after_loss };
                 state.list = Some(listing);
@@ -1304,7 +1630,7 @@ impl Connection {
                 }
             }
             if let Some((stamp, dead)) = liveness {
-                stamp.touch(dead);
+                stamp.touch(Instant::now(), dead);
             }
         }
     }
@@ -1317,23 +1643,11 @@ impl Connection {
                 }
             }
             ToClient::Spawned(spawned) => {
-                let mut state = self.state.lock();
-                match state.requests.remove(&spawned.req).map(|pending| pending.waiting) {
-                    Some(Waiting::Spawn { sink, reply }) => {
-                        let (session, pid, key) = (spawned.session, spawned.pid, SessionKey::from_wire(&spawned.key));
-                        let displaced = state.show(session, Shown::new(sink, key.clone()));
-                        drop(state);
-                        reply.try_send(Ok(Started { session, pid, key })).ok();
-                        self.displaced_lost(session, displaced);
-                    }
-                    other => {
-                        // Its spawner gave up: nobody shows this session.
-                        drop(state);
-                        if let Some(other) = other {
-                            other.fail("answered with SPAWNED".into());
-                        }
-                        self.send_close(spawned.session);
-                    }
+                let routed = self.state.lock().route_spawned(&spawned);
+                if let Some((_, reply, started, displaced)) = self.route(routed) {
+                    let session = started.session;
+                    reply.try_send(Ok(started)).ok();
+                    self.displaced_lost(session, displaced);
                 }
             }
             ToClient::Error(error) => {
@@ -1370,24 +1684,11 @@ impl Connection {
                 }
             }
             ToClient::ReplayStart(ReplayStart { req: Some(req), session, pid }) => {
-                let mut state = self.state.lock();
-                match state.requests.remove(&req).map(|pending| pending.waiting) {
-                    Some(Waiting::Attach { sink, reply, key, .. }) => {
-                        let displaced = state.show(session, Shown::new(sink.clone(), key));
-                        drop(state);
-                        self.displaced_lost(session, displaced);
-                        self.deliver(session, &sink, |sink| sink.replay(true));
-                        reply.try_send(Ok(pid)).ok();
-                    }
-                    other => {
-                        // Its attacher gave up: leave the session detached,
-                        // as it was.
-                        drop(state);
-                        if let Some(other) = other {
-                            other.fail("answered with REPLAY_START".into());
-                        }
-                        self.send(ToCore::Detach(Detach { session, layout: None }));
-                    }
+                let routed = self.state.lock().route_replay_start(req, session, pid);
+                if let Some((sink, reply, pid, displaced)) = self.route(routed) {
+                    self.displaced_lost(session, displaced);
+                    self.deliver(session, &sink, |sink| sink.replay(true));
+                    reply.try_send(Ok(pid)).ok();
                 }
             }
             ToClient::Exit(exit) => {
@@ -1482,6 +1783,32 @@ impl Connection {
                 }
             }
             ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
+        }
+    }
+
+    /// Applies what a [`Routed`] answer does besides showing its session:
+    /// fails the request of another kind it answered, then ends or detaches
+    /// the session nobody here waits for. Gives a shown session's sink,
+    /// reply, answer and displaced entry back to the caller. Called without
+    /// the state lock.
+    fn route<T>(&self, routed: Routed<T>) -> Option<(Sink, Reply<T>, T, Option<Shown>)> {
+        let fail = |fail: Option<(Waiting, &str)>| {
+            if let Some((waiting, why)) = fail {
+                waiting.fail(why.into());
+            }
+        };
+        match routed {
+            Routed::Shown { sink, reply, answer, displaced } => Some((sink, reply, answer, displaced)),
+            Routed::Close { session, fail: misanswered } => {
+                fail(misanswered);
+                self.send_close(session);
+                None
+            }
+            Routed::Detach { session, fail: misanswered } => {
+                fail(misanswered);
+                self.send(ToCore::Detach(Detach { session, layout: None }));
+                None
+            }
         }
     }
 
@@ -1588,24 +1915,7 @@ impl Connection {
             current.wire.end();
         }
         self.unwatch_link();
-        let failed = {
-            let mut state = self.state.lock();
-            state.list = None;
-            state.linked = false;
-            let lost: Vec<RequestId> =
-                state.requests.iter().filter(|(_, pending)| pending.written).map(|(&req, _)| req).collect();
-            let mut failed = Vec::new();
-            for req in lost {
-                let Some(pending) = state.requests.get_mut(&req) else { continue };
-                if pending.is_attach() {
-                    pending.written = false;
-                    pending.carried = true;
-                } else if let Some(pending) = state.requests.remove(&req) {
-                    failed.push(pending);
-                }
-            }
-            failed
-        };
+        let failed = self.state.lock().link_lost();
         for pending in failed {
             pending.waiting.fail(format!("the terminal server went away ({reason})"));
         }
@@ -1623,49 +1933,11 @@ impl Connection {
     }
 
     /// A relay attempt failed with `message`; `refused` when the core
-    /// refused this Brindle ([`Refused`]). Before the first link, new tabs'
-    /// requests fail with it, and the attaches that wait on are told it once;
-    /// after a refusal, new tabs' requests fail with it after a first link
-    /// too, since retrying won't clear it soon. Says whether to keep trying:
-    /// after a refusal only while the connection is eager; otherwise always
-    /// once a link has been up, and before that while an attach or a listing
-    /// hook waits or the connection is eager.
-    fn failed_to_connect(&self, message: &str, refused: bool) -> bool {
-        let (failed, told, keep) = {
-            let mut state = self.state.lock();
-            if state.connected && !refused {
-                return true;
-            }
-            let new_tabs: Vec<RequestId> =
-                state.requests.iter().filter(|(_, pending)| !pending.is_attach()).map(|(&req, _)| req).collect();
-            let failed: Vec<Pending> = new_tabs.into_iter().filter_map(|req| state.requests.remove(&req)).collect();
-            // This attempt answered them: only a later tab hurries the next.
-            state.hurry = false;
-            // Attaches carried over a lost link aren't told: their tabs say
-            // the link was lost.
-            let first = !state.connected;
-            let told: Vec<(SessionId, Sink)> = state
-                .requests
-                .values_mut()
-                .filter(|_| first)
-                .filter_map(|pending| match &pending.waiting {
-                    Waiting::Attach { sink, attach, .. } if !pending.told => {
-                        pending.told = true;
-                        Some((attach.session, sink.clone()))
-                    }
-                    Waiting::Spawn { .. } | Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_) => None,
-                })
-                .collect();
-            let eager = self.eager.load(Ordering::Acquire);
-            let keep = eager
-                || (!refused && (state.requests.values().any(Pending::is_attach) || !state.on_listing.is_empty()));
-            if !keep {
-                // Under the same lock, so no attach slips in to wait on a
-                // connection that has stopped trying.
-                state.ended = Some(message.to_string());
-            }
-            (failed, told, keep)
-        };
+    /// refused this Brindle ([`Refused`]). Fails and tells what
+    /// [`State::connect_failed`] says, and says whether to keep trying.
+    fn failed_to_connect(&self, message: &str, refused: bool) -> Next {
+        let eager = self.eager.load(Ordering::Acquire);
+        let ConnectFailed { failed, told, next } = self.state.lock().connect_failed(refused, eager, message);
         for pending in failed {
             pending.waiting.fail(message.to_string());
         }
@@ -1673,17 +1945,7 @@ impl Connection {
         for (session, sink) in told {
             self.deliver(session, &sink, |sink| sink.output(line.as_bytes()));
         }
-        keep
-    }
-
-    /// The longest pause between relay attempts: longer for an eager
-    /// connection that nothing waits on.
-    fn retry_cap(&self, timings: &Timings) -> Duration {
-        let idle = {
-            let state = self.state.lock();
-            state.sessions.is_empty() && state.requests.is_empty()
-        };
-        if self.eager.load(Ordering::Acquire) && idle { timings.eager_cap } else { timings.retry_cap }
+        next
     }
 
     /// Waits `delay` before the next relay attempt, or less when a new tab
@@ -1990,7 +2252,7 @@ impl Connection {
         }
         match state.requests.get_mut(&req) {
             Some(pending) => {
-                pending.written = written;
+                pending.mark_written(written);
                 true
             }
             None => false,
@@ -2050,20 +2312,20 @@ enum RelayAccount {
     /// isn't asked.
     Silent(Duration),
     /// What the relay's process says ([`Wire::why`]: its status and what it
-    /// wrote to stderr), empty when it said nothing.
+    /// wrote to stderr). Made only when it says something.
     Said(String),
 }
 
 /// Why a relay link ended, in the order that tells the most (design
 /// decision 2): the watchdog ended it for silence; else what the relay's
-/// process says; else how the stream ended. A process that exited 0 with
-/// nothing to say is a relay that closed the connection, as it does when
-/// its core connection closes.
-fn relay_link_ended(name: &str, ending: &Ending, account: RelayAccount) -> String {
+/// process says; else, with no account (`None`), how the stream ended. A
+/// process that exited 0 with nothing to say is a relay that closed the
+/// connection, as it does when its core connection closes.
+fn relay_link_ended(name: &str, ending: &Ending, account: Option<RelayAccount>) -> String {
     match account {
-        RelayAccount::Silent(dead) => format!("nothing read from {name} for {}", span_text(dead)),
-        RelayAccount::Said(why) if !why.is_empty() => why,
-        RelayAccount::Said(_) => match ending {
+        Some(RelayAccount::Silent(dead)) => format!("nothing read from {name} for {}", span_text(dead)),
+        Some(RelayAccount::Said(why)) => why,
+        None => match ending {
             Ending::Closed => "the relay closed the connection".to_string(),
             Ending::Failed(error) => format!("reading from the relay failed: {error}"),
         },
@@ -2074,13 +2336,10 @@ fn relay_link_ended(name: &str, ending: &Ending, account: RelayAccount) -> Strin
 fn next_frame(reader: &mut impl BufRead, wire: &dyn Wire) -> Result<Frame> {
     match Frame::read_from_or_eof(reader) {
         Ok(Some(frame)) => Ok(frame),
-        Ok(None) => {
-            let why = wire.why();
-            if why.is_empty() {
-                bail!("the relay ended before the terminal server answered");
-            }
-            bail!("the relay ended before the terminal server answered: {why}")
-        }
+        Ok(None) => match wire.why() {
+            None => bail!("the relay ended before the terminal server answered"),
+            Some(why) => bail!("the relay ended before the terminal server answered: {why}"),
+        },
         Err(error) => bail!("reading from the relay failed: {error}"),
     }
 }
@@ -2226,7 +2485,7 @@ struct Decided {
 fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[ListedSession], name: &str) -> Decided {
     let mut decided = Decided::default();
     let carried: Vec<RequestId> =
-        requests.iter().filter(|(_, pending)| pending.carried).map(|(&req, _)| req).collect();
+        requests.iter().filter(|(_, pending)| pending.is_carried()).map(|(&req, _)| req).collect();
     for req in carried {
         let Some(pending) = requests.get_mut(&req) else { continue };
         let Waiting::Attach { attach, key, awaits, sink, .. } = &mut pending.waiting else { continue };
@@ -2242,7 +2501,7 @@ fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[Listed
                             (attach.cols, attach.rows) = (cols, rows);
                         }
                         *awaits = Awaits::Replay;
-                        pending.carried = false;
+                        pending.sent = Sent::Queued;
                         decided.again.push((attach.clone(), listing.size.map(|size| (sink.clone(), size))));
                         None
                     }
@@ -2252,7 +2511,7 @@ fn carried_attaches(requests: &mut HashMap<RequestId, Pending>, listed: &[Listed
             Awaits::Replay => match found {
                 Some(listing) if listing.attached => None,
                 Some(_) => {
-                    pending.carried = false;
+                    pending.sent = Sent::Queued;
                     decided.again.push((attach.clone(), None));
                     None
                 }
@@ -2405,12 +2664,12 @@ impl Running {
     }
 
     /// Makes `layout` the session's layout on the core (`SET_LAYOUT`), when it
-    /// differs from the one last sent, the link speaks client protocol 3 and
-    /// the session is shown; a core below 3 gets it only with the `DETACH`
-    /// on quit.
+    /// differs from the one last sent, the current (or last) link speaks
+    /// client protocol 3 ([`Negotiated::sets_layout`]) and the session is
+    /// shown; a core below 3 gets it only with the `DETACH` on quit.
     pub fn set_layout(&self, layout: Option<serde_json::Value>) {
         let state = self.conn.state.lock();
-        if state.protocol < 3 || !state.shows(self.id, self.key.as_ref()) {
+        if !state.link.protocol().is_some_and(Negotiated::sets_layout) || !state.shows(self.id, self.key.as_ref()) {
             return;
         }
         let mut sent = self.layout.lock();
@@ -2584,8 +2843,8 @@ pub(super) mod fake {
             self.far.cut();
         }
 
-        fn why(&self) -> String {
-            self.far.why.lock().clone()
+        fn why(&self) -> Option<String> {
+            Some(self.far.why.lock().clone()).filter(|why| !why.is_empty())
         }
     }
 
@@ -3480,7 +3739,7 @@ mod tests {
         let (sink, _tab) = fake::sink();
         let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
         assert!(matches!(far.next(), ToCore::Spawn(_)));
-        connection.state.lock().protocol = 3;
+        connection.state.lock().link = LinkPhase::Up(Negotiated(3));
 
         let big = serde_json::json!({ "tab": "x".repeat(client::MAX_LAYOUT + 1) });
         let small = serde_json::json!({ "tab": "x" });
@@ -4217,11 +4476,14 @@ mod tests {
     /// come in.
     #[test]
     fn a_relay_links_reason_is_the_silence_then_the_process_then_the_stream() {
-        let said = |ending: &Ending, why: &str| relay_link_ended("A8", ending, RelayAccount::Said(why.to_string()));
+        // A process that said nothing gives no account.
+        let said = |ending: &Ending, why: &str| {
+            relay_link_ended("A8", ending, Some(why.to_string()).filter(|why| !why.is_empty()).map(RelayAccount::Said))
+        };
         let failed = Ending::Failed(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
         // Silence wins, whatever the stream did (the process isn't asked:
         // its status would only report the kill).
-        let silent = RelayAccount::Silent(Duration::from_secs(30));
+        let silent = Some(RelayAccount::Silent(Duration::from_secs(30)));
         assert_eq!(relay_link_ended("A8", &Ending::Closed, silent.clone()), "nothing read from A8 for 30 s");
         assert_eq!(relay_link_ended("A8", &failed, silent), "nothing read from A8 for 30 s");
         // The process's own account.
@@ -4714,11 +4976,11 @@ mod tests {
         // None before the limit.
         assert!(state.give_up_closes(limit, queued + limit - Duration::from_millis(1)).is_empty());
         // None while a link is up, however long they waited.
-        state.linked = true;
+        state.link = LinkPhase::Up(Negotiated(2));
         assert_eq!(state.closes_due(limit), None);
         assert!(state.give_up_closes(limit, queued + limit * 2).is_empty());
         // All of them, oldest first, once the oldest waited the limit.
-        state.linked = false;
+        state.link = LinkPhase::Down(Negotiated(2));
         assert_eq!(state.give_up_closes(limit, queued + limit), [7, 3]);
         assert!(!state.in_use());
         assert!(state.give_up_closes(limit, queued + limit * 2).is_empty(), "once");
@@ -4750,7 +5012,7 @@ mod tests {
                 let (sink, _tab) = fake::sink();
                 let (reply, _answer) = mpsc::sync_channel(1);
                 let (waiting, _message) = request.waiting(req, sink.clone(), reply);
-                carried.requests.insert(req, Pending { waiting, written: false, told: false, carried: true });
+                carried.requests.insert(req, Pending { waiting, sent: Sent::Carried });
                 carried.sinks.insert(req, sink);
             }
             carried
@@ -4808,7 +5070,7 @@ mod tests {
         assert!(untold.is_none());
         for req in [1, 2] {
             assert_eq!(carried.awaits(req), Some(Awaits::Replay));
-            assert!(!carried.requests[&req].carried);
+            assert_eq!(carried.requests[&req].sent, Sent::Queued);
         }
     }
 
@@ -4858,7 +5120,7 @@ mod tests {
         assert!(gone.is_empty(), "{gone:?}");
         for req in [1, 2] {
             assert_eq!(carried.awaits(req), Some(Awaits::Replay));
-            assert!(carried.requests[&req].carried, "still decided by the next listing");
+            assert_eq!(carried.requests[&req].sent, Sent::Carried, "still decided by the next listing");
         }
     }
 
@@ -4873,7 +5135,7 @@ mod tests {
         assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30 });
         assert!(told.is_none());
         assert_eq!(carried.awaits(1), Some(Awaits::Replay));
-        assert!(!carried.requests[&1].carried);
+        assert_eq!(carried.requests[&1].sent, Sent::Queued);
     }
 
     /// Its id is another session's now: never answered with that one.
@@ -4904,5 +5166,559 @@ mod tests {
                 (2, "the terminal server no longer has session 9".to_string()),
             ]
         );
+    }
+
+    /// A request's kind, for assertions.
+    fn kind(waiting: &Waiting) -> &'static str {
+        match waiting {
+            Waiting::Spawn { .. } => "spawn",
+            Waiting::Attach { .. } => "attach",
+            Waiting::List(_) => "list",
+            Waiting::Done(_) => "done",
+        }
+    }
+
+    /// A spawn's request, the sink it shows its session with, and where its
+    /// answer goes.
+    fn spawn_waiting() -> (Waiting, Sink, mpsc::Receiver<std::result::Result<Started, String>>) {
+        let (sink, _tab) = fake::sink();
+        let (reply, answer) = mpsc::sync_channel(1);
+        (Waiting::Spawn { sink: sink.clone(), reply }, sink, answer)
+    }
+
+    fn list_waiting() -> Waiting {
+        let (reply, _answer) = mpsc::sync_channel(1);
+        Waiting::List(reply)
+    }
+
+    fn done_waiting() -> Waiting {
+        let (reply, _answer) = mpsc::sync_channel(1);
+        Waiting::Done(reply)
+    }
+
+    /// `request`'s attach under `req`, and the sink it shows its session
+    /// with.
+    fn attach_waiting(req: RequestId, request: AttachRequest) -> (Waiting, Sink) {
+        let (sink, _tab) = fake::sink();
+        let (reply, _answer) = mpsc::sync_channel(1);
+        let (waiting, _message) = request.waiting(req, sink.clone(), reply);
+        (waiting, sink)
+    }
+
+    /// The requests waiting, by id: their kinds and where their messages
+    /// stand.
+    fn requests(state: &State) -> Vec<(RequestId, &'static str, Sent)> {
+        let mut requests: Vec<(RequestId, &'static str, Sent)> =
+            state.requests.iter().map(|(&req, pending)| (req, kind(&pending.waiting), pending.sent)).collect();
+        requests.sort_by_key(|&(req, ..)| req);
+        requests
+    }
+
+    /// The kinds of `pending`, sorted.
+    fn kinds(pending: &[Pending]) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> = pending.iter().map(|pending| kind(&pending.waiting)).collect();
+        kinds.sort_unstable();
+        kinds
+    }
+
+    fn hook() -> ListingHook {
+        Box::new(|_| {})
+    }
+
+    /// 4.1: a connection's links are never up, then up, then down, and one
+    /// that went down keeps its protocol until the next is up.
+    #[test]
+    fn a_links_phase_goes_from_never_up_to_up_and_down_keeping_its_protocol() {
+        let never = LinkPhase::default();
+        assert_eq!(never, LinkPhase::NeverUp);
+        assert_eq!((never.is_up(), never.has_been_up(), never.protocol()), (false, false, None));
+        assert_eq!(never.down(), LinkPhase::NeverUp, "nothing to lose before the first link");
+        let up = LinkPhase::Up(Negotiated(3));
+        assert_eq!((up.is_up(), up.has_been_up(), up.protocol()), (true, true, Some(Negotiated(3))));
+        let down = up.down();
+        assert_eq!(down, LinkPhase::Down(Negotiated(3)));
+        assert_eq!((down.is_up(), down.has_been_up(), down.protocol()), (false, true, Some(Negotiated(3))));
+        assert_eq!(down.down(), down, "down stays down");
+    }
+
+    /// 4.1: `SET_LAYOUT` goes only to a core on client protocol 3 or later,
+    /// the current link's or, while it is down, the last one's.
+    #[test]
+    fn only_client_protocol_3_and_later_takes_set_layout() {
+        let sets = |link: LinkPhase| link.protocol().is_some_and(Negotiated::sets_layout);
+        assert!(!sets(LinkPhase::NeverUp));
+        for (protocol, expected) in [(1, false), (2, false), (3, true), (4, true)] {
+            assert_eq!(Negotiated(protocol).sets_layout(), expected, "protocol {protocol}");
+            assert_eq!(sets(LinkPhase::Up(Negotiated(protocol))), expected, "up on {protocol}");
+            assert_eq!(sets(LinkPhase::Down(Negotiated(protocol))), expected, "down from {protocol}");
+        }
+    }
+
+    /// 4.2: a request is queued, then written on the link, and a failed
+    /// write leaves it queued for the next link. Only a recorded attach
+    /// starts carried, writing never carries one, and a carried attach whose
+    /// write failed stays carried.
+    #[test]
+    fn a_requests_message_is_queued_written_or_carried() {
+        let (spawn, ..) = spawn_waiting();
+        assert_eq!(Pending::queued(spawn).sent, Sent::Queued);
+        let (recorded, _) = attach_waiting(1, recorded(5));
+        assert_eq!(Pending::recorded(recorded).sent, Sent::Carried);
+        let cases = [
+            (Sent::Queued, true, Sent::Written),
+            (Sent::Queued, false, Sent::Queued),
+            (Sent::Written, true, Sent::Written),
+            (Sent::Written, false, Sent::Queued),
+            (Sent::Carried, true, Sent::Written),
+            (Sent::Carried, false, Sent::Carried),
+        ];
+        for (before, written, after) in cases {
+            let mut pending = Pending { waiting: list_waiting(), sent: before };
+            pending.mark_written(written);
+            assert_eq!(pending.sent, after, "{before:?} marked written {written}");
+        }
+    }
+
+    /// 4.2, 4.3: a lost link fails the requests written on it and carries the
+    /// attaches written on it over to the next listing. Nothing else
+    /// changes, and the listing waited for goes with the link.
+    #[test]
+    fn a_lost_link_fails_written_requests_and_carries_written_attaches() {
+        let mut state = State {
+            link: LinkPhase::Up(Negotiated(2)),
+            list: Some(Listing { req: 99, after_loss: false }),
+            ..State::default()
+        };
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(1, Pending { waiting: spawn, sent: Sent::Written });
+        let (attach, _) = attach_waiting(2, attach_request(7));
+        state.requests.insert(2, Pending { waiting: attach, sent: Sent::Written });
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(3, Pending::queued(spawn));
+        let (attach, _) = attach_waiting(4, attach_request(8));
+        state.requests.insert(4, Pending::queued(attach));
+        let (attach, _) = attach_waiting(5, recorded(9));
+        state.requests.insert(5, Pending::recorded(attach));
+        state.requests.insert(6, Pending { waiting: list_waiting(), sent: Sent::Written });
+        state.requests.insert(7, Pending { waiting: done_waiting(), sent: Sent::Written });
+
+        assert_eq!(kinds(&state.link_lost()), ["done", "list", "spawn"]);
+        assert_eq!(
+            requests(&state),
+            [
+                (2, "attach", Sent::Carried),
+                (3, "spawn", Sent::Queued),
+                (4, "attach", Sent::Queued),
+                (5, "attach", Sent::Carried),
+            ]
+        );
+        assert_eq!(state.link, LinkPhase::Down(Negotiated(2)));
+        assert!(state.list.is_none(), "the listing waited for went with the link");
+        // Nothing was written since: a second loss changes nothing.
+        assert!(state.link_lost().is_empty());
+        assert_eq!(requests(&state).len(), 4);
+    }
+
+    /// 4.3: before the first link, a failed attempt fails new tabs' requests
+    /// and tells each waiting attach, recorded or not, once; it keeps trying
+    /// while one waits.
+    #[test]
+    fn a_failed_first_attempt_fails_new_tabs_and_tells_attaches_once() {
+        let message = "can't connect to A8: boom";
+        let mut state = State { hurry: true, ..State::default() };
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(1, Pending::queued(spawn));
+        state.requests.insert(2, Pending::queued(list_waiting()));
+        state.requests.insert(3, Pending::queued(done_waiting()));
+        let (now, now_sink) = attach_waiting(4, attach_request(7));
+        state.requests.insert(4, Pending::queued(now));
+        let (recorded, recorded_sink) = attach_waiting(5, recorded(8));
+        state.requests.insert(5, Pending::recorded(recorded));
+
+        let ConnectFailed { failed, told, next } = state.connect_failed(false, false, message);
+        assert_eq!(kinds(&failed), ["done", "list", "spawn"]);
+        let mut sessions: Vec<SessionId> = told.iter().map(|&(session, _)| session).collect();
+        sessions.sort_unstable();
+        assert_eq!(sessions, [7, 8]);
+        assert!(same_sinks(told, &[&now_sink, &recorded_sink]));
+        assert_eq!(next, Next::Retry);
+        assert!(!state.hurry, "this attempt answered the tabs that hurried it");
+        assert_eq!(state.ended, None);
+        assert_eq!(requests(&state), [(4, "attach", Sent::Queued), (5, "attach", Sent::Carried)]);
+
+        // Once is enough.
+        let again = state.connect_failed(false, false, message);
+        assert!(again.failed.is_empty() && again.told.is_empty());
+        assert_eq!(again.next, Next::Retry);
+    }
+
+    /// 4.3: whether a failed attempt before the first link keeps trying, by
+    /// what waits, whether the connection is eager and whether the core
+    /// refused Brindle. One that stops has ended, with the message.
+    #[test]
+    fn a_failed_first_attempt_retries_only_for_an_attach_a_hook_or_eagerness() {
+        #[derive(Clone, Copy, Debug)]
+        enum Waits {
+            Nothing,
+            Spawn,
+            Attach,
+            Hook,
+        }
+        let cases = [
+            (Waits::Nothing, false, false, Next::End),
+            (Waits::Spawn, false, false, Next::End),
+            (Waits::Attach, false, false, Next::Retry),
+            (Waits::Hook, false, false, Next::Retry),
+            (Waits::Nothing, true, false, Next::Retry),
+            (Waits::Spawn, true, false, Next::Retry),
+            // A refusal: only eagerness keeps it trying.
+            (Waits::Attach, false, true, Next::End),
+            (Waits::Hook, false, true, Next::End),
+            (Waits::Attach, true, true, Next::Retry),
+        ];
+        let message = "can't connect to A8: boom";
+        for (waits, eager, refused, expected) in cases {
+            let mut state = State::default();
+            match waits {
+                Waits::Nothing => {}
+                Waits::Spawn => {
+                    let (spawn, ..) = spawn_waiting();
+                    state.requests.insert(1, Pending::queued(spawn));
+                }
+                Waits::Attach => {
+                    let (attach, _) = attach_waiting(1, attach_request(7));
+                    state.requests.insert(1, Pending::queued(attach));
+                }
+                Waits::Hook => state.on_listing.push(hook()),
+            }
+            let failed = state.connect_failed(refused, eager, message);
+            let case = format!("{waits:?}, eager {eager}, refused {refused}");
+            assert_eq!(failed.next, expected, "{case}");
+            let ended = match expected {
+                Next::Retry => None,
+                Next::End => Some(message),
+            };
+            assert_eq!(state.ended.as_deref(), ended, "{case}");
+        }
+    }
+
+    /// 4.3: once a link has been up, a failed attempt changes nothing and
+    /// retries, unless the core refused Brindle: then new tabs' requests
+    /// fail with the refusal and it ends unless it is eager. Attaches
+    /// carried over the lost link aren't told: their tabs said it was lost.
+    #[test]
+    fn a_failed_attempt_after_a_link_fails_new_tabs_only_on_a_refusal() {
+        let message = "can't connect to A8: the terminal server refused Brindle";
+        let after_a_link = || {
+            let mut state = State { link: LinkPhase::Down(Negotiated(2)), hurry: true, ..State::default() };
+            let (spawn, ..) = spawn_waiting();
+            state.requests.insert(1, Pending::queued(spawn));
+            let (attach, _) = attach_waiting(2, attach_request(7));
+            state.requests.insert(2, Pending { waiting: attach, sent: Sent::Carried });
+            state
+        };
+
+        let mut state = after_a_link();
+        let failed = state.connect_failed(false, false, message);
+        assert!(failed.failed.is_empty() && failed.told.is_empty());
+        assert_eq!(failed.next, Next::Retry);
+        assert!(state.hurry, "untouched");
+        assert_eq!(requests(&state), [(1, "spawn", Sent::Queued), (2, "attach", Sent::Carried)]);
+
+        for (eager, expected) in [(false, Next::End), (true, Next::Retry)] {
+            let mut state = after_a_link();
+            let failed = state.connect_failed(true, eager, message);
+            assert_eq!(kinds(&failed.failed), ["spawn"]);
+            assert!(failed.told.is_empty(), "eager {eager}");
+            assert_eq!(failed.next, expected, "eager {eager}");
+            assert_eq!(requests(&state), [(2, "attach", Sent::Carried)]);
+        }
+    }
+
+    /// 4.3: a relay out of use ends `idle` after the first look that found it
+    /// so, as no longer used. One in use, or eager, never does, and its idle
+    /// time starts over once it is out of use again. It looks five times per
+    /// `idle`, and at least a millisecond apart.
+    #[test]
+    fn an_unused_relay_ends_idle_after_it_was_last_in_use() {
+        let (idle, close_limit) = (Duration::from_secs(60), Duration::from_secs(300));
+        let (t0, ms) = (Instant::now(), Duration::from_millis(1));
+        let wait = |wait: Duration| IdleStep { given_up: Vec::new(), then: Then::Wait(wait) };
+        let look = wait(Duration::from_secs(12));
+        let mut state = State::default();
+        let step = |state: &mut State, at: Duration, eager: bool| state.idle_step(t0 + at, eager, idle, close_limit, "A8");
+
+        assert_eq!(step(&mut state, Duration::ZERO, false), look);
+        assert_eq!(state.idle, Idle::Since { at: t0, given_up: None });
+        assert_eq!(step(&mut state, idle - ms, false), look);
+        // In use: the time starts over once it isn't.
+        let (sink, _tab) = fake::sink();
+        state.show(1, Shown::new(sink, None));
+        assert_eq!(step(&mut state, idle, false), look);
+        assert_eq!(state.idle, Idle::InUse);
+        state.sessions.clear();
+        let unused = idle + Duration::from_secs(1);
+        assert_eq!(step(&mut state, unused, false), look);
+        assert_eq!(state.idle, Idle::Since { at: t0 + unused, given_up: None });
+        // Eager: in use, whatever uses it.
+        assert_eq!(step(&mut state, unused + idle, true), look);
+        assert_eq!(state.idle, Idle::InUse);
+        let unused = unused + idle + Duration::from_secs(1);
+        assert_eq!(step(&mut state, unused, false), look);
+        assert_eq!(state.ended, None);
+        let why = "the connection was no longer used";
+        assert_eq!(step(&mut state, unused + idle, false), IdleStep { given_up: Vec::new(), then: Then::End(why.into()) });
+        assert_eq!(state.ended.as_deref(), Some(why));
+
+        // The looks are a millisecond apart at least.
+        let mut state = State::default();
+        assert_eq!(state.idle_step(t0, false, Duration::from_millis(2), close_limit, "A8"), wait(ms));
+    }
+
+    /// 4.3: with no link up, the `CLOSE`s are given up `close_limit` after
+    /// the oldest was queued, and that is why an unused relay then ends. The
+    /// look comes when they are due, if that is sooner.
+    #[test]
+    fn closes_given_up_are_why_an_unused_relay_ends() {
+        let (idle, close_limit) = (Duration::from_secs(60), Duration::from_secs(300));
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut state = State::default();
+        state.closing(7, t0);
+        state.closing(3, t0 + secs(10));
+        // In use while the closes wait, looking when they are due.
+        let step = state.idle_step(t0 + secs(295), false, idle, close_limit, "A8");
+        assert_eq!(step, IdleStep { given_up: Vec::new(), then: Then::Wait(secs(5)) });
+        let why = "not ending sessions 7, 3 on A8: it couldn't be reached within 5 minutes of the close";
+        let step = state.idle_step(t0 + secs(300), false, idle, close_limit, "A8");
+        assert_eq!(step, IdleStep { given_up: vec![7, 3], then: Then::Wait(secs(12)) });
+        assert_eq!(state.idle, Idle::Since { at: t0 + secs(300), given_up: Some(why.into()) });
+        let step = state.idle_step(t0 + secs(360), false, idle, close_limit, "A8");
+        assert_eq!(step, IdleStep { given_up: Vec::new(), then: Then::End(why.into()) });
+        assert_eq!(state.ended.as_deref(), Some(why));
+    }
+
+    /// 4.3: closes given up while the relay is in use, or eager, aren't why
+    /// it ends later: it then ends as no longer used.
+    #[test]
+    fn closes_given_up_while_in_use_are_not_why_it_ends_later() {
+        let (idle, close_limit) = (Duration::from_secs(60), Duration::from_secs(300));
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        let why = "not ending session 7 on A8: it couldn't be reached within 5 minutes of the close";
+        for eager in [false, true] {
+            let mut state = State::default();
+            state.closing(7, t0);
+            let (sink, _tab) = fake::sink();
+            if !eager {
+                // Used again after the closes were given up.
+                state.show(1, Shown::new(sink, None));
+            }
+            let step = state.idle_step(t0 + secs(300), eager, idle, close_limit, "A8");
+            assert_eq!(step.given_up, [7], "eager {eager}");
+            assert_eq!(state.idle, Idle::InUse, "eager {eager}");
+            state.sessions.clear();
+            state.idle_step(t0 + secs(301), false, idle, close_limit, "A8");
+            let step = state.idle_step(t0 + secs(361), false, idle, close_limit, "A8");
+            assert_eq!(step.then, Then::End("the connection was no longer used".into()), "eager {eager}");
+        }
+        // Given up while unused, then used again: forgotten too.
+        let mut state = State::default();
+        state.closing(7, t0);
+        state.idle_step(t0 + secs(300), false, idle, close_limit, "A8");
+        assert_eq!(state.idle, Idle::Since { at: t0 + secs(300), given_up: Some(why.into()) });
+        let (sink, _tab) = fake::sink();
+        state.show(1, Shown::new(sink, None));
+        state.idle_step(t0 + secs(310), false, idle, close_limit, "A8");
+        state.sessions.clear();
+        state.idle_step(t0 + secs(320), false, idle, close_limit, "A8");
+        let step = state.idle_step(t0 + secs(380), false, idle, close_limit, "A8");
+        assert_eq!(step.then, Then::End("the connection was no longer used".into()));
+    }
+
+    /// 4.3: an eager relay that nothing waits on pauses up to its eager cap
+    /// between attempts; any other, up to the retry cap. A listing hook or a
+    /// close isn't waited on.
+    #[test]
+    fn only_an_eager_relay_nothing_waits_on_pauses_up_to_the_eager_cap() {
+        let timings = fake::quick();
+        let cases = [
+            (false, false, timings.retry_cap),
+            (false, true, timings.retry_cap),
+            (true, false, timings.retry_cap),
+            (true, true, timings.eager_cap),
+        ];
+        for (eager, nothing_waits, cap) in cases {
+            assert_eq!(retry_cap(eager, nothing_waits, &timings), cap, "eager {eager}, nothing waits {nothing_waits}");
+        }
+        let mut state = State::default();
+        state.on_listing.push(hook());
+        state.closing(1, Instant::now());
+        assert!(state.nothing_waits());
+        state.requests.insert(1, Pending::queued(list_waiting()));
+        assert!(!state.nothing_waits());
+        state.requests.clear();
+        let (sink, _tab) = fake::sink();
+        state.show(1, Shown::new(sink, None));
+        assert!(!state.nothing_waits());
+    }
+
+    /// 4.3: `SPAWNED` for a spawn that waits shows its session with the
+    /// spawn's sink and the key decoded, displacing what had its id. Else
+    /// the session is closed, and a request of another kind under its `req`
+    /// fails.
+    #[test]
+    fn spawned_is_shown_for_its_spawn_and_closed_otherwise() {
+        let mut state = State::default();
+        let (old, _old_tab) = fake::sink();
+        state.show(11, Shown::new(old.clone(), Some(key("old"))));
+        let (spawn, sink, _answer) = spawn_waiting();
+        state.requests.insert(1, Pending { waiting: spawn, sent: Sent::Written });
+        let spawned = client::Spawned { req: 1, session: 11, pid: 1011, key: "k11".into() };
+        let Routed::Shown { sink: shown, answer, displaced, .. } = state.route_spawned(&spawned) else {
+            panic!("not shown")
+        };
+        assert!(Arc::ptr_eq(&shown, &sink));
+        assert_eq!(answer, Started { session: 11, pid: 1011, key: Some(key("k11")) });
+        assert!(displaced.is_some_and(|displaced| Arc::ptr_eq(&displaced.sink, &old)));
+        assert!(state.shows(11, Some(&key("k11"))));
+        assert!(state.requests.is_empty());
+
+        // A core that predates keys sends none.
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(2, Pending::queued(spawn));
+        let spawned = client::Spawned { req: 2, session: 12, pid: 1012, key: String::new() };
+        let Routed::Shown { answer, displaced, .. } = state.route_spawned(&spawned) else { panic!("not shown") };
+        assert_eq!((answer.key, displaced.is_none()), (None, true));
+        assert!(state.shows(12, None));
+
+        // Its spawner gave up.
+        let spawned = client::Spawned { req: 3, session: 13, pid: 1013, key: "k13".into() };
+        let Routed::Close { session: 13, fail: None } = state.route_spawned(&spawned) else { panic!("not closed") };
+        // Another kind of request under its `req`.
+        state.requests.insert(4, Pending::queued(list_waiting()));
+        let spawned = client::Spawned { req: 4, session: 14, pid: 1014, key: "k14".into() };
+        let Routed::Close { session, fail: Some((waiting, why)) } = state.route_spawned(&spawned) else {
+            panic!("not closed with a failure")
+        };
+        assert_eq!((session, kind(&waiting), why), (14, "list", "answered with SPAWNED"));
+        assert!(state.requests.is_empty());
+        assert_eq!(shown_ids(&state), [11, 12]);
+    }
+
+    /// 4.3: the `REPLAY_START` answering an attach that waits shows the
+    /// session with the attach's sink and key. Else the session is left
+    /// detached, and a request of another kind under its `req` fails.
+    #[test]
+    fn a_replay_start_is_shown_for_its_attach_and_detached_otherwise() {
+        let mut state = State::default();
+        let (attach, sink) = attach_waiting(1, attach_request(7));
+        state.requests.insert(1, Pending { waiting: attach, sent: Sent::Written });
+        let Routed::Shown { sink: shown, answer, displaced, .. } = state.route_replay_start(1, 7, 99) else {
+            panic!("not shown")
+        };
+        assert!(Arc::ptr_eq(&shown, &sink));
+        assert_eq!(answer, 99);
+        assert!(displaced.is_none());
+        assert!(state.shows(7, Some(&key("k7"))), "with the attach's key");
+
+        // Its attacher gave up.
+        let Routed::Detach { session: 8, fail: None } = state.route_replay_start(2, 8, 100) else {
+            panic!("not detached")
+        };
+        // Another kind of request under its `req`.
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(3, Pending::queued(spawn));
+        let Routed::Detach { session, fail: Some((waiting, why)) } = state.route_replay_start(3, 9, 101) else {
+            panic!("not detached with a failure")
+        };
+        assert_eq!((session, kind(&waiting), why), (9, "spawn", "answered with REPLAY_START"));
+        assert!(state.requests.is_empty());
+        assert_eq!(shown_ids(&state), [7]);
+    }
+
+    /// 4.4: a connection is in use while it shows a session, a request
+    /// waits, a listing hook waits, or a `CLOSE` isn't written.
+    #[test]
+    fn a_connection_is_in_use_while_anything_needs_it() {
+        assert!(!State::default().in_use());
+        let mut shown = State::default();
+        let (sink, _tab) = fake::sink();
+        shown.show(1, Shown::new(sink, None));
+        let mut requested = State::default();
+        requested.requests.insert(1, Pending::queued(list_waiting()));
+        let mut hooked = State::default();
+        hooked.on_listing.push(hook());
+        let mut closing = State::default();
+        closing.closing(1, Instant::now());
+        for (what, state) in [("shown", shown), ("requested", requested), ("hooked", hooked), ("closing", closing)] {
+            assert!(state.in_use(), "{what}");
+        }
+    }
+
+    /// 4.4: the `CLOSE`s are due `limit` after the oldest was queued, while
+    /// no link is up.
+    #[test]
+    fn closes_are_due_after_the_oldest_only_with_no_link_up() {
+        let (limit, queued) = (Duration::from_secs(300), Instant::now());
+        let mut state = State::default();
+        assert_eq!(state.closes_due(limit), None, "no close");
+        state.closing(7, queued);
+        state.closing(3, queued + Duration::from_secs(10));
+        let cases = [
+            (LinkPhase::NeverUp, Some(queued + limit)),
+            (LinkPhase::Up(Negotiated(2)), None),
+            (LinkPhase::Down(Negotiated(2)), Some(queued + limit)),
+        ];
+        for (link, due) in cases {
+            state.link = link;
+            assert_eq!(state.closes_due(limit), due, "{link:?}");
+        }
+    }
+
+    /// 4.4: a recorded attach not sent yet and a listing hook wait for the
+    /// core's listing; no other request does.
+    #[test]
+    fn only_recorded_attaches_and_listing_hooks_wait_for_a_listing() {
+        let mut state = State::default();
+        assert!(!state.waits_for_listing());
+        let (spawn, ..) = spawn_waiting();
+        state.requests.insert(1, Pending::queued(spawn));
+        let (attach, _) = attach_waiting(2, attach_request(7));
+        state.requests.insert(2, Pending::queued(attach));
+        state.requests.insert(3, Pending::queued(list_waiting()));
+        state.requests.insert(4, Pending::queued(done_waiting()));
+        assert!(!state.waits_for_listing());
+        let (recorded, _) = attach_waiting(5, recorded(8));
+        state.requests.insert(5, Pending::recorded(recorded));
+        assert!(state.waits_for_listing());
+        state.requests.remove(&5);
+        state.on_listing.push(hook());
+        assert!(state.waits_for_listing());
+    }
+
+    /// 4.4: a stamp's deadline is `limit` after its last touch, in whole
+    /// milliseconds from its epoch, rounded down; a held one has none until
+    /// the next touch, and one too far for its milliseconds is the furthest
+    /// short of held. It is expired only once the watchdog says so.
+    #[test]
+    fn a_stamps_deadline_follows_its_touches_and_holds() {
+        let secs = Duration::from_secs;
+        let epoch = Instant::now();
+        let stamp = Stamp::new(epoch, secs(5));
+        assert_eq!(stamp.deadline(), Some(epoch + secs(5)));
+        stamp.touch(epoch + secs(2), secs(30));
+        assert_eq!(stamp.deadline(), Some(epoch + secs(32)));
+        stamp.touch(epoch + Duration::from_micros(1500), Duration::ZERO);
+        assert_eq!(stamp.deadline(), Some(epoch + Duration::from_millis(1)));
+        stamp.hold();
+        assert_eq!(stamp.deadline(), None);
+        stamp.touch(epoch + secs(3), secs(1));
+        assert_eq!(stamp.deadline(), Some(epoch + secs(4)));
+        stamp.touch(epoch, secs(u64::MAX / 2));
+        assert_eq!(stamp.deadline(), Some(epoch + Duration::from_millis(Stamp::HELD - 1)));
+        assert!(!stamp.expired());
+        stamp.expire();
+        assert!(stamp.expired());
     }
 }

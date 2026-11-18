@@ -72,16 +72,15 @@ pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
         format!("terminal server didn't start: can't run {}", endpoint.helper.display())
     })?;
     drop(write);
+    // `None` when the pipe didn't end within the limit.
     let signal = read_ready_pipe(&read, limit);
-    let signalled = signal.is_some();
-    let ready = signal.is_some_and(|signal| signal.is_ready());
     // The starter exits once the core has detached (or failed first).
     let output = child.wait_with_output().context("waiting for the terminal server to start")?;
-    Ok(Start {
-        ready,
-        signalled,
-        status: output.status.to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok(match signal {
+        Some(signal) if signal.is_ready() => Start::Ready,
+        Some(_) => Start::Exited { status: output.status.to_string(), stderr },
+        None => Start::TimedOut { stderr },
     })
 }
 
@@ -311,18 +310,18 @@ mod tests {
     #[test]
     fn a_start_is_ready_only_on_the_ready_byte_and_the_pipes_end() {
         let started = start_script("ready", "printf R >&3");
-        assert!(started.ready && started.signalled, "{} {}", started.status, started.stderr);
+        assert_eq!(started, Start::Ready);
 
         // The bytes a failed exec leaves in the ready pipe when the pipe
         // took the place of `Command`'s own for the error.
         let started = start_script("exec-error", r"printf '\000\000\000\002NOEX' >&3; exit 1");
-        assert!(!started.ready && started.signalled, "{} {}", started.status, started.stderr);
-        assert_eq!(started.status, "exit status: 1");
+        let Start::Exited { status, .. } = started else { panic!("{started:?}") };
+        assert_eq!(status, "exit status: 1");
 
         // A core that says why it can't start, and writes nothing.
         let started = start_script("refused", "echo 'serve: the directory is refused' >&2; exit 1");
-        assert!(!started.ready && started.signalled, "{} {}", started.status, started.stderr);
-        assert!(started.stderr.contains("the directory is refused"), "{}", started.stderr);
+        let Start::Exited { stderr, .. } = started else { panic!("{started:?}") };
+        assert!(stderr.contains("the directory is refused"), "{stderr}");
     }
 
     /// Runs `printf R >&3` with a new pipe's write end passed as fd 3, and

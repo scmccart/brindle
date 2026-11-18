@@ -19,10 +19,11 @@ pub trait Wire: Send + Sync {
     fn end(&self);
     /// Why the link ended, when the far side knows more than the end of the
     /// stream says (a relay process's exit status and what it wrote to
-    /// stderr, the cause first); empty otherwise, and for a process that
-    /// exited 0 with nothing to say.
-    fn why(&self) -> String {
-        String::new()
+    /// stderr, the cause first), never empty. `None` when there is no such
+    /// account: a socket or pipe, a process that exited 0 with nothing to
+    /// say, or one that neither exited nor said anything in time.
+    fn why(&self) -> Option<String> {
+        None
     }
 }
 

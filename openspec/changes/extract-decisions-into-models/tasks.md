@@ -94,13 +94,13 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 
 ## 4. Brindle's client
 
-- [ ] 4.1 `State.link: Link { NeverUp, Up(Negotiated), Down(Negotiated) }` replaces `connected`, `linked` and `protocol`. `SET_LAYOUT` is sent only when `sets_layout()`. Verify with unit tests of the transitions, and with the `fake::link` tests unchanged (b25 #12, #16).
-- [ ] 4.2 `Pending.sent: Sent { Queued, Written, Carried }`, with `told` on `Waiting::Attach`, on change 2's `Awaits`. Verify with unit tests that only `link_lost` and recorded attaches make `Carried` (b25 #11).
-- [ ] 4.3 Add the `State` methods `connect_failed`, `idle_step` (with `Idle`), `link_lost`, `route_spawned` and `route_replay_start`, and the free `retry_cap`. Each comes with table tests written against today's thread code first. Verify with `cargo test --locked -p brindle remote::local::connection::` (b25 #1–#5).
-- [ ] 4.4 Add tests for `in_use`, `closes_due`, `waits_for_listing` and `Stamp`, which takes `now`. Verify with the same command (b25 #9, #10).
-- [ ] 4.5 The platform `start` returns `Start { Ready, Exited, TimedOut }` on both platforms, and `start_failure` is tested on every platform. `forget` compares `Connection::id()`. Verify with `cargo test --locked -p brindle remote::local::`, and on the Windows CI job (b24 #6, #8, #9, b26 #8).
-- [ ] 4.6 Add `replay_resize` in `terminal/server.rs`, with tests, and `Wire::why() -> Option<String>` over change 12's wording. Verify with `cargo test --locked -p brindle -- terminal::server:: remote::local::relay::` (b24 #10, b26 #1).
-- [ ] 4.7 Run the client's end-to-end coverage. Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server remote`, and with `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client` after rebuilding the musl helper.
+- [x] 4.1 `State.link: Link { NeverUp, Up(Negotiated), Down(Negotiated) }` replaces `connected`, `linked` and `protocol`. `SET_LAYOUT` is sent only when `sets_layout()`. Verify with unit tests of the transitions, and with the `fake::link` tests unchanged (b25 #12, #16).
+- [x] 4.2 `Pending.sent: Sent { Queued, Written, Carried }`, with `told` on `Waiting::Attach`, on change 2's `Awaits`. Verify with unit tests that only `link_lost` and recorded attaches make `Carried` (b25 #11).
+- [x] 4.3 Add the `State` methods `connect_failed`, `idle_step` (with `Idle`), `link_lost`, `route_spawned` and `route_replay_start`, and the free `retry_cap`. Each comes with table tests written against today's thread code first. Verify with `cargo test --locked -p brindle remote::local::connection::` (b25 #1–#5).
+- [x] 4.4 Add tests for `in_use`, `closes_due`, `waits_for_listing` and `Stamp`, which takes `now`. Verify with the same command (b25 #9, #10).
+- [x] 4.5 The platform `start` returns `Start { Ready, Exited, TimedOut }` on both platforms, and `start_failure` is tested on every platform. `forget` compares `Connection::id()`. Verify with `cargo test --locked -p brindle remote::local::`, and on the Windows CI job (b24 #6, #8, #9, b26 #8).
+- [x] 4.6 Add `replay_resize` in `terminal/server.rs`, with tests, and `Wire::why() -> Option<String>` over change 12's wording. Verify with `cargo test --locked -p brindle -- terminal::server:: remote::local::relay::` (b24 #10, b26 #1).
+- [x] 4.7 Run the client's end-to-end coverage. Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server remote`, and with `BRINDLE_REMOTE_DOCKER_TEST=1 cargo test -p brindle --locked remote::client` after rebuilding the musl helper.
 
 ## 5. Lifecycles and the spawn request
 
