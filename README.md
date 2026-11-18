@@ -647,7 +647,9 @@ The state is written to `~/.local/state/brindle/session.toml`
 or two after anything changes, and again on quit, so a crash or logout loses
 at most the last couple of seconds. If a profile or directory has gone
 since then, the default profile or the home directory is used. Closing the last tab forgets the
-tabs, and quitting keeps everything that is open.
+tabs, and quitting keeps everything that is open. A state that can't be saved,
+such as one with a tab in a directory whose name isn't valid UTF-8, leaves the
+file as it was, with a line in the log, until it can be saved again.
 
 ### Shell integration
 

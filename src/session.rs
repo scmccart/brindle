@@ -264,11 +264,10 @@ impl State {
         Ok(state)
     }
 
-    pub fn to_text(&self) -> String {
-        toml::to_string(self).unwrap_or_else(|err| {
-            log::error!("could not serialize session state: {err}");
-            String::new()
-        })
+    /// The state's file text, or why it can't be serialized (a directory
+    /// whose name isn't valid UTF-8, say).
+    pub fn to_text(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
     }
 }
 
@@ -664,8 +663,55 @@ pub struct SessionStore {
     /// Something was recorded or forgotten: until then there is nothing to
     /// write (an empty store must not replace a file not yet restored from).
     touched: bool,
+    /// The text the state file last received from this process: set only by
+    /// [`next_write`] when it returns `Write`, and kept through failures, so
+    /// the next state that serializes is written when it differs from this.
     last_written: Option<String>,
+    /// The serialization failure last reported, cleared by any state that
+    /// serializes, so a failure that repeats every check is reported once.
+    unserializable: Option<toml::ser::Error>,
     lock: Option<Lock>,
+}
+
+/// What the state file needs ([`SessionStore::pending_write`]).
+#[derive(Debug, PartialEq)]
+pub enum PendingWrite {
+    /// Nothing to write: this process doesn't own the file, nothing was
+    /// recorded yet, or the state's text is what the file last received.
+    Nothing,
+    /// Replace the file with this text.
+    Write(String),
+    /// The state can't be serialized. The file stays as it was; report this.
+    Unserializable(toml::ser::Error),
+    /// The same failure as the last call, already reported.
+    StillUnserializable,
+}
+
+/// Decides what the file needs from the state's serialization. A failure
+/// leaves `last_written` alone and is returned as `Unserializable` once per
+/// run of equal failures; a success clears it.
+fn next_write(
+    last_written: &mut Option<String>,
+    reported: &mut Option<toml::ser::Error>,
+    text: Result<String, toml::ser::Error>,
+) -> PendingWrite {
+    match text {
+        Ok(text) => {
+            *reported = None;
+            if last_written.as_ref() == Some(&text) {
+                return PendingWrite::Nothing;
+            }
+            *last_written = Some(text.clone());
+            PendingWrite::Write(text)
+        }
+        Err(error) => {
+            if reported.as_ref() == Some(&error) {
+                return PendingWrite::StillUnserializable;
+            }
+            *reported = Some(error.clone());
+            PendingWrite::Unserializable(error)
+        }
+    }
 }
 
 impl gpui::Global for SessionStore {}
@@ -716,17 +762,14 @@ impl SessionStore {
         State::new(entries.into_iter().map(|e| e.state.clone()).collect())
     }
 
-    /// The text to write, if it changed since the last write.
-    pub fn pending_write(&mut self) -> Option<String> {
+    /// What to do with the state file now: write the text if it changed
+    /// since the last write, or report that the state can't be serialized.
+    pub fn pending_write(&mut self) -> PendingWrite {
         if !self.touched || self.lock.is_none() {
-            return None;
+            return PendingWrite::Nothing;
         }
         let text = self.state().to_text();
-        if self.last_written.as_ref() == Some(&text) {
-            return None;
-        }
-        self.last_written = Some(text.clone());
-        Some(text)
+        next_write(&mut self.last_written, &mut self.unserializable, text)
     }
 }
 
@@ -758,7 +801,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let text = sample().to_text();
+        let text = sample().to_text().expect("serializes");
         assert!(text.contains("version = 1"), "{text}");
         assert!(text.contains("kind = \"local\""), "{text}");
         assert!(text.contains("title = \"server\""), "{text}");
@@ -790,7 +833,7 @@ mod tests {
     fn atomic_write_and_load() {
         let dir = tmp_dir("write");
         assert_eq!(load(&dir), Ok(None));
-        write_atomic(&dir, &sample().to_text(), next_generation()).unwrap();
+        write_atomic(&dir, &sample().to_text().expect("serializes"), next_generation()).unwrap();
         assert_eq!(load(&dir), Ok(Some(sample())));
         assert!(!dir.join("session.toml.tmp").exists());
         #[cfg(unix)]
@@ -803,7 +846,7 @@ mod tests {
         let old = next_generation();
         let new = next_generation();
         write_atomic(&dir, "version = 1\n", new).unwrap();
-        write_atomic(&dir, &sample().to_text(), old).unwrap();
+        write_atomic(&dir, &sample().to_text().expect("serializes"), old).unwrap();
         assert_eq!(std::fs::read_to_string(state_path(&dir)).unwrap(), "version = 1\n");
         // A state with no windows is a normal launch, not an error.
         write_atomic(&dir, "version = 1\nwindows = []\n", next_generation()).unwrap();
@@ -904,7 +947,8 @@ mod tests {
         let state = State::parse(&text.replace("active = 2", "active = 1")).unwrap();
         assert_eq!(state.windows[0].active, 0);
         // Saving it again writes no tmux entry.
-        assert!(!state.to_text().contains("tmux"), "{}", state.to_text());
+        let saved = state.to_text().expect("serializes");
+        assert!(!saved.contains("tmux"), "{saved}");
 
         // Only tmux entries: nothing to restore, as with no state file.
         let only = "version = 1\n[[windows]]\n[[windows.tabs]]\nkind = \"tmux\"\nprofile = \"tmux\"\nsession = \"main\"\n\
@@ -928,7 +972,7 @@ mod tests {
             session: Some(session.clone()),
         };
         let state = State::new(vec![WindowState { width: None, height: None, maximized: false, active: 0, tabs: vec![tab] }]);
-        let text = state.to_text();
+        let text = state.to_text().expect("serializes");
         assert!(text.contains("key = \"9f2c\""), "{text}");
         assert!(text.contains("version = 1"), "{text}");
         assert_eq!(State::parse(&text).unwrap(), state);
@@ -1179,16 +1223,16 @@ mod tests {
     fn store_rules() {
         let mut store = SessionStore::default();
         // Nothing recorded and no lock: nothing to write.
-        assert_eq!(store.pending_write(), None);
+        assert_eq!(store.pending_write(), PendingWrite::Nothing);
         store.lock = Some(Lock::acquire(&tmp_dir("store")).unwrap());
-        assert_eq!(store.pending_write(), None);
+        assert_eq!(store.pending_write(), PendingWrite::Nothing);
         store.record(20, 2, window(2));
         store.record(10, 1, window(1));
         let state = store.state();
         assert_eq!(state.windows.len(), 2);
         assert_eq!(state.windows[0].tabs.len(), 1, "ordered by creation");
-        assert!(store.pending_write().is_some());
-        assert_eq!(store.pending_write(), None, "unchanged");
+        assert!(matches!(store.pending_write(), PendingWrite::Write(_)));
+        assert_eq!(store.pending_write(), PendingWrite::Nothing, "unchanged");
         // A window closed while another remains is forgotten...
         store.prune(&[20]);
         assert_eq!(store.state().windows.len(), 1);
@@ -1197,7 +1241,7 @@ mod tests {
         assert_eq!(store.state().windows.len(), 1);
         store.forget(20);
         assert!(store.state().windows.is_empty());
-        assert!(store.pending_write().is_some(), "an emptied store is written");
+        assert!(matches!(store.pending_write(), PendingWrite::Write(_)), "an emptied store is written");
         std::fs::remove_dir_all(tmp_dir("store")).ok();
     }
 
@@ -1206,8 +1250,82 @@ mod tests {
         let dir = tmp_dir("forget");
         let mut store = SessionStore { lock: Some(Lock::acquire(&dir).unwrap()), ..Default::default() };
         store.forget(1);
-        let text = store.pending_write().expect("written");
+        let PendingWrite::Write(text) = store.pending_write() else { panic!("written") };
         assert!(State::parse(&text).unwrap().windows.is_empty(), "nothing to restore: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn failure(message: &str) -> toml::ser::Error {
+        <toml::ser::Error as serde::ser::Error>::custom(message)
+    }
+
+    #[test]
+    fn an_unserializable_state_is_reported_once_and_never_written() {
+        let mut last = Some("kept".to_string());
+        let mut reported = None;
+        assert_eq!(next_write(&mut last, &mut reported, Err(failure("bad"))), PendingWrite::Unserializable(failure("bad")));
+        assert_eq!(last.as_deref(), Some("kept"));
+        assert_eq!(next_write(&mut last, &mut reported, Err(failure("bad"))), PendingWrite::StillUnserializable);
+        assert_eq!(last.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_different_failure_is_reported_again() {
+        let (mut last, mut reported) = (None, None);
+        next_write(&mut last, &mut reported, Err(failure("a")));
+        assert_eq!(next_write(&mut last, &mut reported, Err(failure("b"))), PendingWrite::Unserializable(failure("b")));
+    }
+
+    #[test]
+    fn the_text_last_written_survives_a_failure() {
+        let (mut last, mut reported) = (None, None);
+        assert_eq!(next_write(&mut last, &mut reported, Ok("a".into())), PendingWrite::Write("a".into()));
+        next_write(&mut last, &mut reported, Err(failure("bad")));
+        assert_eq!(next_write(&mut last, &mut reported, Ok("a".into())), PendingWrite::Nothing);
+        assert_eq!(next_write(&mut last, &mut reported, Ok("b".into())), PendingWrite::Write("b".into()));
+    }
+
+    #[test]
+    fn a_failure_after_a_success_is_reported_again() {
+        let (mut last, mut reported) = (None, None);
+        next_write(&mut last, &mut reported, Err(failure("bad")));
+        next_write(&mut last, &mut reported, Ok("a".into()));
+        assert_eq!(next_write(&mut last, &mut reported, Err(failure("bad"))), PendingWrite::Unserializable(failure("bad")));
+    }
+
+    /// A directory whose name isn't valid UTF-8, which serde refuses to
+    /// serialize as a path.
+    fn unserializable_dir() -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            PathBuf::from(std::ffi::OsString::from_wide(&[0xD800]))
+        }
+    }
+
+    #[test]
+    fn a_directory_that_isnt_utf8_leaves_the_file_alone() {
+        let dir = tmp_dir("non-utf8");
+        let mut store = SessionStore { lock: Some(Lock::acquire(&dir).unwrap()), ..Default::default() };
+        let with_cwd = |cwd: PathBuf| {
+            let mut w = window(1);
+            if let TabState::Local { cwd: slot, .. } = &mut w.tabs[0] {
+                *slot = Some(cwd);
+            }
+            w
+        };
+        store.record(1, 1, with_cwd(unserializable_dir()));
+        assert!(matches!(store.pending_write(), PendingWrite::Unserializable(_)));
+        assert_eq!(store.pending_write(), PendingWrite::StillUnserializable);
+        store.record(1, 1, with_cwd("/tmp".into()));
+        let PendingWrite::Write(text) = store.pending_write() else { panic!("written once it serializes") };
+        let state = State::parse(&text).unwrap();
+        assert!(matches!(&state.windows[0].tabs[0], TabState::Local { cwd: Some(c), .. } if c == Path::new("/tmp")), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1263,8 +1381,7 @@ mod tests {
                 },
             ],
         }]);
-        let text = state.to_text();
-        assert!(!text.is_empty(), "serialized state was empty");
+        let text = state.to_text().expect("serializes");
         assert_eq!(State::parse(&text).unwrap(), state);
 
         // Resolving a zone tree applies directory fallbacks per zone and reconstructs ZoneTree.

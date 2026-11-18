@@ -42,7 +42,7 @@ use crate::config::Config;
 use crate::latency::Latency;
 use crate::remote::hosts::Hosts;
 use crate::settings::Settings;
-use crate::session::{SessionStore, WindowState};
+use crate::session::{PendingWrite, SessionStore, WindowState};
 use crate::workspace::{Launch, LaunchRequest, Workspace};
 
 const HELP: &str = "\
@@ -662,9 +662,20 @@ fn restorable_window(listed: bool, cx: &mut App) -> Option<WindowState> {
 /// has recorded itself and left its terminals' sessions (`Workspace::quit`).
 fn record_session(cx: &mut App) {
     fn pending(cx: &mut App) -> Option<String> {
-        cx.update_global(|store: &mut SessionStore, _| {
-            if store.is_owner() { store.pending_write() } else { None }
-        })
+        let outcome = cx.update_global(|store: &mut SessionStore, _| {
+            if store.is_owner() { store.pending_write() } else { PendingWrite::Nothing }
+        });
+        match outcome {
+            PendingWrite::Write(text) => Some(text),
+            PendingWrite::Unserializable(err) => {
+                log::warn!(
+                    "not writing session state to {}: it can't be serialized: {err}",
+                    session::state_path(&session::state_dir()).display()
+                );
+                None
+            }
+            PendingWrite::Nothing | PendingWrite::StillUnserializable => None,
+        }
     }
     fn write(text: &str, generation: u64) {
         let dir = session::state_dir();
