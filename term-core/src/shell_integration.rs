@@ -77,6 +77,16 @@ enum State {
     String,
 }
 
+/// How a terminal's directory reports (OSC 7, 9;9) spell paths: the
+/// platform its program runs on, which the caller knows and this crate doesn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStyle {
+    /// `/home/u`: Linux and other Unix programs.
+    Posix,
+    /// `C:\src` or `\\server\share`; OSC 7's `/C:/src` means `C:\src`.
+    Windows,
+}
+
 // Enough for a working-directory report's percent-encoded path.
 const OSC_KEEP: usize = 4096;
 const CSI_KEEP: usize = 32;
@@ -94,26 +104,17 @@ pub struct Scanner {
     buf: Vec<u8>,
     overflow: bool,
     intermediate: bool,
-    /// Whether working-directory reports use Windows rather than POSIX paths.
-    windows_paths: bool,
+    /// How working-directory reports spell paths.
+    style: PathStyle,
     /// The directory the last [`Split::Cwd`] reported.
     cwd: Option<PathBuf>,
 }
 
-impl Default for Scanner {
-    fn default() -> Self {
-        Self {
-            state: State::default(),
-            buf: Vec::new(),
-            overflow: false,
-            intermediate: false,
-            windows_paths: cfg!(windows),
-            cwd: None,
-        }
-    }
-}
-
 impl Scanner {
+    fn new(style: PathStyle) -> Self {
+        Self { state: State::default(), buf: Vec::new(), overflow: false, intermediate: false, style, cwd: None }
+    }
+
     /// Scans `bytes` up to the first split point. Returns the index of the
     /// byte that completed it and what was found, or `None` when the whole
     /// slice was consumed without one.
@@ -264,40 +265,42 @@ impl Scanner {
             return Some(Split::Mark(mark));
         }
         // A cut-off path would name the wrong directory.
-        let dir = (!self.overflow).then(|| reported_dir(&self.buf, self.windows_paths)).flatten()?;
+        let dir = (!self.overflow).then(|| reported_dir(&self.buf, self.style)).flatten()?;
         self.cwd = Some(PathBuf::from(dir));
         Some(Split::Cwd)
     }
 }
 
-/// The directory an OSC body reports, if it is absolute on the platform
-/// (`windows` or not): OSC 7's `7;file://<host>/<percent-encoded path>`, or
-/// ConEmu's `9;9;<path>`, the path optionally in double quotes. On Windows
-/// OSC 7's `/C:/src` means `C:\src`.
-fn reported_dir(body: &[u8], windows: bool) -> Option<String> {
+/// The directory an OSC body reports, if it is absolute in `style`: OSC 7's
+/// `7;file://<host>/<percent-encoded path>`, or ConEmu's `9;9;<path>`, the
+/// path optionally in double quotes. In the Windows style OSC 7's `/C:/src`
+/// means `C:\src`.
+fn reported_dir(body: &[u8], style: PathStyle) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     let path = if let Some(uri) = body.strip_prefix("7;") {
         let rest = uri.strip_prefix("file://")?;
         let path = percent_decode(&rest[rest.find('/')?..])?;
-        if windows {
-            // `/C:/x`: drop the slash before the drive letter.
-            let path = match path.as_bytes() {
-                [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
-                _ => &path,
-            };
-            path.replace('/', "\\")
-        } else {
-            path
+        match style {
+            PathStyle::Posix => path,
+            PathStyle::Windows => {
+                // `/C:/x`: drop the slash before the drive letter.
+                let path = match path.as_bytes() {
+                    [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+                    _ => &path,
+                };
+                path.replace('/', "\\")
+            }
         }
     } else {
         let path = body.strip_prefix("9;9;")?.trim();
         path.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(path).to_string()
     };
-    let absolute = if windows {
-        let b = path.as_bytes();
-        matches!(b, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()) || path.starts_with("\\\\")
-    } else {
-        path.starts_with('/')
+    let absolute = match style {
+        PathStyle::Posix => path.starts_with('/'),
+        PathStyle::Windows => {
+            let b = path.as_bytes();
+            matches!(b, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()) || path.starts_with("\\\\")
+        }
     };
     absolute.then_some(path)
 }
@@ -759,22 +762,16 @@ impl Marks {
 // ---- parser -----------------------------------------------------------------
 
 /// The vte processor plus the OSC 133 scanner, fed through [`Parser::advance`].
-#[derive(Default)]
 pub struct Parser {
     processor: Processor<StdSyncHandler>,
     scanner: Scanner,
 }
 
 impl Parser {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A parser for a remote Linux PTY, even when Brindle itself runs on Windows.
-    pub fn posix() -> Self {
-        let mut parser = Self::default();
-        parser.scanner.windows_paths = false;
-        parser
+    /// A parser whose directory reports are read in `style`, the path style
+    /// of the platform the terminal's program runs on.
+    pub fn new(style: PathStyle) -> Self {
+        Self { processor: Processor::default(), scanner: Scanner::new(style) }
     }
 
     /// When a synchronized update (mode 2026) that is buffering output
@@ -876,12 +873,14 @@ mod tests {
     use alacritty_terminal::term;
 
     #[test]
-    fn remote_parser_uses_posix_paths_on_every_platform() {
-        assert!(!Parser::posix().scanner.windows_paths);
+    fn a_parser_keeps_the_path_style_it_was_given() {
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            assert_eq!(Parser::new(style).scanner.style, style);
+        }
     }
 
     fn scan_all(input: &[&[u8]]) -> Vec<Split> {
-        let mut scanner = Scanner::default();
+        let mut scanner = Scanner::new(PathStyle::Posix);
         let mut found = Vec::new();
         for chunk in input {
             let mut rest: &[u8] = chunk;
@@ -959,11 +958,12 @@ mod tests {
 
     #[test]
     fn osc7_paths_are_percent_decoded() {
-        assert_eq!(reported_dir(b"7;file://host/home/u/My%20Dir", false).as_deref(), Some("/home/u/My Dir"));
-        assert_eq!(reported_dir(b"7;file:///srv/www", false).as_deref(), Some("/srv/www"));
-        assert_eq!(reported_dir(b"7;file://host/caf%C3%A9", false).as_deref(), Some("/café"));
-        assert_eq!(reported_dir(b"7;file://host/bad%2", false), None);
-        assert_eq!(reported_dir(b"7;http://host/x", false), None);
+        let posix = PathStyle::Posix;
+        assert_eq!(reported_dir(b"7;file://host/home/u/My%20Dir", posix).as_deref(), Some("/home/u/My Dir"));
+        assert_eq!(reported_dir(b"7;file:///srv/www", posix).as_deref(), Some("/srv/www"));
+        assert_eq!(reported_dir(b"7;file://host/caf%C3%A9", posix).as_deref(), Some("/café"));
+        assert_eq!(reported_dir(b"7;file://host/bad%2", posix), None);
+        assert_eq!(reported_dir(b"7;http://host/x", posix), None);
     }
 
     #[test]
@@ -973,11 +973,11 @@ mod tests {
         let (mut posix, mut windows) = (0usize, 0usize);
         for _ in 0..5000 {
             let body = osc_body(&mut rng);
-            if let Some(dir) = reported_dir(&body, false) {
+            if let Some(dir) = reported_dir(&body, PathStyle::Posix) {
                 assert!(dir.starts_with('/'), "{dir:?} from {body:?}");
                 posix += 1;
             }
-            if let Some(dir) = reported_dir(&body, true) {
+            if let Some(dir) = reported_dir(&body, PathStyle::Windows) {
                 let b = dir.as_bytes();
                 let drive = matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
                 assert!(drive || dir.starts_with("\\\\"), "{dir:?} from {body:?}");
@@ -991,45 +991,62 @@ mod tests {
 
     #[test]
     fn osc7_drive_paths_on_windows() {
-        assert_eq!(reported_dir(b"7;file://pc/C:/My%20Files", true).as_deref(), Some("C:\\My Files"));
-        assert_eq!(reported_dir(b"7;file://pc/d:/src/", true).as_deref(), Some("d:\\src\\"));
+        let windows = PathStyle::Windows;
+        assert_eq!(reported_dir(b"7;file://pc/C:/My%20Files", windows).as_deref(), Some("C:\\My Files"));
+        assert_eq!(reported_dir(b"7;file://pc/d:/src/", windows).as_deref(), Some("d:\\src\\"));
         // A WSL shell's Linux path means nothing to Windows.
-        assert_eq!(reported_dir(b"7;file://pc/home/user", true), None);
+        assert_eq!(reported_dir(b"7;file://pc/home/user", windows), None);
     }
 
     #[test]
     fn conemu_osc9_9() {
-        assert_eq!(reported_dir(br#"9;9;"C:\src""#, true).as_deref(), Some("C:\\src"));
-        assert_eq!(reported_dir(br"9;9;C:\src", true).as_deref(), Some("C:\\src"));
-        assert_eq!(reported_dir(br"9;9;\\server\share", true).as_deref(), Some("\\\\server\\share"));
-        assert_eq!(reported_dir(b"9;9;/srv/www", false).as_deref(), Some("/srv/www"));
+        let windows = PathStyle::Windows;
+        assert_eq!(reported_dir(br#"9;9;"C:\src""#, windows).as_deref(), Some("C:\\src"));
+        assert_eq!(reported_dir(br"9;9;C:\src", windows).as_deref(), Some("C:\\src"));
+        assert_eq!(reported_dir(br"9;9;\\server\share", windows).as_deref(), Some("\\\\server\\share"));
+        assert_eq!(reported_dir(b"9;9;/srv/www", PathStyle::Posix).as_deref(), Some("/srv/www"));
         // Relative paths and other ConEmu commands are not reports.
-        assert_eq!(reported_dir(b"9;9;src", true), None);
-        assert_eq!(reported_dir(b"9;4;1;50", true), None);
-        assert_eq!(reported_dir(b"9;done", true), None);
+        assert_eq!(reported_dir(b"9;9;src", windows), None);
+        assert_eq!(reported_dir(b"9;4;1;50", windows), None);
+        assert_eq!(reported_dir(b"9;done", windows), None);
     }
 
     #[test]
-    fn the_latest_report_is_kept() {
-        let (first, second) = if cfg!(windows) { ("C:/one", "C:\\two") } else { ("/one", "/two") };
-        let mut h = Harness::new(20, 5, 100);
-        h.feed(format!("\x1b]7;file://host/{}\x1b\\", first.trim_start_matches('/')).as_bytes());
-        let expect_first = if cfg!(windows) { "C:\\one" } else { "/one" };
-        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(expect_first)));
-        h.feed(format!("text\x1b]9;9;\"{second}\"\x07more").as_bytes());
-        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(second)));
-        assert_eq!(h.text(0), "textmore", "the reports print nothing");
-        // A reset clears marks, not the directory.
-        h.feed(b"\x1bc");
-        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new(second)));
+    fn each_path_style_ignores_the_other_styles_reports() {
+        // A Windows directory is not absolute to a POSIX program, and a
+        // drive in an OSC 7 URI is just a directory named `C:`.
+        assert_eq!(reported_dir(br"9;9;C:\src", PathStyle::Posix), None);
+        assert_eq!(reported_dir(b"7;file://pc/C:/x", PathStyle::Posix).as_deref(), Some("/C:/x"));
+        // A Linux path means nothing to a Windows program.
+        assert_eq!(reported_dir(b"7;file://pc/home/user", PathStyle::Windows), None);
+    }
+
+    #[test]
+    fn the_latest_report_is_kept_in_either_path_style() {
+        // (style, OSC 7 path, OSC 9;9 path, the directory each reports)
+        let cases = [
+            (PathStyle::Posix, "one", "/two", "/one", "/two"),
+            (PathStyle::Windows, "C:/one", "C:\\two", "C:\\one", "C:\\two"),
+        ];
+        for (style, osc7, osc9, first, second) in cases {
+            let mut h = Harness::new(style, 20, 5, 100);
+            let dir = |h: &Harness| h.marks.lock().reported_dir().and_then(Path::to_str).map(str::to_owned);
+            h.feed(format!("\x1b]7;file://host/{osc7}\x1b\\").as_bytes());
+            assert_eq!(dir(&h).as_deref(), Some(first), "{style:?}");
+            h.feed(format!("text\x1b]9;9;\"{osc9}\"\x07more").as_bytes());
+            assert_eq!(dir(&h).as_deref(), Some(second), "{style:?}");
+            assert_eq!(h.text(0), "textmore", "{style:?}: the reports print nothing");
+            // A reset clears marks, not the directory.
+            h.feed(b"\x1bc");
+            assert_eq!(dir(&h).as_deref(), Some(second), "{style:?}");
+        }
     }
 
     #[test]
     fn posix_parser_keeps_remote_osc7_paths_on_any_host() {
         // A remote Linux terminal must read `/var/log`, not a Windows path,
         // even when Brindle itself runs on Windows.
-        let mut h = Harness::new(80, 24, 0);
-        h.parser = Parser::posix();
+        let mut h = Harness::new(PathStyle::Posix, 80, 24, 0);
         h.feed(b"\x1b]7;file://remote-host/var/log\x07");
         assert_eq!(h.marks.lock().reported_dir(), Some(Path::new("/var/log")));
         h.feed(b"\x1b]7;file://remote-host/home/u/My%20Dir/caf%C3%A9\x1b\\");
@@ -1045,10 +1062,11 @@ mod tests {
     }
 
     impl Harness {
-        fn new(cols: u16, rows: u16, history: usize) -> Self {
+        fn new(style: PathStyle, cols: u16, rows: u16, history: usize) -> Self {
             let size = GridSize { cols, rows, ..Default::default() };
             let config = term::Config { scrolling_history: history, ..Default::default() };
-            Harness { term: Term::new(config, &size, VoidListener), parser: Parser::new(), marks: Mutex::default() }
+            let term = Term::new(config, &size, VoidListener);
+            Harness { term, parser: Parser::new(style), marks: Mutex::default() }
         }
 
         fn feed(&mut self, bytes: &[u8]) -> &mut Self {
@@ -1087,7 +1105,7 @@ mod tests {
 
     #[test]
     fn marks_follow_scrolling() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("one", 3, 0).command("two", 30, 1).feed(b"\x1b]133;A\x07$ ");
         assert_eq!(h.prompts(), ["$ one", "$ two", "$"]);
         let marks = h.marks.lock();
@@ -1099,7 +1117,7 @@ mod tests {
     #[test]
     fn marks_survive_full_history() {
         for history in [0, 5, 50] {
-            let mut h = Harness::new(20, 6, history);
+            let mut h = Harness::new(PathStyle::Posix, 20, 6, history);
             for i in 0..20 {
                 h.command(&format!("c{i}"), 2, 0);
             }
@@ -1117,7 +1135,7 @@ mod tests {
     fn marks_split_across_reads() {
         let input = b"ab\r\ncd\r\n\x1b]133;A\x07$ x";
         for cut in 0..=input.len() {
-            let mut h = Harness::new(10, 4, 10);
+            let mut h = Harness::new(PathStyle::Posix, 10, 4, 10);
             let (a, b) = input.split_at(cut);
             h.feed(a).feed(b);
             assert_eq!(h.prompts(), ["$ x"], "cut at {cut}");
@@ -1127,7 +1145,7 @@ mod tests {
 
     #[test]
     fn clear_and_reset_forget_marks() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("one", 10, 0).command("two", 1, 0);
         h.feed(b"\x1b[H\x1b[2J\x1b[3J").command("three", 0, 0);
         assert_eq!(h.prompts(), ["$ three"]);
@@ -1144,7 +1162,7 @@ mod tests {
     /// Jump to Next Prompt.
     #[test]
     fn erase_in_place_forgets_prompts() {
-        let mut h = Harness::new(20, 8, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 8, 100);
         h.command("old", 3, 0);
         h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07clear\r\n\x1b]133;C\x07\x1b[H\x1b[J\x1b[3J\x1b]133;D;0\x07");
         h.command("seq", 12, 0).command("false", 0, 1).feed(b"\x1b]133;A\x07$ ");
@@ -1161,7 +1179,7 @@ mod tests {
     /// oh-my-posh): that prompt keeps its mark.
     #[test]
     fn erase_after_prompt_keeps_it() {
-        let mut h = Harness::new(20, 8, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 8, 100);
         h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[J");
         assert_eq!(h.prompts(), ["$"]);
         // Erasing from the prompt's own start (cursor back at column 0) drops it.
@@ -1174,7 +1192,7 @@ mod tests {
 
     #[test]
     fn clear_scrollback_prunes() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("one", 10, 0).command("two", 1, 0);
         h.term.grid_mut().clear_history();
         h.marks.lock().prune(&h.term);
@@ -1183,7 +1201,7 @@ mod tests {
 
     #[test]
     fn grouping_rules() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         // Enter on an empty line: D without C is ignored.
         h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;D;1\x07");
         assert!(!h.marks.lock().commands()[0].failed());
@@ -1197,21 +1215,21 @@ mod tests {
 
     #[test]
     fn mark_inside_synchronized_update() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.feed(b"\x1b[?2026hline\r\n\x1b]133;A\x07$ y\x1b[?2026l");
         assert_eq!(h.prompts(), ["$ y"]);
     }
 
     #[test]
     fn marks_ignored_on_alternate_screen() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("vim", 0, 0).feed(b"\x1b[?1049h\x1b]133;A\x07x\x1b[?1049l");
         assert_eq!(h.prompts(), ["$ vim"]);
     }
 
     #[test]
     fn resize_reflows_marks() {
-        let mut h = Harness::new(10, 6, 100);
+        let mut h = Harness::new(PathStyle::Posix, 10, 6, 100);
         h.command("aaaaaaaaaaaaaaa", 2, 1).command("b", 1, 0).feed(b"\x1b]133;A\x07$ ");
         let before = h.prompts();
         assert_eq!(before, ["$ aaaaaaaa", "$ b", "$"]);
@@ -1226,7 +1244,7 @@ mod tests {
 
     #[test]
     fn resize_on_alternate_screen() {
-        let mut h = Harness::new(10, 6, 100);
+        let mut h = Harness::new(PathStyle::Posix, 10, 6, 100);
         h.command("aaaaaaaaaaaaaaa", 2, 1).command("b", 1, 0).feed(b"\x1b]133;A\x07$ ");
         h.feed(b"\x1b[?1049hfullscreen");
         h.resize(6, 8);
@@ -1236,7 +1254,7 @@ mod tests {
 
     #[test]
     fn reverse_index_at_top() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("one", 0, 0).feed(b"\x1b]133;A\x07$ two");
         // Scroll the screen down by two (reverse index at the top).
         h.feed(b"\x1b[H\x1bM\x1bM");
@@ -1245,7 +1263,7 @@ mod tests {
 
     #[test]
     fn queries() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("one", 10, 1).feed(b"\x1b]133;A\x07$ \x1b]133;B\x07printf\r\n\x1b]133;C\x07a\r\nb\r\n\x1b]133;D;0\x07");
         h.feed(b"\x1b]133;A\x07$ ");
         let marks = h.marks.lock();
@@ -1267,7 +1285,7 @@ mod tests {
 
     #[test]
     fn empty_output_selects_nothing() {
-        let mut h = Harness::new(20, 5, 100);
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
         h.command("true", 0, 0).feed(b"\x1b]133;A\x07$ ");
         assert!(h.marks.lock().last_output(&h.term).is_none());
     }
@@ -1296,7 +1314,7 @@ mod tests {
     /// recorded, survive a resize, and drive up then down.
     #[test]
     fn oh_my_posh_bash_prompts() {
-        let mut h = Harness::new(80, 30, 10_000);
+        let mut h = Harness::new(PathStyle::Posix, 80, 30, 10_000);
         let seq: String = (1..=60).map(|i| format!("{i}\r\n")).collect();
         let mut bytes = omp_command("seq 1 60", &seq, 0);
         bytes.extend(omp_command("false", "", 1));

@@ -15,7 +15,7 @@ Each kind of test answers one question and has one home:
 | unit tests on pure code | does this function or model decide correctly? | `#[cfg(test)] mod tests` in the same file, every crate |
 | transcript tests | is this message's encoding still byte for byte? | `remote-protocol/` |
 | fuzz tests | does any input make a decoder or parser panic? | `remote-protocol/src/fuzz.rs`, `term-core/src/fuzz.rs` |
-| architecture tests | do the crates still point the right way? | `tests/architecture.rs` |
+| architecture tests | do the crates still point the right way? do platform `cfg`s stay in their seams? | `tests/architecture.rs` |
 | real-process tests | do the real holder, core and relay cooperate? | `remote-agent/tests/` |
 | end-to-end cases | does the shipped app behave, seen from outside? | `tests/e2e/` (opt-in) |
 | performance cases | how fast, compared with last time? | `tests/perf/` (opt-in, numbers only) |
@@ -48,7 +48,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 
 **Asserting the rule, not a count:** the `drain` test records when each callback started and ended and checks that drain takes another item only while the budget hasn't run out. That holds on any machine; "exactly two items" did not.
 
-**Platform pairs:** a server test that needs a Unix shell, exact PTY bytes, signals or `/proc` is `#[cfg(unix)]`, with a Windows counterpart beside it where the property matters on both.
+**Platform pairs:** a server test that needs a Unix shell, exact PTY bytes, signals or `/proc` is `#[cfg(unix)]`, with a Windows counterpart beside it where the property matters on both. Test code is outside `ports R4`, so it may pair platforms this way: `#[cfg(test)]` items and the modules declared under one, `tests/**` and `remote-agent/tests/**`.
 
 ## How it applies here
 
@@ -96,7 +96,7 @@ fn bursts_are_paced_after_four_quick_updates() {
 
 ## Enforcement
 
-- `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets` (R3).
+- `tests/architecture.rs`: `the_opt_in_suites_are_harness_false_targets` (R3), and `platform_cfgs_stay_in_their_seams`, which holds `ports R4` in production code and leaves test code's platform pairs alone.
 - The e2e harness itself holds R4: it refuses a missing or stale `brindle-remote`, gives each case private directories, and fails a case that leaves a `serve` or `hold` running.
 - CI runs `cargo test --workspace` and both harness self-tests on every push for Linux and Windows, and the e2e suite in three advisory shards that upload `target/tmp/e2e/` on failure.
 - R1, R2, R5–R17 otherwise rely on review. No lint keeps `std::thread::sleep` or `Instant::now` out of unit tests.

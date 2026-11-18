@@ -91,7 +91,8 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 ## Enforcement
 
 - `tests/architecture.rs` checks R4: `term_core_does_no_io_and_reads_no_clock` (source search) and `crates_below_the_app_name_only_their_allowed_dependencies` (the closed dependency list). `the_wire_modules_do_no_io` holds the same for the protocol's message modules.
-- R1–R3 and R5–R10 rely on review. Nothing stops a pure module in `src/` from calling `Instant::now()` except the reviewer.
+- `platform_cfgs_stay_in_their_seams` (`ports R4`) holds R7's `cfg` half in production code: outside the seams and `ports R4`'s excepted files nothing is platform-gated, and `brindle-term-core` has no platform `cfg` at all. Testing on every platform, and keeping `Path` off another platform's paths, are review matters.
+- R1–R3 and R5–R10 otherwise rely on review. Nothing stops a pure module in `src/` from calling `Instant::now()` except the reviewer.
 
 ## PR checklist
 

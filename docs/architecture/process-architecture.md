@@ -57,7 +57,7 @@ let Some(lock) = Lock::acquire(&dir.join("core.lock"))? else {
 | --- | --- | --- |
 | holder (`brindle-remote hold`) | PTYs and pseudoconsoles, programs, each session's meta, checkpoint and tail | R1, R9, R10 |
 | server core (`brindle-remote serve`) | an `Emulator` per session, the client protocol, policy | R2, R3, R4–R8, R12, R19 |
-| relay (`brindle-remote relay`) | one endpoint's link, copied by frame | R7, R18 |
+| relay (`brindle-remote relay`; Linux only: built under `target_os = "linux"`, and refused with "relay runs only on Linux" on every other platform, macOS included) | one endpoint's link, copied by frame | R7, R18 |
 | Brindle's connection threads (`src/remote/local/`) | one reader and one writer per endpoint | R13, R14, R18 |
 | Brindle's UI thread | entities, painting | R13, R14, R16 |
 | the instance (`src/instance.rs`) | `session.lock`, the launch socket | R11 |

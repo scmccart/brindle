@@ -494,7 +494,7 @@ impl Terminal {
         let output = Arc::new(OutputMarker::default());
         let size = GridSize::default();
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, Listener(tx, output.clone()))));
-        let parser = Arc::new(Mutex::new(Parser::new()));
+        let parser = Arc::new(Mutex::new(Parser::new(process::LOCAL_PATH_STYLE)));
         let marks = Arc::new(Mutex::new(Marks::default()));
         let mut this = Self::new(term, output, rx, Backend::Remote, parser, marks, size, theme, config, cx);
         this.feed(text.as_bytes(), cx);
@@ -1221,11 +1221,11 @@ pub(crate) fn spawn_request(
     (request, doing)
 }
 
-/// The parser for a terminal on `host`: a remote endpoint is Linux, so its
-/// OSC 7 paths are POSIX ones whatever this machine is.
+/// The parser for a terminal on `host`, reading directory reports in the
+/// host's path style ([`Host::path_style`]).
 #[cfg(any(target_os = "linux", windows))]
 fn parser_for(host: &Host) -> Parser {
-    if host.is_local() { Parser::new() } else { Parser::posix() }
+    Parser::new(host.path_style(process::LOCAL_PATH_STYLE))
 }
 
 /// The program a profile with no `command` runs, with the profile's `args`:

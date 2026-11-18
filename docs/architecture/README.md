@@ -34,7 +34,7 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 | `src/remote/**`, `src/terminal/**`, `src/instance.rs`, `src/session.rs`, `src/config.rs` | process, railway, fcis |
 | the rest of `src/**` (views, overlays, settings) | fcis, types, ports |
 | `tests/**`, `remote-agent/tests/**`, any new kind of test, any flake | testing |
-| a `cfg(unix)`, `cfg(windows)` or `cfg(target_os)` anywhere | ports |
+| a `cfg(unix)`, `cfg(windows)` or `cfg(target_os)` in production code | ports |
 
 ## The docs
 
@@ -71,4 +71,4 @@ These docs were adopted on 2026-11-16 by writing down what the code already does
 | --- | --- | --- | --- |
 | `railway R4` | About 90 existing functions return `Result<_, String>` (57 in `src/`, 36 in the other crates), such as `reattach::attach_target`. | adoption, 2026-11-16 | each is revisited when its error gains a second consumer or a branch on its text |
 | `railway R3`, `types R2` | Existing `_ =>` arms have not been audited for matches on Brindle's own enums. | adoption, 2026-11-16 | each is removed when its `match` is next changed |
-| `ports R4` | `cfg` attributes for a platform concern outside its seam module, in `src/workspace.rs`, `src/terminal/mod.rs`, `src/main.rs` and `src/remote/local.rs` among others. | adoption, 2026-11-16 | the `port-to-macos` change, which moves each behind its seam |
+| `ports R4` | Platform `cfg`s outside a seam in these production files, and no others: `src/instance.rs`, `src/main.rs`, `src/notify/mod.rs`, `src/remote/local.rs`, `src/remote/local/relay.rs`, `src/remote/mod.rs`, `src/session.rs`, `src/settings.rs`, `src/terminal/mod.rs`, `src/terminal_view.rs`, `src/workspace.rs`, `src/zone_view.rs`, `remote-agent/src/main.rs`, `remote-agent/src/server/cli.rs`, `remote-agent/src/server/core.rs`, `remote-agent/src/server/core/sessions.rs`, `remote-agent/src/server/daemon.rs`. The architecture test `platform_cfgs_stay_in_their_seams` lists the same files and fails on any other (backlog: audit 2026-11-16, "Exceptions"). | adoption, 2026-11-16; narrowed by `enforce-platform-seams` | the `port-to-macos` change, which moves each behind its seam |
