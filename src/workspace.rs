@@ -14,11 +14,25 @@ use gpui::{
     Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
 
+mod launch;
+mod overlays;
+mod previews;
+mod tabs;
+
+pub use tabs::{TabId, TabTarget};
+
+use self::launch::{NewTabCwd, new_tab_cwd};
+use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
+use self::previews::Previews;
+use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
-use crate::config::{Config, Profile};
+use crate::config::{Config, Profile, ProfileKey};
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
-use crate::picker::{KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRow, SessionsModel, SubmitFn};
+use crate::picker::{
+    KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRef, SessionRow, SessionsModel, SubmitFn,
+};
+use crate::settings::Zoom;
 use brindle_ui::{
     ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
@@ -39,12 +53,16 @@ use crate::theme::Theme;
 use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
 
 /// The tab strip's height in logical pixels: the pill tab list's
-/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default 16px rem) plus the
-/// `ZONE_GAP` margin above it, which matches the one between it and the
-/// cards (and the one at its left). The strip's `IconSm` (2rem) buttons fit
-/// inside the list's height. It has no border under it: the strip's
-/// background runs on into the margin round the cards below.
-pub(crate) const TAB_BAR_HEIGHT: f32 = brindle_ui::style::TAB_LIST_HEIGHT.0 * 16.0 + ZONE_GAP;
+/// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
+/// `rems_at_default`) plus the `ZONE_GAP` margin above it, which matches
+/// the one between it and the cards (and the one at its left). The strip's
+/// `IconSm` (2rem) buttons fit inside the list's height. It has no border
+/// under it: the strip's background runs on into the margin round the cards
+/// below. (A function, not a constant: gpui reads a `Pixels` value only
+/// outside a constant.)
+pub(crate) fn tab_bar_height() -> f32 {
+    f32::from(brindle_ui::style::rems_at_default(brindle_ui::style::TAB_LIST_HEIGHT)) + ZONE_GAP
+}
 /// The room between two tab faces, in logical pixels.
 const TAB_FACE_GAP: f32 = 4.0;
 const RESIZE_BORDER: f32 = 6.0;
@@ -59,7 +77,7 @@ pub enum TabOrigin {
 }
 
 pub struct Tab {
-    pub id: u64,
+    pub id: TabId,
     /// The tab's profile, as the config has it now.
     pub profile: Profile,
     /// The endpoint the tab opened on: where its zones run, and where new
@@ -91,7 +109,7 @@ impl Tab {
     ) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut tab = Self {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: TabId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             profile,
             host,
             zones,
@@ -232,7 +250,9 @@ pub enum Launch {
 }
 
 enum PaletteKind {
-    NewTab,
+    /// The profiles, by row: each one's key when the palette opened, which
+    /// finds it in the config as it is when the row is chosen.
+    NewTab { keys: Vec<ProfileKey> },
     /// The command palette: its actions by row, and the tab that had focus
     /// when it opened, which they run in.
     Commands { actions: Vec<Box<dyn Action>>, tab_focus: FocusHandle },
@@ -243,6 +263,63 @@ enum PaletteKind {
     /// each row stands for (enter attaches a session into a new tab,
     /// `picker_kill` ends it, both on its endpoint's connection).
     Sessions { model: SessionsModel },
+}
+
+impl PaletteKind {
+    fn role(&self) -> PaletteRole {
+        match self {
+            Self::NewTab { .. } => PaletteRole::NewTab,
+            Self::Commands { .. } => PaletteRole::Commands,
+            Self::Prompt => PaletteRole::Prompt,
+            Self::Sessions { .. } => PaletteRole::Sessions,
+        }
+    }
+}
+
+/// The window's overlay, and what its slot needs while it is open. At most
+/// one of the palette, the settings dialog, the profile menu and the tab or
+/// zone menu shows. A menu and the settings dialog can close themselves
+/// (escape, a press outside, a choice), leaving this behind until the next
+/// change, so what shows is this checked against its slot
+/// ([`Workspace::open_overlay`]).
+enum Overlay {
+    Closed,
+    /// The sessions palette that isn't open yet: it collects the endpoints'
+    /// answers until all are in or `OPEN_GRACE` has passed. Any overlay that
+    /// opens meanwhile takes its place, so it never opens over another.
+    SessionsOpening(SessionsModel),
+    /// What the open palette is for, and the subscription to its events.
+    Palette { kind: PaletteKind, _subscription: Subscription },
+    Settings,
+    ProfileMenu,
+    /// A tab's or a zone header's menu: its entries and what its items
+    /// run, and what it was opened on.
+    ContextMenu { menu: ActionMenu, on: MenuFor },
+}
+
+impl Overlay {
+    /// The overlay this is, for [`toggle`]; `None` when none is open (a
+    /// sessions palette still opening is no overlay yet).
+    fn kind(&self) -> Option<OverlayKind> {
+        match self {
+            Self::Closed | Self::SessionsOpening(_) => None,
+            Self::Palette { kind, .. } => Some(OverlayKind::Palette(kind.role())),
+            Self::Settings => Some(OverlayKind::Settings),
+            Self::ProfileMenu => Some(OverlayKind::ProfileMenu),
+            Self::ContextMenu { .. } => Some(OverlayKind::ContextMenu),
+        }
+    }
+}
+
+/// What a context menu was opened on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuFor {
+    /// A tab's face (or the active tab's, from `OpenTabMenu`): its items act
+    /// on that tab, by id, not on the active one.
+    Tab(TabId),
+    /// A zone header (or the active zone, from `OpenZoneMenu`), focused by
+    /// then: its items run their actions from there.
+    Zone,
 }
 
 /// How long the sessions palette waits for a remote endpoint's listing
@@ -308,9 +385,9 @@ struct Listed {
 /// on the connection the process has (none is made), within [`LIST_LIMIT`];
 /// [`listing_from`] decides what that gives. A kill on an endpoint that
 /// isn't asked fails, so its session's row comes back.
-fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> (Listing, Option<KillOutcome>) {
+fn listing_of(host: &Host, state: &HostState, kill: Option<&SessionRef>) -> (Listing, Option<KillOutcome>) {
     if !asks(host, state) {
-        let kill = kill.map(|id| (id, Err(format!("{} is not connected", host.name()))));
+        let kill = kill.map(|target| (target.session, Err(format!("{} is not connected", host.name()))));
         return (listing_from(host, state, Ok(Vec::new())), kill);
     }
     let listed = list_sessions(host, kill);
@@ -318,8 +395,10 @@ fn listing_of(host: &Host, state: &HostState, kill: Option<u32>) -> (Listing, Op
 }
 
 /// Kills session `kill` (if given) on `host`'s connection, then lists its
-/// sessions. A connection that can't be had fails both.
-fn list_sessions(host: &Host, kill: Option<u32>) -> Listed {
+/// sessions. A connection that can't be had fails both. The kill names the
+/// session by id alone: `KILL` carries no key yet.
+fn list_sessions(host: &Host, kill: Option<&SessionRef>) -> Listed {
+    let kill = kill.map(|target| target.session);
     #[cfg(any(target_os = "linux", windows))]
     {
         use crate::remote::local;
@@ -345,20 +424,18 @@ fn list_sessions(host: &Host, kill: Option<u32>) -> Listed {
 
 
 pub struct Workspace {
+    /// The tabs, in the strip's order.
     tabs: Vec<Tab>,
-    active: usize,
+    /// The active tab, by id.
+    strip: Tabs,
+    /// The open overlay, and what its slot needs ([`Overlay`]).
+    overlay: Overlay,
     /// The palettes' modal slot. At most one overlay, a palette, the
     /// settings dialog or the profile menu, is open at a time.
     palette: UiOverlay<Palette>,
-    /// What the open palette is for, and the subscription to its events.
-    palette_kind: Option<PaletteKind>,
     /// The sessions palette's latest round of listings: an older round's
     /// answers are dropped.
     sessions_listing: u64,
-    /// The sessions palette that isn't open yet: it collects the endpoints'
-    /// answers until all are in or `OPEN_GRACE` has passed.
-    sessions_opening: Option<SessionsModel>,
-    _palette_subscription: Option<Subscription>,
     /// The settings dialog's modal slot. A press on its backdrop does
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
@@ -373,21 +450,13 @@ pub struct Workspace {
     /// four is open at most). It opens on the tab or zone it is for, which
     /// is active and focused by then, so its items run their actions there.
     context_menu: Entity<ContextMenu>,
-    /// The open context menu's entries and what its items run.
-    context_menu_items: Option<ActionMenu>,
-    /// The tab (by id) whose menu is open in `context_menu`; `None` for a
-    /// zone header's menu. Its items act on that tab, not the active one.
-    context_menu_tab: Option<u64>,
     _context_menu_subscription: Subscription,
     /// Where the strip's tabs were laid out in the last frame, in window
     /// coordinates, for placing a tab menu opened from a key.
     tab_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    /// A theme being previewed by the settings dialog, shown on the tabs
-    /// that follow the global theme.
-    theme_preview: Option<Theme>,
-    /// The profile the settings dialog is editing (by its saved name) and
-    /// the settings its tabs preview: theme and font size.
-    profile_preview: Option<(String, Profile)>,
+    /// What the settings dialog previews on the tabs: a theme for those
+    /// that follow the global one, and the profile it is editing.
+    previews: Previews,
     focus_handle: FocusHandle,
     /// The tab strip's focus, as a tab list: one keyboard stop, reached
     /// only through `FocusTabStrip` (a press on a tab leaves focus in its
@@ -423,14 +492,15 @@ impl Workspace {
         static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let focus_handle = cx.focus_handle();
         let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
-        // The menu has closed and given focus back to the tab by now.
-        // The chosen item's key is found among the menu's entries, which
-        // gives the profile's index (`profile_menu_entries`).
+        // The menu has closed and given focus back to the tab by now. The
+        // chosen item's key is its profile's key (`profile_menu_entries`),
+        // found in the config as it is now, else by its place in the menu.
         let profile_menu_subscription =
             cx.subscribe_in(&profile_menu, window, |this, menu, event: &MenuEvent, window, cx| {
                 let MenuEvent::Selected(key) = event;
-                if let Some(ix) = entry_keyed(menu.read(cx).entries(), key) {
-                    this.open_profile(ix, window, cx);
+                if let Some(listed) = entry_keyed(menu.read(cx).entries(), key) {
+                    let profile = ProfileKey::parse(key.as_str());
+                    this.open_profile_keyed(profile.as_ref(), listed, window, cx);
                 }
             });
         let context_menu = cx.new(|_| ContextMenu::new());
@@ -441,23 +511,18 @@ impl Workspace {
             });
         let mut this = Self {
             tabs: Vec::new(),
-            active: 0,
+            strip: Tabs::default(),
+            overlay: Overlay::Closed,
             palette: UiOverlay::modal(),
-            palette_kind: None,
             sessions_listing: 0,
-            sessions_opening: None,
-            _palette_subscription: None,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
             profile_menu,
             _profile_menu_subscription: profile_menu_subscription,
             context_menu,
-            context_menu_items: None,
-            context_menu_tab: None,
             _context_menu_subscription: context_menu_subscription,
             tab_bounds: Rc::default(),
-            theme_preview: None,
-            profile_preview: None,
+            previews: Previews::default(),
             focus_handle,
             strip_focus: cx.focus_handle(),
             last_title: SharedString::default(),
@@ -559,7 +624,7 @@ impl Workspace {
                             self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd), note: None }, window, cx)
                         }
                     }
-                    let Some(tab) = self.tabs.get_mut(self.active) else { continue };
+                    let Some(tab) = self.active_ix().and_then(|ix| self.tabs.get_mut(ix)) else { continue };
                     if let Some(note) = &missing_note
                         && let Some(terminal) = tab.active_terminal(cx)
                     {
@@ -574,8 +639,8 @@ impl Workspace {
                 }
             }
         }
-        if let Some(ix) = active_tab.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
-            self.activate(ix, window, cx);
+        if let Some(id) = active_tab {
+            self.activate(Pick::Tab(id), window, cx);
         }
     }
 
@@ -600,7 +665,7 @@ impl Workspace {
             })
             .collect();
         let font_size = profile.font_size;
-        let theme = self.tab_theme(&profile, &config);
+        let theme = self.previews.theme_for(&profile, &config);
         let p_clone = profile.clone();
         let tree_host = host.clone();
         let view = cx.new(|cx| {
@@ -615,8 +680,8 @@ impl Workspace {
     pub fn snapshot(&self, window: &Window, cx: &App) -> WindowState {
         let mut tabs: Vec<SnapshotTab> = Vec::new();
         let mut active = None;
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            if ix == self.active {
+        for tab in &self.tabs {
+            if Some(tab.id) == self.strip.active() {
                 active = Some(tabs.len());
             }
             tabs.push(match tab.origin {
@@ -710,16 +775,34 @@ impl Workspace {
     }
 
     pub fn active_theme(&self, cx: &App) -> Theme {
-        self.tabs
-            .get(self.active)
+        self.active_tab()
             .map(|t| t.theme(cx))
             .unwrap_or_else(|| Self::settings(cx).theme(None))
+    }
+
+    /// The strip's order, by id, as the [`Tabs`] model takes it.
+    fn order(&self) -> Vec<TabId> {
+        self.tabs.iter().map(|tab| tab.id).collect()
+    }
+
+    /// The active tab's index in `tabs`; `None` with no tabs.
+    fn active_ix(&self) -> Option<usize> {
+        self.strip.active_in(&self.order())
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_ix()?)
+    }
+
+    /// The index of the tab `id`, while it is open.
+    fn tab_ix(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
     }
 
     /// The active directory only has meaning to a new tab on the same host
     /// or container as the active tab ([`same_endpoint`]).
     fn active_cwd_for(&self, host: &Host, cx: &App) -> Option<PathBuf> {
-        let tab = self.tabs.get(self.active)?;
+        let tab = self.active_tab()?;
         if !same_endpoint(&tab.host, host) {
             return None;
         }
@@ -751,27 +834,21 @@ impl Workspace {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
-        let requested_cwd = request.cwd.filter(|cwd| {
-            if host.is_local() {
-                return true;
-            }
-            let cwd = cwd.to_string_lossy();
-            cwd.starts_with('/') || cwd == "~" || cwd.starts_with("~/")
-        });
         let command = request.command;
-
-        let cwd = requested_cwd.or_else(|| {
-            // New tabs follow the current directory only on the same endpoint,
-            // unless the destination profile pins one.
-            if profile.cwd.is_none() { self.active_cwd_for(&host, cx) } else { None }
-        });
+        // New tabs follow the current directory only on the same endpoint,
+        // unless the destination profile pins one.
+        let cwd = match new_tab_cwd(request.cwd, &host, profile.cwd.is_some()) {
+            NewTabCwd::Given(cwd) => Some(cwd),
+            NewTabCwd::FollowActive => self.active_cwd_for(&host, cx),
+            NewTabCwd::ProfileDefault => None,
+        };
 
         let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
         if let Some(note) = &request.note {
             terminal.update(cx, |terminal, cx| terminal.note(note, cx));
         }
         let font_size = profile.font_size;
-        let theme = self.tab_theme(&profile, &config);
+        let theme = self.previews.theme_for(&profile, &config);
         let p_clone = profile.clone();
         let tree_host = host.clone();
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
@@ -791,9 +868,9 @@ impl Workspace {
         activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> u64 {
+    ) -> TabId {
         let config = Self::settings(cx).clone();
-        let theme = self.tab_theme(&profile, &config);
+        let theme = self.previews.theme_for(&profile, &config);
         let font_size = profile.font_size;
         let p_clone = profile.clone();
         let tree_host = host.clone();
@@ -838,7 +915,7 @@ impl Workspace {
                     .into_iter()
                     .map(|(id, info)| (id, Self::attached_terminal(&host, &info, &profile, &config, cx)))
                     .collect();
-                let theme = self.tab_theme(&profile, &config);
+                let theme = self.previews.theme_for(&profile, &config);
                 let font_size = profile.font_size;
                 let (p_clone, tree_host) = (profile.clone(), host.clone());
                 let view = cx.new(|cx| {
@@ -1005,30 +1082,37 @@ impl Workspace {
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
     fn insert_tab(&mut self, tab: Tab, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        let index = self.insert_tab_inactive(tab, index, cx);
-        self.activate(index, window, cx);
+        let id = tab.id;
+        self.insert_tab_inactive(tab, index, cx);
+        self.activate(Pick::Tab(id), window, cx);
     }
 
-    /// Inserts `tab` at `index` without activating it; the active tab stays
-    /// the same.
-    fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) -> usize {
-        let index = index.unwrap_or(if self.tabs.is_empty() { 0 } else { self.active + 1 }).min(self.tabs.len());
-        if !self.tabs.is_empty() && index <= self.active {
-            self.active += 1;
-        }
-        if self.theme_preview.is_some() || self.profile_preview.is_some() {
-            let profile = self.effective_profile(&tab.profile);
-            let theme = self.tab_theme(profile, Self::settings(cx));
+    /// Inserts `tab` at `index` (default: after the active tab) without
+    /// activating it; the active tab stays the same, unless this is the
+    /// window's first tab ([`Tabs::insert_at`]).
+    fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) {
+        let index = self.strip.insert_at(&self.order(), tab.id, index);
+        if self.previews.any() {
+            let profile = self.previews.profile_for(&tab.profile);
+            let theme = self.previews.theme_for(profile, Self::settings(cx));
             set_tab_theme(&tab, theme, profile.font_size, cx);
         }
         self.tabs.insert(index, tab);
         cx.notify();
-        index
     }
 
     /// Opens profile `ix` in a new tab.
     fn open_profile(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.launch(LaunchRequest::profile(ix), window, cx);
+    }
+
+    /// Opens the profile a palette row or a menu item chose, `key` being its
+    /// key and `listed` its place when it was listed: the profile the config
+    /// has under that key now, else (renamed or removed since) the one at
+    /// `listed`, as before keys.
+    fn open_profile_keyed(&mut self, key: Option<&ProfileKey>, listed: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = key.and_then(|key| Self::settings(cx).find_profile(key)).unwrap_or(listed);
+        self.open_profile(ix, window, cx);
     }
 
     fn zone_tab_subscriptions(
@@ -1053,12 +1137,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shown = self.tabs.get(self.active).is_some_and(|t| &t.zones == view);
+        let shown = self.active_tab().is_some_and(|t| &t.zones == view);
         if !shown {
             return;
         }
-        let menu = ActionMenu::new(request.rows.clone(), |action| tab_shortcut(action, cx));
-        self.open_context_menu(menu, request.at, request.press.as_ref(), window, cx);
+        let menu = ActionMenu::new(request.rows.clone(), &menu_shortcuts(&request.rows, cx));
+        self.open_context_menu(menu, MenuFor::Zone, request.at, request.press.as_ref(), window, cx);
     }
 
     fn on_zone_tree_event(
@@ -1072,7 +1156,7 @@ impl Workspace {
             return;
         };
         match event {
-            TerminalEvent::Exited => self.remove_tab(ix, window, cx),
+            TerminalEvent::Exited => self.remove_tab(self.tabs[ix].id, window, cx),
             TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Status(_) => {
                 self.on_attention(ix, event, window, cx)
             }
@@ -1092,7 +1176,7 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
-        let visible = ix == self.active && window.is_window_active();
+        let visible = Some(self.tabs[ix].id) == self.strip.active() && window.is_window_active();
         let (source, title, body) = match event {
             TerminalEvent::Bell => {
                 if !visible {
@@ -1115,7 +1199,7 @@ impl Workspace {
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
         let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
-        let request = notify::Request { source, summary, body, window: handle, tab: tab.id };
+        let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0 };
         Notifier::send(request, cx);
     }
 
@@ -1133,15 +1217,14 @@ impl Workspace {
     /// Activates the tab with this id, if it is still open (a notification
     /// for it was clicked).
     pub fn show_tab(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|t| t.id == tab_id) {
-            self.activate(ix, window, cx);
-        }
+        self.activate(Pick::Tab(TabId(tab_id)), window, cx);
     }
 
-    /// Makes tab `index` the active one and, unless an overlay is open,
-    /// gives its terminal focus.
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.select(index, cx) {
+    /// Makes the tab `pick` names the active one and, unless an overlay is
+    /// open, gives its terminal focus. Nothing happens when there is no such
+    /// tab.
+    fn activate(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.select(pick, cx) {
             return;
         }
         if !self.has_overlay(cx) {
@@ -1149,21 +1232,21 @@ impl Workspace {
         }
     }
 
-    /// Shows tab `index` (clamped) without moving focus: its bell clears.
-    /// False with no tabs.
-    fn select(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        if self.tabs.is_empty() {
-            return false;
+    /// Shows the tab `pick` names without moving focus: its bell clears.
+    /// False, changing nothing, when there is no such tab.
+    fn select(&mut self, pick: Pick, cx: &mut Context<Self>) -> bool {
+        let order = self.order();
+        let Some(id) = self.strip.pick(&order, pick) else { return false };
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.bell = false;
         }
-        self.active = index.min(self.tabs.len() - 1);
-        self.tabs[self.active].bell = false;
         cx.notify();
         true
     }
 
     /// Focuses the active tab's terminal (the tab's own focus handle).
     fn focus_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self.active_tab() {
             window.focus(&tab.focus_handle(cx));
         }
     }
@@ -1171,12 +1254,15 @@ impl Workspace {
     /// The strip asked to activate a tab. A pointer press activates it and
     /// puts focus in its terminal, as a key or a click elsewhere would; an
     /// arrow, home or end while the strip has focus only shows the tab, so
-    /// focus stays on the strip, resting on the new active tab.
+    /// focus stays on the strip, resting on the new active tab. The strip
+    /// names the tab by its place as it last drew it, so the tab is found
+    /// there at once.
     fn activate_from_strip(&mut self, request: &TabActivate, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pick) = self.tabs.get(request.index).map(|tab| Pick::Tab(tab.id)) else { return };
         match request.by {
-            Modality::Pointer => self.activate(request.index, window, cx),
+            Modality::Pointer => self.activate(pick, window, cx),
             Modality::Keyboard => {
-                self.select(request.index, cx);
+                self.select(pick, cx);
             }
         }
     }
@@ -1203,17 +1289,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Removes tab `ix`, ending its terminals' programs. When it was the
+    /// Removes the tab `id`, ending its terminals' programs. When it was the
     /// last tab on a remote endpoint that no profile connects to at launch,
     /// the launch stops waiting for that endpoint's first listing
     /// ([`crate::remote::local::stop_listing`]), so it doesn't sweep it.
-    fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.tabs.len() {
-            return;
-        }
+    fn remove_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_ix(id) else { return };
         #[cfg(any(target_os = "linux", windows))]
         let before: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
+        let order = self.order();
         let tab = self.tabs.remove(ix);
+        let removed = self.strip.removed(&order, id);
         tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
         #[cfg(any(target_os = "linux", windows))]
         {
@@ -1223,17 +1309,15 @@ impl Workspace {
                 crate::remote::local::stop_listing(&host);
             }
         }
-        if self.tabs.is_empty() {
-            // Nothing to restore for a window whose tabs all closed.
-            let id = self.window_id;
-            cx.update_global(|store: &mut SessionStore, _| store.forget(id));
-            window.remove_window();
-            return;
+        match removed {
+            Removed::Last => {
+                // Nothing to restore for a window whose tabs all closed.
+                let id = self.window_id;
+                cx.update_global(|store: &mut SessionStore, _| store.forget(id));
+                window.remove_window();
+            }
+            Removed::Active(active) => self.activate(Pick::Tab(active), window, cx),
         }
-        if self.active > ix || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1);
-        }
-        self.activate(self.active, window, cx);
     }
 
     // ---- actions ----------------------------------------------------------------
@@ -1260,42 +1344,29 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab_at(self.active, window, cx);
-    }
-
-    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.remove_tab(ix, window, cx);
+        if let Some(active) = self.strip.active() {
+            self.remove_tab(active, window, cx);
+        }
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
-        }
+        self.activate(Pick::Next, window, cx);
     }
 
     fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + self.tabs.len() - 1) % self.tabs.len(), window, cx);
-        }
+        self.activate(Pick::Prev, window, cx);
     }
 
     fn activate_tab(&mut self, action: &ActivateTab, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = if action.0 == usize::MAX { self.tabs.len().saturating_sub(1) } else { action.0 };
-        if ix < self.tabs.len() {
-            self.activate(ix, window, cx);
-        }
+        self.activate(Pick::Target(action.0), window, cx);
     }
 
+    /// Moves the active tab one place (`delta` -1 or 1), past an end to the
+    /// other.
     fn move_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let len = self.tabs.len() as isize;
-        if len < 2 {
-            return;
+        if let Some(active) = self.strip.active() {
+            self.shift_tab(active, Shift::Wrapping(delta), cx);
         }
-        let to = (self.active as isize + delta).rem_euclid(len) as usize;
-        let tab = self.tabs.remove(self.active);
-        self.tabs.insert(to, tab);
-        self.active = to;
-        cx.notify();
     }
 
     fn move_tab_left(&mut self, _: &MoveTabLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -1306,21 +1377,26 @@ impl Workspace {
         self.move_tab(1, cx);
     }
 
-    /// Moves tab `ix` one place (`delta` -1 or 1), without wrapping, as the
-    /// tab menu does; the active tab stays active wherever it ends up.
-    fn move_tab_at(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
-        let Some(to) = ix.checked_add_signed(delta) else { return };
-        self.move_tab_to(ix, to, cx);
+    /// Moves the tab `id` as `by` says ([`Tabs::shift`]); the active tab
+    /// stays active wherever it ends up.
+    fn shift_tab(&mut self, id: TabId, by: Shift, cx: &mut Context<Self>) {
+        if let Some((from, to)) = self.strip.shift(&self.order(), id, by)
+            && reorder(&mut self.tabs, from, to)
+        {
+            cx.notify();
+        }
     }
 
     fn rename_tab(&mut self, _: &RenameTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.rename_tab_at(self.active, window, cx);
+        if let Some(active) = self.strip.active() {
+            self.rename_tab_at(active, window, cx);
+        }
     }
 
-    /// Asks for a new title for tab `ix`, which it gets whatever moves meanwhile.
-    fn rename_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(ix) else { return };
-        let tab_id = tab.id;
+    /// Asks for a new title for the tab `tab_id`, which it gets whatever
+    /// moves meanwhile.
+    fn rename_tab_at(&mut self, tab_id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else { return };
         let initial = tab.title.to_string();
         let this = cx.entity().downgrade();
         let submit: SubmitFn = Rc::new(move |text, cx| {
@@ -1338,19 +1414,13 @@ impl Workspace {
     }
 
     /// A tab dragged onto another: the tab whose trigger the move names
-    /// takes the place of the tab at `to` ([`Workspace::move_tab_to`]); a
-    /// tab gone since the drag began moves nothing.
+    /// takes the place of the tab at `to` (after it when it came from the
+    /// left, before it from the right; [`reorder`]), and the active tab
+    /// stays active wherever it ends up. A tab gone since the drag began
+    /// moves nothing.
     fn move_dragged_tab(&mut self, request: &TabMove, cx: &mut Context<Self>) {
         let Some(from) = self.tabs.iter().position(|t| tab_trigger_id(t.id) == request.from) else { return };
-        self.move_tab_to(from, request.to, cx);
-    }
-
-    /// The tab at `from` takes `to`'s place (after it when it came from the
-    /// left, before it from the right), and the active tab stays active
-    /// wherever it ends up.
-    fn move_tab_to(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if let Some(active) = reorder_keeping(&mut self.tabs, self.active, from, to, |t| t.id) {
-            self.active = active;
+        if reorder(&mut self.tabs, from, request.to) {
             cx.notify();
         }
     }
@@ -1362,18 +1432,19 @@ impl Workspace {
     }
 
     fn open_profile_picker(&mut self, _: &OpenProfilePicker, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_palette_toggling(|k| matches!(k, PaletteKind::NewTab), window, cx) {
+        if !self.toggles_open(OverlayKind::Palette(PaletteRole::NewTab), window, cx) {
             return;
         }
         let rows = self.profile_rows(window, cx);
+        let keys = Self::settings(cx).profile_keys();
         let palette = cx.new(|cx| Palette::list(rows, "Open profile…", cx));
-        self.show_palette(palette, PaletteKind::NewTab, window, cx);
+        self.show_palette(palette, PaletteKind::NewTab { keys }, window, cx);
     }
 
     /// The profiles as the picker and the profile menu list them
     /// ([`profile_rows`]), with the keys that open each in the active tab.
     fn profile_rows(&self, window: &Window, cx: &App) -> Vec<PaletteRow> {
-        let focus = self.tabs.get(self.active).map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
+        let focus = self.active_tab().map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
         let profiles = &Self::settings(cx).profiles;
         let shortcuts: Vec<Option<SharedString>> =
             (0..profiles.len()).map(|ix| shortcut(&NewTabWithProfile(ix), &focus, window)).collect();
@@ -1381,9 +1452,10 @@ impl Workspace {
     }
 
     /// Gives the profile menu the picker's rows as they are now, for its
-    /// next opening.
+    /// next opening, each keyed by its profile's key.
     fn refresh_profile_menu(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let entries = profile_menu_entries(self.profile_rows(window, cx));
+        let keys = Self::settings(cx).profile_keys();
+        let entries = profile_menu_entries(self.profile_rows(window, cx), &keys);
         self.profile_menu.update(cx, |menu, _| menu.set_entries(entries));
     }
 
@@ -1391,62 +1463,59 @@ impl Workspace {
     /// on the button does, or closes it when it is open. Another overlay
     /// closes first, so the menu gives focus back to the tab.
     fn open_profile_menu(&mut self, _: &OpenProfileMenu, window: &mut Window, cx: &mut Context<Self>) {
-        let was_open = self.profile_menu.read(cx).is_open();
-        if self.has_overlay(cx) {
-            self.dismiss_overlay(window, cx);
-        }
-        if was_open {
+        if !self.toggles_open(OverlayKind::ProfileMenu, window, cx) {
             return;
         }
         self.refresh_profile_menu(window, cx);
         self.profile_menu.update(cx, |menu, cx| menu.open(window, cx));
+        self.overlay = Overlay::ProfileMenu;
         cx.notify();
     }
 
     /// `OpenTabMenu`: the active tab's menu, below its face in the strip
     /// (below the strip's start before the strip was first drawn).
     fn open_tab_menu(&mut self, _: &OpenTabMenu, window: &mut Window, cx: &mut Context<Self>) {
-        let face = self.tab_bounds.borrow().get(self.active).copied();
-        let at = face.map_or_else(|| point(px(0.), px(TAB_BAR_HEIGHT)), |face| face.bottom_left());
-        self.open_tab_menu_at(self.active, at, None, window, cx);
+        let Some(ix) = self.active_ix() else { return };
+        let face = self.tab_bounds.borrow().get(ix).copied();
+        let at = face.map_or_else(|| point(px(0.), px(tab_bar_height())), |face| face.bottom_left());
+        self.open_tab_menu_at(self.tabs[ix].id, at, None, window, cx);
     }
 
-    /// Tab `ix`'s menu, at `at` (window coordinates), from the secondary
-    /// `press` on its face when one asked. The tab isn't activated: focus
-    /// stays with the active tab, and the items act on tab `ix` by its id
-    /// (`context_menu_selected`).
+    /// The menu of the tab `id`, at `at` (window coordinates), from the
+    /// secondary `press` on its face when one asked. The tab isn't
+    /// activated: focus stays with the active tab, and the items act on the
+    /// tab `id` (`context_menu_selected`).
     fn open_tab_menu_at(
         &mut self,
-        ix: usize,
+        id: TabId,
         at: Point<Pixels>,
         press: Option<&MouseDownEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ix >= self.tabs.len() {
-            return;
-        }
-        let menu = ActionMenu::new(tab_menu_rows(ix, self.tabs.len()), |action| tab_shortcut(action, cx));
-        self.open_context_menu(menu, at, press, window, cx);
-        self.context_menu_tab = Some(self.tabs[ix].id);
+        let Some(ix) = self.tab_ix(id) else { return };
+        let rows = tab_menu_rows(ix, self.tabs.len());
+        let menu = ActionMenu::new(rows.clone(), &menu_shortcuts(&rows, cx));
+        self.open_context_menu(menu, MenuFor::Tab(id), at, press, window, cx);
     }
 
-    /// Opens `menu` in the context menu slot at `at`, or at the pointer of
-    /// `press`, replacing any overlay. Focus goes to the active tab first:
-    /// the menu gives it back there on closing, and a chosen item's action
-    /// runs from there.
+    /// Opens `menu`, for what it is `on`, in the context menu slot at `at`,
+    /// or at the pointer of `press`, replacing any overlay. Focus goes to the
+    /// active tab first: the menu gives it back there on closing, and a
+    /// chosen item's action runs from there.
     fn open_context_menu(
         &mut self,
         menu: ActionMenu,
+        on: MenuFor,
         at: Point<Pixels>,
         press: Option<&MouseDownEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_overlay(window, cx);
+        self.replace_overlay(OverlayKind::ContextMenu, window, cx);
         self.focus_active_tab(window, cx);
         let entries = menu.entries.clone();
-        self.context_menu_items = Some(menu);
+        self.overlay = Overlay::ContextMenu { menu, on };
         self.context_menu.update(cx, |context_menu, cx| match press {
             Some(event) => context_menu.open_on_press(event, entries, window, cx),
             None => context_menu.open(at, entries, window, cx),
@@ -1460,23 +1529,27 @@ impl Workspace {
     /// focused zone, exactly as its keybinding would (as the command palette
     /// runs one).
     fn context_menu_selected(&mut self, key: &ItemKey, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = self.context_menu_tab.take();
-        let action = self.context_menu_items.take().and_then(|menu| {
-            let ix = entry_keyed(&menu.entries, key)?;
-            menu.action(ix).map(|a| a.boxed_clone())
-        });
-        let Some(action) = action else {
+        let Overlay::ContextMenu { menu, on } = std::mem::replace(&mut self.overlay, Overlay::Closed) else {
+            return;
+        };
+        let Some(action) = menu.chosen(key).map(|a| a.boxed_clone()) else {
             return;
         };
         self.focus_active_tab(window, cx);
         cx.notify();
-        if let Some(item) = tab.and_then(|_| TabMenuItem::of(&*action)) {
-            let Some(ix) = tab.and_then(|id| self.tabs.iter().position(|t| t.id == id)) else { return };
+        let item = match on {
+            MenuFor::Tab(id) => TabMenuItem::of(&*action).map(|item| (id, item)),
+            MenuFor::Zone => None,
+        };
+        if let Some((id, item)) = item {
+            if self.tab_ix(id).is_none() {
+                return;
+            }
             match item {
-                TabMenuItem::Rename => self.rename_tab_at(ix, window, cx),
-                TabMenuItem::MoveLeft => self.move_tab_at(ix, -1, cx),
-                TabMenuItem::MoveRight => self.move_tab_at(ix, 1, cx),
-                TabMenuItem::Close => self.close_tab_at(ix, window, cx),
+                TabMenuItem::Rename => self.rename_tab_at(id, window, cx),
+                TabMenuItem::MoveLeft => self.shift_tab(id, Shift::Within(-1), cx),
+                TabMenuItem::MoveRight => self.shift_tab(id, Shift::Within(1), cx),
+                TabMenuItem::Close => self.remove_tab(id, window, cx),
             }
             return;
         }
@@ -1484,10 +1557,10 @@ impl Workspace {
     }
 
     fn open_command_palette(&mut self, _: &OpenCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_palette_toggling(|k| matches!(k, PaletteKind::Commands { .. }), window, cx) {
+        if !self.toggles_open(OverlayKind::Palette(PaletteRole::Commands), window, cx) {
             return;
         }
-        let Some(tab_focus) = self.tabs.get(self.active).map(|t| t.focus_handle(cx)) else { return };
+        let Some(tab_focus) = self.active_tab().map(|t| t.focus_handle(cx)) else { return };
         // Snapshot what the tab can do while it still has focus.
         window.focus(&tab_focus);
         let types: std::collections::HashSet<std::any::TypeId> =
@@ -1517,20 +1590,33 @@ impl Workspace {
         self.show_palette(palette, PaletteKind::Prompt, window, cx);
     }
 
-    /// Closes any open palette. Returns true if it was of the kind `is`
-    /// matches, so that opening a palette again toggles it.
-    fn close_palette_toggling(
-        &mut self,
-        is: impl Fn(&PaletteKind) -> bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.has_overlay(cx) {
-            return false;
+    /// Asks for overlay `wanted` from its key, which toggles it ([`toggle`]
+    /// on the overlay open now): closes whatever is open, giving focus back
+    /// to the tab, and returns whether `wanted` opens now, which it doesn't
+    /// when it was the one open.
+    fn toggles_open(&mut self, wanted: OverlayKind, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match toggle(self.open_overlay(cx), wanted, Opens::Toggles) {
+            Toggle::Open => true,
+            Toggle::CloseThenOpen => {
+                self.dismiss_overlay(window, cx);
+                true
+            }
+            Toggle::CloseOnly => {
+                self.dismiss_overlay(window, cx);
+                false
+            }
         }
-        let same = self.palette_kind.as_ref().is_some_and(is);
-        self.dismiss_overlay(window, cx);
-        same
+    }
+
+    /// Makes room for overlay `wanted`, which takes the place of whatever is
+    /// open ([`toggle`] with [`Opens::Replaces`]): a prompt a command asks
+    /// for, a tab or zone menu, the sessions palette once its listings are
+    /// in. Focus stays where it is.
+    fn replace_overlay(&mut self, wanted: OverlayKind, window: &mut Window, cx: &mut Context<Self>) {
+        match toggle(self.open_overlay(cx), wanted, Opens::Replaces) {
+            Toggle::Open => {}
+            Toggle::CloseThenOpen | Toggle::CloseOnly => self.close_overlay(window, cx),
+        }
     }
 
     /// Opens `palette` in the palette slot, replacing any overlay. The one
@@ -1543,14 +1629,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_overlay(window, cx);
+        self.replace_overlay(OverlayKind::Palette(kind.role()), window, cx);
         let subscription = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
             PaletteEvent::Confirmed(ix) => this.palette_confirmed(*ix, window, cx),
             PaletteEvent::Kill(ix) => this.palette_kill(*ix, window, cx),
             PaletteEvent::Dismissed => this.palette_dismissed(window, cx),
         });
-        self.palette_kind = Some(kind);
-        self._palette_subscription = Some(subscription);
+        self.overlay = Overlay::Palette { kind, _subscription: subscription };
         self.palette.open(palette, |this| &mut this.palette, window, cx);
         cx.notify();
     }
@@ -1561,38 +1646,39 @@ impl Workspace {
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(kind) = self.palette_kind.take() else { return };
+        let Overlay::Palette { kind, .. } = &self.overlay else { return };
         match kind {
-            PaletteKind::NewTab => {
+            PaletteKind::NewTab { keys } => {
+                let key = keys.get(ix).cloned();
                 self.dismiss_overlay(window, cx);
-                self.open_profile(ix, window, cx);
+                self.open_profile_keyed(key.as_ref(), ix, window, cx);
             }
             PaletteKind::Commands { actions, tab_focus } => {
                 // Run it from the tab, exactly as its keybinding would: the
                 // palette closes first (giving focus back to the tab), since
                 // the dispatch is deferred and follows focus. A prompt the
                 // command asks for opens a palette of its own.
+                let action = actions.get(ix).map(|action| action.boxed_clone());
+                let tab_focus = tab_focus.clone();
                 self.close_overlay(window, cx);
                 window.focus(&tab_focus);
                 cx.notify();
-                if let Some(action) = actions.into_iter().nth(ix) {
+                if let Some(action) = action {
                     window.dispatch_action(action, cx);
                 }
             }
             // A prompt has no rows to confirm.
-            PaletteKind::Prompt => self.palette_kind = Some(PaletteKind::Prompt),
+            PaletteKind::Prompt => {}
             PaletteKind::Sessions { model } => {
-                let target =
-                    model.rows().get(ix).and_then(SessionRow::session).map(|(host, info)| (host.clone(), info.clone()));
-                match target {
-                    Some((host, info)) => {
-                        self.dismiss_overlay(window, cx);
-                        self.attach_detached_here(host, info, window, cx);
-                    }
-                    // A row that does nothing (the command list confirms
-                    // none of them anyway).
-                    None => self.palette_kind = Some(PaletteKind::Sessions { model }),
-                }
+                // A row that does nothing (the command list confirms none
+                // of them anyway) leaves the palette open.
+                let Some((host, info)) =
+                    model.rows().get(ix).and_then(SessionRow::session).map(|(host, info)| (host.clone(), info.clone()))
+                else {
+                    return;
+                };
+                self.dismiss_overlay(window, cx);
+                self.attach_detached_here(host, info, window, cx);
             }
         }
     }
@@ -1600,7 +1686,7 @@ impl Workspace {
     /// "Attach Session…": lists the detached sessions off the UI thread,
     /// then shows them.
     fn attach_session(&mut self, _: &AttachSession, window: &mut Window, cx: &mut Context<Self>) {
-        if self.close_palette_toggling(|k| matches!(k, PaletteKind::Sessions { .. }), window, cx) {
+        if !self.toggles_open(OverlayKind::Palette(PaletteRole::Sessions), window, cx) {
             return;
         }
         self.refresh_sessions_palette(None, true, window, cx);
@@ -1609,7 +1695,7 @@ impl Workspace {
     /// The remote endpoints' states changed (the [`Hosts`] global): an open
     /// sessions palette lists them again.
     pub fn hosts_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.palette_kind, Some(PaletteKind::Sessions { .. })) {
+        if matches!(self.overlay, Overlay::Palette { kind: PaletteKind::Sessions { .. }, .. }) {
             self.refresh_sessions_palette(None, false, window, cx);
         }
     }
@@ -1629,23 +1715,23 @@ impl Workspace {
     /// `opening`, the answers go to the open sessions palette's model, which
     /// keeps the highlighted row where it was; a palette closed meanwhile
     /// stays closed.
-    fn refresh_sessions_palette(&mut self, kill: Option<(Host, u32)>, opening: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_sessions_palette(&mut self, kill: Option<SessionRef>, opening: bool, window: &mut Window, cx: &mut Context<Self>) {
         let endpoints = palette_endpoints(cx.try_global::<Hosts>().map(Hosts::states).unwrap_or_default());
         self.sessions_listing += 1;
         let round = self.sessions_listing;
         let hosts = endpoints.iter().map(|(host, _)| host.clone());
         if opening {
-            self.sessions_opening = Some(SessionsModel::new(round, hosts));
-        } else if let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind {
+            self.overlay = Overlay::SessionsOpening(SessionsModel::new(round, hosts));
+        } else if let Overlay::Palette { kind: PaletteKind::Sessions { model }, .. } = &mut self.overlay {
             model.start_round(round, hosts);
         } else {
             return;
         }
         for (host, state) in endpoints {
-            let kill = kill.as_ref().filter(|(on, _)| *on == host).map(|(_, id)| *id);
+            let kill = kill.as_ref().filter(|target| target.host == host).cloned();
             let listing = {
                 let host = host.clone();
-                cx.background_executor().spawn(async move { listing_of(&host, &state, kill) })
+                cx.background_executor().spawn(async move { listing_of(&host, &state, kill.as_ref()) })
             };
             cx.spawn_in(window, async move |this, cx| {
                 let (listed, killed) = listing.await;
@@ -1657,7 +1743,7 @@ impl Workspace {
             cx.spawn_in(window, async move |this, cx| {
                 cx.background_executor().timer(crate::picker::OPEN_GRACE).await;
                 this.update_in(cx, |this, window, cx| {
-                    if this.sessions_opening.as_ref().is_some_and(|model| model.round() == round) {
+                    if matches!(&this.overlay, Overlay::SessionsOpening(model) if model.round() == round) {
                         this.open_sessions_palette(window, cx);
                     }
                 })
@@ -1680,21 +1766,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind {
-            if model.answer(round, &host, listed, killed) {
-                self.show_sessions_palette(cx);
+        match &mut self.overlay {
+            Overlay::Palette { kind: PaletteKind::Sessions { model }, .. } => {
+                if model.answer(round, &host, listed, killed) {
+                    self.show_sessions_palette(cx);
+                }
             }
-        } else if let Some(model) = &mut self.sessions_opening
-            && model.answer(round, &host, listed, killed)
-            && model.complete()
-        {
-            self.open_sessions_palette(window, cx);
+            Overlay::SessionsOpening(model) => {
+                if model.answer(round, &host, listed, killed) && model.complete() {
+                    self.open_sessions_palette(window, cx);
+                }
+            }
+            // A palette closed or replaced meanwhile stays so.
+            Overlay::Closed
+            | Overlay::Palette { kind: PaletteKind::NewTab { .. } | PaletteKind::Commands { .. } | PaletteKind::Prompt, .. }
+            | Overlay::Settings
+            | Overlay::ProfileMenu
+            | Overlay::ContextMenu { .. } => {}
         }
     }
 
     /// Opens the sessions palette with what the endpoints have listed so far.
     fn open_sessions_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut model) = self.sessions_opening.take() else { return };
+        let Overlay::SessionsOpening(mut model) = std::mem::replace(&mut self.overlay, Overlay::Closed) else { return };
         let view = model.view(Self::settings(cx), unix_now());
         let palette = cx.new(|cx| Palette::list_grouped(view.groups, "Attach a detached session", view.empty, cx));
         self.show_palette(palette, PaletteKind::Sessions { model }, window, cx);
@@ -1704,7 +1798,7 @@ impl Workspace {
     /// stays, and so does the highlighted row (by identity, as the user left
     /// it in the list).
     fn show_sessions_palette(&mut self, cx: &mut Context<Self>) {
-        let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind else { return };
+        let Overlay::Palette { kind: PaletteKind::Sessions { model }, .. } = &mut self.overlay else { return };
         let Some(palette) = self.palette.view().cloned() else { return };
         model.highlight(palette.read(cx).highlighted(cx));
         let view = model.view(Self::settings(cx), unix_now());
@@ -1713,18 +1807,20 @@ impl Workspace {
     }
 
     /// `picker_kill` in the sessions palette: ends that session on its
-    /// endpoint, and shows the list again.
+    /// endpoint (by its row's endpoint, id and key), and shows the list
+    /// again.
     fn palette_kill(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteKind::Sessions { model }) = &mut self.palette_kind else {
+        let Overlay::Palette { kind: PaletteKind::Sessions { model }, .. } = &mut self.overlay else {
             return;
         };
-        let Some((host, info)) = model.rows().get(ix).and_then(SessionRow::session) else { return };
-        let (host, id, key) = (host.clone(), info.session, info.key.clone());
-        model.kill(host.clone(), id, key);
+        let Some(target) = model.rows().get(ix).and_then(SessionRow::target) else { return };
+        // The model keeps the key as the wire writes it (empty for none).
+        let key = target.key.clone().map_or_else(String::new, |key| key.into_string());
+        model.kill(target.host.clone(), target.session, key);
         // Its row goes at once, so enter can't attach it meanwhile, and the
         // highlight passes to the row that takes its place.
         self.show_sessions_palette(cx);
-        self.refresh_sessions_palette(Some((host, id)), false, window, cx);
+        self.refresh_sessions_palette(Some(target), false, window, cx);
     }
 
     /// Attaches a detached session of `host` into a new tab after the
@@ -1745,7 +1841,8 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_open() {
+        let opening = toggle(self.open_overlay(cx), OverlayKind::Settings, Opens::Toggles);
+        if opening == Toggle::CloseOnly {
             self.dismiss_overlay(window, cx);
             return;
         }
@@ -1772,14 +1869,21 @@ impl Workspace {
         });
         // The slot closes itself on the dialog's `DismissEvent`; this ends
         // the previews, as closing it any other way does.
-        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| this.end_previews(cx));
+        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| {
+            if matches!(this.overlay, Overlay::Settings) {
+                this.overlay = Overlay::Closed;
+            }
+            this.end_previews(cx)
+        });
         // A palette or the profile menu goes first, with focus back on the
         // tab, so that is the focus the dialog records and puts back when it
         // closes (the palette's input is gone by then).
-        if self.has_overlay(cx) {
-            self.dismiss_overlay(window, cx);
+        match opening {
+            Toggle::CloseThenOpen => self.dismiss_overlay(window, cx),
+            Toggle::Open | Toggle::CloseOnly => {}
         }
         self._settings_subscriptions = vec![subscription, dismissed];
+        self.overlay = Overlay::Settings;
         self.settings.open(dialog, |this| &mut this.settings, window, cx);
         cx.notify();
     }
@@ -1793,6 +1897,20 @@ impl Workspace {
             || self.context_menu.read(cx).is_open()
     }
 
+    /// The overlay open now: the one `overlay` records, while its slot is
+    /// still open (a menu or the settings dialog that closed itself leaves
+    /// the record behind).
+    fn open_overlay(&self, cx: &App) -> Option<OverlayKind> {
+        let kind = self.overlay.kind()?;
+        let open = match kind {
+            OverlayKind::Palette(_) => self.palette.is_open(),
+            OverlayKind::Settings => self.settings.is_open(),
+            OverlayKind::ProfileMenu => self.profile_menu.read(cx).is_open(),
+            OverlayKind::ContextMenu => self.context_menu.read(cx).is_open(),
+        };
+        open.then_some(kind)
+    }
+
     /// The open menu: the profile menu, or a tab or zone menu.
     fn open_menu(&self, cx: &App) -> Option<Entity<brindle_ui::Menu>> {
         self.profile_menu.read(cx).menu().or_else(|| self.context_menu.read(cx).menu()).cloned()
@@ -1801,35 +1919,31 @@ impl Workspace {
     /// Closes whatever overlay is open and gives focus back to the tab.
     fn dismiss_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_overlay(window, cx);
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self.active_tab() {
             window.focus(&tab.focus_handle(cx));
         }
         cx.notify();
     }
 
     /// Drops the open overlay. Closing the settings dialog this way cancels
-    /// it, ending any preview.
+    /// it, ending any preview. A sessions palette still collecting answers
+    /// goes too, so it never opens over whatever replaces this overlay.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette.close(window, cx);
-        self.palette_kind = None;
-        // A sessions palette still collecting answers isn't opened over
-        // whatever replaces this overlay.
-        self.sessions_opening = None;
-        self._palette_subscription = None;
+        self.overlay = Overlay::Closed;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
-        self.context_menu_tab = None;
         self.end_previews(cx);
     }
 
     /// Stops the settings dialog's theme, profile and font previews.
     fn end_previews(&mut self, cx: &mut Context<Self>) {
-        if self.theme_preview.is_some() {
+        if self.previews.theme.is_some() {
             self.set_theme_preview(None, cx);
         }
-        if self.profile_preview.is_some() {
+        if self.previews.profile.is_some() {
             self.set_profile_preview(None, cx);
         }
         if Settings::get(cx).font_preview().is_some() {
@@ -1848,24 +1962,21 @@ impl Workspace {
         cx.notify();
     }
 
-    fn change_font_size(&mut self, delta: Option<f32>, cx: &mut Context<Self>) {
-        cx.update_global::<Settings, _>(|settings, _| match delta {
-            Some(d) => settings.zoom = (settings.zoom + d).clamp(-10.0, 60.0),
-            None => settings.zoom = 0.0,
-        });
+    fn change_font_size(&mut self, change: Zoom, cx: &mut Context<Self>) {
+        cx.update_global::<Settings, _>(|settings, _| settings.zoom = Settings::zoomed(settings.zoom, change));
         cx.refresh_windows();
     }
 
     fn increase_font_size(&mut self, _: &IncreaseFontSize, _: &mut Window, cx: &mut Context<Self>) {
-        self.change_font_size(Some(1.0), cx);
+        self.change_font_size(Zoom::By(1.0), cx);
     }
 
     fn decrease_font_size(&mut self, _: &DecreaseFontSize, _: &mut Window, cx: &mut Context<Self>) {
-        self.change_font_size(Some(-1.0), cx);
+        self.change_font_size(Zoom::By(-1.0), cx);
     }
 
     fn reset_font_size(&mut self, _: &ResetFontSize, _: &mut Window, cx: &mut Context<Self>) {
-        self.change_font_size(None, cx);
+        self.change_font_size(Zoom::Reset, cx);
     }
 
     fn open_config(&mut self, _: &OpenConfig, window: &mut Window, cx: &mut Context<Self>) {
@@ -1874,37 +1985,20 @@ impl Workspace {
         self.launch_on(request, host, window, cx);
     }
 
-    /// The theme a tab with `profile` shows: the preview for tabs that
-    /// follow the global theme, else the profile's theme.
-    fn tab_theme(&self, profile: &Profile, config: &Config) -> Theme {
-        match (&self.theme_preview, &profile.theme) {
-            (Some(preview), None) => preview.clone(),
-            _ => config.profile_theme(profile),
-        }
-    }
-
-    /// A tab's profile, or the settings dialog's preview of it.
-    fn effective_profile<'a>(&'a self, profile: &'a Profile) -> &'a Profile {
-        match &self.profile_preview {
-            Some((name, preview)) if name.eq_ignore_ascii_case(&profile.name) => preview,
-            _ => profile,
-        }
-    }
-
     /// Re-themes every tab (and sets its font size) from the config and the
     /// previews.
     fn apply_tab_themes(&mut self, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         for tab in &self.tabs {
-            let profile = self.effective_profile(&tab.profile);
-            set_tab_theme(tab, self.tab_theme(profile, &config), profile.font_size, cx);
+            let profile = self.previews.profile_for(&tab.profile);
+            set_tab_theme(tab, self.previews.theme_for(profile, &config), profile.font_size, cx);
         }
     }
 
     /// Shows the edited profile's theme and font size on its tabs, or, with
     /// `None`, puts their configured ones back.
     pub fn set_profile_preview(&mut self, preview: Option<(String, Profile)>, cx: &mut Context<Self>) {
-        self.profile_preview = preview;
+        self.previews.profile = preview;
         self.apply_tab_themes(cx);
         cx.notify();
     }
@@ -1916,7 +2010,7 @@ impl Workspace {
             Some(theme) => Settings::set_ui_theme(theme, cx),
             None => Settings::apply_ui_theme(cx),
         }
-        self.theme_preview = preview;
+        self.previews.theme = preview;
         self.apply_tab_themes(cx);
         cx.notify();
     }
@@ -1956,7 +2050,7 @@ impl Workspace {
         if self.settings.is_open() {
             return self.settings.view()?.read(cx).focused_input(window, cx);
         }
-        let input = self.tabs.get(self.active)?.active_view(cx)?.read(cx).find_input()?;
+        let input = self.active_tab()?.active_view(cx)?.read(cx).find_input()?;
         input.read(cx).is_focused(window).then_some(input)
     }
 
@@ -1968,7 +2062,7 @@ impl Workspace {
             input.update(cx, |input, cx| input.insert(&text, cx));
             return;
         }
-        if let Some(terminal) = self.tabs.get(self.active).and_then(|t| t.active_terminal(cx)) {
+        if let Some(terminal) = self.active_tab().and_then(|t| t.active_terminal(cx)) {
             let bytes = bytes.to_vec();
             terminal.update(cx, |t, cx| t.input(bytes, cx));
         }
@@ -1977,7 +2071,7 @@ impl Workspace {
     /// Debug hook for `--hover` / `--click`: mouse events for a cell of the
     /// active terminal, through its own handlers.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
-        match self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
+        match self.active_tab().and_then(|t| t.active_view(cx)) {
             Some(view) => view.update(cx, |view, cx| view.debug_pointer(step, window, cx)),
             None => log::error!("--hover/--click: no active terminal"),
         }
@@ -1985,14 +2079,14 @@ impl Workspace {
 
     /// Debug hook for `--find`: searches the active terminal for `query`.
     pub fn find_in_active(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)) {
+        if let Some(view) = self.active_tab().and_then(|t| t.active_view(cx)) {
             view.update(cx, |view, cx| view.find_text(query, window, cx));
         }
     }
 
     /// The active terminal's visible screen text, for `--wait-for`.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
-        Some(self.tabs.get(self.active)?.active_terminal(cx)?.read(cx).screen_text())
+        Some(self.active_tab()?.active_terminal(cx)?.read(cx).screen_text())
     }
 
     /// Debug hook for `--dump-screen-after`.
@@ -2004,18 +2098,18 @@ impl Workspace {
                 "--- tab {} {:?}{}\n",
                 ix + 1,
                 tab.title,
-                if ix == self.active { " (active)" } else { "" }
+                if Some(tab.id) == self.strip.active() { " (active)" } else { "" }
             ));
         }
-        if let Some(terminal) = self.tabs.get(self.active).and_then(|t| t.active_terminal(cx)) {
+        if let Some(terminal) = self.active_tab().and_then(|t| t.active_terminal(cx)) {
             let terminal = terminal.read(cx);
             let size = terminal.size();
             out.push_str(&format!("--- screen {}x{} mode {:?}\n", size.cols, size.rows, terminal.mode()));
-            if let Some(grid) = self.tabs.get(self.active).and_then(|t| t.active_grid(cx)) {
+            if let Some(grid) = self.active_tab().and_then(|t| t.active_grid(cx)) {
                 out.push_str(&grid.describe(scale));
             }
             out.push_str(&describe_fonts(cx));
-            let view = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
+            let view = self.active_tab().and_then(|t| t.active_view(cx));
             if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
                 out.push_str(&format!("--- link {}\n", link.uri));
             }
@@ -2023,14 +2117,14 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
-            if let Some(tab) = self.tabs.get(self.active) {
+            if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&terminal.screen_text());
         } else {
             out.push_str(&describe_fonts(cx));
         }
-        if let Some(find) = self.tabs.get(self.active).and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
+        if let Some(find) = self.active_tab().and_then(|t| t.active_view(cx)).and_then(|v| v.read(cx).describe_find(cx)) {
             out.push_str(&find);
         }
         if let Some(palette) = self.palette.view() {
@@ -2058,7 +2152,7 @@ impl Workspace {
     /// `other`; then the window's `modality=keyboard|pointer`, which
     /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
-        let terminal = self.tabs.get(self.active).and_then(|t| t.active_view(cx));
+        let terminal = self.active_tab().and_then(|t| t.active_view(cx));
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
             "terminal".to_string()
         } else if self.palette.view().is_some_and(|p| p.read(cx).focus_handle(cx).contains_focused(window, cx)) {
@@ -2143,20 +2237,28 @@ impl Workspace {
                 trigger
             })
             .collect();
+        // The list names tabs by their place as it drew them: each handler
+        // finds the tab there at once and goes on by its id.
         let list = TabList::new("tabs")
-            .active(self.active)
+            .active(self.active_ix().unwrap_or(0))
             .children(triggers)
             .focus(&self.strip_focus)
             .trigger_width(TabWidth::new(rems(5.), rems(15.)))
             .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
-            .on_close(cx.listener(|this, ix: &usize, window, cx| this.close_tab_at(*ix, window, cx)))
+            .on_close(cx.listener(|this, ix: &usize, window, cx| {
+                if let Some(id) = this.tabs.get(*ix).map(|tab| tab.id) {
+                    this.remove_tab(id, window, cx);
+                }
+            }))
             .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_dragged_tab(request, cx)))
             // A right-click on a tab opens its menu at the pointer; the press
             // goes no further, so the strip's window menu doesn't open too.
             // (On Windows a tab isn't a caption area: only the empty
             // `caption` element is, so the system menu doesn't open either.)
             .on_context_menu(cx.listener(|this, request: &TabContextMenu, window, cx| {
-                this.open_tab_menu_at(request.index, request.event.position, Some(&request.event), window, cx)
+                if let Some(id) = this.tabs.get(request.index).map(|tab| tab.id) {
+                    this.open_tab_menu_at(id, request.event.position, Some(&request.event), window, cx);
+                }
             }))
             .on_trigger_bounds({
                 let tab_bounds = self.tab_bounds.clone();
@@ -2201,6 +2303,7 @@ impl Workspace {
             cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                 if event.button == MouseButton::Left {
                     this.refresh_profile_menu(window, cx);
+                    this.overlay = Overlay::ProfileMenu;
                 }
             }),
         );
@@ -2271,7 +2374,7 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_end()
-            .h(px(TAB_BAR_HEIGHT))
+            .h(px(tab_bar_height()))
             .pt(px(ZONE_GAP))
             .pl(px(ZONE_GAP))
             .gap_0p5()
@@ -2324,7 +2427,7 @@ impl Workspace {
     }
 
     fn render_content(&self) -> AnyElement {
-        match self.tabs.get(self.active) {
+        match self.active_tab() {
             Some(tab) => tab.zones.clone().into_any_element(),
             None => div().into_any_element(),
         }
@@ -2345,20 +2448,10 @@ fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
     true
 }
 
-/// The strip trigger's element id for the tab whose id is `id`, which a
-/// dragged trigger's `TabMove` names it by.
-fn tab_trigger_id(id: u64) -> ElementId {
-    ("tab", id as usize).into()
-}
-
-/// [`reorder`], following the item at `active` by its id: its new index, or
-/// `None` when nothing moved.
-fn reorder_keeping<T>(items: &mut Vec<T>, active: usize, from: usize, to: usize, id: impl Fn(&T) -> u64) -> Option<usize> {
-    let active_id = id(items.get(active)?);
-    if !reorder(items, from, to) {
-        return None;
-    }
-    Some(items.iter().position(|item| id(item) == active_id).unwrap_or(0))
+/// The strip trigger's element id for the tab `id`, which a dragged
+/// trigger's `TabMove` names it by.
+fn tab_trigger_id(id: TabId) -> ElementId {
+    ("tab", id.0 as usize).into()
 }
 
 /// Whether a key pressed while the tab strip has focus sends focus back to
@@ -2487,13 +2580,15 @@ fn profile_rows(profiles: &[Profile], shortcuts: &[Option<SharedString>]) -> Vec
 
 /// The profile menu's items: the picker's rows, the description under the
 /// name and the keys at the right. There are no separators, so an item's
-/// index is its profile's, and each item is keyed by that index (names can
-/// repeat), so the chosen key is found again at it (`entry_keyed`).
-fn profile_menu_entries(rows: Vec<PaletteRow>) -> Vec<MenuEntry> {
+/// index is its profile's when the menu opens. Each item is keyed by its
+/// profile's key (`keys[ix]`, [`ProfileKey`]'s text; names can repeat), so
+/// the chosen one is found in the config as it is when it is chosen; a row
+/// past the end of `keys` is keyed by its index.
+fn profile_menu_entries(rows: Vec<PaletteRow>, keys: &[ProfileKey]) -> Vec<MenuEntry> {
     rows.into_iter()
         .enumerate()
         .map(|(ix, row)| {
-            let key = ItemKey::new(ix.to_string());
+            let key = ItemKey::new(keys.get(ix).map_or_else(|| ix.to_string(), ProfileKey::to_string));
             MenuItem { key, label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into()
         })
         .collect()
@@ -2559,6 +2654,12 @@ fn tab_shortcut(action: &dyn Action, cx: &App) -> Option<SharedString> {
     let keymap = cx.key_bindings();
     let keymap = keymap.borrow();
     tab_keys(&keymap, action)
+}
+
+/// The keys each of a menu's `rows` shows, as [`ActionMenu::new`] takes
+/// them: its action's [`tab_shortcut`], none for a separator.
+fn menu_shortcuts(rows: &[ActionRow], cx: &App) -> Vec<Option<SharedString>> {
+    rows.iter().map(|row| row.action().and_then(|action| tab_shortcut(action, cx))).collect()
 }
 
 /// [`tab_shortcut`] in `keymap`.
@@ -2695,7 +2796,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.tabs.get(self.active).map(|t| t.title.clone()).unwrap_or_default();
+        let title = self.active_tab().map(|t| t.title.clone()).unwrap_or_default();
         if title != self.last_title {
             window.set_window_title(&title);
             self.last_title = title;
@@ -3186,8 +3287,8 @@ mod tests {
 
         // One item per row, in the same order, with nothing between them,
         // each keyed so that the key of `MenuEvent::Selected` is found at
-        // profile `ix`.
-        let entries = profile_menu_entries(build());
+        // profile `ix`, and names profile `ix` in the config.
+        let entries = profile_menu_entries(build(), &config.profile_keys());
         assert_eq!(entries.len(), rows.len());
         for (ix, (entry, row)) in entries.iter().zip(&rows).enumerate() {
             let item = entry.item().expect("a separator in the profile menu");
@@ -3196,11 +3297,19 @@ mod tests {
             assert_eq!(item.shortcut, row.shortcut);
             assert!(!item.disabled);
             assert_eq!(entry_keyed(&entries, &item.key), Some(ix));
+            let key = ProfileKey::parse(item.key.as_str()).expect("a profile key");
+            assert_eq!(config.find_profile(&key), Some(ix));
         }
         // Two profiles of one name are still told apart.
-        let twins = profile_menu_entries(vec![rows[0].clone(), rows[0].clone()]);
+        let twins = Config::parse("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"Shell\"\n").unwrap().config;
+        let twins = profile_menu_entries(vec![rows[0].clone(), rows[0].clone()], &twins.profile_keys());
         let keys: Vec<&ItemKey> = twins.iter().filter_map(MenuEntry::key).collect();
         assert_eq!(entry_keyed(&twins, keys[1]), Some(1));
+        // A key the config no longer has is found by its place in the menu.
+        let rows = vec![rows[0].clone(), rows[1].clone()];
+        let unkeyed = profile_menu_entries(rows, &config.profile_keys()[..1]);
+        let keys: Vec<&str> = unkeyed.iter().filter_map(MenuEntry::key).map(ItemKey::as_str).collect();
+        assert_eq!(keys, ["0:Shell", "1"]);
     }
 
     /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth
@@ -3209,7 +3318,8 @@ mod tests {
     fn only_the_first_nine_profiles_have_keys() {
         let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
         let config = Config::parse(&toml).unwrap().config;
-        let entries = profile_menu_entries(profile_rows(&config.profiles, &profile_shortcuts(config.profiles.len())));
+        let rows = profile_rows(&config.profiles, &profile_shortcuts(config.profiles.len()));
+        let entries = profile_menu_entries(rows, &config.profile_keys());
         assert_eq!(entries.len(), 11);
         for (ix, entry) in entries.iter().enumerate() {
             let item = entry.item().unwrap();
@@ -3247,7 +3357,10 @@ mod tests {
     /// with the default keys.
     fn tab_menu_line(ix: usize, count: usize) -> String {
         let keymap = gpui::Keymap::new(default_bindings());
-        let menu = ActionMenu::new(tab_menu_rows(ix, count), |action| tab_keys(&keymap, action));
+        let rows = tab_menu_rows(ix, count);
+        let shortcuts: Vec<Option<SharedString>> =
+            rows.iter().map(|row| row.action().and_then(|action| tab_keys(&keymap, action))).collect();
+        let menu = ActionMenu::new(rows, &shortcuts);
         describe_menu(&menu.entries, None)
     }
 
@@ -3269,21 +3382,33 @@ mod tests {
 
     /// Moving a background tab from its menu keeps the active tab active,
     /// and moving the active one moves it with it; nothing moves past an end.
+    /// (Once `reorder_keeping`'s test: the same cases, through the `Tabs`
+    /// model's `shift` and `reorder`.)
     #[test]
     fn a_menu_move_keeps_the_active_tab() {
-        let moved = |active: usize, from: usize, to: usize| {
-            let mut ids = vec![10u64, 11, 12];
-            let active = reorder_keeping(&mut ids, active, from, to, |id| *id);
-            (ids, active)
+        let moved = |active: usize, from: usize, delta: isize| {
+            let mut ids = vec![TabId(10), TabId(11), TabId(12)];
+            let mut tabs = Tabs::default();
+            tabs.pick(&ids, Pick::Tab(ids[active]));
+            let shifted = tabs.shift(&ids, ids[from], Shift::Within(delta));
+            let moved = shifted.is_some_and(|(from, to)| reorder(&mut ids, from, to));
+            (ids.iter().map(|id| id.0).collect::<Vec<_>>(), moved.then(|| tabs.active_in(&ids)).flatten())
         };
         // The third tab moves left while the first is active.
-        assert_eq!(moved(0, 2, 1), (vec![10, 12, 11], Some(0)));
+        assert_eq!(moved(0, 2, -1), (vec![10, 12, 11], Some(0)));
         // The second moves left past the active first one.
-        assert_eq!(moved(0, 1, 0), (vec![11, 10, 12], Some(1)));
+        assert_eq!(moved(0, 1, -1), (vec![11, 10, 12], Some(1)));
         // The active tab itself moves right.
-        assert_eq!(moved(1, 1, 2), (vec![10, 12, 11], Some(2)));
+        assert_eq!(moved(1, 1, 1), (vec![10, 12, 11], Some(2)));
         // Past the end: nothing.
-        assert_eq!(moved(0, 2, 3), (vec![10, 11, 12], None));
+        assert_eq!(moved(0, 2, 1), (vec![10, 11, 12], None));
+    }
+
+    /// The strip's height: the 36px tab list under the 6px gap above it,
+    /// which the e2e cases' `STRIP_HEIGHT` measures.
+    #[test]
+    fn the_strip_is_42_pixels_high() {
+        assert_eq!(tab_bar_height(), 42.0);
     }
 
     /// The spec's tab menu: Move Tab Left disabled on the first tab, Move
@@ -3300,7 +3425,7 @@ mod tests {
         assert!(tab_menu_line(2, 4).starts_with("--- menu items=Rename Tab|Move Tab Left|Move Tab Right|-|Close Tab "));
         assert!(tab_menu_line(2, 3).starts_with("--- menu items=Rename Tab|Move Tab Left|[Move Tab Right]|-|Close Tab "));
         assert!(tab_menu_line(0, 1).starts_with("--- menu items=Rename Tab|[Move Tab Left]|[Move Tab Right]|-|Close Tab "));
-        let menu = ActionMenu::new(tab_menu_rows(0, 2), |_| None);
+        let menu = ActionMenu::new(tab_menu_rows(0, 2), &[]);
         assert!(menu.action(0).is_some_and(|a| a.partial_eq(&RenameTab)));
         assert!(menu.action(1).is_none(), "Move Tab Left on the first tab runs nothing");
         assert!(menu.action(4).is_some_and(|a| a.partial_eq(&CloseTab)));
