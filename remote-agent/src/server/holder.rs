@@ -36,9 +36,15 @@
 //!   `REFUSAL_CLOSE_LIMIT` (1 s), so it reads the error and then the end.
 //! - **Supervision:** with sessions but no core for [`CORE_GRACE`], it
 //!   starts `serve` from its own binary (which survives the file being
-//!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`].
+//!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`]
+//!   ([`CoreStart`]).
 //! - **Exit:** once it has no sessions (after having one, after `DRAIN`, or
 //!   when no core used it within [`UNUSED_LIMIT`] of starting).
+//!
+//! Its decisions (spawn refusals, when an exited session is drained, when
+//! to start a core) are pure, in [`policy`].
+
+mod policy;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -57,6 +63,7 @@ use brindle_remote_protocol::holder::{
 };
 use brindle_remote_protocol::ready::ReadyRead;
 
+use self::policy::{CoreStart, Output};
 use super::conn::Conn;
 use super::daemon::ReadyPipe;
 use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
@@ -64,10 +71,7 @@ use super::platform::listen::{self, Identity, Listener};
 use super::platform::lock::Lock;
 use super::platform::pty::{self, Group, Program, Pty};
 use super::{build_id, daemon, dir, fault};
-use crate::pty::{
-    GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT, PtyCommand,
-    Reparented,
-};
+use crate::pty::{GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, PtyCommand, Reparented};
 
 /// From this much queued to the core, the holder stops reading PTYs...
 pub const CORE_QUEUE_HIGH: usize = 8 * 1024 * 1024;
@@ -243,9 +247,22 @@ impl Tail {
     }
 }
 
+/// Where a session's program is in its life (`types R1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Life {
+    Running,
+    /// Reaped `at`, with its exit code (`None` for a signal); its output
+    /// may still be draining ([`policy::drained`]).
+    Reaped { code: Option<i32>, at: Instant },
+    /// Its output is drained, and `held.exit` says how it ended: the
+    /// connected core is sent `EXITED`, or the next core's `WELCOME`
+    /// reports it.
+    Finished,
+}
+
 struct Session {
-    /// The entry `WELCOME` reports; `exit` is set once the program has
-    /// exited and its output is drained.
+    /// The entry `WELCOME` reports; its `exit` is written only when the
+    /// session becomes [`Life::Finished`].
     held: HeldSession,
     program: Program,
     /// Closed on hang-up and once the session is finished.
@@ -255,12 +272,23 @@ struct Session {
     checkpoint: Vec<u8>,
     tail: Tail,
     input: VecDeque<u8>,
-    /// The program was reaped, with its exit code (`None` for a signal).
-    reaped: Option<(Option<i32>, Instant)>,
+    life: Life,
     last_output: Instant,
-    output_closed: bool,
+    /// Closed once the PTY's output ended or the session was hung up.
+    output: Output,
     /// The connected core sent `PAUSE`: its client isn't keeping up.
     paused: bool,
+}
+
+/// Whether the connected core is staying, or said `GOODBYE` (`types R1`):
+/// a handover is always a goodbye.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Farewell {
+    Staying,
+    /// It sent `GOODBYE`: it is going, so exits wait for the next core.
+    Goodbye,
+    /// It sent `GOODBYE { handover: true }`: it stepped down for the next.
+    Handover,
 }
 
 struct Core {
@@ -273,10 +301,7 @@ struct Core {
     /// starts empty, so under.
     over: bool,
     checkpoints: Assembler,
-    /// It sent `GOODBYE { handover: true }`.
-    handover: bool,
-    /// It sent `GOODBYE`: it is going, so exits wait for the next core.
-    goodbye: bool,
+    farewell: Farewell,
 }
 
 struct Pending {
@@ -309,8 +334,8 @@ struct Holder<L: EventLoop> {
     draining: bool,
     had_session: bool,
     started: Instant,
-    next_core_start: Option<Instant>,
-    backoff: Duration,
+    /// When it starts a core of its own, with no core connected.
+    core_start: CoreStart,
     core_args: Vec<String>,
     core_starts: Vec<Child>,
     core_ready: HashMap<Token, ReadyPipe>,
@@ -345,8 +370,7 @@ impl<L: EventLoop> Holder<L> {
             draining: false,
             had_session: false,
             started: Instant::now(),
-            next_core_start: None,
-            backoff: CORE_BACKOFF_START,
+            core_start: CoreStart::new(),
             core_args,
             core_starts: Vec::new(),
             core_ready: HashMap::new(),
@@ -359,11 +383,13 @@ impl<L: EventLoop> Holder<L> {
         let mut events: Vec<Event> = Vec::new();
         let result = loop {
             self.update_interests();
+            // Ticks come fast while kills wait or a reaped program's
+            // output drains.
             let fast = !self.kills.is_empty()
-                || self
-                    .sessions
-                    .values()
-                    .any(|session| session.reaped.is_some() && session.held.exit.is_none());
+                || self.sessions.values().any(|session| match session.life {
+                    Life::Reaped { .. } => true,
+                    Life::Running | Life::Finished => false,
+                });
             if let Err(error) = self
                 .ev
                 .wait(&mut events, Some(if fast { TICK_FAST } else { TICK_SLOW }))
@@ -529,8 +555,7 @@ impl<L: EventLoop> Holder<L> {
             instance: hello.instance,
             over: false,
             checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
-            handover: false,
-            goodbye: false,
+            farewell: Farewell::Staying,
         };
         let sessions = self
             .sessions
@@ -563,15 +588,17 @@ impl<L: EventLoop> Holder<L> {
         let finished: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.held.exit.is_some())
+            .filter(|(_, session)| match session.life {
+                Life::Finished => true,
+                Life::Running | Life::Reaped { .. } => false,
+            })
             .map(|(&id, _)| id)
             .collect();
         for id in finished {
             self.remove_session(id);
         }
         self.core = Some(core);
-        self.next_core_start = None;
-        self.backoff = CORE_BACKOFF_START;
+        self.core_start.connected();
         self.process_core_frames();
     }
 
@@ -584,17 +611,16 @@ impl<L: EventLoop> Holder<L> {
         for session in self.sessions.values_mut() {
             session.paused = false;
         }
-        self.previous = if core.handover {
-            Previous::Handover
-        } else {
-            Previous::Crash
+        self.previous = match core.farewell {
+            Farewell::Handover => Previous::Handover,
+            Farewell::Staying | Farewell::Goodbye => Previous::Crash,
         };
         log!(
             "core instance {} left ({reason}); {} session(s) held",
             core.instance,
             self.sessions.len()
         );
-        self.next_core_start = Some(Instant::now() + CORE_GRACE);
+        self.core_start.lost(Instant::now());
     }
 
     fn flush_core(&mut self) {
@@ -778,8 +804,11 @@ impl<L: EventLoop> Holder<L> {
             }
             ToHolder::Goodbye(goodbye) => {
                 if let Some(core) = self.core.as_mut() {
-                    core.handover = goodbye.handover;
-                    core.goodbye = true;
+                    core.farewell = if goodbye.handover {
+                        Farewell::Handover
+                    } else {
+                        Farewell::Goodbye
+                    };
                 }
             }
             ToHolder::Reparent(reparent) => {
@@ -826,21 +855,11 @@ impl<L: EventLoop> Holder<L> {
 
     fn spawn(&mut self, spawn: Spawn) {
         let id = spawn.session;
-        let refusal = if self.draining {
-            Some("the holder is draining and takes no new sessions".to_string())
-        } else if self.sessions.contains_key(&id) {
-            Some(format!("session {id} already exists"))
-        } else if spawn.command.as_deref() == Some("") {
-            Some("command must not be empty".into())
-        } else if spawn.cols == 0 || spawn.rows == 0 {
-            Some("PTY rows and columns must be non-zero".into())
-        } else {
-            None
-        };
-        if let Some(message) = refusal {
+        let exists = self.sessions.contains_key(&id);
+        if let Some(refusal) = policy::spawn_refusal(self.draining, exists, &spawn) {
             return self.send(ToCore::SpawnFailed(SpawnFailed {
                 session: id,
-                message,
+                message: refusal.to_string(),
             }));
         }
         for arg in &spawn.args {
@@ -908,9 +927,9 @@ impl<L: EventLoop> Holder<L> {
                 checkpoint: Vec::new(),
                 tail: Tail::default(),
                 input: VecDeque::new(),
-                reaped: None,
+                life: Life::Running,
                 last_output: Instant::now(),
-                output_closed: false,
+                output: Output::Open,
                 paused: false,
             },
         );
@@ -947,19 +966,22 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return false;
         };
-        if session.reaped.is_none() {
-            let group = session.program.group();
-            group.hang_up();
-            self.kills
-                .push((id, group, Instant::now() + GRACEFUL_SHUTDOWN));
-            log!("session {id}: hung up");
+        match session.life {
+            Life::Running => {
+                let group = session.program.group();
+                group.hang_up();
+                self.kills
+                    .push((id, group, Instant::now() + GRACEFUL_SHUTDOWN));
+                log!("session {id}: hung up");
+            }
+            Life::Reaped { .. } | Life::Finished => {}
         }
         if session.pty.take().is_some() {
             let _ = self.ev.deregister(session.token);
             self.sources.remove(&session.token);
         }
         session.input.clear();
-        session.output_closed = true;
+        session.output = Output::Closed;
         true
     }
 
@@ -972,8 +994,9 @@ impl<L: EventLoop> Holder<L> {
         };
         let mut buffer = [0u8; OUTPUT_CHUNK_SIZE];
         for _ in 0..READS_PER_EVENT {
-            if session.output_closed {
-                break;
+            match session.output {
+                Output::Open => {}
+                Output::Closed => break,
             }
             let dest = match self.core.as_mut() {
                 Some(core) => {
@@ -993,7 +1016,7 @@ impl<L: EventLoop> Holder<L> {
             match pty.read(&mut buffer[..limit]) {
                 // The program's side is closed.
                 Ok(0) => {
-                    session.output_closed = true;
+                    session.output = Output::Closed;
                     break;
                 }
                 Ok(read) => {
@@ -1014,7 +1037,7 @@ impl<L: EventLoop> Holder<L> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     log!("session {id}: reading output failed: {error}");
-                    session.output_closed = true;
+                    session.output = Output::Closed;
                     break;
                 }
             }
@@ -1074,8 +1097,9 @@ impl<L: EventLoop> Holder<L> {
     fn reap(&mut self) {
         let now = Instant::now();
         for (id, session) in &mut self.sessions {
-            if session.reaped.is_some() {
-                continue;
+            match session.life {
+                Life::Running => {}
+                Life::Reaped { .. } | Life::Finished => continue,
             }
             match session.program.try_wait() {
                 Ok(Some(exit)) => {
@@ -1083,12 +1107,15 @@ impl<L: EventLoop> Holder<L> {
                         (Some(code), _) => log!("session {id}: exited with {code}"),
                         (None, signal) => log!("session {id}: killed by signal {signal:?}"),
                     }
-                    session.reaped = Some((exit.code, now));
+                    session.life = Life::Reaped {
+                        code: exit.code,
+                        at: now,
+                    };
                 }
                 Ok(None) => {}
                 Err(error) => {
                     log!("session {id}: can't wait for its program: {error}");
-                    session.reaped = Some((None, now));
+                    session.life = Life::Reaped { code: None, at: now };
                 }
             }
         }
@@ -1100,18 +1127,13 @@ impl<L: EventLoop> Holder<L> {
         // A reaped program's session ends once its output is drained.
         let mut finished = Vec::new();
         for (&id, session) in &mut self.sessions {
-            let Some((code, reaped_at)) = session.reaped else {
-                continue;
+            let (code, reaped_at) = match session.life {
+                Life::Reaped { code, at } => (code, at),
+                Life::Running | Life::Finished => continue,
             };
-            if session.held.exit.is_some() {
-                continue;
-            }
-            let quiet_since = reaped_at.max(session.last_output);
-            if session.pty.is_none()
-                || session.output_closed
-                || now >= quiet_since + OUTPUT_DRAIN_IDLE
-                || now >= reaped_at + OUTPUT_DRAIN_LIMIT
-            {
+            // A hang-up, which closes the PTY, closes its output too.
+            if policy::drained(now, reaped_at, session.last_output, session.output) {
+                session.life = Life::Finished;
                 session.held.exit = Some(ExitStatus { code });
                 if session.pty.take().is_some() {
                     let _ = self.ev.deregister(session.token);
@@ -1123,7 +1145,11 @@ impl<L: EventLoop> Holder<L> {
         for (id, code) in finished {
             // Without a core, or with one that said GOODBYE (it may no
             // longer read), the next one's WELCOME reports it.
-            if self.core.as_ref().is_some_and(|core| !core.goodbye) {
+            let staying = self.core.as_ref().is_some_and(|core| match core.farewell {
+                Farewell::Staying => true,
+                Farewell::Goodbye | Farewell::Handover => false,
+            });
+            if staying {
                 self.send(ToCore::Exited(Exited { session: id, code }));
                 self.remove_session(id);
             }
@@ -1152,13 +1178,9 @@ impl<L: EventLoop> Holder<L> {
             self.drop_source(token);
         }
 
-        if self.core.is_none() && !self.sessions.is_empty() {
-            let due = *self.next_core_start.get_or_insert(now + CORE_GRACE);
-            if now >= due {
-                self.start_core();
-                self.next_core_start = Some(now + self.backoff);
-                self.backoff = (self.backoff * 2).min(CORE_BACKOFF_MAX);
-            }
+        let needed = self.core.is_none() && !self.sessions.is_empty();
+        if self.core_start.step(now, needed) {
+            self.start_core();
         }
     }
 
@@ -1208,7 +1230,10 @@ impl<L: EventLoop> Holder<L> {
                     room: session.tail.room(),
                 },
             };
-            let readable = !session.output_closed && read_limit(dest, session.paused, 1) > 0;
+            let readable = match session.output {
+                Output::Open => read_limit(dest, session.paused, 1) > 0,
+                Output::Closed => false,
+            };
             let want = Interest {
                 readable,
                 writable: !session.input.is_empty(),

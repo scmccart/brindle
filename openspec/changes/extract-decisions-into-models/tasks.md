@@ -83,13 +83,13 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 - [x] 3.4 Add `ClientToken::from_wire`, decoded once in `welcome`, `enum Peer` for `close_peers` and `forget_peer`, and `endpoint::Holder.build`, parsed once. Verify with unit tests in `remote-protocol`'s `endpoint.rs` and the core's `clients.rs`, and with `--test core` (b10 #10, #11, b11 #18).
 - [x] 3.5 Make `check::refusal_reason` pure, with tests. Verify with `--test manage` (b10 #8).
 - [x] 3.6 Add the tests that are missing: `kept_layout`, `command_line`, `allocate_id`'s wrap and skip of 0, and `holders.rs`'s `is_adopted` and `status`. Verify with `cargo test --locked -p brindle-remote-agent server::core::` (b11 #10).
-- [ ] 3.7 Add the pure `holder/policy.rs`:
+- [x] 3.7 Add the pure `holder/policy.rs`:
   - `spawn_refusal`, whose `Display` gives today's texts;
   - `drained` with `Output`;
   - `CoreStart::step`, taking over the backoff.
 
   Table tests for each. Verify with `cargo test --locked -p brindle-remote-agent server::holder::` and `--test holder` (b12 `holder.rs:731-741`, `:1000-1005`, `:1044-1050`).
-- [ ] 3.8 The holder's `Farewell { Staying, Goodbye, Handover }` and its session `Life`/`Output`. `held.exit` is written only on `Life::Finished`. Verify with `--test holder` and `--test upgrade` unchanged, on Linux and on the Windows CI job (b12 `holder.rs:224-254`).
+- [x] 3.8 The holder's `Farewell { Staying, Goodbye, Handover }` and its session `Life`/`Output`. `held.exit` is written only on `Life::Finished`. Verify with `--test holder` and `--test upgrade` unchanged, on Linux and on the Windows CI job (b12 `holder.rs:224-254`).
 - [ ] 3.9 Add `core/policy.rs` and `holder/policy.rs` to `fcis`'s whole-module table and to `PURE_MODULES`, and name `Lifecycle`, `Life` and `Ownership` in `CLAUDE.md`'s core paragraph. Verify with `cargo test --locked -p brindle --test architecture`.
 
 ## 4. Brindle's client
