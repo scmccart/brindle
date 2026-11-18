@@ -1176,7 +1176,7 @@ mod tests {
             .collect();
         // Every round ends what it started, so all of them finish first.
         let ended: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
-        for panic in ended.into_iter().filter_map(Result::err) {
+        if let Some(panic) = ended.into_iter().find_map(Result::err) {
             std::panic::resume_unwind(panic);
         }
     }

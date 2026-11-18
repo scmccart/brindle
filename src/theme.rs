@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(color_of(t.destructive), theme.ansi[1]);
         assert_eq!(color_of(t.background), theme.chrome_background());
         assert!(t.dark);
-        assert!(!builtin_theme("brindle-light").map_or(false, |l| l.ui_tokens().dark));
+        assert!(!builtin_theme("brindle-light").is_some_and(|l| l.ui_tokens().dark));
     }
 
     /// A zone card's border is the `border` token's mix of the terminal's

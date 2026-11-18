@@ -83,7 +83,8 @@ pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pend
 
 - `tests/architecture.rs` checks R2's dependency half: `crates_below_the_app_name_only_their_allowed_dependencies` fails if a shared crate or the helper gains `anyhow`.
 - `remote-protocol/src/fuzz.rs` holds R5 for the decoders, and `term-core/src/fuzz.rs` (with the parser tests in `shell_integration.rs`) for the OSC scanners, the status parser and the emulator.
-- R1, R3, R4 and R6–R12 rely on review. There is no clippy step in CI, so `unwrap_used` and wildcard arms are not linted.
+- CI runs clippy with `-D warnings` on Linux and Windows. In non-test code, `clippy::wildcard_enum_match_arm` holds R3 on all five crates (a foreign enum's allow says `foreign enum: <type>`; an own-enum exception says `railway R3 exception`, see `docs/architecture/README.md`), and `clippy::unwrap_used` and `clippy::expect_used` hold R5's no-panic half and R9 on `brindle-remote-protocol` and `brindle-term-core`. `tests/architecture.rs` (`the_crate_roots_enable_the_restriction_lints`) fails if a crate root loses its attribute.
+- R1, R4, R5's bounds, R9 on the other three crates and R6–R12 otherwise rely on review.
 
 ## PR checklist
 

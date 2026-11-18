@@ -526,12 +526,12 @@ mod tests {
         let local = Host::Local;
         // The last tab on A8 went; B9 has another tab left.
         let before = [local.clone(), a8.clone(), b9.clone(), b9.clone()];
-        assert_eq!(endpoints_without_tabs(&before, &[local.clone(), b9.clone()], &[]), [a8.clone()]);
+        assert_eq!(endpoints_without_tabs(&before, &[local.clone(), b9.clone()], &[]), std::slice::from_ref(&a8));
         // Two tabs on A8 before: the first close leaves one.
-        assert!(endpoints_without_tabs(&[a8.clone(), a8.clone()], &[a8.clone()], &[]).is_empty());
-        assert_eq!(endpoints_without_tabs(&[a8.clone(), a8.clone()], &[], &[]), [a8.clone()]);
+        assert!(endpoints_without_tabs(&[a8.clone(), a8.clone()], std::slice::from_ref(&a8), &[]).is_empty());
+        assert_eq!(endpoints_without_tabs(&[a8.clone(), a8.clone()], &[], &[]), std::slice::from_ref(&a8));
         // An eager endpoint keeps its listing.
-        assert!(endpoints_without_tabs(&[local.clone(), a8.clone()], &[local.clone()], std::slice::from_ref(&a8)).is_empty());
+        assert!(endpoints_without_tabs(&[local.clone(), a8.clone()], std::slice::from_ref(&local), std::slice::from_ref(&a8)).is_empty());
         // This machine is never one, even with no tab left.
         assert!(endpoints_without_tabs(std::slice::from_ref(&local), &[], &[]).is_empty());
         // Several at once, in the window's order.

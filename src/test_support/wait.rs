@@ -68,10 +68,9 @@ pub fn until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<T
     if eventually(limit, || {
         found = probe();
         found.is_some()
-    }) {
-        if let Some(value) = found {
-            return value;
-        }
+    }) && let Some(value) = found
+    {
+        return value;
     }
     panic!("never: {what} (within {scaled:?})");
 }

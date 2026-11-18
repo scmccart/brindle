@@ -18,11 +18,14 @@ pub fn trim_screen<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
     out
 }
 
-/// Fails with a message unless `cond` holds.
+/// Fails with a message unless `cond` holds. The failure is the `else` arm,
+/// not a negated condition, so a comparison of floats stays as written and
+/// an incomparable pair (NaN) fails the check as before.
 #[macro_export]
 macro_rules! ensure {
     ($cond:expr, $($msg:tt)+) => {
-        if !$cond {
+        if $cond {
+        } else {
             return Err(format!($($msg)+));
         }
     };

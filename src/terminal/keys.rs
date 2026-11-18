@@ -51,10 +51,8 @@ fn with_alt(m: &Modifiers, bytes: &[u8]) -> Vec<u8> {
 /// CSI u when disambiguate mode is set), while Shift and/or Control send CSI u
 /// (`\x1b[13;<m>u`).
 fn enter_key(m: &Modifiers, mode: TermMode) -> Vec<u8> {
-    if m.shift || m.control || mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-        if any_modifier(m) {
-            return format!("\x1b[13;{}u", modifier_param(m)).into_bytes();
-        }
+    if (m.shift || m.control || mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)) && any_modifier(m) {
+        return format!("\x1b[13;{}u", modifier_param(m)).into_bytes();
     }
     with_alt(m, b"\r")
 }

@@ -68,6 +68,10 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path target/tmp/skipped.log) { Get-Content target/tmp/skipped.log } else { "none" }
+      # The Linux clippy job never sees cfg(windows) code (src/win.rs,
+      # terminal/process.rs, the helper's conpty/ and platform/windows/).
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: e2e harness self-test
         run: cargo test --locked -p brindle --test e2e -- --self-test
         env:

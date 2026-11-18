@@ -1,7 +1,8 @@
-# Unit tests, a release build, and the end-to-end suite, plus a Windows build
-# and tests. The e2e jobs are advisory: they go red on
-# failure but aren't required checks. The release and Windows builds are the
-# reusable build-linux.yml and build-windows.yml, which releases run too.
+# Unit tests, clippy with -D warnings, a release build, and the end-to-end
+# suite, plus a Windows build, tests and clippy. The e2e jobs are advisory:
+# they go red on failure but aren't required checks. The release and Windows
+# builds are the reusable build-linux.yml and build-windows.yml, which
+# releases run too.
 # rust-toolchain.toml pins Rust for every job.
 #
 # Pushes to main and pull requests run it. A pull request that changes only
@@ -112,6 +113,26 @@ jobs:
         run: BRINDLE_E2E=1 cargo test --locked -p brindle --test e2e -- --self-test
       - name: perf harness self-test
         run: BRINDLE_PERF=1 cargo test --locked -p brindle --test perf -- --self-test
+
+  # Lints on every target of the workspace. A lint is an error here, so a rule
+  # the lints hold (docs/architecture) is checked by CI. The crate roots'
+  # attributes switch on the restriction lints; Windows-only code is linted by
+  # build-windows.yml. Like test, it runs on release pull requests too.
+  clippy:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   # The builds and e2e jobs below skip release-please's release pull requests
   # (branches release-please--…). Those change only versions and

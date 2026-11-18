@@ -746,7 +746,7 @@ fn powershell_warmup(ctx: &Ctx, bin: &str) {
             }
         },
     };
-    ctx.save("powershell-warmup.txt", &format!("{:.1} s, {outcome}\n", started.elapsed().as_secs_f64()));
+    ctx.save("powershell-warmup.txt", format!("{:.1} s, {outcome}\n", started.elapsed().as_secs_f64()));
 }
 
 fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {

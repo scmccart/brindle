@@ -410,7 +410,7 @@ impl Model {
     pub fn preview(&self) -> Option<Theme> {
         match &self.mode {
             Mode::Editor(editor) => Some(editor.current.clone()),
-            _ => self.selected_entry()?.theme.as_ref().ok().cloned(),
+            Mode::List | Mode::ConfirmDelete => self.selected_entry()?.theme.as_ref().ok().cloned(),
         }
     }
 
@@ -778,7 +778,7 @@ impl Model {
     fn selection_foreground_set(&self) -> bool {
         match &self.mode {
             Mode::Editor(editor) => Slot::SelectionForeground.get(&editor.current).is_some(),
-            _ => false,
+            Mode::List | Mode::ConfirmDelete => false,
         }
     }
 
@@ -972,6 +972,10 @@ impl Model {
 
 // ---- view -------------------------------------------------------------------
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "emitted one at a time to the workspace and consumed at once; never stored"
+)]
 pub enum SettingsEvent {
     /// Show this theme on the tabs that follow the global theme.
     Preview(Theme),
@@ -1320,7 +1324,9 @@ impl SettingsDialog {
     fn default_focus(&self, cx: &App) -> FocusHandle {
         match self.model.mode_kind() {
             ModeKind::List => self.list_handle.clone(),
-            _ => self.field_stops(cx).into_iter().next().unwrap_or_else(|| self.focus_handle.clone()),
+            ModeKind::Editor | ModeKind::ConfirmDelete | ModeKind::Form => {
+                self.field_stops(cx).into_iter().next().unwrap_or_else(|| self.focus_handle.clone())
+            }
         }
     }
 

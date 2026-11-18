@@ -482,7 +482,10 @@ pub fn ensure_helper_copy(installed: &Path, copies: &Path) -> io::Result<PathBuf
     if server_dir::is_current(build_of(&copy).as_deref(), &build) {
         return Ok(copy);
     }
-    let dir = copy.parent().expect("the copy is in its build's directory");
+    // `helper_copy` puts the copy in its build's directory, so this can't miss.
+    let dir = copy.parent().ok_or_else(|| {
+        io::Error::other(format!("{} has no directory to be made in", copy.display()))
+    })?;
     std::fs::create_dir_all(dir).map_err(|error| context(dir.display(), error))?;
     let temp = dir.join(server_dir::copy_temp_name(
         std::process::id(),

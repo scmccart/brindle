@@ -288,6 +288,10 @@ impl AttachRequest {
 
 type Reply<T> = mpsc::SyncSender<Result<T, String>>;
 
+/// A relay that was started and greeted: its reader, the stamp its watchdog
+/// reads and the wire to write to.
+type GreetedRelay = (BufReader<Box<dyn Read + Send>>, Arc<Stamp>, Arc<dyn Wire>);
+
 /// What an attach waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Awaits {
@@ -1160,11 +1164,7 @@ impl Connection {
 
     /// Starts a relay and greets the core behind it, with the watchdog
     /// ending a link that takes longer than [`Timings::bootstrap`].
-    fn open_relay(
-        &self,
-        dial: &dyn Dial,
-        timings: &Timings,
-    ) -> Result<(BufReader<Box<dyn Read + Send>>, Arc<Stamp>, Arc<dyn Wire>)> {
+    fn open_relay(&self, dial: &dyn Dial, timings: &Timings) -> Result<GreetedRelay> {
         let Link { reader, wire } = dial.launch()?;
         let stamp = Arc::new(Stamp::new(timings.bootstrap));
         self.watch_link(&wire, &stamp);
@@ -1189,6 +1189,10 @@ impl Connection {
     /// Reads the relay's `RELAY_HOST` (or its `RELAY_ERROR`) and says
     /// `HELLO` at once, since the core drops a client that hasn't within
     /// 5 s; then waits for `WELCOME`. Heartbeats are skipped.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: any answer to HELLO but `Welcome` or `Error` fails the greeting, naming it"
+    )]
     fn greet(&self, name: &str, reader: &mut impl BufRead, wire: &dyn Wire) -> Result<(RelayHost, u32)> {
         let host = loop {
             let frame = next_frame(reader, wire)?;
@@ -1608,7 +1612,7 @@ impl Connection {
                         pending.told = true;
                         Some((attach.session, sink.clone()))
                     }
-                    _ => None,
+                    Waiting::Spawn { .. } | Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_) => None,
                 })
                 .collect();
             let eager = self.eager.load(Ordering::Acquire);
@@ -1840,6 +1844,10 @@ impl Connection {
     /// whose write failed goes out on the next link. False once the
     /// connection ended.
     fn write(&self, message: &ToCore) -> bool {
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "railway R3 exception: the other messages carry no request id the link has to keep"
+        )]
         let request = match message {
             ToCore::Spawn(client::Spawn { req, .. })
             | ToCore::Attach(client::Attach { req, .. })
@@ -3696,12 +3704,11 @@ mod tests {
         let (link, second) = fake::link(&[], listing);
         plan.link(link);
         assert!(matches!(second.next(), ToCore::List(_)));
-        let written = loop {
-            match second.next() {
-                ToCore::Close(close) => break (close.session, Instant::now()),
-                other => panic!("not CLOSE: {other:?}"),
-            }
+        let close = match second.next() {
+            ToCore::Close(close) => close,
+            other => panic!("not CLOSE: {other:?}"),
         };
+        let written = (close.session, Instant::now());
         assert_eq!(written.0, id);
         eventually("the unused connection ends", || connection.is_dead());
         // Not before `idle` (less the idle thread's look, a fifth of it).

@@ -90,7 +90,7 @@ impl Image {
             *counts.entry(p).or_default() += 1;
         }
         let mut counts: Vec<_> = counts.into_iter().collect();
-        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.sort_by_key(|a| std::cmp::Reverse(a.1));
         counts.iter().take(5).map(|(c, n)| format!("{} x{n}", c.hex())).collect::<Vec<_>>().join(", ")
     }
 
@@ -309,14 +309,14 @@ pub fn grab(display: &str, pid: u32, slow: f64) -> Result<Image> {
             .map_err(|e| e.to_string())?
             .reply()
             .map_err(|e| format!("GetImage: {e}"))?;
-        if image.data.chunks_exact(4).any(|px| px[..3] != [0, 0, 0]) || Instant::now() >= deadline {
+        if image.data.as_chunks::<4>().0.iter().any(|px| px[..3] != [0, 0, 0]) || Instant::now() >= deadline {
             break image;
         }
         std::thread::sleep(Duration::from_millis(100));
     };
     ensure!(image.depth >= 24, "unexpected window depth {}", image.depth);
     let mut data = Vec::with_capacity(geometry.width as usize * geometry.height as usize * 3);
-    for px in image.data.chunks_exact(4) {
+    for px in image.data.as_chunks::<4>().0 {
         data.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     Ok(Image { width: geometry.width.into(), height: geometry.height.into(), data })

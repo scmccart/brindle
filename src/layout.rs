@@ -190,6 +190,10 @@ impl LayoutTab {
     }
 
     /// The tab's one session, or the tab back when it is split.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the `Err` hands the caller's own tab back unchanged, once per restored tab; a boxed copy would move it for nothing"
+    )]
     pub fn into_single(self) -> Result<SessionInfo, Self> {
         match self.zones {
             Tree::Leaf { item, .. } => Ok(item),

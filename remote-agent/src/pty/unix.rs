@@ -330,7 +330,7 @@ fn describe(pid: libc::pid_t, fallback: libc::pid_t) -> Foreground {
     let name = fs::read_to_string(format!("{proc_dir}/comm"))
         .ok()
         .map(|name| {
-            name.trim_end_matches(|character| character == '\r' || character == '\n')
+            name.trim_end_matches(['\r', '\n'])
                 .to_owned()
         })
         .filter(|name| !name.is_empty());

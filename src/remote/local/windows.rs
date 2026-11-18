@@ -52,7 +52,7 @@ use crate::terminal::cmdline::merge_environment;
 const SETTLE: Duration = Duration::from_secs(1);
 
 fn os(error: windows::core::Error) -> io::Error {
-    io::Error::from_raw_os_error((error.code().0 & 0xffff) as i32)
+    io::Error::from_raw_os_error(error.code().0 & 0xffff)
 }
 
 fn wide(text: &std::ffi::OsStr) -> Vec<u16> {

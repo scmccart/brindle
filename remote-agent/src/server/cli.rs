@@ -140,6 +140,10 @@ fn list_line(session: &SessionInfo, now: u64) -> String {
     )
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: any reply but `Ok` is a failure `unexpected` reports"
+)]
 fn kill(args: &[String]) -> Result<(), String> {
     let target = match args {
         [all] if all == "--all" => KillTarget::All,
@@ -165,6 +169,10 @@ fn kill(args: &[String]) -> Result<(), String> {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: any reply but `Ok` is a failure `unexpected` reports"
+)]
 fn stop() -> Result<(), String> {
     let Some(mut core) = Connection::open()? else {
         eprintln!("{NO_SERVER}");
@@ -240,6 +248,10 @@ fn uptime(secs: u64) -> String {
     }
 }
 
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: an `Error` says its message, any other reply is named by its debug text"
+)]
 fn unexpected(reply: &ToClient) -> String {
     match reply {
         ToClient::Error(error) => error.message.clone(),
@@ -255,6 +267,10 @@ struct Connection {
 
 impl Connection {
     /// Connects and says `HELLO`; `None` when no core is listening.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "railway R3 exception: any answer but `Welcome` is a failure `unexpected` reports"
+    )]
     fn open() -> Result<Option<Self>, String> {
         let dir = dir::resolve_from_env().map_err(|error| error.to_string())?;
         let socket = match Endpoints::of(&dir) {
@@ -318,6 +334,10 @@ impl Connection {
         self.send(&message(req))?;
         loop {
             let reply = self.recv()?;
+            #[allow(
+                clippy::wildcard_enum_match_arm,
+                reason = "railway R3 exception: the other replies carry no request id, so they never answer one"
+            )]
             let matches = match &reply {
                 ToClient::Ok(ok) => ok.req == req,
                 ToClient::Error(error) => error.req == Some(req),

@@ -130,6 +130,10 @@ fn run(command: &mut Command) -> Result<std::process::Output> {
 }
 
 /// Sends `STEP_DOWN` and waits for `OK`, then for the core to close.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: frames other than this request's `Ok` or `Error` are skipped while the core closes"
+)]
 fn step_down(stream: &mut Stream) -> Result<()> {
     let req = 1;
     stream.set_read_timeout(Some(STEP_DOWN_LIMIT))?;

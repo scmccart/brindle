@@ -1,6 +1,9 @@
 // A GUI program on Windows, so launching it opens no console window (see
 // `console_output`). Test builds keep the console subsystem.
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+// railway R3, types R2: no `_ =>` on one of Brindle's own enums. Non-test
+// code only; `docs/architecture/README.md` lists the exceptions.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
 mod actions;
 mod config;

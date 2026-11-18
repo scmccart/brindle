@@ -645,7 +645,7 @@ pub fn ssh_connect_at_launch(ctx: &Ctx) -> Result<Outcome> {
     ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
     let shown = format!("left-2 {shell}");
     ensure!(
-        second.dump.screen.iter().any(|line| *line == shown),
+        second.dump.screen.contains(&shown),
         "the attached tab doesn't show {shown:?}: {:?}",
         second.dump.screen
     );
@@ -855,7 +855,7 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
         let offline = format!("{endpoint}  offline: ");
         let at = palette.iter().position(|row| row.starts_with(&offline));
         let Some(at) = at else {
-            return Err(format!("no offline row for {endpoint}: {palette:?}").into());
+            return Err(format!("no offline row for {endpoint}: {palette:?}"));
         };
         let row = &palette[at];
         ensure!(row.contains(cause), "{endpoint}'s row doesn't say {cause:?}: {row:?}");
@@ -865,7 +865,7 @@ pub fn offline(ctx: &Ctx) -> Result<Outcome> {
     // palette says so, after both endpoints' rows.
     let note = palette.iter().position(|row| row == "No detached sessions");
     let Some(note) = note else {
-        return Err(format!("no \"No detached sessions\" row: {palette:?}").into());
+        return Err(format!("no \"No detached sessions\" row: {palette:?}"));
     };
     ensure!(
         offline_rows.iter().all(|&at| at < note),

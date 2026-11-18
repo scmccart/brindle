@@ -212,7 +212,11 @@ pub fn button_style(variant: ButtonVariant, size: ButtonSize, t: &Tokens) -> But
     // with focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40.
     let ring = match variant {
         ButtonVariant::Destructive => t.destructive.opacity(if dark { 0.4 } else { 0.2 }),
-        _ => focus_ring(t),
+        ButtonVariant::Default
+        | ButtonVariant::Outline
+        | ButtonVariant::Secondary
+        | ButtonVariant::Ghost
+        | ButtonVariant::Link => focus_ring(t),
     };
     // focus-visible:border-ring, except that the dark outline's
     // dark:border-input wins and keeps the input colour.

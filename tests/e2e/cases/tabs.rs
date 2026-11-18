@@ -202,8 +202,7 @@ fn measure_plus(image: &Image, strip: &Strip, bg: Rgb, face: Rgb) -> Result<Plus
     let row = dev(strip.top + BUTTON_MIDDLE);
     let (from, to) = (dev(strip.left + FACE_LEFT), dev(strip.left + FACE_LEFT + 400.0).min(image.width));
     let list_end = (from..to)
-        .filter(|&x| image.pixel(x, row).near(face, 2))
-        .last()
+        .rfind(|&x| image.pixel(x, row).near(face, 2))
         .ok_or_else(|| format!("no tab face along y={row}: {}", image.summary(PxRect { x0: from, y0: row, x1: to, y1: row + 1 })))?;
     // The horizontal arm: the first run of ink past the list. The face's
     // anti-aliased right edge (a blend of the face and the strip's

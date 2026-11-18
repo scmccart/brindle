@@ -407,6 +407,10 @@ pub fn running_sessions(limit: Duration) -> Result<Vec<client::SessionInfo>> {
 /// not, for a launch to attach: none when no core is listening (it never
 /// starts one). It blocks: on Windows up to `limit` for a busy pipe, then up
 /// to `HELLO_LIMIT` for the `HELLO`, then about `limit` per read.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: frames other than this request's `Sessions` or `Error` are skipped"
+)]
 pub fn running_sessions_at(endpoint: &Endpoint, limit: Duration) -> Result<Vec<client::SessionInfo>> {
     static LISTINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(stream) = try_connect_within(endpoint, limit)? else {
@@ -630,6 +634,10 @@ fn hello_message(token: &str, relay: bool) -> Hello {
 
 /// Says `HELLO` and waits for `WELCOME`. An `ERROR` (no common version)
 /// names both sides' ranges.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "railway R3 exception: any answer to HELLO but `Welcome` or `Error` fails it, naming the answer"
+)]
 pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
     let hello = ToCore::Hello(hello_message(token, false));
     let talk = |error: io::Error| anyhow!("terminal server unreachable: {error}");
@@ -1180,7 +1188,7 @@ mod tests {
         let (a8, b9, c7) = (ssh("A8"), ssh("B9"), ssh("C7"));
         assert_eq!(eager_change(&[], &[a8.clone(), b9.clone()]), (vec![a8.clone(), b9.clone()], vec![]));
         assert_eq!(eager_change(&[a8.clone(), b9.clone()], &[c7.clone(), a8.clone()]), (vec![c7.clone()], vec![b9.clone()]));
-        assert_eq!(eager_change(&[a8.clone()], &[a8.clone()]), (vec![], vec![]));
+        assert_eq!(eager_change(std::slice::from_ref(&a8), std::slice::from_ref(&a8)), (vec![], vec![]));
         assert_eq!(eager_change(&[a8.clone(), c7.clone()], &[]), (vec![], vec![a8, c7]));
     }
 

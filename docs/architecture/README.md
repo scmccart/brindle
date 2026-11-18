@@ -59,7 +59,7 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 
 ## Enforcement
 
-`tests/architecture.rs` runs with plain `cargo test` on every platform CI builds. It checks the crate boundaries from the manifests and a few source rules by text search; each doc's Enforcement section says which of its rules that covers. Everything else is held by review, through the `architecture-review` skill.
+`tests/architecture.rs` runs with plain `cargo test` on every platform CI builds. It checks the crate boundaries from the manifests and a few source rules by text search; each doc's Enforcement section says which of its rules that covers. CI also runs `cargo clippy --workspace --all-targets -- -D warnings` on Linux and Windows, and the crate roots switch on `clippy::wildcard_enum_match_arm` (all five crates) and `clippy::unwrap_used` and `clippy::expect_used` (`brindle-remote-protocol` and `brindle-term-core`) for non-test code; `tests/architecture.rs` fails if a root loses one. Everything else is held by review, through the `architecture-review` skill.
 
 ## Scope of adoption
 
@@ -70,5 +70,5 @@ These docs were adopted on 2026-11-16 by writing down what the code already does
 | Doc rule | Exception | Approved in | Ends with |
 | --- | --- | --- | --- |
 | `railway R4` | About 90 existing functions return `Result<_, String>` (57 in `src/`, 36 in the other crates), such as `reattach::attach_target`. | adoption, 2026-11-16 | each is revisited when its error gains a second consumer or a branch on its text |
-| `railway R3`, `types R2` | Existing `_ =>` arms have not been audited for matches on Brindle's own enums. | adoption, 2026-11-16 | each is removed when its `match` is next changed |
+| `railway R3`, `types R2` | 16 `_ =>` or catch-all arms on Brindle's own enums (`ToClient`, `ToCore`, the settings dialog's `Field`), each under `#[allow(clippy::wildcard_enum_match_arm, reason = "railway R3 exception: …")]`: `remote-agent/src/server/cli.rs` 5, `remote-agent/src/server/relay.rs` 1, `src/remote/local.rs` 2, `src/remote/local/connection.rs` 2, `src/remote/local/upgrade.rs` 1, `src/settings_dialog/profiles.rs` 5. `grep -rn "railway R3 exception" --include=*.rs .` lists them. | adoption, 2026-11-16 | each allow is removed when its `match` is next changed, and the row goes when that search finds none |
 | `ports R4` | Platform `cfg`s outside a seam in these production files, and no others: `src/instance.rs`, `src/main.rs`, `src/notify/mod.rs`, `src/remote/local.rs`, `src/remote/local/relay.rs`, `src/remote/mod.rs`, `src/session.rs`, `src/settings.rs`, `src/terminal/mod.rs`, `src/terminal_view.rs`, `src/workspace.rs`, `src/zone_view.rs`, `remote-agent/src/main.rs`, `remote-agent/src/server/cli.rs`, `remote-agent/src/server/core.rs`, `remote-agent/src/server/core/sessions.rs`, `remote-agent/src/server/daemon.rs`. The architecture test `platform_cfgs_stay_in_their_seams` lists the same files and fails on any other (backlog: audit 2026-11-16, "Exceptions"). | adoption, 2026-11-16; narrowed by `enforce-platform-seams` | the `port-to-macos` change, which moves each behind its seam |

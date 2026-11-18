@@ -98,6 +98,10 @@ pub fn has_font_family(family: &str) -> bool {
 }
 
 /// The window's HWND.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enum: raw_window_handle's non-exhaustive RawWindowHandle, of which only Win32's counts"
+)]
 pub fn hwnd(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     // GPUI's own `window_handle` is another thing.

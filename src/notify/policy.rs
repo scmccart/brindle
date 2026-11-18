@@ -26,7 +26,7 @@ pub fn layout(source: Source, title: &str, body: &str, tab_title: &str) -> (Stri
     let summary = if title.is_empty() { tab_title.to_string() } else { format!("{title} — {tab_title}") };
     let body = match source {
         Source::Bell => "Bell".to_string(),
-        _ => body.to_string(),
+        Source::Osc9 | Source::Osc777 | Source::Osc7501 => body.to_string(),
     };
     (truncate(&summary, MAX_TITLE_CHARS), body)
 }

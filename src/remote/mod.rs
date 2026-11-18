@@ -317,10 +317,10 @@ mod tests {
             dir.join("brindle-remote-linux-x86_64"),
         );
         assert_eq!(find(None, &[]).unwrap(), None);
-        assert_eq!(find(None, &[helper.clone()]).unwrap(), Some(helper.clone()));
+        assert_eq!(find(None, std::slice::from_ref(&helper)).unwrap(), Some(helper.clone()));
         // An empty variable counts as unset.
         assert_eq!(
-            find(Some(""), &[helper.clone()]).unwrap(),
+            find(Some(""), std::slice::from_ref(&helper)).unwrap(),
             Some(helper.clone())
         );
         // The archive's name comes before the installed one.
@@ -331,7 +331,7 @@ mod tests {
         // The variable's path is used when it is a file, and is an error naming
         // the variable when it isn't, whatever sits beside Brindle.
         let named = PathBuf::from("/elsewhere/helper");
-        let error = find(Some("/elsewhere/helper"), &[helper.clone()]).unwrap_err();
+        let error = find(Some("/elsewhere/helper"), std::slice::from_ref(&helper)).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -367,10 +367,10 @@ mod tests {
         }
         // Beside the exe: Linux names, and on Windows only brindle-remote.exe.
         assert_eq!(
-            find(None, None, false, &[helper.clone()]).unwrap(),
+            find(None, None, false, std::slice::from_ref(&helper)).unwrap(),
             Some(helper.clone())
         );
-        assert_eq!(find(None, None, true, &[helper.clone()]).unwrap(), None);
+        assert_eq!(find(None, None, true, std::slice::from_ref(&helper)).unwrap(), None);
         let beside = [helper.clone(), exe_helper.clone()];
         assert_eq!(
             find(None, None, true, &beside).unwrap(),

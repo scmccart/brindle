@@ -430,7 +430,10 @@ impl ZoneTreeView {
 
     /// Creates a `ZoneTreeView` from a restored split tree and pre-spawned
     /// terminals for each leaf, which run on `host`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "both call sites (`Workspace`'s restore and layout tab) already hold each of these as separate values (profile, host, theme, tree, terminals, active zone); a parameter struct would be built only to be taken apart here"
+    )]
     pub fn from_restored(
         profile: Profile,
         host: Host,

@@ -244,7 +244,7 @@ mod imp {
     pub(super) fn forward_to(path: &Path, request: &Request) -> Result<(), String> {
         let deadline = Instant::now() + FORWARD_LIMIT;
         let stream = loop {
-            match UnixStream::connect(&path) {
+            match UnixStream::connect(path) {
                 Ok(stream) => break stream,
                 // The instance may still be starting: it takes the lock before
                 // it binds.
