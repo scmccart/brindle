@@ -72,3 +72,48 @@ pub fn config_editor_local(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.screen.concat().contains(&want), "no {want:?} on the screen: {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }
+
+/// A valid config that Brindle doesn't use as written: an unknown theme, a
+/// font size out of range and a binding to an action that doesn't exist.
+/// The window's config line names all three (`--- config`), the tab uses
+/// the built-in `brindle-dark` theme, and fixing the file while Brindle runs
+/// takes the line away.
+pub fn config_findings(ctx: &Ctx) -> Result<Outcome> {
+    const BAD: &str = "\n[font]\nsize = 200\n\n[keybindings]\n\"ctrl-shift-y\" = \"split_zone_rihgt\"\n";
+    let out = Run::new(ctx, "findings").initial_theme("tokyonight").config(BAD).capture_at(5.0).dump_at(6.0).run()?;
+    let line = out.dump.config.as_deref().ok_or("no --- config line in the dump")?;
+    for (what, text) in [
+        ("the unknown theme", "tokyonight"),
+        ("the theme used instead", "brindle-dark"),
+        ("the clamped size", "font.size 200 is out of range, using 96"),
+        ("the binding's keys", "ctrl-shift-y"),
+        ("the binding's action", "split_zone_rihgt"),
+    ] {
+        ensure!(line.contains(text), "the config line doesn't name {what} ({text:?}): {line:?}");
+    }
+    // The grid is of 96 px text: sample the last row, left of the prompt's
+    // reach, rather than the middle of the window.
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let (cols, rows) = out.dump.size.ok_or("no size")?;
+    let background = image.dominant(cells(&out)?.rect(0, rows - 1, cols.min(8), 1));
+    ensure!(
+        background == Some(theme::BRINDLE_DARK_BACKGROUND),
+        "background {:?}, not brindle-dark's",
+        background.map(|c| c.hex())
+    );
+
+    // The same file, fixed while Brindle runs (`theme_at` rewrites the test
+    // config): the line goes, and the test config's own theme applies.
+    let out = Run::new(ctx, "fixed")
+        .initial_theme("tokyonight")
+        .config(BAD)
+        .theme_at(3.0, "e2e")
+        .capture_at(5.0)
+        .dump_at(6.0)
+        .run()?;
+    ensure!(out.dump.config.is_none(), "the config line stayed after the fix: {:?}", out.dump.config);
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let background = image.dominant(cells(&out)?.rect(2, 8, 20, 10));
+    ensure!(background == Some(theme::BACKGROUND), "background after the fix {:?}", background.map(|c| c.hex()));
+    Ok(Outcome::Pass)
+}

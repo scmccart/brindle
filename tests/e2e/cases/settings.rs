@@ -569,3 +569,17 @@ pub fn enter_on_button(ctx: &Ctx) -> Result<Outcome> {
     ensure!(config_text(ctx)? == brindle::config("e2e"), "enter on Cancel changed the config");
     Ok(Outcome::Pass)
 }
+
+/// A config whose `themes` is not a table: the Theme section says so in its
+/// error line, naming the key and the file, instead of listing nothing.
+pub fn themes_not_a_table(ctx: &Ctx) -> Result<Outcome> {
+    let out = open_theme(Run::new(ctx, "run").whole_config("themes = 3\n")).dump_at(step_time(2) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.starts_with("section=Theme mode=list"), "dialog state: {settings:?}");
+    let path = ctx.dir.join("config.toml");
+    let want = format!("themes in {} is not a table", path.display());
+    ensure!(settings.contains(&want), "the error line doesn't say {want:?}: {settings:?}");
+    // The built-ins are still listed.
+    ensure!(settings.contains("selected=\"brindle-dark\""), "dialog state: {settings:?}");
+    Ok(Outcome::Pass)
+}

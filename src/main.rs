@@ -43,7 +43,7 @@ use gpui::{
 };
 
 use crate::actions::{Quit, ReloadConfig};
-use crate::config::Config;
+use crate::config::{Config, ConfigReport};
 use crate::latency::Latency;
 use crate::reattach::Listing;
 use crate::remote::hosts::Hosts;
@@ -457,8 +457,8 @@ fn start_config_reloads(cx: &mut App) {
                 batch.push(more);
             }
             let renames = merge_renames(batch);
-            let (config, error) = cx.background_executor().spawn(async { Config::load_or_default() }).await;
-            if cx.update(|cx| apply_config(config, error, &renames, cx)).is_err() {
+            let (config, report) = cx.background_executor().spawn(async { Config::load_or_default() }).await;
+            if cx.update(|cx| apply_config(config, report, &renames, cx)).is_err() {
                 break;
             }
         }
@@ -466,16 +466,23 @@ fn start_config_reloads(cx: &mut App) {
     .detach();
 }
 
+/// Binds the keys, and adds the config's keybindings that couldn't be bound
+/// to the window's config line.
+fn bind_keys(cx: &mut App) {
+    let findings = actions::bind_keys(cx);
+    cx.update_global(|settings: &mut Settings, _| settings.add_binding_findings(findings));
+}
+
 /// Applies a config read from the file to every window. `renames` are
 /// profiles renamed in the settings dialog, whose open tabs follow the new
 /// name.
-fn apply_config(config: Config, error: Option<String>, renames: &[(String, String)], cx: &mut App) {
+fn apply_config(config: Config, report: ConfigReport, renames: &[(String, String)], cx: &mut App) {
     let zoom = Settings::get(cx).zoom;
-    let mut settings = Settings::from_platform(config, error, cx);
+    let mut settings = Settings::from_platform(config, report, cx);
     settings.zoom = zoom;
     cx.set_global(settings);
     Settings::apply_ui_theme(cx);
-    actions::bind_keys(cx);
+    bind_keys(cx);
     for window in cx.windows() {
         if let Some(window) = window.downcast::<Workspace>() {
             window.update(cx, |workspace, _, cx| workspace.apply_config(renames, cx)).ok();
@@ -999,7 +1006,7 @@ fn main() {
     let restoring = !args.no_restore && lock.is_some();
     let reads = start_launch_reads(restoring, args.attach.is_some(), &state_dir);
     // A plain value, read before any event loop exists.
-    let (config, error) = Config::load_or_default();
+    let (config, report) = Config::load_or_default();
 
     // Before any window: windows, shortcuts and toasts share one identity.
     #[cfg(windows)]
@@ -1010,7 +1017,7 @@ fn main() {
         // when it started.
         let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         let origin: gpui::SharedString = layout::origin_id(std::process::id(), since_epoch).into();
-        let settings = Settings::from_platform(config, error, cx);
+        let settings = Settings::from_platform(config, report, cx);
         let profile = match &args.profile {
             Some(name) => settings.config.profile_index(name).unwrap_or_else(|| {
                 log::warn!("no profile named {name:?}");
@@ -1021,7 +1028,7 @@ fn main() {
         cx.set_global(settings);
         Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
-        actions::bind_keys(cx);
+        bind_keys(cx);
         // brindle-ui's keystroke observer: a key sets keyboard modality, so
         // focus rings come back after a click had hidden them.
         brindle_ui::init(cx);
@@ -1394,7 +1401,7 @@ mod tests {
 
     #[test]
     fn forwarded_requests_open_tabs() {
-        let config = Config::parse("default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap();
+        let config = Config::parse("default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap().config;
         let request = |r: instance::Request| forwarded_launch(&r, &Listing::Skipped, &config);
         assert!(request(instance::Request { launch_dir: Some("/x".into()), ..Default::default() }).is_none(), "a plain launch only raises");
         let Some(Launch::Request(tab)) = request(instance::Request {
@@ -1420,7 +1427,7 @@ mod tests {
 
     #[test]
     fn forwarded_attach_says_why_listing_failed() {
-        let config = Config::parse("[[profiles]]\nname = \"a\"\n").unwrap();
+        let config = Config::parse("[[profiles]]\nname = \"a\"\n").unwrap().config;
         let attach = instance::Request { attach: Some(7), ..Default::default() };
         let opened = |listing: &Listing| forwarded_launch(&attach, listing, &config).map(opens);
         assert_eq!(

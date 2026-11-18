@@ -205,7 +205,7 @@ pub fn merge_windows(ctx: &Ctx) -> Result<Outcome> {
 /// What a version with tmux support left behind: a config with its default
 /// `tmux` and `tmux (classic)` profiles and `tmux_session_end`, and a state
 /// file with a control-mode session between two local tabs. Brindle starts
-/// as usual (no config error, a warning per removed key), restores only the
+/// as usual (no config error, the window's config line names each removed key), restores only the
 /// local tabs and saves no tmux entry, and the legacy profile opens a
 /// shell, not tmux.
 pub fn tmux_legacy_config(ctx: &Ctx) -> Result<Outcome> {
@@ -221,6 +221,9 @@ pub fn tmux_legacy_config(ctx: &Ctx) -> Result<Outcome> {
     let log = std::fs::read_to_string(ctx.dir.join("restore.log")).unwrap_or_default();
     ensure!(!log.contains("invalid config"), "the config didn't load:\n{log}");
     ensure!(!log.contains("ignoring session state"), "the state file was rejected:\n{log}");
+    // The removed keys are findings on the window's config line, not log
+    // warnings.
+    let line = out.dump.config.as_deref().ok_or("no --- config line in the dump")?;
     for want in [
         "tmux_session_end is ignored",
         "profile \"tmux\": tmux is ignored",
@@ -228,7 +231,7 @@ pub fn tmux_legacy_config(ctx: &Ctx) -> Result<Outcome> {
         "profile \"tmux (classic)\": tmux is ignored",
         "profile \"tmux (classic)\": tmux_session is ignored",
     ] {
-        ensure!(log.contains(want), "the log doesn't warn {want:?}:\n{log}");
+        ensure!(line.contains(want), "the config line doesn't name {want:?}: {line:?}");
     }
     let recorded = state_text(ctx)?;
     ctx.save("recorded.toml", &recorded);

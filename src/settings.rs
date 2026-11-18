@@ -2,13 +2,19 @@
 
 use gpui::{App, Font, FontFallbacks, FontFeatures, Global, Pixels, SharedString, px};
 
-use crate::config::{Config, FontConfig};
+use crate::config::{Config, ConfigFinding, ConfigReport, FontConfig, config_line};
 use crate::theme::Theme;
 
 pub struct Settings {
     pub config: Config,
-    /// Error from the last config load, shown in a banner until fixed.
-    pub config_error: Option<String>,
+    /// Error from the last config load, which made the defaults apply.
+    config_error: Option<String>,
+    /// What the config's file says that Brindle didn't use as written.
+    config_findings: Vec<ConfigFinding>,
+    /// The window's config line (the error and the findings, worded by
+    /// [`config_line`]), shown until the file is fixed. Built when the
+    /// settings are, so drawing only reads it.
+    pub config_line: Option<SharedString>,
     /// Font size change from ctrl-+ / ctrl-- (applies to all tabs).
     pub zoom: f32,
     font: Font,
@@ -85,12 +91,15 @@ pub const SYSTEM_UI_FONT: &str = ".SystemUIFont";
 impl Settings {
     /// The settings for `config`, its fonts resolved against the
     /// `installed` families.
-    pub fn new(config: Config, config_error: Option<String>, installed: Vec<String>) -> Self {
+    pub fn new(config: Config, report: ConfigReport, installed: Vec<String>) -> Self {
         let font = terminal_font(resolve_family(&config.font.family, &installed), &installed);
         let ui_font_family = resolve_ui_family(&config.ui_font.family, &installed);
+        let config_line = config_line(report.error.as_deref(), &report.findings, &[]).map(SharedString::from);
         Self {
             config,
-            config_error,
+            config_error: report.error,
+            config_findings: report.findings,
+            config_line,
             zoom: 0.0,
             font,
             ui_font_family: ui_font_family.into(),
@@ -101,12 +110,21 @@ impl Settings {
 
     /// [`Settings::new`] with the families the platform has installed
     /// ([`installed_families`]), logging the two it resolved.
-    pub fn from_platform(config: Config, config_error: Option<String>, cx: &App) -> Self {
-        let settings = Self::new(config, config_error, installed_families(cx));
+    pub fn from_platform(config: Config, report: ConfigReport, cx: &App) -> Self {
+        let settings = Self::new(config, report, installed_families(cx));
         let (font_family, ui_font_family): (&str, &str) = (&settings.font.family, &settings.ui_font_family);
         log::info!("using font family {font_family:?}");
         log::info!("using UI font family {ui_font_family:?}");
         settings
+    }
+
+    /// Adds the keybindings the config couldn't bind (known only once
+    /// [`crate::actions::bind_keys`] has run, after these settings were
+    /// made) to the config line.
+    pub fn add_binding_findings(&mut self, findings: Vec<ConfigFinding>) {
+        self.config_findings.extend(findings);
+        self.config_line =
+            config_line(self.config_error.as_deref(), &self.config_findings, &[]).map(SharedString::from);
     }
 
     /// Makes the config's global theme the active `brindle-ui` token set,
@@ -243,10 +261,29 @@ fn without_unverified(mut names: Vec<String>, has: impl Fn(&str) -> bool) -> Vec
     names
 }
 
-/// Whether DirectWrite's system font collection has `family`.
+/// Whether DirectWrite's system font collection has `family`. When
+/// DirectWrite can't answer, the family stays listed (see [`has_or_keep`]),
+/// and the first failure is logged: font enumeration belongs to no tab.
 #[cfg(windows)]
 fn platform_has_family(_: &gpui::TextSystem, family: &str) -> bool {
-    crate::win::has_font_family(family)
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let (has, failure) = has_or_keep(crate::win::has_font_family(family));
+    if let Some(error) = failure {
+        LOGGED.call_once(|| log::warn!("can't tell whether {family:?} is installed, so it stays listed: {error}"));
+    }
+    has
+}
+
+/// Whether a family is installed, given what asking the platform gave. A
+/// platform that can't answer keeps the family: hiding one the user may
+/// have chosen is the worse fallback. The error is returned for the caller
+/// to log.
+#[cfg(any(windows, test))]
+fn has_or_keep(asked: std::io::Result<bool>) -> (bool, Option<std::io::Error>) {
+    match asked {
+        Ok(has) => (has, None),
+        Err(error) => (true, Some(error)),
+    }
 }
 
 /// Whether the platform has `family`. GPUI's Linux text system fails to
@@ -354,12 +391,38 @@ mod tests {
         assert_eq!(resolve_ui_family(&[], &without_unverified(names(&["Cantarell", "Consolas"]), |_| false)), SYSTEM_UI_FONT);
     }
 
+    /// A platform that can't say keeps the family listed, with its error.
+    #[test]
+    fn a_family_stays_listed_when_the_platform_cant_answer() {
+        assert!(matches!(has_or_keep(Ok(true)), (true, None)));
+        assert!(matches!(has_or_keep(Ok(false)), (false, None)));
+        let (kept, error) = has_or_keep(Err(std::io::Error::other("no factory")));
+        assert!(kept);
+        assert_eq!(error.map(|e| e.to_string()).as_deref(), Some("no factory"));
+    }
+
+    /// The config line is built with the settings, and the bindings
+    /// `bind_keys` couldn't bind join it afterwards.
+    #[test]
+    fn the_config_line_has_the_findings_and_the_bindings_added_later() {
+        let finding = ConfigFinding::UnknownTheme { name: "x".into(), profile: None };
+        let report = ConfigReport { error: None, findings: vec![finding] };
+        let mut settings = Settings::new(Config::default(), report, names(&["DejaVu Sans Mono"]));
+        assert_eq!(settings.config_line.as_ref().map(|line| line.as_ref()), Some("Config: unknown theme \"x\", using brindle-dark"));
+        let binding = ConfigFinding::UnknownAction { keys: "ctrl-shift-y".into(), action: "nope".into() };
+        settings.add_binding_findings(vec![binding]);
+        let line: &str = settings.config_line.as_ref().unwrap();
+        assert!(line.contains("unknown theme") && line.contains("ctrl-shift-y"), "{line}");
+        let clean = Settings::new(Config::default(), ConfigReport::default(), names(&["DejaVu Sans Mono"]));
+        assert_eq!(clean.config_line, None);
+    }
+
     /// Every Windows has Segoe UI; no machine has the made-up family.
     #[cfg(windows)]
     #[test]
     fn directwrite_has_segoe_ui_and_not_a_made_up_family() {
-        assert!(crate::win::has_font_family("Segoe UI"));
-        assert!(!crate::win::has_font_family("Nonexistent Brindle Font"));
+        assert!(crate::win::has_font_family("Segoe UI").unwrap());
+        assert!(!crate::win::has_font_family("Nonexistent Brindle Font").unwrap());
     }
 
     #[test]
@@ -425,7 +488,7 @@ mod tests {
         in_headless_app(|cx| {
             let config = Config::default();
             let config_theme = config.theme(None);
-            cx.set_global(Settings::from_platform(config, None, cx));
+            cx.set_global(Settings::from_platform(config, ConfigReport::default(), cx));
 
             Settings::apply_ui_theme(cx);
             let before = *cx.ui_theme();
@@ -451,7 +514,7 @@ mod tests {
     #[test]
     fn a_font_preview_overrides_the_config_until_cleared() {
         let mut settings =
-            Settings::new(Config::default(), None, names(&["Cascadia Mono", "Consolas", "Arial", "Segoe UI"]));
+            Settings::new(Config::default(), ConfigReport::default(), names(&["Cascadia Mono", "Consolas", "Arial", "Segoe UI"]));
         let (font, ui) = (settings.font(), settings.ui_font_family());
         // The config's lists, resolved against the installed families.
         assert_eq!(font.family.as_ref(), "Cascadia Mono");
@@ -493,7 +556,7 @@ mod tests {
     /// stays within 5 to 96 pixels.
     #[test]
     fn font_sizes_are_clamped_to_5_to_96() {
-        let mut settings = Settings::new(Config::default(), None, names(&["DejaVu Sans Mono"]));
+        let mut settings = Settings::new(Config::default(), ConfigReport::default(), names(&["DejaVu Sans Mono"]));
         assert_eq!(settings.font_size(Some(1.0)), px(5.0));
         assert_eq!(settings.font_size(Some(200.0)), px(96.0));
         assert_eq!(settings.font_size(Some(12.0)), px(12.0));

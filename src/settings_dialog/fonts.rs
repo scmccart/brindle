@@ -842,7 +842,7 @@ mod tests {
         state.choose(FontField::Ui, family("Inter"));
         assert_eq!(state.apply(&f.path), Ok(Done::Written));
         assert_eq!(f.text(), format!("{text}\n[ui_font]\nfamily = [\"Inter\"]\n"));
-        let config = crate::config::Config::parse(&f.text()).unwrap();
+        let config = crate::config::Config::parse(&f.text()).unwrap().config;
         assert_eq!(config.ui_font.family, ["Inter"]);
         assert_eq!(config.font.size, 13.0);
     }

@@ -55,6 +55,10 @@ pub mod theme {
     pub const SEARCH_FOCUSED_BG: Rgb = Rgb(0xff, 0x00, 0xa0);
     pub const SEARCH_FOCUSED_FG: Rgb = Rgb(0x00, 0x00, 0x00);
 
+    /// The built-in `brindle-dark` theme's background, which an unknown theme
+    /// name falls back to (`Theme::default`).
+    pub const BRINDLE_DARK_BACKGROUND: Rgb = Rgb(0x1b, 0x1a, 0x18);
+
     /// The second theme, for reload checks.
     pub const ALT_FOREGROUND: Rgb = Rgb(0xa0, 0xa0, 0xa0);
     pub const ALT_BACKGROUND: Rgb = Rgb(0x28, 0x20, 0x20);
@@ -152,8 +156,12 @@ pub struct Run<'a> {
     ctx: &'a Ctx,
     label: &'static str,
     profile: &'static str,
+    /// The config's global `theme`: `e2e`, the test config's own.
+    theme: &'static str,
     /// Appended to the test config (after its tables).
     extra_config: String,
+    /// The whole config file, in place of the test config and `extra_config`.
+    whole_config: Option<String>,
     /// Top-level keys, placed before the test config's tables.
     top: String,
     /// Brindle should quit by itself (its window closed) before the dump.
@@ -278,7 +286,9 @@ impl<'a> Run<'a> {
             ctx,
             label,
             profile: "Shell",
+            theme: "e2e",
             extra_config: String::new(),
+            whole_config: None,
             top: String::new(),
             expect_exit: false,
             expect_killed: false,
@@ -316,6 +326,13 @@ impl<'a> Run<'a> {
 
     pub fn default_profile(mut self, name: &'static str) -> Self {
         self.default_profile = name;
+        self
+    }
+
+    /// Starts with `name` as the config's global theme in place of `e2e`,
+    /// which needn't exist (an unknown one is what a check is for).
+    pub fn initial_theme(mut self, name: &'static str) -> Self {
+        self.theme = name;
         self
     }
 
@@ -382,6 +399,15 @@ impl<'a> Run<'a> {
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
+        self
+    }
+
+    /// Makes `text` the whole config file, in place of the test config, for a
+    /// check that needs a file the test config's tables would make invalid
+    /// (`themes = 3`). It has no `e2e` theme and no profile, so the window
+    /// uses the built-in theme and the implicit `Shell` profile.
+    pub fn whole_config(mut self, text: &str) -> Self {
+        self.whole_config = Some(text.to_string());
         self
     }
 
@@ -519,11 +545,14 @@ impl<'a> Run<'a> {
         let ctx = self.ctx;
         let dump_secs = self.dump_secs();
         let config_path = ctx.dir.join("config.toml");
-        let mut text = config_with("e2e", self.default_profile, &self.top);
+        let mut text = config_with(self.theme, self.default_profile, &self.top);
         if let Some(padding) = self.padding {
             text = text.replacen("\npadding = 6\n", &format!("\npadding = {padding}\n"), 1);
         }
         text += &self.extra_config;
+        if let Some(whole) = &self.whole_config {
+            text.clone_from(whole);
+        }
         std::fs::write(&config_path, text).map_err(|e| e.to_string())?;
         let log = std::fs::File::create(ctx.dir.join(format!("{}.log", self.label))).map_err(|e| e.to_string())?;
 
@@ -701,6 +730,8 @@ pub struct Dump {
     pub grid: Option<Grid>,
     /// The families in effect, preview included (`--- fonts`).
     pub fonts: Option<Fonts>,
+    /// The window's config line, unescaped (`--- config`), when it shows one.
+    pub config: Option<String>,
     /// The link under the mouse while hover feedback shows (`--- link`).
     pub link: Option<String>,
     pub screen: Vec<String>,
@@ -790,6 +821,8 @@ impl Dump {
                 dump.grid = parse_grid(rest);
             } else if let Some(rest) = line.strip_prefix("--- fonts ") {
                 dump.fonts = parse_fonts(rest);
+            } else if let Some(rest) = line.strip_prefix("--- config ") {
+                dump.config = unquote(rest);
             } else if let Some(rest) = line.strip_prefix("--- link ") {
                 dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- selection ") {
@@ -988,6 +1021,18 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.fonts().map(|f| f.ui.as_str()) == Ok("Segoe UI"), "fonts without a terminal {:?}", dump.fonts);
     ensure!(dump.screen.is_empty(), "screen without a terminal {:?}", dump.screen);
     ensure!(dump.selection.is_none(), "selection {:?}", dump.selection);
+    ensure!(dump.config.is_none(), "config {:?}", dump.config);
+    // The config line follows the fonts line, and is not screen text.
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- fonts terminal=\"A\" ui=\"B\"\n\
+         --- config \"Config: unknown theme \\\"x\\\", using brindle-dark\"\nhi\n",
+    );
+    ensure!(
+        dump.config.as_deref() == Some("Config: unknown theme \"x\", using brindle-dark"),
+        "config {:?}",
+        dump.config
+    );
+    ensure!(dump.screen == ["hi"], "screen after config {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- selection \"one\\ntwo \\\"q\\\" \\u{1b}\"\nhi\n",
     );

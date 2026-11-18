@@ -71,7 +71,7 @@ Needs change 3 (its `SessionMeta::from_value` fuzz target) and change 10 (the se
 
 Needs change 7 (textual: `config.rs`) and change 9 (`config::write_replacing`).
 
-- [ ] 2.1 `ConfigFinding`, `Loaded` and `ConfigReport` in `src/config.rs` (decision 2).
+- [x] 2.1 `ConfigFinding`, `Loaded` and `ConfigReport` in `src/config.rs` (decision 2).
   - `Config::parse` returns `Loaded`: `normalized` returns its clamps, and the removed-key warnings are findings, not log lines.
   - `Config::findings` reports unknown global and per-profile themes.
   - `Config::theme` stops logging.
@@ -82,42 +82,42 @@ Needs change 7 (textual: `config.rs`) and change 9 (`config::write_replacing`).
     - `an_unknown_profile_theme_names_the_profile`;
     - `a_removed_key_is_a_finding`;
     - `a_valid_config_has_no_findings`.
-- [ ] 2.2 `actions::user_bindings(&[(String, String)]) -> (Vec<KeyBinding>, Vec<ConfigFinding>)`, pure. `bind_keys(cx)` returns the findings.
+- [x] 2.2 `actions::user_bindings(&[(String, String)]) -> (Vec<KeyBinding>, Vec<ConfigFinding>)`, pure. `bind_keys(cx)` returns the findings.
   - Unit tests: `an_unknown_action_is_a_finding`, `invalid_keys_are_a_finding`, `none_unbinds_and_is_not_a_finding`.
-- [ ] 2.3 The pure `config_line(error, findings, notices) -> Option<String>`.
+- [x] 2.3 The pure `config_line(error, findings, notices) -> Option<String>`.
   - Unit tests:
     - `no_error_and_no_findings_is_no_line`;
     - `findings_are_joined_after_an_error`;
     - `each_finding_says_what_was_used`;
     - `notices_come_last`.
-- [ ] 2.4 `config_edit::{custom_themes, profiles} -> Result<Vec<…>, Shape>`, with `Shape { Unparsable, NotATable, NotAnArray }`. `theme_entries` is pure, and `join_words`/`quote` return `Result<String, Unquotable>` (decision 9).
+- [x] 2.4 `config_edit::{custom_themes, profiles} -> Result<Vec<…>, Shape>`, with `Shape { Unparsable, NotATable, NotAnArray }`. `theme_entries` is pure, and `join_words`/`quote` return `Result<String, Unquotable>` (decision 9).
   - Unit tests:
     - `themes_that_are_not_a_table_are_a_shape_error`;
     - `profiles_that_are_not_an_array_are_a_shape_error`;
     - `a_missing_key_is_empty`;
     - `theme_entries_name_the_path_and_cause`;
     - `a_word_with_nul_is_unquotable`.
-- [ ] 2.5 `has_font_family -> io::Result<bool>` (`src/win.rs`). `platform_has_family` keeps the family on `Err` and logs once per process.
-- [ ] 2.6 Shell:
+- [x] 2.5 `has_font_family -> io::Result<bool>` (`src/win.rs`). `platform_has_family` keeps the family on `Err` and logs once per process.
+- [x] 2.6 Shell:
   - `load_or_default` returns `(Config, ConfigReport)`, with a failed `write_default` as a finding.
   - `Settings` keeps `config_findings` and the precomputed `config_line`, built by `Settings::new` and by `reload_config` after `bind_keys`.
   - `Workspace::render` reads `config_line` in place of `config_error`.
   - `dump_active_screen` prints `--- config <escaped>` after the `--- fonts` line when there is one.
-- [ ] 2.7 The settings dialog:
+- [x] 2.7 The settings dialog:
   - `reload_entries` uses `theme_entries` and shows its message in the Theme section's error line;
   - the Profiles section's read-only text is `reading <path>: <error>`;
   - `NotFound` reads as an empty document;
   - the profile editor marks an unquotable field invalid and blocks Save.
 
   Unit test on the profile editor's pure model in `settings_dialog/profiles.rs`: `an_unquotable_argument_blocks_save`.
-- [ ] 2.8 e2e:
+- [x] 2.8 e2e:
   - Teach `tests/e2e/brindle.rs`'s dump parser the `--- config` line.
   - New case `reload-config-findings` (`tests/e2e/cases/reload.rs`):
     1. A config with `theme = "tokyonight"`, `font.size = 200` and `"ctrl-shift-y" = "split_zone_rihgt"`. The dump's `--- config` line names all three, and the active tab uses `brindle-dark`'s background (sampled as `reload-theme-attached` does).
     2. Fix the file while it runs. A later dump has no `--- config` line.
   - Extend `settings` (`tests/e2e/cases/settings.rs`): with `themes = 3`, the Theme section's error line names `themes`.
   - Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- reload settings`.
-- [ ] 2.9 Docs:
+- [x] 2.9 Docs:
   - CLAUDE.md: `--dump-screen-after`'s `--- config` line, and the `settings.rs` paragraph's config line;
   - the railway doc's "config and settings" row: the config line lists the findings.
 

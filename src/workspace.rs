@@ -2479,10 +2479,22 @@ fn profile_menu_trigger(focus: FocusHandle) -> impl Fn(bool, &mut Window, &mut A
 }
 
 /// The fonts in effect, preview included, for `--dump-screen-after`:
-/// `--- fonts terminal="…" ui="…"`, the families GPUI is asked for.
+/// `--- fonts terminal="…" ui="…"`, the families GPUI is asked for. The
+/// window's config line follows it when there is one.
 fn describe_fonts(cx: &App) -> String {
     let settings = Settings::get(cx);
-    format!("--- fonts terminal={:?} ui={:?}\n", settings.font().family.to_string(), settings.ui_font_family().to_string())
+    format!(
+        "--- fonts terminal={:?} ui={:?}\n{}",
+        settings.font().family.to_string(),
+        settings.ui_font_family().to_string(),
+        describe_config(settings.config_line.as_ref().map(|line| line.as_ref()))
+    )
+}
+
+/// The window's config line for `--dump-screen-after`: `--- config "TEXT"`,
+/// the text escaped onto one line, or nothing when the window shows none.
+fn describe_config(line: Option<&str>) -> String {
+    line.map_or_else(String::new, |line| format!("--- config {line:?}\n"))
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
@@ -2578,7 +2590,7 @@ impl Render for Workspace {
         let decorations = window.window_decorations();
         let inset = px(RESIZE_BORDER);
         let rounding = px(8.0);
-        let config_error = Settings::get(cx).config_error.clone();
+        let config_line = Settings::get(cx).config_line.clone();
 
         // While the settings dialog previews a theme, only the overlay
         // toggles act, so nothing (such as a new tab) changes underneath it.
@@ -2642,7 +2654,7 @@ impl Render for Workspace {
             })
             .on_mouse_move(|_, _, cx| cx.stop_propagation())
             .child(self.render_tab_bar(window, cx))
-            .when_some(config_error, |d, err| {
+            .when_some(config_line, |d, line| {
                 d.child(
                     div()
                         .flex_none()
@@ -2651,7 +2663,7 @@ impl Render for Workspace {
                         .text_xs()
                         .bg(theme.ansi[1].mix(theme.background, 0.6).hsla())
                         .text_color(theme.foreground.hsla())
-                        .child(SharedString::from(format!("Config error (using defaults): {err}"))),
+                        .child(line),
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))
@@ -2985,7 +2997,7 @@ mod tests {
             "[[profiles]]\nname = \"Shell\"\ncommand = \"bash\"\n\
              [[profiles]]\nname = \"htop\"\ncommand = \"htop\"\n[[profiles]]\nname = \"work\"\n",
         )
-        .unwrap();
+        .unwrap().config;
         let shortcuts = profile_shortcuts(config.profiles.len());
         let build = || profile_rows(&config.profiles, &shortcuts);
         let rows = build();
@@ -3019,7 +3031,7 @@ mod tests {
     #[test]
     fn only_the_first_nine_profiles_have_keys() {
         let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
-        let config = Config::parse(&toml).unwrap();
+        let config = Config::parse(&toml).unwrap().config;
         let entries = profile_menu_entries(profile_rows(&config.profiles, &profile_shortcuts(config.profiles.len())));
         assert_eq!(entries.len(), 11);
         for (ix, entry) in entries.iter().enumerate() {
@@ -3043,6 +3055,15 @@ mod tests {
             "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
+    }
+
+    #[test]
+    fn the_dump_prints_the_config_line_escaped_onto_one_line() {
+        assert_eq!(describe_config(None), "");
+        assert_eq!(
+            describe_config(Some("Config: unknown theme \"x\"\nfont.size 200")),
+            "--- config \"Config: unknown theme \\\"x\\\"\\nfont.size 200\"\n"
+        );
     }
 
     /// The first line `--- menu` prints for the menu of tab `ix` of `count`,

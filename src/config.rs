@@ -4,6 +4,7 @@
 //! file is written on first launch.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -12,6 +13,101 @@ use serde::Deserialize;
 use crate::theme::{Theme, builtin_theme};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../assets/default-config.toml");
+
+/// Something Brindle used in place of what the config file says, or ignored
+/// in it, though the file is otherwise valid. The window's config line lists
+/// each one, with what was used instead, until the file is fixed
+/// (`railway R10`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigFinding {
+    /// A theme name that is neither built in nor under `[themes]`: the
+    /// default theme is used. `profile` is the profile that names it, or
+    /// `None` for the global `theme`.
+    UnknownTheme { name: String, profile: Option<String> },
+    /// A value outside its range, clamped to `used`.
+    Clamped { key: &'static str, given: f32, used: f32 },
+    /// A removed key the file still sets, which is ignored. `hint` says what
+    /// to do instead.
+    Removed { key: String, profile: Option<String>, hint: Option<&'static str> },
+    /// The default file couldn't be written where the config belongs.
+    DefaultNotWritten { path: PathBuf, error: String },
+    /// A keybinding to a name that is no action: ignored.
+    UnknownAction { keys: String, action: String },
+    /// A keybinding whose keys can't be parsed: ignored.
+    InvalidKeys { keys: String, error: String },
+}
+
+impl fmt::Display for ConfigFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTheme { name, profile } => {
+                write!(f, "unknown theme {name:?}")?;
+                if let Some(profile) = profile {
+                    write!(f, " (profile {profile})")?;
+                }
+                write!(f, ", using {DEFAULT_THEME}")
+            }
+            Self::Clamped { key, given, used } => write!(f, "{key} {given} is out of range, using {used}"),
+            Self::Removed { key, profile, hint } => {
+                if let Some(profile) = profile {
+                    write!(f, "profile {profile:?}: ")?;
+                }
+                write!(f, "{key} is ignored")?;
+                match hint {
+                    Some(hint) => write!(f, ": {hint}"),
+                    None => Ok(()),
+                }
+            }
+            Self::DefaultNotWritten { path, error } => {
+                write!(f, "the default config could not be written to {}: {error}", path.display())
+            }
+            Self::UnknownAction { keys, action } => {
+                write!(f, "keybinding {keys:?} names an unknown action {action:?}, ignored")
+            }
+            Self::InvalidKeys { keys, error } => write!(f, "keybinding {keys:?} is invalid ({error}), ignored"),
+        }
+    }
+}
+
+/// The theme an unknown name falls back to.
+const DEFAULT_THEME: &str = "brindle-dark";
+
+/// A parsed config and what was used in place of the file's own values.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    pub config: Config,
+    pub findings: Vec<ConfigFinding>,
+}
+
+/// What loading the config left to say: the error that made the defaults
+/// apply, and the findings of a file that did load (or of the defaults).
+#[derive(Debug, Clone, Default)]
+pub struct ConfigReport {
+    pub error: Option<String>,
+    pub findings: Vec<ConfigFinding>,
+}
+
+/// The text of the window's config line, or `None` when there is nothing to
+/// say. An error gives the banner's text with the findings after it;
+/// otherwise the findings follow `Config: `. `notices` are window notices
+/// that aren't about the config (Brindle can't save its session, say), and
+/// come last.
+pub fn config_line(error: Option<&str>, findings: &[ConfigFinding], notices: &[String]) -> Option<String> {
+    let found = findings.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let mut line = match (error, found.is_empty()) {
+        (Some(error), true) => format!("Config error (using defaults): {error}"),
+        (Some(error), false) => format!("Config error (using defaults): {error}; {found}"),
+        (None, false) => format!("Config: {found}"),
+        (None, true) => String::new(),
+    };
+    for notice in notices {
+        if !line.is_empty() {
+            line.push_str("; ");
+        }
+        line.push_str(notice);
+    }
+    (!line.is_empty()).then_some(line)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -32,14 +128,14 @@ pub struct Config {
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
     /// The removed `restore_session` key, still accepted so old configs
-    /// load: restoring is always on now. Parsing logs that it's ignored.
+    /// load: restoring is always on now. Parsing reports that it's ignored.
     #[serde(rename = "restore_session")]
     removed_restore_session: Option<serde::de::IgnoredAny>,
     /// Draw a red bar beside prompts whose command failed (needs shell
     /// integration; see `shell-integration/`).
     pub mark_failed_commands: bool,
     /// The removed `tmux_session_end` key, still accepted (whatever its
-    /// value) so old configs load. Parsing logs that it's ignored.
+    /// value) so old configs load. Parsing reports that it's ignored.
     #[serde(rename = "tmux_session_end")]
     removed_tmux_session_end: Option<toml::Value>,
     /// Desktop notifications from bells and OSC 9/777.
@@ -249,7 +345,7 @@ pub struct Profile {
     /// Font size override.
     pub font_size: Option<f32>,
     /// The removed `tmux`, `tmux_session` and `tmux_args` keys, still
-    /// accepted (whatever their values) so old configs load. Parsing logs
+    /// accepted (whatever their values) so old configs load. Parsing reports
     /// that each is ignored.
     #[serde(rename = "tmux")]
     pub(crate) removed_tmux: Option<toml::Value>,
@@ -310,26 +406,38 @@ impl Config {
     }
 
     /// Loads the config, writing the default file if none exists. Errors in
-    /// the file are logged and the defaults are used instead, so a typo never
-    /// prevents the terminal from starting.
-    pub fn load_or_default() -> (Self, Option<String>) {
-        let path = Self::path();
+    /// the file are reported and the defaults are used instead, so a typo
+    /// never prevents the terminal from starting. The report is what the
+    /// window's config line says (`configuration`).
+    pub fn load_or_default() -> (Self, ConfigReport) {
+        Self::load_or_default_at(&Self::path())
+    }
+
+    /// [`Config::load_or_default`] for the file at `path`.
+    fn load_or_default_at(path: &Path) -> (Self, ConfigReport) {
+        let mut findings = Vec::new();
         if !path.exists()
-            && let Err(err) = write_default(&path)
+            && let Err(err) = write_default(path)
         {
-            log::warn!("could not write default config to {}: {err:#}", path.display());
+            findings.push(ConfigFinding::DefaultNotWritten { path: path.to_path_buf(), error: format!("{err:#}") });
         }
-        match Self::load(&path) {
-            Ok(config) => (config, None),
+        match Self::load(path) {
+            Ok(Loaded { config, findings: found }) => {
+                findings.extend(found);
+                findings.extend(config.findings());
+                (config, ConfigReport { error: None, findings })
+            }
             Err(err) => {
                 let message = format!("{err:#}");
                 log::error!("{message}");
-                (Self::default().normalized(), Some(message))
+                let (config, clamped) = Self::default().normalized();
+                findings.extend(clamped);
+                (config, ConfigReport { error: Some(message), findings })
             }
         }
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path) -> Result<Loaded> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -338,55 +446,71 @@ impl Config {
         Self::parse(&text).with_context(|| format!("invalid config {}", path.display()))
     }
 
-    pub fn parse(text: &str) -> Result<Self> {
+    /// Parses `text`: the config, with what was clamped and the removed keys
+    /// it still sets as findings. Unknown themes are [`Config::findings`].
+    pub fn parse(text: &str) -> Result<Loaded> {
         let config: Self = toml::from_str(text)?;
-        if config.has_removed_restore_session() {
-            log::warn!("restore_session is no longer a setting and is ignored: Brindle always restores (--no-restore skips it once)");
-        }
-        for warning in config.removed_tmux_warnings() {
-            log::warn!("{warning}");
-        }
-        Ok(config.normalized())
+        let mut findings = config.removed_findings();
+        let (config, clamped) = config.normalized();
+        findings.extend(clamped);
+        Ok(Loaded { config, findings })
     }
 
-    /// Whether the file still sets the removed `restore_session` key.
-    pub fn has_removed_restore_session(&self) -> bool {
-        self.removed_restore_session.is_some()
-    }
-
-    /// One warning for each removed tmux key the file still sets: the
-    /// top-level `tmux_session_end`, and each profile's `tmux`,
+    /// One finding for each removed key the file still sets: `restore_session`
+    /// and `tmux_session_end` at the top, and each profile's `tmux`,
     /// `tmux_session` and `tmux_args` (naming the profile).
-    fn removed_tmux_warnings(&self) -> Vec<String> {
+    fn removed_findings(&self) -> Vec<ConfigFinding> {
         const GONE: &str = "Brindle no longer has tmux support";
-        let mut warnings = Vec::new();
+        const TMUX: &str = "Brindle no longer has tmux support; to run tmux in its tabs, set command = \"tmux\" and args = [\"new-session\", \"-A\", \"-s\", \"main\"]";
+        let mut found = Vec::new();
+        if self.removed_restore_session.is_some() {
+            found.push(ConfigFinding::Removed {
+                key: "restore_session".into(),
+                profile: None,
+                hint: Some("it is no longer a setting: Brindle always restores (--no-restore skips it once)"),
+            });
+        }
         if self.removed_tmux_session_end.is_some() {
-            warnings.push(format!("tmux_session_end is ignored: {GONE}"));
+            found.push(ConfigFinding::Removed { key: "tmux_session_end".into(), profile: None, hint: Some(GONE) });
         }
         for profile in &self.profiles {
             let keys = [
-                ("tmux", &profile.removed_tmux),
-                ("tmux_session", &profile.removed_tmux_session),
-                ("tmux_args", &profile.removed_tmux_args),
+                ("tmux", &profile.removed_tmux, TMUX),
+                ("tmux_session", &profile.removed_tmux_session, GONE),
+                ("tmux_args", &profile.removed_tmux_args, GONE),
             ];
-            for (key, value) in keys {
-                if value.is_none() {
-                    continue;
+            for (key, value, hint) in keys {
+                if value.is_some() {
+                    found.push(ConfigFinding::Removed {
+                        key: key.into(),
+                        profile: Some(profile.name.clone()),
+                        hint: Some(hint),
+                    });
                 }
-                let mut warning = format!("profile {:?}: {key} is ignored: {GONE}", profile.name);
-                if key == "tmux" {
-                    warning.push_str(
-                        "; to run tmux in its tabs, set command = \"tmux\" and args = [\"new-session\", \"-A\", \"-s\", \"main\"]",
-                    );
-                }
-                warnings.push(warning);
             }
         }
-        warnings
+        found
     }
 
-    /// Ensures there is at least one profile and that names are usable.
-    fn normalized(mut self) -> Self {
+    /// The unknown themes the config names: the global one, and each
+    /// profile's. Their tabs use the default theme ([`Config::theme`]).
+    pub fn findings(&self) -> Vec<ConfigFinding> {
+        let known = |name: &str| self.themes.contains_key(name) || builtin_theme(name).is_some();
+        let mut found = Vec::new();
+        if !known(&self.theme) {
+            found.push(ConfigFinding::UnknownTheme { name: self.theme.clone(), profile: None });
+        }
+        for profile in &self.profiles {
+            if let Some(name) = profile.theme.as_deref().filter(|name| !known(name)) {
+                found.push(ConfigFinding::UnknownTheme { name: name.into(), profile: Some(profile.name.clone()) });
+            }
+        }
+        found
+    }
+
+    /// Ensures there is at least one profile and that names are usable, and
+    /// clamps the font's size and line height, returning each clamp.
+    fn normalized(mut self) -> (Self, Vec<ConfigFinding>) {
         if self.profiles.is_empty() {
             self.profiles.push(Profile::default_shell());
         }
@@ -395,9 +519,18 @@ impl Config {
                 profile.name = format!("Profile {}", ix + 1);
             }
         }
-        self.font.size = self.font.size.clamp(4.0, 96.0);
-        self.font.line_height = self.font.line_height.clamp(0.8, 3.0);
-        self
+        let mut clamped = Vec::new();
+        let size = self.font.size.clamp(4.0, 96.0);
+        if size != self.font.size {
+            clamped.push(ConfigFinding::Clamped { key: "font.size", given: self.font.size, used: size });
+        }
+        let line_height = self.font.line_height.clamp(0.8, 3.0);
+        if line_height != self.font.line_height {
+            clamped.push(ConfigFinding::Clamped { key: "font.line_height", given: self.font.line_height, used: line_height });
+        }
+        self.font.size = size;
+        self.font.line_height = line_height;
+        (self, clamped)
     }
 
     pub fn default_profile_index(&self) -> usize {
@@ -419,21 +552,22 @@ impl Config {
         self.theme(profile.theme.as_deref())
     }
 
+    /// The theme `name` (or the global one) names. Every name it is given
+    /// comes from the config, whose unknown names are
+    /// [`Config::findings`], so the default theme it falls back to is one
+    /// the window reports.
     pub fn theme(&self, name: Option<&str>) -> Theme {
         let name = name.unwrap_or(&self.theme);
         if let Some(theme) = self.themes.get(name) {
             return theme.clone();
         }
-        builtin_theme(name).unwrap_or_else(|| {
-            log::warn!("unknown theme {name:?}, using brindle-dark");
-            Theme::default()
-        })
+        builtin_theme(name).unwrap_or_default()
     }
 }
 
 fn write_default(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     write_replacing(path, DEFAULT_CONFIG)?;
     Ok(())
@@ -475,6 +609,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The config `text` parses to, without its findings.
+    fn parsed(text: &str) -> Result<Config> {
+        Config::parse(text).map(|loaded| loaded.config)
+    }
+
+    /// The findings of parsing `text`, then of its config's themes.
+    fn findings_of(text: &str) -> Vec<ConfigFinding> {
+        let loaded = Config::parse(text).unwrap();
+        let mut findings = loaded.findings;
+        findings.extend(loaded.config.findings());
+        findings
     }
 
     /// The names of the files in `dir`, sorted.
@@ -522,25 +669,25 @@ mod tests {
 
     #[test]
     fn default_config_file_parses() {
-        let config = Config::parse(DEFAULT_CONFIG).unwrap();
+        let config = parsed(DEFAULT_CONFIG).unwrap();
         assert!(!config.profiles.is_empty());
         assert_eq!(config.profiles[config.default_profile_index()].name, "Shell");
     }
 
     #[test]
     fn ui_font_takes_a_family_list_and_nothing_else() {
-        let config = Config::parse("[ui_font]\nfamily = [\"Inter\", \"Segoe UI\"]").unwrap();
+        let config = parsed("[ui_font]\nfamily = [\"Inter\", \"Segoe UI\"]").unwrap();
         assert_eq!(config.ui_font.family, ["Inter", "Segoe UI"]);
-        let err = Config::parse("[ui_font]\nsize = 12").unwrap_err();
+        let err = parsed("[ui_font]\nsize = 12").unwrap_err();
         assert!(format!("{err:#}").contains("size"), "{err:#}");
         // Without the table the list is empty, so the built-in list applies.
-        assert!(Config::parse("").unwrap().ui_font.family.is_empty());
-        assert!(Config::parse(DEFAULT_CONFIG).unwrap().ui_font.family.is_empty());
+        assert!(parsed("").unwrap().ui_font.family.is_empty());
+        assert!(parsed(DEFAULT_CONFIG).unwrap().ui_font.family.is_empty());
     }
 
     #[test]
     fn empty_config_gets_a_shell_profile() {
-        let config = Config::parse("").unwrap();
+        let config = parsed("").unwrap();
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(config.profiles[0].name, "Shell");
         assert_eq!(config.theme, "brindle-dark");
@@ -548,7 +695,7 @@ mod tests {
 
     #[test]
     fn profiles_and_overrides() {
-        let config = Config::parse(
+        let config = parsed(
             r##"
             default_profile = "work"
             theme = "mine"
@@ -597,7 +744,7 @@ mod tests {
 
     #[test]
     fn remote_profiles() {
-        let config = Config::parse(
+        let config = parsed(
             r##"
             [[profiles]]
             name = "A8"
@@ -634,7 +781,7 @@ mod tests {
         assert_eq!(config.profiles[0].description(), "ssh:A8 · default shell");
         assert_eq!(config.profiles[1].description(), "container:rust-box · default shell");
         assert_eq!(config.profiles[0].working_directory(Some(Path::new("/home/u"))), Some(PathBuf::from("~/src")));
-        assert!(Config::parse(
+        assert!(parsed(
             "[[profiles]]\nname = \"bad\"\nremote = { type = \"ssh\", host = \"A8\", password = \"secret\" }"
         )
         .is_err());
@@ -644,7 +791,7 @@ mod tests {
     /// isn't part of the endpoint.
     #[test]
     fn remote_targets_may_connect_at_launch() {
-        let config = Config::parse(
+        let config = parsed(
             r##"
             [[profiles]]
             name = "A8"
@@ -683,7 +830,7 @@ mod tests {
                 connect_at_launch: false,
             }
         );
-        assert!(Config::parse(
+        assert!(parsed(
             "[[profiles]]\nname = \"bad\"\nremote = { type = \"container\", container = \"c\", connect_at_launch = 1 }"
         )
         .is_err());
@@ -710,7 +857,7 @@ mod tests {
                 _ => {}
             }
         }
-        let config = Config::parse(&toml).unwrap();
+        let config = parsed(&toml).unwrap();
         let remotes: Vec<(&str, &str, bool)> = config
             .profiles
             .iter()
@@ -738,22 +885,24 @@ mod tests {
 
     #[test]
     fn the_removed_restore_session_key_still_loads() {
-        assert!(!Config::parse("").unwrap().has_removed_restore_session());
-        assert!(!Config::parse(DEFAULT_CONFIG).unwrap().has_removed_restore_session());
+        assert!(findings_of("").is_empty());
+        assert!(findings_of(DEFAULT_CONFIG).is_empty());
         assert!(!DEFAULT_CONFIG.contains("restore_session"));
-        // Any old value loads, with no error for the banner.
+        // Any old value loads, with no error for the banner, and a finding.
         for old in ["restore_session = true", "restore_session = false"] {
-            assert!(Config::parse(old).unwrap().has_removed_restore_session(), "{old}");
+            let findings = findings_of(old);
+            assert!(
+                matches!(findings.as_slice(), [ConfigFinding::Removed { key, profile: None, .. }] if key == "restore_session"),
+                "{old}: {findings:?}"
+            );
         }
     }
 
     #[test]
     fn the_removed_tmux_keys_still_load() {
-        assert!(Config::parse("").unwrap().removed_tmux_warnings().is_empty());
-        // Any old value loads, with no error for the banner, and one warning
+        // Any old value loads, with no error for the banner, and one finding
         // per key; profile keys name their profile.
-        let config = Config::parse(
-            r#"
+        let text = r#"
             tmux_session_end = 7
 
             [[profiles]]
@@ -761,52 +910,173 @@ mod tests {
             tmux = "plain"
             tmux_session = ["not", "a", "name"]
             tmux_args = { odd = true }
-            "#,
-        )
-        .unwrap();
-        let warnings = config.removed_tmux_warnings();
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
-        assert!(warnings[0].starts_with("tmux_session_end is ignored"), "{warnings:?}");
-        for (warning, key) in warnings[1..].iter().zip(["tmux", "tmux_session", "tmux_args"]) {
-            assert!(warning.starts_with(&format!("profile \"work\": {key} is ignored")), "{warning}");
+            "#;
+        let findings = findings_of(text);
+        let lines: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("tmux_session_end is ignored"), "{lines:?}");
+        for (line, key) in lines[1..].iter().zip(["tmux", "tmux_session", "tmux_args"]) {
+            assert!(line.starts_with(&format!("profile \"work\": {key} is ignored")), "{line}");
         }
-        assert!(warnings[1].contains("command = \"tmux\""), "{}", warnings[1]);
+        assert!(lines[1].contains("command = \"tmux\""), "{}", lines[1]);
         // The profile runs the default shell, not tmux.
-        let work = &config.profiles[0];
+        let work = &parsed(text).unwrap().profiles[0];
         assert_eq!(work.command, None);
         assert_eq!(work.description(), "default shell");
         for old in ["tmux_session_end = \"ask\"", "tmux_session_end = \"shell\""] {
-            assert_eq!(Config::parse(old).unwrap().removed_tmux_warnings().len(), 1, "{old}");
+            assert_eq!(findings_of(old).len(), 1, "{old}");
         }
+    }
+
+    #[test]
+    fn a_removed_key_is_a_finding() {
+        let findings = findings_of("restore_session = true\n[[profiles]]\nname = \"w\"\ntmux = 1");
+        let lines: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("restore_session is ignored: "), "{lines:?}");
+        assert!(lines[1].starts_with("profile \"w\": tmux is ignored: "), "{lines:?}");
+    }
+
+    #[test]
+    fn a_valid_config_has_no_findings() {
+        assert!(findings_of("").is_empty());
+        assert!(findings_of(DEFAULT_CONFIG).is_empty());
+        assert!(findings_of("theme = \"mine\"\n[themes.mine]\nbackground = \"#000000\"").is_empty());
+        assert!(findings_of("[font]\nsize = 4\nline_height = 3.0").is_empty());
+        assert!(findings_of("[[profiles]]\nname = \"w\"\ntheme = \"tokyo-night\"").is_empty());
+    }
+
+    #[test]
+    fn a_clamped_font_size_is_a_finding() {
+        let loaded = Config::parse("[font]\nsize = 200").unwrap();
+        assert_eq!(loaded.config.font.size, 96.0);
+        assert_eq!(loaded.findings, [ConfigFinding::Clamped { key: "font.size", given: 200.0, used: 96.0 }]);
+        assert_eq!(loaded.findings[0].to_string(), "font.size 200 is out of range, using 96");
+        let loaded = Config::parse("[font]\nsize = 1").unwrap();
+        assert_eq!(loaded.findings, [ConfigFinding::Clamped { key: "font.size", given: 1.0, used: 4.0 }]);
+    }
+
+    #[test]
+    fn a_clamped_line_height_is_a_finding() {
+        let loaded = Config::parse("[font]\nline_height = 9.5").unwrap();
+        assert_eq!(loaded.config.font.line_height, 3.0);
+        assert_eq!(loaded.findings, [ConfigFinding::Clamped { key: "font.line_height", given: 9.5, used: 3.0 }]);
+        assert_eq!(loaded.findings[0].to_string(), "font.line_height 9.5 is out of range, using 3");
+    }
+
+    #[test]
+    fn an_unknown_theme_is_a_finding() {
+        let loaded = Config::parse("theme = \"tokyonight\"").unwrap();
+        assert_eq!(loaded.config.findings(), [ConfigFinding::UnknownTheme { name: "tokyonight".into(), profile: None }]);
+        assert_eq!(loaded.config.findings()[0].to_string(), "unknown theme \"tokyonight\", using brindle-dark");
+    }
+
+    #[test]
+    fn an_unknown_profile_theme_names_the_profile() {
+        let config = parsed("[[profiles]]\nname = \"Work\"\ntheme = \"gruvbox\"\n[[profiles]]\nname = \"Ok\"\ntheme = \"gruvbox-dark\"")
+            .unwrap();
+        let findings = config.findings();
+        assert_eq!(findings, [ConfigFinding::UnknownTheme { name: "gruvbox".into(), profile: Some("Work".into()) }]);
+        assert_eq!(findings[0].to_string(), "unknown theme \"gruvbox\" (profile Work), using brindle-dark");
+    }
+
+    #[test]
+    fn each_finding_says_what_was_used() {
+        let findings = [
+            ConfigFinding::UnknownTheme { name: "x".into(), profile: None },
+            ConfigFinding::Clamped { key: "font.size", given: 200.0, used: 96.0 },
+            ConfigFinding::DefaultNotWritten { path: PathBuf::from("/c/config.toml"), error: "denied".into() },
+        ];
+        let lines: Vec<String> = findings.iter().map(ToString::to_string).collect();
+        assert!(lines[0].ends_with("using brindle-dark"), "{}", lines[0]);
+        assert!(lines[1].ends_with("using 96"), "{}", lines[1]);
+        assert!(lines[2].contains("/c/config.toml") && lines[2].ends_with("denied"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn no_error_and_no_findings_is_no_line() {
+        assert_eq!(config_line(None, &[], &[]), None);
+    }
+
+    #[test]
+    fn findings_are_joined_after_an_error() {
+        let findings = [
+            ConfigFinding::Clamped { key: "font.size", given: 200.0, used: 96.0 },
+            ConfigFinding::UnknownTheme { name: "x".into(), profile: None },
+        ];
+        assert_eq!(
+            config_line(Some("bad key"), &findings, &[]).as_deref(),
+            Some("Config error (using defaults): bad key; font.size 200 is out of range, using 96; unknown theme \"x\", using brindle-dark")
+        );
+        assert_eq!(
+            config_line(None, &findings, &[]).as_deref(),
+            Some("Config: font.size 200 is out of range, using 96; unknown theme \"x\", using brindle-dark")
+        );
+        assert_eq!(config_line(Some("bad key"), &[], &[]).as_deref(), Some("Config error (using defaults): bad key"));
+    }
+
+    #[test]
+    fn notices_come_last() {
+        let findings = [ConfigFinding::UnknownTheme { name: "x".into(), profile: None }];
+        let notices = ["can't save".to_string()];
+        assert_eq!(
+            config_line(None, &findings, &notices).as_deref(),
+            Some("Config: unknown theme \"x\", using brindle-dark; can't save")
+        );
+        assert_eq!(
+            config_line(Some("e"), &findings, &notices).as_deref(),
+            Some("Config error (using defaults): e; unknown theme \"x\", using brindle-dark; can't save")
+        );
+        // A notice alone isn't a config problem: no `Config:` prefix.
+        assert_eq!(config_line(None, &[], &notices).as_deref(), Some("can't save"));
+    }
+
+    #[test]
+    fn a_default_that_cant_be_written_is_a_finding() {
+        let dir = temp_dir("default-unwritable");
+        // The temp file `write_replacing` makes beside the config is a
+        // directory, so the write fails while the file reads as missing
+        // (a read-only directory would do, but not for root).
+        let path = dir.join("config.toml");
+        std::fs::create_dir(dir.join(format!("config.toml.{}.tmp", std::process::id()))).unwrap();
+        let (config, report) = Config::load_or_default_at(&path);
+        assert_eq!(report.error, None);
+        assert_eq!(config.theme, "brindle-dark");
+        assert!(
+            matches!(report.findings.as_slice(), [ConfigFinding::DefaultNotWritten { path: p, .. }] if *p == path),
+            "{:?}",
+            report.findings
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn notification_settings() {
-        let config = Config::parse("").unwrap();
+        let config = parsed("").unwrap();
         assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
         assert!(config.notifications.osc7501);
-        let config = Config::parse("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
+        let config = parsed("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
         assert!(!config.notifications.bell);
         assert!(config.notifications.osc9);
         assert!(!config.notifications.osc7501);
         assert_eq!(config.notifications.when, NotifyWhen::Always);
-        assert!(Config::parse("[notifications]\nwhen = \"sometimes\"").is_err());
-        assert!(Config::parse("[notifications]\nsound = true").is_err());
+        assert!(parsed("[notifications]\nwhen = \"sometimes\"").is_err());
+        assert!(parsed("[notifications]\nsound = true").is_err());
     }
 
     #[test]
     fn unknown_keys_are_errors() {
-        assert!(Config::parse("fontsize = 3").is_err());
+        assert!(parsed("fontsize = 3").is_err());
         // Only the removed keys' exact names are tolerated.
-        let err = Config::parse("tmux_sesion_end = \"ask\"").unwrap_err();
+        let err = parsed("tmux_sesion_end = \"ask\"").unwrap_err();
         assert!(format!("{err:#}").contains("tmux_sesion_end"), "{err:#}");
-        assert!(Config::parse("[[profiles]]\nname = \"x\"\ntmux_sesion = \"x\"").is_err());
+        assert!(parsed("[[profiles]]\nname = \"x\"\ntmux_sesion = \"x\"").is_err());
     }
 
     #[test]
     fn unknown_theme_falls_back() {
-        let config = Config::parse("theme = \"nope\"").unwrap();
+        let config = parsed("theme = \"nope\"").unwrap();
         let theme = config.theme(None);
         assert_eq!(theme.background, builtin_theme("brindle-dark").unwrap().background);
     }
