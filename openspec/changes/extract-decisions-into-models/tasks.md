@@ -108,7 +108,7 @@ Behaviour doesn't change. Existing unit, real-process and e2e tests pass unmodif
 - [x] 5.2 `Session`'s `Phase { Starting(Queued), Left(Leaving), Running, Gone }` and `Queued::into_ops`. The `_ => None` arms name every variant. Verify with unit tests of the hand-over order and of a session left while starting (b26's `session.rs:31-283`).
 - [x] 5.3 `SpawnRequest.command: Option<String>`, mapped at encode, and `spawn_request` matches on it. Verify with a unit test that the encoded bytes are unchanged for `None` and `Some` (b26 #2, b28 #7).
 - [x] 5.4 `spawn_request` takes `home` and an `is_dir` probe, and its test drops the `/var/log` path. Verify with `cargo test --locked -p brindle terminal::` (b28 #4).
-- [ ] 5.5 Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server` that tabs that exit, are lost or fail still show today's lines.
+- [x] 5.5 Verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- local-server` that tabs that exit, are lost or fail still show today's lines.
 
 ## 6. Workspace
 
