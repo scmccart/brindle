@@ -24,9 +24,11 @@ mod common;
 mod capture;
 mod cases;
 mod query;
+mod switches;
 mod wait;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 #[cfg(windows)]
@@ -36,6 +38,7 @@ use common::server::{Suite, check_helper, end_roles, helper, helper_name, privat
 use common::winproc;
 use common::{Selection, take_shard};
 pub use common::Result;
+use switches::{Listing, Readiness, SwitchHost, TestSwitch};
 pub use wait::Scale;
 
 pub enum Outcome {
@@ -47,12 +50,35 @@ pub struct Case {
     pub name: &'static str,
     /// Runs Brindle, so it needs an X display.
     pub display: bool,
+    /// The fault switches the case sets, which its binaries must list
+    /// (`--list-fault-switches`) for it to run (`testing R18`).
+    pub needs: &'static [TestSwitch],
     pub run: fn(&Ctx) -> Result<Outcome>,
+}
+
+impl Case {
+    /// A case that opens windows and needs no switch.
+    pub fn display(name: &'static str, run: fn(&Ctx) -> Result<Outcome>) -> Self {
+        Case { name, display: true, needs: &[], run }
+    }
+
+    /// A case that opens no window.
+    pub fn headless(name: &'static str, run: fn(&Ctx) -> Result<Outcome>) -> Self {
+        Case { name, display: false, needs: &[], run }
+    }
+
+    /// A case that opens windows and sets the fault switches `needs`.
+    pub fn needing(name: &'static str, needs: &'static [TestSwitch], run: fn(&Ctx) -> Result<Outcome>) -> Self {
+        Case { name, display: true, needs, run }
+    }
 }
 
 /// What a case gets from the runner.
 pub struct Ctx {
     pub name: &'static str,
+    /// The fault switches the case declared ([`Case::needs`]); `Run::env`
+    /// refuses any other `BRINDLE_TEST_*` variable.
+    pub needs: &'static [TestSwitch],
     /// Scratch and artifact directory for this case, emptied before it runs.
     pub dir: PathBuf,
     pub bin: PathBuf,
@@ -142,11 +168,21 @@ fn main() {
         }
     }
 
+    let required = std::env::var("BRINDLE_E2E_SWITCHES_REQUIRED").as_deref() == Ok("1");
+    let mut probes = Probes::new(&bin, &helper, &root, &display, Scale::new(slow));
+
     let (mut passed, mut failed, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (n, case) in selected.into_iter().enumerate() {
         let started = Instant::now();
+        // Before the case's directories are filled, so no window opens for
+        // a case whose binary lacks a switch it needs.
+        let ready = if case.display && !has_display { Readiness::Run } else { probes.readiness(case.needs, required) };
         let outcome = if case.display && !has_display {
             Ok(Outcome::Skip(format!("no X display at {display}")))
+        } else if let Readiness::Skip(why) = ready {
+            Ok(Outcome::Skip(why))
+        } else if let Readiness::Fail(why) = ready {
+            Err(why)
         } else {
             let dir = root.join(case.name);
             let server_dir = private_dir(Suite::E2e, &dir, n);
@@ -158,6 +194,7 @@ fn main() {
             std::fs::create_dir_all(&dir).expect("case directory");
             let ctx = Ctx {
                 name: case.name,
+                needs: case.needs,
                 dir,
                 bin: bin.clone(),
                 helper: helper.clone(),
@@ -200,6 +237,89 @@ fn main() {
     }
 }
 
+/// What the binaries under test say they honour (`--list-fault-switches`),
+/// asked lazily and once per run: a host is probed only when a selected
+/// case needs one of its switches.
+struct Probes<'a> {
+    bin: &'a Path,
+    helper: &'a Path,
+    scratch: PathBuf,
+    display: &'a str,
+    scale: Scale,
+    brindle: Option<Listing>,
+    helper_listing: Option<Listing>,
+}
+
+impl<'a> Probes<'a> {
+    fn new(bin: &'a Path, helper: &'a Path, root: &Path, display: &'a str, scale: Scale) -> Self {
+        Probes { bin, helper, scratch: root.join("probe"), display, scale, brindle: None, helper_listing: None }
+    }
+
+    /// Whether a case needing `needs` can run, probing the hosts it needs.
+    fn readiness(&mut self, needs: &[TestSwitch], required: bool) -> Readiness {
+        let wants = |host| needs.iter().any(|switch| switch.host() == host);
+        if wants(SwitchHost::Brindle) && self.brindle.is_none() {
+            self.brindle = Some(self.probe(self.bin, "brindle"));
+        }
+        if wants(SwitchHost::Helper) && self.helper_listing.is_none() {
+            self.helper_listing = Some(self.probe(self.helper, "helper"));
+        }
+        let unasked = |binary: &Path| Listing::unasked(binary);
+        let brindle = self.brindle.clone().unwrap_or_else(|| unasked(self.bin));
+        let helper = self.helper_listing.clone().unwrap_or_else(|| unasked(self.helper));
+        switches::readiness(needs, &brindle, &helper, required)
+    }
+
+    /// Runs `binary --list-fault-switches` isolated, killed past 10 s
+    /// (stretched), with its output in the probe's scratch directory.
+    fn probe(&self, binary: &Path, label: &str) -> Listing {
+        let switches = self.ask(binary, label);
+        Listing { binary: binary.to_path_buf(), switches }
+    }
+
+    fn ask(&self, binary: &Path, label: &str) -> Result<std::collections::BTreeSet<String>> {
+        let dir = self.scratch.join(label);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        let (out_path, err_path) = (dir.join("stdout"), dir.join("stderr"));
+        let file = |path: &Path| std::fs::File::create(path).map_err(|e| format!("creating {}: {e}", path.display()));
+        let mut command = Command::new(binary);
+        common::server::isolate(
+            &mut command,
+            &common::server::Isolation {
+                config: &dir.join("config.toml"),
+                state_dir: &dir.join("state"),
+                server_dir: &dir.join("server"),
+                display: self.display,
+            },
+        );
+        let mut child = command
+            .arg("--list-fault-switches")
+            .stdin(Stdio::null())
+            .stdout(file(&out_path)?)
+            .stderr(file(&err_path)?)
+            .spawn()
+            .map_err(|e| format!("couldn't run {} --list-fault-switches: {e}", binary.display()))?;
+        let exited = self.scale.poll(10.0, &format!("{} --list-fault-switches exiting", binary.display()), || {
+            child.try_wait().map_err(|e| e.to_string())
+        });
+        let status = match exited {
+            Ok(status) => status,
+            Err(why) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(why);
+            }
+        };
+        if !status.success() {
+            let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+            return Err(format!("{} --list-fault-switches exited with {status}: {}", binary.display(), stderr.trim()));
+        }
+        let text = std::fs::read_to_string(&out_path).map_err(|e| format!("reading {}: {e}", out_path.display()))?;
+        Ok(switches::parse_listing(&text))
+    }
+}
+
 fn usage(why: &str) -> ! {
     eprintln!("e2e: {why}");
     std::process::exit(2);
@@ -221,6 +341,7 @@ fn self_test() -> i32 {
         ("pixel scans", capture::self_test_scan),
         ("remote parsing", cases::self_test_remote),
         ("server helpers", common::server::self_test),
+        ("fault switches", switches::self_test),
         #[cfg(windows)]
         ("windows processes", winproc::self_test),
         #[cfg(windows)]
