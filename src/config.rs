@@ -226,6 +226,24 @@ pub enum RightClick {
     Paste,
 }
 
+impl RightClick {
+    /// `right_click`'s value for it, as the config file spells it.
+    pub fn word(self) -> &'static str {
+        match self {
+            RightClick::Nothing => "none",
+            RightClick::Paste => "paste",
+        }
+    }
+
+    /// The value `word` names, read as a load reads `right_click`, or
+    /// `None` for a word it refuses.
+    pub fn from_word(word: &str) -> Option<Self> {
+        use serde::de::IntoDeserializer as _;
+        let word: serde::de::value::StrDeserializer<'_, serde::de::value::Error> = word.into_deserializer();
+        Self::deserialize(word).ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CursorShapeConfig {
@@ -1192,6 +1210,19 @@ mod tests {
         assert_eq!(parsed("").unwrap().right_click, RightClick::Nothing);
         assert_eq!(parsed("right_click = \"none\"").unwrap().right_click, RightClick::Nothing);
         assert_eq!(parsed("right_click = \"paste\"").unwrap().right_click, RightClick::Paste);
+    }
+
+    /// Each value's word is the one a load reads back as it, and the words
+    /// a load refuses are none.
+    #[test]
+    fn right_click_words_read_back_as_their_values() {
+        for value in [RightClick::Nothing, RightClick::Paste] {
+            assert_eq!(RightClick::from_word(value.word()), Some(value));
+            let config = parsed(&format!("right_click = {:?}", value.word())).unwrap();
+            assert_eq!(config.right_click, value);
+        }
+        assert_eq!(RightClick::from_word("menu"), None);
+        assert_eq!(RightClick::from_word("Paste"), None);
     }
 
     #[test]

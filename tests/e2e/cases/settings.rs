@@ -1,7 +1,8 @@
-//! The settings dialog: it opens on Profiles, the first of its three
-//! sections (Profiles, Theme, Fonts); a theme previews on the tabs behind
-//! it, cancel puts the old theme back, and apply writes it to the config.
-//! The Fonts section's cases are in `fonts.rs`.
+//! The settings dialog: it opens on Profiles, the first of its four
+//! sections (Profiles, Theme, Fonts, Clipboard); a theme previews on the
+//! tabs behind it, cancel puts the old theme back, and apply writes it to
+//! the config. The Fonts section's cases are in `fonts.rs`, the Clipboard
+//! section's in `clipboard.rs`.
 //!
 //! The test config's custom themes list as `e2e` (active) then `e2e-alt`,
 //! after the built-ins, so one `settings_down` selects `e2e-alt`. Its one
@@ -183,8 +184,9 @@ pub fn profile_rename(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// The dialog opens on Profiles with the profile list focused, and has
-/// three sections: ctrl-tab shows Theme, ctrl-tab again Fonts, and a third
-/// wraps back to Profiles. Nothing in the dialog's state mentions tmux.
+/// four sections: ctrl-tab shows Theme, ctrl-tab again Fonts, a third
+/// Clipboard, and a fourth wraps back to Profiles. Nothing in the dialog's
+/// state mentions tmux.
 pub fn sections(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "open").action("open_settings").dump_at(step_time(1) + 0.8).run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
@@ -210,7 +212,7 @@ pub fn sections(ctx: &Ctx) -> Result<Outcome> {
     // Focus moved to the section's first field.
     ensure!(out.dump.focus_stop.as_deref() == Some("Terminal font"), "focus on Fonts: {:?}", out.dump.focus_stop);
 
-    let out = Run::new(ctx, "wrap")
+    let out = Run::new(ctx, "clipboard")
         .action("open_settings")
         .key("ctrl-tab")
         .key("ctrl-tab")
@@ -218,7 +220,20 @@ pub fn sections(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(step_time(4) + 0.8)
         .run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
-    ensure!(settings.starts_with("section=Profiles mode=list"), "ctrl-tab three times: {settings:?}");
+    ensure!(settings.starts_with("section=Clipboard mode=form"), "ctrl-tab three times: {settings:?}");
+    // Focus moved to the section's first switch.
+    ensure!(out.dump.focus_stop.as_deref() == Some("Copy on select"), "focus on Clipboard: {:?}", out.dump.focus_stop);
+
+    let out = Run::new(ctx, "wrap")
+        .action("open_settings")
+        .key("ctrl-tab")
+        .key("ctrl-tab")
+        .key("ctrl-tab")
+        .key("ctrl-tab")
+        .dump_at(step_time(5) + 0.8)
+        .run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.starts_with("section=Profiles mode=list"), "ctrl-tab four times: {settings:?}");
     Ok(Outcome::Pass)
 }
 
@@ -465,7 +480,7 @@ pub fn section_list(ctx: &Ctx) -> Result<Outcome> {
 
     let out = open("ends").key("end").key("home").key("up").dump_at(step_time(5) + 0.8).run()?;
     expect_on_sections(&out, "end, home, up")?;
-    ensure!(shown_section(&out) == "Fonts", "up from Profiles wraps to Fonts: {:?}", out.dump.settings);
+    ensure!(shown_section(&out) == "Clipboard", "up from Profiles wraps to Clipboard: {:?}", out.dump.settings);
 
     // Unsaved edits in the profile editor hold the section.
     let out = edit_shell(Run::new(ctx, "held"))
@@ -498,11 +513,13 @@ pub fn section_list(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// The dialog-level section shortcuts work from every kind of stop: a
-/// list, a select, a text field, a button, a family combobox. Each run
-/// presses one with `--key` and checks the section it lands on.
+/// list, a select, a text field, a button, a family combobox, a switch.
+/// Each run presses one with `--key` and checks the section it lands on.
 pub fn section_shortcuts(ctx: &Ctx) -> Result<Outcome> {
     let section = shown_section;
-    let cases: [(&'static str, &[&str], &str, &str); 8] = [
+    // Fonts, the section before the last, with focus on its first field.
+    const FONTS: [&str; 3] = ["open_settings", "settings_section_last", "settings_section_prev"];
+    let cases: [(&'static str, &[&str], &str, &str); 10] = [
         // From the profile list, focused on open.
         ("profile-list", &["open_settings"], "ctrl-tab", "Theme"),
         // From the (clean) profile editor's Remote select.
@@ -514,12 +531,16 @@ pub fn section_shortcuts(ctx: &Ctx) -> Result<Outcome> {
         // From the theme list, forwards.
         ("theme-list-next", &["open_settings", "settings_section_next"], "ctrl-pagedown", "Fonts"),
         // From the profile list's first button, wrapping backwards.
-        ("button", &["open_settings", "settings_next_field"], "ctrl-pageup", "Fonts"),
-        // From the Terminal font combobox, focused as Fonts opens, wrapping
-        // forwards.
-        ("combobox", &["open_settings", "settings_section_last"], "ctrl-tab", "Profiles"),
+        ("button", &["open_settings", "settings_next_field"], "ctrl-pageup", "Clipboard"),
+        // From the Terminal font combobox, focused as Fonts opens, forwards.
+        ("combobox", &FONTS, "ctrl-tab", "Clipboard"),
         // From the Size field, backwards.
-        ("size-field", &["open_settings", "settings_section_last", "settings_next_field"], "ctrl-shift-tab", "Theme"),
+        ("size-field", &[FONTS[0], FONTS[1], FONTS[2], "settings_next_field"], "ctrl-shift-tab", "Theme"),
+        // From the Copy on select switch, focused as Clipboard opens,
+        // wrapping forwards.
+        ("switch", &["open_settings", "settings_section_last"], "ctrl-tab", "Profiles"),
+        // From the Right-click pastes switch, backwards.
+        ("next-switch", &["open_settings", "settings_section_last", "settings_next_field"], "ctrl-pageup", "Fonts"),
     ];
     for (label, actions, key, want) in cases {
         let run = actions.iter().fold(Run::new(ctx, label), |run, a| run.action(a));

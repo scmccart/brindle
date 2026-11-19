@@ -508,7 +508,7 @@ family = ["Inter", "Segoe UI"]
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
-| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor, fonts; also the `⌄` menu's Settings) |
+| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor, fonts, clipboard; also the `⌄` menu's Settings) |
 | ctrl-, | edit config |
 
 The `⌄` button at the end of the tab strip opens the profile menu: every profile
@@ -533,7 +533,7 @@ and `focus_tab_strip` to put keyboard focus on the tab strip, where left/right
 (wrapping), home and end switch tabs and enter or escape go back to the
 terminal.
 
-The settings dialog has three sections: Profiles, Theme and Fonts. The section
+The settings dialog has four sections: Profiles, Theme, Fonts and Clipboard. The section
 list is the dialog's first Tab stop (shift-tab from where the dialog opens):
 there up/down change the section at once (wrapping) and home/end go to the
 first or last, then tab goes into the section. ctrl-tab and ctrl-pagedown
@@ -578,6 +578,8 @@ enter in Size or Line height) writes the changed values and closes the dialog:
 a chosen family goes to the front of that table's `family` list, keeping the
 others after it as fallbacks, and "Default" removes the list. Cancel, escape
 or another section drop the changes.
+
+The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes only when nothing is selected). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
 

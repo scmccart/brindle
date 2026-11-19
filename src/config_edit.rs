@@ -7,7 +7,7 @@ use std::path::Path;
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::config::{DEFAULT_CONFIG, Profile, RemoteTarget, write_replacing};
+use crate::config::{Config, DEFAULT_CONFIG, Profile, RemoteTarget, RightClick, write_replacing};
 use crate::theme::{BUILTIN_THEMES, Theme};
 
 pub fn parse(text: &str) -> Result<DocumentMut, String> {
@@ -89,6 +89,8 @@ pub enum ConfigEdit {
     MoveProfile { at: ProfileRef, up: bool },
     /// The Fonts section's changed fields, in this order.
     SetFonts(Vec<FontChange>),
+    /// The Clipboard section's changed settings, in this order.
+    SetClipboard(Vec<ClipboardChange>),
 }
 
 /// What saving a profile does to `default_profile`.
@@ -113,6 +115,15 @@ pub enum FontChange {
     LineHeight(f32),
     /// `[ui_font].family`: the family first, or `None` for Brindle's list.
     UiFamily(Option<String>),
+}
+
+/// A Clipboard setting written by Apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardChange {
+    /// The top-level `copy_on_select`.
+    CopyOnSelect(bool),
+    /// The top-level `right_click`, written as its word (`"paste"`, `"none"`).
+    RightClick(RightClick),
 }
 
 /// What applying an edit gave.
@@ -153,6 +164,11 @@ impl ConfigEdit {
                         FontChange::LineHeight(height) => set_font_number(doc, "line_height", *height),
                         FontChange::UiFamily(family) => set_font_family(doc, UI_FONT_TABLE, family.as_deref()),
                     }
+                }
+            }
+            ConfigEdit::SetClipboard(changes) => {
+                for change in changes {
+                    set_clipboard(doc, *change);
                 }
             }
         }
@@ -738,6 +754,77 @@ pub fn set_font_number(doc: &mut DocumentMut, key: &str, value: f32) {
         Value::from(value.to_string().parse::<f64>().unwrap_or(value as f64))
     };
     set_value(font_table_mut(doc, FONT_TABLE), key, value);
+}
+
+// ---- clipboard ----------------------------------------------------------------
+
+/// The top-level key that says whether a finished selection is copied to the
+/// clipboard.
+pub const COPY_ON_SELECT: &str = "copy_on_select";
+/// The top-level key that says what a right press does.
+pub const RIGHT_CLICK: &str = "right_click";
+
+/// The Clipboard section's two settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardValues {
+    pub copy_on_select: bool,
+    pub right_click: RightClick,
+}
+
+impl ClipboardValues {
+    /// The values `config` holds.
+    pub fn of(config: &Config) -> Self {
+        Self { copy_on_select: config.copy_on_select, right_click: config.right_click }
+    }
+}
+
+impl Default for ClipboardValues {
+    /// What a config without either key gives.
+    fn default() -> Self {
+        Self::of(&Config::default())
+    }
+}
+
+/// `copy_on_select` and `right_click` from the file, read on their own so
+/// that a mistake elsewhere in it doesn't hide them. A missing key takes its
+/// default, and so does one set to a value of the wrong kind, which gets a
+/// note naming the key (one per key, in that order).
+pub fn clipboard_values(doc: &DocumentMut) -> (ClipboardValues, Vec<String>) {
+    let defaults = ClipboardValues::default();
+    let mut notes = Vec::new();
+    let mut wrong = |key: &str, want: &str, shown: &str| {
+        notes.push(format!("{key} isn't {want}, so its switch shows {shown}"));
+    };
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let copy_on_select = match doc.get(COPY_ON_SELECT).map(|item| item.as_bool()) {
+        None => defaults.copy_on_select,
+        Some(Some(on)) => on,
+        Some(None) => {
+            wrong(COPY_ON_SELECT, "true or false", on_off(defaults.copy_on_select));
+            defaults.copy_on_select
+        }
+    };
+    let right_click = match doc.get(RIGHT_CLICK).map(|item| item.as_str().and_then(RightClick::from_word)) {
+        None => defaults.right_click,
+        Some(Some(value)) => value,
+        Some(None) => {
+            let want = format!("{:?} or {:?}", RightClick::Nothing.word(), RightClick::Paste.word());
+            wrong(RIGHT_CLICK, &want, on_off(defaults.right_click == RightClick::Paste));
+            defaults.right_click
+        }
+    };
+    (ClipboardValues { copy_on_select, right_click }, notes)
+}
+
+/// Writes one Clipboard setting's top-level key, in its place when the file
+/// has it (keeping its trailing comment), else after the other top-level
+/// keys.
+pub fn set_clipboard(doc: &mut DocumentMut, change: ClipboardChange) {
+    let (key, value) = match change {
+        ClipboardChange::CopyOnSelect(on) => (COPY_ON_SELECT, Value::from(on)),
+        ClipboardChange::RightClick(value) => (RIGHT_CLICK, Value::from(value.word())),
+    };
+    set_value(doc.as_table_mut(), key, value);
 }
 
 /// Removes `key` from `table`, handing the comments above it to the next
@@ -1534,6 +1621,112 @@ background = "nope"
         let config = reparse(&doc);
         assert_eq!(config.font.family, crate::config::FontConfig::default().family);
         assert!(config.ui_font.family.is_empty());
+    }
+
+    // ---- clipboard ----
+
+    fn clipboard(copy_on_select: bool, right_click: RightClick) -> ClipboardValues {
+        ClipboardValues { copy_on_select, right_click }
+    }
+
+    /// The two keys are read from the file whatever else is wrong in it; a
+    /// missing one takes its default, as a load does.
+    #[test]
+    fn clipboard_values_are_read_past_errors_elsewhere() {
+        let doc = parse("bogus = 1\ntheme = 7\ncopy_on_select = true\nright_click = \"paste\"\n").unwrap();
+        assert_eq!(clipboard_values(&doc), (clipboard(true, RightClick::Paste), Vec::new()));
+        let doc = parse("copy_on_select = true\n").unwrap();
+        assert_eq!(clipboard_values(&doc), (clipboard(true, RightClick::Nothing), Vec::new()));
+        assert_eq!(clipboard_values(&parse("").unwrap()).0, ClipboardValues::default());
+        assert_eq!(ClipboardValues::default(), clipboard(false, RightClick::Nothing));
+        // A key inside a table isn't the top-level one.
+        let doc = parse("[font]\ncopy_on_select = true\n").unwrap();
+        assert_eq!(clipboard_values(&doc).0, ClipboardValues::default());
+    }
+
+    /// A key set to a value of the wrong kind reads as its default, with a
+    /// note naming the key and what it takes.
+    #[test]
+    fn a_wrongly_typed_clipboard_key_reads_as_its_default_with_a_note() {
+        let doc = parse("copy_on_select = \"yes\"\nright_click = \"paste\"\n").unwrap();
+        let (values, notes) = clipboard_values(&doc);
+        assert_eq!(values, clipboard(false, RightClick::Paste));
+        assert_eq!(notes, ["copy_on_select isn't true or false, so its switch shows off"]);
+        for right_click in ["\"menu\"", "1", "true", "[\"paste\"]"] {
+            let doc = parse(&format!("copy_on_select = true\nright_click = {right_click}\n")).unwrap();
+            let (values, notes) = clipboard_values(&doc);
+            assert_eq!(values, clipboard(true, RightClick::Nothing), "{right_click}");
+            assert_eq!(notes, ["right_click isn't \"none\" or \"paste\", so its switch shows off"], "{right_click}");
+        }
+        let doc = parse("[copy_on_select]\nx = 1\n").unwrap();
+        assert_eq!(clipboard_values(&doc).1.len(), 1);
+    }
+
+    /// A key the file lacks goes after its other top-level keys; the file's
+    /// comments, order and tables stay as they were.
+    #[test]
+    fn clipboard_edits_keep_comments_and_order() {
+        let (result, text) = applied(&ConfigEdit::SetClipboard(vec![ClipboardChange::RightClick(RightClick::Paste)]));
+        assert_eq!(result, Ok(Applied::Done));
+        assert_eq!(text, SAMPLE.replace("# the one I like\n", "# the one I like\nright_click = \"paste\"\n"));
+        // Both, in the edit's order.
+        let both = ConfigEdit::SetClipboard(vec![
+            ClipboardChange::CopyOnSelect(true),
+            ClipboardChange::RightClick(RightClick::Paste),
+        ]);
+        let (_, text) = applied(&both);
+        assert_eq!(
+            text,
+            SAMPLE.replace("# the one I like\n", "# the one I like\ncopy_on_select = true\nright_click = \"paste\"\n")
+        );
+    }
+
+    /// Only the keys an edit names are written; one the file has is written
+    /// in its place, keeping its trailing comment.
+    #[test]
+    fn only_the_changed_clipboard_keys_are_written() {
+        let text = "# mine\ncopy_on_select = false # off for now\n\n# what a right press does\nright_click = \"none\"\npadding = 6\n\n[font]\nsize = 13\n";
+        let mut doc = parse(text).unwrap();
+        ConfigEdit::SetClipboard(vec![ClipboardChange::CopyOnSelect(true)]).apply(&mut doc).unwrap();
+        assert_eq!(doc.to_string(), text.replace("copy_on_select = false", "copy_on_select = true"));
+        ConfigEdit::SetClipboard(vec![ClipboardChange::RightClick(RightClick::Paste)]).apply(&mut doc).unwrap();
+        assert_eq!(
+            doc.to_string(),
+            text.replace("copy_on_select = false", "copy_on_select = true").replace("\"none\"", "\"paste\"")
+        );
+        // The default config has both keys: each is written where it is.
+        let mut doc = parse(DEFAULT_CONFIG).unwrap();
+        ConfigEdit::SetClipboard(vec![ClipboardChange::RightClick(RightClick::Paste)]).apply(&mut doc).unwrap();
+        assert_eq!(doc.to_string(), DEFAULT_CONFIG.replace("right_click = \"none\"", "right_click = \"paste\""));
+    }
+
+    /// `right_click` is written as the word a load reads back.
+    #[test]
+    fn right_click_is_written_as_its_word() {
+        for (value, word) in [(RightClick::Paste, "\"paste\""), (RightClick::Nothing, "\"none\"")] {
+            let mut doc = parse("theme = \"x\"\n").unwrap();
+            ConfigEdit::SetClipboard(vec![ClipboardChange::RightClick(value)]).apply(&mut doc).unwrap();
+            assert_eq!(doc.to_string(), format!("theme = \"x\"\nright_click = {word}\n"));
+            assert_eq!(reparse(&doc).right_click, value);
+            assert_eq!(clipboard_values(&doc).0.right_click, value);
+        }
+        let mut doc = parse("theme = \"x\"\n").unwrap();
+        ConfigEdit::SetClipboard(vec![ClipboardChange::CopyOnSelect(true)]).apply(&mut doc).unwrap();
+        assert!(reparse(&doc).copy_on_select);
+    }
+
+    /// A key of the wrong kind stays as the file has it while the edit
+    /// leaves its setting alone, and is replaced, comment kept, when it
+    /// names it.
+    #[test]
+    fn a_wrongly_typed_clipboard_key_is_replaced_only_when_its_switch_changed() {
+        let text = "copy_on_select = \"yes\" # typo\n";
+        let mut doc = parse(text).unwrap();
+        ConfigEdit::SetClipboard(vec![ClipboardChange::RightClick(RightClick::Paste)]).apply(&mut doc).unwrap();
+        assert_eq!(doc.to_string(), format!("{text}right_click = \"paste\"\n"));
+        ConfigEdit::SetClipboard(vec![ClipboardChange::CopyOnSelect(true)]).apply(&mut doc).unwrap();
+        assert_eq!(doc.to_string(), "copy_on_select = true # typo\nright_click = \"paste\"\n");
+        assert_eq!(clipboard_values(&doc), (clipboard(true, RightClick::Paste), Vec::new()));
     }
 
     /// What `save` writes, without a file: the default config when there is

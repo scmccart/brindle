@@ -1,14 +1,16 @@
 //! The settings dialog: an overlay over the window with a list of sections.
 //! Its sections are "Profiles" (list, edit, reorder and delete profiles),
 //! "Theme" (pick a theme with a live preview on the tabs behind the dialog,
-//! and create, edit, rename or delete custom themes) and "Fonts" (the
+//! and create, edit, rename or delete custom themes), "Fonts" (the
 //! terminal font's family, size and line height and the chrome's family,
-//! previewed as they change). Changes are written to the config file with
+//! previewed as they change) and "Clipboard" (copy on select and
+//! right-click paste). Changes are written to the config file with
 //! `config_edit`.
 //!
 //! [`Model`] holds the state and all the logic and has no GPUI dependency,
 //! so it is unit-tested. Each section is a model of its own
-//! ([`ThemesState`], [`ProfilesState`], [`FontsState`]), and none of them
+//! ([`ThemesState`], [`ProfilesState`], [`FontsState`],
+//! [`ClipboardState`]), and none of them
 //! touches the file: they are given its text, and answer an operation with
 //! a [`Step`], which may be a [`ConfigEdit`] to write. [`SettingsDialog`]
 //! is the view around the model: it reads the file, writes the edits and
@@ -35,12 +37,15 @@ use crate::actions::{
 use crate::config_edit::{self, Applied, ConfigEdit, FileText};
 use crate::theme::{Color, Theme};
 
+mod clipboard;
 mod fonts;
 mod profiles;
 mod themes;
 
 use crate::config::{FontConfig, Profile, UiFontConfig};
+use crate::config_edit::ClipboardValues;
 use crate::settings::FontPreview;
+use clipboard::{ClipboardField, ClipboardState};
 use fonts::FontsState;
 use profiles::ProfilesState;
 use themes::{Editor, FieldId, SLOTS, ThemesState};
@@ -51,9 +56,10 @@ pub enum Section {
     Profiles,
     Theme,
     Fonts,
+    Clipboard,
 }
 
-const SECTIONS: [Section; 3] = [Section::Profiles, Section::Theme, Section::Fonts];
+const SECTIONS: [Section; 4] = [Section::Profiles, Section::Theme, Section::Fonts, Section::Clipboard];
 
 impl Section {
     fn label(self) -> &'static str {
@@ -61,6 +67,7 @@ impl Section {
             Section::Profiles => "Profiles",
             Section::Theme => "Theme",
             Section::Fonts => "Fonts",
+            Section::Clipboard => "Clipboard",
         }
     }
 }
@@ -77,12 +84,13 @@ pub enum ListMode {
 }
 
 /// What the dialog shows: a section, and its list's mode for the two that
-/// have one. The Fonts section is a form, always.
+/// have one. The Fonts and Clipboard sections are forms, always.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Profiles(ListMode),
     Theme(ListMode),
     Fonts,
+    Clipboard,
 }
 
 impl View {
@@ -91,6 +99,7 @@ impl View {
             View::Profiles(_) => Section::Profiles,
             View::Theme(_) => Section::Theme,
             View::Fonts => Section::Fonts,
+            View::Clipboard => Section::Clipboard,
         }
     }
 
@@ -101,15 +110,15 @@ impl View {
                 ListMode::Editor => ModeKind::Editor,
                 ListMode::ConfirmDelete => ModeKind::ConfirmDelete,
             },
-            View::Fonts => ModeKind::Form,
+            View::Fonts | View::Clipboard => ModeKind::Form,
         }
     }
 }
 
 /// What kind of view a section shows: its list, an editor, the delete
-/// confirmation, or a form (Fonts: fields always editable, applied
-/// together). A change of section or kind moves focus to the new view's
-/// first control.
+/// confirmation, or a form (Fonts and Clipboard: fields always shown,
+/// applied together). A change of section or kind moves focus to the new
+/// view's first control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeKind {
     List,
@@ -221,6 +230,7 @@ pub struct Model {
     themes: ThemesState,
     profiles: ProfilesState,
     fonts: FontsState,
+    clipboard: ClipboardState,
     /// The last failure to show (save errors, refused deletes).
     error: Option<String>,
 }
@@ -240,7 +250,8 @@ impl Model {
         let themes = ThemesState::new(&config_path, text, active, fallback);
         let profiles = ProfilesState::new(&config_path, text, fallback_profiles, fallback_default);
         let fonts = FontsState::new(text, (FontConfig::default(), UiFontConfig::default()), Vec::new());
-        Self { config_path, section: Section::Profiles, themes, profiles, fonts, error: None }
+        let clipboard = ClipboardState::new(text, ClipboardValues::default());
+        Self { config_path, section: Section::Profiles, themes, profiles, fonts, clipboard, error: None }
     }
 
     /// The Fonts section's fonts, from `text`: `fallback`, the loaded
@@ -249,6 +260,13 @@ impl Model {
     /// field shows and lists.
     pub fn with_fonts(mut self, text: &FileText, fallback: (FontConfig, UiFontConfig), installed: Vec<String>) -> Self {
         self.fonts = FontsState::new(text, fallback, installed);
+        self
+    }
+
+    /// The Clipboard section's switches, from `text`: `fallback`, the loaded
+    /// config's values, shown read-only when the file can't be parsed.
+    pub fn with_clipboard(mut self, text: &FileText, fallback: ClipboardValues) -> Self {
+        self.clipboard = ClipboardState::new(text, fallback);
         self
     }
 
@@ -281,7 +299,7 @@ impl Model {
     pub fn move_selection(&mut self, forward: bool) {
         match self.section {
             // The form's fields are focus stops: the view moves focus.
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
             Section::Profiles => {
                 self.profiles.move_selection(forward);
                 self.error = None;
@@ -307,13 +325,13 @@ impl Model {
                 let reply = self.themes.select_edge(last);
                 self.reply(reply);
             }
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
         }
     }
 
     pub fn select(&mut self, ix: usize) {
         match self.section {
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
             Section::Profiles => {
                 self.profiles.select(ix);
                 self.error = None;
@@ -326,10 +344,11 @@ impl Model {
     }
 
     /// Enter: apply in the theme list, edit in the profile list, save in an
-    /// editor, delete when confirming, apply the Fonts form.
+    /// editor, delete when confirming, apply the Fonts or Clipboard form.
     pub fn confirm(&mut self) -> Step {
         let reply = match self.section {
             Section::Fonts => self.fonts.apply().into(),
+            Section::Clipboard => self.clipboard.apply().into(),
             Section::Profiles => match self.profiles.list_mode() {
                 ListMode::List => {
                     let themes = self.themes.theme_names();
@@ -343,11 +362,11 @@ impl Model {
         self.reply(reply)
     }
 
-    /// Escape: closes the dialog from a list or the form; otherwise leaves
+    /// Escape: closes the dialog from a list or a form; otherwise leaves
     /// the editor or the confirmation for the list.
     pub fn cancel(&mut self) -> Step {
         match self.section {
-            Section::Fonts => Step::Close,
+            Section::Fonts | Section::Clipboard => Step::Close,
             Section::Profiles => {
                 self.error = None;
                 self.profiles.cancel()
@@ -367,10 +386,19 @@ impl Model {
         Step::Close
     }
 
+    /// A Clipboard switch was flipped (by space or a click). The error line
+    /// goes back to the section's note, dropping a failed write's error.
+    pub fn toggle_clipboard(&mut self, field: ClipboardField) {
+        if self.section == Section::Clipboard {
+            self.clipboard.toggle(field);
+            self.error = self.clipboard.note().cloned();
+        }
+    }
+
     /// New: a copy of the selected theme, or a new profile.
     pub fn start_new(&mut self) {
         match self.section {
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
             Section::Profiles => {
                 if self.profiles.list_mode() == ListMode::List {
                     let themes = self.themes.theme_names();
@@ -388,7 +416,7 @@ impl Model {
     /// Edit: the selected custom theme (a built-in is refused) or profile.
     pub fn start_edit(&mut self) {
         match self.section {
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
             Section::Profiles => {
                 if self.profiles.list_mode() == ListMode::List {
                     let themes = self.themes.theme_names();
@@ -417,7 +445,7 @@ impl Model {
     /// what still refers to a theme.
     pub fn request_delete(&mut self, text: &FileText) {
         match self.section {
-            Section::Fonts => {}
+            Section::Fonts | Section::Clipboard => {}
             Section::Profiles => {
                 if self.profiles.list_mode() == ListMode::List {
                     let reply = self.profiles.request_delete().map(|()| Step::Nothing).into();
@@ -431,8 +459,8 @@ impl Model {
         }
     }
 
-    /// The list shortcut `ks` is, in a list. In an editor and the Fonts
-    /// form, keys belong to the fields.
+    /// The list shortcut `ks` is, in a list. In an editor and a form, keys
+    /// belong to the fields.
     pub fn list_key(&self, ks: &Keystroke) -> Option<ListOp> {
         let plain = !(ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform);
         if !plain || self.mode_kind() != ModeKind::List {
@@ -475,6 +503,7 @@ impl Model {
             Section::Theme => View::Theme(self.themes.list_mode()),
             Section::Profiles => View::Profiles(self.profiles.list_mode()),
             Section::Fonts => View::Fonts,
+            Section::Clipboard => View::Clipboard,
         }
     }
 
@@ -489,10 +518,10 @@ impl Model {
 
     /// Switches section, refused while an editor has unsaved edits. Leaving
     /// Theme drops an unapplied preview: its selection goes back to the
-    /// active theme. Leaving Fonts drops its unapplied changes; it has no
-    /// editor, so it never holds the section. Profiles and Fonts are reread
-    /// from `text`, the file as it reads now, to pick up edits made
-    /// elsewhere since the dialog opened.
+    /// active theme. Leaving Fonts or Clipboard drops its unapplied
+    /// changes; neither has an editor, so neither holds the section.
+    /// Profiles, Fonts and Clipboard are reread from `text`, the file as it
+    /// reads now, to pick up edits made elsewhere since the dialog opened.
     pub fn select_section(&mut self, section: Section, text: &FileText) -> bool {
         if section == self.section {
             return true;
@@ -500,7 +529,7 @@ impl Model {
         let dirty = match self.section {
             Section::Theme => self.themes.dirty(),
             Section::Profiles => self.profiles.editor().is_some_and(|e| e.dirty()),
-            Section::Fonts => false,
+            Section::Fonts | Section::Clipboard => false,
         };
         if dirty {
             self.error = Some("Save or discard the edits first".into());
@@ -514,14 +543,21 @@ impl Model {
                 }
             }
             Section::Fonts => self.fonts.reset(),
+            Section::Clipboard => self.clipboard.reset(),
         }
         match section {
             Section::Profiles => self.profiles.reload(&self.config_path, text, None),
             Section::Fonts => self.fonts.reload(text),
+            Section::Clipboard => self.clipboard.reload(text),
             Section::Theme => {}
         }
         self.section = section;
-        self.error = (section == Section::Theme).then(|| self.themes.note().cloned()).flatten();
+        // A section's note on the file, if it has one.
+        self.error = match section {
+            Section::Theme => self.themes.note().cloned(),
+            Section::Clipboard => self.clipboard.note().cloned(),
+            Section::Profiles | Section::Fonts => None,
+        };
         true
     }
 
@@ -566,7 +602,9 @@ impl Model {
         };
         self.error = None;
         match edit {
-            ConfigEdit::SetGlobalTheme { .. } | ConfigEdit::SetFonts(_) => Outcome::Applied,
+            ConfigEdit::SetGlobalTheme { .. } | ConfigEdit::SetFonts(_) | ConfigEdit::SetClipboard(_) => {
+                Outcome::Applied
+            }
             ConfigEdit::SaveTheme { .. } | ConfigEdit::DeleteTheme { .. } => {
                 self.themes.written(edit, &self.config_path, text);
                 if self.section == Section::Theme {
@@ -587,6 +625,7 @@ impl Model {
             Section::Theme => self.themes.enabled(b),
             Section::Profiles => self.profiles.enabled(b),
             Section::Fonts => self.fonts.enabled(b),
+            Section::Clipboard => self.clipboard.enabled(b),
         }
     }
 
@@ -624,13 +663,14 @@ impl Model {
     }
 
     /// Debug description for `--dump-screen-after`. `field` names the
-    /// focused control, which an editor reports as its `field=` (`""` for
-    /// none); `open` is an open family list's field, search and highlighted
-    /// option, for the Fonts section's line.
+    /// focused control, which an editor or a form reports as its `field=`
+    /// (`""` for none); `open` is an open family list's field, search and
+    /// highlighted option, for the Fonts section's line.
     pub fn describe_open(&self, field: Option<&str>, open: Option<(fonts::FontField, String, Option<String>)>) -> String {
         let field = field.unwrap_or("");
         match self.section {
             Section::Fonts => self.fonts.describe(&self.error, field, open),
+            Section::Clipboard => self.clipboard.describe(&self.error, field),
             Section::Profiles => self.profiles.describe(&self.error, field),
             Section::Theme => self.themes.describe(&self.error, field),
         }
@@ -739,7 +779,7 @@ impl Btn {
 /// The footer buttons of each view, in Tab order (left to right).
 fn footer_buttons(view: View) -> &'static [Btn] {
     match view {
-        View::Fonts => &[Btn::Cancel, Btn::Apply],
+        View::Fonts | View::Clipboard => &[Btn::Cancel, Btn::Apply],
         View::Theme(ListMode::ConfirmDelete) | View::Profiles(ListMode::ConfirmDelete) => {
             &[Btn::Keep, Btn::ConfirmDelete]
         }
@@ -798,6 +838,8 @@ pub struct SettingsDialog {
     _font_subscriptions: Vec<Subscription>,
     /// What the last font preview showed, to tell when it changes.
     font_previewed: Option<FontPreview>,
+    /// The Clipboard section's switches, one handle each.
+    clipboard_handles: Vec<(ClipboardField, FocusHandle)>,
     /// The view focus was last placed for.
     placed_for: View,
     /// The focused handle an editor last scrolled into view.
@@ -831,6 +873,7 @@ impl FocusStops for SettingsDialog {
             }
             View::Profiles(ListMode::Editor) => stops.extend(self.profile_field_stops(cx)),
             View::Fonts => stops.extend(self.font_field_stops(cx)),
+            View::Clipboard => stops.extend(self.clipboard_field_stops()),
             View::Theme(ListMode::ConfirmDelete) | View::Profiles(ListMode::ConfirmDelete) => {}
         }
         stops.extend(footer_buttons(view).iter().filter(|b| self.model.enabled(**b)).map(|b| self.button_handle(*b)));
@@ -878,6 +921,7 @@ impl SettingsDialog {
             font_choices: Vec::new(),
             _font_subscriptions: Vec::new(),
             font_previewed: None,
+            clipboard_handles: clipboard::CLIPBOARD_FIELDS.iter().map(|&f| (f, cx.focus_handle())).collect(),
             placed_for,
             scrolled_to: None,
         }
@@ -922,6 +966,9 @@ impl SettingsDialog {
         if let Some(field) = self.focused_font_field(window, cx) {
             return Some(field.label());
         }
+        if let Some(field) = self.focused_clipboard_field(window) {
+            return Some(field.label());
+        }
         if self.default_handle.is_focused(window) {
             return Some(profiles::Field::Default.label());
         }
@@ -958,14 +1005,15 @@ impl SettingsDialog {
             View::Theme(ListMode::Editor) => self.fields.iter().map(|(_, f)| f.focus_handle(cx)).collect(),
             View::Profiles(ListMode::Editor) => self.profile_field_stops(cx),
             View::Fonts => self.font_field_stops(cx),
+            View::Clipboard => self.clipboard_field_stops(),
             View::Theme(ListMode::List | ListMode::ConfirmDelete)
             | View::Profiles(ListMode::List | ListMode::ConfirmDelete) => Vec::new(),
         }
     }
 
-    /// Where focus goes when a view opens: a list, an editor's name, the
-    /// Fonts section's first field, or (asking to confirm a delete) the
-    /// dialog itself.
+    /// Where focus goes when a view opens: a list, an editor's name, a
+    /// form's first field, or (asking to confirm a delete, or a read-only
+    /// Clipboard section) the dialog itself.
     fn default_focus(&self, cx: &App) -> FocusHandle {
         match self.model.mode_kind() {
             ModeKind::List => self.list_handle.clone(),
@@ -1018,7 +1066,8 @@ impl SettingsDialog {
             }
             View::Theme(ListMode::Editor | ListMode::ConfirmDelete)
             | View::Profiles(ListMode::Editor | ListMode::ConfirmDelete)
-            | View::Fonts => {}
+            | View::Fonts
+            | View::Clipboard => {}
         }
         cx.notify();
     }
@@ -1561,6 +1610,7 @@ impl Render for SettingsDialog {
                 None => self.render_list(window, cx),
             },
             Section::Fonts => self.render_fonts(cx),
+            Section::Clipboard => self.render_clipboard(cx),
         };
         let current = self.model.section();
         // The section list is a vertical tab list: one Tab stop whose
@@ -1673,6 +1723,7 @@ impl Render for SettingsDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RightClick;
     use crate::theme::{BUILTIN_THEMES, builtin_theme};
 
     const CONFIG: &str = r##"# test config
@@ -1810,13 +1861,15 @@ background = "nope"
         assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Fonts);
         assert!(f.next(&mut model, true));
+        assert_eq!(model.section(), Section::Clipboard);
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Profiles);
         assert!(f.next(&mut model, false));
-        assert_eq!(model.section(), Section::Fonts);
+        assert_eq!(model.section(), Section::Clipboard);
         assert!(f.edge(&mut model, false));
         assert_eq!(model.section(), Section::Profiles);
         assert!(f.edge(&mut model, true));
-        assert_eq!(model.section(), Section::Fonts);
+        assert_eq!(model.section(), Section::Clipboard);
     }
 
     #[test]
@@ -1931,6 +1984,9 @@ background = "nope"
 
         f.section(&mut model, Section::Fonts);
         assert_eq!(model.cancel(), Step::Close, "the Fonts form closes");
+        f.section(&mut model, Section::Clipboard);
+        model.toggle_clipboard(ClipboardField::RightClick);
+        assert_eq!(model.cancel(), Step::Close, "the Clipboard form closes");
         // Nothing was written.
         assert_eq!(f.text(), config);
     }
@@ -1959,6 +2015,9 @@ background = "nope"
         model.cancel();
         f.section(&mut model, Section::Fonts);
         assert_eq!(key(&model, "n"), None);
+        f.section(&mut model, Section::Clipboard);
+        assert_eq!(key(&model, "e"), None);
+        assert_eq!(key(&model, "d"), None);
     }
 
     /// Enter on a focused button (or the close `X`) is the button's: the
@@ -1982,6 +2041,7 @@ background = "nope"
         }
         assert_eq!(footer_buttons(View::Profiles(ListMode::List)).last(), Some(&Btn::Close));
         assert_eq!(footer_buttons(View::Fonts), [Btn::Cancel, Btn::Apply]);
+        assert_eq!(footer_buttons(View::Clipboard), [Btn::Cancel, Btn::Apply]);
         // Ids are unique, so the shared handles never meet in one view.
         let ids: std::collections::HashSet<_> = BUTTONS.iter().map(|b| b.id()).collect();
         assert_eq!(ids.len(), BUTTONS.len());
@@ -2027,6 +2087,12 @@ background = "nope"
         model.fonts.set_text(fonts::FontField::Size, "200");
         assert!(!model.enabled(Btn::Apply));
         assert_eq!(f.confirm(&mut model), Outcome::Nothing);
+
+        f.section(&mut model, Section::Clipboard);
+        assert!(model.enabled(Btn::Apply) && model.enabled(Btn::Cancel));
+        let mut read_only = File::new("[oops\n").opened("mine");
+        File::new("[oops\n").section(&mut read_only, Section::Clipboard);
+        assert!(!read_only.enabled(Btn::Apply) && read_only.enabled(Btn::Cancel));
     }
 
     #[test]
@@ -2058,6 +2124,7 @@ background = "nope"
         assert_eq!(focus_target(list, list, facts(false, true, false)), FocusMove::Stay);
         assert_eq!(focus_target(list, editor, facts(false, true, true)), FocusMove::Default, "a list key opened an editor");
         assert_eq!(View::Fonts.kind(), ModeKind::Form);
+        assert_eq!((View::Clipboard.section(), View::Clipboard.kind()), (Section::Clipboard, ModeKind::Form));
         assert_eq!((editor.section(), editor.kind()), (Section::Theme, ModeKind::Editor));
     }
 
@@ -2126,7 +2193,7 @@ background = "nope"
         let f = File::new(CONFIG);
         let mut model = f.opened("mine");
         assert_eq!(model.section(), Section::Profiles);
-        assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme", "Fonts"]);
+        assert_eq!(SECTIONS.map(Section::label), ["Profiles", "Theme", "Fonts", "Clipboard"]);
         assert!(model.in_list());
         assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Theme);
@@ -2136,10 +2203,122 @@ background = "nope"
         assert_eq!(model.section(), Section::Fonts);
         assert_eq!(model.mode_kind(), ModeKind::Form);
         assert!(f.next(&mut model, true));
+        assert_eq!(model.section(), Section::Clipboard);
+        assert_eq!(model.mode_kind(), ModeKind::Form);
+        // The spec's "Last section wraps".
+        assert!(f.next(&mut model, true));
         assert_eq!(model.section(), Section::Profiles);
         assert!(f.next(&mut model, false));
-        assert_eq!(model.section(), Section::Fonts);
+        assert_eq!(model.section(), Section::Clipboard);
         assert_eq!(f.text(), CONFIG);
+    }
+
+    fn clipboard_model(f: &File) -> Model {
+        let mut model = f.opened("mine").with_clipboard(&f.read(), ClipboardValues::default());
+        assert!(f.section(&mut model, Section::Clipboard));
+        model
+    }
+
+    /// The spec's "Leave Clipboard unapplied": nothing is written, and the
+    /// section shows the file's values when it is selected again.
+    #[test]
+    fn leaving_clipboard_drops_the_changes() {
+        let f = File::new("copy_on_select = true\n");
+        let mut model = clipboard_model(&f);
+        assert!(model.describe("").starts_with(
+            "--- settings section=Clipboard mode=form copy_on_select=true right_click=none field=\"\" can_apply=true error=None"
+        ));
+        model.toggle_clipboard(ClipboardField::RightClick);
+        assert!(model.clipboard.is_on(ClipboardField::RightClick));
+        // Nothing holds the section.
+        assert!(f.section(&mut model, Section::Profiles));
+        assert!(f.section(&mut model, Section::Clipboard));
+        assert!(!model.clipboard.is_on(ClipboardField::RightClick));
+        assert!(model.clipboard.is_on(ClipboardField::CopyOnSelect));
+        assert_eq!(f.text(), "copy_on_select = true\n");
+        // A switch flips only in its own section.
+        f.section(&mut model, Section::Fonts);
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        assert!(model.clipboard.is_on(ClipboardField::CopyOnSelect));
+    }
+
+    /// The Clipboard section is reread from the file each time it is shown.
+    #[test]
+    fn entering_clipboard_rereads_the_file() {
+        let mut f = File::new("");
+        let mut model = clipboard_model(&f);
+        f.section(&mut model, Section::Theme);
+        f.text = Some("right_click = \"paste\"\n".into());
+        f.section(&mut model, Section::Clipboard);
+        assert!(model.clipboard.is_on(ClipboardField::RightClick));
+    }
+
+    /// Apply writes the changed switches and closes the dialog (the spec's
+    /// "Turn on right-click paste"); with nothing changed it closes without
+    /// writing.
+    #[test]
+    fn applying_clipboard() {
+        let mut f = File::new(CONFIG);
+        let mut model = clipboard_model(&f);
+        assert_eq!(model.confirm(), Step::Close);
+        assert_eq!(f.text(), CONFIG);
+        model.toggle_clipboard(ClipboardField::RightClick);
+        assert_eq!(f.confirm(&mut model), Outcome::Applied);
+        assert_eq!(model.error, None);
+        assert_eq!(f.text(), CONFIG.replace("theme = \"mine\"\n", "theme = \"mine\"\nright_click = \"paste\"\n"));
+        // The list keys do nothing in the form.
+        let before = model.describe("");
+        model.move_selection(true);
+        model.select_edge(true);
+        model.select(1);
+        model.start_new();
+        model.start_edit();
+        model.start_duplicate();
+        model.request_delete(&f.read());
+        assert_eq!(model.move_profile(true), Step::Nothing);
+        assert_eq!(model.describe(""), before);
+        // A failed write keeps the dialog with the error, which a toggle
+        // clears.
+        let mut model = clipboard_model(&f);
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        let Step::Write(edit) = model.confirm() else { panic!("a write") };
+        assert_eq!(model.written(&edit, Err("writing: denied".into()), &f.read()), Outcome::Nothing);
+        assert_eq!(model.error.as_deref(), Some("writing: denied"));
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        assert_eq!(model.error, None);
+    }
+
+    /// A key of the wrong kind is named in the section's error line, which
+    /// stays through a toggle and goes with the section.
+    #[test]
+    fn the_clipboard_section_notes_a_wrongly_typed_key() {
+        let f = File::new("copy_on_select = 1\n");
+        let mut model = clipboard_model(&f);
+        let note = model.error.clone().unwrap();
+        assert!(note.starts_with("copy_on_select isn't true or false"), "{note}");
+        assert!(model.describe("").contains(&format!("error={:?}", Some(&note))));
+        model.toggle_clipboard(ClipboardField::RightClick);
+        assert_eq!(model.error.as_ref(), Some(&note));
+        f.section(&mut model, Section::Profiles);
+        assert_eq!(model.error, None);
+    }
+
+    /// The spec's "Unparseable config": the loaded config's values, and
+    /// Apply refused with why.
+    #[test]
+    fn an_unparseable_file_makes_clipboard_read_only() {
+        let mut f = File::new("[oops\n");
+        let mut model = f
+            .opened("mine")
+            .with_clipboard(&f.read(), ClipboardValues { copy_on_select: true, right_click: RightClick::Paste });
+        f.section(&mut model, Section::Clipboard);
+        assert!(model.clipboard.is_on(ClipboardField::CopyOnSelect) && model.clipboard.is_on(ClipboardField::RightClick));
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        assert!(model.clipboard.is_on(ClipboardField::CopyOnSelect));
+        assert_eq!(f.confirm(&mut model), Outcome::Nothing);
+        assert!(model.error.as_deref().unwrap().contains("not valid TOML"));
+        assert!(model.describe("").contains(" can_apply=false "));
+        assert_eq!(f.text(), "[oops\n");
     }
 
     fn fonts_model(f: &File) -> Model {
@@ -2313,6 +2492,10 @@ background = "nope"
         model.fonts.set_text(fonts::FontField::Size, "20");
         assert_eq!(f.confirm(&mut model), Outcome::Applied, "the fonts set");
         assert!(f.text().contains("theme = \"brindle-dark\"") && f.text().contains("size = 20"), "{}", f.text());
+        f.section(&mut model, Section::Clipboard);
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        assert_eq!(f.confirm(&mut model), Outcome::Applied, "the clipboard settings set");
+        assert!(f.text().contains("copy_on_select = true"), "{}", f.text());
     }
 
     #[test]
@@ -2552,6 +2735,11 @@ background = "nope"
         f.section(&mut model, Section::Fonts);
         model.fonts.set_text(fonts::FontField::Size, "20");
         assert_eq!(model.view(), View::Fonts);
+        assert_eq!(model.close(), Step::Close);
+        // Clipboard with a switch flipped.
+        f.section(&mut model, Section::Clipboard);
+        model.toggle_clipboard(ClipboardField::CopyOnSelect);
+        assert_eq!(model.view(), View::Clipboard);
         assert_eq!(model.close(), Step::Close);
         // Closing wrote nothing.
         assert_eq!(f.text(), two_profiles());

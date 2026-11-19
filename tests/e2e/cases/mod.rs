@@ -91,6 +91,7 @@ fn unix() -> Vec<Case> {
         display("settings-section-list", settings::section_list),
         display("settings-themes-not-a-table", settings::themes_not_a_table),
         display("settings-fonts", fonts::settings_fonts),
+        display("settings-clipboard", clipboard::settings_section),
         display("ui-font-config", fonts::ui_font_config),
         display("multi-process-local", multi_window::second_process_local),
         display("input-palette", input::palette),

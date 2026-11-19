@@ -1865,7 +1865,8 @@ impl Workspace {
             config.profiles.clone(),
             config.default_profile.clone(),
         )
-        .with_fonts(&text, (config.font.clone(), config.ui_font.clone()), settings.installed_fonts().to_vec());
+        .with_fonts(&text, (config.font.clone(), config.ui_font.clone()), settings.installed_fonts().to_vec())
+        .with_clipboard(&text, config_edit::ClipboardValues::of(config));
         let theme = config.theme(None);
         let dialog = cx.new(|cx| SettingsDialog::new(model, theme, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, |this, _, event, _, cx| match event {

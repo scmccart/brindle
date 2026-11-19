@@ -583,7 +583,8 @@ impl ThemesState {
             | ConfigEdit::SaveProfile { .. }
             | ConfigEdit::DeleteProfile { .. }
             | ConfigEdit::MoveProfile { .. }
-            | ConfigEdit::SetFonts(_) => {}
+            | ConfigEdit::SetFonts(_)
+            | ConfigEdit::SetClipboard(_) => {}
         }
     }
 

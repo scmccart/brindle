@@ -1043,7 +1043,8 @@ impl ProfilesState {
             ConfigEdit::SetGlobalTheme { .. }
             | ConfigEdit::SaveTheme { .. }
             | ConfigEdit::DeleteTheme { .. }
-            | ConfigEdit::SetFonts(_) => {}
+            | ConfigEdit::SetFonts(_)
+            | ConfigEdit::SetClipboard(_) => {}
         }
     }
 
