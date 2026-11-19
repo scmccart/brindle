@@ -57,6 +57,7 @@ pub enum Icon {
     ArrowDown,
     Columns2,
     Rows2,
+    Lock,
 }
 
 /// One stroke of an icon, in unit coordinates.
@@ -166,9 +167,27 @@ const ARROW_DOWN: &[Stroke] = &[
 const COLUMNS_2: &[Stroke] = &[rect(3., 3., 18., 18., 2.), Stroke::Polyline(&[p(12., 3.), p(12., 21.)])];
 // lucide `rows-2`: rect width=18 height=18 x=3 y=3 rx=2, M3 12h18
 const ROWS_2: &[Stroke] = &[rect(3., 3., 18., 18., 2.), Stroke::Polyline(&[p(3., 12.), p(21., 12.)])];
+// lucide `lock`: rect width=18 height=11 x=3 y=11 rx=2, M7 11V7a5 5 0 0 1 10 0v4,
+// the shackle's arc (radius 5 about (12, 7)) drawn as chords every 22.5 degrees.
+const LOCK: &[Stroke] = &[
+    rect(3., 11., 18., 11., 2.),
+    Stroke::Polyline(&[
+        p(7., 11.),
+        p(7., 7.),
+        p(7.38, 5.09),
+        p(8.46, 3.46),
+        p(10.09, 2.38),
+        p(12., 2.),
+        p(13.91, 2.38),
+        p(15.54, 3.46),
+        p(16.62, 5.09),
+        p(17., 7.),
+        p(17., 11.),
+    ]),
+];
 
 impl Icon {
-    pub const ALL: [Icon; 14] = [
+    pub const ALL: [Icon; 15] = [
         Icon::Check,
         Icon::ChevronDown,
         Icon::ChevronUp,
@@ -183,6 +202,7 @@ impl Icon {
         Icon::ArrowDown,
         Icon::Columns2,
         Icon::Rows2,
+        Icon::Lock,
     ];
 
     pub(crate) fn strokes(self) -> &'static [Stroke] {
@@ -201,6 +221,7 @@ impl Icon {
             Icon::ArrowDown => ARROW_DOWN,
             Icon::Columns2 => COLUMNS_2,
             Icon::Rows2 => ROWS_2,
+            Icon::Lock => LOCK,
         }
     }
 
@@ -475,6 +496,24 @@ mod tests {
                 panic!("{icon:?} ends with its rule");
             };
             assert_eq!(line.iter().copied().map(grid).collect::<Vec<_>>(), rule);
+        }
+        // The lock is an 18 by 11 body and a shackle over it, whose arc is
+        // radius 5 about (12, 7).
+        let Stroke::Rect { x, y, width, height, radius } = Icon::Lock.strokes()[0] else {
+            panic!("lock starts with its body");
+        };
+        assert_eq!([x, y, width, height, radius].map(|v| (v * GRID).round()), [3., 11., 18., 11., 2.]);
+        let Stroke::Polyline(shackle) = Icon::Lock.strokes()[1] else {
+            panic!("lock ends with its shackle");
+        };
+        let shackle: Vec<_> = shackle.iter().copied().map(|(x, y)| (x * GRID, y * GRID)).collect();
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+        assert!(near(shackle[0], (7., 11.)) && near(shackle[1], (7., 7.)));
+        assert!(shackle.iter().any(|&pt| near(pt, (12., 2.))));
+        assert!(near(shackle[shackle.len() - 2], (17., 7.)) && near(shackle[shackle.len() - 1], (17., 11.)));
+        for &(x, y) in &shackle[1..shackle.len() - 1] {
+            let r = ((x - 12.).powi(2) + (y - 7.).powi(2)).sqrt();
+            assert!((r - 5.).abs() < 0.01 || (x - 7.).abs() < 0.01, "({x}, {y}) is off the arc: {r}");
         }
     }
 

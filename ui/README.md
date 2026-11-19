@@ -241,8 +241,8 @@ rule, not a convenience.
 - **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
   rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
-  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2` and
-  `Rows2`. Strokes have butt caps and miter joins, since gpui doesn't expose
+  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2`, `Rows2` and
+  `Lock`. Strokes have butt caps and miter joins, since gpui doesn't expose
   lucide's round caps. Lucide's stroke (2 on its 24 grid) scales with the
   icon, which leaves a 16px icon 1.33px thin; `IconElement::min_stroke`
   (and `Button::icon_min_stroke`, with `Button::icon_size` for a bigger
