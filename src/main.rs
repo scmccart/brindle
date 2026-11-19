@@ -49,6 +49,7 @@ use crate::reattach::Listing;
 use crate::remote::hosts::Hosts;
 use crate::remote::protocol::client::SessionInfo;
 use crate::settings::Settings;
+use crate::terminal_view::{PointerAction, PointerButton};
 use crate::session::{PendingWrite, SessionStore, WindowState};
 use crate::workspace::{Launch, LaunchRequest, Workspace};
 
@@ -94,6 +95,8 @@ DEBUGGING:
         --hover [MODS-]COL,ROW   Move the mouse over a cell of the active terminal
                                  (e.g. ctrl-3,0); in-process, not OS input
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
+        --right-click [MODS-]COL,ROW
+                                 Right-click that cell (e.g. shift-5,1)
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
         --wait-for <TEXT>        Hold the later steps until the active terminal shows
                                  TEXT (\\n = a line break), for at most 30 step
@@ -124,7 +127,7 @@ enum Step {
     /// `--action`: an action's name, checked against the action table when
     /// the arguments were parsed.
     Action(String),
-    /// `--hover` / `--click`.
+    /// `--hover` / `--click` / `--right-click`.
     Pointer(terminal_view::PointerStep),
     Find(String),
     /// `--wait-for`: the text the active terminal must show before the
@@ -368,9 +371,14 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 }
                 args.steps.push(Step::Action(name));
             }
-            "--hover" | "--click" => {
+            "--hover" | "--click" | "--right-click" => {
                 let pos = value_of(it, &arg, "a cell, [MODS-]COL,ROW")?;
-                let step = terminal_view::PointerStep::parse(&pos, arg == "--click").map_err(|why| format!("{arg}: {why}"))?;
+                let action = match arg.as_str() {
+                    "--click" => PointerAction::Click(PointerButton::Left),
+                    "--right-click" => PointerAction::Click(PointerButton::Right),
+                    _ => PointerAction::Hover,
+                };
+                let step = terminal_view::PointerStep::parse(&pos, action).map_err(|why| format!("{arg}: {why}"))?;
                 args.steps.push(Step::Pointer(step));
             }
             "--find" => args.steps.push(Step::Find(value_of(it, &arg, "text to find")?)),
@@ -1402,6 +1410,7 @@ mod tests {
             "--key",
             "--hover",
             "--click",
+            "--right-click",
             "--dump-screen-after",
             "--latency-log",
             "--prefix",
@@ -1435,13 +1444,18 @@ mod tests {
 
     #[test]
     fn a_bad_pointer_position_is_a_usage_error() {
-        for (option, position) in [("--hover", "3"), ("--click", "hyper-3,0"), ("--click", "a,b")] {
+        for (option, position) in
+            [("--hover", "3"), ("--click", "hyper-3,0"), ("--click", "a,b"), ("--right-click", "3"), ("--right-click", "hyper-3,0")]
+        {
             let why = refused(&[option, position]);
             assert!(why.starts_with(&format!("{option}: ")), "{option} {position}: {why}");
         }
         let args = parse(&["--click", "ctrl-3,1"]);
         let [Step::Pointer(step)] = &args.steps[..] else { panic!("{:?}", args.steps) };
-        assert_eq!((step.col, step.row, step.click, step.modifiers.control), (3, 1, true, true));
+        assert_eq!((step.col, step.row, step.action, step.modifiers.control), (3, 1, PointerAction::Click(PointerButton::Left), true));
+        let args = parse(&["--right-click", "shift-5,2"]);
+        let [Step::Pointer(step)] = &args.steps[..] else { panic!("{:?}", args.steps) };
+        assert_eq!((step.col, step.row, step.action, step.modifiers.shift), (5, 2, PointerAction::Click(PointerButton::Right), true));
     }
 
     #[test]

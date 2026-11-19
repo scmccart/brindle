@@ -294,7 +294,6 @@ pub struct Terminal {
     /// Program status records (OSC 7501).
     status: status::Records,
     pub theme: Theme,
-    copy_on_select: bool,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
     /// Pending flush of a synchronized update (mode 2026).
@@ -450,7 +449,6 @@ impl Terminal {
             replaying: false,
             status: status::Records::default(),
             theme,
-            copy_on_select: config.copy_on_select,
             last_activity: Instant::now(),
             sync_flush: None,
         }
@@ -973,14 +971,14 @@ impl Terminal {
     }
 
     /// Selects the last command's output. Returns `false` when there is none.
-    pub fn select_last_output(&mut self, cx: &mut Context<Self>) -> bool {
+    pub fn select_last_output(&mut self, to_clipboard: bool, cx: &mut Context<Self>) -> bool {
         let mut term = self.term.lock();
         let Some((start, end)) = self.marks.lock().last_output(&term) else { return false };
         let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
         selection.update(end, Side::Right);
         term.selection = Some(selection);
         drop(term);
-        self.finish_selection(cx);
+        self.finish_selection(to_clipboard, cx);
         cx.notify();
         true
     }
@@ -1045,11 +1043,13 @@ impl Terminal {
         self.term.lock().selection_to_string().filter(|s| !s.is_empty())
     }
 
-    /// Called when a mouse selection is finished.
-    pub fn finish_selection(&mut self, cx: &mut Context<Self>) {
+    /// Called when a mouse selection is finished: the text goes to the
+    /// primary selection, and to the clipboard when `to_clipboard` (the
+    /// `copy_on_select` setting in effect now) says so.
+    pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) {
         if let Some(text) = self.selection_text() {
             crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
-            if self.copy_on_select {
+            if to_clipboard {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
         }
