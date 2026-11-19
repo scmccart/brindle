@@ -56,7 +56,7 @@ PR title: `feat(settings): open settings from the profile menu, mark built-in th
   Verify: `cargo test -p brindle workspace::` passes.
 - [x] 2.3 Profile menu shell: `refresh_profile_menu` passes `shortcut(&OpenSettings, &focus, window)`, and the `MenuEvent` subscription matches on `ProfileMenuChoice`: `Profile` → `open_profile_keyed` as today, `Settings` → `open_settings`. Verify: task 2.4's cases.
 - [x] 2.4 e2e (`cases/profile_menu.rs`): `profile-menu-items` expects `items=Shell|Other|-|Settings` and a Settings row carrying the Open Settings shortcut. A new `profile-menu-settings`: `open_profile_menu`, `--key end`, `--key enter` → a `--- settings` line, focus `settings`, one tab; then `--key escape` → no dialog, focus `terminal`. Verify: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- profile-menu` passes.
-- [ ] 2.5 Built-in themes (`settings_dialog/themes.rs`):
+- [x] 2.5 Built-in themes (`settings_dialog/themes.rs`):
   - `ThemeEntry::tag()` (`"built-in"`/`"custom"`);
   - `enabled(Btn::Edit)` only for a readable custom theme;
   - `start_edit` on a built-in returns `Reply::Refused("\"<name>\" is built in: New makes an editable copy")` instead of copying;

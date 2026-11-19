@@ -23,6 +23,14 @@ pub struct ThemeEntry {
     pub theme: Result<Theme, String>,
 }
 
+impl ThemeEntry {
+    /// Where the theme comes from, as the dump and an accessible row name
+    /// it: `built-in` (the lock in the list) or `custom` (the file's).
+    pub fn tag(&self) -> &'static str {
+        if self.custom { "custom" } else { "built-in" }
+    }
+}
+
 /// A theme's identity in the list across a reread: its name, and whether
 /// it is the file's (a custom theme may share a built-in's name, and
 /// shadows it).
@@ -603,7 +611,8 @@ impl ThemesState {
         Reply::Done(Step::Nothing)
     }
 
-    /// Edit: a custom theme in place; a built-in is copied first.
+    /// Edit: a custom theme in place. A built-in is read-only: the refusal
+    /// says New makes an editable copy.
     pub fn start_edit(&mut self) -> Reply {
         if !matches!(self.mode, Mode::List) {
             return Reply::Quiet;
@@ -613,7 +622,9 @@ impl ThemesState {
                 self.mode = Mode::Editor(Editor::new(Some(name.clone()), name, &theme, self.selected.clone()));
                 Reply::Done(Step::Nothing)
             }
-            Some(ThemeEntry { custom: false, .. }) => self.start_new(),
+            Some(ThemeEntry { name, custom: false, .. }) => {
+                Reply::Refused(format!("{name:?} is built in: New makes an editable copy"))
+            }
             Some(ThemeEntry { custom: true, theme: Err(_), .. }) | None => Reply::Quiet,
         }
     }
@@ -641,7 +652,7 @@ impl ThemesState {
         }
         let Some(entry) = self.selected_entry() else { return Reply::Quiet };
         if !entry.custom {
-            return Reply::Refused(format!("{:?} is a built-in theme and can't be deleted", entry.name));
+            return Reply::Refused(format!("{:?} is built in and can't be deleted", entry.name));
         }
         let name = entry.name.clone();
         let refs = text
@@ -693,11 +704,11 @@ impl ThemesState {
     pub fn enabled(&self, b: Btn) -> bool {
         match b {
             Btn::Delete => self.selected_entry().is_some_and(|e| e.custom),
+            Btn::Edit => self.selected_entry().is_some_and(|e| e.custom && e.theme.is_ok()),
             Btn::Clear => self.selection_foreground_set(),
             Btn::Save => self.editor_can_save(),
             Btn::New
             | Btn::Duplicate
-            | Btn::Edit
             | Btn::Up
             | Btn::Down
             | Btn::Cancel
@@ -716,8 +727,9 @@ impl ThemesState {
         let selected = self.selected_entry().map(|e| e.name.as_str()).unwrap_or("");
         match &self.mode {
             Mode::List => format!(
-                "--- settings section={section} mode=list selected={selected:?} active={:?} error={error:?}\n",
+                "--- settings section={section} mode=list selected={selected:?} active={:?} error={error:?} origin={}\n",
                 self.active,
+                self.selected_entry().map_or("none", ThemeEntry::tag),
             ),
             Mode::Editor(editor) => format!(
                 "--- settings section={section} mode=editor name={:?} field={field:?} invalid={:?} can_save={} error={error:?}\n",
@@ -831,7 +843,7 @@ background = "nope"
         // In use, built in, or the file can't be read.
         assert!(matches!(themes.request_delete(&text), Reply::Refused(e) if e.contains("the global theme")));
         themes.select(0);
-        assert!(matches!(themes.request_delete(&text), Reply::Refused(e) if e.contains("built-in")));
+        assert!(matches!(themes.request_delete(&text), Reply::Refused(e) if e.contains("built in and can't be deleted")));
         themes.select(7);
         let unreadable = Err("reading /c/config.toml: denied".to_string());
         assert_eq!(themes.request_delete(&unreadable), Reply::Refused("reading /c/config.toml: denied".into()));
@@ -941,8 +953,62 @@ background = "nope"
         assert!(!themes.enabled(Btn::Clear));
         themes.set_field(FieldId::Color(0), "nope");
         assert!(!themes.enabled(Btn::Save));
-        for b in [Btn::New, Btn::Edit, Btn::Cancel, Btn::Apply, Btn::Discard, Btn::Keep, Btn::ConfirmDelete] {
+        for b in [Btn::New, Btn::Cancel, Btn::Apply, Btn::Discard, Btn::Keep, Btn::ConfirmDelete] {
             assert!(themes.enabled(b), "{b:?}");
         }
+    }
+
+    #[test]
+    fn every_theme_is_tagged_built_in_or_custom() {
+        let themes = state(CONFIG, "mine");
+        for entry in themes.entries() {
+            assert_eq!(entry.tag(), if entry.custom { "custom" } else { "built-in" }, "{}", entry.name);
+        }
+        let tags: Vec<&str> = themes.entries().iter().map(ThemeEntry::tag).collect();
+        assert_eq!(tags.iter().filter(|t| **t == "built-in").count(), BUILTIN_THEMES.len());
+        assert_eq!(&tags[BUILTIN_THEMES.len()..], ["custom"; 3]);
+        let mut themes = themes;
+        themes.select(0);
+        assert!(themes.describe(&None, "").ends_with("origin=built-in\n"));
+        themes.select(BUILTIN_THEMES.len() + 1); // mine
+        assert!(themes.describe(&None, "").ends_with("origin=custom\n"));
+    }
+
+    #[test]
+    fn edit_is_unavailable_on_a_built_in() {
+        let mut themes = state(CONFIG, "mine");
+        themes.select(0);
+        assert!(!themes.enabled(Btn::Edit));
+        themes.select(BUILTIN_THEMES.len() + 1);
+        assert_eq!(themes.selected_entry().unwrap().name, "mine");
+        assert!(themes.enabled(Btn::Edit), "mine is a custom theme");
+        // A custom theme that can't be read can't be selected, so Edit
+        // stays where it was.
+        let broken = themes.entries().iter().position(|e| e.theme.is_err()).unwrap();
+        assert_eq!(themes.select(broken), Reply::Quiet);
+        assert!(themes.enabled(Btn::Edit));
+    }
+
+    #[test]
+    fn the_edit_key_on_a_built_in_says_new_copies() {
+        let mut themes = state(CONFIG, "mine");
+        themes.select(0);
+        let name = themes.selected_entry().unwrap().name.clone();
+        assert_eq!(
+            themes.start_edit(),
+            Reply::Refused(format!("{name:?} is built in: New makes an editable copy"))
+        );
+        assert_eq!(themes.list_mode(), ListMode::List);
+        assert!(themes.editor().is_none());
+    }
+
+    #[test]
+    fn the_delete_key_on_a_built_in_says_why() {
+        let mut themes = state(CONFIG, "mine");
+        themes.select(0);
+        let name = themes.selected_entry().unwrap().name.clone();
+        let text = Ok(Some(CONFIG.to_string()));
+        assert_eq!(themes.request_delete(&text), Reply::Refused(format!("{name:?} is built in and can't be deleted")));
+        assert_eq!(themes.list_mode(), ListMode::List);
     }
 }

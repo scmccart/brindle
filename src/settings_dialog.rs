@@ -2342,10 +2342,10 @@ background = "nope"
         assert_eq!(e.current.accent, Some(tokyo.ansi[4]));
         assert_eq!(e.current, tokyo.with_effective_colors());
         assert_eq!(model.preview(), Some(tokyo.with_effective_colors()));
-        // Edit on a built-in copies it too.
+        // Edit on a built-in doesn't copy it: New does.
         model.cancel();
         f.key(&mut model, "e");
-        assert_eq!(editor(&model).name, "tokyo-night-custom");
+        assert!(model.in_list());
     }
 
     #[test]
@@ -2507,7 +2507,7 @@ background = "nope"
         // Built-ins can't be deleted.
         model.select(0);
         f.key(&mut model, "d");
-        assert!(model.error.as_deref().unwrap().contains("built-in"));
+        assert!(model.error.as_deref().unwrap().contains("built in and can't be deleted"));
         // An unused one goes after confirming.
         model.select(7);
         f.key(&mut model, "delete");
