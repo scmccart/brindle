@@ -150,6 +150,7 @@ fn unix() -> Vec<Case> {
         display("tabs-actions-keep-focus", tabs::actions_keep_focus),
         display("profile-menu-items", profile_menu::items),
         display("profile-menu-pick", profile_menu::pick),
+        display("profile-menu-settings", profile_menu::settings),
         display("profile-menu-palette-exclusive", profile_menu::palette_exclusive),
         display("tab-menu-items", tab_menu::items),
         display("tab-menu-choose", tab_menu::choose),

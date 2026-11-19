@@ -493,15 +493,19 @@ impl Workspace {
         static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let focus_handle = cx.focus_handle();
         let profile_menu = cx.new(|_| DropdownMenu::new(profile_menu_trigger(focus_handle.clone()), Vec::<MenuEntry>::new()));
-        // The menu has closed and given focus back to the tab by now. The
-        // chosen item's key is its profile's key (`profile_menu_entries`),
-        // found in the config as it is now, else by its place in the menu.
+        // The menu has closed and given focus back to the tab by now, which
+        // is the focus the settings dialog records. A profile item's key is
+        // its profile's key (`profile_menu_entries`), found in the config as
+        // it is now, else by its place in the menu.
         let profile_menu_subscription =
             cx.subscribe_in(&profile_menu, window, |this, menu, event: &MenuEvent, window, cx| {
                 let MenuEvent::Selected(key) = event;
-                if let Some(listed) = entry_keyed(menu.read(cx).entries(), key) {
-                    let profile = ProfileKey::parse(key.as_str());
-                    this.open_profile_keyed(profile.as_ref(), listed, window, cx);
+                match profile_menu_choice(menu.read(cx).entries(), key) {
+                    Some(ProfileMenuChoice::Profile { key, listed }) => {
+                        this.open_profile_keyed(key.as_ref(), listed, window, cx);
+                    }
+                    Some(ProfileMenuChoice::Settings) => this.open_settings(&OpenSettings, window, cx),
+                    None => {}
                 }
             });
         let context_menu = cx.new(|_| ContextMenu::new());
@@ -1456,7 +1460,9 @@ impl Workspace {
     /// next opening, each keyed by its profile's key.
     fn refresh_profile_menu(&mut self, window: &Window, cx: &mut Context<Self>) {
         let keys = Self::settings(cx).profile_keys();
-        let entries = profile_menu_entries(self.profile_rows(window, cx), &keys);
+        let focus = self.active_tab().map_or_else(|| self.focus_handle.clone(), |t| t.focus_handle(cx));
+        let settings_shortcut = shortcut(&OpenSettings, &focus, window);
+        let entries = profile_menu_entries(self.profile_rows(window, cx), &keys, settings_shortcut);
         self.profile_menu.update(cx, |menu, _| menu.set_entries(entries));
     }
 
@@ -2582,20 +2588,59 @@ fn profile_rows(profiles: &[Profile], shortcuts: &[Option<SharedString>]) -> Vec
         .collect()
 }
 
+/// The key of the profile menu's Settings item. It is neither a
+/// [`ProfileKey`]'s text (those hold a `:`) nor an index (digits), so no
+/// profile item can carry it.
+const SETTINGS_ITEM_KEY: &str = "settings";
+
 /// The profile menu's items: the picker's rows, the description under the
-/// name and the keys at the right. There are no separators, so an item's
-/// index is its profile's when the menu opens. Each item is keyed by its
-/// profile's key (`keys[ix]`, [`ProfileKey`]'s text; names can repeat), so
-/// the chosen one is found in the config as it is when it is chosen; a row
-/// past the end of `keys` is keyed by its index.
-fn profile_menu_entries(rows: Vec<PaletteRow>, keys: &[ProfileKey]) -> Vec<MenuEntry> {
+/// name and the keys at the right, then a separator and Settings (with
+/// `settings_shortcut`, the keys that open the dialog). The profiles come
+/// first, so a profile item's index is its profile's when the menu opens.
+/// Each profile item is keyed by its profile's key (`keys[ix]`,
+/// [`ProfileKey`]'s text; names can repeat), so the chosen one is found in
+/// the config as it is when it is chosen; a row past the end of `keys` is
+/// keyed by its index. Settings is keyed [`SETTINGS_ITEM_KEY`].
+fn profile_menu_entries(
+    rows: Vec<PaletteRow>,
+    keys: &[ProfileKey],
+    settings_shortcut: Option<SharedString>,
+) -> Vec<MenuEntry> {
+    let settings = MenuItem {
+        key: ItemKey::new(SETTINGS_ITEM_KEY),
+        label: "Settings".into(),
+        description: None,
+        shortcut: settings_shortcut,
+        disabled: false,
+    };
     rows.into_iter()
         .enumerate()
         .map(|(ix, row)| {
             let key = ItemKey::new(keys.get(ix).map_or_else(|| ix.to_string(), ProfileKey::to_string));
             MenuItem { key, label: row.label, description: row.detail, shortcut: row.shortcut, disabled: false }.into()
         })
+        .chain([MenuEntry::Separator, settings.into()])
         .collect()
+}
+
+/// What choosing an item of the profile menu does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProfileMenuChoice {
+    /// Open a profile: the one the config has under `key` now, else the one
+    /// at `listed`, its place in the menu when it was listed.
+    Profile { key: Option<ProfileKey>, listed: usize },
+    /// Open the settings dialog.
+    Settings,
+}
+
+/// The choice `key` makes among the profile menu's `entries` (as
+/// [`profile_menu_entries`] built them), or `None` when no item has it.
+fn profile_menu_choice(entries: &[MenuEntry], key: &ItemKey) -> Option<ProfileMenuChoice> {
+    let at = entry_keyed(entries, key)?;
+    if key.as_str() == SETTINGS_ITEM_KEY {
+        return Some(ProfileMenuChoice::Settings);
+    }
+    Some(ProfileMenuChoice::Profile { key: ProfileKey::parse(key.as_str()), listed: at })
 }
 
 /// The menu of tab `ix` of `count`: Rename Tab, Move Tab Left (disabled on
@@ -3291,9 +3336,10 @@ mod tests {
 
         // One item per row, in the same order, with nothing between them,
         // each keyed so that the key of `MenuEvent::Selected` is found at
-        // profile `ix`, and names profile `ix` in the config.
-        let entries = profile_menu_entries(build(), &config.profile_keys());
-        assert_eq!(entries.len(), rows.len());
+        // profile `ix`, and names profile `ix` in the config. A separator
+        // and Settings follow the profiles.
+        let entries = profile_menu_entries(build(), &config.profile_keys(), None);
+        assert_eq!(entries.len(), rows.len() + 2);
         for (ix, (entry, row)) in entries.iter().zip(&rows).enumerate() {
             let item = entry.item().expect("a separator in the profile menu");
             assert_eq!(item.label, row.label);
@@ -3306,14 +3352,67 @@ mod tests {
         }
         // Two profiles of one name are still told apart.
         let twins = Config::parse("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"Shell\"\n").unwrap().config;
-        let twins = profile_menu_entries(vec![rows[0].clone(), rows[0].clone()], &twins.profile_keys());
+        let twins = profile_menu_entries(vec![rows[0].clone(), rows[0].clone()], &twins.profile_keys(), None);
         let keys: Vec<&ItemKey> = twins.iter().filter_map(MenuEntry::key).collect();
         assert_eq!(entry_keyed(&twins, keys[1]), Some(1));
         // A key the config no longer has is found by its place in the menu.
         let rows = vec![rows[0].clone(), rows[1].clone()];
-        let unkeyed = profile_menu_entries(rows, &config.profile_keys()[..1]);
+        let unkeyed = profile_menu_entries(rows, &config.profile_keys()[..1], None);
         let keys: Vec<&str> = unkeyed.iter().filter_map(MenuEntry::key).map(ItemKey::as_str).collect();
-        assert_eq!(keys, ["0:Shell", "1"]);
+        assert_eq!(keys, ["0:Shell", "1", "settings"]);
+    }
+
+    /// The menu ends with a separator and Settings, carrying the keys that
+    /// open the dialog.
+    #[test]
+    fn the_profile_menu_ends_with_settings() {
+        let config = Config::parse("[[profiles]]\nname = \"Shell\"\n").unwrap().config;
+        let rows = profile_rows(&config.profiles, &profile_shortcuts(1));
+        let entries = profile_menu_entries(rows, &config.profile_keys(), Some("ctrl-shift-,".into()));
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[1], MenuEntry::Separator));
+        let item = entries[2].item().expect("Settings is an item");
+        assert_eq!(item.label.as_ref(), "Settings");
+        assert_eq!(text(&item.shortcut), Some("ctrl-shift-,"));
+        assert!(!item.disabled);
+        // With no profiles the menu is still the separator and Settings.
+        let none = profile_menu_entries(Vec::new(), &[], None);
+        assert_eq!(none.len(), 2);
+        assert_eq!(text(&none[1].item().unwrap().shortcut), None);
+    }
+
+    /// No profile item can be keyed `settings`: a profile key holds a `:`
+    /// and an index is digits.
+    #[test]
+    fn the_settings_key_is_never_a_profile_or_an_index() {
+        assert_eq!(ProfileKey::parse(SETTINGS_ITEM_KEY), None);
+        assert!(SETTINGS_ITEM_KEY.parse::<usize>().is_err());
+        // Even a profile named "settings" is keyed `0:settings`.
+        let config = Config::parse("[[profiles]]\nname = \"settings\"\n").unwrap().config;
+        let rows = profile_rows(&config.profiles, &[]);
+        let entries = profile_menu_entries(rows, &config.profile_keys(), None);
+        let keys: Vec<&str> = entries.iter().filter_map(MenuEntry::key).map(ItemKey::as_str).collect();
+        assert_eq!(keys, ["0:settings", "settings"]);
+    }
+
+    #[test]
+    fn profile_menu_choice_decodes_profiles_and_settings() {
+        let config = Config::parse("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"Shell\"\n").unwrap().config;
+        let rows = profile_rows(&config.profiles, &[]);
+        let entries = profile_menu_entries(rows.clone(), &config.profile_keys(), None);
+        let choice = |key: &str| profile_menu_choice(&entries, &ItemKey::new(key.to_string()));
+        let twin = |nth| Some(ProfileKey { name: "Shell".into(), nth });
+        assert_eq!(choice("0:Shell"), Some(ProfileMenuChoice::Profile { key: twin(0), listed: 0 }));
+        assert_eq!(choice("1:Shell"), Some(ProfileMenuChoice::Profile { key: twin(1), listed: 1 }));
+        assert_eq!(choice("settings"), Some(ProfileMenuChoice::Settings));
+        assert_eq!(choice("nothing"), None);
+        // A row without a key is chosen by its index, and has no profile key.
+        let unkeyed = profile_menu_entries(rows, &config.profile_keys()[..1], None);
+        assert_eq!(
+            profile_menu_choice(&unkeyed, &ItemKey::new("1")),
+            Some(ProfileMenuChoice::Profile { key: None, listed: 1 })
+        );
+        assert_eq!(profile_menu_choice(&unkeyed, &ItemKey::new("settings")), Some(ProfileMenuChoice::Settings));
     }
 
     /// ctrl-alt-1 … ctrl-alt-9 are bound to the first nine profiles; a tenth
@@ -3323,9 +3422,9 @@ mod tests {
         let toml: String = (1..=11).map(|n| format!("[[profiles]]\nname = \"p{n}\"\ncommand = \"bash\"\n")).collect();
         let config = Config::parse(&toml).unwrap().config;
         let rows = profile_rows(&config.profiles, &profile_shortcuts(config.profiles.len()));
-        let entries = profile_menu_entries(rows, &config.profile_keys());
-        assert_eq!(entries.len(), 11);
-        for (ix, entry) in entries.iter().enumerate() {
+        let entries = profile_menu_entries(rows, &config.profile_keys(), None);
+        assert_eq!(entries.len(), 13);
+        for (ix, entry) in entries.iter().take(11).enumerate() {
             let item = entry.item().unwrap();
             assert_eq!(item.label.as_ref(), format!("p{}", ix + 1));
             let want = (ix < 9).then(|| format!("ctrl-alt-{}", ix + 1));
