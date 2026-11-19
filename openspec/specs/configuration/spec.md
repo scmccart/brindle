@@ -81,8 +81,11 @@ The config SHALL control:
 - grid padding;
 - cursor shape and blinking;
 - `copy_on_select`;
+- `right_click`: `"none"` (the default) or `"paste"` (a right-click pastes the clipboard when no text is selected, and does nothing while text is selected, as defined by `terminal-emulation`);
 - `osc52_paste` (whether programs may read the clipboard);
 - `mark_failed_commands` (whether failed commands get a gutter mark; on by default).
+
+A reload SHALL apply `copy_on_select` and `right_click` to open tabs as well as new ones.
 
 Session restore is always on (see `session-restore`). A config that still sets `restore_session` SHALL load, with the key ignored and a warning logged that it no longer has an effect.
 
@@ -91,6 +94,14 @@ Brindle has no tmux support. A config that still sets `tmux_session_end` at the 
 #### Scenario: Blinking disabled
 - **WHEN** `cursor.blink = false`
 - **THEN** the focused cursor never blinks
+
+#### Scenario: Right-click paste enabled
+- **WHEN** the config contains `right_click = "paste"`
+- **THEN** a right-click in a terminal that isn't reporting the mouse and has no text selected pastes the clipboard, and one while text is selected does nothing
+
+#### Scenario: Unknown right-click value
+- **WHEN** the config contains `right_click = "menu"`
+- **THEN** Brindle starts with defaults and shows a config error banner saying `menu` isn't one of `none` or `paste`
 
 #### Scenario: Session restore enabled
 - **WHEN** the config contains `restore_session = true`
