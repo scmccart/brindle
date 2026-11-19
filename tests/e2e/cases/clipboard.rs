@@ -1,11 +1,13 @@
 //! Right-click paste (`right_click = "paste"`) and the clipboard settings
-//! read when they are used. The clipboard is set through OSC 52 from the
-//! shell, to a command whose text doesn't show its own output
-//! (`echo pasted-$((6*7))` prints `pasted-42`); the mouse is driven with
-//! Brindle's `--right-click`, `--click` and `--action select_all`.
+//! read when they are used, and the settings dialog's Clipboard section that
+//! writes them. The clipboard is set through OSC 52 from the shell, to a
+//! command whose text doesn't show its own output (`echo pasted-$((6*7))`
+//! prints `pasted-42`); the mouse is driven with Brindle's `--right-click`,
+//! `--click` and `--action select_all`.
 
 use std::path::PathBuf;
 
+use super::step_time;
 use crate::brindle::{Run, config_with};
 use crate::{Ctx, Outcome, Result, ensure};
 
@@ -149,5 +151,75 @@ pub fn right_click_reload(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(8.0)
         .run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "no paste after the reload: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    Ok(Outcome::Pass)
+}
+
+/// A comment of the user's in the config, which writes from the settings
+/// dialog keep.
+const COMMENT: &str = "# my clipboard settings\n";
+
+fn config_text(ctx: &Ctx) -> Result<String> {
+    std::fs::read_to_string(ctx.dir.join("config.toml")).map_err(|e| e.to_string())
+}
+
+/// Opens the settings dialog on its Clipboard section, the last, where focus
+/// is on the first switch, "Copy on select". Two steps.
+fn open_section(run: Run) -> Run {
+    run.top(COMMENT).action("open_settings").action("settings_section_last")
+}
+
+/// The settings dialog's Clipboard section shows the config's values; tab,
+/// space and enter turn on "Right-click pastes" and apply it, which writes
+/// `right_click = "paste"` alone, keeps the file's comments and closes the
+/// dialog, and a right-click then pastes in the open tab. Escape after
+/// turning both switches on writes nothing.
+pub fn settings_section(ctx: &Ctx) -> Result<Outcome> {
+    let original = config_with("e2e", "Shell", COMMENT);
+
+    let out = open_section(Run::new(ctx, "open")).dump_at(step_time(2) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.starts_with("section=Clipboard mode=form copy_on_select=false right_click=none field=\"Copy on select\""),
+        "dialog state on the Clipboard section: {settings:?}"
+    );
+    ensure!(out.dump.focus_stop.as_deref() == Some("Copy on select"), "focus stop: {:?}", out.dump.focus_stop);
+
+    // Space flips the focused switch, and tab goes on to the next.
+    let both = |label: &'static str| open_section(Run::new(ctx, label)).key("space").key("tab").key("space");
+    let out = both("both").dump_at(step_time(5) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("copy_on_select=true right_click=paste field=\"Right-click pastes\" can_apply=true"),
+        "dialog state with both switches on: {settings:?}"
+    );
+    ensure!(config_text(ctx)? == original, "turning the switches on changed the config");
+
+    let out = both("escape").key("escape").dump_at(step_time(6) + 0.8).run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open after escape: {:?}", out.dump.settings);
+    ensure!(out.dump.focus.as_deref() == Some("terminal"), "focus after escape: {:?}", out.dump.focus);
+    ensure!(config_text(ctx)? == original, "escape changed the config:\n{}", config_text(ctx)?);
+
+    // With the clipboard set: the Right-click pastes switch, applied with
+    // enter, then a right-click in the tab.
+    let out = open_section(run(ctx, "apply"))
+        .key("tab")
+        .key("space")
+        .key("enter")
+        .right_click("0,0")
+        .send("\\r")
+        .wait_for(PRINTED)
+        .dump_at(step_time(9) + 2.0)
+        .run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open after enter: {:?}", out.dump.settings);
+    ensure!(out.dump.focus.as_deref() == Some("terminal"), "focus after apply: {:?}", out.dump.focus);
+    let want = original.replacen("padding = 6\n", "padding = 6\nright_click = \"paste\"\n", 1);
+    ensure!(config_text(ctx)? == want, "config after apply:\n{}", config_text(ctx)?);
+    ensure!(
+        out.dump.wait_timeouts.is_empty(),
+        "no paste after apply: {:?}; screen {:?}",
+        out.dump.wait_timeouts,
+        out.dump.screen
+    );
+    ensure!(marks(&out.dump.screen) == 2, "screen {:?}", out.dump.screen);
     Ok(Outcome::Pass)
 }

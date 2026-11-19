@@ -497,6 +497,10 @@ mod tests {
     #[test]
     fn fields_are_labelled_and_listed_in_tab_order() {
         assert_eq!(CLIPBOARD_FIELDS.map(ClipboardField::label), ["Copy on select", "Right-click pastes"]);
+        assert_eq!(
+            CLIPBOARD_FIELDS.map(ClipboardField::hint),
+            [None, Some("Pastes only when nothing is selected. Hold shift to paste where a program uses the mouse.")]
+        );
         let on = values(true, RightClick::Paste);
         assert!(CLIPBOARD_FIELDS.iter().all(|&f| is_on(&on, f)));
         assert!(CLIPBOARD_FIELDS.iter().all(|&f| !is_on(&toggled(on, f), f) && is_on(&toggled(toggled(on, f), f), f)));

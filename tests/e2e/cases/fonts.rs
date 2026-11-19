@@ -61,11 +61,12 @@ fn config_text(ctx: &Ctx) -> Result<String> {
     std::fs::read_to_string(ctx.dir.join("config.toml")).map_err(|e| e.to_string())
 }
 
-/// Opens the dialog, goes to Fonts (the last section, focus on its first
-/// field, Terminal font), tabs to Size and types 20 over it. Five steps.
+/// Opens the dialog, goes to Fonts (the third section, focus on its first
+/// field, Terminal font), tabs to Size and types 20 over it. Six steps.
 fn type_size(run: Run) -> Run {
     run.action("open_settings")
-        .action("settings_section_last")
+        .action("settings_section_next")
+        .action("settings_section_next")
         .action("settings_next_field")
         .action("text_input_select_all")
         .send("20")
@@ -75,7 +76,7 @@ fn type_size(run: Run) -> Run {
 /// escape puts the config's size back; Apply writes the size alone and
 /// closes the dialog.
 pub fn settings_fonts(ctx: &Ctx) -> Result<Outcome> {
-    let out = type_size(Run::new(ctx, "preview")).dump_at(step_time(5) + 0.8).run()?;
+    let out = type_size(Run::new(ctx, "preview")).dump_at(step_time(6) + 0.8).run()?;
     let settings = out.dump.settings.as_deref().unwrap_or("");
     ensure!(
         settings.starts_with("section=Fonts mode=form ") && settings.contains(" size=\"20\" "),
@@ -89,12 +90,12 @@ pub fn settings_fonts(ctx: &Ctx) -> Result<Outcome> {
     expect_line_height("previewing size 20", &out, LINE_HEIGHT_AT_20)?;
     ensure!(config_text(ctx)? == brindle::config("e2e"), "previewing changed the config");
 
-    let out = type_size(Run::new(ctx, "cancel")).action("settings_cancel").dump_at(step_time(6) + 0.8).run()?;
+    let out = type_size(Run::new(ctx, "cancel")).action("settings_cancel").dump_at(step_time(7) + 0.8).run()?;
     ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
     expect_line_height("after cancel", &out, LINE_HEIGHT)?;
     ensure!(config_text(ctx)? == brindle::config("e2e"), "cancelling changed the config");
 
-    let out = type_size(Run::new(ctx, "apply")).action("settings_confirm").dump_at(step_time(6) + 1.3).run()?;
+    let out = type_size(Run::new(ctx, "apply")).action("settings_confirm").dump_at(step_time(7) + 1.3).run()?;
     ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
     ensure!(out.dump.focus.as_deref() == Some("terminal"), "focus after apply: {:?}", out.dump.focus);
     expect_line_height("after apply", &out, LINE_HEIGHT_AT_20)?;
