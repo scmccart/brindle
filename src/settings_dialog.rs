@@ -21,12 +21,12 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, CursorStyle, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px, rems,
 };
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Combobox, Dialog, Dismiss, FocusRing as _, FocusStops, Input,
-    Select, TextInput, TextInputEvent, Tokens,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Combobox, Dialog, Dismiss, FocusRing as _, FocusStops, Icon,
+    Input, Select, TextInput, TextInputEvent, Tokens, TooltipFor as _,
 };
 
 use crate::actions::{
@@ -359,6 +359,14 @@ impl Model {
         }
     }
 
+    /// The close `X`: closes the whole dialog from every view, dropping an
+    /// editor's unsaved edits and an unanswered delete question, as
+    /// ctrl-shift-, and opening a palette do. Escape steps back
+    /// ([`Model::cancel`]).
+    pub fn close(&self) -> Step {
+        Step::Close
+    }
+
     /// New: a copy of the selected theme, or a new profile.
     pub fn start_new(&mut self) {
         match self.section {
@@ -377,7 +385,7 @@ impl Model {
         }
     }
 
-    /// Edit: the selected theme (a built-in is copied first) or profile.
+    /// Edit: the selected custom theme (a built-in is refused) or profile.
     pub fn start_edit(&mut self) {
         match self.section {
             Section::Fonts => {}
@@ -1213,16 +1221,22 @@ impl SettingsDialog {
     }
 
     /// Escape (through the overlay's `Dismiss`, after an open select menu
-    /// took its own) or the close `X`: closes in a list, discards in an
-    /// editor. Handling `Dismiss` here keeps the dialog open
-    /// unless the model says it is done.
+    /// took its own): closes in a list, discards in an editor. Handling
+    /// `Dismiss` here keeps the dialog open unless the model says it is
+    /// done.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         self.request_cancel(window, cx);
     }
 
-    /// Escape or the close `X`: closes in a list, discards in an editor.
+    /// Escape: closes in a list, discards in an editor.
     fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let step = self.model.cancel();
+        self.step(step, window, cx);
+    }
+
+    /// The close `X`: closes the dialog whatever it shows.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let step = self.model.close();
         self.step(step, window, cx);
     }
 
@@ -1358,6 +1372,15 @@ impl SettingsDialog {
                     }),
             )
             .when(entry.custom, |d| d.child(div().flex_none().text_xs().text_color(muted).child("custom")))
+            .when(!entry.custom, |d| {
+                d.child(
+                    div()
+                        .id(("theme-lock", ix))
+                        .flex_none()
+                        .child(Icon::Lock.size(rems(0.875)).color(muted))
+                        .tooltip_for("Built in: New makes an editable copy", None),
+                )
+            })
             .when(active, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● active")))
         })
         .collect::<Vec<_>>();
@@ -1594,7 +1617,7 @@ impl Render for SettingsDialog {
                     .p_4()
                     .gap_3()
                     .close_focus(&self.close_handle)
-                    .on_close(cx.listener(|this, _: &ClickEvent, window, cx| this.request_cancel(window, cx)))
+                    .on_close(cx.listener(|this, _: &ClickEvent, window, cx| this.request_close(window, cx)))
                     .child(
                 div()
                     .flex()
@@ -2342,10 +2365,10 @@ background = "nope"
         assert_eq!(e.current.accent, Some(tokyo.ansi[4]));
         assert_eq!(e.current, tokyo.with_effective_colors());
         assert_eq!(model.preview(), Some(tokyo.with_effective_colors()));
-        // Edit on a built-in copies it too.
+        // Edit on a built-in doesn't copy it: New does.
         model.cancel();
         f.key(&mut model, "e");
-        assert_eq!(editor(&model).name, "tokyo-night-custom");
+        assert!(model.in_list());
     }
 
     #[test]
@@ -2496,6 +2519,44 @@ background = "nope"
         }
     }
 
+    /// The close `X` closes the whole dialog from every view, where escape
+    /// only steps back from an editor or the delete question.
+    #[test]
+    fn the_close_button_closes_from_every_view() {
+        let f = File::new(&two_profiles());
+        let mut model = f.opened("mine");
+        // The profile list, and a profile editor with an unsaved rename.
+        assert_eq!(model.view(), View::Profiles(ListMode::List));
+        assert_eq!(model.close(), Step::Close);
+        f.key(&mut model, "e");
+        model.profiles.editor_mut().unwrap().set_text(profiles::Field::Name, "work");
+        assert_eq!(model.view(), View::Profiles(ListMode::Editor));
+        assert_eq!(model.close(), Step::Close);
+        assert_eq!(model.cancel(), Step::Nothing, "escape only leaves the editor");
+        // The theme list, a theme editor with an unsaved color, and the
+        // delete question.
+        f.section(&mut model, Section::Theme);
+        assert_eq!(model.view(), View::Theme(ListMode::List));
+        assert_eq!(model.close(), Step::Close);
+        model.select(7);
+        model.start_new();
+        model.set_field(FieldId::Color(1), "#123456");
+        assert_eq!(model.view(), View::Theme(ListMode::Editor));
+        assert_eq!(model.close(), Step::Close);
+        model.cancel();
+        f.key(&mut model, "d");
+        assert_eq!(model.view(), View::Theme(ListMode::ConfirmDelete));
+        assert_eq!(model.close(), Step::Close);
+        assert_eq!(model.cancel(), Step::Nothing, "escape keeps the theme");
+        // Fonts with a changed field.
+        f.section(&mut model, Section::Fonts);
+        model.fonts.set_text(fonts::FontField::Size, "20");
+        assert_eq!(model.view(), View::Fonts);
+        assert_eq!(model.close(), Step::Close);
+        // Closing wrote nothing.
+        assert_eq!(f.text(), two_profiles());
+    }
+
     #[test]
     fn deleting_themes() {
         let mut f = File::new(CONFIG);
@@ -2507,7 +2568,7 @@ background = "nope"
         // Built-ins can't be deleted.
         model.select(0);
         f.key(&mut model, "d");
-        assert!(model.error.as_deref().unwrap().contains("built-in"));
+        assert!(model.error.as_deref().unwrap().contains("built in and can't be deleted"));
         // An unused one goes after confirming.
         model.select(7);
         f.key(&mut model, "delete");

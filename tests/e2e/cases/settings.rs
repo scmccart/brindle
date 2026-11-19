@@ -583,3 +583,103 @@ pub fn themes_not_a_table(ctx: &Ctx) -> Result<Outcome> {
     ensure!(settings.contains("selected=\"brindle-dark\""), "dialog state: {settings:?}");
     Ok(Outcome::Pass)
 }
+
+/// Presses shift-tab `n` times, `n` counted from the control that has focus.
+fn shift_tabs(run: Run, n: usize) -> Run {
+    (0..n).fold(run, |run, _| run.key("shift-tab"))
+}
+
+/// The close `X` closes the whole dialog from an editor and from the delete
+/// question, dropping what they hold, where escape only steps back. Each
+/// view is run twice: once to dump with the `X` focused (shift-tab from the
+/// first control reaches the section list, then the `X`), once pressing
+/// enter on it.
+pub fn close_button(ctx: &Ctx) -> Result<Outcome> {
+    // The theme editor (New on `e2e`), the background retyped, then back
+    // four stops: Foreground, the name, the section list, the `X`.
+    let theme_editor = |name: &'static str| {
+        let run = open_theme(Run::new(ctx, name))
+            .action("settings_new")
+            .action("settings_next_field")
+            .action("settings_next_field")
+            .action("text_input_select_all")
+            .send("#123456");
+        shift_tabs(run, 4)
+    };
+    let out = theme_editor("theme-focus").dump_at(step_time(11) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("mode=editor") && settings.contains("field=\"close\""),
+        "the theme editor before enter: {settings:?}"
+    );
+    let out = theme_editor("theme-editor").key("enter").capture_at(step_time(12) + 0.6).dump_at(step_time(12) + 0.9).run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
+    expect_focus_on_tab(&out)?;
+    expect_background("background after the X in a theme editor", &out, theme::BACKGROUND)?;
+    ensure!(config_text(ctx)? == brindle::config("e2e"), "the X in a theme editor changed the config");
+
+    // The profile editor with `Shell` renamed: the name, back two stops.
+    let profile_editor = |name: &'static str| {
+        shift_tabs(edit_shell(Run::new(ctx, name)).action("text_input_select_home").send("work"), 2)
+    };
+    let out = profile_editor("profile-focus").dump_at(step_time(6) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("mode=editor") && settings.contains("field=\"close\""),
+        "the profile editor before enter: {settings:?}"
+    );
+    let out = profile_editor("profile-editor").key("enter").dump_at(step_time(7) + 0.8).run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
+    expect_focus_on_tab(&out)?;
+    ensure!(config_text(ctx)? == brindle::config("e2e"), "the X in a profile editor changed the config");
+
+    // The delete question for `e2e-alt`: focus is on the dialog itself, not
+    // on a stop, so one shift-tab wraps to the last stop, the `X`.
+    let delete_question = |name: &'static str| shift_tabs(open_theme(Run::new(ctx, name)).key("down").key("d"), 1);
+    let out = delete_question("delete-focus").dump_at(step_time(5) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("mode=confirm-delete theme=\"e2e-alt\"") && out.dump.focus_stop.as_deref() == Some("close"),
+        "the delete question before enter: {settings:?}, stop {:?}",
+        out.dump.focus_stop
+    );
+    let out = delete_question("delete-question").key("enter").dump_at(step_time(6) + 0.8).run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
+    expect_focus_on_tab(&out)?;
+    ensure!(config_text(ctx)? == brindle::config("e2e"), "the X on the delete question changed the config");
+    ensure!(config_text(ctx)?.contains("[themes.e2e-alt]"), "e2e-alt is gone");
+    Ok(Outcome::Pass)
+}
+
+/// Built-in themes are read-only: the list says where the selected theme
+/// comes from, and e and d refuse on a built-in, naming New as the way to
+/// a copy. A custom theme edits.
+pub fn builtin_theme(ctx: &Ctx) -> Result<Outcome> {
+    let out = open_theme(Run::new(ctx, "first")).action("settings_first").dump_at(step_time(3) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("mode=list selected=\"brindle-dark\"") && settings.contains("origin=built-in"),
+        "the first theme: {settings:?}"
+    );
+
+    let out = open_theme(Run::new(ctx, "edit")).action("settings_first").key("e").dump_at(step_time(4) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.contains("mode=list selected=\"brindle-dark\""), "e on a built-in: {settings:?}");
+    ensure!(settings.contains("is built in") && settings.contains("New makes an editable copy"), "the refusal: {settings:?}");
+
+    let out = open_theme(Run::new(ctx, "delete")).action("settings_first").key("d").dump_at(step_time(4) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(!settings.contains("mode=confirm-delete"), "d on a built-in asked to delete: {settings:?}");
+    ensure!(settings.contains("is built in and can't be deleted"), "the refusal: {settings:?}");
+
+    let out = open_theme(Run::new(ctx, "custom")).action("settings_last").dump_at(step_time(3) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(
+        settings.contains("selected=\"e2e-alt\"") && settings.contains("origin=custom"),
+        "the last theme: {settings:?}"
+    );
+    let out = open_theme(Run::new(ctx, "custom-edit")).action("settings_last").key("e").dump_at(step_time(4) + 0.8).run()?;
+    let settings = out.dump.settings.as_deref().unwrap_or("");
+    ensure!(settings.contains("mode=editor name=\"e2e-alt\""), "e on a custom theme: {settings:?}");
+    Ok(Outcome::Pass)
+}

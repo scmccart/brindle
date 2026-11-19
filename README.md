@@ -508,13 +508,14 @@ family = ["Inter", "Segoe UI"]
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
 | ctrl-= / ctrl-- / ctrl-0 | font size |
-| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor, fonts) |
+| ctrl-shift-, | settings (profiles, theme picker with live preview, custom theme editor, fonts; also the `⌄` menu's Settings) |
 | ctrl-, | edit config |
 
 The `⌄` button at the end of the tab strip opens the profile menu: every profile
 in config order, each with what it runs and its ctrl-alt-N key. Up/down move,
 enter opens the profile in a new tab, typing jumps to a profile whose name
 starts with the text, and escape, a click outside or `⌄` again closes the menu.
+It ends with Settings, which opens the settings dialog.
 The ctrl-shift-space list is the one to use to filter by name.
 
 Right-clicking a tab makes it the active tab and opens its menu at the pointer:
@@ -542,9 +543,8 @@ discard. It opens on Profiles.
 
 In the Theme section, the theme list has focus: up/down (and home/end) preview a
 theme and enter applies it as the default; escape puts the previous theme back.
-Tab moves from the list to its buttons and back, as in the profile list. `n` makes a new theme (a copy of
-the selected one), `e` edits a custom theme and `d` deletes one. Built-in themes
-can't be changed, so editing one starts from a copy. In the editor, every valid
+Tab moves from the list to its buttons and back, as in the profile list.
+Built-in themes carry a lock and can't be edited or deleted: `n` makes an editable copy of the selected theme, `e` edits a custom theme and `d` deletes one. In the editor, every valid
 color shows on the tabs as you type. Saving
 updates `config.toml` in place: your comments and the rest of the file are kept.
 
@@ -563,7 +563,8 @@ down don't move between fields). Enter saves from a text field or a checkbox;
 on a focused button, enter or space presses that button alone. A choice field (a profile's theme, remote kind or container
 engine) works like a select: enter, space, up or down opens its menu, where
 up/down move, enter picks and escape closes the menu; left and right do nothing.
-Otherwise escape discards the editor's changes and goes back to the list. A
+Otherwise escape discards the editor's changes and goes back to the list.
+The dialog's close button (×) closes the whole dialog from anywhere, dropping unsaved changes, as ctrl-shift-, does. A
 click outside the dialog doesn't close it.
 
 The Fonts section has four fields, always editable: Terminal font, Size, Line

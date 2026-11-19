@@ -36,7 +36,11 @@ fn expect_closed(out: &Output, what: &str) -> Result {
 pub fn items(ctx: &Ctx) -> Result<Outcome> {
     let out = two_profiles(Run::new(ctx, "open")).action("open_profile_menu").key("down").dump_at(step_time(2) + 1.0).run()?;
     let menu = &out.dump.menu;
-    ensure!(menu.first().map(String::as_str) == Some("items=Shell|Other highlighted=0"), "menu {menu:?}");
+    ensure!(menu.first().map(String::as_str) == Some("items=Shell|Other|-|Settings highlighted=0"), "menu {menu:?}");
+    ensure!(
+        menu.get(3).is_some_and(|r| r.starts_with("Settings") && r.ends_with("  [ctrl-shift-,]")),
+        "Settings item: {menu:?}"
+    );
     ensure!(
         menu.get(1).is_some_and(|r| r.starts_with("Shell  ") && r.ends_with("  [ctrl-alt-1]")),
         "Shell item: {menu:?}"
@@ -75,7 +79,7 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(step_time(1) + 1.0)
         .run()?;
     ensure!(
-        out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell|Other ")),
+        out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell|Other|-|Settings ")),
         "menu after the bound key: {:?}",
         out.dump.menu
     );
@@ -98,6 +102,35 @@ pub fn pick(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "tabs: {:?}", out.dump.tabs);
     ensure!(out.dump.screen.iter().any(|l| l == "picked 42"), "the new tab's screen: {:?}", out.dump.screen);
     expect_focus(&out, "terminal", "after choosing Other")?;
+    Ok(Outcome::Pass)
+}
+
+/// Choosing Settings (the last item, reached with end) opens the settings
+/// dialog over the one tab, with focus in it; escape then closes it and
+/// focus returns to the terminal.
+pub fn settings(ctx: &Ctx) -> Result<Outcome> {
+    let out = two_profiles(Run::new(ctx, "settings"))
+        .action("open_profile_menu")
+        .key("end")
+        .key("enter")
+        .dump_at(step_time(3) + 1.0)
+        .run()?;
+    expect_closed(&out, "after choosing Settings")?;
+    ensure!(out.dump.settings.is_some(), "no settings dialog");
+    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    expect_focus(&out, "settings", "after choosing Settings")?;
+
+    let out = two_profiles(Run::new(ctx, "settings-escape"))
+        .action("open_profile_menu")
+        .key("end")
+        .key("enter")
+        .key("escape")
+        .dump_at(step_time(4) + 1.0)
+        .run()?;
+    ensure!(out.dump.settings.is_none(), "the dialog is still open: {:?}", out.dump.settings);
+    expect_closed(&out, "after escape from the dialog")?;
+    ensure!(out.dump.tabs.len() == 1, "tabs after escape: {:?}", out.dump.tabs);
+    expect_focus(&out, "terminal", "after escape from the dialog")?;
     Ok(Outcome::Pass)
 }
 
