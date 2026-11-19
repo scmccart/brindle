@@ -503,7 +503,7 @@ family = ["Inter", "Segoe UI"]
 | the strip's `⌄` | profile menu (see below) |
 | right-click a tab / a zone header | tab menu / zone menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
-| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection) |
+| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard when nothing is selected and does nothing while text is: shift-right-click where a program uses the mouse) |
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
