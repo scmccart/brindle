@@ -73,7 +73,7 @@ PR title: `feat(settings): open settings from the profile menu, mark built-in th
 
   Verify: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- settings` passes, `settings-enter-on-button` and `settings-tab-wrap` included.
 - [x] 2.9 e2e `settings-builtin-theme`: `open_theme` then `settings_first` (`brindle-dark`) → `origin=built-in`. `--key e` → still `mode=list selected="brindle-dark"`, with the error naming built in and New. `--key d` → no `mode=confirm-delete`, error says built in. `settings_last` (`e2e-alt`) → `origin=custom`, and `--key e` → `mode=editor name="e2e-alt"`. Verify: the `settings` filter run in 2.8.
-- [ ] 2.10 Docs:
+- [x] 2.10 Docs:
   - `README.md`:
     - the profile-menu paragraph (lines 512–516): add "It ends with Settings, which opens the settings dialog.";
     - the ctrl-shift-, table row: add "(also the `⌄` menu's Settings)";
