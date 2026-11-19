@@ -92,7 +92,7 @@ These modules mix pure items with shell code, which a text search can't tell apa
 | `src/terminal/pace.rs` (`step`) | when the event task waits |
 | `src/session.rs` (`merge_windows`, `drop_lost_zones`, `record_zones`, `resolve_tab`) | which windows, tabs and zones a launch restores, and the zones a tab is saved with |
 | `src/settings.rs` (`Settings::new`, `Settings::zoomed`) | the fonts and sizes a config and a preview resolve to, and the zoom a key leaves |
-| `src/settings_dialog.rs` (`Model`, `focus_target`), `src/settings_dialog/profiles.rs` (`ProfilesState`, `ProfileEditor`), `src/settings_dialog/fonts.rs` (`FontsState`) | overlay state and rows, which buttons are enabled, where focus goes, and the `ConfigEdit` each operation writes |
+| `src/settings_dialog.rs` (`Model`, `focus_target`), `src/settings_dialog/profiles.rs` (`ProfilesState`, `ProfileEditor`), `src/settings_dialog/fonts.rs` (`FontsState`), `src/settings_dialog/clipboard.rs` (`ClipboardState`) | overlay state and rows, which buttons are enabled, where focus goes, and the `ConfigEdit` each operation writes |
 | `ui/src/text_input.rs` (`EditState`) | editing |
 | `src/workspace.rs` (`program_title`) | whether an OSC title is the program's own, by the path style of the programs' paths |
 | `src/desktop.rs` (`without_verbatim_prefix`) | a Windows path without its verbatim `\\?\` prefix |
