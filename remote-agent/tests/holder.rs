@@ -1192,6 +1192,9 @@ fn answers(core: &mut TestCore, session: u32, word: &str) {
 
 #[test]
 fn a_holder_fault_while_spawning_fails_that_spawn_only() {
+    if skip_without_switch("BRINDLE_TEST_HOLDER_PANIC") {
+        return;
+    }
     let (dir, mut core, holder_pid) = faulty_holder("fault-spawn");
     let go = dir.path.join("go");
     let pid = core.spawn(programs::echoes_a_line(1, &go));
@@ -1225,6 +1228,9 @@ fn a_holder_fault_while_spawning_fails_that_spawn_only() {
 
 #[test]
 fn a_holder_fault_on_input_reports_an_error_and_both_sessions_keep_running() {
+    if skip_without_switch("BRINDLE_TEST_HOLDER_PANIC") {
+        return;
+    }
     let (dir, mut core, holder_pid) = faulty_holder("fault-input");
     let gos = [dir.path.join("go1"), dir.path.join("go2")];
     // Each session's `one` before the next spawn, which drops output.

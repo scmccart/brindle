@@ -747,8 +747,8 @@ pub fn reattach_no_restore(ctx: &Ctx) -> Result<Outcome> {
 /// (`BRINDLE_TEST_LAUNCH_LISTING`) opens what one answered at once opens:
 /// the recorded tab, active, then the session a `--no-restore` launch left
 /// detached, as in `local-server-reattach-no-restore`. The switch works in
-/// debug builds only, so this needs one (`BRINDLE_E2E_BIN` unset): against
-/// a release build it can't tell whether the listing was slow.
+/// debug builds only, so the case declares it (`Case::needs`) and is
+/// skipped when the binary doesn't list it.
 pub fn reattach_slow_listing(ctx: &Ctx) -> Result<Outcome> {
     left_by_no_restore(ctx)?;
     let delay = ((ctx.secs(3.0) * 1000.0).round() as u64).to_string();
@@ -800,7 +800,7 @@ fn left_by_no_restore(ctx: &Ctx) -> Result {
 /// new shell in its recorded directory and leaves the recorded session
 /// detached; the next launch that lists opens that session as a tab after
 /// the restored one; and `--attach` says the server couldn't be listed,
-/// not that the session doesn't exist. Needs a debug build, as
+/// not that the session doesn't exist. It declares the switch, as
 /// `local-server-reattach-slow-listing` does.
 pub fn reattach_failed_listing(ctx: &Ctx) -> Result<Outcome> {
     let srv = Server::of(ctx);
@@ -821,7 +821,7 @@ pub fn reattach_failed_listing(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(later(4.0))
         .run()?;
     let shell = shown_pid(&second, "second=")?;
-    ensure!(shell != first, "BRINDLE_TEST_LAUNCH_LISTING had no effect: is BRINDLE_E2E_BIN a release build?");
+    ensure!(shell != first, "BRINDLE_TEST_LAUNCH_LISTING had no effect: the second launch attached the first's session");
     ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
     ensure!(second.dump.screen.iter().any(|l| l == "/tmp"), "the new shell isn't in /tmp: {:?}", second.dump.screen);
     // The recorded session, and now the second run's shell.
@@ -1434,8 +1434,7 @@ pub fn reused_id(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// What the case sets `BRINDLE_TEST_SINK_PANIC` to: Brindle's emulator
-/// panics on a read of a session's output that holds it. The switch exists
-/// only in debug builds, which is what the suite tests by default.
+/// panics on a read of a session's output that holds it.
 const SINK_PANIC: &str = "brindle-test-sink-panic";
 
 /// Brindle's emulator failing on one zone's output (the fault switch
@@ -1479,7 +1478,7 @@ pub fn sink_panic(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(
         out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
-        "waits that gave up: {:?}, still waiting: {:?} (the fault switch is in debug builds only)",
+        "waits that gave up: {:?}, still waiting: {:?}",
         out.dump.wait_timeouts,
         out.dump.wait_pending
     );
@@ -1493,8 +1492,8 @@ pub fn sink_panic(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// What the case sets `BRINDLE_TEST_HOLDER_PANIC` to: a holder panics, in
-/// a debug build, handling an `INPUT` whose bytes hold it.
+/// What the case sets `BRINDLE_TEST_HOLDER_PANIC` to: a holder panics
+/// handling an `INPUT` whose bytes hold it.
 const HOLDER_FAULT: &str = "brindle-test-holder-panic";
 
 /// A failure of the session's holder on one input (the fault switch
@@ -1513,7 +1512,7 @@ pub fn session_error(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(
         out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
-        "waits that gave up: {:?}, still waiting: {:?} (the fault switch is in debug builds only)",
+        "waits that gave up: {:?}, still waiting: {:?}",
         out.dump.wait_timeouts,
         out.dump.wait_pending
     );

@@ -292,6 +292,8 @@ it opens Brindle windows (under Xwayland, display `:0` unless
 Each case keeps its logs, screen dumps and window captures in
 `target/tmp/e2e/<case>/`.
 
+Cases that need a debug-only fault switch are skipped, with the reason, when the binary under test has none (`cargo test --release`, or `BRINDLE_E2E_BIN` naming a release build); `BRINDLE_E2E_SWITCHES_REQUIRED=1`, as CI sets, makes that a failure.
+
 To run the suite headless, the way CI does, wrap it in `scripts/with-xvfb`
 (after `sudo apt install xvfb x11-utils openbox mesa-vulkan-drivers dbus`):
 

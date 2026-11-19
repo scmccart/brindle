@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::brindle::{Output, Run};
 use crate::capture::{self, Cells, Changes, Image};
+use crate::switches::TestSwitch;
 use crate::{Case, Ctx, Result, ensure};
 
 pub fn all() -> Vec<Case> {
@@ -47,9 +48,10 @@ pub fn all() -> Vec<Case> {
 }
 
 fn unix() -> Vec<Case> {
-    let display = |name, run| Case { name, display: true, run };
+    let (display, needing) = (Case::display, Case::needing);
     vec![
-        Case { name: "cli-usage-errors", display: false, run: cli::usage_errors },
+        Case::headless("cli-usage-errors", cli::usage_errors),
+        Case::headless("cli-list-fault-switches", cli::list_fault_switches),
         display("dump-grid-geometry", dump::grid_geometry),
         display("dump-wait-for-timeout", dump::wait_for_timeout),
         display("dump-wait-for-pending", dump::wait_for_pending),
@@ -168,8 +170,8 @@ fn unix() -> Vec<Case> {
         display("local-server-reattach-inactive", local_server::reattach_inactive),
         display("local-server-reattach-closed-tab", local_server::reattach_closed_tab),
         display("local-server-reattach-no-restore", local_server::reattach_no_restore),
-        display("local-server-reattach-slow-listing", local_server::reattach_slow_listing),
-        display("local-server-reattach-failed-listing", local_server::reattach_failed_listing),
+        needing("local-server-reattach-slow-listing", &[TestSwitch::LaunchListing], local_server::reattach_slow_listing),
+        needing("local-server-reattach-failed-listing", &[TestSwitch::LaunchListing], local_server::reattach_failed_listing),
         display("local-server-reattach-second", local_server::reattach_second),
         display("local-server-layout", local_server::layout),
         display("local-server-layout-live", local_server::layout_live),
@@ -184,8 +186,8 @@ fn unix() -> Vec<Case> {
         display("local-server-replay-quiet", local_server::replay_quiet),
         display("local-server-holder-lost", local_server::holder_lost),
         display("local-server-reused-id", local_server::reused_id),
-        display("local-server-sink-panic", local_server::sink_panic),
-        display("local-server-session-error", local_server::session_error),
+        needing("local-server-sink-panic", &[TestSwitch::SinkPanic], local_server::sink_panic),
+        needing("local-server-session-error", &[TestSwitch::HolderPanic], local_server::session_error),
         // Unix only: the case makes the server directory unreadable with a mode.
         #[cfg(unix)]
         display("local-server-no-core-back", local_server::no_core_back),

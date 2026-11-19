@@ -111,9 +111,9 @@ impl Screen {
 /// builds only).
 fn inject_fault(bytes: &[u8]) {
     static MARKER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    if let Some(marker) = fault::marker("BRINDLE_TEST_FEED_PANIC", &MARKER)
+    if let Some(marker) = fault::marker(fault::FEED_PANIC, &MARKER)
         && fault::holds(bytes, marker)
     {
-        panic!("BRINDLE_TEST_FEED_PANIC matched");
+        panic!("{} matched", fault::FEED_PANIC);
     }
 }

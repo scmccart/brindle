@@ -10,11 +10,13 @@ use std::time::{Duration, Instant};
 use super::local_server;
 use crate::brindle::Dump;
 use crate::common::server::{Isolation, isolate};
+use crate::switches::TestSwitch;
 use crate::{Case, Ctx, Outcome, Result, ensure, winproc};
 
 pub fn all() -> Vec<Case> {
-    let display = |name, run| Case { name, display: true, run };
+    let (display, needing) = (Case::display, Case::needing);
     vec![
+        Case::headless("cli-list-fault-switches", super::cli::list_fault_switches),
         display("windows-conpty-host", conpty_host),
         display("windows-conpty-fallback", conpty_fallback),
         display("windows-passthrough", passthrough),
@@ -53,7 +55,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-replay-quiet", local_server::replay_quiet),
         display("local-server-holder-lost", local_server::holder_lost),
         display("local-server-reused-id", local_server::reused_id),
-        display("local-server-sink-panic", local_server::sink_panic),
+        needing("local-server-sink-panic", &[TestSwitch::SinkPanic], local_server::sink_panic),
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),

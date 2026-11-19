@@ -121,6 +121,23 @@ fn with_no_server_running_nothing_is_printed_and_nothing_starts() {
 }
 
 #[test]
+fn the_helper_lists_its_fault_switches() {
+    let dir = TempDir::new("cli-switches");
+    let output = succeeded(cli(&dir.path, &["--list-fault-switches"]));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    for line in stdout(&output).lines() {
+        assert!(line.starts_with("BRINDLE_TEST_"), "{line:?}");
+    }
+    // The listing never connects to a core, so it starts none.
+    assert!(server_processes(&dir.path, "serve").is_empty());
+    assert!(core_endpoint_gone(&dir.path));
+    let output = cli(&dir.path, &["--list-fault-switches", "extra"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(stderr(&output).contains("takes no arguments"), "{output:?}");
+}
+
+#[test]
 fn a_failed_command_names_its_action() {
     let dir = TempDir::new("cli-file");
     // The server directory is a file: there may be a server, but it can't

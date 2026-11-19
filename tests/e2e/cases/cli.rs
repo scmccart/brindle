@@ -7,6 +7,48 @@ use crate::brindle::state_dir;
 use crate::common::server::{Isolation, isolate};
 use crate::{Ctx, Outcome, Result, ensure};
 
+/// `brindle --list-fault-switches` and `brindle-remote --list-fault-switches`
+/// exit 0 and print only `BRINDLE_TEST_` names (none in a release build),
+/// opening no window: the runs get no display. This checks the contract the
+/// runner's probe relies on, whichever build is under test.
+pub fn list_fault_switches(ctx: &Ctx) -> Result<Outcome> {
+    let config = ctx.dir.join("config.toml");
+    std::fs::write(&config, crate::brindle::config("e2e")).map_err(|e| format!("writing the config: {e}"))?;
+    for (label, binary) in [("brindle", &ctx.bin), ("helper", &ctx.helper)] {
+        let mut command = Command::new(binary);
+        isolate(
+            &mut command,
+            &Isolation { config: &config, state_dir: &state_dir(ctx), server_dir: &ctx.server_dir, display: &ctx.display },
+        );
+        // A window would need a display: none is given.
+        command.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+        let stdout = ctx.dir.join(format!("{label}.out"));
+        let file = std::fs::File::create(&stdout).map_err(|e| format!("creating {}: {e}", stdout.display()))?;
+        let mut child = command
+            .arg("--list-fault-switches")
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("starting {}: {e}", binary.display()))?;
+        let exited = ctx.scale().poll(10.0, &format!("{label} --list-fault-switches exiting"), || child.try_wait().map_err(|e| e.to_string()));
+        let status = match exited {
+            Ok(status) => status,
+            Err(why) => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(why);
+            }
+        };
+        ensure!(status.code() == Some(0), "{} --list-fault-switches exited with {status}", binary.display());
+        let text = std::fs::read_to_string(&stdout).map_err(|e| format!("reading {}: {e}", stdout.display()))?;
+        for line in text.lines() {
+            ensure!(line.starts_with("BRINDLE_TEST_"), "{label} printed {line:?}, which isn't a BRINDLE_TEST_ name");
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
 /// `-p` without a name, a misspelled `--action` and `--dump-screen-after`
 /// without a number each exit with status 2, naming what was wrong, and
 /// open no window: the runs pass no display that could show one, and each

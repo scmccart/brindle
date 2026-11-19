@@ -555,6 +555,11 @@ impl<'a> Run<'a> {
 
     pub fn run(mut self) -> Result<Output> {
         let ctx = self.ctx;
+        // A fault switch the case didn't declare would fail confusingly on a
+        // build without it, instead of skipping (`testing R18`).
+        if let Some(why) = self.env.iter().find_map(|(key, _)| crate::switches::undeclared(key, ctx.needs)) {
+            return Err(why);
+        }
         let dump_secs = self.dump_secs();
         let config_path = ctx.dir.join("config.toml");
         let mut text = config_with(self.theme, self.default_profile, &self.top);
@@ -974,6 +979,7 @@ pub fn self_test_dump_after_last_step() -> Result {
     // A run's own steps, at factor 3.
     let ctx = Ctx {
         name: "self-test",
+        needs: &[],
         dir: std::env::temp_dir(),
         bin: std::path::PathBuf::new(),
         helper: std::path::PathBuf::new(),
@@ -986,6 +992,13 @@ pub fn self_test_dump_after_last_step() -> Result {
     ensure!((dump - 8.2).abs() < 1e-9, "2 steps, 3 s apart, then 0.7 s: {dump}");
     let run = run.dump_at(4.0);
     ensure!(run.dump_secs() == 12.0, "dump_at(4) at factor 3: {}", run.dump_secs());
+    // A fault switch the case didn't declare refuses the run before it launches.
+    let refused = Run::new(&ctx, "self-test").env("BRINDLE_TEST_SINK_PANIC", "x").run();
+    ensure!(
+        refused.as_ref().err().is_some_and(|why| why.contains("BRINDLE_TEST_SINK_PANIC") && why.contains("needs")),
+        "an undeclared switch gave {:?}",
+        refused.map(|_| ())
+    );
     Ok(())
 }
 

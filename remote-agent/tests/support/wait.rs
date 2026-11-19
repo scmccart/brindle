@@ -154,16 +154,20 @@ pub enum Capability {
     Scopes,
     /// The packaged ConPTY (`conpty.dll`) beside the test helper.
     PackagedConpty,
+    /// A helper build that honours a fault switch (a debug build): ask it
+    /// with `--list-fault-switches` ([`skip_without_switch`]).
+    FaultSwitches,
 }
 
 impl Capability {
-    const ALL: [Capability; 2] = [Capability::Scopes, Capability::PackagedConpty];
+    const ALL: [Capability; 3] = [Capability::Scopes, Capability::PackagedConpty, Capability::FaultSwitches];
 
     /// Its name in [`REQUIRE_VAR`] and in `skipped.log`.
     pub fn name(self) -> &'static str {
         match self {
             Capability::Scopes => "scopes",
             Capability::PackagedConpty => "packaged-conpty",
+            Capability::FaultSwitches => "fault-switches",
         }
     }
 }
@@ -216,4 +220,80 @@ pub fn skip(capability: Capability, reason: &str) {
         eprintln!("couldn't record the skip in {}: {error}", log.display());
     }
     eprint!("skipped: {line}");
+}
+
+/// The names in `--list-fault-switches`' output: one per line, blank lines
+/// ignored.
+pub fn parse_listing(text: &str) -> Vec<String> {
+    text.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
+}
+
+/// The fault switches the helper under test lists (`BIN
+/// --list-fault-switches`), asked once; why it couldn't say otherwise.
+fn listed_switches() -> &'static Result<Vec<String>, String> {
+    static LISTED: OnceLock<Result<Vec<String>, String>> = OnceLock::new();
+    LISTED.get_or_init(|| {
+        let output = std::process::Command::new(super::BIN)
+            .arg("--list-fault-switches")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("couldn't run {} --list-fault-switches: {error}", super::BIN))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} --list-fault-switches failed with {}: {}",
+                super::BIN,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(parse_listing(&String::from_utf8_lossy(&output.stdout)))
+    })
+}
+
+/// Skips the running test ([`skip`], as [`Capability::FaultSwitches`]) and
+/// returns true when the helper under test doesn't list `switch`; the
+/// caller returns. A probe that failed skips with its reason.
+pub fn skip_without_switch(switch: &str) -> bool {
+    match listed_switches() {
+        Ok(listed) if listed.iter().any(|name| name == switch) => false,
+        Ok(_) => {
+            skip(
+                Capability::FaultSwitches,
+                &format!(
+                    "needs {switch}, which {} doesn't list (a release build has none: run without --release)",
+                    super::BIN
+                ),
+            );
+            true
+        }
+        Err(why) => {
+            skip(Capability::FaultSwitches, why);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_capabilities_are_named_and_unknown_names_refused() {
+        assert_eq!(parse_required(None), Ok(vec![]));
+        assert_eq!(
+            parse_required(Some("scopes, packaged-conpty,fault-switches")),
+            Ok(vec![Capability::Scopes, Capability::PackagedConpty, Capability::FaultSwitches])
+        );
+        let error = parse_required(Some("scopes,nope")).unwrap_err();
+        assert!(error.contains("\"nope\"") && error.contains("fault-switches"), "{error}");
+    }
+
+    #[test]
+    fn a_listing_is_one_name_per_line() {
+        assert_eq!(parse_listing(""), Vec::<String>::new());
+        assert_eq!(
+            parse_listing("BRINDLE_TEST_HOLDER_PANIC\r\n\nBRINDLE_TEST_FEED_PANIC\n"),
+            ["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC"]
+        );
+    }
 }

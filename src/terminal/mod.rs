@@ -22,6 +22,9 @@ pub mod search;
 pub mod tab_note;
 #[cfg(any(target_os = "linux", windows))]
 mod server;
+/// The fault switch the server sink reads (`server`'s `inject_fault`), named
+/// here so `--list-fault-switches` and the reader share one constant.
+pub const SINK_PANIC: &str = "BRINDLE_TEST_SINK_PANIC";
 // Moved to `brindle-term-core`, which the server core shares.
 pub use brindle_term_core::emulator::MIN_COLS;
 pub use brindle_term_core::{shell_integration, status};
