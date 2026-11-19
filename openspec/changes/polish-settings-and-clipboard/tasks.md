@@ -84,7 +84,7 @@ PR title: `feat(settings): open settings from the profile menu, mark built-in th
     - "Manual checks", the profile menu item (line 112): add "its Settings item opening the dialog", and add an item: "a pointer click on the settings dialog's close × closes it from an editor". In the hover-tooltip item (the last), add "the Theme list's lock on a built-in" to the places a hover shows a tooltip.
 
   Verify: the README and CLAUDE.md diffs say exactly this.
-- [ ] 2.11 Group check: `cargo test --locked --workspace`, clippy and both self-tests pass; `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- profile-menu settings input-settings` passes. Manual checks for the PR body: the press on `⌄` with Settings chosen by pointer, a pointer click on the × in an editor, and a hover on a built-in's lock showing "Built in: New makes an editable copy".
+- [x] 2.11 Group check: `cargo test --locked --workspace`, clippy and both self-tests pass; `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- profile-menu settings input-settings` passes. Manual checks for the PR body: the press on `⌄` with Settings chosen by pointer, a pointer click on the × in an editor, and a hover on a built-in's lock showing "Built in: New makes an editable copy".
 
 ## 3. Right-click paste, and the clipboard settings read live
 
