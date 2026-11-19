@@ -143,7 +143,8 @@ pub fn exclusive(ctx: &Ctx) -> Result<Outcome> {
         .action("open_profile_menu")
         .dump_at(step_time(3) + 1.0)
         .run()?;
-    ensure!(out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell ")), "menu {:?}", out.dump.menu);
+    // The profile menu: the one profile, then its Settings item.
+    ensure!(out.dump.menu.first().is_some_and(|h| h.starts_with("items=Shell|-|Settings ")), "menu {:?}", out.dump.menu);
     expect_focus(&out, "menu", "tab menu, then the profile menu")?;
 
     let out = shell(Run::new(ctx, "profile-then-tab"))
