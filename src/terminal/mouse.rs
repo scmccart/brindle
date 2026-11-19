@@ -4,6 +4,40 @@
 use alacritty_terminal::term::TermMode;
 use gpui::Modifiers;
 
+use crate::config::RightClick;
+
+/// Whether mouse events go to the program rather than to selection and
+/// paste: it asked for mouse reporting and shift isn't held (shift always
+/// bypasses, as in xterm).
+pub fn reports(mode: TermMode, shift: bool) -> bool {
+    mode.intersects(TermMode::MOUSE_MODE) && !shift
+}
+
+/// What a right press does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightPress {
+    /// It goes to the program as a mouse report.
+    Report,
+    /// The clipboard is pasted.
+    Paste,
+    /// Nothing happens, and the selection stays.
+    Nothing,
+}
+
+/// Decides a right press. `reports` is [`reports`] for the press, and
+/// `has_selection` says whether text is selected (so a copy would take
+/// something). The press pastes only when the setting says so and nothing is
+/// selected, so a stray right-click can't paste over a selection.
+pub fn right_press(reports: bool, has_selection: bool, setting: RightClick) -> RightPress {
+    if reports {
+        return RightPress::Report;
+    }
+    match (setting, has_selection) {
+        (RightClick::Paste, false) => RightPress::Paste,
+        (RightClick::Paste, true) | (RightClick::Nothing, true | false) => RightPress::Nothing,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Left,
@@ -217,6 +251,51 @@ mod tests {
         assert_eq!(alternate_scroll(-1, mode | TermMode::APP_CURSOR).unwrap(), b"\x1bOB");
         assert_eq!(alternate_scroll(1, mode | TermMode::MOUSE_REPORT_CLICK), None);
         assert_eq!(alternate_scroll(1, TermMode::ALTERNATE_SCROLL), None);
+    }
+
+    const SETTINGS: [RightClick; 2] = [RightClick::Nothing, RightClick::Paste];
+
+    #[test]
+    fn reporting_needs_a_mouse_mode_and_no_shift() {
+        for mode in [TermMode::MOUSE_REPORT_CLICK, TermMode::MOUSE_DRAG, TermMode::MOUSE_MOTION] {
+            assert!(reports(mode, false), "{mode:?}");
+            assert!(!reports(mode, true), "{mode:?} with shift");
+        }
+        assert!(!reports(TermMode::NONE, false));
+        assert!(!reports(TermMode::SGR_MOUSE, false));
+    }
+
+    #[test]
+    fn a_right_press_is_reported_while_the_program_reports() {
+        for selected in [false, true] {
+            for setting in SETTINGS {
+                assert_eq!(right_press(true, selected, setting), RightPress::Report, "{selected} {setting:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn right_click_pastes_only_when_set_to_paste() {
+        assert_eq!(right_press(false, false, RightClick::Paste), RightPress::Paste);
+        assert_eq!(right_press(false, false, RightClick::Nothing), RightPress::Nothing);
+    }
+
+    #[test]
+    fn a_right_press_over_a_selection_does_nothing() {
+        for setting in SETTINGS {
+            assert_eq!(right_press(false, true, setting), RightPress::Nothing, "{setting:?}");
+        }
+    }
+
+    #[test]
+    fn shift_right_click_follows_the_selection_rule() {
+        // Reporting on, shift held: `reports` is false, so the press is an
+        // unreported one.
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        let unreported = reports(mode, true);
+        assert_eq!(right_press(unreported, false, RightClick::Paste), RightPress::Paste);
+        assert_eq!(right_press(unreported, true, RightClick::Paste), RightPress::Nothing);
+        assert_eq!(right_press(reports(mode, false), false, RightClick::Paste), RightPress::Report);
     }
 
     #[test]

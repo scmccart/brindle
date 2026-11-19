@@ -408,6 +408,13 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Right-clicks a cell of the active terminal, e.g. `shift-3,0`
+    /// (`--right-click`).
+    pub fn right_click(mut self, pos: &str) -> Self {
+        self.steps.extend(["--right-click".to_string(), pos.to_string()]);
+        self
+    }
+
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);

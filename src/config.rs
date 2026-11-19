@@ -125,6 +125,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     /// Copy selected text to the clipboard as soon as a selection is made.
     pub copy_on_select: bool,
+    /// What a right-click does in a terminal.
+    pub right_click: RightClick,
     /// Allow programs to read the clipboard via OSC 52 (writing is always allowed).
     pub osc52_paste: bool,
     /// The removed `restore_session` key, still accepted so old configs
@@ -157,6 +159,7 @@ impl Default for Config {
             padding: 6.0,
             cursor: CursorConfig::default(),
             copy_on_select: false,
+            right_click: RightClick::Nothing,
             osc52_paste: false,
             removed_restore_session: None,
             mark_failed_commands: true,
@@ -208,6 +211,19 @@ impl Default for FontConfig {
 pub struct UiFontConfig {
     /// Font families in order of preference; the first one installed is used.
     pub family: Vec<String>,
+}
+
+/// What a right press does in a terminal when the program isn't using the
+/// mouse (or shift is held).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+pub enum RightClick {
+    /// Nothing: the default.
+    #[default]
+    #[serde(rename = "none")]
+    Nothing,
+    /// Paste the clipboard when no text is selected.
+    #[serde(rename = "paste")]
+    Paste,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -1169,6 +1185,19 @@ mod tests {
         assert_eq!(config.notifications.when, NotifyWhen::Always);
         assert!(parsed("[notifications]\nwhen = \"sometimes\"").is_err());
         assert!(parsed("[notifications]\nsound = true").is_err());
+    }
+
+    #[test]
+    fn right_click_parses_none_and_paste() {
+        assert_eq!(parsed("").unwrap().right_click, RightClick::Nothing);
+        assert_eq!(parsed("right_click = \"none\"").unwrap().right_click, RightClick::Nothing);
+        assert_eq!(parsed("right_click = \"paste\"").unwrap().right_click, RightClick::Paste);
+    }
+
+    #[test]
+    fn an_unknown_right_click_value_is_a_config_error() {
+        let err = format!("{:#}", parsed("right_click = \"menu\"").unwrap_err());
+        assert!(err.contains("menu") && err.contains("none") && err.contains("paste"), "{err}");
     }
 
     #[test]

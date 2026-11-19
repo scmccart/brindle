@@ -56,8 +56,9 @@ pub fn list_fault_switches(ctx: &Ctx) -> Result<Outcome> {
 pub fn usage_errors(ctx: &Ctx) -> Result<Outcome> {
     let config = ctx.dir.join("config.toml");
     std::fs::write(&config, crate::brindle::config("e2e")).map_err(|e| format!("writing the config: {e}"))?;
-    let cases: [(&str, &[&str], &str); 3] = [
+    let cases: [(&str, &[&str], &str); 4] = [
         ("profile", &["-p"], "-p needs"),
+        ("right-click", &["--right-click", "3", "--dump-screen-after", "30"], "--right-click: expected COL,ROW in \"3\""),
         ("action", &["--action", "split_zone_rihgt", "--dump-screen-after", "30"], "\"split_zone_rihgt\""),
         ("dump", &["--dump-screen-after", "soon"], "--dump-screen-after needs"),
     ];

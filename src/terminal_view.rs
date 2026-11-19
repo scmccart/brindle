@@ -90,18 +90,44 @@ impl GridLayout {
     }
 }
 
-/// A `--hover` or `--click` debug step: `[mods-]COL,ROW`, zero-based cells
-/// of the active terminal, e.g. `ctrl-3,0` or `ctrl-shift-10,2`.
+/// What a pointer step does at its cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAction {
+    /// `--hover`: move over the cell.
+    Hover,
+    /// `--click` and `--right-click`: press and release a button.
+    Click(PointerButton),
+}
+
+/// The button of a clicking pointer step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    Left,
+    Right,
+}
+
+impl PointerButton {
+    fn gpui(self) -> gpui::MouseButton {
+        match self {
+            PointerButton::Left => gpui::MouseButton::Left,
+            PointerButton::Right => gpui::MouseButton::Right,
+        }
+    }
+}
+
+/// A `--hover`, `--click` or `--right-click` debug step: `[mods-]COL,ROW`,
+/// zero-based cells of the active terminal, e.g. `ctrl-3,0` or
+/// `ctrl-shift-10,2`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointerStep {
     pub modifiers: Modifiers,
     pub col: usize,
     pub row: usize,
-    pub click: bool,
+    pub action: PointerAction,
 }
 
 impl PointerStep {
-    pub fn parse(text: &str, click: bool) -> Result<PointerStep, String> {
+    pub fn parse(text: &str, action: PointerAction) -> Result<PointerStep, String> {
         let mut parts: Vec<&str> = text.split('-').collect();
         let position = parts.pop().unwrap_or_default();
         let mut modifiers = Modifiers::default();
@@ -116,7 +142,7 @@ impl PointerStep {
         }
         let (col, row) = position.split_once(',').ok_or_else(|| format!("expected COL,ROW in {text:?}"))?;
         let number = |s: &str| s.trim().parse::<usize>().map_err(|_| format!("bad cell {s:?} in {text:?}"));
-        Ok(PointerStep { modifiers, col: number(col)?, row: number(row)?, click })
+        Ok(PointerStep { modifiers, col: number(col)?, row: number(row)?, action })
     }
 }
 
@@ -300,6 +326,12 @@ impl TerminalView {
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste_clipboard(cx);
+    }
+
+    /// Pastes the clipboard's text, as the paste key does; an empty one
+    /// pastes nothing.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.terminal.update(cx, |t, cx| t.paste(&text, cx));
         }
@@ -408,7 +440,8 @@ impl TerminalView {
     }
 
     fn select_last_output(&mut self, _: &SelectLastOutput, _: &mut Window, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |t, cx| t.select_last_output(cx));
+        let to_clipboard = crate::settings::Settings::get(cx).config.copy_on_select;
+        self.terminal.update(cx, |t, cx| t.select_last_output(to_clipboard, cx));
     }
 
     fn copy_last_output(&mut self, _: &CopyLastOutput, _: &mut Window, cx: &mut Context<Self>) {
@@ -419,15 +452,9 @@ impl TerminalView {
 
     // ---- mouse ----------------------------------------------------------------
 
-    /// Whether mouse events go to the application rather than to selection.
-    /// Holding shift always selects, as in xterm.
-    fn reporting(&self, mode: TermMode, modifiers: &gpui::Modifiers) -> bool {
-        mode.intersects(TermMode::MOUSE_MODE) && !modifiers.shift
-    }
-
     #[allow(
         clippy::wildcard_enum_match_arm,
-        reason = "foreign enum: gpui::MouseButton, of which left and middle act here"
+        reason = "foreign enum: gpui::MouseButton, of which left, middle and right act here"
     )]
     pub fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
@@ -445,7 +472,24 @@ impl TerminalView {
             return;
         }
 
-        if self.reporting(mode, &e.modifiers) {
+        let reports = mouse::reports(mode, e.modifiers.shift);
+
+        // A right press that isn't reported pastes, or does nothing. Neither
+        // records a button, so its release reports nothing either.
+        if e.button == gpui::MouseButton::Right {
+            let has_selection = self.terminal.read(cx).selection_text().is_some();
+            let setting = crate::settings::Settings::get(cx).config.right_click;
+            match mouse::right_press(reports, has_selection, setting) {
+                mouse::RightPress::Report => {}
+                mouse::RightPress::Paste => {
+                    self.paste_clipboard(cx);
+                    return;
+                }
+                mouse::RightPress::Nothing => return,
+            }
+        }
+
+        if reports {
             if let Some(button) = Button::from_gpui(e.button)
                 && let Some(bytes) =
                     mouse::report(col, line, button, mouse::Action::Press, &e.modifiers, mode)
@@ -532,7 +576,8 @@ impl TerminalView {
         }
         if self.mouse.selecting && e.button == gpui::MouseButton::Left {
             self.mouse.selecting = false;
-            self.terminal.update(cx, |t, cx| t.finish_selection(cx));
+            let to_clipboard = crate::settings::Settings::get(cx).config.copy_on_select;
+            self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx));
             return;
         }
         let Some(layout) = self.layout.get() else { return };
@@ -563,7 +608,7 @@ impl TerminalView {
         }
 
         let mode = self.mode(cx);
-        if self.reporting(mode, &e.modifiers) {
+        if mouse::reports(mode, e.modifiers.shift) {
             let (col, line, _) = layout.cell_at(e.position);
             let button = if lines > 0 { Button::WheelUp } else { Button::WheelDown };
             let terminal = self.terminal.read(cx);
@@ -583,18 +628,18 @@ impl TerminalView {
         self.hover(e.position, e.modifiers, true, cx);
     }
 
-    /// Debug hook for `--hover` / `--click`: feeds GPUI mouse events for a
+    /// Debug hook for `--hover` / `--click` / `--right-click`: feeds GPUI mouse events for a
     /// cell straight to this view's handlers. No OS-level input is made.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.get() else {
-            log::error!("--hover/--click: the terminal hasn't been painted yet");
+            log::error!("--hover/--click/--right-click: the terminal hasn't been painted yet");
             return;
         };
         let position = layout.cell_center(step.col, step.row);
         let modifiers = step.modifiers;
         self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
-        if step.click {
-            let button = gpui::MouseButton::Left;
+        if let PointerAction::Click(which) = step.action {
+            let button = which.gpui();
             self.mouse_down(&MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false }, window, cx);
             self.mouse_up(&MouseUpEvent { button, position, modifiers, click_count: 1 }, window, cx);
         }
@@ -755,17 +800,26 @@ mod tests {
 
     #[test]
     fn pointer_steps() {
-        let step = PointerStep::parse("ctrl-3,0", true).unwrap();
-        assert_eq!((step.col, step.row, step.click), (3, 0, true));
+        let left = PointerAction::Click(PointerButton::Left);
+        let right = PointerAction::Click(PointerButton::Right);
+        let step = PointerStep::parse("ctrl-3,0", left).unwrap();
+        assert_eq!((step.col, step.row, step.action), (3, 0, left));
         assert!(step.modifiers.control && !step.modifiers.shift && !step.modifiers.alt);
-        let step = PointerStep::parse("ctrl-shift-10,2", false).unwrap();
+        let step = PointerStep::parse("ctrl-shift-10,2", PointerAction::Hover).unwrap();
         assert!(step.modifiers.control && step.modifiers.shift);
-        assert_eq!((step.col, step.row), (10, 2));
-        assert_eq!(PointerStep::parse("4,5", false).unwrap().modifiers, Modifiers::default());
-        assert!(PointerStep::parse("hyper-1,1", false).is_err());
-        assert!(PointerStep::parse("ctrl-1", false).is_err());
-        assert!(PointerStep::parse("ctrl-a,1", false).is_err());
-        assert!(PointerStep::parse("", false).is_err());
+        assert_eq!((step.col, step.row, step.action), (10, 2, PointerAction::Hover));
+        assert_eq!(PointerStep::parse("4,5", PointerAction::Hover).unwrap().modifiers, Modifiers::default());
+        // A right click keeps its modifiers.
+        let step = PointerStep::parse("shift-5,2", right).unwrap();
+        assert!(step.modifiers.shift && !step.modifiers.control);
+        assert_eq!((step.col, step.row, step.action), (5, 2, right));
+        for action in [PointerAction::Hover, left, right] {
+            assert!(PointerStep::parse("hyper-1,1", action).is_err());
+            assert!(PointerStep::parse("ctrl-1", action).is_err());
+            assert!(PointerStep::parse("ctrl-a,1", action).is_err());
+            assert!(PointerStep::parse("3", action).is_err());
+            assert!(PointerStep::parse("", action).is_err());
+        }
     }
 
     #[test]
