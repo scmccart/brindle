@@ -566,7 +566,9 @@ impl Model {
         };
         self.error = None;
         match edit {
-            ConfigEdit::SetGlobalTheme { .. } | ConfigEdit::SetFonts(_) => Outcome::Applied,
+            ConfigEdit::SetGlobalTheme { .. } | ConfigEdit::SetFonts(_) | ConfigEdit::SetClipboard(_) => {
+                Outcome::Applied
+            }
             ConfigEdit::SaveTheme { .. } | ConfigEdit::DeleteTheme { .. } => {
                 self.themes.written(edit, &self.config_path, text);
                 if self.section == Section::Theme {
