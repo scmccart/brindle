@@ -90,20 +90,20 @@ PR title: `feat(settings): open settings from the profile menu, mark built-in th
 
 PR title: `feat: paste the clipboard on right-click when right_click = "paste"`.
 
-- [ ] 3.1 Config (`src/config.rs`): `enum RightClick { Nothing, Paste }`, deserialised from `"none"` and `"paste"` with `Nothing` the default, and the `right_click` field. `assets/default-config.toml` gets `right_click = "none"` after `copy_on_select`, with a comment ("`"paste"`: a right-click pastes the clipboard when nothing is selected, and does nothing while text is; hold shift where a program uses the mouse"). Tests: `right_click_parses_none_and_paste` (absent → `Nothing`), and `an_unknown_right_click_value_is_a_config_error` (the message names `none` and `paste`); the default-config parse test still passes. Verify: `cargo test -p brindle config::` passes.
-- [ ] 3.2 Decision (`src/terminal/mouse.rs`): `reports(mode, shift)` (moved from `TerminalView::reporting`), `RightPress { Report, Paste, Nothing }` and `right_press(reports, has_selection, setting)`. Tests over every mode × shift × selection × setting:
+- [x] 3.1 Config (`src/config.rs`): `enum RightClick { Nothing, Paste }`, deserialised from `"none"` and `"paste"` with `Nothing` the default, and the `right_click` field. `assets/default-config.toml` gets `right_click = "none"` after `copy_on_select`, with a comment ("`"paste"`: a right-click pastes the clipboard when nothing is selected, and does nothing while text is; hold shift where a program uses the mouse"). Tests: `right_click_parses_none_and_paste` (absent → `Nothing`), and `an_unknown_right_click_value_is_a_config_error` (the message names `none` and `paste`); the default-config parse test still passes. Verify: `cargo test -p brindle config::` passes.
+- [x] 3.2 Decision (`src/terminal/mouse.rs`): `reports(mode, shift)` (moved from `TerminalView::reporting`), `RightPress { Report, Paste, Nothing }` and `right_press(reports, has_selection, setting)`. Tests over every mode × shift × selection × setting:
   - `a_right_press_is_reported_while_the_program_reports` (with or without a selection);
   - `right_click_pastes_only_when_set_to_paste`;
   - `a_right_press_over_a_selection_does_nothing` (both settings);
   - `shift_right_click_follows_the_selection_rule` (reporting on, shift held: `Paste` with no selection, `Nothing` with one). Verify: `cargo test -p brindle terminal::mouse` passes.
-- [ ] 3.3 Pointer step (`src/terminal_view.rs`, `src/main.rs`): `PointerStep { …, action: PointerAction }` with `PointerAction { Hover, Click(PointerButton) }` and `PointerButton { Left, Right }`; `--right-click POS` parsed and refused before the run like `--click`; a `HELP` line. Extend `pointer_steps` (a right click keeps its modifiers; a bad position errs) and `main.rs`'s usage-error tests, if they cover `--click`. Verify: `cargo test -p brindle terminal_view:: main::` passes.
-- [ ] 3.4 Shell:
+- [x] 3.3 Pointer step (`src/terminal_view.rs`, `src/main.rs`): `PointerStep { …, action: PointerAction }` with `PointerAction { Hover, Click(PointerButton) }` and `PointerButton { Left, Right }`; `--right-click POS` parsed and refused before the run like `--click`; a `HELP` line. Extend `pointer_steps` (a right click keeps its modifiers; a bad position errs) and `main.rs`'s usage-error tests, if they cover `--click`. Verify: `cargo test -p brindle terminal_view:: main::` passes.
+- [x] 3.4 Shell:
   - `TerminalView::mouse_down` calls `mouse::reports`, and on a right press dispatches on `right_press(reports, terminal.read(cx).selection_text().is_some(), Settings::get(cx).config.right_click)`: `Paste` → the paste action's path (a shared helper); `Nothing` → return, leaving the selection; neither sets `reported_button`.
   - `mouse_up` passes `config.copy_on_select`, read at the release, to `Terminal::finish_selection(to_clipboard, cx)`, and `Terminal` drops its `copy_on_select` field.
   - `debug_pointer` presses the step's button.
 
   Verify: unit tests pass, `links-*` still pass (task 3.7), and task 3.5's cases.
-- [ ] 3.5 e2e: a new `tests/e2e/cases/clipboard.rs`. Each case sets the clipboard through OSC 52 from the shell, to `echo pasted-$((6*7))` (content the case typed, `testing R6`):
+- [x] 3.5 e2e: a new `tests/e2e/cases/clipboard.rs`. Each case sets the clipboard through OSC 52 from the shell, to `echo pasted-$((6*7))` (content the case typed, `testing R6`):
   - `clipboard-right-click-paste`: with `right_click = "paste"`, `--right-click 0,0`, `--send '\r'`, `--wait-for pasted-42`;
   - `clipboard-right-click-off`: the default config, the same steps → no `pasted-42` on the screen;
   - `clipboard-right-click-selection`, two runs with `right_click = "paste"`. First, `--action select_all`, `--right-click 0,0`, then the dump: its `--- selection` line is still there and the prompt's line holds nothing typed. Second, the same steps, then `--click 0,0` to clear the selection, `--right-click 0,0`, `--send '\r'` and `--wait-for pasted-42`: no `--- selection` line, and `pasted-42` is shown;
@@ -111,13 +111,13 @@ PR title: `feat: paste the clipboard on right-click when right_click = "paste"`.
   - `clipboard-right-click-reload`: the default config, a `call_at` that rewrites it with `right_click = "paste"`, `--action reload_config`, then a right-click pastes.
 
   Register them in `cases/mod.rs`, and `clipboard-right-click-paste` also in `cases/win.rs` with a pwsh variant of the OSC 52 step (the `sh(unix, windows)` pair). Extend `cli-usage-errors` with `--right-click 3` → exit 2 naming the step. Verify: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- clipboard cli-usage-errors` passes.
-- [ ] 3.6 Docs:
+- [x] 3.6 Docs:
   - `README.md` line 504: "copy / paste (middle click pastes the primary selection)" → "copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard when nothing is selected and does nothing while text is: shift-right-click where a program uses the mouse)".
   - `CLAUDE.md` line 199 (Mouse bullet): append "A right press that isn't reported (`mouse::reports`; shift always bypasses) pastes the clipboard when `right_click = "paste"` and no text is selected, and does nothing while text is (`mouse::right_press`). `copy_on_select` and `right_click` are read from `Settings` at the event, so a reload reaches open tabs. `--right-click` is the right button's `--click`."
   - `CLAUDE.md` "Manual checks": add "right-click paste with `right_click = "paste"` (nothing selected; a right-click over a selection doing nothing; and shift-right-click over a program that uses the mouse, such as htop), and select-to-copy with `copy_on_select = true`, with a real pointer, on Linux and on Windows (no system menu on Windows)".
 
   Verify: the diffs say exactly this.
-- [ ] 3.7 Group check: `cargo test --locked --workspace`, clippy and both self-tests pass; `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- clipboard links input cli` passes. Hand the manual check in 3.6 to the user with `scripts/run-throwaway.sh --config <file with right_click = "paste">`, and list it in the PR body.
+- [x] 3.7 Group check: `cargo test --locked --workspace`, clippy and both self-tests pass; `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- clipboard links input cli` passes. Hand the manual check in 3.6 to the user with `scripts/run-throwaway.sh --config <file with right_click = "paste">`, and list it in the PR body.
 
 ## 4. Clipboard section in the settings dialog
 
