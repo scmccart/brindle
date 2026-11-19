@@ -7,6 +7,7 @@
 #[cfg(windows)]
 mod win;
 mod cards;
+mod clipboard;
 mod cli;
 mod colors;
 mod commands;
@@ -97,6 +98,11 @@ fn unix() -> Vec<Case> {
         display("input-select-all", input::select_all),
         display("input-settings-tab", input::settings_tab),
         display("input-prompt-preselected", input::prompt_preselected),
+        display("clipboard-right-click-paste", clipboard::right_click_paste),
+        display("clipboard-right-click-off", clipboard::right_click_off),
+        display("clipboard-right-click-selection", clipboard::right_click_selection),
+        display("clipboard-right-click-mouse-mode", clipboard::right_click_mouse_mode),
+        display("clipboard-right-click-reload", clipboard::right_click_reload),
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
         display("links-opener-fails", links::opener_fails),
