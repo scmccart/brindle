@@ -123,13 +123,13 @@ PR title: `feat: paste the clipboard on right-click when right_click = "paste"`.
 
 PR title: `feat(settings): add a Clipboard section for copy on select and right-click paste`. The archive goes on this PR.
 
-- [ ] 4.1 `src/config_edit.rs`:
+- [x] 4.1 `src/config_edit.rs`:
   - `clipboard_values(doc)`, read past errors elsewhere; a key of the wrong type reads as its default, with a note naming the key;
   - `ClipboardChange { CopyOnSelect(bool), RightClick(RightClick) }`;
   - `ConfigEdit::SetClipboard(Vec<ClipboardChange>)`, writing the top-level keys in place.
 
   Tests: comments and order kept, only changed keys written, `right_click` written as `"paste"`/`"none"`, a wrongly typed key replaced only when its switch changed. Verify: `cargo test -p brindle config_edit::` passes.
-- [ ] 4.2 `src/settings_dialog/clipboard.rs`: `ClipboardState` (`new`, `reload`, `reset`, `toggle(ClipboardField)`, `apply`, `describe`) and `ClipboardField { CopyOnSelect, RightClick }`. Tests:
+- [x] 4.2 `src/settings_dialog/clipboard.rs`: `ClipboardState` (`new`, `reload`, `reset`, `toggle(ClipboardField)`, `apply`, `describe`) and `ClipboardField { CopyOnSelect, RightClick }`. Tests:
   - values from the file's text;
   - the loaded config's values, read-only, when the file doesn't parse;
   - `apply` with no change → `Step::Close`;
@@ -138,21 +138,21 @@ PR title: `feat(settings): add a Clipboard section for copy on select and right-
   - the `--- settings section=Clipboard mode=form copy_on_select=… right_click=… field=… can_apply=… error=…` line.
 
   Verify: `cargo test -p brindle settings_dialog::clipboard` passes.
-- [ ] 4.3 `Model` (`settings_dialog.rs`):
+- [x] 4.3 `Model` (`settings_dialog.rs`):
   - `Section::Clipboard` last in `SECTIONS`, and `View::Clipboard` (`ModeKind::Form`);
   - `select_section` resets it on leave;
   - `confirm` applies, `cancel` and `close` give `Step::Close`;
   - footer `[Cancel, Apply]`, and `describe_open` routes to it.
 
   Update the tests that count sections or wrap (`next_section` from Clipboard to Profiles), and extend `the_close_button_closes_from_every_view` to Clipboard. Verify: `cargo test -p brindle settings_dialog` passes.
-- [ ] 4.4 View: two `brindle_ui::Switch`es labelled "Copy on select" and "Right-click pastes", with a hint line ("Pastes only when nothing is selected. Hold shift to paste where a program uses the mouse."). They are `FocusStops` with `field=` names. Space toggles, enter applies, and `Outcome::Applied` reloads as the Fonts section does. Verify: task 4.5's case.
-- [ ] 4.5 e2e:
+- [x] 4.4 View: two `brindle_ui::Switch`es labelled "Copy on select" and "Right-click pastes", with a hint line ("Pastes only when nothing is selected. Hold shift to paste where a program uses the mouse."). They are `FocusStops` with `field=` names. Space toggles, enter applies, and `Outcome::Applied` reloads as the Fonts section does. Verify: task 4.5's case.
+- [x] 4.5 e2e:
   - a new `settings-clipboard`: `open_settings`, `settings_section_last` → `section=Clipboard mode=form copy_on_select=false right_click=none`; tab to "Right-click pastes", `--key space`, `--key enter` → the dialog is closed and the config gains only `right_click = "paste"`, with its comments kept. In the same run, an OSC 52 clipboard and `--right-click` paste into the open tab.
   - a second run toggles both switches and presses `--key escape` → config unchanged.
   - update `settings-sections`, `settings-section-list` and `settings-section-shortcuts` for four sections.
 
   Verify: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e -- settings` passes.
-- [ ] 4.6 Docs:
+- [x] 4.6 Docs:
   - `README.md`:
     - line 533: "three sections: Profiles, Theme and Fonts" → "four sections: Profiles, Theme, Fonts and Clipboard";
     - the ctrl-shift-, row: add "clipboard";
@@ -162,7 +162,7 @@ PR title: `feat(settings): add a Clipboard section for copy on select and right-
     - after line 210 (the Fonts section bullet), add "**Clipboard section (`settings_dialog/clipboard.rs`):** `ClipboardState` is the GPUI-free model (the two values read from the file's text past errors elsewhere, `toggle`, `apply()` returning `ConfigEdit::SetClipboard` with only the changed keys); the view's two `brindle_ui::Switch`es are its stops."
 
   Verify: the diffs say exactly this.
-- [ ] 4.7 Integration check:
+- [x] 4.7 Integration check:
   - `cargo test --locked --workspace`, clippy and both self-tests pass;
   - the whole e2e suite passes headless: `BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e`;
   - `openspec validate polish-settings-and-clipboard --strict` passes.
