@@ -503,6 +503,57 @@ fn input_resize_and_close() {
     }
 }
 
+/// The size `session` is listed with.
+fn listed_size(client: &mut TestClient, session: SessionId) -> (u16, u16) {
+    let listed = client.list();
+    let info = listed
+        .iter()
+        .find(|info| info.session == session)
+        .expect("the session is listed");
+    (info.cols, info.rows)
+}
+
+/// A `SPAWN` or a `RESIZE` past the grid limits is taken at them, so the
+/// core never builds a grid of 65535 × 65535 cells, and a size within them
+/// is taken as it is.
+#[test]
+fn a_session_spawned_at_65535_by_65535_is_listed_at_2048_by_1024() {
+    let (_dir, mut client) = core("grid-limits");
+    let mut spawn = programs::waits();
+    (spawn.cols, spawn.rows) = (65535, 65535);
+    let (session, _) = client.spawn(spawn);
+    assert_eq!(listed_size(&mut client, session), (2048, 1024));
+
+    // A `LIST` is answered after the `RESIZE` sent before it.
+    let resize = |client: &mut TestClient, cols, rows| {
+        client.send(client::ToCore::Resize(client::Resize {
+            session,
+            cols,
+            rows,
+            cell_w: 0,
+            cell_h: 0,
+        }));
+    };
+    resize(&mut client, 120, 40);
+    assert_eq!(listed_size(&mut client, session), (120, 40));
+    resize(&mut client, 65535, 3);
+    assert_eq!(listed_size(&mut client, session), (2048, 3));
+    resize(&mut client, 1, 65535);
+    assert_eq!(listed_size(&mut client, session), (10, 1024));
+}
+
+/// The program's terminal has the size the session is listed with.
+#[cfg(unix)]
+#[test]
+fn a_program_spawned_past_the_grid_limits_sees_the_limits() {
+    let (_dir, mut client) = core("grid-limits-pty");
+    let mut spawn = client_shell("stty size; read x");
+    (spawn.cols, spawn.rows) = (65535, 65535);
+    let (session, _) = client.spawn(spawn);
+    client.output_until(session, b"1024 2048");
+    assert_eq!(listed_size(&mut client, session), (2048, 1024));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_stalled_client_doesnt_delay_another_clients_session() {

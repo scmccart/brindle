@@ -29,13 +29,19 @@ pub fn wants_inbox(env: &BTreeMap<String, String>) -> bool {
 
 /// Where the packaged ConPTY of `version` is extracted to:
 /// `%LOCALAPPDATA%\brindle\conpty\<version>`, or `None` without a local app
-/// data directory (an empty variable counts as unset).
-pub fn extract_dir(local_app_data: Option<&OsStr>, version: &str) -> Option<PathBuf> {
+/// data directory (an empty variable counts as unset). An elevated process
+/// has its own, `conpty-elevated\<version>`, so the files an elevated
+/// holder loads are never the ones an unelevated process extracted.
+pub fn extract_dir(
+    local_app_data: Option<&OsStr>,
+    version: &str,
+    elevated: bool,
+) -> Option<PathBuf> {
     let base = local_app_data.filter(|base| !base.is_empty())?;
     Some(
         Path::new(base)
             .join("brindle")
-            .join("conpty")
+            .join(if elevated { "conpty-elevated" } else { "conpty" })
             .join(version),
     )
 }
@@ -168,7 +174,7 @@ mod tests {
     fn the_extraction_is_under_local_app_data_by_version() {
         let base = r"C:\Users\me\AppData\Local";
         assert_eq!(
-            extract_dir(Some(OsStr::new(base)), "1.25.0"),
+            extract_dir(Some(OsStr::new(base)), "1.25.0", false),
             Some(
                 PathBuf::from(base)
                     .join("brindle")
@@ -178,10 +184,36 @@ mod tests {
         );
     }
 
+    /// An elevated process extracts to a directory of its own, beside the
+    /// unelevated one and by version too.
+    #[test]
+    fn an_elevated_process_extracts_to_a_directory_of_its_own() {
+        let base = r"C:\Users\me\AppData\Local";
+        let elevated = extract_dir(Some(OsStr::new(base)), "1.25.0", true);
+        assert_eq!(
+            elevated,
+            Some(
+                PathBuf::from(base)
+                    .join("brindle")
+                    .join("conpty-elevated")
+                    .join("1.25.0")
+            )
+        );
+        assert_ne!(
+            elevated,
+            extract_dir(Some(OsStr::new(base)), "1.25.0", false)
+        );
+        // Neither is inside the other.
+        let unelevated = PathBuf::from(base).join("brindle").join("conpty");
+        assert!(!elevated.unwrap().starts_with(unelevated));
+    }
+
     #[test]
     fn an_empty_local_app_data_is_unset() {
-        assert_eq!(extract_dir(Some(OsStr::new("")), "1.25.0"), None);
-        assert_eq!(extract_dir(None, "1.25.0"), None);
+        for elevated in [false, true] {
+            assert_eq!(extract_dir(Some(OsStr::new("")), "1.25.0", elevated), None);
+            assert_eq!(extract_dir(None, "1.25.0", elevated), None);
+        }
     }
 
     /// A probe that holds the embedded files in `matching` and records what

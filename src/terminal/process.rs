@@ -1,11 +1,13 @@
 //! Process info for tab titles and new-tab directories: which process is in
-//! the foreground on a tab's PTY, its name, and its working directory, and
-//! the path style its directory reports use ([`LOCAL_PATH_STYLE`]).
+//! the foreground on a tab's PTY, its name, and its working directory, the
+//! path style its directory reports use ([`LOCAL_PATH_STYLE`]) and where
+//! its directory comes from ([`LOCAL_DIRECTORY`]).
 //!
 //! Linux reads `/proc`. Windows has no foreground process group, so a
 //! tab's process name is its program's most recently started descendant,
 //! found in a [`Snapshot`] of all processes that one title tick shares
-//! between tabs. Neither platform reads another process's directory there.
+//! between tabs. No process's directory can be read there, so a tab's is
+//! the one its program reported.
 
 use std::path::PathBuf;
 
@@ -20,6 +22,28 @@ pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Windows;
 /// 9;9). [`crate::remote::Host::path_style`] picks it for a local session.
 #[cfg(not(windows))]
 pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Posix;
+
+/// Where the directory of a program on this machine comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalDirectory {
+    /// The foreground process's own, read from the system
+    /// ([`PtyProcess::working_directory`]).
+    #[cfg_attr(windows, allow(dead_code, reason = "Windows can't read another process's directory"))]
+    Process,
+    /// The one the program last reported (OSC 7, 9;9), if it exists: the
+    /// system gives no other. It is a path the program chose, so whether
+    /// it exists is checked off the UI thread (`dir_check`).
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows has to take the program's word"))]
+    Reported,
+}
+
+/// Where a local session's directory comes from on this platform.
+#[cfg(windows)]
+pub const LOCAL_DIRECTORY: LocalDirectory = LocalDirectory::Reported;
+
+/// Where a local session's directory comes from on this platform.
+#[cfg(not(windows))]
+pub const LOCAL_DIRECTORY: LocalDirectory = LocalDirectory::Process;
 
 /// A process in a [`Snapshot`].
 #[derive(Clone, Debug, PartialEq)]

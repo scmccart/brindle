@@ -2,3 +2,5 @@
 /.rtk
 /.conpty/*
 !/.conpty/README.md
+# Security audits' per-batch results describe attack paths in detail; kept local.
+/docs/security/audits/*/

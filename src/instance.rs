@@ -136,6 +136,27 @@ fn parse_answer(line: &str) -> Result<(), String> {
     }
 }
 
+/// What a launch says when it won't hand its request to whatever serves
+/// `address` (the instance's socket or pipe), and `why`: nothing was sent.
+/// A request names the launch's command, its directory and its activation
+/// token, which are only for this user's own Brindle.
+fn not_sent(address: &str, why: impl std::fmt::Display) -> String {
+    format!("not sending the launch to {address}: {why}")
+}
+
+/// Whether the instance a launch reached on a Unix socket is this user's:
+/// `own` is the launch's effective uid, and `peer` the uid serving the
+/// socket (`SO_PEERCRED`), or why it can't be told, which refuses it too.
+/// The `Err` says why not.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn same_user(own: u32, peer: io::Result<u32>) -> Result<(), String> {
+    match peer {
+        Ok(peer) if peer == own => Ok(()),
+        Ok(peer) => Err(format!("it is served by another user (uid {peer}, not {own})")),
+        Err(error) => Err(format!("the user serving it can't be told: {error}")),
+    }
+}
+
 /// Handles one request on the listener's thread, returning once the
 /// instance has taken it (or refused it).
 pub type Handler = Box<dyn Fn(Request) -> Result<(), String> + Send + 'static>;
@@ -205,7 +226,9 @@ mod imp {
         }
     }
 
-    fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    /// The uid at the other end of `stream` (`SO_PEERCRED`): for a client,
+    /// the user whose process listens on the socket.
+    pub(super) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
         #[cfg(target_os = "linux")]
         {
             let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
@@ -240,7 +263,9 @@ mod imp {
         forward_to(&socket_path(state_dir), request)
     }
 
-    /// [`forward`] to the socket at `path`.
+    /// [`forward`] to the socket at `path`. Before anything is sent, the
+    /// socket must be served by this user ([`same_user`]): the instance
+    /// checks who connects, and the launch checks who it connected to.
     pub(super) fn forward_to(path: &Path, request: &Request) -> Result<(), String> {
         let deadline = Instant::now() + FORWARD_LIMIT;
         let stream = loop {
@@ -255,6 +280,9 @@ mod imp {
                 Err(e) => return Err(format!("could not reach the running Brindle at {}: {e}", path.display())),
             }
         };
+        // SAFETY: takes no argument and can't fail.
+        let own = unsafe { libc::geteuid() };
+        same_user(own, peer_uid(&stream)).map_err(|why| not_sent(&path.display().to_string(), why))?;
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
         stream.set_read_timeout(Some(left)).ok();
         stream.set_write_timeout(Some(left)).ok();
@@ -266,15 +294,20 @@ mod imp {
 mod imp {
     use super::*;
     use std::fs::File;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::HSTRING;
+
+    use crate::remote::protocol::win;
 
     /// `\\.\pipe\<name>-<user>` ([`pipe_name_for`]). The pipe's default
     /// security lets only its owner (and administrators) write to it.
@@ -344,11 +377,22 @@ mod imp {
         Ok(PathBuf::from(name))
     }
 
+    /// Sends `request` to the instance's pipe. The pipe is opened so that
+    /// its server can identify this launch but not act as it
+    /// (`SECURITY_IDENTIFICATION`), and before anything is sent its server
+    /// must run as this user at this integrity level
+    /// ([`win::check_server`]): a pipe of that name made by another
+    /// process, or by this user's Brindle at another level, gets nothing.
     pub fn forward(state_dir: &Path, request: &Request) -> Result<(), String> {
         let name = pipe_name(state_dir);
         let deadline = Instant::now() + FORWARD_LIMIT;
         let pipe = loop {
-            match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0)
+                .open(&name);
+            match opened {
                 Ok(pipe) => break pipe,
                 Err(e) if Instant::now() < deadline => {
                     log::debug!("connecting to {name}: {e}");
@@ -357,8 +401,10 @@ mod imp {
                 Err(e) => return Err(format!("could not reach the running Brindle at {name}: {e}")),
             }
         };
+        win::check_server(&pipe).map_err(|why| not_sent(&name, why))?;
         // Windows lets a process take the foreground only when the one that
-        // has it allows it: this launch has it, so it lets the instance.
+        // has it allows it: this launch has it, so it lets the instance,
+        // once it is known to be this user's own.
         let mut pid = 0;
         // SAFETY: the pipe handle is live and `pid` is a plain out parameter.
         if unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }.is_ok() {
@@ -461,6 +507,88 @@ mod tests {
         let state = Path::new(r"C:\Users\me\AppData\Local\brindle\state");
         assert_eq!(pipe_name_for(None, state), format!(r"\\.\pipe\{}-", name(state)));
         assert_eq!(pipe_name_for(Some(String::new()), state), pipe_name_for(None, state));
+    }
+
+    /// A launch hands its request only to an instance of its own user:
+    /// the refusal names where it wasn't sent and why.
+    #[test]
+    fn a_launch_is_sent_only_to_an_instance_of_the_same_user() {
+        assert_eq!(same_user(1000, Ok(1000)), Ok(()));
+        assert_eq!(same_user(0, Ok(0)), Ok(()));
+        assert_eq!(same_user(1000, Ok(0)), Err("it is served by another user (uid 0, not 1000)".into()));
+        assert_eq!(same_user(0, Ok(1000)), Err("it is served by another user (uid 1000, not 0)".into()));
+        // Not knowing who serves it refuses it too.
+        let unknown = io::Error::new(io::ErrorKind::PermissionDenied, "not permitted");
+        assert_eq!(same_user(1000, Err(unknown)), Err("the user serving it can't be told: not permitted".into()));
+
+        let socket = "/run/user/1000/brindle-instance-cbf29ce484222325.sock";
+        assert_eq!(
+            not_sent(socket, same_user(1000, Ok(0)).unwrap_err()),
+            "not sending the launch to /run/user/1000/brindle-instance-cbf29ce484222325.sock: \
+             it is served by another user (uid 0, not 1000)"
+        );
+        // A pipe's refusal reads the same way.
+        assert_eq!(
+            not_sent(r"\\.\pipe\brindle-instance-cbf29ce484222325-me", "the server runs at medium integrity, and this process at high"),
+            r"not sending the launch to \\.\pipe\brindle-instance-cbf29ce484222325-me: the server runs at medium integrity, and this process at high"
+        );
+    }
+
+    /// A socket this user may connect to that another user serves, if this
+    /// machine has one: the system bus's, which its bus daemon's or
+    /// systemd's user listens on.
+    #[cfg(target_os = "linux")]
+    fn socket_of_another_user() -> Option<PathBuf> {
+        // SAFETY: takes no argument and can't fail.
+        let own = unsafe { libc::geteuid() };
+        ["/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket"].into_iter().map(PathBuf::from).find(|path| {
+            std::os::unix::net::UnixStream::connect(path)
+                .and_then(|stream| imp::peer_uid(&stream))
+                .is_ok_and(|peer| peer != own)
+        })
+    }
+
+    /// The launch refuses a socket another user serves before it sends
+    /// anything: what comes back is the refusal, not an answer (or the
+    /// lack of one) to a request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_served_by_another_user_is_refused_before_anything_is_sent() {
+        let Some(socket) = socket_of_another_user() else {
+            eprintln!(
+                "skipped: a_socket_served_by_another_user_is_refused_before_anything_is_sent needs a socket \
+                 another user serves, and found none (the system bus at /run/dbus/system_bus_socket, \
+                 served by another user than this one)"
+            );
+            return;
+        };
+        let request = Request { command: Some(vec!["secret".into()]), ..Default::default() };
+        let error = imp::forward_to(&socket, &request).unwrap_err();
+        let expected = format!("not sending the launch to {}: it is served by another user (uid ", socket.display());
+        assert!(error.starts_with(&expected), "{error}");
+    }
+
+    /// A launch reaches an instance of its own user and level: the pipe's
+    /// check of its server, made before the request is written, lets this
+    /// process's own listener through, and the answer comes back.
+    #[cfg(windows)]
+    #[test]
+    fn a_forwarded_request_reaches_the_handler_through_the_checked_pipe() {
+        let state = std::env::temp_dir().join(format!("brindle-instance-win-test-{}", std::process::id()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        imp::listen(
+            &state,
+            Box::new(move |request: Request| {
+                let refuse = request.attach == Some(0);
+                tx.send(request).unwrap();
+                if refuse { Err("no such session".into()) } else { Ok(()) }
+            }),
+        )
+        .unwrap();
+        let request = Request { profile: Some("p".into()), ..Default::default() };
+        assert_eq!(forward(&state, &request), Ok(()));
+        assert_eq!(rx.recv().unwrap(), request);
+        assert_eq!(forward(&state, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
     }
 
     #[cfg(unix)]

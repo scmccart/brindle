@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Profile};
 use crate::remote::Host;
+use crate::terminal::shell_integration::{PathStyle, is_absolute_path};
 use crate::zone_view::{SplitAxis, ZoneId, ZoneTree};
 
 /// The state file format this build reads and writes.
@@ -494,7 +495,21 @@ pub enum RestoredTab {
 /// runs there, else home (a remote endpoint's default, the empty path).
 /// `is_dir` is the probe for a local directory (the shell passes
 /// `Path::is_dir`).
-fn resolve_cwd(cwd: Option<&Path>, host: &Host, profile: &Profile, home: &Path, is_dir: &dyn Fn(&Path) -> bool) -> PathBuf {
+///
+/// A directory recorded for this machine counts only when it is a plain
+/// absolute path in `style`, this machine's path style: the rule a
+/// program's report follows ([`is_absolute_path`]). Any other is as good
+/// as none, and is never probed. A record is what a program once reported,
+/// and a state file from before that rule may still hold a path it refuses
+/// now.
+fn resolve_cwd(
+    cwd: Option<&Path>,
+    host: &Host,
+    profile: &Profile,
+    home: &Path,
+    style: PathStyle,
+    is_dir: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
     // The profile's directory is a path on its own endpoint.
     let own = (Host::of(profile) == *host).then_some(profile);
     if !host.is_local() {
@@ -503,7 +518,8 @@ fn resolve_cwd(cwd: Option<&Path>, host: &Host, profile: &Profile, home: &Path, 
             .or_else(|| own.and_then(|p| p.cwd.as_deref()).map(PathBuf::from))
             .unwrap_or_default();
     }
-    cwd.filter(|d| is_dir(d))
+    cwd.filter(|d| is_absolute_path(&d.to_string_lossy(), style))
+        .filter(|d| is_dir(d))
         .map(Path::to_path_buf)
         .or_else(|| own.and_then(|p| p.working_directory(Some(home))).filter(|d| is_dir(d)))
         .unwrap_or_else(|| home.to_path_buf())
@@ -514,17 +530,18 @@ fn resolve_zone_node(
     host: &Host,
     profile: &Profile,
     home: &Path,
+    style: PathStyle,
     is_dir: &dyn Fn(&Path) -> bool,
 ) -> RestoredZoneNode {
     if let (Some(axis), Some(first), Some(second)) = (node.split, node.first.as_deref(), node.second.as_deref()) {
         RestoredZoneNode::Split {
             axis,
-            first: Box::new(resolve_zone_node(first, host, profile, home, is_dir)),
-            second: Box::new(resolve_zone_node(second, host, profile, home, is_dir)),
+            first: Box::new(resolve_zone_node(first, host, profile, home, style, is_dir)),
+            second: Box::new(resolve_zone_node(second, host, profile, home, style, is_dir)),
         }
     } else {
         RestoredZoneNode::Leaf {
-            cwd: resolve_cwd(node.cwd.as_deref(), host, profile, home, is_dir),
+            cwd: resolve_cwd(node.cwd.as_deref(), host, profile, home, style, is_dir),
             active: node.active,
             session: node.session.clone(),
         }
@@ -534,8 +551,10 @@ fn resolve_zone_node(
 /// Resolves a recorded tab against the current config: an unknown profile
 /// becomes the default one (and is named in `missing_profile`), and a
 /// vanished directory the profile's own (or `home`). `is_dir` is the probe
-/// for whether a local directory is still there. `None` for an entry that
-/// isn't restored (parsing drops those).
+/// for whether a local directory is still there, and `style` how this
+/// machine's programs spell one: a directory recorded for this machine
+/// that isn't absolute in it is no directory, and isn't probed. `None` for
+/// an entry that isn't restored (parsing drops those).
 ///
 /// A tab whose zones recorded terminal server sessions stays on the
 /// endpoint it recorded, whatever its profile targets now, so they can be
@@ -547,6 +566,7 @@ pub fn resolve_tab(
     tab: &TabState,
     config: &Config,
     home: &Path,
+    style: PathStyle,
     is_dir: &dyn Fn(&Path) -> bool,
 ) -> Option<RestoredTab> {
     let (name, recorded_remote, cwd, title, zones, session) = match tab {
@@ -571,10 +591,10 @@ pub fn resolve_tab(
     let has_session = session.is_some() || zones.is_some_and(ZoneNodeState::has_session);
     let host = if has_session { recorded.clone() } else { Host::of(profile) };
     let same_endpoint = host == recorded;
-    let cwd = resolve_cwd(cwd.filter(|_| same_endpoint), &host, profile, home, is_dir);
+    let cwd = resolve_cwd(cwd.filter(|_| same_endpoint), &host, profile, home, style, is_dir);
     let zones = zones
         .filter(|_| same_endpoint)
-        .map(|z| resolve_zone_node(z, &host, profile, home, is_dir))
+        .map(|z| resolve_zone_node(z, &host, profile, home, style, is_dir))
         .filter(|z| matches!(z, RestoredZoneNode::Split { .. }));
     // Only with a record, which keeps the tab on its endpoint.
     let session = session.cloned();
@@ -1036,7 +1056,7 @@ mod tests {
         let work = "/srv/work";
         let existing = [work, "/"];
         let is_dir = only(&existing);
-        let resolve = |tab: &TabState| resolve_tab(tab, &config, home, &is_dir);
+        let resolve = |tab: &TabState| resolve_tab(tab, &config, home, PathStyle::Posix, &is_dir);
         let restored = |profile, cwd: &str, title: Option<&str>| {
             Some(RestoredTab::Local {
                 profile,
@@ -1056,7 +1076,7 @@ mod tests {
         assert_eq!(resolve(&local_tab("shell", None)), restored(0, "/home/nobody", None));
         assert_eq!(resolve(&local_tab("Pinned", Some(gone))), restored(1, "/", None));
         // The profile's own directory gone too: home.
-        assert_eq!(resolve_tab(&local_tab("Pinned", Some(gone)), &config, home, &none_exist), restored(1, "/home/nobody", None));
+        assert_eq!(resolve_tab(&local_tab("Pinned", Some(gone)), &config, home, PathStyle::Posix, &none_exist), restored(1, "/home/nobody", None));
         // Recorded manual title is preserved for local tabs (and trimmed/ignored if empty).
         assert_eq!(
             resolve(&TabState::Local { profile: "Shell".into(), remote: None, cwd: Some(work.into()), title: Some("server".into()), zones: None, session: None }),
@@ -1074,14 +1094,14 @@ mod tests {
         let config = config();
         let home = Path::new("/home/nobody");
         let Some(RestoredTab::Local { profile, cwd, missing_profile, .. }) =
-            resolve_tab(&local_tab("Gone", Some("/srv/work")), &config, home, &only(&["/srv/work"]))
+            resolve_tab(&local_tab("Gone", Some("/srv/work")), &config, home, PathStyle::Posix, &only(&["/srv/work"]))
         else {
             panic!("not local")
         };
         // The default profile takes its place, in the recorded directory.
         assert_eq!((profile, cwd, missing_profile), (0, PathBuf::from("/srv/work"), Some("Gone".to_string())));
         // A profile found under another case isn't missing.
-        let Some(RestoredTab::Local { profile, missing_profile, .. }) = resolve_tab(&local_tab("pinned", None), &config, home, &none_exist)
+        let Some(RestoredTab::Local { profile, missing_profile, .. }) = resolve_tab(&local_tab("pinned", None), &config, home, PathStyle::Posix, &none_exist)
         else {
             panic!("not local")
         };
@@ -1149,7 +1169,7 @@ mod tests {
         .unwrap().config;
         let home = Path::new("/home/u");
         let Some(RestoredTab::Local { session: kept, host, .. }) =
-            resolve_tab(&state.windows[0].tabs[0], &config, home, &none_exist)
+            resolve_tab(&state.windows[0].tabs[0], &config, home, PathStyle::Posix, &none_exist)
         else {
             panic!("not local")
         };
@@ -1163,7 +1183,7 @@ mod tests {
             zones: None,
             session: Some(session.clone()),
         };
-        let Some(RestoredTab::Local { session: kept, host, .. }) = resolve_tab(&remote, &config, home, &none_exist) else {
+        let Some(RestoredTab::Local { session: kept, host, .. }) = resolve_tab(&remote, &config, home, PathStyle::Posix, &none_exist) else {
             panic!("not local")
         };
         assert_eq!((kept, host), (Some(session), Host::Remote(target)));
@@ -1201,7 +1221,7 @@ mod tests {
 
         // A single zone: the profile now points to new-host.
         let Some(RestoredTab::Local { profile, host, cwd, session, .. }) =
-            resolve_tab(&tab("Remote", None, s(7)), &moved, home, &none_exist)
+            resolve_tab(&tab("Remote", None, s(7)), &moved, home, PathStyle::Posix, &none_exist)
         else {
             panic!("not local")
         };
@@ -1209,7 +1229,7 @@ mod tests {
 
         // A split, under a profile that is gone (the default is local).
         let Some(RestoredTab::Local { profile, host, zones, .. }) =
-            resolve_tab(&tab("Gone", Some(split.clone()), None), &moved, home, &none_exist)
+            resolve_tab(&tab("Gone", Some(split.clone()), None), &moved, home, PathStyle::Posix, &none_exist)
         else {
             panic!("not local")
         };
@@ -1221,7 +1241,7 @@ mod tests {
         // No record: the profile's endpoint, its directory, no zones.
         let unrecorded = ZoneNodeState::split(SplitAxis::Vertical, leaf("/srv/a", None, true), leaf("/srv/b", None, false));
         let Some(RestoredTab::Local { host, cwd, zones, session, .. }) =
-            resolve_tab(&tab("Remote", Some(unrecorded), None), &moved, home, &none_exist)
+            resolve_tab(&tab("Remote", Some(unrecorded), None), &moved, home, PathStyle::Posix, &none_exist)
         else {
             panic!("not local")
         };
@@ -1278,7 +1298,7 @@ mod tests {
             session: None,
         };
         assert_eq!(
-            resolve_tab(&tab, &config, Path::new("/local/home"), &none_exist),
+            resolve_tab(&tab, &config, Path::new("/local/home"), PathStyle::Posix, &none_exist),
             Some(RestoredTab::Local {
                 profile: 0,
                 host: Host::Remote(ssh("new-host")),
@@ -1563,7 +1583,7 @@ mod tests {
             session: None,
         };
         let Some(RestoredTab::Local { profile, cwd, title, zones, .. }) =
-            resolve_tab(&tab, &config, home, &only(&["/srv/work"]))
+            resolve_tab(&tab, &config, home, PathStyle::Posix, &only(&["/srv/work"]))
         else {
             panic!("expected RestoredTab::Local");
         };
@@ -1581,5 +1601,114 @@ mod tests {
                 (z3, home.to_path_buf(), None),
             ]
         );
+    }
+
+    /// A directory recorded for this machine is restored only when it is
+    /// absolute in this machine's path style, as a program's report must
+    /// be: on Windows, on a drive letter. Any other is never probed, and
+    /// home takes its place, whatever the probe would say of it. A state
+    /// file written before reports had that rule may still hold one.
+    #[test]
+    fn a_recorded_directory_that_is_not_absolute_here_is_neither_probed_nor_restored() {
+        use std::cell::RefCell;
+
+        let config = config();
+        let probed = RefCell::new(Vec::new());
+        // Every directory is there: only the rule keeps one out.
+        let all_exist = |dir: &Path| {
+            probed.borrow_mut().push(dir.to_path_buf());
+            true
+        };
+        let restore = |tab: &TabState, home: &str, style: PathStyle| {
+            match resolve_tab(tab, &config, Path::new(home), style, &all_exist) {
+                Some(RestoredTab::Local { cwd, zones, .. }) => (cwd, zones),
+                None => panic!("not restored"),
+            }
+        };
+        let was_probed = |dir: &str| probed.borrow().iter().any(|probed| probed == Path::new(dir));
+
+        let home = r"C:\Users\me";
+        let (kept, _) = restore(&local_tab("Shell", Some(r"C:\src")), home, PathStyle::Windows);
+        assert_eq!(kept, PathBuf::from(r"C:\src"));
+        assert!(was_probed(r"C:\src"));
+        let refused = [
+            r"\\host\share",
+            r"\\?\UNC\host\share",
+            r"\\?\C:\src",
+            r"\\.\pipe\x",
+            r"\\host@80\x",
+            "//host/share",
+            r"\src",
+            "src",
+            "/home/me",
+        ];
+        for dir in refused {
+            let (cwd, _) = restore(&local_tab("Shell", Some(dir)), home, PathStyle::Windows);
+            assert_eq!(cwd, PathBuf::from(home), "{dir}");
+            assert!(!was_probed(dir), "{dir} was probed");
+        }
+
+        // Each zone of a split follows the same rule.
+        let split = ZoneNodeState::split(
+            SplitAxis::Horizontal,
+            ZoneNodeState::leaf(Some(PathBuf::from(r"\\host\zone")), false),
+            ZoneNodeState::leaf(Some(PathBuf::from(r"D:\work")), true),
+        );
+        let tab = TabState::Local {
+            profile: "Shell".into(),
+            remote: None,
+            cwd: Some(PathBuf::from(r"D:\work")),
+            title: None,
+            zones: Some(split),
+            session: None,
+        };
+        let (_, zones) = restore(&tab, home, PathStyle::Windows);
+        let (_, leaves, _) = zones.expect("a split").into_tree();
+        let dirs: Vec<PathBuf> = leaves.into_iter().map(|(_, cwd, _)| cwd).collect();
+        assert_eq!(dirs, [PathBuf::from(home), PathBuf::from(r"D:\work")]);
+        assert!(!was_probed(r"\\host\zone"));
+
+        // The same rule in the POSIX style: only a path from the root.
+        probed.borrow_mut().clear();
+        let (kept, _) = restore(&local_tab("Shell", Some("/srv/work")), "/home/me", PathStyle::Posix);
+        assert_eq!(kept, PathBuf::from("/srv/work"));
+        for dir in ["srv/work", r"C:\src", "~"] {
+            let (cwd, _) = restore(&local_tab("Shell", Some(dir)), "/home/me", PathStyle::Posix);
+            assert_eq!(cwd, PathBuf::from("/home/me"), "{dir}");
+            assert!(!was_probed(dir), "{dir} was probed");
+        }
+    }
+
+    /// A remote tab's recorded directory is a path on its host: this
+    /// machine's path style says nothing of it, and it is never probed.
+    #[test]
+    fn a_remote_tabs_recorded_directory_is_kept_whatever_this_machines_path_style() {
+        let remote = crate::config::RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        };
+        let mut config = config();
+        config.profiles[0].remote = Some(remote.clone());
+        let tab = TabState::Local {
+            profile: "Shell".into(),
+            remote: Some(remote),
+            cwd: Some(PathBuf::from("/srv/www")),
+            title: None,
+            zones: None,
+            session: None,
+        };
+        let never = |dir: &Path| -> bool { panic!("{} was probed", dir.display()) };
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            let Some(RestoredTab::Local { cwd, host, .. }) = resolve_tab(&tab, &config, Path::new("/home/me"), style, &never)
+            else {
+                panic!("not restored");
+            };
+            assert!(!host.is_local());
+            assert_eq!(cwd, PathBuf::from("/srv/www"), "{style:?}");
+        }
     }
 }

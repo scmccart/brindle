@@ -77,7 +77,7 @@ While ctrl is held (without alt) and the mouse is over a link in a terminal, tha
 - **THEN** the underline goes away and the pointer goes back to the text pointer
 
 ### Requirement: Opening links
-A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. When the `BRINDLE_LINK_OPENER` environment variable is set, Brindle SHALL pass the link as a single argument to the program it names. Otherwise it SHALL pass the link as a single argument to `xdg-open` on Linux, and on Windows have the shell open it with the link's default handler. It SHALL do this without waiting for it to finish. Brindle SHALL NOT open an OSC 8 URI that has no valid scheme. When Brindle doesn't open a clicked link, or the opener can't be started or reports a failure, the tab that was clicked SHALL say so in one dim line naming the link and the cause.
+A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. When the `BRINDLE_LINK_OPENER` environment variable is set, Brindle SHALL pass the link as a single argument to the program it names. Otherwise it SHALL pass the link as a single argument to `xdg-open` on Linux, and on Windows have the shell open it with the link's default handler. It SHALL do this without waiting for it to finish. Brindle SHALL open a link, detected or OSC 8, only when its scheme is one of those "URL detection" names, compared without case. It SHALL open a `file:` link only when its host is empty, `localhost` or this machine's name. On Windows, a `file:` link whose path isn't on a drive letter (`X:\…`, with no further `:`, no `"` and no control character) SHALL NOT be opened, a `file:` link to anything but a directory SHALL be shown selected in Explorer instead of opened, and double quotes and whitespace in a link SHALL be percent-encoded before it reaches the shell. When Brindle doesn't open a clicked link, or the opener can't be started or reports a failure, the tab that was clicked SHALL say so in one dim line naming the link and the cause.
 
 #### Scenario: Ctrl-click
 - **WHEN** the user ctrl-clicks `https://example.com` in a shell
@@ -106,6 +106,26 @@ A left click with ctrl held (without alt) on a link SHALL open the link when the
 #### Scenario: Link without a scheme
 - **WHEN** a program prints an OSC 8 hyperlink whose URI is `example.com/x`, and the user ctrl-clicks it
 - **THEN** nothing is opened, and the tab says the link was not opened because it has no URI scheme
+
+#### Scenario: Scheme Brindle doesn't open
+- **WHEN** a program prints an OSC 8 hyperlink whose URI is `ms-settings:privacy` or `C:\Windows\System32\calc.exe`, and the user ctrl-clicks it
+- **THEN** nothing is opened, and the tab says the link was not opened because Brindle doesn't open that scheme, naming it
+
+#### Scenario: File link to another host
+- **WHEN** a program prints `file://host/share/x.exe` (as text or an OSC 8 URI), and the user ctrl-clicks it
+- **THEN** nothing is opened, no connection is made to `host`, and the tab says the link was not opened because it names another host
+
+#### Scenario: Local file link on Windows
+- **WHEN** a program in a Windows tab prints an OSC 8 hyperlink to `file:///C:/Users/me/tool.exe`, and the user ctrl-clicks it
+- **THEN** Explorer shows `tool.exe` selected in `C:\Users\me`, and the program doesn't run
+
+#### Scenario: File link with no drive on Windows
+- **WHEN** a program in a Windows tab prints an OSC 8 hyperlink whose URI is `file:shell:AppsFolder` or `file:///etc/hosts`, and the user ctrl-clicks it
+- **THEN** nothing is opened, Explorer isn't started, and the tab says the link was not opened because its path isn't on a drive letter
+
+#### Scenario: Quotes in a link on Windows
+- **WHEN** a program in a Windows tab prints an OSC 8 hyperlink whose URI is `https://example.com/" --flag`, and the user ctrl-clicks it
+- **THEN** the shell is given `https://example.com/%22%20--flag` as one link
 
 ### Requirement: Links take ctrl-clicks from mouse reporting
 When the program has turned on mouse reporting, a ctrl-click on a link SHALL open it and SHALL NOT be reported to the program, neither the press nor the release. A ctrl-click anywhere else SHALL still be reported as before.

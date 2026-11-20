@@ -503,7 +503,16 @@ fn detach(program: &Program, args: &[String], ready: Option<HANDLE>) -> io::Resu
 
 /// Opens (appending) a server log. The server directory's protection is the
 /// log's.
+///
+/// An elevated role opens it without following a link and uses only its
+/// own plain file (`win::open_elevated_file`).
 pub fn open_log(path: &Path) -> io::Result<File> {
+    if super::dir::elevated_role()? {
+        return brindle_remote_protocol::win::open_elevated_file(
+            path,
+            brindle_remote_protocol::win::FileOpen::Log,
+        );
+    }
     OpenOptions::new().create(true).append(true).open(path)
 }
 

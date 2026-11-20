@@ -84,7 +84,7 @@ impl Sink {
 }
 
 /// The size a replay rendered at `recorded` is fed at, by a terminal whose
-/// grid is `own`: the recorded size, no narrower than any grid
+/// grid is `own`: the recorded size, within the limits every grid keeps
 /// ([`GridSize::clamped`]), when its columns or rows differ from the
 /// grid's; `None` when nothing was recorded or the grid already has it.
 /// The recorded size is a session's decoded one (`ListedSession::size`, or
@@ -364,6 +364,8 @@ mod tests {
             ("both", own, Some(size(40, 5)), Some(size(40, 5))),
             ("one column, clamped", own, Some(size(1, 5)), Some(size(min, 5))),
             ("clamped to the grid's own", size(min, 5), Some(size(1, 5)), None),
+            ("past the limits, clamped", own, Some(size(u16::MAX, u16::MAX)), Some(size(2048, 1024))),
+            ("past the limits, clamped to the grid's own", size(2048, 1024), Some(size(u16::MAX, u16::MAX)), None),
         ];
         for (case, own, recorded, expected) in cases {
             assert_eq!(replay_resize(own, recorded), expected, "{case}");

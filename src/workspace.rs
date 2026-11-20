@@ -607,7 +607,10 @@ impl Workspace {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let mut active_tab = None;
         for (ix, entry) in state.tabs.iter().enumerate() {
-            match session::resolve_tab(entry, &config, &home, &|dir: &Path| dir.is_dir()) {
+            // The probe sees only directories that are absolute in this
+            // machine's path style (on Windows, on a drive letter).
+            let style = crate::terminal::process::LOCAL_PATH_STYLE;
+            match session::resolve_tab(entry, &config, &home, style, &|dir: &Path| dir.is_dir()) {
                 None => {}
                 Some(RestoredTab::Local { profile, host, cwd, title, zones, session, missing_profile }) => {
                     let missing_note = missing_profile.map(|name| {
@@ -963,15 +966,14 @@ impl Workspace {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        // At the session's own size, so attaching resizes nothing; a core
-        // that predates sizes lists none, and the default grid stands in.
+        // At the session's own size, so attaching resizes nothing; one
+        // listed with no usable size starts at the default grid.
         let listed = crate::remote::ListedSession::of(info);
-        let default = crate::terminal::GridSize::default();
-        let (cols, rows) = listed.size.unwrap_or((default.cols, default.rows));
+        let size = crate::terminal::GridSize::listed(listed.size);
         let request = crate::remote::local::AttachRequest {
             session: listed.session,
             key: listed.key,
-            when: crate::remote::local::Attaching::Now { cols, rows },
+            when: crate::remote::local::Attaching::Now { cols: size.cols, rows: size.rows },
         };
         let what = crate::reattach::label(info);
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
@@ -3089,8 +3091,9 @@ mod tests {
         assert_eq!(request.command, Some(editor()));
         assert_eq!(request.cwd, None);
         let profile = &config.profiles[request.profile];
-        let nothing_here = |_: &std::path::Path| false;
-        let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config, None, nothing_here);
+        let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config, None);
+        // Nothing is here: what the thread that starts the session finds.
+        let spawn = crate::terminal::with_checked_dir(spawn, false);
         let (program, args) = editor();
         assert_eq!((spawn.command, spawn.args), (Some(program), args));
         assert_eq!(doing, "start \"/bin/sh\"");
@@ -3234,9 +3237,15 @@ mod tests {
         let reloaded = reloaded_profile(&before, &config).expect("the profile is still there");
         assert_eq!(reloaded.remote, moved.remote);
         let split = |profile: &Profile, host: &Host| {
-            let nothing_here = |_: &std::path::Path| false;
             let cwd = Some("/var/log/brindle-nowhere".into());
-            crate::terminal::spawn_request(profile, host, None, cwd, &config, None, nothing_here)
+            let (request, doing) = crate::terminal::spawn_request(profile, host, None, cwd, &config, None);
+            // Nothing is here: what the thread that starts a session on
+            // this machine finds. A remote host's directory isn't checked.
+            let request = match host {
+                Host::Local => crate::terminal::with_checked_dir(request, false),
+                Host::Remote(_) => request,
+            };
+            (request, doing)
         };
         let (request, doing) = split(&reloaded, &tab_host);
         assert_eq!(doing, "start \"htop\" on old-host");

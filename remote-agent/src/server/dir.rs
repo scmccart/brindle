@@ -3,16 +3,31 @@
 //! instead). The platform says where it is and who may enter it.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::platform::dir;
-pub use super::platform::dir::resolve_from_env;
+pub use super::platform::dir::{prune_copies, resolve_from_env};
+
+/// The server directory a role uses, with what the platform holds of it
+/// for as long as this lives (an elevated process's directory on Windows),
+/// so a role keeps it for its life.
+#[derive(Debug)]
+pub struct ServerDir {
+    path: PathBuf,
+    _held: dir::Held,
+}
+
+impl ServerDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// The server directory for this process's environment, created if needed.
-pub fn from_env() -> io::Result<PathBuf> {
+pub fn from_env() -> io::Result<ServerDir> {
     let path = resolve_from_env()?;
-    dir::ensure(&path)?;
-    Ok(path)
+    let held = dir::ensure(&path)?;
+    Ok(ServerDir { path, _held: held })
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ use crate::server::platform::{Loop, Source, Listener, Pty};
 | the server directory, endpoint names, access checks, scopes | `remote-protocol/src/{server_dir,endpoint,access,scope,win}.rs` |
 | the app's connection to a server | `src/remote/local/{unix,windows,pipe}.rs` |
 | a remote endpoint's transport (OpenSSH, Docker and Podman exec) | `src/remote/client.rs` |
-| a local program's name and directory, and the path style its directory reports use (`LOCAL_PATH_STYLE`) | `src/terminal/process.rs` |
+| a local program's name and directory, the path style its directory reports use (`LOCAL_PATH_STYLE`) and whether its directory is read from the system or taken from those reports (`LOCAL_DIRECTORY`) | `src/terminal/process.rs` |
 | the primary selection | `src/primary.rs` |
 | desktop notifications and window activation | `src/notify/{dbus,toast,activation}.rs` |
 | launcher registration | `src/desktop.rs` |

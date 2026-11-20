@@ -124,6 +124,47 @@ pub fn mouse_mode(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// `text` without its whitespace, so a line the terminal wrapped reads as
+/// it was written.
+fn squeezed(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Links Brindle doesn't open: an OSC 8 hyperlink whose scheme isn't one it
+/// detects, and a `file:` link to another host. A ctrl-click on each says
+/// why in the tab, naming the link, and the opener is never run.
+pub fn refused(ctx: &Ctx) -> Result<Outcome> {
+    let (opener, log) = recorder(ctx)?;
+    let show = script(
+        ctx,
+        "show",
+        "clear\n\
+         printf '\\033]8;;ms-settings:privacy\\033\\\\settings\\033]8;;\\033\\\\\\n'\n\
+         printf '\\033]8;;file://elsewhere.invalid/x.exe\\033\\\\tool\\033]8;;\\033\\\\\\n'\n",
+    )?;
+    let out = Run::new(ctx, "run")
+        .profile("Shell")
+        .env("BRINDLE_LINK_OPENER", &opener.display().to_string())
+        .send(&format!("sh {}\r", show.display()))
+        .click("ctrl-2,0")
+        .wait_for("couldn't open ms-settings")
+        .click("ctrl-2,1")
+        .wait_for("couldn't open file:")
+        .dump_at(8.0)
+        .run()?;
+    let text = out.dump.screen.join("\n");
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {text:?}", out.dump.wait_timeouts);
+    let shown = squeezed(&text);
+    for line in [
+        "couldn't open ms-settings:privacy: its scheme (ms-settings) isn't one Brindle opens",
+        "couldn't open file://elsewhere.invalid/x.exe: it names another host (elsewhere.invalid)",
+    ] {
+        ensure!(shown.contains(&squeezed(line)), "the tab doesn't say {line:?}: {text:?}");
+    }
+    ensure!(opened(&log).is_empty(), "the opener ran: {:?}", opened(&log));
+    Ok(Outcome::Pass)
+}
+
 /// An opener that can't run: ctrl-click on a link says in the tab that it
 /// couldn't be opened, with the link and the cause.
 pub fn opener_fails(ctx: &Ctx) -> Result<Outcome> {

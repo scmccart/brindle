@@ -259,7 +259,10 @@ fn host_build(build: &Result<String, String>) -> &str {
 /// it), and opens the client's connection; or says what went wrong, with
 /// the core's log when there is a directory for it.
 fn reach() -> Result<Reached, String> {
-    let dir = dir::from_env().map_err(|error| format!("terminal server unreachable: {error}"))?;
+    let dir = dir::from_env()
+        .map_err(|error| format!("terminal server unreachable: {error}"))?
+        .path()
+        .to_path_buf();
     let server = Server {
         socket: dir.join(server_dir::CORE_SOCKET),
         log: Log(dir.join(server_dir::CORE_LOG)),

@@ -73,7 +73,7 @@ use windows::core::PCWSTR;
 
 use super::event_loop::{ExitWatch, Source, Waker, os_error, win32};
 use super::pipe::Pipe;
-use crate::conpty::cmdline::{self, launch_line};
+use crate::conpty::cmdline::{self, Resolved, launch_line};
 use crate::conpty::hosts::{self, HostSeen, Listed};
 use crate::conpty::{Process, Pseudoconsole, choice};
 use crate::pty::{PtyCommand, Reparented};
@@ -486,8 +486,29 @@ fn pipe(
     Ok((server, client))
 }
 
+/// The file `request`'s program is ([`cmdline::resolve_program`]), looked
+/// up in the `PATH` of the environment `env` it gets. A name
+/// without a directory is never looked for beside this process's image,
+/// which for a server role is the helper copy's directory.
+fn application(program: &str, env: &[(String, String)]) -> io::Result<String> {
+    let path = cmdline::variable(env, "PATH");
+    match cmdline::resolve_program(program, path, |file| Path::new(file).is_file()) {
+        Resolved::Found(file) => Ok(file),
+        Resolved::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{program} is in no directory of the session's PATH"),
+        )),
+    }
+}
+
 /// Opens a pseudoconsole and starts `request`'s program on it.
 pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
+    let program = program_name(request);
+    let program = program.to_string_lossy();
+    let env = environment(request);
+    let application = application(&program, &env)?;
+    let line = launch_line(&program, request.args);
+
     let (input, host_input) = pipe(PIPE_ACCESS_OUTBOUND, GENERIC_READ.0)?;
     let (output, host_output) = pipe(PIPE_ACCESS_INBOUND, GENERIC_WRITE.0)?;
     let mut pseudoconsole = Pseudoconsole::create(
@@ -506,10 +527,8 @@ pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
     #[cfg(test)]
     let packaged = pseudoconsole.is_packaged();
 
-    let program = program_name(request);
-    let line = launch_line(&program.to_string_lossy(), request.args);
-    let env = environment(request);
     let process = pseudoconsole.start(
+        &application,
         &line,
         request.cwd.map(Path::new),
         env.iter().map(|(name, value)| (name.as_str(), value.as_str())),

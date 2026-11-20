@@ -460,6 +460,11 @@ pub struct Endpoint {
     /// Where the per-build copies of the helper go, which roles run from.
     #[cfg(windows)]
     copies: PathBuf,
+    /// Whether `copies` is an elevated process's own (`server-elevated`),
+    /// made for Administrators and SYSTEM only and held while a core is
+    /// started from it.
+    #[cfg(windows)]
+    protect_copies: bool,
     /// Whether a core started here may run in a systemd scope of its own
     /// (`scope::current()` decides). Only the environment's server may:
     /// tests' stand-in cores never become units.
@@ -479,18 +484,20 @@ impl Endpoint {
         #[cfg(not(windows))]
         let dir = server_dir::resolve(named, std::env::var_os("XDG_RUNTIME_DIR"), dirs::home_dir());
         #[cfg(windows)]
-        let (dir, copies) = {
+        let (dir, copies, protect_copies) = {
             use super::protocol::win;
 
             let local = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
             let elevated = win::is_elevated().context("finding the terminal server directory")?;
             let given = named.as_ref().is_some_and(|dir| !dir.is_empty());
             let dir = server_dir::resolve_windows(named, Some(local.clone()), elevated);
-            // In a directory that was named, the copies are its own.
+            // In a directory that was named, the copies are its own, used as
+            // they are; else `server`, or an elevated Brindle's protected
+            // `server-elevated`.
             let copies = dir.as_ref().ok().map(|dir| {
-                server_dir::helper_copies(given.then_some(dir.as_path()), std::path::Path::new(&local))
+                server_dir::helper_copies(given.then_some(dir.as_path()), std::path::Path::new(&local), elevated)
             });
-            (dir, copies.unwrap_or_default())
+            (dir, copies.unwrap_or_default(), elevated && !given)
         };
         let dir = dir.context("finding the terminal server directory")?;
         Ok(Self {
@@ -498,6 +505,8 @@ impl Endpoint {
             dir,
             #[cfg(windows)]
             copies,
+            #[cfg(windows)]
+            protect_copies,
             #[cfg(not(windows))]
             scope: true,
             role_env: Vec::new(),
@@ -514,7 +523,9 @@ impl Endpoint {
         Self {
             helper,
             #[cfg(windows)]
-            copies: server_dir::helper_copies(Some(&dir), std::path::Path::new("")),
+            copies: server_dir::helper_copies(Some(&dir), std::path::Path::new(""), false),
+            #[cfg(windows)]
+            protect_copies: false,
             role_env: vec![
                 ("BRINDLE_SERVER_DIR", dir.clone().into_os_string()),
                 ("BRINDLE_NO_SCOPE", "1".into()),

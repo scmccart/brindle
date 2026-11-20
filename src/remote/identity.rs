@@ -6,8 +6,10 @@
 //! The key, a random value the core gives each session, tells them apart
 //! ([`SessionKey`]). A listing's entry is decoded into a [`ListedSession`],
 //! and [`ListedSession::is`] is the one rule for "the same session". The
-//! wire keeps its own forms (an empty key, a 0x0 size); nothing past this
-//! module looks at them.
+//! wire keeps its own forms (an empty key, a 0x0 size, any size a `u16`
+//! holds); nothing past this module looks at them.
+
+use brindle_term_core::emulator;
 
 use crate::remote::protocol::SessionId;
 use crate::remote::protocol::client::SessionInfo;
@@ -45,18 +47,23 @@ pub struct ListedSession {
     pub key: Option<SessionKey>,
     /// A client has it.
     pub attached: bool,
-    /// Its columns and rows; `None` from a core that predates sizes, which
-    /// lists 0 for both.
+    /// Its columns and rows, within the limits every grid keeps
+    /// ([`emulator::clamped`]). `None` for any other size: a core that
+    /// predates sizes lists 0 for both, and an endpoint can list whatever a
+    /// `u16` holds. A size outside the limits isn't clamped, since a replay
+    /// rendered at another size than the one it is fed at lands elsewhere:
+    /// it counts as no size, and the tab starts at the default one.
     pub size: Option<(u16, u16)>,
 }
 
 impl ListedSession {
     pub fn of(info: &SessionInfo) -> Self {
+        let size = (info.cols, info.rows);
         Self {
             session: info.session,
             key: SessionKey::from_wire(&info.key),
             attached: info.attached,
-            size: (info.cols > 0 && info.rows > 0).then_some((info.cols, info.rows)),
+            size: (emulator::clamped(info.cols, info.rows) == size).then_some(size),
         }
     }
 
@@ -108,6 +115,20 @@ mod tests {
         for (cols, rows) in [(0, 0), (80, 0), (0, 24)] {
             let info = SessionInfo { session: 4, cols, rows, ..Default::default() };
             assert_eq!(ListedSession::of(&info).size, None, "{cols}x{rows}");
+        }
+    }
+
+    /// A listed size is used only within the grid limits, 10 columns and 1
+    /// row up to 2048 columns and 1024 rows: any other counts as no size,
+    /// as a core that lists none does.
+    #[test]
+    fn a_listed_size_outside_the_grid_limits_is_no_size() {
+        let size = |cols, rows| ListedSession::of(&SessionInfo { session: 4, cols, rows, ..Default::default() }).size;
+        for inside in [(10, 1), (80, 24), (120, 40), (2048, 1024), (10, 1024), (2048, 1)] {
+            assert_eq!(size(inside.0, inside.1), Some(inside), "{inside:?}");
+        }
+        for (cols, rows) in [(65535, 65535), (2049, 24), (80, 1025), (2049, 1025), (9, 24), (1, 5), (65535, 1), (10, 65535)] {
+            assert_eq!(size(cols, rows), None, "{cols}x{rows}");
         }
     }
 

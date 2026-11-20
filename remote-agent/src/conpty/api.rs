@@ -15,6 +15,8 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::core::{HRESULT, PCSTR, PCWSTR, s, w};
 
+use brindle_remote_protocol::win::{self, Contents, ProtectedDir};
+
 use super::choice::{self, Shipped};
 
 /// The packaged ConPTY embedded by `build.rs`: `VERSION` and `FILES`.
@@ -84,6 +86,9 @@ pub(super) fn api(inbox: bool) -> &'static Api {
     INBOX.get_or_init(inbox_api)
 }
 
+/// An elevated process's extraction directory, held from its first use.
+static PROTECTED: OnceLock<ProtectedDir> = OnceLock::new();
+
 /// The packaged ConPTY, or why it isn't usable. Its success says where it
 /// loaded from in the log; a failure is the caller's to say.
 fn packaged() -> Result<Api, String> {
@@ -94,7 +99,22 @@ fn packaged() -> Result<Api, String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let extract_dir = choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version);
+    let elevated = win::is_elevated()
+        .map_err(|err| format!("can't tell whether this process is elevated: {err}"))?;
+    let extract_dir =
+        choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version, elevated);
+    // An elevated holder's extraction (`conpty-elevated\<version>`) is for
+    // Administrators and SYSTEM only, and held for the holder's life, so
+    // the files it loads are never ones an unelevated process wrote or
+    // swapped.
+    if elevated
+        && let Some(dir) = extract_dir.as_deref()
+        && PROTECTED.get().is_none()
+    {
+        let held = win::protected_dir(dir, Contents::Executables)
+            .map_err(|err| format!("protecting {}: {err}", dir.display()))?;
+        let _ = PROTECTED.set(held);
+    }
     let dir = shipped_dir(exe_dir.as_deref(), extract_dir.as_deref(), files)?;
     let api = load(&dir).map_err(|err| format!("loading it from {}: {err}", dir.display()))?;
     eprintln!(

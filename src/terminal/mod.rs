@@ -12,6 +12,7 @@
 //!   [`Terminal::feed`]; it has no program, so input goes nowhere.
 
 pub mod cmdline;
+mod dir_check;
 pub mod events;
 pub mod keys;
 pub mod links;
@@ -181,12 +182,22 @@ impl Default for GridSize {
 }
 
 impl GridSize {
-    /// This size with at least [`MIN_COLS`] columns, the narrowest grid the
-    /// client and the server's emulators make. Where a size comes from
-    /// outside the term (a layout, a listing), it goes through here before
-    /// it is used.
+    /// This size within the limits every grid keeps, on the client and in
+    /// the server's emulators alike (`emulator::clamped`): [`MIN_COLS`] to
+    /// 2048 columns and 1 to 1024 rows. Where a size comes from outside the
+    /// term (a layout, a listing), it goes through here before a grid is
+    /// made or resized with it.
     pub fn clamped(self) -> Self {
-        Self { cols: self.cols.max(MIN_COLS), ..self }
+        let (cols, rows) = brindle_term_core::emulator::clamped(self.cols, self.rows);
+        Self { cols, rows, ..self }
+    }
+
+    /// The grid a session listed at `size` is attached at: its own size,
+    /// so attaching resizes nothing, or the default grid when its listing
+    /// gave none (`ListedSession::size`: a core that predates sizes, or a
+    /// size outside the grid limits).
+    pub fn listed(size: Option<(u16, u16)>) -> Self {
+        size.map_or_else(Self::default, |(cols, rows)| Self { cols, rows, ..Self::default() }.clamped())
     }
 }
 
@@ -293,6 +304,11 @@ pub struct Terminal {
     replaying: bool,
     /// Program status records (OSC 7501).
     status: status::Records,
+    /// Whether the directory the program reports exists, where that is the
+    /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
+    /// refreshed when output brings another report, by a check off the UI
+    /// thread ([`Terminal::follow_reported_dir`]).
+    dir_check: dir_check::DirCheck,
     pub theme: Theme,
     /// Updated whenever there is output; drives the cursor blink reset.
     pub last_activity: Instant,
@@ -448,6 +464,7 @@ impl Terminal {
             held_notes: None,
             replaying: false,
             status: status::Records::default(),
+            dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
             sync_flush: None,
@@ -474,15 +491,8 @@ impl Terminal {
             // Brindle. Everything else keeps running when Brindle goes away
             // without closing it.
             let closing = Closing::new(command_override.is_some());
-            let (request, doing) = spawn_request(
-                profile,
-                host,
-                command_override,
-                cwd_override,
-                config,
-                dirs::home_dir(),
-                std::path::Path::is_dir,
-            );
+            let (request, doing) =
+                spawn_request(profile, host, command_override, cwd_override, config, dirs::home_dir());
             Self::start_session(host, request, doing, closing, theme, config, cx)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -496,7 +506,11 @@ impl Terminal {
     }
 
     /// A terminal whose session `request` starts on `host`, in the
-    /// background ([`crate::remote::local::Session::start`]).
+    /// background ([`crate::remote::local::Session::start`]). The directory
+    /// of a request for this machine is checked there, on the thread that
+    /// starts the session and not on this one, which a path that takes long
+    /// to answer would hold up ([`with_checked_dir`]). A remote host's is a
+    /// path on that host, which the host resolves.
     #[cfg(any(target_os = "linux", windows))]
     #[allow(
         clippy::too_many_arguments,
@@ -517,7 +531,17 @@ impl Terminal {
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
         let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
-        let session = crate::remote::local::Session::start(host.clone(), request, Box::new(sink));
+        let session = match host {
+            Host::Local => crate::remote::local::Session::start(
+                host.clone(),
+                move || {
+                    let is_dir = request.cwd.as_deref().is_some_and(|dir| std::path::Path::new(dir).is_dir());
+                    with_checked_dir(request, is_dir)
+                },
+                Box::new(sink),
+            ),
+            Host::Remote(_) => crate::remote::local::Session::start(host.clone(), move || request, Box::new(sink)),
+        };
         let backend = Backend::Server { session, closing, host: host.clone() };
         Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx)
     }
@@ -540,15 +564,7 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> Self {
         let (listener, rx) = Listener::channel();
-        // The session's size: the replay is rendered at it, and the first
-        // layout resizes the session only if the window's grid differs. A
-        // recorded session's comes with its listing.
-        let (size, recorded) = match request.when {
-            crate::remote::local::Attaching::Now { cols, rows } => {
-                (GridSize { cols, rows, ..GridSize::default() }, false)
-            }
-            crate::remote::local::Attaching::Recorded => (GridSize::default(), true),
-        };
+        let (size, recorded) = attach_size(request.when);
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
@@ -752,6 +768,8 @@ impl Terminal {
                 self.last_activity = Instant::now();
                 Latency::output(cx.entity_id(), self.output.generation(), self.output.at(), cx);
                 self.schedule_sync_flush(cx);
+                // Output is what brings a directory report.
+                self.follow_reported_dir(cx);
             }
             AlacEvent::Title(title) => self.set_title(Some(title), cx),
             AlacEvent::ResetTitle => self.set_title(None, cx),
@@ -834,6 +852,8 @@ impl Terminal {
             *term = fresh_term;
             *self.marks.lock() = Marks::default();
         }
+        // The marks' directory report went with them.
+        self.follow_reported_dir(cx);
         self.status.reset();
         cx.emit(TerminalEvent::Status(None));
         self.show(&broken_line(reason), cx);
@@ -1092,21 +1112,22 @@ impl Terminal {
     /// Current working directory of the foreground process (falls back to
     /// the shell). On Windows, where no other process's directory can be
     /// read, it is the directory the program last reported (OSC 7 or 9;9),
-    /// if it still exists. A remote session's is a path on its host, never
-    /// checked here: the directory the program reported (OSC 7), else the
-    /// one its host last reported.
+    /// if it existed when it was checked: this only reads what the check,
+    /// run off the UI thread, found (`dir_check`), so it gives none while
+    /// the check is still out. A remote session's is a path on its host,
+    /// never checked here: the directory the program reported (OSC 7),
+    /// else the one its host last reported.
     pub fn working_directory(&self) -> Option<std::path::PathBuf> {
         match &self.backend {
-            #[cfg(windows)]
-            Backend::Server { host: Host::Local, .. } => {
-                self.marks.lock().reported_dir().filter(|dir| dir.is_dir()).map(Into::into)
-            }
-            #[cfg(target_os = "linux")]
-            Backend::Server { session, host: Host::Local, .. } => {
-                session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
-            }
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, .. } => self
+            Backend::Server { session, host: Host::Local, .. } => match process::LOCAL_DIRECTORY {
+                process::LocalDirectory::Reported => self.dir_check.existing().map(Into::into),
+                process::LocalDirectory::Process => {
+                    session.pid().and_then(|pid| process::PtyProcess::new(pid).working_directory())
+                }
+            },
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { session, host: Host::Remote(_), .. } => self
                 .marks
                 .lock()
                 .reported_dir()
@@ -1114,6 +1135,53 @@ impl Terminal {
                 .or_else(|| session.foreground()?.cwd.map(Into::into)),
             Backend::Remote => None,
         }
+    }
+
+    /// Whether the terminal's directory is the one its program reports,
+    /// checked on this machine: a session here, where the system gives no
+    /// process's directory ([`process::LOCAL_DIRECTORY`]). A remote
+    /// session's reported directory is a path on its host, never checked
+    /// here, and a message terminal has no program.
+    fn follows_reported_dir(&self) -> bool {
+        match &self.backend {
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { host: Host::Local, .. } => {
+                process::LOCAL_DIRECTORY == process::LocalDirectory::Reported
+            }
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { host: Host::Remote(_), .. } => false,
+            Backend::Remote => false,
+        }
+    }
+
+    /// Tells the directory check which directory the program reports now,
+    /// and starts the check it asks for, if any ([`dir_check::DirCheck`]).
+    fn follow_reported_dir(&mut self, cx: &mut Context<Self>) {
+        if !self.follows_reported_dir() {
+            return;
+        }
+        let to_check = self.dir_check.report(self.marks.lock().reported_dir());
+        if let Some(dir) = to_check {
+            self.check_dir(dir, cx);
+        }
+    }
+
+    /// Finds out whether `dir` is a directory on the background executor,
+    /// where a path that takes long to answer holds nothing up, and gives
+    /// the directory check the answer; it may then ask for the next one.
+    fn check_dir(&mut self, dir: std::path::PathBuf, cx: &mut Context<Self>) {
+        let probed = dir.clone();
+        let is_dir = cx.background_executor().spawn(async move { probed.is_dir() });
+        cx.spawn(async move |this, cx| {
+            let is_dir = is_dir.await;
+            this.update(cx, |this, cx| {
+                if let Some(next) = this.dir_check.finished(&dir, is_dir) {
+                    this.check_dir(next, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The visible screen as plain text (used by `--dump-screen` and tests).
@@ -1421,10 +1489,14 @@ fn broken_line(reason: &str) -> String {
 /// command, a directory as given (its holder expands `~` and falls back to
 /// home), and its own environment under the profile's
 /// ([`SpawnRequest::remote`](crate::remote::local::SpawnRequest::remote)).
-/// This machine's is resolved here: the program, a directory that exists
-/// (by `is_dir`: the asked one, else the profile's with `~` as `home`, else
+/// This machine's is resolved here: the program, the directory it is to
+/// start in (the asked one, else the profile's with `~` as `home`, else
 /// `home`), and Brindle's own environment under the profile's. Which one
 /// depends on `host` alone, not on what the profile targets.
+///
+/// This machine's directory is named, not checked: whether it exists is
+/// found out on the thread that starts the session, and
+/// [`with_checked_dir`] then says what is sent.
 #[cfg(any(target_os = "linux", windows))]
 pub(crate) fn spawn_request(
     profile: &Profile,
@@ -1433,7 +1505,6 @@ pub(crate) fn spawn_request(
     cwd_override: Option<std::path::PathBuf>,
     config: &Config,
     home: Option<std::path::PathBuf>,
-    is_dir: impl Fn(&std::path::Path) -> bool,
 ) -> (crate::remote::local::SpawnRequest, String) {
     let policy = Closing::new(command_override.is_some()).policy();
     let size = GridSize::default();
@@ -1453,10 +1524,7 @@ pub(crate) fn spawn_request(
         Some(program) => (program.clone(), profile.args.clone()),
         None => default_program(&profile.args),
     });
-    let working_directory = cwd_override
-        .or_else(|| profile.working_directory(home.as_deref()))
-        .or(home)
-        .filter(|dir| is_dir(dir));
+    let working_directory = cwd_override.or_else(|| profile.working_directory(home.as_deref())).or(home);
     let doing = format!("start {program:?}");
     let request = crate::remote::local::SpawnRequest {
         // A profile's empty `command` is none.
@@ -1473,6 +1541,38 @@ pub(crate) fn spawn_request(
         profile: Some(profile.name.clone()),
     };
     (request, doing)
+}
+
+/// A request for this machine ([`spawn_request`]) as it is sent, once its
+/// directory has been looked at: `is_dir` is whether `request.cwd` is a
+/// directory here. One that isn't is left out, and the program starts in
+/// its server's default directory; no other directory is tried in its
+/// place.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn with_checked_dir(
+    mut request: crate::remote::local::SpawnRequest,
+    is_dir: bool,
+) -> crate::remote::local::SpawnRequest {
+    if !is_dir {
+        request.cwd = None;
+    }
+    request
+}
+
+/// The grid an attach starts with, and whether its session's size is still
+/// to come with a listing (a recorded session's). A session just listed is
+/// attached at its own size, so its replay, rendered at that size, lands
+/// as it was drawn and the first layout resizes the session only if the
+/// window's grid differs. The size is the caller's (`GridSize::listed`),
+/// taken within the limits every grid keeps whatever it says.
+#[cfg(any(target_os = "linux", windows))]
+fn attach_size(when: crate::remote::local::Attaching) -> (GridSize, bool) {
+    match when {
+        crate::remote::local::Attaching::Now { cols, rows } => {
+            (GridSize { cols, rows, ..GridSize::default() }.clamped(), false)
+        }
+        crate::remote::local::Attaching::Recorded => (GridSize::default(), true),
+    }
 }
 
 /// The parser for a terminal on `host`, reading directory reports in the
@@ -1598,11 +1698,58 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     #[test]
-    fn a_grid_size_narrower_than_min_cols_is_clamped_and_its_rows_kept() {
+    fn a_grid_size_is_clamped_to_the_grid_limits_and_its_cells_kept() {
         let narrow = GridSize { cols: 1, rows: 7, cell_width: 9, cell_height: 18 };
         assert_eq!(narrow.clamped(), GridSize { cols: MIN_COLS, rows: 7, cell_width: 9, cell_height: 18 });
         let wide = GridSize { cols: 120, ..narrow };
         assert_eq!(wide.clamped(), wide);
+        let huge = GridSize { cols: u16::MAX, rows: u16::MAX, ..narrow };
+        assert_eq!(huge.clamped(), GridSize { cols: 2048, rows: 1024, cell_width: 9, cell_height: 18 });
+        let largest = GridSize { cols: 2048, rows: 1024, ..narrow };
+        assert_eq!(largest.clamped(), largest);
+        assert_eq!(GridSize { rows: 0, ..wide }.clamped(), GridSize { rows: 1, ..wide });
+    }
+
+    /// A session an endpoint lists at 65535×65535 has no usable size: its
+    /// tab starts at the default grid, as a session listed with no size
+    /// does. One listed within the limits is attached at its own size.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_session_listed_past_the_grid_limits_attaches_at_the_default_size() {
+        use crate::remote::ListedSession;
+        use crate::remote::local::Attaching;
+        use crate::remote::protocol::client::SessionInfo;
+
+        // As `Workspace::attached_terminal` asks for the attach.
+        let attach = |cols, rows| {
+            let listed = ListedSession::of(&SessionInfo { session: 3, cols, rows, ..Default::default() });
+            let size = GridSize::listed(listed.size);
+            attach_size(Attaching::Now { cols: size.cols, rows: size.rows })
+        };
+        let default = GridSize::default();
+        assert_eq!(attach(65535, 65535), (default, false));
+        assert_eq!(attach(2049, 24), (default, false));
+        assert_eq!(attach(80, 1025), (default, false));
+        // A core that predates sizes lists none.
+        assert_eq!(attach(0, 0), (default, false));
+        assert_eq!(attach(120, 40), (GridSize { cols: 120, rows: 40, ..default }, false));
+        assert_eq!(attach(2048, 1024), (GridSize { cols: 2048, rows: 1024, ..default }, false));
+    }
+
+    /// Whatever size an attach is asked at, its grid stays within the
+    /// limits; a recorded session's size comes later, with its listing.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn an_attach_never_starts_past_the_grid_limits() {
+        use crate::remote::local::Attaching;
+
+        let default = GridSize::default();
+        assert_eq!(
+            attach_size(Attaching::Now { cols: 65535, rows: 65535 }),
+            (GridSize { cols: 2048, rows: 1024, ..default }, false)
+        );
+        assert_eq!(attach_size(Attaching::Now { cols: 1, rows: 5 }), (GridSize { cols: MIN_COLS, rows: 5, ..default }, false));
+        assert_eq!(attach_size(Attaching::Recorded), (default, true));
     }
 
     /// 6.1/6.2: what a new terminal runs follows the host it opens on, not
@@ -1627,10 +1774,23 @@ mod tests {
         };
         let config = Config::default();
         let remote_host = Host::Remote(a8);
-        // Which directories this machine has, as `is_dir` says.
+        // The request as it is sent: this machine's with its directory
+        // checked against `here`, the directories this machine has, as the
+        // thread that starts the session checks it; a remote host's as it
+        // is.
         let request = |profile: &Profile, host: &Host, command, cwd, here: &[&str]| {
             let home = Some(PathBuf::from("/home/me"));
-            spawn_request(profile, host, command, cwd, &config, home, |dir: &Path| here.iter().any(|here| dir == Path::new(here)))
+            let (request, doing) = spawn_request(profile, host, command, cwd, &config, home);
+            let request = match host {
+                Host::Local => {
+                    // As paths: Windows joins with `\`.
+                    let is_dir =
+                        request.cwd.as_deref().is_some_and(|dir| here.iter().any(|here| Path::new(dir) == Path::new(here)));
+                    with_checked_dir(request, is_dir)
+                }
+                Host::Remote(_) => request,
+            };
+            (request, doing)
         };
 
         let (remote, doing) = request(&profile, &remote_host, None, None, &[]);
@@ -1666,6 +1826,37 @@ mod tests {
         let (command, _) = request(&profile, &remote_host, Some(("top".into(), vec!["-b".into()])), None, &[]);
         assert_eq!((command.command.as_deref(), command.args.as_slice()), (Some("top"), ["-b".to_string()].as_slice()));
         assert_eq!(command.policy, Policy::Kill);
+    }
+
+    /// A request for this machine names the directory it is to start in
+    /// without looking at it. What the thread that starts the session then
+    /// finds decides whether it is sent: a directory that isn't there is
+    /// left out, and nothing else of the request changes.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_local_requests_directory_is_named_unchecked_and_sent_only_if_it_is_there() {
+        use std::path::PathBuf;
+
+        let profile =
+            Profile { name: "sh".into(), command: Some("sh".into()), cwd: Some("/srv/logs".into()), ..Default::default() };
+        let request = |cwd: Option<&str>| {
+            let home = Some(PathBuf::from("/home/me"));
+            spawn_request(&profile, &Host::Local, None, cwd.map(PathBuf::from), &Config::default(), home).0
+        };
+        // The asked directory, else the profile's: neither is looked at.
+        assert_eq!(request(Some("/gone/away")).cwd.as_deref(), Some("/gone/away"));
+        assert_eq!(request(None).cwd.as_deref(), Some("/srv/logs"));
+
+        let there = with_checked_dir(request(Some("/gone/away")), true);
+        assert_eq!(there.cwd.as_deref(), Some("/gone/away"));
+        let gone = with_checked_dir(request(Some("/gone/away")), false);
+        assert_eq!(gone.cwd, None, "the profile's directory isn't tried in its place");
+        assert_eq!((gone.command, gone.args, gone.profile), (there.command, there.args, there.profile));
+        // A request with no directory stays one.
+        let none = Profile { cwd: None, ..profile.clone() };
+        let (bare, _) = spawn_request(&none, &Host::Local, None, None, &Config::default(), None);
+        assert_eq!(bare.cwd, None);
+        assert_eq!(with_checked_dir(bare, false).cwd, None);
     }
 
     /// What reaches the event task through a listener: its waiting merged

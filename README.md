@@ -594,6 +594,21 @@ enclosing brackets aren't part of a link, and a URL that wraps onto the next
 row is still one link. Ctrl-drag no longer block-selects when it starts on a
 link; alt-drag still does.
 
+A link is whatever a program printed, so Brindle opens only what it would
+detect itself:
+
+- **Schemes:** `http`, `https`, `ftp`, `file`, `ssh`, `git`, `gemini`,
+  `gopher`, `ipfs`, `ipns`, `mailto`, `news` and `magnet`, in any case. An OSC 8
+  hyperlink with another scheme (`vscode:`, `ms-settings:`, a Windows path
+  such as `C:\tool.exe`) is underlined but not opened.
+- **`file:` links:** only when the host is empty, `localhost` or this
+  machine's name. On Windows a file is shown selected in Explorer instead of
+  opened, so a click never runs a program; a directory opens in Explorer.
+  Only a path on a drive letter (`file:///C:/…`) is taken there.
+- **Quotes and spaces** in a link are percent-encoded before it is opened.
+
+When a link isn't opened, or the opener fails, the tab says why in a dim line.
+
 To open links with something other than `xdg-open`, set
 `BRINDLE_LINK_OPENER` to a program; it gets the link as its only argument.
 "Copy Link Under Mouse" (`copy_link`) in the command palette copies the link
@@ -678,7 +693,9 @@ reports the current directory (OSC 7). On Windows, where Brindle can't read
 another program's directory, that report is what a new tab and a restored tab
 start in; without it they start in your home directory. Tools that report the
 directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
-the like, when configured to) work the same way.
+the like, when configured to) work the same way. Only a directory on a drive
+letter counts: a report of a network path (`\\server\share`) or a device path
+is ignored, so map a drive to have new tabs follow you there.
 
 The same scripts are in [`shell-integration/`](shell-integration/) if you'd rather
 `source` a file. Brindle never edits your startup files or injects the scripts

@@ -9,9 +9,12 @@
 //! (`run-elevated` for an elevated process, so the two never share a server).
 //! The directory holds lock files and logs; the core and the holders listen
 //! on named pipes whose names come from the directory and the user's SID, and
-//! the helper runs from a per-build copy. The Windows functions here only
-//! compute names and paths from their arguments, so they are tested on every
-//! platform. So are the rules the platforms' seams apply to what they read:
+//! the helper runs from a per-build copy, an elevated process's from copies
+//! of its own ([`helper_copies`]). A directory an elevated process doesn't
+//! trust is set aside under a name of its own ([`untrusted_name`]). The
+//! Windows functions here only compute names and paths from their
+//! arguments, so they are tested on every platform. So are the rules the
+//! platforms' seams apply to what they read:
 //! which names are pipe names ([`check_pipe_name`]), which files show a
 //! Linux holder ([`holder_socket_stem`]), and which helper copy is current,
 //! how a lost race to place one ends and which builds a prune removes
@@ -176,12 +179,69 @@ pub fn check_pipe_name(name: &str) -> Result<(), BadPipeName> {
 }
 
 /// Where the per-build helper copies live: `<server_dir>\bin` when
-/// `BRINDLE_SERVER_DIR` was given, else `<local_app_data>\brindle\server`.
-pub fn helper_copies(server_dir: Option<&Path>, local_app_data: &Path) -> PathBuf {
+/// `BRINDLE_SERVER_DIR` was given, elevated or not, as that directory is
+/// used as given ([`choose_windows`]); else under `<local_app_data>\brindle`,
+/// in `server`, or in `server-elevated` for an elevated process, so the
+/// copies an elevated server runs are never the ones an unelevated process
+/// wrote.
+pub fn helper_copies(server_dir: Option<&Path>, local_app_data: &Path, elevated: bool) -> PathBuf {
     match server_dir {
         Some(dir) => dir.join("bin"),
-        None => local_app_data.join("brindle").join("server"),
+        None => local_app_data
+            .join("brindle")
+            .join(if elevated { "server-elevated" } else { "server" }),
     }
+}
+
+/// The name a directory an elevated process doesn't trust is set aside
+/// under, beside where it was: `<name>.untrusted-<pid>-<n>`, by process
+/// `pid`'s `n`th, so no two set aside share one. A fresh directory then
+/// takes the name.
+pub fn untrusted_name(name: &str, pid: u32, n: u64) -> String {
+    format!("{name}{UNTRUSTED}{pid}-{n}")
+}
+
+/// What follows a directory's own name in the name it is set aside under
+/// ([`untrusted_name`]).
+const UNTRUSTED: &str = ".untrusted-";
+
+/// Whether `name` is one [`untrusted_name`] gave: a directory set aside,
+/// which a later start may remove.
+pub fn is_untrusted_name(name: &str) -> bool {
+    let Some((original, suffix)) = name.rsplit_once(UNTRUSTED) else {
+        return false;
+    };
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    !original.is_empty()
+        && suffix
+            .split_once('-')
+            .is_some_and(|(pid, n)| number(pid) && number(n))
+}
+
+/// Whether a held directory is where it was asked for: `expected` is the
+/// path it was opened by, with its short (8.3) names made long, and
+/// `final_path` what the system says the handle is
+/// (`GetFinalPathNameByHandleW`). They differ when a directory above it is
+/// a link: the handle is then on the link's target, which whoever made the
+/// link may point elsewhere once the check is done.
+///
+/// The final path's `\\?\` (or `\\?\UNC\` for a share) prefix is dropped,
+/// as are trailing separators, `/` counts as `\`, and case doesn't matter,
+/// as in Windows names.
+pub fn same_final_path(expected: &str, final_path: &str) -> bool {
+    fn plain(path: &str) -> String {
+        let path = path.replace('/', "\\");
+        let path = if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{share}")
+        } else if let Some(local) = path.strip_prefix(r"\\?\") {
+            local.to_string()
+        } else {
+            path
+        };
+        path.trim_end_matches('\\').to_lowercase()
+    }
+    let (expected, found) = (plain(expected), plain(final_path));
+    !expected.is_empty() && expected == found
 }
 
 /// The copy of the helper for one build, in `copies` (see [`helper_copies`]).
@@ -404,16 +464,119 @@ mod tests {
     fn helper_copies_live_beside_the_server_or_under_local_app_data() {
         let local = Path::new("local");
         let dir = Path::new("srv");
-        assert_eq!(helper_copies(Some(dir), local), dir.join("bin"));
+        // Without `BRINDLE_SERVER_DIR`: an elevated process has its own.
         assert_eq!(
-            helper_copies(None, local),
+            helper_copies(None, local, false),
             local.join("brindle").join("server")
         );
-        let copies = helper_copies(Some(dir), local);
+        assert_eq!(
+            helper_copies(None, local, true),
+            local.join("brindle").join("server-elevated")
+        );
+        // With it, the directory is used as given, elevated or not.
+        assert_eq!(helper_copies(Some(dir), local, false), dir.join("bin"));
+        assert_eq!(helper_copies(Some(dir), local, true), dir.join("bin"));
+        let copies = helper_copies(Some(dir), local, false);
         assert_eq!(
             helper_copy(&copies, "b1"),
             dir.join("bin").join("b1").join("brindle-remote.exe")
         );
+        assert_eq!(
+            helper_copy(&helper_copies(None, local, true), "b1"),
+            local
+                .join("brindle")
+                .join("server-elevated")
+                .join("b1")
+                .join("brindle-remote.exe")
+        );
+    }
+
+    /// An elevated process's directories are beside the unelevated ones,
+    /// never the same: its server directory and its helper copies.
+    #[test]
+    fn an_elevated_process_shares_no_directory_with_an_unelevated_one() {
+        let base = || os(r"C:\Users\u\AppData\Local");
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        assert_ne!(
+            choose_windows(None, base(), true).unwrap(),
+            choose_windows(None, base(), false).unwrap()
+        );
+        assert_ne!(
+            helper_copies(None, &local, true),
+            helper_copies(None, &local, false)
+        );
+    }
+
+    #[test]
+    fn a_directory_is_set_aside_under_its_name_a_pid_and_a_count() {
+        assert_eq!(
+            untrusted_name("server-elevated", 4242, 0),
+            "server-elevated.untrusted-4242-0"
+        );
+        assert_eq!(untrusted_name("1.25.0", 7, 12), "1.25.0.untrusted-7-12");
+        assert_ne!(untrusted_name("bin", 7, 1), untrusted_name("bin", 8, 1));
+        assert_ne!(untrusted_name("bin", 7, 1), untrusted_name("bin", 7, 2));
+        // One set aside again keeps both marks, and is still one.
+        let twice = untrusted_name(&untrusted_name("bin", 7, 1), 9, 0);
+        assert_eq!(twice, "bin.untrusted-7-1.untrusted-9-0");
+        assert!(is_untrusted_name(&twice));
+    }
+
+    #[test]
+    fn a_held_directory_is_where_it_was_asked_for_only_by_its_final_path() {
+        let asked = r"C:\Users\Me\AppData\Local\brindle\server-elevated";
+        for found in [
+            r"\\?\C:\Users\Me\AppData\Local\brindle\server-elevated",
+            r"\\?\c:\users\me\appdata\local\BRINDLE\server-elevated",
+            r"C:\Users\Me\AppData\Local\brindle\server-elevated\",
+            r"\\?\C:/Users/Me/AppData/Local/brindle/server-elevated",
+        ] {
+            assert!(same_final_path(asked, found), "{found}");
+        }
+        assert!(same_final_path(
+            r"\\server\share\brindle",
+            r"\\?\UNC\server\share\brindle"
+        ));
+        // A link above it: the handle is on wherever it points.
+        for found in [
+            r"\\?\C:\Users\Me\elsewhere\server-elevated",
+            r"\\?\D:\Users\Me\AppData\Local\brindle\server-elevated",
+            r"\\?\C:\Users\Me\AppData\Local\brindle\server-elevated\inner",
+            r"\\?\UNC\C:\Users\Me\AppData\Local\brindle\server-elevated",
+            "",
+        ] {
+            assert!(!same_final_path(asked, found), "{found:?}");
+        }
+        assert!(!same_final_path("", ""));
+    }
+
+    #[test]
+    fn only_a_set_aside_name_is_one() {
+        for name in [
+            "server-elevated.untrusted-4242-0",
+            "bin.untrusted-1-18446744073709551615",
+            "1.25.0.untrusted-7-12",
+            "a.b.untrusted-0-0",
+        ] {
+            assert!(is_untrusted_name(name), "{name}");
+        }
+        for name in [
+            "server-elevated",
+            "server",
+            ".untrusted-1-2",
+            "bin.untrusted-",
+            "bin.untrusted-1",
+            "bin.untrusted-1-",
+            "bin.untrusted--2",
+            "bin.untrusted-x-2",
+            "bin.untrusted-1-2x",
+            "bin.untrusted-1-2-3",
+            "bin.UNTRUSTED-1-2",
+            "bin.untrusted-1-2.tmp",
+            "",
+        ] {
+            assert!(!is_untrusted_name(name), "{name:?}");
+        }
     }
 
     #[test]

@@ -107,6 +107,7 @@ fn unix() -> Vec<Case> {
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
         display("links-opener-fails", links::opener_fails),
+        display("links-refused", links::refused),
         display("launch-unknown-profile", launch::unknown_profile),
         display("profile-shortcut-missing", launch::shortcut_missing),
         display("restore-local-tabs", restore::local_tabs),
