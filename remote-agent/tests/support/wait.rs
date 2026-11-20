@@ -157,10 +157,18 @@ pub enum Capability {
     /// A helper build that honours a fault switch (a debug build): ask it
     /// with `--list-fault-switches` ([`skip_without_switch`]).
     FaultSwitches,
+    /// An elevated test process (Windows), for what only an elevated
+    /// process makes: the protected directories of an elevated server.
+    Elevated,
 }
 
 impl Capability {
-    const ALL: [Capability; 3] = [Capability::Scopes, Capability::PackagedConpty, Capability::FaultSwitches];
+    const ALL: [Capability; 4] = [
+        Capability::Scopes,
+        Capability::PackagedConpty,
+        Capability::FaultSwitches,
+        Capability::Elevated,
+    ];
 
     /// Its name in [`REQUIRE_VAR`] and in `skipped.log`.
     pub fn name(self) -> &'static str {
@@ -168,6 +176,7 @@ impl Capability {
             Capability::Scopes => "scopes",
             Capability::PackagedConpty => "packaged-conpty",
             Capability::FaultSwitches => "fault-switches",
+            Capability::Elevated => "elevated",
         }
     }
 }
@@ -284,6 +293,7 @@ mod tests {
             parse_required(Some("scopes, packaged-conpty,fault-switches")),
             Ok(vec![Capability::Scopes, Capability::PackagedConpty, Capability::FaultSwitches])
         );
+        assert_eq!(parse_required(Some("elevated")), Ok(vec![Capability::Elevated]));
         let error = parse_required(Some("scopes,nope")).unwrap_err();
         assert!(error.contains("\"nope\"") && error.contains("fault-switches"), "{error}");
     }

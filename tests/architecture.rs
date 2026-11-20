@@ -1236,7 +1236,7 @@ const SEAMS: &[&str] = &[
 /// `ports R4`'s exception: the production files that still have platform
 /// `cfg`s outside a seam, listed again in `docs/architecture/README.md`'s
 /// `ports R4` row. It only shrinks, and ends with `port-to-macos`.
-const R4_EXCEPTION: [&str; 16] = [
+const R4_EXCEPTION: [&str; 15] = [
     "src/instance.rs",
     "src/main.rs",
     "src/notify/mod.rs",
@@ -1250,7 +1250,6 @@ const R4_EXCEPTION: [&str; 16] = [
     "src/zone_view.rs",
     "remote-agent/src/main.rs",
     "remote-agent/src/server/cli.rs",
-    "remote-agent/src/server/core.rs",
     "remote-agent/src/server/core/sessions.rs",
     "remote-agent/src/server/daemon.rs",
 ];
@@ -1972,7 +1971,7 @@ fn platform_cfgs_stay_in_their_seams() {
     let sites = production_platform_cfgs();
     for walked in [
         "src/main.rs",
-        "remote-agent/src/server/core.rs",
+        "remote-agent/src/server/core/sessions.rs",
         "term-core/src/lib.rs",
         "build.rs",
     ] {

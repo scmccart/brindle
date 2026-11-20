@@ -1,17 +1,25 @@
 //! The server directory on Windows: `%BRINDLE_SERVER_DIR%`, else
 //! `%LOCALAPPDATA%\brindle\run` (`run-elevated` for an elevated process),
-//! created with a protected DACL for the user and SYSTEM. It holds locks and
-//! logs; the pipes are named from it and protected on their own.
+//! created with a protected DACL for the user and SYSTEM, or for an
+//! elevated process's `run-elevated` for Administrators and SYSTEM only,
+//! held open while the role runs. It holds locks and logs; the pipes are
+//! named from it and protected on their own.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Shared with Brindle's client, so both find the same directory.
-use brindle_remote_protocol::server_dir::resolve_windows;
-use brindle_remote_protocol::win;
+use brindle_remote_protocol::server_dir::{self, resolve_windows};
+use brindle_remote_protocol::win::{self, Contents, ProtectedDir};
 
-use super::super::ensure_dir::{self, AfterCreate, First, Found, Protect};
+use super::super::ensure_dir::{self, AfterCreate, First, Found, Protect, Protection};
+
+/// What a role keeps of its server directory while it runs: the elevated
+/// directory, held so it stays the one that was checked; nothing for any
+/// other.
+#[derive(Debug)]
+pub struct Held(#[allow(dead_code, reason = "held for its handles")] Option<ProtectedDir>);
 
 /// Where the server directory for this process's environment is, without
 /// creating it.
@@ -23,17 +31,109 @@ pub fn resolve_from_env() -> io::Result<PathBuf> {
     )
 }
 
-/// The directory used when `BRINDLE_SERVER_DIR` isn't set.
-fn default_dir() -> Option<PathBuf> {
-    resolve_windows(None, std::env::var_os("LOCALAPPDATA"), win::is_elevated().ok()?).ok()
+/// The directory used when `BRINDLE_SERVER_DIR` isn't set, for a process
+/// that is `elevated` or not.
+fn default_dir(elevated: bool) -> Option<PathBuf> {
+    resolve_windows(None, std::env::var_os("LOCALAPPDATA"), elevated).ok()
+}
+
+/// What a core's start did beside its server directory, and what it holds
+/// there for its life.
+#[derive(Debug)]
+pub struct Pruned {
+    /// An elevated core's copies' directory (`server-elevated`).
+    _held: Held,
+    /// Lines for the core's log.
+    pub notes: Vec<String>,
+}
+
+/// Removes the per-build helper copies of other builds, where nothing runs
+/// from them any more (Windows runs every role from a copy, since a running
+/// image can't be replaced); a copy still in use stays for a later core,
+/// and a note says why.
+///
+/// An elevated core's copies are in `server-elevated`, which Brindle made
+/// protected before it started the core there: it is checked, not changed,
+/// and held, and nothing is pruned in it unless it is the protected
+/// directory. An elevated core also removes what was set aside for not
+/// being protected, beside it and among the ConPTY extractions, leaving a
+/// link alone.
+pub fn prune_copies(build: &str) -> Pruned {
+    let mut notes = Vec::new();
+    let given = std::env::var_os("BRINDLE_SERVER_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let none = |notes| Pruned {
+        _held: Held(None),
+        notes,
+    };
+    let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()) else {
+        return none(notes);
+    };
+    let elevated = match win::is_elevated() {
+        Ok(elevated) => elevated,
+        Err(error) => {
+            notes.push(format!("not pruning the helper copies: can't tell whether this process is elevated: {error}"));
+            return none(notes);
+        }
+    };
+    let local = PathBuf::from(local);
+    let copies = server_dir::helper_copies(given.as_deref(), &local, elevated);
+    let mut held = None;
+    if elevated && given.is_none() {
+        let brindle = local.join("brindle");
+        for dir in [brindle.clone(), brindle.join("conpty-elevated")] {
+            let removed = win::remove_untrusted(&dir);
+            if removed.removed > 0 {
+                notes.push(format!("removed {} directories set aside in {}", removed.removed, dir.display()));
+            }
+            for (path, why) in removed.kept {
+                notes.push(format!("kept {}: {why}", path.display()));
+            }
+        }
+        match win::hold_protected_dir(&copies) {
+            Ok(Some(dir)) => held = Some(dir),
+            Ok(None) => return none(notes),
+            Err(error) => {
+                notes.push(format!("not pruning the helper copies: {error}"));
+                return none(notes);
+            }
+        }
+    }
+    let pruned = win::prune_helper_copies(&copies, build);
+    if pruned.removed > 0 {
+        notes.push(format!("removed {} other build(s)' helper copies", pruned.removed));
+    }
+    for (path, why) in &pruned.kept {
+        notes.push(format!("kept the helper copy {}: {why}", path.display()));
+    }
+    Pruned {
+        _held: Held(held),
+        notes,
+    }
 }
 
 /// Creates `dir` (and missing parents) for this user and SYSTEM only. An
 /// existing directory is used as it is, except the default one, whose DACL
 /// is set again: a directory someone named with `BRINDLE_SERVER_DIR` is
-/// theirs to protect.
-pub fn ensure(dir: &Path) -> io::Result<()> {
-    ensure_with(dir, default_dir().as_deref() == Some(dir))
+/// theirs to protect. An elevated process's default directory is made or
+/// checked for Administrators and SYSTEM only and held
+/// ([`ensure_dir::protection`]).
+pub fn ensure(dir: &Path) -> io::Result<Held> {
+    let elevated = win::is_elevated()?;
+    match ensure_dir::protection(default_dir(elevated).as_deref() == Some(dir), elevated) {
+        Protection::Elevated => win::protected_dir(dir, Contents::State)
+            .map(|held| Held(Some(held)))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("can't use the elevated server directory {}: {error}", dir.display()),
+                )
+            }),
+        Protection::Private(protect) => {
+            ensure_with(dir, protect == Protect::Existing).map(|()| Held(None))
+        }
+    }
 }
 
 /// [`ensure`], re-protecting an existing `dir` when `protect_existing`.
@@ -167,7 +267,7 @@ mod tests {
         let dir = resolve_from_env().unwrap();
         assert!(dir.is_absolute());
         if std::env::var_os("BRINDLE_SERVER_DIR").is_none_or(|value| value.is_empty()) {
-            assert_eq!(Some(dir), default_dir());
+            assert_eq!(Some(dir), default_dir(win::is_elevated().unwrap()));
         }
     }
 }

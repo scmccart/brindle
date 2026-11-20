@@ -218,6 +218,32 @@ pub fn is_untrusted_name(name: &str) -> bool {
             .is_some_and(|(pid, n)| number(pid) && number(n))
 }
 
+/// Whether a held directory is where it was asked for: `expected` is the
+/// path it was opened by, with its short (8.3) names made long, and
+/// `final_path` what the system says the handle is
+/// (`GetFinalPathNameByHandleW`). They differ when a directory above it is
+/// a link: the handle is then on the link's target, which whoever made the
+/// link may point elsewhere once the check is done.
+///
+/// The final path's `\\?\` (or `\\?\UNC\` for a share) prefix is dropped,
+/// as are trailing separators, `/` counts as `\`, and case doesn't matter,
+/// as in Windows names.
+pub fn same_final_path(expected: &str, final_path: &str) -> bool {
+    fn plain(path: &str) -> String {
+        let path = path.replace('/', "\\");
+        let path = if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{share}")
+        } else if let Some(local) = path.strip_prefix(r"\\?\") {
+            local.to_string()
+        } else {
+            path
+        };
+        path.trim_end_matches('\\').to_lowercase()
+    }
+    let (expected, found) = (plain(expected), plain(final_path));
+    !expected.is_empty() && expected == found
+}
+
 /// The copy of the helper for one build, in `copies` (see [`helper_copies`]).
 pub fn helper_copy(copies: &Path, build: &str) -> PathBuf {
     copies.join(build).join("brindle-remote.exe")
@@ -494,6 +520,34 @@ mod tests {
         let twice = untrusted_name(&untrusted_name("bin", 7, 1), 9, 0);
         assert_eq!(twice, "bin.untrusted-7-1.untrusted-9-0");
         assert!(is_untrusted_name(&twice));
+    }
+
+    #[test]
+    fn a_held_directory_is_where_it_was_asked_for_only_by_its_final_path() {
+        let asked = r"C:\Users\Me\AppData\Local\brindle\server-elevated";
+        for found in [
+            r"\\?\C:\Users\Me\AppData\Local\brindle\server-elevated",
+            r"\\?\c:\users\me\appdata\local\BRINDLE\server-elevated",
+            r"C:\Users\Me\AppData\Local\brindle\server-elevated\",
+            r"\\?\C:/Users/Me/AppData/Local/brindle/server-elevated",
+        ] {
+            assert!(same_final_path(asked, found), "{found}");
+        }
+        assert!(same_final_path(
+            r"\\server\share\brindle",
+            r"\\?\UNC\server\share\brindle"
+        ));
+        // A link above it: the handle is on wherever it points.
+        for found in [
+            r"\\?\C:\Users\Me\elsewhere\server-elevated",
+            r"\\?\D:\Users\Me\AppData\Local\brindle\server-elevated",
+            r"\\?\C:\Users\Me\AppData\Local\brindle\server-elevated\inner",
+            r"\\?\UNC\C:\Users\Me\AppData\Local\brindle\server-elevated",
+            "",
+        ] {
+            assert!(!same_final_path(asked, found), "{found:?}");
+        }
+        assert!(!same_final_path("", ""));
     }
 
     #[test]

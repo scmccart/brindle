@@ -50,7 +50,9 @@
 //!   socket is removed first.
 //! - **Windows:** a client's `REPARENT` goes to its session's holder, and
 //!   at its start the core removes the helper copies of other builds that
-//!   nothing runs from any more ([`prune_copies`]).
+//!   nothing runs from any more, and an elevated core what was set aside
+//!   for not being protected (`dir::prune_copies`), holding its own copies'
+//!   directory for its life.
 
 mod clients;
 mod holders;
@@ -123,8 +125,11 @@ pub(crate) use log;
 /// Windows). Without it the core stays in the foreground and logs to stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
     let ready = daemon::ready_from_args("serve", args)?;
-    let dir =
+    // Held until the core exits: an elevated core's directory stays the one
+    // it checked.
+    let server_dir =
         dir::from_env().map_err(|error| format!("can't set up the server directory: {error}"))?;
+    let dir = server_dir.path().to_path_buf();
     let paths = Paths::new(&dir)
         .map_err(|error| format!("can't name the core's endpoint in {}: {error}", dir.display()))?;
     let claimed = claim(&paths)
@@ -148,7 +153,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("can't detach from the starter: {error}"))?;
     }
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
-    prune_copies(&build);
+    // Held until the core exits, as its server directory is.
+    let pruned = dir::prune_copies(&build);
+    for note in &pruned.notes {
+        log!("{note}");
+    }
     let ev = Loop::new().map_err(|error| format!("can't create the event loop: {error}"))?;
     let core = Core::new(ev, dir, paths, lock, build, Identity::own()).map_err(|error| {
         log!("can't start: {error}");
@@ -187,37 +196,6 @@ impl Paths {
         })
     }
 }
-
-/// Removes the per-build helper copies of other builds, where nothing runs
-/// from them any more (Windows runs every role from a copy, since a running
-/// image can't be replaced). A copy still in use stays for a later core,
-/// and the log says why.
-#[cfg(windows)]
-fn prune_copies(build: &str) {
-    use brindle_remote_protocol::{server_dir, win};
-
-    let server_dir = std::env::var_os("BRINDLE_SERVER_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from);
-    let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()) else {
-        return;
-    };
-    // The unelevated copies' directory, whoever runs this: an elevated
-    // core's own (`server-elevated`) comes with its protected directories
-    // (fix-security-audit-2026-11-20, tasks 2.3 and 2.4).
-    let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local), false);
-    let pruned = win::prune_helper_copies(&copies, build);
-    if pruned.removed > 0 {
-        log!("removed {} other build(s)' helper copies", pruned.removed);
-    }
-    for (path, why) in &pruned.kept {
-        log!("kept the helper copy {}: {why}", path.display());
-    }
-}
-
-/// Only Windows runs its roles from per-build copies.
-#[cfg(not(windows))]
-fn prune_copies(_build: &str) {}
 
 enum Claim {
     /// This process holds `core.lock` and becomes the core.

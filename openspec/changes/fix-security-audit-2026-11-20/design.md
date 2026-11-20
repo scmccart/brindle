@@ -46,11 +46,23 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
   - It applies the security descriptor `O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)` (from a pure builder in `access.rs`, beside `dir_sddl`). Owner Administrators, no ACE for the user's SID, and a High no-write-up label, so a Medium process of the same user can neither write nor read in it.
   - It opens the directory with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT` and no `FILE_SHARE_DELETE`, and refuses a reparse point.
   - It compares the directory's owner, DACL and label with the descriptor, through a pure `access::matches_elevated`.
+  - It holds the parent too, opened following links, and checks both with `GetFinalPathNameByHandleW` (against the expected path with its 8.3 names made long) before anything is made, renamed or protected: a parent that is, or sits under, a link is refused, never written through.
+  - What to do with what it finds is the pure `access::protected_step`.
 - **A directory that doesn't match.** What happens depends on its `Contents`:
   - `Contents::Executables` (the copies and the ConPTY files): the directory is renamed aside (`<name>.untrusted-<pid>-<n>`) and made fresh, since nothing in it can be trusted.
   - `Contents::State` (`run-elevated`: locks and logs, nothing that is run): it is re-protected in place, and any reparse point inside it is deleted. Renaming it would orphan the sessions of an elevated core started by an older build.
+    - The directory itself is protected first (`SetKernelObjectSecurity` on a handle, which propagates nothing: the DACL through the owner's own right, then the owner and label), and checked, so no one else can add a link inside while it is cleaned.
+    - What is inside is then taken flat: a link is deleted without being followed, a subdirectory is deleted too (a server directory never holds one, and one could hide links), and each file is given the descriptor without inheritance flags (`access::contained_file_sddl`). Files an older core holds open are protected too, since changing a descriptor takes no data access.
+  - If the path itself is a junction, a symbolic link or a file, whatever its `Contents`, it is renamed aside without being followed, and a fresh directory is made.
+  - A directory this process just made that doesn't read back as made is a failure, not another round.
 - **Holding the directory.** The handle is held while the process uses the directory: for a role, its whole life; for Brindle's client, while it ensures and launches a copy. Windows refuses to rename or delete a directory while a handle to it, or to anything under it, is open without delete sharing. So once the check passes, neither the directory nor its parents can be swapped before use, which closes the check-then-run gap at `win.rs:475/482`, `daemon.rs:260` and `conpty/api.rs:117`.
 - **The prune.** `prune_helper_copies` walks the held directory's children and skips any reparse point, never descending into one.
+- **Who holds what.**
+  - The core and holder hold `run-elevated` through the server directory seam (`dir::ensure`, whose `Held` lives for the role).
+  - Brindle's client makes `server-elevated` and holds it while it copies and launches.
+  - The elevated core checks it without changing it (`win::hold_protected_dir`) and holds it for its life, pruning only once it reads as protected.
+  - The elevated holder makes and holds `conpty-elevated\<version>` the first time it loads the packaged ConPTY.
+  - A directory named by `BRINDLE_SERVER_DIR` stays the namer's to protect, elevated or not, as today.
 - **Unelevated processes** keep today's directories and DACLs. The same user owns them, so there is no boundary to protect.
 - **Alternatives considered:**
   - `%ProgramData%`. Rejected: users can create subdirectories there, so it has the same squatting problem plus a machine-wide name.
@@ -102,6 +114,9 @@ How it fits into the rest of the code:
 
 - **Held directory handles might not lock renames everywhere.** The "can't rename a directory under an open handle" rule is NTFS behaviour; other file systems may not enforce it.
   - Mitigation: after opening, `protected_dir` also compares `GetFinalPathNameByHandleW` with the expected path. A Windows real-process test in `remote-agent/tests/launch.rs` tries to rename the held directory and its parent from an unelevated token, and expects a failure. Where elevation isn't available, the test skips through `skip(Capability, …)`.
+- **A link above an elevated directory stops elevated local tabs.** If `%LOCALAPPDATA%\brindle`, or a directory above it, is a junction or a symbolic link, the elevated directories are refused rather than used through it ("… resolves to …, refusing it"). Elevated local tabs then fail with that message until the link is removed. This also catches setups that aren't hostile: a profile or `%LOCALAPPDATA%` redirected through a junction, or a `subst` drive.
+  - Mitigation: the failure is the tab's message, naming both paths. Unelevated tabs are unaffected.
+- **Files planted in an old `run-elevated` keep their contents.** Re-protecting gives each file the protected owner and DACL, but what an unelevated process wrote into a lock or log stays. The core and holder only lock, append and read their own files, so they never run or load it.
 - **Directories renamed aside pile up** in `%LOCALAPPDATA%\brindle` until removed.
   - Mitigation: the core's start removes `*.untrusted-*` siblings it can delete, skipping reparse points, as `prune_copies` does.
 - **Users lose links.** Ctrl-click no longer opens a scheme outside the detected list, such as `vscode://`, and Windows `file:` links reveal instead of run.

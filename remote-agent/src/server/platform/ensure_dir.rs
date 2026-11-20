@@ -26,6 +26,30 @@ pub enum Protect {
     AsFound,
 }
 
+/// How the server directory is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    /// The elevated default directory (`run-elevated`): for Administrators
+    /// and SYSTEM only, with a high label, held for the role's life
+    /// (`win::protected_dir`), since an unelevated process of the same
+    /// user could otherwise write in it.
+    Elevated,
+    /// For this user and SYSTEM, as [`first`] says.
+    Private(Protect),
+}
+
+/// How the server directory is protected: the default directory by this
+/// process, an elevated one as [`Protection::Elevated`]; a directory
+/// someone named with `BRINDLE_SERVER_DIR` is theirs to protect, elevated
+/// or not.
+pub fn protection(is_default: bool, elevated: bool) -> Protection {
+    match (is_default, elevated) {
+        (true, true) => Protection::Elevated,
+        (true, false) => Protection::Private(Protect::Existing),
+        (false, _) => Protection::Private(Protect::AsFound),
+    }
+}
+
 /// What the first look at the path leads to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum First {
@@ -69,6 +93,15 @@ pub fn after_create(found: Found) -> AfterCreate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_elevated_default_directory_is_the_elevated_one() {
+        assert_eq!(protection(true, true), Protection::Elevated);
+        assert_eq!(protection(true, false), Protection::Private(Protect::Existing));
+        for elevated in [false, true] {
+            assert_eq!(protection(false, elevated), Protection::Private(Protect::AsFound));
+        }
+    }
 
     #[test]
     fn an_existing_directory_is_used_or_protected_as_asked() {

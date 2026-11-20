@@ -127,9 +127,11 @@ macro_rules! log {
 /// stderr.
 pub fn run(args: &[String]) -> Result<(), String> {
     let ready = daemon::ready_from_args("hold", args)?;
-    let dir = dir::from_env().map_err(|error| error.to_string())?;
+    // Held until the holder exits: an elevated holder's directory stays the
+    // one it checked.
+    let server_dir = dir::from_env().map_err(|error| error.to_string())?;
     let build = build_id::current().map_err(|error| format!("can't read the build id: {error}"))?;
-    let slot = Slot::claim(&dir, &build).map_err(|error| error.to_string())?;
+    let slot = Slot::claim(server_dir.path(), &build).map_err(|error| error.to_string())?;
     if ready.is_some() {
         let log = daemon::open_log(&slot.log_path)
             .map_err(|error| format!("can't open {}: {error}", slot.log_path.display()))?;

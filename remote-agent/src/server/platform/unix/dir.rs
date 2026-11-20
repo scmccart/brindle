@@ -25,10 +25,33 @@ pub(super) fn own_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// What a role keeps of its server directory while it runs: nothing here,
+/// where the directory's mode and owner protect it (Windows holds an
+/// elevated process's open).
+#[derive(Debug)]
+pub struct Held;
+
+/// What a core's start did beside its server directory, and what it holds
+/// there for its life.
+#[derive(Debug)]
+pub struct Pruned {
+    _held: Held,
+    /// Lines for the core's log.
+    pub notes: Vec<String>,
+}
+
+/// Nothing to do: only Windows runs its roles from per-build copies.
+pub fn prune_copies(_build: &str) -> Pruned {
+    Pruned {
+        _held: Held,
+        notes: Vec::new(),
+    }
+}
+
 /// Creates `dir` (and missing parents) for this user only, or checks that
 /// the existing one is.
-pub fn ensure(dir: &Path) -> io::Result<()> {
-    ensure_for(dir, own_uid())
+pub fn ensure(dir: &Path) -> io::Result<Held> {
+    ensure_for(dir, own_uid()).map(|()| Held)
 }
 
 /// Creates `dir` (and missing parents) with mode 0700, or checks that the

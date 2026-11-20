@@ -259,6 +259,17 @@ pub struct DirSecurity {
 /// and may hold what an unelevated process put there: an entry for another
 /// SID, another owner, a lower label or none, a narrower inheritance.
 pub fn matches_elevated(found: &DirSecurity) -> bool {
+    matches_owned(found, ADMINISTRATORS_SID, Integrity::HIGH)
+}
+
+/// Whether `found` is exactly the descriptor [`elevated_dir_sddl`]'s form
+/// gives with `owner` in Administrators' place and a `level` label: owned
+/// by `owner`; a protected DACL of two entries, `owner` and SYSTEM, each
+/// with full access and inherited by everything inside; and a no-write-up
+/// label at `level`, inherited likewise. [`matches_elevated`] is its
+/// Administrators and high case; the seam's tests use their own user's at
+/// medium, which an unelevated process can make.
+pub fn matches_owned(found: &DirSecurity, owner: &str, level: Integrity) -> bool {
     let allows_fully = |sid: &str| {
         found
             .dacl
@@ -267,15 +278,93 @@ pub fn matches_elevated(found: &DirSecurity) -> bool {
             .any(|ace| ace.sid == sid && ace.mask == FILE_ALL_ACCESS && ace.flags == INHERITED_BY_ALL)
     };
     let label = Label {
-        integrity: Integrity::HIGH,
+        integrity: level,
         mask: NO_WRITE_UP,
         flags: INHERITED_BY_ALL,
     };
-    found.owner == ADMINISTRATORS_SID
-        && found.dacl.allows_only(&[ADMINISTRATORS_SID, SYSTEM_SID])
-        && allows_fully(ADMINISTRATORS_SID)
+    found.owner == owner
+        && found.dacl.allows_only(&[owner, SYSTEM_SID])
+        && allows_fully(owner)
         && allows_fully(SYSTEM_SID)
         && found.label == Some(label)
+}
+
+/// The descriptor a file kept in a directory made with `dir_sddl` is given
+/// when the directory is protected again in place: the same owner, entries
+/// and label, without the inheritance flags only a directory takes.
+pub fn contained_file_sddl(dir_sddl: &str) -> String {
+    dir_sddl.replace("OICI;", ";")
+}
+
+/// What a protected directory holds, which says what becomes of one found
+/// with another descriptor ([`protected_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contents {
+    /// Files that are run or loaded (the helper copies, the ConPTY files):
+    /// nothing in a directory someone else could write can be trusted, so
+    /// it is set aside and made fresh.
+    Executables,
+    /// Locks and logs, nothing that is run (`run-elevated`): it is
+    /// protected again where it is, since an older build's elevated core
+    /// may still have its sessions there.
+    State,
+}
+
+/// What is at a protected directory's path, as the seam found it through
+/// a handle that doesn't follow links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// Nothing.
+    Missing,
+    /// A junction, a symbolic link or another reparse point: the link
+    /// itself, never what it points to.
+    Link,
+    /// A file, not a directory.
+    NotDir,
+    /// A directory whose descriptor is the protected one.
+    Matches,
+    /// A directory with any other descriptor, or one that can't be read.
+    Other,
+}
+
+/// What [`protected_step`] says to do with what was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Hold it: it is the protected directory.
+    Use,
+    /// Make it with the protected descriptor.
+    Create,
+    /// Rename what is there aside ([`crate::server_dir::untrusted_name`]),
+    /// without following it, then make the directory fresh.
+    SetAside,
+    /// Put the protected descriptor on the directory where it is, after
+    /// deleting every link inside it.
+    Reprotect,
+    /// Give up: the directory this process just made doesn't read back as
+    /// made, so making it again wouldn't help.
+    Fail,
+}
+
+/// What to do with what was found at a protected directory's path.
+/// `created` says whether this process made what is there, in which case
+/// only the protected directory itself will do.
+///
+/// A link or a file is set aside whatever the contents: a link was never
+/// a directory an older build kept sessions in, and following one would
+/// put the files wherever it points. A directory with another descriptor
+/// is set aside when it holds what is run, and protected again in place
+/// when it holds state ([`Contents`]).
+pub fn protected_step(found: Found, contents: Contents, created: bool) -> Step {
+    match (found, created) {
+        (Found::Matches, _) => Step::Use,
+        (Found::Missing, false) => Step::Create,
+        (Found::Missing | Found::Link | Found::NotDir | Found::Other, true) => Step::Fail,
+        (Found::Link | Found::NotDir, false) => Step::SetAside,
+        (Found::Other, false) => match contents {
+            Contents::Executables => Step::SetAside,
+            Contents::State => Step::Reprotect,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -610,5 +699,66 @@ mod tests {
             label: None,
         };
         assert!(!matches_elevated(&found));
+        // With a medium label it is the user's own protected form, which
+        // the seam's unelevated tests make.
+        let labelled = DirSecurity {
+            label: Some(Label {
+                integrity: Integrity::MEDIUM,
+                ..HIGH_LABEL
+            }),
+            ..found
+        };
+        assert!(matches_owned(&labelled, user, Integrity::MEDIUM));
+        assert!(!matches_owned(&labelled, user, Integrity::HIGH));
+        assert!(!matches_owned(&labelled, SIDS[1], Integrity::MEDIUM));
+        assert!(!matches_elevated(&labelled));
+    }
+
+    #[test]
+    fn a_file_kept_inside_takes_the_directory_s_descriptor_without_inheritance() {
+        assert_eq!(
+            contained_file_sddl(elevated_dir_sddl()),
+            "O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)S:(ML;;NW;;;HI)"
+        );
+    }
+
+    #[test]
+    fn the_protected_directory_is_used_and_a_missing_one_made() {
+        for contents in [Contents::Executables, Contents::State] {
+            for created in [false, true] {
+                assert_eq!(protected_step(Found::Matches, contents, created), Step::Use);
+            }
+            assert_eq!(protected_step(Found::Missing, contents, false), Step::Create);
+        }
+    }
+
+    /// A link or a file in the directory's place is renamed aside, never
+    /// followed, whatever the directory holds.
+    #[test]
+    fn a_link_or_a_file_is_set_aside_whatever_the_contents() {
+        for contents in [Contents::Executables, Contents::State] {
+            for found in [Found::Link, Found::NotDir] {
+                assert_eq!(protected_step(found, contents, false), Step::SetAside, "{found:?}");
+            }
+        }
+    }
+
+    /// Another descriptor: what is run can't be trusted and is set aside,
+    /// while state an older build's sessions use is protected in place.
+    #[test]
+    fn a_directory_with_another_descriptor_is_set_aside_or_reprotected() {
+        assert_eq!(protected_step(Found::Other, Contents::Executables, false), Step::SetAside);
+        assert_eq!(protected_step(Found::Other, Contents::State, false), Step::Reprotect);
+    }
+
+    /// What this process just made must read back as made: anything else
+    /// is a failure, not another round of setting aside.
+    #[test]
+    fn a_directory_just_made_is_used_only_as_made() {
+        for contents in [Contents::Executables, Contents::State] {
+            for found in [Found::Missing, Found::Link, Found::NotDir, Found::Other] {
+                assert_eq!(protected_step(found, contents, true), Step::Fail, "{found:?}");
+            }
+        }
     }
 }
