@@ -462,6 +462,7 @@ writes its WinGet manifest.
 brindle [-p PROFILE] [-d DIR] [--no-restore] [-e COMMAND ARGS...]
 brindle --attach ID                 # Linux: a detached terminal server session
 brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish
+brindle --export-ui-tokens          # the built-in themes' UI tokens as CSS
 brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
 

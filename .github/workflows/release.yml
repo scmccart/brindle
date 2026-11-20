@@ -81,9 +81,9 @@ jobs:
         working-directory: dist
         run: |
           ls -l
-          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip brindle-ui-tokens.css > SHA256SUMS
           cat SHA256SUMS
       - name: Attach the assets
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/brindle-ui-tokens.css dist/SHA256SUMS --clobber
       - name: Publish
         run: gh release edit "$TAG" --draft=false

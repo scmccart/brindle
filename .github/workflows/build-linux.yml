@@ -54,8 +54,14 @@ jobs:
           retention-days: 14
       - name: Release archive
         run: scripts/package-linux.sh
+      # The built-in themes' UI tokens as CSS, for the website (released
+      # beside the archives).
+      - name: UI tokens
+        run: target/release/brindle --export-ui-tokens > target/dist/brindle-ui-tokens.css
       - uses: actions/upload-artifact@v7
         with:
           name: brindle-linux-x64
-          path: target/dist/*.tar.gz
+          path: |
+            target/dist/*.tar.gz
+            target/dist/brindle-ui-tokens.css
           retention-days: 14

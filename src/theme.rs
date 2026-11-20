@@ -409,9 +409,126 @@ pub fn builtin_theme(name: &str) -> Option<Theme> {
     Some(theme)
 }
 
+/// The built-in themes as CSS custom properties, for `--export-ui-tokens`:
+/// each theme's [`Theme::ui_tokens`] under shadcn/ui's variable names, plus
+/// its terminal colours (`--terminal-*`), so a web page can wear the chrome
+/// Brindle draws. Each theme is a `[data-theme="NAME"]` block; `brindle-light`
+/// is also `:root` and `brindle-dark` also `.dark`, shadcn's light and dark
+/// selectors. Colours are `#rrggbb`, or `rgb(r g b / a)` when translucent.
+/// `:root` comes first and `.dark` second: `.dark` usually sits on the root
+/// element, where both match with equal specificity and the later wins.
+pub fn ui_tokens_css(version: &str) -> String {
+    let mut out = format!(
+        "/* Brindle {version} UI tokens, written by `brindle --export-ui-tokens`.\n   \
+         Generated from the built-in themes: don't edit by hand. */\n"
+    );
+    let first = ["brindle-light", "brindle-dark"];
+    let rest = BUILTIN_THEMES.iter().copied().filter(|name| !first.contains(name));
+    for name in first.into_iter().chain(rest) {
+        let Some(theme) = builtin_theme(name) else { continue };
+        let selector = match name {
+            "brindle-light" => format!(":root,\n[data-theme=\"{name}\"]"),
+            "brindle-dark" => format!(".dark,\n[data-theme=\"{name}\"]"),
+            _ => format!("[data-theme=\"{name}\"]"),
+        };
+        out.push_str(&format!("\n{selector} {{\n"));
+        for (var, value) in theme_css_vars(&theme) {
+            out.push_str(&format!("  --{var}: {value};\n"));
+        }
+        let scheme = if theme.is_dark() { "dark" } else { "light" };
+        out.push_str(&format!("  color-scheme: {scheme};\n}}\n"));
+    }
+    out
+}
+
+fn theme_css_vars(theme: &Theme) -> Vec<(String, String)> {
+    let t = theme.ui_tokens();
+    let mut vars: Vec<(String, String)> = [
+        ("background", t.background),
+        ("foreground", t.foreground),
+        ("card", t.card),
+        ("card-foreground", t.card_foreground),
+        ("popover", t.popover),
+        ("popover-foreground", t.popover_foreground),
+        ("primary", t.primary),
+        ("primary-foreground", t.primary_foreground),
+        ("secondary", t.secondary),
+        ("secondary-foreground", t.secondary_foreground),
+        ("muted", t.muted),
+        ("muted-foreground", t.muted_foreground),
+        ("accent", t.accent),
+        ("accent-foreground", t.accent_foreground),
+        ("destructive", t.destructive),
+        ("destructive-foreground", t.destructive_foreground),
+        ("border", t.border),
+        ("input", t.input),
+        ("ring", t.ring),
+    ]
+    .into_iter()
+    .map(|(var, color)| (var.to_string(), css_color(color)))
+    .collect();
+    vars.push(("radius".into(), format!("{}rem", t.radius.0)));
+    let terminal = [
+        ("background", theme.background),
+        ("foreground", theme.foreground),
+        ("cursor", theme.cursor),
+        ("selection", theme.selection_background),
+    ];
+    for (var, color) in terminal {
+        vars.push((format!("terminal-{var}"), css_color(color.hsla())));
+    }
+    for (i, color) in theme.ansi.iter().enumerate() {
+        vars.push((format!("terminal-ansi-{i}"), css_color(color.hsla())));
+    }
+    vars
+}
+
+/// A colour as CSS: `#rrggbb` when opaque, else `rgb(r g b / a)`.
+fn css_color(color: Hsla) -> String {
+    let rgba = Rgba::from(color);
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let (r, g, b) = (channel(rgba.r), channel(rgba.g), channel(rgba.b));
+    if rgba.a >= 1.0 {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        format!("rgb({r} {g} {b} / {})", (rgba.a * 100.0).round() / 100.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every built-in theme gets a block with every shadcn variable, the
+    /// light and dark brindle themes also answer shadcn's own selectors, and
+    /// the values are the tokens the chrome draws with.
+    #[test]
+    fn ui_tokens_css_covers_every_builtin_with_shadcn_names() {
+        let css = ui_tokens_css("9.9.9");
+        assert!(css.starts_with("/* Brindle 9.9.9 UI tokens"));
+        for name in BUILTIN_THEMES {
+            assert!(css.contains(&format!("[data-theme=\"{name}\"] {{")), "{name}");
+        }
+        let root = css.find(":root,\n[data-theme=\"brindle-light\"]").unwrap();
+        let dark = css.find(".dark,\n[data-theme=\"brindle-dark\"]").unwrap();
+        assert!(root < dark, ".dark must follow :root to win on the root element");
+        let blocks = css.matches("color-scheme:").count();
+        assert_eq!(blocks, BUILTIN_THEMES.len());
+        for var in ["background", "primary-foreground", "muted-foreground", "ring", "radius"] {
+            assert_eq!(css.matches(&format!("  --{var}: ")).count(), blocks, "{var}");
+        }
+        let dark = builtin_theme("brindle-dark").unwrap();
+        let primary = css_color(dark.ui_tokens().primary);
+        assert_eq!(primary, "#e6a756");
+        assert!(css.contains(&format!("  --primary: {primary};")));
+        assert!(css.contains("  --terminal-ansi-15: #f2eee6;"));
+    }
+
+    #[test]
+    fn css_colors_are_hex_when_opaque_and_rgb_when_translucent() {
+        assert_eq!(css_color(Color::hex(0x1b1a18).hsla()), "#1b1a18");
+        assert_eq!(css_color(gpui::hsla(0., 0., 1., 0.15)), "rgb(255 255 255 / 0.15)");
+    }
 
     /// Status dots: the theme's yellow, red and green, and the muted colour
     /// given for working (and idle, which shows no dot).
