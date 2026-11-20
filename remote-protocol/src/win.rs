@@ -33,8 +33,9 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    GetLongPathNameW, MOVE_FILE_FLAGS, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_WRITE_DATA, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    GetLongPathNameW, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     WRITE_OWNER,
 };
 use std::os::windows::fs::MetadataExt;
@@ -1061,6 +1062,75 @@ fn reprotect(
     Ok(())
 }
 
+/// How a role opens a lock or log in an elevated server directory
+/// ([`open_elevated_file`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOpen {
+    /// A lock: read and written, and made when `create` and missing.
+    Lock { create: bool },
+    /// A log: appended to, and made when missing.
+    Log,
+}
+
+/// Opens a lock or log of an elevated role in its server directory without
+/// following a link. A file it makes is owned by Administrators, for them
+/// and SYSTEM only; one it finds must be a plain file of one name owned by
+/// Administrators ([`access::check_file`]), or it is refused, naming the
+/// file and why. Protecting the directory stops what an unelevated process
+/// adds to it later, but not what one adds through a handle it opened
+/// before: this check stops that, file by file.
+pub fn open_elevated_file(path: &Path, open: FileOpen) -> io::Result<File> {
+    open_owned_file(
+        path,
+        open,
+        &access::contained_file_sddl(access::elevated_dir_sddl()),
+        access::ADMINISTRATORS_SID,
+    )
+}
+
+/// [`open_elevated_file`], making a file with the descriptor `sddl` and
+/// requiring the owner `owner`.
+fn open_owned_file(path: &Path, open: FileOpen, sddl: &str, owner: &str) -> io::Result<File> {
+    let refused = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("refusing {}: {why}", path.display()));
+    // Applied only to a file this call makes.
+    let security = Security::from_sddl(sddl)?;
+    let (access, disposition) = match open {
+        FileOpen::Lock { create } => (
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+        ),
+        // Appending only, as std's `append`, and reading its attributes.
+        FileOpen::Log => ((FILE_GENERIC_WRITE.0 & !FILE_WRITE_DATA.0) | FILE_READ_ATTRIBUTES.0, OPEN_ALWAYS),
+    };
+    // SAFETY: the name is NUL-terminated and the attributes outlive the
+    // call; the handle is owned below.
+    let handle = unsafe {
+        CreateFileW(
+            &HSTRING::from(path),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            Some(security.attributes()),
+            disposition,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|error| context(path.display(), os(error)))?;
+    // SAFETY: a fresh handle nothing else owns.
+    let file = unsafe { File::from_raw_handle(handle.0) };
+    let raw = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open for the call and `info` is writable.
+    unsafe { GetFileInformationByHandle(raw, &mut info) }.map_err(|error| context(path.display(), os(error)))?;
+    let facts = access::FileFacts {
+        reparse_point: is_reparse_point(info.dwFileAttributes),
+        links: info.nNumberOfLinks,
+        owner: read_dir_security(raw).map_err(|error| context(path.display(), error))?.owner,
+    };
+    access::check_file(&facts, owner).map_err(|refusal| refused(refusal.to_string()))?;
+    Ok(file)
+}
+
 /// What [`remove_untrusted`] did.
 #[derive(Debug, Default)]
 pub struct Removed {
@@ -1088,7 +1158,11 @@ pub fn remove_untrusted(dir: &Path) -> Removed {
         let link = std::fs::symlink_metadata(&path).map(|metadata| is_reparse_point(metadata.file_attributes()));
         match link {
             Ok(true) => removed.kept.push((path, "it is a link".into())),
-            // `remove_dir_all` deletes links inside, never what they point to.
+            // `remove_dir_all` opens what it removes without following it and
+            // works relative to the handles it holds, so an entry swapped
+            // for a link after this check, or a link inside, is deleted as a
+            // link and never descended into. A file set aside is removed as
+            // a file (a file link as the link itself).
             Ok(false) => match std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path)) {
                 Ok(()) => removed.removed += 1,
                 Err(error) => removed.kept.push((path, format!("can't remove it: {error}"))),
@@ -1735,6 +1809,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A lock or log of the user's own is made with the given descriptor
+    /// and opened again; a hard link, a link and a file someone else owns
+    /// are refused, and what a link points to is left alone.
+    #[test]
+    fn an_elevated_role_s_files_are_its_own_plain_files() {
+        let dir = scratch("owned-file");
+        let sid = own_sid().unwrap();
+        let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)S:(ML;;NW;;;ME)");
+        let open = |path: &Path, how: FileOpen| open_owned_file(path, how, &sddl, &sid);
+        let lock = dir.join("core.lock");
+        let log = dir.join("core.log");
+        drop(open(&lock, FileOpen::Lock { create: true }).unwrap());
+        drop(open(&lock, FileOpen::Lock { create: false }).unwrap());
+        assert_eq!(read_security(&lock).owner, sid);
+        {
+            use std::io::Write as _;
+            open(&log, FileOpen::Log).unwrap().write_all(b"one\n").unwrap();
+            open(&log, FileOpen::Log).unwrap().write_all(b"two\n").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
+        let missing = open(&dir.join("absent.lock"), FileOpen::Lock { create: false }).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound, "{missing}");
+
+        // A second name for a file elsewhere.
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::hard_link(&outside, dir.join("holder-b-0.log")).unwrap();
+        let error = open(&dir.join("holder-b-0.log"), FileOpen::Log).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("2 names"), "{error}");
+        // A junction in a file's place: refused, its target untouched.
+        let target = dir.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        junction(&dir.join("holder-b-1.lock"), &target);
+        assert!(open(&dir.join("holder-b-1.lock"), FileOpen::Lock { create: true }).is_err());
+        assert!(names(&target).is_empty());
+        // A file another owner made.
+        let error = open_owned_file(&lock, FileOpen::Lock { create: true }, &sddl, SYSTEM_SID).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains(&format!("owned by {sid}")), "{error}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        std::fs::remove_dir(dir.join("holder-b-1.lock")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// What was set aside is removed later, except a link, which is never
     /// followed.
     #[test]
@@ -1754,7 +1873,13 @@ mod tests {
         assert_eq!(removed.kept[0].0, link);
         assert!(!aside.exists());
         assert_eq!(names(&target), ["outside"]);
-        std::fs::remove_dir(&link).unwrap();
+        // A set-aside directory swapped for a junction after the check, as
+        // another process could: the removal deletes the link itself and
+        // never descends into its target (std's `remove_dir_all` opens what
+        // it removes without following it, and works relative to handles).
+        std::fs::remove_dir_all(&link).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(names(&target), ["outside"]);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(remove_untrusted(&dir).removed, 0);
     }

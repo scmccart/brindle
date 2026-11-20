@@ -289,6 +289,60 @@ pub fn matches_owned(found: &DirSecurity, owner: &str, level: Integrity) -> bool
         && found.label == Some(label)
 }
 
+/// What a role found of a lock or log it opened in an elevated server
+/// directory, through a handle that doesn't follow links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFacts {
+    /// A junction, a symbolic link or another reparse point.
+    pub reparse_point: bool,
+    /// How many names the file has (`nNumberOfLinks`).
+    pub links: u32,
+    /// Its owner, as a SID string.
+    pub owner: String,
+}
+
+/// Why a role refuses a lock or log in an elevated server directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRefusal {
+    /// It is a link, which would send the role's writes elsewhere.
+    Link,
+    /// It has other names (hard links): it may be a file outside.
+    Links(u32),
+    /// Another owner made it, such as an unelevated process through a
+    /// handle to the directory opened before the directory was protected.
+    Owner(String),
+}
+
+impl std::fmt::Display for FileRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link => write!(f, "it is a link"),
+            Self::Links(links) => write!(f, "it has {links} names (hard links)"),
+            Self::Owner(owner) => write!(f, "it is owned by {owner}, not by Administrators"),
+        }
+    }
+}
+
+/// Whether a role uses a lock or log it opened in an elevated server
+/// directory: only a plain file of one name owned by `owner`
+/// (Administrators, whom an elevated process's files belong to).
+///
+/// Protecting the directory stops new entries from unelevated processes,
+/// but not from one that opened the directory before: what it planted is
+/// refused here, file by file.
+pub fn check_file(facts: &FileFacts, owner: &str) -> Result<(), FileRefusal> {
+    if facts.reparse_point {
+        return Err(FileRefusal::Link);
+    }
+    if facts.links != 1 {
+        return Err(FileRefusal::Links(facts.links));
+    }
+    if facts.owner != owner {
+        return Err(FileRefusal::Owner(facts.owner.clone()));
+    }
+    Ok(())
+}
+
 /// The descriptor a file kept in a directory made with `dir_sddl` is given
 /// when the directory is protected again in place: the same owner, entries
 /// and label, without the inheritance flags only a directory takes.
@@ -712,6 +766,43 @@ mod tests {
         assert!(!matches_owned(&labelled, user, Integrity::HIGH));
         assert!(!matches_owned(&labelled, SIDS[1], Integrity::MEDIUM));
         assert!(!matches_elevated(&labelled));
+    }
+
+    fn facts(reparse_point: bool, links: u32, owner: &str) -> FileFacts {
+        FileFacts {
+            reparse_point,
+            links,
+            owner: owner.to_string(),
+        }
+    }
+
+    /// An elevated role's lock or log is a plain file of one name that an
+    /// elevated process made; anything else is refused with its reason.
+    #[test]
+    fn an_elevated_role_uses_only_a_plain_file_of_its_own() {
+        assert_eq!(check_file(&facts(false, 1, ADMINISTRATORS_SID), ADMINISTRATORS_SID), Ok(()));
+        let user = SIDS[0];
+        assert_eq!(
+            check_file(&facts(true, 1, ADMINISTRATORS_SID), ADMINISTRATORS_SID),
+            Err(FileRefusal::Link)
+        );
+        assert_eq!(
+            check_file(&facts(false, 2, ADMINISTRATORS_SID), ADMINISTRATORS_SID),
+            Err(FileRefusal::Links(2))
+        );
+        assert_eq!(
+            check_file(&facts(false, 1, user), ADMINISTRATORS_SID),
+            Err(FileRefusal::Owner(user.to_string()))
+        );
+        // A link is refused as one, whatever else is true of it.
+        assert_eq!(check_file(&facts(true, 3, user), ADMINISTRATORS_SID), Err(FileRefusal::Link));
+        assert_eq!(check_file(&facts(false, 2, user), ADMINISTRATORS_SID), Err(FileRefusal::Links(2)));
+        assert_eq!(FileRefusal::Link.to_string(), "it is a link");
+        assert_eq!(FileRefusal::Links(2).to_string(), "it has 2 names (hard links)");
+        assert_eq!(
+            FileRefusal::Owner(user.to_string()).to_string(),
+            format!("it is owned by {user}, not by Administrators")
+        );
     }
 
     #[test]

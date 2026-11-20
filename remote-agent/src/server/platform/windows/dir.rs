@@ -31,6 +31,17 @@ pub fn resolve_from_env() -> io::Result<PathBuf> {
     )
 }
 
+/// Whether this process is elevated, read once: an elevated role opens its
+/// locks and logs with `win::open_elevated_file`.
+pub(super) fn elevated_role() -> io::Result<bool> {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(elevated) = ELEVATED.get() {
+        return Ok(*elevated);
+    }
+    let elevated = win::is_elevated()?;
+    Ok(*ELEVATED.get_or_init(|| elevated))
+}
+
 /// The directory used when `BRINDLE_SERVER_DIR` isn't set, for a process
 /// that is `elevated` or not.
 fn default_dir(elevated: bool) -> Option<PathBuf> {

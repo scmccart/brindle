@@ -6,7 +6,9 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 
-use brindle_remote_protocol::win::file_identity;
+use brindle_remote_protocol::win::{self, FileOpen, file_identity};
+
+use super::dir::elevated_role;
 
 /// A held lock. Dropping it releases the lock.
 pub struct Lock(File);
@@ -15,13 +17,24 @@ impl Lock {
     /// Takes the lock at `path`, creating the file if needed. `None` means
     /// another process holds it.
     pub fn create(path: &Path) -> io::Result<Option<Self>> {
-        Self::take(Self::options().create(true).truncate(false).open(path)?)
+        Self::take(Self::open(path, true)?)
     }
 
     /// Takes the lock at `path` if the file exists (`NotFound` otherwise).
     /// `None` means another process holds it.
     pub fn existing(path: &Path) -> io::Result<Option<Self>> {
-        Self::take(Self::options().open(path)?)
+        Self::take(Self::open(path, false)?)
+    }
+
+    /// Opens the lock file, made when `create`. An elevated role opens it
+    /// without following a link and uses only its own plain file
+    /// (`win::open_elevated_file`).
+    fn open(path: &Path, create: bool) -> io::Result<File> {
+        if elevated_role()? {
+            win::open_elevated_file(path, FileOpen::Lock { create })
+        } else {
+            Self::options().create(create).truncate(false).open(path)
+        }
     }
 
     /// std opens with `FILE_SHARE_READ | FILE_SHARE_WRITE |
