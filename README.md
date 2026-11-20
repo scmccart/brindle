@@ -594,6 +594,20 @@ enclosing brackets aren't part of a link, and a URL that wraps onto the next
 row is still one link. Ctrl-drag no longer block-selects when it starts on a
 link; alt-drag still does.
 
+A link is whatever a program printed, so Brindle opens only what it would
+detect itself:
+
+- **Schemes:** `http`, `https`, `ftp`, `file`, `ssh`, `git`, `gemini`,
+  `gopher`, `ipfs`, `ipns`, `mailto`, `news` and `magnet`, in any case. An OSC 8
+  hyperlink with another scheme (`vscode:`, `ms-settings:`, a Windows path
+  such as `C:\tool.exe`) is underlined but not opened.
+- **`file:` links:** only when the host is empty, `localhost` or this
+  machine's name. On Windows a file is shown selected in Explorer instead of
+  opened, so a click never runs a program; a directory opens in Explorer.
+- **Quotes and spaces** in a link are percent-encoded before it is opened.
+
+When a link isn't opened, or the opener fails, the tab says why in a dim line.
+
 To open links with something other than `xdg-open`, set
 `BRINDLE_LINK_OPENER` to a program; it gets the link as its only argument.
 "Copy Link Under Mouse" (`copy_link`) in the command palette copies the link
