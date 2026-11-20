@@ -54,6 +54,7 @@ use brindle_remote_protocol::client::{
 };
 use brindle_remote_protocol::holder::{self as h1, HeldSession, MetaFault, SessionMeta, ToHolder};
 use brindle_remote_protocol::{RequestId, SessionId};
+use brindle_term_core::emulator;
 
 use super::clients::{ClientToken, error};
 use super::holders::WaitingSpawn;
@@ -371,6 +372,8 @@ impl Session {
     /// the `core.log` line that says so comes with it, and the core stores
     /// the repaired meta. A running session with no pid (0, which no
     /// holder reports) isn't adopted: the `Err` is the line that says so.
+    /// Its size is the holder's, within the limits every grid keeps
+    /// ([`emulator::clamped`]).
     pub(super) fn adopted(
         holder: Token,
         held: HeldSession,
@@ -393,14 +396,15 @@ impl Session {
         let (mut meta, repaired) =
             adopt_meta(held.session, SessionMeta::from_value(&held.meta), session_key);
         let owner = ClientToken::from_wire(&std::mem::take(&mut meta.owner));
+        let (cols, rows) = emulator::clamped(held.cols, held.rows);
         let session = Self {
             holder,
             life,
-            screen: Screen::new(held.cols, held.rows, meta.scrollback),
+            screen: Screen::new(cols, rows, meta.scrollback),
             meta,
             owner,
-            cols: held.cols,
-            rows: held.rows,
+            cols,
+            rows,
             ownership: Ownership::AwaitingOwner { since: now },
             paused: false,
             rebuild: Rebuild::Pending {
@@ -560,8 +564,10 @@ fn free_id(mut next: SessionId, taken: impl Fn(SessionId) -> bool) -> (SessionId
 
 impl<L: EventLoop> Core<L> {
     /// A client's `SPAWN`: it gets an id now and goes to a holder of the
-    /// core's build once one is ready.
-    pub(super) fn client_spawn(&mut self, client: Token, spawn: client::Spawn) {
+    /// core's build once one is ready. Its size is taken within the limits
+    /// every grid keeps ([`emulator::clamped`]), here, so the session's
+    /// emulator, its program's terminal and its listing all have the same.
+    pub(super) fn client_spawn(&mut self, client: Token, mut spawn: client::Spawn) {
         if self.stopping.is_some() {
             return self.send_client(
                 client,
@@ -578,6 +584,7 @@ impl<L: EventLoop> Core<L> {
                 ),
             );
         }
+        (spawn.cols, spawn.rows) = emulator::clamped(spawn.cols, spawn.rows);
         let id = self.allocate_id();
         self.waiting.push(WaitingSpawn { client, id, spawn });
         self.place_waiting();
@@ -1424,11 +1431,13 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Resizes the session's emulator and its PTY.
+    /// Resizes the session's emulator and its PTY to `cols` × `rows`,
+    /// within the limits every grid keeps ([`emulator::clamped`]).
     fn resize_session(&mut self, id: SessionId, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        let (cols, rows) = emulator::clamped(cols, rows);
         session.cols = cols;
         session.rows = rows;
         session.screen.resize(id, cols, rows);
@@ -1568,6 +1577,20 @@ mod tests {
         assert_eq!(session.active_at, now);
         assert_eq!(session.rebuild, Rebuild::Pending { truncated: true });
         assert!(session.life.is_running());
+    }
+
+    /// A holder may hold a session at any size a `u16` has: the core takes
+    /// it within the limits every grid keeps, for its emulator and its
+    /// listing alike.
+    #[test]
+    fn an_adopted_session_past_the_grid_limits_is_taken_at_them() {
+        let now = Instant::now();
+        let huge = adopted(HeldSession { cols: 65535, rows: 65535, ..held(false) }, now);
+        assert_eq!((huge.cols, huge.rows), (2048, 1024));
+        let info = huge.info(3, now);
+        assert_eq!((info.cols, info.rows), (2048, 1024));
+        let narrow = adopted(HeldSession { cols: 1, rows: 0, ..held(false) }, now);
+        assert_eq!((narrow.cols, narrow.rows), (10, 1));
     }
 
     #[test]

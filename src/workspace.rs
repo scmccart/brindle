@@ -963,15 +963,14 @@ impl Workspace {
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Entity<Terminal> {
-        // At the session's own size, so attaching resizes nothing; a core
-        // that predates sizes lists none, and the default grid stands in.
+        // At the session's own size, so attaching resizes nothing; one
+        // listed with no usable size starts at the default grid.
         let listed = crate::remote::ListedSession::of(info);
-        let default = crate::terminal::GridSize::default();
-        let (cols, rows) = listed.size.unwrap_or((default.cols, default.rows));
+        let size = crate::terminal::GridSize::listed(listed.size);
         let request = crate::remote::local::AttachRequest {
             session: listed.session,
             key: listed.key,
-            when: crate::remote::local::Attaching::Now { cols, rows },
+            when: crate::remote::local::Attaching::Now { cols: size.cols, rows: size.rows },
         };
         let what = crate::reattach::label(info);
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))

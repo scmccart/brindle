@@ -2,7 +2,7 @@
 
 ## 1. Shared limits and pure decisions
 
-- [ ] 1.1 Add `MAX_COLS` (2048) and `MAX_ROWS` (1024) beside `MIN_COLS` in `term-core/src/emulator.rs`, and clamp both ends in `emulator::size`. Verify with unit tests that `Emulator::new(65535, 65535, …)` builds a 2048×1024 grid, and that sizes inside the limits are unchanged.
+- [x] 1.1 Add `MAX_COLS` (2048) and `MAX_ROWS` (1024) beside `MIN_COLS` in `term-core/src/emulator.rs`, and clamp both ends in `emulator::size`. Verify with unit tests that `Emulator::new(65535, 65535, …)` builds a 2048×1024 grid, and that sizes inside the limits are unchanged.
 - [ ] 1.2 Restrict `reported_dir` (`term-core/src/shell_integration.rs`) in the Windows style to drive-letter paths. The OSC 7 branch returns `None` unless the path is `/X:/…`. Verify with parser unit tests for `\\host\share`, `\\?\UNC\h\s`, `\\.\pipe\x`, `\\host@80\x`, `file://x//host/share` (each ignored, keeping the previous directory) and the existing drive-letter cases. Fuzz targets keep passing.
 - [ ] 1.3 Add `access::elevated_dir_sddl()` (owner BA; protected DACL of BA and SY full control; High no-write-up label) and the pure `access::matches_elevated` in `remote-protocol/src/access.rs`. Verify with unit tests that the exact descriptor matches, and that ones with a user-SID ACE, another owner, no label or a Medium label don't.
 - [ ] 1.4 Add the elevated names in `remote-protocol/src/server_dir.rs` (`helper_copies(…, elevated)` giving `server-elevated`) and `remote-agent/src/conpty/choice.rs` (`conpty-elevated\<version>`), plus the pure `untrusted_name(name, pid, n)`. Verify with unit tests for both elevations, with and without `BRINDLE_SERVER_DIR`.
@@ -12,7 +12,7 @@
 
 ## 2. Shared crates and server roles
 
-- [ ] 2.1 Make the core's emulator sizes go through the clamped `emulator::size` for `SPAWN`, `RESIZE` and adoption. Verify with a `remote-agent/tests/core.rs` test that spawns at 65535×65535 and gets a session listed at 2048×1024.
+- [x] 2.1 Make the core's emulator sizes go through the clamped `emulator::size` for `SPAWN`, `RESIZE` and adoption. Verify with a `remote-agent/tests/core.rs` test that spawns at 65535×65535 and gets a session listed at 2048×1024.
 - [ ] 2.2 Implement `win::protected_dir(path, Contents)` in `remote-protocol/src/win.rs`:
   - it opens with `FILE_FLAG_OPEN_REPARSE_POINT` and without `FILE_SHARE_DELETE`, and refuses reparse points;
   - it checks the result with `matches_elevated` and `GetFinalPathNameByHandleW`;
@@ -27,7 +27,7 @@
 
 ## 3. Brindle's client and entities
 
-- [ ] 3.1 Make `ListedSession::of` (`src/remote/identity.rs`) give `size: None` outside `MIN_COLS..=MAX_COLS` × `1..=MAX_ROWS`, and clamp `GridSize::clamped`, `Terminal::resize` and the replay resize to both ends. Verify with unit tests for `of`, and a `src/terminal` test that a listed 65535×65535 attaches at the default size.
+- [x] 3.1 Make `ListedSession::of` (`src/remote/identity.rs`) give `size: None` outside `MIN_COLS..=MAX_COLS` × `1..=MAX_ROWS`, and clamp `GridSize::clamped`, `Terminal::resize` and the replay resize to both ends. Verify with unit tests for `of`, and a `src/terminal` test that a listed 65535×65535 attaches at the default size.
 - [ ] 3.2 Run the reported directory's existence check through `DirCheck` on the background executor, and have `Terminal::working_directory` read only the model, with no I/O on the UI thread. Verify with `cargo test -p brindle terminal`, and confirm by reading the code that `record_session`, `new_tab_cwd`, splits and `session.rs` restore call nothing that touches the file system.
 - [ ] 3.3 Use the elevated, held `server-elevated` copy in `src/remote/local/windows.rs` when Brindle is elevated. Verify with `cargo clippy` on Windows CI and the existing `windows-*` e2e cases.
 - [ ] 3.4 Apply `links::plan` in `links::open`: `Reveal` runs `explorer.exe /select,<path>` on the opener thread, and opens a directory instead. Word the new refusals in `links::failure_text`. Verify with unit tests for the wording, and update the e2e `links` case to ctrl-click an `ms-settings:` OSC 8 link and expect the dim refusal line.

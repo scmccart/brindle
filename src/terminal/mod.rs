@@ -181,12 +181,22 @@ impl Default for GridSize {
 }
 
 impl GridSize {
-    /// This size with at least [`MIN_COLS`] columns, the narrowest grid the
-    /// client and the server's emulators make. Where a size comes from
-    /// outside the term (a layout, a listing), it goes through here before
-    /// it is used.
+    /// This size within the limits every grid keeps, on the client and in
+    /// the server's emulators alike (`emulator::clamped`): [`MIN_COLS`] to
+    /// 2048 columns and 1 to 1024 rows. Where a size comes from outside the
+    /// term (a layout, a listing), it goes through here before a grid is
+    /// made or resized with it.
     pub fn clamped(self) -> Self {
-        Self { cols: self.cols.max(MIN_COLS), ..self }
+        let (cols, rows) = brindle_term_core::emulator::clamped(self.cols, self.rows);
+        Self { cols, rows, ..self }
+    }
+
+    /// The grid a session listed at `size` is attached at: its own size,
+    /// so attaching resizes nothing, or the default grid when its listing
+    /// gave none (`ListedSession::size`: a core that predates sizes, or a
+    /// size outside the grid limits).
+    pub fn listed(size: Option<(u16, u16)>) -> Self {
+        size.map_or_else(Self::default, |(cols, rows)| Self { cols, rows, ..Self::default() }.clamped())
     }
 }
 
@@ -540,15 +550,7 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> Self {
         let (listener, rx) = Listener::channel();
-        // The session's size: the replay is rendered at it, and the first
-        // layout resizes the session only if the window's grid differs. A
-        // recorded session's comes with its listing.
-        let (size, recorded) = match request.when {
-            crate::remote::local::Attaching::Now { cols, rows } => {
-                (GridSize { cols, rows, ..GridSize::default() }, false)
-            }
-            crate::remote::local::Attaching::Recorded => (GridSize::default(), true),
-        };
+        let (size, recorded) = attach_size(request.when);
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
@@ -1475,6 +1477,22 @@ pub(crate) fn spawn_request(
     (request, doing)
 }
 
+/// The grid an attach starts with, and whether its session's size is still
+/// to come with a listing (a recorded session's). A session just listed is
+/// attached at its own size, so its replay, rendered at that size, lands
+/// as it was drawn and the first layout resizes the session only if the
+/// window's grid differs. The size is the caller's (`GridSize::listed`),
+/// taken within the limits every grid keeps whatever it says.
+#[cfg(any(target_os = "linux", windows))]
+fn attach_size(when: crate::remote::local::Attaching) -> (GridSize, bool) {
+    match when {
+        crate::remote::local::Attaching::Now { cols, rows } => {
+            (GridSize { cols, rows, ..GridSize::default() }.clamped(), false)
+        }
+        crate::remote::local::Attaching::Recorded => (GridSize::default(), true),
+    }
+}
+
 /// The parser for a terminal on `host`, reading directory reports in the
 /// host's path style ([`Host::path_style`]).
 #[cfg(any(target_os = "linux", windows))]
@@ -1598,11 +1616,58 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     #[test]
-    fn a_grid_size_narrower_than_min_cols_is_clamped_and_its_rows_kept() {
+    fn a_grid_size_is_clamped_to_the_grid_limits_and_its_cells_kept() {
         let narrow = GridSize { cols: 1, rows: 7, cell_width: 9, cell_height: 18 };
         assert_eq!(narrow.clamped(), GridSize { cols: MIN_COLS, rows: 7, cell_width: 9, cell_height: 18 });
         let wide = GridSize { cols: 120, ..narrow };
         assert_eq!(wide.clamped(), wide);
+        let huge = GridSize { cols: u16::MAX, rows: u16::MAX, ..narrow };
+        assert_eq!(huge.clamped(), GridSize { cols: 2048, rows: 1024, cell_width: 9, cell_height: 18 });
+        let largest = GridSize { cols: 2048, rows: 1024, ..narrow };
+        assert_eq!(largest.clamped(), largest);
+        assert_eq!(GridSize { rows: 0, ..wide }.clamped(), GridSize { rows: 1, ..wide });
+    }
+
+    /// A session an endpoint lists at 65535×65535 has no usable size: its
+    /// tab starts at the default grid, as a session listed with no size
+    /// does. One listed within the limits is attached at its own size.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_session_listed_past_the_grid_limits_attaches_at_the_default_size() {
+        use crate::remote::ListedSession;
+        use crate::remote::local::Attaching;
+        use crate::remote::protocol::client::SessionInfo;
+
+        // As `Workspace::attached_terminal` asks for the attach.
+        let attach = |cols, rows| {
+            let listed = ListedSession::of(&SessionInfo { session: 3, cols, rows, ..Default::default() });
+            let size = GridSize::listed(listed.size);
+            attach_size(Attaching::Now { cols: size.cols, rows: size.rows })
+        };
+        let default = GridSize::default();
+        assert_eq!(attach(65535, 65535), (default, false));
+        assert_eq!(attach(2049, 24), (default, false));
+        assert_eq!(attach(80, 1025), (default, false));
+        // A core that predates sizes lists none.
+        assert_eq!(attach(0, 0), (default, false));
+        assert_eq!(attach(120, 40), (GridSize { cols: 120, rows: 40, ..default }, false));
+        assert_eq!(attach(2048, 1024), (GridSize { cols: 2048, rows: 1024, ..default }, false));
+    }
+
+    /// Whatever size an attach is asked at, its grid stays within the
+    /// limits; a recorded session's size comes later, with its listing.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn an_attach_never_starts_past_the_grid_limits() {
+        use crate::remote::local::Attaching;
+
+        let default = GridSize::default();
+        assert_eq!(
+            attach_size(Attaching::Now { cols: 65535, rows: 65535 }),
+            (GridSize { cols: 2048, rows: 1024, ..default }, false)
+        );
+        assert_eq!(attach_size(Attaching::Now { cols: 1, rows: 5 }), (GridSize { cols: MIN_COLS, rows: 5, ..default }, false));
+        assert_eq!(attach_size(Attaching::Recorded), (default, true));
     }
 
     /// 6.1/6.2: what a new terminal runs follows the host it opens on, not

@@ -51,6 +51,24 @@ impl EventListener for Titles {
 /// in less than this anyway. Rows are clamped to 1 only.
 pub const MIN_COLS: u16 = 10;
 
+/// The most columns any grid Brindle creates or resizes has, on the client
+/// and in the server's emulators alike. A size comes from outside (a
+/// `SPAWN`, a `RESIZE`, a listing), and a grid allocates every cell of its
+/// screen: at [`MAX_COLS`] × [`MAX_ROWS`] that is 2 M cells a screen, where
+/// 65535 × 65535 would be more memory than a machine has. 2048 columns is
+/// wider than a 7680-pixel display at a 4-pixel cell.
+pub const MAX_COLS: u16 = 2048;
+
+/// The most rows any grid has; see [`MAX_COLS`].
+pub const MAX_ROWS: u16 = 1024;
+
+/// `cols` × `rows` within the limits every grid keeps: [`MIN_COLS`] to
+/// [`MAX_COLS`] columns and 1 to [`MAX_ROWS`] rows. A size already within
+/// them comes back as it is.
+pub fn clamped(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(MIN_COLS, MAX_COLS), rows.clamp(1, MAX_ROWS))
+}
+
 /// A grid size, for `Term::new` and resizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
@@ -80,8 +98,9 @@ pub struct Emulator {
 }
 
 impl Emulator {
-    /// An emulator of `cols` (at least [`MIN_COLS`]) × `rows` (at least 1)
-    /// keeping `scrollback` lines of history; 0 means [`DEFAULT_SCROLLBACK`].
+    /// An emulator of `cols` × `rows`, within the limits every grid keeps
+    /// ([`clamped`]), keeping `scrollback` lines of history; 0 means
+    /// [`DEFAULT_SCROLLBACK`].
     ///
     /// It reads directory reports (OSC 7, 9;9) as `style` spells paths: the
     /// style of the platform the session's program runs on, which the
@@ -131,6 +150,7 @@ impl Emulator {
         self.records.seen();
     }
 
+    /// Resizes the grid to `cols` × `rows`, within the same limits.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let size = size(cols, rows);
         if (size.cols, size.rows) != (self.term.columns(), self.term.screen_lines()) {
@@ -166,8 +186,10 @@ impl Emulator {
     }
 }
 
+/// The grid size an emulator asked for `cols` × `rows` has ([`clamped`]).
 fn size(cols: u16, rows: u16) -> Size {
-    Size { cols: usize::from(cols.max(MIN_COLS)), rows: usize::from(rows.max(1)) }
+    let (cols, rows) = clamped(cols, rows);
+    Size { cols: usize::from(cols), rows: usize::from(rows) }
 }
 
 #[cfg(test)]
@@ -216,6 +238,39 @@ mod tests {
     fn a_zero_by_zero_emulator_is_min_cols_by_one_row() {
         let emulator = Emulator::new(0, 0, 0, PathStyle::Posix);
         assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (usize::from(MIN_COLS), 1));
+    }
+
+    #[test]
+    fn a_size_within_the_limits_is_kept_and_any_other_is_clamped_to_them() {
+        assert_eq!((MIN_COLS, MAX_COLS, MAX_ROWS), (10, 2048, 1024));
+        for size in [(MIN_COLS, 1), (80, 24), (132, 43), (MAX_COLS, MAX_ROWS)] {
+            assert_eq!(clamped(size.0, size.1), size, "{size:?}");
+        }
+        assert_eq!(clamped(0, 0), (MIN_COLS, 1));
+        assert_eq!(clamped(MIN_COLS - 1, 5), (MIN_COLS, 5));
+        assert_eq!(clamped(MAX_COLS + 1, 5), (MAX_COLS, 5));
+        assert_eq!(clamped(80, MAX_ROWS + 1), (80, MAX_ROWS));
+        assert_eq!(clamped(u16::MAX, u16::MAX), (MAX_COLS, MAX_ROWS));
+    }
+
+    /// The largest size a `SPAWN` or a listing can carry builds a grid at
+    /// the limits, not one of 65535 × 65535 cells.
+    #[test]
+    fn an_emulator_asked_for_65535_by_65535_is_2048_by_1024() {
+        let emulator = Emulator::new(65535, 65535, 0, PathStyle::Posix);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (2048, 1024));
+    }
+
+    #[test]
+    fn a_resize_past_the_limits_stops_at_them() {
+        let mut emulator = Emulator::new(132, 43, 0, PathStyle::Posix);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (132, 43), "within them: kept");
+        emulator.resize(65535, 2);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (2048, 2));
+        emulator.resize(20, 65535);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (20, 1024));
+        emulator.resize(120, 40);
+        assert_eq!((emulator.term().columns(), emulator.term().screen_lines()), (120, 40));
     }
 
     #[test]
