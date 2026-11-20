@@ -202,7 +202,10 @@ fn prune_copies(build: &str) {
     let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|dir| !dir.is_empty()) else {
         return;
     };
-    let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local));
+    // The unelevated copies' directory, whoever runs this: an elevated
+    // core's own (`server-elevated`) comes with its protected directories
+    // (fix-security-audit-2026-11-20, tasks 2.3 and 2.4).
+    let copies = server_dir::helper_copies(server_dir.as_deref(), Path::new(&local), false);
     let pruned = win::prune_helper_copies(&copies, build);
     if pruned.removed > 0 {
         log!("removed {} other build(s)' helper copies", pruned.removed);

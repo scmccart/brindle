@@ -486,9 +486,12 @@ impl Endpoint {
             let elevated = win::is_elevated().context("finding the terminal server directory")?;
             let given = named.as_ref().is_some_and(|dir| !dir.is_empty());
             let dir = server_dir::resolve_windows(named, Some(local.clone()), elevated);
-            // In a directory that was named, the copies are its own.
+            // In a directory that was named, the copies are its own. The
+            // unelevated copies' directory otherwise, whoever runs this: an
+            // elevated Brindle's own (`server-elevated`) comes with its
+            // protected directories (fix-security-audit-2026-11-20, 3.3).
             let copies = dir.as_ref().ok().map(|dir| {
-                server_dir::helper_copies(given.then_some(dir.as_path()), std::path::Path::new(&local))
+                server_dir::helper_copies(given.then_some(dir.as_path()), std::path::Path::new(&local), false)
             });
             (dir, copies.unwrap_or_default())
         };
@@ -514,7 +517,7 @@ impl Endpoint {
         Self {
             helper,
             #[cfg(windows)]
-            copies: server_dir::helper_copies(Some(&dir), std::path::Path::new("")),
+            copies: server_dir::helper_copies(Some(&dir), std::path::Path::new(""), false),
             role_env: vec![
                 ("BRINDLE_SERVER_DIR", dir.clone().into_os_string()),
                 ("BRINDLE_NO_SCOPE", "1".into()),

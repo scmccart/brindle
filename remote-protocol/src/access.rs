@@ -2,7 +2,9 @@
 //! to the process at the other end ([`peer_allowed`], and the server's
 //! [`admit_client`]), the security descriptors the pipes and the server
 //! directory are created with, and what a DACL read back from one must
-//! hold ([`Dacl::allows_only`]).
+//! hold ([`Dacl::allows_only`]). An elevated process's directories get a
+//! descriptor of their own ([`elevated_dir_sddl`]), which one read back
+//! must match exactly ([`matches_elevated`]).
 //!
 //! Everything here works on values (a SID string, an integrity RID, the
 //! entries of a DACL), so it is tested on every platform; `crate::win`
@@ -189,6 +191,91 @@ pub fn pipe_sddl(user_sid: &str, elevated: bool) -> String {
 /// entry is stored as two entries, one for the directory and one to inherit.
 pub fn dir_sddl(user_sid: &str) -> String {
     format!("D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)")
+}
+
+/// Administrators' SID (`BA` in SDDL): the owner of an elevated process's
+/// directories, and with SYSTEM the only one their DACL allows.
+pub const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// `FILE_ALL_ACCESS` (`FA` in SDDL): every right on a file or a directory.
+pub const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
+/// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE` (`OICI` in SDDL): the files
+/// and directories made inside inherit the entry, and nothing else is set,
+/// so the entry applies to the directory itself and came from no parent.
+pub const INHERITED_BY_ALL: u8 = 0x03;
+
+/// `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` (`NW` in SDDL): a process below the
+/// label's level can't write to the object.
+pub const NO_WRITE_UP: u32 = 0x1;
+
+/// The SDDL the directories of an elevated process are created with: its
+/// server directory, its helper copies and its ConPTY files.
+///
+/// - **Owner:** Administrators, so the user's unelevated processes, which
+///   hold that group only to be denied by it, can't change the DACL as its
+///   owner.
+/// - **DACL:** protected, full access for Administrators and SYSTEM and
+///   for nobody else, inherited by what is made inside. There is no entry
+///   for the user's own SID, which an unelevated process of the same user
+///   has too.
+/// - **Label:** high, no write-up, inherited likewise.
+///
+/// So an unelevated process of the same user can neither write nor read
+/// in the directory. [`matches_elevated`] says whether a directory read
+/// back has exactly this.
+pub fn elevated_dir_sddl() -> &'static str {
+    "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)"
+}
+
+/// An object's mandatory label, as read back from its SACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Label {
+    /// Its level: the last sub-authority of the label's SID.
+    pub integrity: Integrity,
+    /// Its policy mask.
+    pub mask: u32,
+    /// The entry's flags (inheritance).
+    pub flags: u8,
+}
+
+/// What protects a directory, as read back from it (`crate::win`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirSecurity {
+    /// The owner, as a SID string.
+    pub owner: String,
+    pub dacl: Dacl,
+    /// The mandatory label; `None` when the directory has none, which
+    /// Windows treats as medium.
+    pub label: Option<Label>,
+}
+
+/// Whether `found` is exactly what [`elevated_dir_sddl`] gives a directory:
+/// owned by Administrators; a protected DACL of two entries, Administrators
+/// and SYSTEM, each with full access and inherited by everything inside;
+/// and a high, no-write-up label inherited likewise.
+///
+/// Anything else is a directory an elevated process didn't make that way,
+/// and may hold what an unelevated process put there: an entry for another
+/// SID, another owner, a lower label or none, a narrower inheritance.
+pub fn matches_elevated(found: &DirSecurity) -> bool {
+    let allows_fully = |sid: &str| {
+        found
+            .dacl
+            .allowed
+            .iter()
+            .any(|ace| ace.sid == sid && ace.mask == FILE_ALL_ACCESS && ace.flags == INHERITED_BY_ALL)
+    };
+    let label = Label {
+        integrity: Integrity::HIGH,
+        mask: NO_WRITE_UP,
+        flags: INHERITED_BY_ALL,
+    };
+    found.owner == ADMINISTRATORS_SID
+        && found.dacl.allows_only(&[ADMINISTRATORS_SID, SYSTEM_SID])
+        && allows_fully(ADMINISTRATORS_SID)
+        && allows_fully(SYSTEM_SID)
+        && found.label == Some(label)
 }
 
 #[cfg(test)]
@@ -405,5 +492,123 @@ mod tests {
             dir_sddl("S-1-5-21-1-2-3-1001"),
             "D:P(A;OICI;FA;;;S-1-5-21-1-2-3-1001)(A;OICI;FA;;;SY)"
         );
+        assert_eq!(
+            elevated_dir_sddl(),
+            "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)"
+        );
+    }
+
+    /// One entry of the elevated directories' DACL.
+    fn full(sid: &str) -> Ace {
+        Ace {
+            sid: sid.to_string(),
+            mask: FILE_ALL_ACCESS,
+            flags: INHERITED_BY_ALL,
+        }
+    }
+
+    const HIGH_LABEL: Label = Label {
+        integrity: Integrity::HIGH,
+        mask: NO_WRITE_UP,
+        flags: INHERITED_BY_ALL,
+    };
+
+    /// What a directory made with [`elevated_dir_sddl`] reads back as:
+    /// `O:BA`, `D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)`, `S:(ML;OICI;NW;;;HI)`.
+    fn elevated() -> DirSecurity {
+        DirSecurity {
+            owner: ADMINISTRATORS_SID.to_string(),
+            dacl: Dacl {
+                protected: true,
+                allowed: vec![full(ADMINISTRATORS_SID), full(SYSTEM_SID)],
+                others: 0,
+            },
+            label: Some(HIGH_LABEL),
+        }
+    }
+
+    /// [`elevated`] with one thing changed.
+    fn elevated_but(change: impl FnOnce(&mut DirSecurity)) -> DirSecurity {
+        let mut found = elevated();
+        change(&mut found);
+        found
+    }
+
+    #[test]
+    fn the_elevated_descriptors_values_are_what_its_sddl_names() {
+        // `BA`, `FA`, `OICI`, `NW` and `HI`, as Windows defines them.
+        assert_eq!(ADMINISTRATORS_SID, "S-1-5-32-544");
+        assert_eq!(FILE_ALL_ACCESS, 0x1f_01ff);
+        assert_eq!(INHERITED_BY_ALL, 0x1 | 0x2);
+        assert_eq!(NO_WRITE_UP, 1);
+        assert_eq!(Integrity::HIGH, Integrity(0x3000));
+    }
+
+    #[test]
+    fn the_exact_elevated_descriptor_matches() {
+        assert!(matches_elevated(&elevated()));
+        // The two entries in either order.
+        assert!(matches_elevated(&elevated_but(|found| found.dacl.allowed.reverse())));
+    }
+
+    #[test]
+    fn any_other_descriptor_is_not_the_elevated_one() {
+        let user = SIDS[0];
+        let label = |change: fn(&mut Label)| {
+            elevated_but(|found| {
+                let mut label = HIGH_LABEL;
+                change(&mut label);
+                found.label = Some(label);
+            })
+        };
+        let entry = |change: fn(&mut Ace)| elevated_but(|found| change(&mut found.dacl.allowed[0]));
+        let others = [
+            // What an unelevated process of the same user could use.
+            ("an entry for the user's SID", elevated_but(|found| found.dacl.allowed.push(full(user)))),
+            ("the user's SID in place of Administrators", elevated_but(|found| found.dacl.allowed[0] = full(user))),
+            ("owned by the user", elevated_but(|found| found.owner = user.to_string())),
+            ("owned by SYSTEM", elevated_but(|found| found.owner = SYSTEM_SID.to_string())),
+            ("no label", elevated_but(|found| found.label = None)),
+            ("a medium label", label(|label| label.integrity = Integrity::MEDIUM)),
+            ("a low label", label(|label| label.integrity = Integrity::LOW)),
+            // And what the SDDL simply doesn't give.
+            ("a system label", label(|label| label.integrity = Integrity::SYSTEM)),
+            ("a label that lets a lower process write", label(|label| label.mask = 0)),
+            ("a label that also stops reading", label(|label| label.mask = 0x3)),
+            ("a label nothing inherits", label(|label| label.flags = 0)),
+            ("a label only directories inherit", label(|label| label.flags = 0x2)),
+            ("an unprotected DACL", elevated_but(|found| found.dacl.protected = false)),
+            ("an entry of another kind", elevated_but(|found| found.dacl.others = 1)),
+            ("less than full access", entry(|ace| ace.mask = 0x12_00a9)),
+            ("more than file access", entry(|ace| ace.mask = 0x1000_0000)),
+            ("an entry nothing inherits", entry(|ace| ace.flags = 0)),
+            ("an entry only files inherit", entry(|ace| ace.flags = 0x1)),
+            ("an entry that skips the directory itself", entry(|ace| ace.flags = 0x3 | 0x8)),
+            ("an entry inherited from the parent", entry(|ace| ace.flags = 0x3 | 0x10)),
+            ("Administrators alone", elevated_but(|found| found.dacl.allowed.truncate(1))),
+            ("SYSTEM alone", elevated_but(|found| drop(found.dacl.allowed.remove(0)))),
+            ("Administrators twice", elevated_but(|found| found.dacl.allowed[1] = full(ADMINISTRATORS_SID))),
+            ("no entry at all", elevated_but(|found| found.dacl.allowed.clear())),
+        ];
+        for (case, found) in others {
+            assert!(!matches_elevated(&found), "{case}: {found:?}");
+        }
+    }
+
+    /// The server directory's own descriptor, for the user and SYSTEM, is
+    /// not the elevated one.
+    #[test]
+    fn the_unelevated_server_directory_is_not_the_elevated_one() {
+        let user = SIDS[0];
+        let found = DirSecurity {
+            owner: user.to_string(),
+            dacl: Dacl {
+                protected: true,
+                allowed: vec![full(user), full(SYSTEM_SID)],
+                others: 0,
+            },
+            label: None,
+        };
+        assert!(!matches_elevated(&found));
     }
 }

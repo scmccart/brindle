@@ -9,9 +9,12 @@
 //! (`run-elevated` for an elevated process, so the two never share a server).
 //! The directory holds lock files and logs; the core and the holders listen
 //! on named pipes whose names come from the directory and the user's SID, and
-//! the helper runs from a per-build copy. The Windows functions here only
-//! compute names and paths from their arguments, so they are tested on every
-//! platform. So are the rules the platforms' seams apply to what they read:
+//! the helper runs from a per-build copy, an elevated process's from copies
+//! of its own ([`helper_copies`]). A directory an elevated process doesn't
+//! trust is set aside under a name of its own ([`untrusted_name`]). The
+//! Windows functions here only compute names and paths from their
+//! arguments, so they are tested on every platform. So are the rules the
+//! platforms' seams apply to what they read:
 //! which names are pipe names ([`check_pipe_name`]), which files show a
 //! Linux holder ([`holder_socket_stem`]), and which helper copy is current,
 //! how a lost race to place one ends and which builds a prune removes
@@ -176,12 +179,43 @@ pub fn check_pipe_name(name: &str) -> Result<(), BadPipeName> {
 }
 
 /// Where the per-build helper copies live: `<server_dir>\bin` when
-/// `BRINDLE_SERVER_DIR` was given, else `<local_app_data>\brindle\server`.
-pub fn helper_copies(server_dir: Option<&Path>, local_app_data: &Path) -> PathBuf {
+/// `BRINDLE_SERVER_DIR` was given, elevated or not, as that directory is
+/// used as given ([`choose_windows`]); else under `<local_app_data>\brindle`,
+/// in `server`, or in `server-elevated` for an elevated process, so the
+/// copies an elevated server runs are never the ones an unelevated process
+/// wrote.
+pub fn helper_copies(server_dir: Option<&Path>, local_app_data: &Path, elevated: bool) -> PathBuf {
     match server_dir {
         Some(dir) => dir.join("bin"),
-        None => local_app_data.join("brindle").join("server"),
+        None => local_app_data
+            .join("brindle")
+            .join(if elevated { "server-elevated" } else { "server" }),
     }
+}
+
+/// The name a directory an elevated process doesn't trust is set aside
+/// under, beside where it was: `<name>.untrusted-<pid>-<n>`, by process
+/// `pid`'s `n`th, so no two set aside share one. A fresh directory then
+/// takes the name.
+pub fn untrusted_name(name: &str, pid: u32, n: u64) -> String {
+    format!("{name}{UNTRUSTED}{pid}-{n}")
+}
+
+/// What follows a directory's own name in the name it is set aside under
+/// ([`untrusted_name`]).
+const UNTRUSTED: &str = ".untrusted-";
+
+/// Whether `name` is one [`untrusted_name`] gave: a directory set aside,
+/// which a later start may remove.
+pub fn is_untrusted_name(name: &str) -> bool {
+    let Some((original, suffix)) = name.rsplit_once(UNTRUSTED) else {
+        return false;
+    };
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    !original.is_empty()
+        && suffix
+            .split_once('-')
+            .is_some_and(|(pid, n)| number(pid) && number(n))
 }
 
 /// The copy of the helper for one build, in `copies` (see [`helper_copies`]).
@@ -404,16 +438,91 @@ mod tests {
     fn helper_copies_live_beside_the_server_or_under_local_app_data() {
         let local = Path::new("local");
         let dir = Path::new("srv");
-        assert_eq!(helper_copies(Some(dir), local), dir.join("bin"));
+        // Without `BRINDLE_SERVER_DIR`: an elevated process has its own.
         assert_eq!(
-            helper_copies(None, local),
+            helper_copies(None, local, false),
             local.join("brindle").join("server")
         );
-        let copies = helper_copies(Some(dir), local);
+        assert_eq!(
+            helper_copies(None, local, true),
+            local.join("brindle").join("server-elevated")
+        );
+        // With it, the directory is used as given, elevated or not.
+        assert_eq!(helper_copies(Some(dir), local, false), dir.join("bin"));
+        assert_eq!(helper_copies(Some(dir), local, true), dir.join("bin"));
+        let copies = helper_copies(Some(dir), local, false);
         assert_eq!(
             helper_copy(&copies, "b1"),
             dir.join("bin").join("b1").join("brindle-remote.exe")
         );
+        assert_eq!(
+            helper_copy(&helper_copies(None, local, true), "b1"),
+            local
+                .join("brindle")
+                .join("server-elevated")
+                .join("b1")
+                .join("brindle-remote.exe")
+        );
+    }
+
+    /// An elevated process's directories are beside the unelevated ones,
+    /// never the same: its server directory and its helper copies.
+    #[test]
+    fn an_elevated_process_shares_no_directory_with_an_unelevated_one() {
+        let base = || os(r"C:\Users\u\AppData\Local");
+        let local = PathBuf::from(r"C:\Users\u\AppData\Local");
+        assert_ne!(
+            choose_windows(None, base(), true).unwrap(),
+            choose_windows(None, base(), false).unwrap()
+        );
+        assert_ne!(
+            helper_copies(None, &local, true),
+            helper_copies(None, &local, false)
+        );
+    }
+
+    #[test]
+    fn a_directory_is_set_aside_under_its_name_a_pid_and_a_count() {
+        assert_eq!(
+            untrusted_name("server-elevated", 4242, 0),
+            "server-elevated.untrusted-4242-0"
+        );
+        assert_eq!(untrusted_name("1.25.0", 7, 12), "1.25.0.untrusted-7-12");
+        assert_ne!(untrusted_name("bin", 7, 1), untrusted_name("bin", 8, 1));
+        assert_ne!(untrusted_name("bin", 7, 1), untrusted_name("bin", 7, 2));
+        // One set aside again keeps both marks, and is still one.
+        let twice = untrusted_name(&untrusted_name("bin", 7, 1), 9, 0);
+        assert_eq!(twice, "bin.untrusted-7-1.untrusted-9-0");
+        assert!(is_untrusted_name(&twice));
+    }
+
+    #[test]
+    fn only_a_set_aside_name_is_one() {
+        for name in [
+            "server-elevated.untrusted-4242-0",
+            "bin.untrusted-1-18446744073709551615",
+            "1.25.0.untrusted-7-12",
+            "a.b.untrusted-0-0",
+        ] {
+            assert!(is_untrusted_name(name), "{name}");
+        }
+        for name in [
+            "server-elevated",
+            "server",
+            ".untrusted-1-2",
+            "bin.untrusted-",
+            "bin.untrusted-1",
+            "bin.untrusted-1-",
+            "bin.untrusted--2",
+            "bin.untrusted-x-2",
+            "bin.untrusted-1-2x",
+            "bin.untrusted-1-2-3",
+            "bin.UNTRUSTED-1-2",
+            "bin.untrusted-1-2.tmp",
+            "",
+        ] {
+            assert!(!is_untrusted_name(name), "{name:?}");
+        }
     }
 
     #[test]

@@ -94,7 +94,11 @@ fn packaged() -> Result<Api, String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let extract_dir = choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version);
+    // The unelevated extraction, whoever runs this: an elevated holder's
+    // own (`conpty-elevated`) comes with its protected directory
+    // (fix-security-audit-2026-11-20, task 2.5).
+    let extract_dir =
+        choice::extract_dir(std::env::var_os("LOCALAPPDATA").as_deref(), version, false);
     let dir = shipped_dir(exe_dir.as_deref(), extract_dir.as_deref(), files)?;
     let api = load(&dir).map_err(|err| format!("loading it from {}: {err}", dir.display()))?;
     eprintln!(
