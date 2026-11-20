@@ -1714,4 +1714,48 @@ mod on_windows {
         core.hang_up(1);
         core.hung_up(1);
     }
+
+    /// A program named without a directory is looked for in the session's
+    /// `PATH` only: a `cmd.exe` beside the holder's own image, where
+    /// `CreateProcessW` would look first, isn't the one started.
+    #[test]
+    fn a_bare_program_name_is_looked_up_in_path_not_beside_the_holder() {
+        let mut dir = TempDir::new("bare-name");
+        let bin_dir = TempDir::new("bare-name-bin");
+        let copy = bin_dir.path.join("brindle-remote.exe");
+        fs::copy(BIN, &copy).unwrap();
+        // The planted `cmd.exe` prints the machine's name, never the line
+        // the real one is asked to echo.
+        let root = std::env::var("SystemRoot").unwrap();
+        fs::copy(format!(r"{root}\System32\hostname.exe"), bin_dir.path.join("cmd.exe")).unwrap();
+        start(&copy, "hold", &dir.path, &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")]).unwrap();
+        let mut core = TestCore::connect_to(&dir);
+        let holder_pid = core.hello(1).welcome().pid;
+        dir.track(holder_pid);
+
+        core.spawn(shell(1, "echo the-real-cmd-ran"));
+        let (output, code) = core.output_and_exit(1);
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("the-real-cmd-ran"), "{output}");
+        assert_eq!(code, Some(0), "{output}");
+    }
+
+    /// A program named without a directory that no directory of the
+    /// session's `PATH` has fails its spawn, naming the program.
+    #[test]
+    fn a_program_in_no_directory_of_path_fails_its_spawn_naming_it() {
+        let (_dir, mut core, holder_pid) = holder("not-in-path");
+        core.send(ToHolder::Spawn(spawn(1, "brindle-no-such-program", &[])));
+        match core.recv() {
+            ToCore::SpawnFailed(failed) => {
+                assert_eq!(failed.session, 1, "{}", failed.message);
+                assert!(failed.message.contains("brindle-no-such-program"), "{}", failed.message);
+            }
+            other => panic!("expected SPAWN_FAILED, got {other:?}"),
+        }
+        assert!(alive(holder_pid));
+        // The holder carries on with the next spawn.
+        core.spawn(shell(2, "exit 3"));
+        assert_eq!(core.exit_code(2), Some(3));
+    }
 }

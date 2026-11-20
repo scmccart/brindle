@@ -39,6 +39,16 @@ pub fn environment(
         .collect()
 }
 
+/// The value of the variable `name` in the environment `env`, whatever the
+/// case of its name, as Windows reads names; empty when it isn't set. The
+/// holder reads the `PATH` a program is looked up in ([`resolve_program`])
+/// from the environment the program gets.
+pub fn variable<'a>(env: &'a [(String, String)], name: &str) -> &'a str {
+    env.iter()
+        .find(|(set, _)| set.eq_ignore_ascii_case(name))
+        .map_or("", |(_, value)| value.as_str())
+}
+
 /// The command line for `program` and `args`, each argument quoted so that
 /// the MSVC runtime's `CommandLineToArgvW` rules give it back as written.
 pub fn command_line(program: &str, args: &[String]) -> String {
@@ -104,15 +114,17 @@ pub enum Resolved {
 ///   unless `PATH` lists it. A directory `PATH` doesn't spell from a drive
 ///   or a share (`.`, `bin`, an empty entry) is skipped, since it would be
 ///   read against the current directory. A name with no extension is tried
-///   with each extension of `pathext` (`PATHEXT`) in turn, or with `.exe`
-///   when `pathext` gives none.
+///   with `.exe`, then `.com`, in each directory, and with nothing else
+///   `PATHEXT` lists: those are what `CreateProcessW` would have started
+///   for it. A batch file is never found for a bare name, since one is
+///   started through `cmd /c`, which looks its name up again by its own
+///   rules.
 ///
 /// `exists` says whether a path is a file. Paths are text, joined with
 /// `\`, so the same code runs and is tested on every platform.
 pub fn resolve_program(
     name: &str,
     path_var: &str,
-    pathext: &str,
     exists: impl Fn(&str) -> bool,
 ) -> Resolved {
     if name.is_empty() {
@@ -126,7 +138,7 @@ pub fn resolve_program(
     let names: Vec<String> = if name.contains('.') {
         vec![name.to_string()]
     } else {
-        extensions(pathext)
+        EXTENSIONS
             .iter()
             .map(|extension| format!("{name}{extension}"))
             .collect()
@@ -148,17 +160,9 @@ fn has_suffix(name: &str, suffix: &str) -> bool {
         .is_some_and(|end| end.eq_ignore_ascii_case(suffix))
 }
 
-/// The extensions a name with none is tried with: `PATHEXT`'s, `;` between
-/// them and each from its dot, in their order; `.exe`, which is what
-/// `CreateProcessW` adds itself, when it gives none.
-fn extensions(pathext: &str) -> Vec<&str> {
-    let listed: Vec<&str> = pathext
-        .split(';')
-        .map(str::trim)
-        .filter(|extension| extension.len() > 1 && extension.starts_with('.'))
-        .collect();
-    if listed.is_empty() { vec![".exe"] } else { listed }
-}
+/// The extensions a name with none is tried with, in this order within
+/// each directory of `PATH`: the programs `CreateProcessW` starts itself.
+const EXTENSIONS: [&str; 2] = [".exe", ".com"];
 
 /// The directories of a `PATH`: `;` between them, except inside double
 /// quotes, which are dropped.
@@ -433,7 +437,6 @@ mod tests {
 
     use std::cell::RefCell;
 
-    const PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
     const PATH: &str = r"C:\Windows\System32;C:\Windows;C:\Program Files\PowerShell\7";
 
     /// A probe over the files that exist (compared without case, as
@@ -448,10 +451,10 @@ mod tests {
         }
     }
 
-    /// [`resolve_program`] of `name` over [`PATH`] and [`PATHEXT`], when
-    /// only `existing` exist.
+    /// [`resolve_program`] of `name` over [`PATH`], when only `existing`
+    /// exist.
     fn resolve(name: &str, existing: &[&str]) -> Resolved {
-        resolve_program(name, PATH, PATHEXT, files(existing, &RefCell::default()))
+        resolve_program(name, PATH, files(existing, &RefCell::default()))
     }
 
     fn found(path: &str) -> Resolved {
@@ -461,7 +464,7 @@ mod tests {
     #[test]
     fn a_bare_name_is_found_in_path_in_its_order() {
         let pwsh = r"C:\Program Files\PowerShell\7\pwsh.EXE";
-        assert_eq!(resolve("pwsh", &[pwsh]), found(pwsh));
+        assert_eq!(resolve("pwsh", &[pwsh]), found(r"C:\Program Files\PowerShell\7\pwsh.exe"));
         // The first directory of `PATH` that has it wins.
         let (system, windows) = (r"C:\Windows\System32\cmd.exe", r"C:\Windows\cmd.exe");
         assert_eq!(resolve("cmd.exe", &[windows, system]), found(system));
@@ -471,19 +474,38 @@ mod tests {
     }
 
     #[test]
-    fn a_name_with_no_extension_tries_pathext_in_each_directory() {
-        // The extensions in `PATHEXT`'s order, within a directory.
+    fn a_name_with_no_extension_tries_exe_then_com_in_each_directory() {
+        // `.exe` before `.com`, within a directory.
         let (com, exe) = (r"C:\Windows\System32\more.COM", r"C:\Windows\System32\more.EXE");
-        assert_eq!(resolve("more", &[exe, com]), found(com));
+        assert_eq!(resolve("more", &[com, exe]), found(r"C:\Windows\System32\more.exe"));
+        assert_eq!(resolve("more", &[com]), found(r"C:\Windows\System32\more.com"));
         // The directories in `PATH`'s order, before the extensions.
-        let later_com = r"C:\Windows\tool.COM";
-        let earlier_cmd = r"C:\Windows\System32\tool.CMD";
-        assert_eq!(resolve("tool", &[later_com, earlier_cmd]), found(earlier_cmd));
+        let later_exe = r"C:\Windows\tool.EXE";
+        let earlier_com = r"C:\Windows\System32\tool.COM";
+        assert_eq!(resolve("tool", &[later_exe, earlier_com]), found(r"C:\Windows\System32\tool.com"));
         // Every candidate was asked about in that order.
         let asked = RefCell::default();
-        let resolved = resolve_program("x", r"C:\a;C:\b", ".EXE;.CMD", files(&[], &asked));
+        let resolved = resolve_program("x", r"C:\a;C:\b", files(&[], &asked));
         assert_eq!(resolved, Resolved::NotFound);
-        assert_eq!(*asked.borrow(), [r"C:\a\x.EXE", r"C:\a\x.CMD", r"C:\b\x.EXE", r"C:\b\x.CMD"]);
+        assert_eq!(*asked.borrow(), [r"C:\a\x.exe", r"C:\a\x.com", r"C:\b\x.exe", r"C:\b\x.com"]);
+    }
+
+    /// A batch file runs through `cmd /c`, which would look its name up
+    /// again: a bare name never finds one, nor any script `PATHEXT` lists.
+    #[test]
+    fn a_bare_name_never_finds_a_batch_file_or_a_script() {
+        let scripts = [
+            r"C:\Windows\System32\tool.cmd",
+            r"C:\Windows\System32\tool.bat",
+            r"C:\Windows\tool.js",
+            r"C:\Windows\tool.ps1",
+        ];
+        assert_eq!(resolve("tool", &scripts), Resolved::NotFound);
+        // A later directory's program is found past them.
+        let program = r"C:\Program Files\PowerShell\7\tool.exe";
+        let mut with_program = scripts.to_vec();
+        with_program.push(program);
+        assert_eq!(resolve("tool", &with_program), found(program));
     }
 
     #[test]
@@ -491,7 +513,7 @@ mod tests {
         let asked = RefCell::default();
         let existing = [r"C:\Windows\run.cmd.EXE", r"C:\Windows\run.cmd"];
         assert_eq!(
-            resolve_program("run.cmd", PATH, PATHEXT, files(&existing, &asked)),
+            resolve_program("run.cmd", PATH, files(&existing, &asked)),
             found(r"C:\Windows\run.cmd")
         );
         assert_eq!(*asked.borrow(), [r"C:\Windows\System32\run.cmd", r"C:\Windows\run.cmd"]);
@@ -508,14 +530,14 @@ mod tests {
         // What a search of the current directory would find.
         let planted = ["cmd.exe", r".\cmd.exe", "cmd.EXE", r"bin\cmd.exe", r"C:cmd.exe", r"\tools\cmd.exe"];
         let path = r".;;bin;C:tools;\tools;C:\Windows\System32;..";
-        let resolved = resolve_program("cmd.exe", path, PATHEXT, files(&planted, &asked));
+        let resolved = resolve_program("cmd.exe", path, files(&planted, &asked));
         assert_eq!(resolved, Resolved::NotFound);
         // Only the one directory spelled from a drive was looked in.
         assert_eq!(*asked.borrow(), [r"C:\Windows\System32\cmd.exe"]);
 
         // With no `PATH` at all, nothing is searched.
         let asked = RefCell::default();
-        assert_eq!(resolve_program("cmd", "", PATHEXT, files(&planted, &asked)), Resolved::NotFound);
+        assert_eq!(resolve_program("cmd", "", files(&planted, &asked)), Resolved::NotFound);
         assert_eq!(*asked.borrow(), Vec::<String>::new());
     }
 
@@ -528,8 +550,8 @@ mod tests {
             assert!(!is_rooted(dir), "{dir:?}");
         }
         // A share's directory is searched like a drive's.
-        let tool = r"\\server\tools\tool.EXE";
-        assert_eq!(resolve_program("tool", r"\\server\tools", PATHEXT, files(&[tool], &RefCell::default())), found(tool));
+        let tool = r"\\server\tools\tool.exe";
+        assert_eq!(resolve_program("tool", r"\\server\tools", files(&[tool], &RefCell::default())), found(tool));
     }
 
     #[test]
@@ -537,23 +559,12 @@ mod tests {
         assert_eq!(path_dirs(r#"C:\a;"C:\b;c";C:\d"#), [r"C:\a", r"C:\b;c", r"C:\d"]);
         assert_eq!(path_dirs(r#""C:\Program Files"\x;;C:\y"#), [r"C:\Program Files\x", "", r"C:\y"]);
         assert_eq!(path_dirs(""), [""]);
-        let tool = r"C:\b;c\tool.EXE";
-        assert_eq!(resolve_program("tool", r#"C:\a;"C:\b;c""#, PATHEXT, files(&[tool], &RefCell::default())), found(tool));
+        let tool = r"C:\b;c\tool.exe";
+        assert_eq!(resolve_program("tool", r#"C:\a;"C:\b;c""#, files(&[tool], &RefCell::default())), found(tool));
         // The separator a directory ends with isn't doubled.
         let asked = RefCell::default();
-        resolve_program("x.exe", r"C:\a\;C:/b/;C:\", PATHEXT, files(&[], &asked));
+        resolve_program("x.exe", r"C:\a\;C:/b/;C:\", files(&[], &asked));
         assert_eq!(*asked.borrow(), [r"C:\a\x.exe", "C:/b/x.exe", r"C:\x.exe"]);
-    }
-
-    #[test]
-    fn a_pathext_that_gives_no_extension_means_exe() {
-        assert_eq!(extensions(PATHEXT), [".COM", ".EXE", ".BAT", ".CMD"]);
-        assert_eq!(extensions(" .exe ; .cmd;"), [".exe", ".cmd"]);
-        // Entries that aren't extensions are no entries.
-        assert_eq!(extensions("exe;.;;cmd"), [".exe"]);
-        assert_eq!(extensions(""), [".exe"]);
-        let cmd = r"C:\Windows\System32\cmd.exe";
-        assert_eq!(resolve_program("cmd", PATH, "", files(&[cmd], &RefCell::default())), found(cmd));
     }
 
     #[test]
@@ -572,7 +583,7 @@ mod tests {
             "C:pwsh.exe",
         ];
         for name in named {
-            assert_eq!(resolve_program(name, PATH, PATHEXT, files(&elsewhere, &asked)), found(name), "{name}");
+            assert_eq!(resolve_program(name, PATH, files(&elsewhere, &asked)), found(name), "{name}");
         }
         // A name that ends in `.exe` is the file: nothing is asked.
         assert_eq!(*asked.borrow(), Vec::<String>::new());
@@ -582,7 +593,7 @@ mod tests {
     fn a_name_with_a_directory_and_no_exe_takes_it_when_that_file_exists() {
         let asked = RefCell::default();
         let existing = [r"C:\msys64\usr\bin\bash.exe", r"C:\tools\run.cmd"];
-        let resolve = |name: &str| resolve_program(name, PATH, PATHEXT, files(&existing, &asked));
+        let resolve = |name: &str| resolve_program(name, PATH, files(&existing, &asked));
         assert_eq!(resolve(r"C:\msys64\usr\bin\bash"), found(r"C:\msys64\usr\bin\bash.exe"));
         // Another extension stays, since no `run.cmd.exe` exists.
         assert_eq!(resolve(r"C:\tools\run.cmd"), found(r"C:\tools\run.cmd"));
@@ -672,5 +683,17 @@ mod tests {
             environment(&BTreeMap::new(), false, vars(&[("A", "1")])),
             vars(&[("A", "1")])
         );
+    }
+
+    #[test]
+    fn a_variable_is_read_by_its_name_in_any_case() {
+        let env = vars(&[("Path", r"C:\tools"), ("PATHEXT", ".COM;.EXE"), ("Empty", "")]);
+        assert_eq!(variable(&env, "PATH"), r"C:\tools");
+        assert_eq!(variable(&env, "path"), r"C:\tools");
+        assert_eq!(variable(&env, "PathExt"), ".COM;.EXE");
+        assert_eq!(variable(&env, "EMPTY"), "");
+        // An unset one reads as empty, which searches nothing.
+        assert_eq!(variable(&env, "COMSPEC"), "");
+        assert_eq!(resolve_program("cmd.exe", variable(&env, "COMSPEC"), |_| true), Resolved::NotFound);
     }
 }

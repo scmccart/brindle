@@ -59,7 +59,8 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
 ### 3. Bare program names: an explicit PATH search
 
 `CreateProcessW` with a bare name searches the calling image's directory first, which is the helper copy's directory. The holder now resolves a bare name itself:
-- **The pure part.** `conpty::cmdline::resolve_program(name, path_var, pathext, exists: impl Fn(&str) -> bool) -> Resolved` returns an enum, `Resolved::{Found(String), NotFound}`. It walks `PATH` (and `PATHEXT` when the name has no extension). It is tested on every platform, with `str` paths as the Windows pitfall note asks.
+- **The pure part.** `conpty::cmdline::resolve_program(name, path_var, exists: impl Fn(&str) -> bool) -> Resolved` returns an enum, `Resolved::{Found(String), NotFound}`. It walks `PATH`, trying a name with no extension with `.exe` and then `.com` in each directory. It is tested on every platform, with `str` paths as the Windows pitfall note asks.
+- **Only `.exe` and `.com`, not `PATHEXT`.** A batch file found for a bare name would not be the file that runs: `CreateProcessW` starts a `.cmd` or `.bat` as `cmd /c <command line>`, and cmd looks the line's first word up again by its own rules (checked on Windows). Other `PATHEXT` entries (`.js`, `.vbs`) aren't programs and fail with `ERROR_BAD_EXE_FORMAT`. The old `CreateProcessW(NULL, "foo")` only ever added `.exe`, so nothing that started before stops starting.
 - **The seam.** `pty.rs` passes its absolute result as the application name.
 - **When nothing is found,** the session fails with `SPAWN_FAILED`, naming the program, as an unknown program does today.
 

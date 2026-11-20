@@ -145,12 +145,16 @@ impl Pseudoconsole {
         Ok(Reparented::Done)
     }
 
-    /// Starts the program of the command line `line` (see
+    /// Starts the file `application` with the command line `line` (see
     /// [`super::cmdline`]) on this pseudoconsole, in `cwd` (this process's
-    /// directory when `None`), with exactly the environment `env`. Closing
-    /// the pseudoconsole waits for it to be on the console.
+    /// directory when `None`), with exactly the environment `env`.
+    /// `application` is the program's complete file name
+    /// ([`super::cmdline::resolve_program`]): `CreateProcessW` runs it as
+    /// given, searching nowhere. Closing the pseudoconsole waits for the
+    /// program to be on the console.
     pub fn start<'a>(
         &mut self,
+        application: &str,
         line: &str,
         cwd: Option<&Path>,
         env: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -190,6 +194,7 @@ impl Pseudoconsole {
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         startup.lpAttributeList = list.0;
 
+        let application: Vec<u16> = application.encode_utf16().chain(Some(0)).collect();
         let mut line: Vec<u16> = line.encode_utf16().chain(Some(0)).collect();
         let env = environment_block(env);
         let cwd = cwd.map(|dir| wide(dir.as_os_str()));
@@ -198,7 +203,7 @@ impl Pseudoconsole {
         // buffer is writable, as CreateProcessW requires.
         unsafe {
             CreateProcessW(
-                PCWSTR::null(),
+                PCWSTR(application.as_ptr()),
                 Some(PWSTR(line.as_mut_ptr())),
                 None,
                 None,
@@ -361,6 +366,12 @@ mod tests {
     use super::super::cmdline::launch_line;
     use super::*;
 
+    /// The system's `cmd.exe`, by its full name.
+    fn cmd_exe() -> String {
+        let root = std::env::var("SystemRoot").unwrap();
+        format!(r"{root}\System32\cmd.exe")
+    }
+
     fn pipe() -> (OwnedHandle, OwnedHandle) {
         let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
         // SAFETY: CreatePipe fills both handles; they aren't inheritable.
@@ -410,6 +421,7 @@ mod tests {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         let process = console
             .start(
+                &cmd_exe(),
                 &launch_line("cmd.exe", &args),
                 Some(&std::env::temp_dir()),
                 env.iter().map(|(name, value)| (name.as_str(), value.as_str())),
