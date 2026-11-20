@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Opening links
-A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. When the `BRINDLE_LINK_OPENER` environment variable is set, Brindle SHALL pass the link as a single argument to the program it names. Otherwise it SHALL pass the link as a single argument to `xdg-open` on Linux, and on Windows have the shell open it with the link's default handler. It SHALL do this without waiting for it to finish. Brindle SHALL open a link, detected or OSC 8, only when its scheme is one of those "URL detection" names, compared without case. It SHALL open a `file:` link only when its host is empty, `localhost` or this machine's name. On Windows, a `file:` link to anything but a directory SHALL be shown selected in Explorer instead of opened, and double quotes and whitespace in a link SHALL be percent-encoded before it reaches the shell. When Brindle doesn't open a clicked link, or the opener can't be started or reports a failure, the tab that was clicked SHALL say so in one dim line naming the link and the cause.
+A left click with ctrl held (without alt) on a link SHALL open the link when the button is released over the same link. When the `BRINDLE_LINK_OPENER` environment variable is set, Brindle SHALL pass the link as a single argument to the program it names. Otherwise it SHALL pass the link as a single argument to `xdg-open` on Linux, and on Windows have the shell open it with the link's default handler. It SHALL do this without waiting for it to finish. Brindle SHALL open a link, detected or OSC 8, only when its scheme is one of those "URL detection" names, compared without case. It SHALL open a `file:` link only when its host is empty, `localhost` or this machine's name. On Windows, a `file:` link whose path isn't on a drive letter (`X:\…`) SHALL NOT be opened, a `file:` link to anything but a directory SHALL be shown selected in Explorer instead of opened, and double quotes and whitespace in a link SHALL be percent-encoded before it reaches the shell. When Brindle doesn't open a clicked link, or the opener can't be started or reports a failure, the tab that was clicked SHALL say so in one dim line naming the link and the cause.
 
 #### Scenario: Ctrl-click
 - **WHEN** the user ctrl-clicks `https://example.com` in a shell
@@ -42,6 +42,10 @@ A left click with ctrl held (without alt) on a link SHALL open the link when the
 #### Scenario: Local file link on Windows
 - **WHEN** a program in a Windows tab prints an OSC 8 hyperlink to `file:///C:/Users/me/tool.exe`, and the user ctrl-clicks it
 - **THEN** Explorer shows `tool.exe` selected in `C:\Users\me`, and the program doesn't run
+
+#### Scenario: File link with no drive on Windows
+- **WHEN** a program in a Windows tab prints an OSC 8 hyperlink whose URI is `file:shell:AppsFolder` or `file:///etc/hosts`, and the user ctrl-clicks it
+- **THEN** nothing is opened, Explorer isn't started, and the tab says the link was not opened because its path isn't on a drive letter
 
 #### Scenario: Quotes in a link on Windows
 - **WHEN** a program in a Windows tab prints an OSC 8 hyperlink whose URI is `https://example.com/" --flag`, and the user ctrl-clicks it
