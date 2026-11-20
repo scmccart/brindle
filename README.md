@@ -678,7 +678,9 @@ reports the current directory (OSC 7). On Windows, where Brindle can't read
 another program's directory, that report is what a new tab and a restored tab
 start in; without it they start in your home directory. Tools that report the
 directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
-the like, when configured to) work the same way.
+the like, when configured to) work the same way. Only a directory on a drive
+letter counts: a report of a network path (`\\server\share`) or a device path
+is ignored, so map a drive to have new tabs follow you there.
 
 The same scripts are in [`shell-integration/`](shell-integration/) if you'd rather
 `source` a file. Brindle never edits your startup files or injects the scripts
