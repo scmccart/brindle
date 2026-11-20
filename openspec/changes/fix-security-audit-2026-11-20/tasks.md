@@ -13,16 +13,16 @@
 ## 2. Shared crates and server roles
 
 - [x] 2.1 Make the core's emulator sizes go through the clamped `emulator::size` for `SPAWN`, `RESIZE` and adoption. Verify with a `remote-agent/tests/core.rs` test that spawns at 65535×65535 and gets a session listed at 2048×1024.
-- [ ] 2.2 Implement `win::protected_dir(path, Contents)` in `remote-protocol/src/win.rs`:
+- [x] 2.2 Implement `win::protected_dir(path, Contents)` in `remote-protocol/src/win.rs`:
   - it opens with `FILE_FLAG_OPEN_REPARSE_POINT` and without `FILE_SHARE_DELETE`, and refuses reparse points;
   - it checks the result with `matches_elevated` and `GetFinalPathNameByHandleW`;
   - a mismatch under `Executables` renames the directory aside and remakes it, and a mismatch under `State` re-protects it and deletes reparse points inside;
   - it returns the held `ProtectedDir`.
 
   Verify with a Windows test in `remote-agent/tests/launch.rs` that a planted junction and a user-owned directory are each replaced, and that renaming the held directory or its parent from a Medium token fails. The test skips through `skip(Capability, …)` when not elevated.
-- [ ] 2.3 Use `protected_dir` for the elevated server directory (`remote-agent/src/server/platform/windows/dir.rs`, `State`) and the elevated helper copies (`win::ensure_helper_copy`, `Executables`), holding the handle for the role's life. Verify with a Windows test that a planted `brindle-remote.exe` in the elevated copies location is never run.
-- [ ] 2.4 Make `prune_helper_copies` and the start-up removal of `*.untrusted-*` directories skip reparse points without descending. Verify with a Windows test that a junction among the copies leaves its target untouched.
-- [ ] 2.5 Extract and load the elevated ConPTY files from a held `conpty-elevated\<version>` (`remote-agent/src/conpty/{choice,api}.rs`). Verify with a Windows test that an elevated holder's `OpenConsole.exe` path is inside the protected directory.
+- [x] 2.3 Use `protected_dir` for the elevated server directory (`remote-agent/src/server/platform/windows/dir.rs`, `State`) and the elevated helper copies (`win::ensure_helper_copy`, `Executables`), holding the handle for the role's life. Verify with a Windows test that a planted `brindle-remote.exe` in the elevated copies location is never run.
+- [x] 2.4 Make `prune_helper_copies` and the start-up removal of `*.untrusted-*` directories skip reparse points without descending. Verify with a Windows test that a junction among the copies leaves its target untouched.
+- [x] 2.5 Extract and load the elevated ConPTY files from a held `conpty-elevated\<version>` (`remote-agent/src/conpty/{choice,api}.rs`). Verify with a Windows test that an elevated holder's `OpenConsole.exe` path is inside the protected directory.
 - [x] 2.6 Resolve bare program names in `remote-agent/src/server/platform/windows/pty.rs` with `resolve_program` and pass the absolute application name. Verify with a Windows `remote-agent/tests/holder.rs` test that a `cmd.exe` placed beside the helper copy isn't the one started, and that an unknown name gives `SPAWN_FAILED` naming it.
 
 ## 3. Brindle's client and entities
@@ -34,7 +34,7 @@
   - Keep a directory recorded for this machine only when it is absolute in the local path style (`shell_integration::is_absolute_path`, the rule `reported_dir` uses), in `session::resolve_tab`, before it is probed.
 
   Verify with `cargo test -p brindle terminal`, unit tests in `session.rs` for the recorded-directory rule and in `remote/local/session.rs` for the thread the request is made on, and confirm by reading the code that `record_session`, `new_tab_cwd` and splits check no directory on the UI thread. The restore probe (`Workspace::restore` → `session::resolve_tab`) stays on the UI thread, limited to drive-letter paths: see design.md's Risks.
-- [ ] 3.3 Use the elevated, held `server-elevated` copy in `src/remote/local/windows.rs` when Brindle is elevated. Verify with `cargo clippy` on Windows CI and the existing `windows-*` e2e cases.
+- [x] 3.3 Use the elevated, held `server-elevated` copy in `src/remote/local/windows.rs` when Brindle is elevated. Verify with `cargo clippy` on Windows CI and the existing `windows-*` e2e cases.
 - [x] 3.4 Apply `links::plan` in `links::open`: `Reveal` runs `explorer.exe /select,<path>` on the opener thread, and opens a directory instead. Word the new refusals in `links::failure_text`. Verify with unit tests for the wording, and update the e2e `links` case to ctrl-click an `ms-settings:` OSC 8 link and expect the dim refusal line.
 - [x] 3.5 Make the Windows `instance::forward` open with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, call `win::check_server` before writing, and return a refusal string. Make the Linux `forward` check `SO_PEERCRED` against the effective uid. Verify with a pure test of the refusal wording, and a Linux test that a socket served by a peer of another uid is refused, skipping when it can't make one.
 

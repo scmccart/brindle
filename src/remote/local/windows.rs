@@ -43,7 +43,7 @@ pub use super::pipe::{Stream, address, connect};
 pub use super::pipe::Listener;
 use super::{Endpoint, Start};
 use crate::remote::protocol::environment::environment_block;
-use crate::remote::protocol::win;
+use crate::remote::protocol::win::{self, Contents};
 use crate::terminal::cmdline::merge_environment;
 
 /// How long the trampoline may take to exit, and its stderr to end, once
@@ -62,8 +62,23 @@ fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
 /// Runs the per-build copy of the helper as `launch serve --ready-handle N`,
 /// with the endpoint's role variables over this process's environment, and
 /// waits up to `limit` for the core's ready byte.
+///
+/// An elevated Brindle's copies' directory is made or checked for
+/// Administrators and SYSTEM only and held until the core has answered, so
+/// the copy it runs is never one an unelevated process wrote or swapped
+/// (the core holds it from then on).
 pub fn start(endpoint: &Endpoint, limit: Duration) -> Result<Start> {
     let environment = role_environment(endpoint)?;
+    let _held = endpoint
+        .protect_copies
+        .then(|| win::protected_dir(&endpoint.copies, Contents::Executables))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "terminal server didn't start: can't use the elevated helper copies' directory {}",
+                endpoint.copies.display()
+            )
+        })?;
     let copy = win::ensure_helper_copy(&endpoint.helper, &endpoint.copies).with_context(|| {
         format!(
             "terminal server didn't start: can't copy {} to {}",
