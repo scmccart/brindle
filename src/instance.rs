@@ -294,15 +294,20 @@ mod imp {
 mod imp {
     use super::*;
     use std::fs::File;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::HSTRING;
+
+    use crate::remote::protocol::win;
 
     /// `\\.\pipe\<name>-<user>` ([`pipe_name_for`]). The pipe's default
     /// security lets only its owner (and administrators) write to it.
@@ -372,11 +377,22 @@ mod imp {
         Ok(PathBuf::from(name))
     }
 
+    /// Sends `request` to the instance's pipe. The pipe is opened so that
+    /// its server can identify this launch but not act as it
+    /// (`SECURITY_IDENTIFICATION`), and before anything is sent its server
+    /// must run as this user at this integrity level
+    /// ([`win::check_server`]): a pipe of that name made by another
+    /// process, or by this user's Brindle at another level, gets nothing.
     pub fn forward(state_dir: &Path, request: &Request) -> Result<(), String> {
         let name = pipe_name(state_dir);
         let deadline = Instant::now() + FORWARD_LIMIT;
         let pipe = loop {
-            match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0)
+                .open(&name);
+            match opened {
                 Ok(pipe) => break pipe,
                 Err(e) if Instant::now() < deadline => {
                     log::debug!("connecting to {name}: {e}");
@@ -385,8 +401,10 @@ mod imp {
                 Err(e) => return Err(format!("could not reach the running Brindle at {name}: {e}")),
             }
         };
+        win::check_server(&pipe).map_err(|why| not_sent(&name, why))?;
         // Windows lets a process take the foreground only when the one that
-        // has it allows it: this launch has it, so it lets the instance.
+        // has it allows it: this launch has it, so it lets the instance,
+        // once it is known to be this user's own.
         let mut pid = 0;
         // SAFETY: the pipe handle is live and `pid` is a plain out parameter.
         if unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }.is_ok() {
@@ -548,6 +566,29 @@ mod tests {
         let error = imp::forward_to(&socket, &request).unwrap_err();
         let expected = format!("not sending the launch to {}: it is served by another user (uid ", socket.display());
         assert!(error.starts_with(&expected), "{error}");
+    }
+
+    /// A launch reaches an instance of its own user and level: the pipe's
+    /// check of its server, made before the request is written, lets this
+    /// process's own listener through, and the answer comes back.
+    #[cfg(windows)]
+    #[test]
+    fn a_forwarded_request_reaches_the_handler_through_the_checked_pipe() {
+        let state = std::env::temp_dir().join(format!("brindle-instance-win-test-{}", std::process::id()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        imp::listen(
+            &state,
+            Box::new(move |request: Request| {
+                let refuse = request.attach == Some(0);
+                tx.send(request).unwrap();
+                if refuse { Err("no such session".into()) } else { Ok(()) }
+            }),
+        )
+        .unwrap();
+        let request = Request { profile: Some("p".into()), ..Default::default() };
+        assert_eq!(forward(&state, &request), Ok(()));
+        assert_eq!(rx.recv().unwrap(), request);
+        assert_eq!(forward(&state, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
     }
 
     #[cfg(unix)]
