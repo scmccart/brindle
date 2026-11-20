@@ -40,8 +40,8 @@
 
 ## 4. Integration
 
-- [ ] 4.1 Run `cargo test --workspace`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo test -p brindle --test architecture`, and verify all pass.
-- [ ] 4.2 Run `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` on Linux, and the Windows e2e cases on Windows CI, and verify both pass.
+- [x] 4.1 Run `cargo test --workspace`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo test -p brindle --test architecture`, and verify all pass.
+- [x] 4.2 Run `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e` on Linux, and the Windows e2e cases on Windows CI, and verify both pass.
 - [ ] 4.3 Manual checks on Windows, handed to the user:
   - an elevated Brindle opens a local tab, and an unelevated `New-Item` into `server-elevated` is denied;
   - ctrl-clicking a `file:///C:/…/x.exe` OSC 8 link shows it selected in Explorer;
