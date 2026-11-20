@@ -72,6 +72,8 @@ OPTIONS:
                                  detached session ID (see brindle-remote list)
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
+        --export-ui-tokens       Print the built-in themes' UI tokens as CSS
+                                 (shadcn/ui variable names) and exit
         --shell-integration <SHELL>
                                  Print the bash, zsh, fish or pwsh (PowerShell)
                                  integration script (OSC 133 prompt marks) and
@@ -320,6 +322,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 for name in theme::BUILTIN_THEMES {
                     println!("{name}");
                 }
+                std::process::exit(0);
+            }
+            "--export-ui-tokens" => {
+                console_output();
+                print!("{}", theme::ui_tokens_css(env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             "--shell-integration" => {
