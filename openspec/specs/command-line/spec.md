@@ -41,7 +41,9 @@ An unknown argument, an option given without the value it takes (`-e` without a 
 - **THEN** Brindle prints usage naming the option and exits with status 2, without opening a window
 
 ### Requirement: Informational options
-`--help`, `--version`, `--list-actions` (every bindable action name), `--list-themes` (the built-in themes) and `--shell-integration <bash|zsh|fish|pwsh>` (that shell's integration script) SHALL print their output and exit without opening a window. `--shell-integration` with a missing or unsupported shell SHALL print an error naming the supported shells and exit with status 2.
+`--help`, `--version`, `--list-actions` (every bindable action name), `--list-themes` (the built-in themes), `--export-ui-tokens` (the built-in themes' UI tokens as CSS) and `--shell-integration <bash|zsh|fish|pwsh>` (that shell's integration script) SHALL print their output and exit without opening a window. `--shell-integration` with a missing or unsupported shell SHALL print an error naming the supported shells and exit with status 2.
+
+`--export-ui-tokens` SHALL print, for each built-in theme, a CSS rule setting shadcn/ui's custom properties (`--background`, `--foreground`, `--card`, `--card-foreground`, `--popover`, `--popover-foreground`, `--primary`, `--primary-foreground`, `--secondary`, `--secondary-foreground`, `--muted`, `--muted-foreground`, `--accent`, `--accent-foreground`, `--destructive`, `--destructive-foreground`, `--border`, `--input`, `--ring`, `--radius`) to the tokens Brindle's chrome draws with in that theme, and the theme's terminal colours (`--terminal-background`, `--terminal-foreground`, `--terminal-cursor`, `--terminal-selection`, `--terminal-ansi-0` to `--terminal-ansi-15`). Each rule SHALL match `[data-theme="NAME"]`; the `brindle-light` rule SHALL also match `:root` and the `brindle-dark` rule `.dark`, and the `.dark` rule SHALL come after the `:root` rule.
 
 #### Scenario: List actions
 - **WHEN** the user runs `brindle --list-actions`
@@ -54,6 +56,10 @@ An unknown argument, an option given without the value it takes (`-e` without a 
 #### Scenario: Print the PowerShell script
 - **WHEN** the user runs `brindle --shell-integration pwsh`
 - **THEN** the PowerShell integration script is printed and the process exits 0 without opening a window
+
+#### Scenario: Export UI tokens
+- **WHEN** the user runs `brindle --export-ui-tokens`
+- **THEN** a CSS rule per built-in theme is printed, `brindle-dark`'s setting `--primary` to its accent `#e6a756`, and the process exits 0 without opening a window
 
 ### Requirement: Debug automation hooks
 For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--action <NAME>`, `--hover <POS>`, `--click <POS>`, `--find <TEXT>` and `--wait-for <TEXT>` steps. Steps SHALL run in command-line order, one second apart, against the window's active tab. `--step-interval <SECONDS>` SHALL space them that many seconds apart instead, with half that interval before the first step, and SHALL be rejected with a usage error unless it is a positive number:
