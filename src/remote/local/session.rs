@@ -3,12 +3,14 @@
 //! opens.
 //!
 //! [`Session::start`] and [`Session::attach`] return at once: connecting
-//! (starting a core if needed, or reconnecting), an upgrade's step-down and
-//! the `SPAWN` or `ATTACH` itself all happen on a thread of their own, so
-//! opening a tab never blocks the UI thread. Input and resizes made
-//! meanwhile are kept, and go out in order once the core reports the
-//! session. A failure goes to the sink, which shows it in the tab. A tab
-//! closed while its request waits for a connection withdraws the request.
+//! (starting a core if needed, or reconnecting), an upgrade's step-down,
+//! saying what a spawn asks for (which may look at this machine's
+//! directories) and the `SPAWN` or `ATTACH` itself all happen on a thread
+//! of their own, so opening a tab never blocks the UI thread. Input and
+//! resizes made meanwhile are kept, and go out in order once the core
+//! reports the session. A failure goes to the sink, which shows it in the
+//! tab. A tab closed while its request waits for a connection withdraws
+//! the request.
 
 use std::sync::Arc;
 
@@ -113,7 +115,11 @@ impl Phase {
 
 /// What the session's thread asks the core for.
 enum Start {
-    Spawn(SpawnRequest),
+    /// What to spawn, said on the session's thread once it is connected:
+    /// saying it may mean looking at this machine (whether the directory
+    /// to start in exists), which must not hold up the thread that opened
+    /// the tab.
+    Spawn(Box<dyn FnOnce() -> SpawnRequest + Send>),
     Attach(AttachRequest),
 }
 
@@ -141,18 +147,37 @@ pub struct Session {
 
 impl Session {
     /// Starts a session on `host`, through the process's connection to it.
-    pub fn start(host: Host, request: SpawnRequest, sink: Box<dyn SessionSink>) -> Self {
-        Self::start_with(move || super::shared(&host), request, sink)
+    /// `request` says what to spawn, and is called on the session's own
+    /// thread, once it is connected: what it has to look at on this
+    /// machine never holds up the caller.
+    pub fn start(
+        host: Host,
+        request: impl FnOnce() -> SpawnRequest + Send + 'static,
+        sink: Box<dyn SessionSink>,
+    ) -> Self {
+        Self::start_deciding(move || super::shared(&host), request, sink)
     }
 
-    /// Starts a session in the connection `connect` gives, on a thread of
-    /// its own.
+    /// Starts a session for `request` in the connection `connect` gives,
+    /// on a thread of its own: the tests' way in, with a connection of
+    /// their own and a request that needs nothing looked at.
+    #[cfg(test)]
     pub fn start_with(
         connect: impl FnOnce() -> Result<Arc<Connection>> + Send + 'static,
         request: SpawnRequest,
         sink: Box<dyn SessionSink>,
     ) -> Self {
-        Self::begin(connect, Start::Spawn(request), sink)
+        Self::start_deciding(connect, move || request, sink)
+    }
+
+    /// Starts a session in the connection `connect` gives, on a thread of
+    /// its own, where `request` says what to spawn ([`Session::start`]).
+    fn start_deciding(
+        connect: impl FnOnce() -> Result<Arc<Connection>> + Send + 'static,
+        request: impl FnOnce() -> SpawnRequest + Send + 'static,
+        sink: Box<dyn SessionSink>,
+    ) -> Self {
+        Self::begin(connect, Start::Spawn(Box::new(request)), sink)
     }
 
     /// Attaches a detached session on `host`, through the process's
@@ -333,7 +358,7 @@ fn run(
             anyhow::bail!("closed before it started");
         }
         match start {
-            Start::Spawn(request) => connection.spawn(request, sink.clone(), Some(abandon)),
+            Start::Spawn(request) => connection.spawn(request(), sink.clone(), Some(abandon)),
             Start::Attach(request) => connection.attach(request, sink.clone(), Some(abandon)),
         }
     });
@@ -1007,6 +1032,39 @@ mod tests {
         assert_eq!(x.bytes, b"x");
         session.close();
         assert!(matches!(next(), ToCore::Close(close) if close.session == 7));
+    }
+
+    /// What a spawn asks for is said on the session's thread, once it is
+    /// connected, and never on the thread that opened the tab: so whatever
+    /// saying it looks at on this machine holds nothing else up.
+    #[test]
+    fn a_spawns_request_is_said_on_the_sessions_thread_once_it_is_connected() {
+        let dir = temp_dir("request-thread");
+        let (core, welcome) = slow_core(&dir);
+        let endpoint = Endpoint::at(dir.join("unused"), dir.to_path_buf());
+        let (tx, _seen) = mpsc::channel();
+        let (said_on, said) = mpsc::channel();
+        let session = Session::start_deciding(
+            move || {
+                let connected = connect(&endpoint, "tok")?;
+                Connection::start(endpoint, "tok", connected)
+            },
+            move || {
+                said_on.send(std::thread::current().id()).unwrap();
+                SpawnRequest { cwd: Some("/checked/there".into()), ..request() }
+            },
+            Box::new(Recorder(tx)),
+        );
+        // The core holds its WELCOME, so the session isn't connected:
+        // nothing was said yet, here or there.
+        assert!(said.try_recv().is_err());
+        welcome.send(()).unwrap();
+
+        let ToCore::Spawn(spawn) = recv(&core) else { panic!("not SPAWN") };
+        assert_eq!(spawn.cwd.as_deref(), Some("/checked/there"));
+        let thread = said.recv_timeout(limit(Duration::from_secs(10))).unwrap();
+        assert_ne!(thread, std::thread::current().id());
+        session.close();
     }
 
     /// 6.1: a session keeps the last `PROCESS` for it, from the one the

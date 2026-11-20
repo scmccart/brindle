@@ -22,9 +22,16 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
   - Because the parser is in `term-core`, the core's emulator applies the same rule. A UNC directory then never reaches the core's replay either, which keeps client and core tracking identical.
   - Alternative: filter at `Terminal::working_directory`. Rejected, because every other reader of `Marks::reported_dir` (the record, `new_tab_cwd`, splits, the core) would still need the same check.
 - **The off-thread check.** The existence check moves into a GPUI-free model in `src/terminal/` (`DirCheck`, pure, with unit tests). It records the reported path last checked, and the outcome as a closed enum `Checked::{Exists(PathBuf), Missing, Pending}`. When the reported directory changes, the model says to check it. The `Terminal` entity runs `is_dir` on the background executor and gives the result back to the model.
-  - `working_directory()` only reads the model: an existing directory, or `None` while pending or missing. So `record_session`, `new_tab_cwd` and splits do no I/O on the UI thread (`process` R13).
-  - The model starts at most one check per terminal at a time. A report that arrives during a check is checked after it, and only the latest is kept.
+  - `working_directory()` only reads the model: an existing directory, or `None` while pending or missing. So `record_session` and `new_tab_cwd` do no I/O on the UI thread (`process` R13).
+  - The model starts at most one check per terminal at a time. A report that arrives during a check is checked after it, and only the latest is kept. A directory reported again is not checked again.
+  - Where the directory comes from is the seam's to say: `process::LOCAL_DIRECTORY` is `Reported` on Windows and `Process` elsewhere, so the terminal's code has no `cfg` for it and builds on every platform.
   - Alternative: a timeout around `is_dir` on the UI thread. Rejected, because any wait there is a freeze.
+- **The check when a tab or split starts.** `Terminal::spawn` probed the directory a new tab or split starts in on the UI thread, through `spawn_request`'s `is_dir`. A directory that passed its check and whose drive then stopped answering would still freeze the window there. The probe moves to the thread that already starts the session:
+  - `spawn_request` (pure) names the directory without checking it.
+  - `Session::start` takes the request as a closure and calls it on its own thread, once connected. For a session on this machine the closure probes the directory and passes the result to `with_checked_dir` (pure), which leaves out a directory that isn't one. The outcome is the same as before: the program starts in the server's default directory.
+  - A remote host's directory is a path on that host and is never probed here, as before.
+  - Nothing changes on the wire or in the order of messages.
+- **Recorded directories.** A state file written before this change can still hold a UNC path that a program reported. `session::resolve_tab` therefore keeps a directory recorded for this machine only when it is absolute in this machine's path style, before it probes it. The rule is the parser's own, exposed as one function, `shell_integration::is_absolute_dir`, so the two can't drift.
 
 ### 2. Elevated files on Windows: protected directories, held open
 
@@ -97,6 +104,8 @@ How it fits into the rest of the code:
   - Mitigation: the message names the cause. The old behaviour silently ran the request without elevation, which wasn't what the user asked for.
 - **Very wide grids are capped.** A legitimate grid wider than 2048 columns or taller than 1024 rows (a tiny font on a huge display) is capped.
   - Mitigation: the program sees the capped size through `TIOCSWINSZ` or ConPTY, as it would with `MIN_COLS`.
+- **The restore probe stays on the UI thread.** `Workspace::restore` still asks `is_dir` there, once for each recorded directory, through `session::resolve_tab`. With the recorded-directory rule it only sees drive-letter paths on Windows, so no host is contacted, but a mapped drive that has stopped answering can delay one launch.
+  - Mitigation: a follow-up change moves this probe off the UI thread.
 
 ## Migration Plan
 
