@@ -126,6 +126,9 @@ pub enum Refusal {
     /// A `file:` link that names another host than this machine, as its
     /// host or as a network or device path.
     OtherHost(String),
+    /// A `file:` link on Windows whose path isn't on a drive letter: no
+    /// file's path, but whatever else the shell would make of it.
+    NoDrive,
 }
 
 /// What a click on a link does.
@@ -134,9 +137,9 @@ pub enum Plan {
     /// The opener gets the link, with each double quote and whitespace
     /// character percent-encoded.
     Open(String),
-    /// A `file:` link on Windows: its path, to show selected in Explorer
-    /// (a directory is opened there). It is never handed to the shell to
-    /// open, which would run a program.
+    /// A `file:` link on Windows: its path, on a drive letter, to show
+    /// selected in Explorer (a directory is opened there). It is never
+    /// handed to the shell to open, which would run a program.
     Reveal(String),
     Refuse(Refusal),
 }
@@ -150,9 +153,11 @@ pub enum Plan {
 ///   of `C:\tool.exe`).
 /// - A `file:` link is taken only when its host is empty, `localhost` or
 ///   `this_host`, this machine's name.
-/// - With `windows`, a `file:` link's path is shown in Explorer, and one
-///   that is a network or device path (`\\host\share`, `\\?\…`) is refused
-///   like another host.
+/// - With `windows`, a `file:` link's path is shown in Explorer, and only
+///   a path on a drive letter (`C:\…`) is one: Explorer is given nothing
+///   else. A network or device path (`\\host\share`, `\\?\…`) is refused
+///   like another host, and any other (`shell:…`, a path with no drive)
+///   as no file's path, since the shell reads more than paths.
 pub fn plan(uri: &str, this_host: &str, windows: bool) -> Plan {
     let Some((scheme, rest)) = uri.split_once(':').filter(|_| has_scheme(uri)) else {
         return Plan::Refuse(Refusal::NoScheme);
@@ -178,6 +183,9 @@ pub fn plan(uri: &str, this_host: &str, windows: bool) -> Plan {
     let path = windows_path(path);
     if path.starts_with(r"\\") {
         return Plan::Refuse(Refusal::OtherHost(unc_host(&path)));
+    }
+    if !is_absolute_dir(&path, PathStyle::Windows) {
+        return Plan::Refuse(Refusal::NoDrive);
     }
     Plan::Reveal(path)
 }
@@ -287,6 +295,7 @@ pub fn failure_text(uri: &str, error: &OpenError) -> String {
         OpenError::Refused(Refusal::NoScheme) => "it has no URI scheme".to_string(),
         OpenError::Refused(Refusal::Scheme(scheme)) => format!("its scheme ({scheme}) isn't one Brindle opens"),
         OpenError::Refused(Refusal::OtherHost(host)) => format!("it names another host ({host})"),
+        OpenError::Refused(Refusal::NoDrive) => "its path isn't on a drive letter".to_string(),
         OpenError::NoThread(error) => format!("the opener's thread couldn't start: {error}"),
         OpenError::NotStarted { program, error } => format!("couldn't run {program}: {error}"),
         OpenError::Failed { program, code: Some(code) } => format!("{program} exited with status {code}"),
@@ -753,8 +762,7 @@ mod tests {
             ("file:///C:/", r"C:\"),
             // A query or a fragment is no part of the path.
             ("file:///C:/docs/a.html?x=1#top", r"C:\docs\a.html"),
-            // A path with no drive stays on the current one.
-            ("file:///etc/hosts", r"\etc\hosts"),
+            // On a drive, whatever follows it.
             ("file:///C:/..//host/share", r"C:\..\\host\share"),
             // An escape that isn't one stays as written.
             ("file:///C:/100%/a%2", r"C:\100%\a%2"),
@@ -816,6 +824,34 @@ mod tests {
         }
     }
 
+    /// Explorer is given a path on a drive letter and nothing else: it
+    /// reads more than paths (`shell:` folders, namespace objects, links),
+    /// and a `file:` link can carry any of them where its path goes.
+    #[test]
+    fn a_windows_file_link_whose_path_is_not_on_a_drive_is_refused() {
+        for link in [
+            "file:///etc/hosts",
+            "file:x.txt",
+            "file:///x.txt",
+            "file:C:tool.exe",
+            "file:///C:",
+            "file:///1:/x",
+            "file:ms-settings:privacy",
+            "file:///ms-settings:privacy",
+            "file:https://example.com/",
+            r"file:shell:AppsFolder\Calc!App",
+            "file:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+            "file:///",
+            "file://localhost",
+            "file://mybox",
+            "file:",
+        ] {
+            assert_eq!(plan(link, HERE, true), refused(Refusal::NoDrive), "{link}");
+        }
+        // Elsewhere a path needs no drive.
+        assert_eq!(plan("file:///etc/hosts", HERE, false), open_plan("file:///etc/hosts"));
+    }
+
     /// A quote or a space in a link would let it end the argument its
     /// handler's command line gives it, so both are percent-encoded.
     #[test]
@@ -851,6 +887,10 @@ mod tests {
         assert_eq!(
             says("file://host/share/x.exe", Refusal::OtherHost("host".into())),
             "couldn't open file://host/share/x.exe: it names another host (host)"
+        );
+        assert_eq!(
+            says("file:shell:Downloads", Refusal::NoDrive),
+            "couldn't open file:shell:Downloads: its path isn't on a drive letter"
         );
     }
 

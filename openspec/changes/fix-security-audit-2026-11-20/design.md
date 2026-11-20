@@ -66,14 +66,18 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
 
 `links::plan(uri, this_host: &str, windows: bool) -> Plan` is pure, with a unit test per scenario. It returns a closed enum:
 - `Plan::Open(String)`: the link with `"` and whitespace percent-encoded;
-- `Plan::Reveal(String)`: a Windows `file:` path, for Explorer's `/select,` unless the shell finds it is a directory, in which case it opens it;
-- `Plan::Refuse(Refusal)`, where `Refusal` is `NoScheme`, `Scheme(String)` or `OtherHost(String)`.
+- `Plan::Reveal(String)`: a Windows `file:` path on a drive letter, for Explorer's `/select,` unless the shell finds it is a directory, in which case it opens it;
+- `Plan::Refuse(Refusal)`, where `Refusal` is `NoScheme`, `Scheme(String)`, `OtherHost(String)` or `NoDrive`.
 
 How it fits into the rest of the code:
 - **One scheme list.** The allowed schemes are the same list `find_url` detects (one `const`, so detection and opening can't drift).
 - **The host check.** `this_host` comes from the shell (`gethostname`, or `COMPUTERNAME`), read once.
+- **Only a drive-letter path reaches Explorer.** A `file:` link can carry anything where its path goes: `file:ms-settings:privacy`, `file:shell:AppsFolder\X!App`, a path with no drive. Explorer opens links and `shell:` items it is given, so handing it such a "path" could bring back a handler the scheme list refuses. On Windows `plan` therefore refuses a `file:` path that isn't `X:\…`:
+  - a path that starts with two separators (UNC, `\\?\`, `\\.\`) is `OtherHost`, naming the host;
+  - any other is `NoDrive`.
+- **Quotes and controls in a revealed path.** An escape that decodes to a double quote or a control character stays an escape, so neither reaches the command line Explorer is given.
 - **Refusals in the tab.** `links::failure_text` words each refusal for the tab's dim note, as `NoScheme` is worded today.
-- **What `open` does.** It applies the plan. Only `Reveal` is new: it runs `explorer.exe /select,<path>` on the opener thread.
+- **What `open` does.** It applies the plan. Only `Reveal` is new: it runs `explorer.exe /select,<path>` on the opener thread, whatever `BRINDLE_LINK_OPENER` says. A directory is opened with the shell's `explore` verb, which takes nothing but a folder.
 - **Platform code.** The `cfg(windows)` stays in `links.rs`'s existing opener functions (`ports` R4).
 
 ### 5. Session sizes: one pair of limits

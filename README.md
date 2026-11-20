@@ -604,6 +604,7 @@ detect itself:
 - **`file:` links:** only when the host is empty, `localhost` or this
   machine's name. On Windows a file is shown selected in Explorer instead of
   opened, so a click never runs a program; a directory opens in Explorer.
+  Only a path on a drive letter (`file:///C:/…`) is taken there.
 - **Quotes and spaces** in a link are percent-encoded before it is opened.
 
 When a link isn't opened, or the opener fails, the tab says why in a dim line.
