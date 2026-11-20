@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use super::shell_integration::{PathStyle, is_absolute_dir};
+use super::shell_integration::{PathStyle, is_absolute_path};
 
 /// The schemes Brindle detects in plain text and opens, each with the
 /// separator that must follow it in text. One list for both, so what is
@@ -123,11 +123,12 @@ pub enum Refusal {
     NoScheme,
     /// Its scheme, as written, isn't one Brindle opens ([`SCHEMES`]).
     Scheme(String),
-    /// A `file:` link that names another host than this machine, as its
-    /// host or as a network or device path.
+    /// A `file:` link that names another host than this machine: as its
+    /// host, or on Windows as its path's (`\\host\share`).
     OtherHost(String),
-    /// A `file:` link on Windows whose path isn't on a drive letter: no
-    /// file's path, but whatever else the shell would make of it.
+    /// A `file:` link on Windows whose path isn't a plain one on a drive
+    /// letter: no file's path, but whatever else the shell would make of
+    /// it.
     NoDrive,
 }
 
@@ -137,9 +138,10 @@ pub enum Plan {
     /// The opener gets the link, with each double quote and whitespace
     /// character percent-encoded.
     Open(String),
-    /// A `file:` link on Windows: its path, on a drive letter, to show
-    /// selected in Explorer (a directory is opened there). It is never
-    /// handed to the shell to open, which would run a program.
+    /// A `file:` link on Windows: its path, a plain one on a drive letter
+    /// (`is_absolute_path`), to show selected in Explorer (a directory is
+    /// opened there). It is never handed to the shell to open, which would
+    /// run a program.
     Reveal(String),
     Refuse(Refusal),
 }
@@ -153,11 +155,16 @@ pub enum Plan {
 ///   of `C:\tool.exe`).
 /// - A `file:` link is taken only when its host is empty, `localhost` or
 ///   `this_host`, this machine's name.
-/// - With `windows`, a `file:` link's path is shown in Explorer, and only
-///   a path on a drive letter (`C:\…`) is one: Explorer is given nothing
-///   else. A network or device path (`\\host\share`, `\\?\…`) is refused
-///   like another host, and any other (`shell:…`, a path with no drive)
-///   as no file's path, since the shell reads more than paths.
+/// - With `windows`, a `file:` link's path is shown in Explorer, and
+///   Explorer is given nothing but a plain path on a drive letter: `X:\`
+///   and then no `:`, no `"` and no control character, which is the rule
+///   a reported directory follows ([`is_absolute_path`]). The path is
+///   checked as Windows will read it, percent-decoded and with every `/`
+///   a `\`. A network path (`\\host\share`) is refused as another host,
+///   and any other as no file's path: a device or rooted path (`\\?\…`,
+///   `\??\…`, `\Device\…`), one with no drive or none from its root
+///   (`C:x`), a stream of a file, `shell:…`. The shell reads more than
+///   paths, and a quote would end the argument Explorer is given.
 pub fn plan(uri: &str, this_host: &str, windows: bool) -> Plan {
     let Some((scheme, rest)) = uri.split_once(':').filter(|_| has_scheme(uri)) else {
         return Plan::Refuse(Refusal::NoScheme);
@@ -181,10 +188,10 @@ pub fn plan(uri: &str, this_host: &str, windows: bool) -> Plan {
         return Plan::Open(encoded(uri));
     }
     let path = windows_path(path);
-    if path.starts_with(r"\\") {
-        return Plan::Refuse(Refusal::OtherHost(unc_host(&path)));
+    if let Some(host) = unc_host(&path) {
+        return Plan::Refuse(Refusal::OtherHost(host.to_string()));
     }
-    if !is_absolute_dir(&path, PathStyle::Windows) {
+    if !is_absolute_path(&path, PathStyle::Windows) {
         return Plan::Refuse(Refusal::NoDrive);
     }
     Plan::Reveal(path)
@@ -213,23 +220,18 @@ fn push_encoded(out: &mut String, c: char) {
     }
 }
 
-/// The path of a `file:` link as Windows spells it: without a query or
-/// fragment, percent-decoded, `/C:/x` as `C:\x`, and every `/` a `\`.
-///
-/// A double quote or a control character stays percent-encoded: no file
-/// name has one, and neither may reach the command line Explorer is given.
+/// The path of a `file:` link as Windows reads it: without a query or
+/// fragment, percent-decoded, `/C:…` without the slash before its drive,
+/// and every `/` a `\`. Whether it is a path to show is [`plan`]'s to say,
+/// of this form and no earlier one.
 fn windows_path(path: &str) -> String {
     let path = path.split(['?', '#']).next().unwrap_or(path);
-    let mut text = String::with_capacity(path.len());
-    for c in percent_decoded(path).chars() {
-        if c == '"' || c.is_control() {
-            push_encoded(&mut text, c);
-        } else {
-            text.push(c);
-        }
-    }
-    let on_a_drive = text.strip_prefix('/').filter(|rest| is_absolute_dir(rest, PathStyle::Windows));
-    on_a_drive.unwrap_or(&text).replace('/', "\\")
+    let decoded = percent_decoded(path);
+    let from_drive = match decoded.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => decoded.get(1..),
+        _ => None,
+    };
+    from_drive.unwrap_or(&decoded).replace('/', "\\")
 }
 
 /// `text` with its `%XX` escapes decoded, as UTF-8. An escape that isn't
@@ -258,17 +260,14 @@ fn percent_decoded(text: &str) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
-/// What a Windows path that starts with `\\` names in place of a drive:
-/// the host of `\\host\share` and of `\\?\UNC\host\share`, else the device
-/// path's root (`\\.\pipe`).
-fn unc_host(path: &str) -> String {
-    let mut parts = path.split('\\').filter(|part| !part.is_empty());
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("?" | "."), Some(unc), Some(host)) if unc.eq_ignore_ascii_case("UNC") => host.to_string(),
-        (Some(device @ ("?" | ".")), Some(root), _) => format!(r"\\{device}\{root}"),
-        (Some(host), _, _) => host.to_string(),
-        (None, _, _) => path.to_string(),
-    }
+/// The host a Windows path names where a drive would be, when it is a
+/// network path: the `host` of `\\host\share`. `None` for any other path,
+/// a device path (`\\?\…`, `\\.\…`) included: what follows its two
+/// separators is no host's name.
+fn unc_host(path: &str) -> Option<&str> {
+    let host = path.strip_prefix(r"\\")?.split('\\').find(|part| !part.is_empty())?;
+    let named = host != "." && !host.chars().any(|c| matches!(c, '?' | '*' | ':' | '"' | '<' | '>' | '|') || c.is_control());
+    named.then_some(host)
 }
 
 /// Why a link wasn't opened.
@@ -774,29 +773,41 @@ mod tests {
         }
     }
 
-    /// No double quote and no control character reaches the command line
-    /// Explorer is given: escapes that decode to one stay escapes.
+    /// What Explorer is given goes inside one pair of quotes on its command
+    /// line. A path with a double quote would end them and add arguments,
+    /// and no file's name holds a quote, a control character or a second
+    /// colon (a stream of a file): each is refused, however it is written.
     #[test]
-    fn a_quote_or_a_control_in_a_revealed_path_stays_encoded() {
-        let cases = [
-            ("file:///C:/a%22%20b.exe", r"C:\a%22 b.exe"),
-            (r#"file:///C:/a" "C:/evil.exe"#, r"C:\a%22 %22C:\evil.exe"),
-            ("file:///C:/a%0Ab%00c%7F", r"C:\a%0Ab%00c%7F"),
-            ("file:///C:/a%C2%9Bb", r"C:\a%C2%9Bb"),
-        ];
-        for (link, path) in cases {
-            let planned = plan(link, HERE, true);
-            assert_eq!(planned, Plan::Reveal(path.to_string()), "{link}");
-            let Plan::Reveal(path) = planned else { unreachable!() };
-            assert!(!path.contains('"') && !path.chars().any(char::is_control), "{path:?}");
+    fn a_windows_file_link_with_a_quote_a_control_or_a_second_colon_is_refused() {
+        for link in [
+            // A path with `"`.
+            r#"file:///C:/a" "C:/evil.exe"#,
+            r#"file:///C:/a".exe"#,
+            "file:///C:/a%22%20b.exe",
+            "file:///C:/a%22%20%22C:/evil.exe",
+            // A control character can only come percent-encoded.
+            "file:///C:/a%0Ab",
+            "file:///C:/a%00b",
+            "file:///C:/a%1Bb",
+            "file:///C:/a%7Fb",
+            "file:///C:/a%C2%9Bb",
+            // `C:\a\b.txt:stream`, and other second colons.
+            "file:///C:/a/b.txt:stream",
+            r"file:///C:\a\b.txt:stream",
+            "file:///C:/a/b.txt::$DATA",
+            "file:///C:/a/b.txt%3Astream",
+            "file:///C:/D:/x.exe",
+            "file:///C:/ms-settings:privacy",
+        ] {
+            assert_eq!(plan(link, HERE, true), refused(Refusal::NoDrive), "{link}");
         }
     }
 
-    /// A Windows path that starts with two separators leaves this machine
-    /// (or its drives): such a `file:` link is refused like another host,
-    /// however its slashes are written.
+    /// A Windows path that starts with two separators and then a host's
+    /// name is a network path: such a `file:` link is refused as another
+    /// host, however its separators are written.
     #[test]
-    fn a_windows_file_link_to_a_network_or_device_path_is_refused() {
+    fn a_windows_file_link_to_a_network_path_is_refused_naming_its_host() {
         let cases = [
             ("file:////host/share/x.exe", "host"),
             ("file://///host/share/x.exe", "host"),
@@ -804,23 +815,55 @@ mod tests {
             ("file://mybox//host/share", "host"),
             (r"file:///\\host\share\x.exe", "host"),
             (r"file:\\host\share\x.exe", "host"),
-            ("file:///%5C%5Chost%5Cshare", "host"),
+            // `%5C%5Chost%5Cs`, and the forward slashes encoded too.
+            ("file:///%5C%5Chost%5Cs", "host"),
+            ("file:%5C%5Chost%5Cs", "host"),
             ("file:///%2F%2Fhost/share", "host"),
             ("file:////host@80/dav/x", "host@80"),
             ("file:////host@SSL@443/DavWWWRoot/x", "host@SSL@443"),
-            ("file:////%3F/UNC/host/share/x", "host"),
-            ("file:////./unc/host/share/x", "host"),
-            ("file:////%3F/C:/Users/me/x.exe", r"\\?\C:"),
-            ("file:////./pipe/x", r"\\.\pipe"),
-            ("file:////%3F/GLOBALROOT/Device/Mup/host/share", r"\\?\GLOBALROOT"),
-            ("file:////", r"\\"),
-            // A `?` written as it is starts the query: what is left of the
-            // path still starts with two separators.
-            ("file:////?/UNC/host/share/x", r"\\"),
-            (r"file:///\\?\C:\Users\me\x.exe", r"\\\"),
+            ("file:////wsl$/Ubuntu/home/me", "wsl$"),
+            // With the link's own slash before it, a rooted path is a
+            // network path to Windows: `\\Device\Mup\h\s`.
+            (r"file:///\Device\Mup\h\s", "Device"),
         ];
         for (link, host) in cases {
             assert_eq!(plan(link, HERE, true), refused(Refusal::OtherHost(host.to_string())), "{link}");
+        }
+    }
+
+    /// Every other way to leave the drives is refused too: a device or
+    /// extended path, and a path from the root of the object namespace,
+    /// which reach a network path or a device as well as `\\host` does.
+    #[test]
+    fn a_windows_file_link_to_a_device_or_rooted_path_is_refused() {
+        for link in [
+            // `\??\UNC\h\s`, written out and percent-encoded.
+            r"file:\??\UNC\h\s",
+            r"file:///\??\UNC\h\s",
+            "file:%5C%3F%3F%5CUNC%5Ch%5Cs",
+            "file:///%5C%3F%3F%5CUNC%5Ch%5Cs",
+            "file:///%3F%3F/UNC/h/s",
+            "file:///%5C%3F%3F%5CC:%5Cx.exe",
+            // `\Device\Mup\h\s` and `\GLOBALROOT\…`.
+            r"file:\Device\Mup\h\s",
+            "file:///Device/Mup/h/s",
+            "file:%5CDevice%5CMup%5Ch%5Cs",
+            r"file:\GLOBALROOT\Device\Mup\h\s",
+            "file:///GLOBALROOT/Device/Mup/h/s",
+            // `\\?\…` and `\\.\…`.
+            "file:////%3F/UNC/host/share/x",
+            "file:////./unc/host/share/x",
+            "file:////%3F/C:/Users/me/x.exe",
+            "file:////./C:/Users/me/x.exe",
+            "file:////./pipe/x",
+            "file:////%3F/GLOBALROOT/Device/Mup/host/share",
+            // A `?` written as it is starts the query: what is left of the
+            // path is two separators and no host.
+            "file:////?/UNC/host/share/x",
+            r"file:///\\?\C:\Users\me\x.exe",
+            "file:////",
+        ] {
+            assert_eq!(plan(link, HERE, true), refused(Refusal::NoDrive), "{link}");
         }
     }
 
@@ -830,9 +873,17 @@ mod tests {
     #[test]
     fn a_windows_file_link_whose_path_is_not_on_a_drive_is_refused() {
         for link in [
+            // A path with no drive, from the root or relative.
             "file:///etc/hosts",
             "file:x.txt",
             "file:///x.txt",
+            "file:docs/x.txt",
+            r"file:docs\x.txt",
+            "file:../x.exe",
+            "file:.",
+            // A drive with no root after it: `C:x.exe`.
+            "file:C:x.exe",
+            "file:///C:x.exe",
             "file:C:tool.exe",
             "file:///C:",
             "file:///1:/x",

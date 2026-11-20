@@ -19,6 +19,7 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
 ### 1. Reported directories: drive letters only, checked off the UI thread
 
 - **The parser change.** `brindle-term-core`'s `reported_dir` (pure, `shell_integration.rs`) treats a Windows-style path as absolute only when it is `X:\` or `X:/`. The `|| path.starts_with("\\\\")` arm goes. The OSC 7 branch returns `None` unless the decoded path is `/X:/…`, so `file://x//host/share` is refused there, before any backslash conversion.
+  - **One rule, one function.** The rule is `shell_integration::is_absolute_path(path, style)`. In the Windows style a path passes only when it is on a drive letter and what follows the drive has no `:`, no `"` and no control character. That also rules out a stream of a file and anything a later reader would take for more than a name. The parser, the restore check and `links::plan` all call it, so they can't drift.
   - Because the parser is in `term-core`, the core's emulator applies the same rule. A UNC directory then never reaches the core's replay either, which keeps client and core tracking identical.
   - Alternative: filter at `Terminal::working_directory`. Rejected, because every other reader of `Marks::reported_dir` (the record, `new_tab_cwd`, splits, the core) would still need the same check.
 - **The off-thread check.** The existence check moves into a GPUI-free model in `src/terminal/` (`DirCheck`, pure, with unit tests). It records the reported path last checked, and the outcome as a closed enum `Checked::{Exists(PathBuf), Missing, Pending}`. When the reported directory changes, the model says to check it. The `Terminal` entity runs `is_dir` on the background executor and gives the result back to the model.
@@ -31,7 +32,7 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
   - `Session::start` takes the request as a closure and calls it on its own thread, once connected. For a session on this machine the closure probes the directory and passes the result to `with_checked_dir` (pure), which leaves out a directory that isn't one. The outcome is the same as before: the program starts in the server's default directory.
   - A remote host's directory is a path on that host and is never probed here, as before.
   - Nothing changes on the wire or in the order of messages.
-- **Recorded directories.** A state file written before this change can still hold a UNC path that a program reported. `session::resolve_tab` therefore keeps a directory recorded for this machine only when it is absolute in this machine's path style, before it probes it. The rule is the parser's own, exposed as one function, `shell_integration::is_absolute_dir`, so the two can't drift.
+- **Recorded directories.** A state file written before this change can still hold a UNC path that a program reported. `session::resolve_tab` therefore keeps a directory recorded for this machine only when it is absolute in this machine's path style, before it probes it. The rule is the parser's own, `shell_integration::is_absolute_path`.
 
 ### 2. Elevated files on Windows: protected directories, held open
 
@@ -72,10 +73,10 @@ The findings, their paths and the audit's suggested fixes are in `docs/security/
 How it fits into the rest of the code:
 - **One scheme list.** The allowed schemes are the same list `find_url` detects (one `const`, so detection and opening can't drift).
 - **The host check.** `this_host` comes from the shell (`gethostname`, or `COMPUTERNAME`), read once.
-- **Only a drive-letter path reaches Explorer.** A `file:` link can carry anything where its path goes: `file:ms-settings:privacy`, `file:shell:AppsFolder\X!App`, a path with no drive. Explorer opens links and `shell:` items it is given, so handing it such a "path" could bring back a handler the scheme list refuses. On Windows `plan` therefore refuses a `file:` path that isn't `X:\…`:
-  - a path that starts with two separators (UNC, `\\?\`, `\\.\`) is `OtherHost`, naming the host;
-  - any other is `NoDrive`.
-- **Quotes and controls in a revealed path.** An escape that decodes to a double quote or a control character stays an escape, so neither reaches the command line Explorer is given.
+- **Only a plain drive-letter path reaches Explorer.** A `file:` link can carry anything where its path goes: `file:ms-settings:privacy`, `file:shell:AppsFolder\X!App`, a path with no drive. Explorer opens links and `shell:` items it is given, so handing it such a "path" could bring back a handler the scheme list refuses. And the path goes inside one pair of quotes on Explorer's command line, which a double quote in it would end.
+  - **The check.** On Windows `plan` takes the path as Windows will read it: without query or fragment, percent-decoded, and with every `/` a `\`. That form must pass `shell_integration::is_absolute_path`, the rule a reported directory follows: `X:\`, then no `:`, no `"` and no control character. Nothing is checked in an earlier form, so an encoded backslash or quote is seen as what it becomes.
+  - **A network path** (`\\host\…`, however its separators were written) is `OtherHost`, naming the host.
+  - **Any other** is `NoDrive`: a device or extended path (`\\?\…`, `\\.\…`), a path from the root of the object namespace (`\??\…`, `\Device\…`, `\GLOBALROOT\…`), a path with no drive or none from its root (`C:x`), a stream of a file (`C:\a.txt:s`), and a path with a double quote or a control character.
 - **Refusals in the tab.** `links::failure_text` words each refusal for the tab's dim note, as `NoScheme` is worded today.
 - **What `open` does.** It applies the plan. Only `Reveal` is new: it runs `explorer.exe /select,<path>` on the opener thread, whatever `BRINDLE_LINK_OPENER` says. A directory is opened with the shell's `explore` verb, which takes nothing but a folder.
 - **Platform code.** The `cfg(windows)` stays in `links.rs`'s existing opener functions (`ports` R4).

@@ -87,20 +87,31 @@ pub enum PathStyle {
     Windows,
 }
 
-/// Whether `path` is one a program's directory report may name, and a
-/// record of one may keep, in `style`: an absolute path of the platform.
+/// Whether `path` is a plain absolute path of the platform, in `style`:
+/// the one rule for a path that came from a program, which says what a
+/// directory report may name, what a record of one may keep and what a
+/// `file:` link may show.
 /// - **POSIX:** it starts with `/`.
-/// - **Windows:** it starts with a drive letter, `X:\` or `X:/`. A UNC
-///   path (`\\host\share`), a device or extended path (`\\.\…`, `\\?\…`)
-///   and a path with no drive are not: the directory a program reports is
-///   one Brindle later looks at and starts programs in, and only a drive
-///   names a place the user set up.
-pub fn is_absolute_dir(path: &str, style: PathStyle) -> bool {
+/// - **Windows:** it is on a drive letter, `X:\` or `X:/`, and what
+///   follows the drive has no `:`, no `"` and no control character.
+///
+/// So on Windows a UNC path (`\\host\share`), a device or extended path
+/// (`\\.\…`, `\\?\…`, `\??\…`, `\Device\…`), a path with no drive or none
+/// from its root (`\src`, `C:src`) and a stream of a file (`C:\a.txt:s`)
+/// are not. Such a path is one Brindle later looks at, starts a program
+/// in or hands to the shell, and only a drive names a place the user set
+/// up; no file's name holds one of those characters, and each means
+/// something to what reads the path next.
+pub fn is_absolute_path(path: &str, style: PathStyle) -> bool {
     match style {
         PathStyle::Posix => path.starts_with('/'),
-        PathStyle::Windows => {
-            matches!(path.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
-        }
+        PathStyle::Windows => match path.as_bytes() {
+            // The drive and its separator are ASCII, so `3` is a boundary.
+            [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => path
+                .get(3..)
+                .is_some_and(|rest| !rest.chars().any(|c| matches!(c, ':' | '"') || c.is_control())),
+            _ => false,
+        },
     }
 }
 
@@ -285,9 +296,10 @@ impl Scanner {
     }
 }
 
-/// The directory an OSC body reports, if it is absolute in `style`
-/// ([`is_absolute_dir`]): OSC 7's `7;file://<host>/<percent-encoded path>`,
-/// or ConEmu's `9;9;<path>`, the path optionally in double quotes.
+/// The directory an OSC body reports, if it is a plain absolute path in
+/// `style` ([`is_absolute_path`]): OSC 7's
+/// `7;file://<host>/<percent-encoded path>`, or ConEmu's `9;9;<path>`, the
+/// path optionally in double quotes.
 ///
 /// In the Windows style OSC 7's `/C:/src` means `C:\src`, and its path is a
 /// directory only in that form, a slash before a drive letter. Any other
@@ -302,7 +314,7 @@ fn reported_dir(body: &[u8], style: PathStyle) -> Option<String> {
             PathStyle::Posix => path,
             PathStyle::Windows => {
                 // `/C:/x`: without the slash before the drive letter.
-                let drive_path = path.strip_prefix('/').filter(|rest| is_absolute_dir(rest, style))?;
+                let drive_path = path.strip_prefix('/').filter(|rest| is_absolute_path(rest, style))?;
                 drive_path.replace('/', "\\")
             }
         }
@@ -310,7 +322,7 @@ fn reported_dir(body: &[u8], style: PathStyle) -> Option<String> {
         let path = body.strip_prefix("9;9;")?.trim();
         path.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(path).to_string()
     };
-    is_absolute_dir(&path, style).then_some(path)
+    is_absolute_path(&path, style).then_some(path)
 }
 
 /// `%XX` escapes decoded, as UTF-8.
@@ -990,6 +1002,10 @@ mod tests {
                 let b = dir.as_bytes();
                 let drive = matches!(b, [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
                 assert!(drive, "{dir:?} from {body:?}");
+                // And plain: one colon, the drive's, and nothing that
+                // isn't part of a name.
+                assert_eq!(dir.matches(':').count(), 1, "{dir:?} from {body:?}");
+                assert!(!dir.contains('"') && !dir.chars().any(char::is_control), "{dir:?} from {body:?}");
                 windows += 1;
             }
             // Any body, a mark or not, must come back as a value.
@@ -1028,38 +1044,97 @@ mod tests {
     }
 
     #[test]
-    fn only_a_path_on_the_platforms_root_is_an_absolute_directory() {
+    fn only_a_plain_path_from_the_platforms_root_is_an_absolute_path() {
         let (posix, windows) = (PathStyle::Posix, PathStyle::Windows);
-        for path in ["/", "/home/u", "//host/share", "/C:/src"] {
-            assert!(is_absolute_dir(path, posix), "{path}");
+        for path in ["/", "/home/u", "//host/share", "/C:/src", "/a:b/c\"d"] {
+            assert!(is_absolute_path(path, posix), "{path}");
         }
         for path in ["", "home/u", "~", "C:\\src", "\\\\host\\share"] {
-            assert!(!is_absolute_dir(path, posix), "{path}");
+            assert!(!is_absolute_path(path, posix), "{path}");
         }
-        for path in ["C:\\", "C:\\src", "c:/src", "Z:\\a b\\c", "C:\\\\host\\share"] {
-            assert!(is_absolute_dir(path, windows), "{path}");
+        let on_a_drive = [
+            "C:\\",
+            "C:\\src",
+            "c:/src",
+            "Z:\\a b\\c",
+            "C:\\Users\\me\\tool.exe",
+            "C:\\caf\u{e9}\\100%\\a%22b",
+            "C:\\\\host\\share",
+            "C:\\..\\..\\x",
+        ];
+        for path in on_a_drive {
+            assert!(is_absolute_path(path, windows), "{path}");
         }
         let not_on_a_drive = [
             "",
             "C:",
             "C:src",
+            "C:x.exe",
             "src",
             "\\src",
             "/src",
             "/C:/src",
             "1:\\src",
             "é:\\src",
+            // A network path, however it is spelled.
             "\\\\host\\share",
             "//host/share",
-            "\\\\?\\C:\\src",
-            "\\\\?\\UNC\\host\\share",
-            "\\\\.\\pipe\\x",
             "\\\\host@80\\x",
             "\\\\host@SSL@443\\DavWWWRoot\\x",
+            "\\\\?\\UNC\\host\\share",
+            "\\??\\UNC\\h\\s",
+            "\\Device\\Mup\\h\\s",
+            "\\GLOBALROOT\\Device\\Mup\\h\\s",
+            // A device or extended path.
+            "\\\\?\\C:\\src",
+            "\\\\.\\pipe\\x",
+            "\\\\.\\C:\\src",
+            "\\??\\C:\\src",
         ];
         for path in not_on_a_drive {
-            assert!(!is_absolute_dir(path, windows), "{path}");
+            assert!(!is_absolute_path(path, windows), "{path}");
         }
+        // On a drive, but with what no file's name holds: a second colon (a
+        // stream, another drive), a double quote, a control character.
+        let not_plain = [
+            "C:\\a\\b.txt:stream",
+            "C:\\a\\b.txt::$DATA",
+            "C:\\D:\\src",
+            "C:\\:",
+            "C:\\a\"b",
+            "C:\\a\" \"C:\\b.exe",
+            "C:\\a\nb",
+            "C:\\a\0b",
+            "C:\\a\x1bb",
+            "C:\\a\x7fb",
+            "C:\\a\u{9b}b",
+            "C:/a:b",
+        ];
+        for path in not_plain {
+            assert!(!is_absolute_path(path, windows), "{path:?}");
+        }
+    }
+
+    /// A reported directory with what no directory's name holds is no
+    /// report either, in the Windows style: it names no place to look at.
+    #[test]
+    fn a_windows_report_with_a_second_colon_a_quote_or_a_control_is_no_report() {
+        let windows = PathStyle::Windows;
+        let ignored: [&[u8]; 8] = [
+            br"9;9;C:\src:stream",
+            br"9;9;C:\D:\src",
+            br#"9;9;C:\a"b"#,
+            br#"9;9;"C:\a" "C:\b""#,
+            b"7;file://pc/C:/src:stream",
+            b"7;file://pc/C:/a%22b",
+            b"7;file://pc/C:/a%0Ab",
+            b"7;file://pc/C:/a%C2%9Bb",
+        ];
+        for body in ignored {
+            assert_eq!(reported_dir(body, windows), None, "{:?}", String::from_utf8_lossy(body));
+        }
+        // What the path style doesn't forbid stays a report elsewhere.
+        assert_eq!(reported_dir(b"7;file://h/a:b/c%22d", PathStyle::Posix).as_deref(), Some("/a:b/c\"d"));
     }
 
     /// The Windows style takes a directory only on a drive letter. A UNC

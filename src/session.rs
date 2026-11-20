@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Profile};
 use crate::remote::Host;
-use crate::terminal::shell_integration::{PathStyle, is_absolute_dir};
+use crate::terminal::shell_integration::{PathStyle, is_absolute_path};
 use crate::zone_view::{SplitAxis, ZoneId, ZoneTree};
 
 /// The state file format this build reads and writes.
@@ -496,11 +496,12 @@ pub enum RestoredTab {
 /// `is_dir` is the probe for a local directory (the shell passes
 /// `Path::is_dir`).
 ///
-/// A directory recorded for this machine counts only when it is absolute
-/// in `style`, this machine's path style: the rule a program's report
-/// follows ([`is_absolute_dir`]). Any other is as good as none, and is
-/// never probed. A record is what a program once reported, and a state
-/// file from before that rule may still hold a path it refuses now.
+/// A directory recorded for this machine counts only when it is a plain
+/// absolute path in `style`, this machine's path style: the rule a
+/// program's report follows ([`is_absolute_path`]). Any other is as good
+/// as none, and is never probed. A record is what a program once reported,
+/// and a state file from before that rule may still hold a path it refuses
+/// now.
 fn resolve_cwd(
     cwd: Option<&Path>,
     host: &Host,
@@ -517,7 +518,7 @@ fn resolve_cwd(
             .or_else(|| own.and_then(|p| p.cwd.as_deref()).map(PathBuf::from))
             .unwrap_or_default();
     }
-    cwd.filter(|d| is_absolute_dir(&d.to_string_lossy(), style))
+    cwd.filter(|d| is_absolute_path(&d.to_string_lossy(), style))
         .filter(|d| is_dir(d))
         .map(Path::to_path_buf)
         .or_else(|| own.and_then(|p| p.working_directory(Some(home))).filter(|d| is_dir(d)))
