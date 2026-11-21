@@ -48,7 +48,7 @@
 - **Pure:** `session::state_dir(env)` reads a new field, `StateEnv::elevated: bool`. On Windows, with `BRINDLE_STATE_DIR` unset and `elevated` true, the directory is `%LOCALAPPDATA%\brindle\state-elevated`. When `BRINDLE_STATE_DIR` is set, whoever set it chose the directory, as for the server directory.
 - **Shell:** `main.rs` reads the elevation once through `win::is_elevated` (already in the `win.rs` seam), and Linux passes `false`.
 - **Nothing else changes:** the instance's key, lock and pipe name all come from the state directory, so two levels are two instances. The integrity check before a hand-off stays. It is now reached only when `BRINDLE_STATE_DIR` names one directory for both levels on purpose.
-- **Protection:** the elevated state directory is made like the elevated server directory, with `win::protected_dir(…, Contents::State)`. This stops an unelevated process from planting a `session.toml` for an elevated Brindle to restore. The Windows-only call sits in the `win.rs` seam, behind a function `main.rs` calls on every platform.
+- **Protection:** the elevated state directory is made like the elevated server directory, with `win::protected_dir(…, Contents::State)`. This stops an unelevated process from planting a `session.toml` for an elevated Brindle to restore. It uses `Contents::Executables`, not `State`: a directory found there without the elevated descriptor is set aside and made fresh rather than re-protected in place, since re-protecting keeps the files' contents, and nothing an unelevated process could have written may be restored. The Windows-only call sits in the `win.rs` seam, behind a function `main.rs` calls on every platform.
 
 ### 3. A failed hand-off is visible
 

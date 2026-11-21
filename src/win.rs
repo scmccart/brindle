@@ -120,15 +120,19 @@ pub fn elevated() -> Result<bool, String> {
 
 /// Makes or checks an elevated Brindle's state directory `dir` for
 /// Administrators and SYSTEM only, as its terminal server's `run-elevated`
-/// is ([`win::protected_dir`](crate::remote::protocol::win::protected_dir)
-/// with [`Contents::State`](crate::remote::protocol::win::Contents)), and
-/// holds it until the process exits, so an unelevated process can't add,
+/// is ([`win::protected_dir`](crate::remote::protocol::win::protected_dir)),
+/// and holds it until the process exits, so an unelevated process can't add,
 /// swap or rename what is read from it. `Err` says why, naming `dir`.
+///
+/// It is made with `Contents::Executables`, not `State`: a directory found
+/// there without the elevated descriptor is set aside and made fresh, never
+/// re-protected in place, since an unelevated process could have planted a
+/// `session.toml` in it that an elevated Brindle would then restore.
 pub fn protect_state_dir(dir: &std::path::Path) -> Result<(), String> {
     use crate::remote::protocol::win::{Contents, ProtectedDir, protected_dir};
 
     static HELD: std::sync::OnceLock<ProtectedDir> = std::sync::OnceLock::new();
-    let held = protected_dir(dir, Contents::State).map_err(|error| error.to_string())?;
+    let held = protected_dir(dir, Contents::Executables).map_err(|error| error.to_string())?;
     // Called once, before the session lock; a second hold would be the same
     // directory's.
     HELD.set(held).ok();
