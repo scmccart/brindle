@@ -156,7 +156,7 @@ Their sockets, locks and logs (`core.log`, `holder-*.log`) are in
 `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else
 `~/.cache/brindle/run`. A socket path must fit in 108 bytes, so keep a custom
 `BRINDLE_SERVER_DIR` short. On Windows the directory is
-`%LOCALAPPDATA%rindleun` (`run-elevated` for an elevated Brindle), or
+`%LOCALAPPDATA%\brindle\run` (`run-elevated` for an elevated Brindle), or
 `%BRINDLE_SERVER_DIR%`, and the roles run from a per-build copy of
 `brindle-remote.exe`, so a rebuild or an upgrade never needs a running one
 replaced.
@@ -608,7 +608,11 @@ detect itself:
   Only a path on a drive letter (`file:///C:/…`) is taken there.
 - **Quotes and spaces** in a link are percent-encoded before it is opened.
 
-When a link isn't opened, or the opener fails, the tab says why in a dim line.
+When a link isn't opened, or the opener fails, the line under the tab strip
+says why, naming the link, and the terminal is left alone. The notice goes
+after 10 seconds, or when you press its × button or run "Dismiss Notices"
+(`dismiss_notices`) from the command palette; config errors on that line
+stay until the config is fixed.
 
 To open links with something other than `xdg-open`, set
 `BRINDLE_LINK_OPENER` to a program; it gets the link as its only argument.
@@ -666,7 +670,10 @@ sessions alone.
 The state is written to `~/.local/state/brindle/session.toml`
 (`$XDG_STATE_HOME/brindle/`, or `$BRINDLE_STATE_DIR` when it is set) a second
 or two after anything changes, and again on quit, so a crash or logout loses
-at most the last couple of seconds. If a profile or directory has gone
+at most the last couple of seconds. On Windows it is
+`%LOCALAPPDATA%\brindle\session.toml`, and an elevated Brindle keeps its own in
+`%LOCALAPPDATA%\brindle\state-elevated\`, so it runs beside an unelevated one as
+a separate Brindle with its own session. If a profile or directory has gone
 since then, the default profile or the home directory is used. Closing the last tab forgets the
 tabs, and quitting keeps everything that is open. A state that can't be saved,
 such as one with a tab in a directory whose name isn't valid UTF-8, leaves the

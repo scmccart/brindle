@@ -438,6 +438,58 @@ fn console_output() {
     win::attach_parent_console();
 }
 
+/// Shows `text`, already printed after [`console_output`], in a message box
+/// when the launch has no console for it (on Windows, a Start Menu launch).
+/// Elsewhere stderr is all: a desktop launch on Linux has the journal.
+fn show_unprinted(text: &str) {
+    #[cfg(windows)]
+    win::show_unprinted(text);
+    #[cfg(not(windows))]
+    let _ = text;
+}
+
+/// Whether this process runs elevated: from its token on Windows, never on
+/// Linux.
+#[cfg(windows)]
+fn elevation() -> Result<bool, String> {
+    win::elevated()
+}
+
+#[cfg(not(windows))]
+fn elevation() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Makes and holds an elevated Brindle's own state directory, for
+/// Administrators and SYSTEM only; only Windows has one.
+#[cfg(windows)]
+fn protect_state_dir(dir: &Path) -> Result<(), String> {
+    win::protect_state_dir(dir)
+}
+
+#[cfg(not(windows))]
+fn protect_state_dir(_: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// The launch's state directory, or the window's notice saying why it has
+/// none. An elevated Brindle's own on Windows is made for Administrators
+/// and SYSTEM only, and held, before the session lock is taken in it.
+fn launch_state_dir() -> Result<PathBuf, String> {
+    let mut env = session::StateEnv::read();
+    match elevation() {
+        Ok(elevated) => env.elevated = elevated,
+        Err(why) if session::depends_on_elevation(&env) => return Err(session::unknown_elevation_notice(&why)),
+        // A named directory is used whatever the level.
+        Err(_) => {}
+    }
+    let dir = session::state_dir(&env).ok_or_else(|| session::NO_STATE_DIR.to_string())?;
+    if session::is_elevated_default(&env) {
+        protect_state_dir(&dir).map_err(|why| session::elevated_dir_notice(&why))?;
+    }
+    Ok(dir)
+}
+
 fn unescape(s: &str) -> String {
     s.replace("\\r", "\r").replace("\\n", "\n").replace("\\e", "\x1b").replace("\\t", "\t")
 }
@@ -1008,6 +1060,7 @@ fn session_lock(state_dir: &Path, args: &Args) -> Option<session::Lock> {
                     Err(_) => {
                         console_output();
                         eprintln!("brindle: {why}");
+                        show_unprinted(&why);
                         std::process::exit(1);
                     }
                 },
@@ -1042,15 +1095,17 @@ fn main() {
     // lock is the instance, and a later launch hands it its request and
     // exits. A debug run beside it runs on its own instead, and so does a
     // Brindle with no state directory, whose window says so.
-    let state_dir = session::state_dir(&session::StateEnv::read());
+    let (state_dir, notices) = match launch_state_dir() {
+        Ok(dir) => (Some(dir), Vec::new()),
+        Err(notice) => (None, vec![notice]),
+    };
     let lock = match &state_dir {
         Some(state_dir) => session_lock(state_dir, &args),
         None => {
-            log::warn!("no state directory: running on its own, without restoring or recording");
+            log::warn!("no state directory: running on its own, without restoring or recording ({})", notices.join("; "));
             None
         }
     };
-    let notices: Vec<String> = if state_dir.is_none() { vec![session::NO_STATE_DIR.to_string()] } else { Vec::new() };
     let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
     let mut socket = None;
     if lock.is_some()

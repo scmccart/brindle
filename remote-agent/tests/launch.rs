@@ -210,7 +210,9 @@ mod elevated {
         let mut core = TestCore::connect_to(&dir);
         let holder_pid = core.hello(1).welcome().pid;
         dir.track(holder_pid);
-        core.spawn(shell(1, "echo conpty-up"));
+        // The session stays until it is hung up, so its console host is
+        // still there to look at.
+        core.spawn(shell(1, "echo conpty-up & pause >nul"));
         core.output_until(1, b"conpty-up");
 
         let hosts = children_named(holder_pid, "OpenConsole.exe");

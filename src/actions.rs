@@ -47,6 +47,10 @@ actions!(
         ReloadConfig,
         OpenConfig,
         OpenSettings,
+        /// Dismisses the window's transient notices on its config line (a
+        /// link Brindle didn't open), leaving the config's errors and
+        /// findings. Available while one shows.
+        DismissNotices,
         SplitZoneRight,
         SplitZoneDown,
         CloseZone,
@@ -152,6 +156,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("reload_config", Some("Reload Config"), || Box::new(ReloadConfig)),
     ("open_config", Some("Open Config"), || Box::new(OpenConfig)),
     ("open_settings", Some("Open Settings"), || Box::new(OpenSettings)),
+    ("dismiss_notices", Some("Dismiss Notices"), || Box::new(DismissNotices)),
     ("split_zone_right", Some("Split Zone Right"), || Box::new(SplitZoneRight)),
     ("split_zone_down", Some("Split Zone Down"), || Box::new(SplitZoneDown)),
     ("close_zone", Some("Close Zone"), || Box::new(CloseZone)),

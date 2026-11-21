@@ -7,8 +7,11 @@
 //! replaces the tab's previous one. A click reports the default action. A
 //! toast that times out stays in Action Center and can still be clicked, so
 //! only one the user dismissed counts as closed. When Windows or the user
-//! has turned Brindle's notifications off, requests are dropped with one
-//! warning.
+//! has turned Brindle's notifications off, Windows drops them and the worker
+//! logs one warning. It still shows every toast: Windows keeps an app's
+//! notification settings only once it has shown one of its toasts, so a
+//! worker that skipped them while `Setting()` said off could leave Brindle
+//! listed as off in Settings with a toggle that never stuck.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -59,13 +62,12 @@ fn run(commands: mpsc::Receiver<Command>, replies: UnboundedSender<Reply>) {
     let mut warned = false;
     for command in commands {
         let Command::Notify { key, replaces, summary, body } = command;
-        if !matches!(notifier.Setting(), Ok(NotificationSetting::Enabled)) {
-            if !std::mem::replace(&mut warned, true) {
-                log::warn!("notifications for Brindle are turned off in Windows; dropping them");
-            }
-            continue;
+        // Only for the log: Windows drops a toast it won't show itself.
+        if matches!(notifier.Setting(), Ok(NotificationSetting::Enabled)) {
+            warned = false;
+        } else if !std::mem::replace(&mut warned, true) {
+            log::warn!("notifications for Brindle are turned off in Windows; it will drop them");
         }
-        warned = false;
         let id = if replaces != 0 {
             replaces
         } else {

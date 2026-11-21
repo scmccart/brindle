@@ -15,6 +15,7 @@ use gpui::{
 };
 
 mod launch;
+mod notices;
 mod overlays;
 mod previews;
 mod tabs;
@@ -22,6 +23,7 @@ mod tabs;
 pub use tabs::{TabId, TabTarget};
 
 use self::launch::{NewTabCwd, new_tab_cwd};
+use self::notices::Notices;
 use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
 use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
@@ -49,7 +51,7 @@ use crate::terminal::process::Snapshot;
 use crate::terminal::shell_integration::PathStyle;
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
-use crate::terminal_view::{GridLayout, PointerStep, TerminalView};
+use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
 
@@ -484,6 +486,12 @@ pub struct Workspace {
     /// This Brindle's id in its tabs' layouts (`layout::origin_id`), made
     /// once in `main.rs`.
     origin: SharedString,
+    /// The transient notices on the config line (a link that wasn't
+    /// opened), which `Settings` words into the line.
+    notices: Notices,
+    /// Waits for the next notice's deadline, then drops what is due and
+    /// waits for the one after. One at a time: a new one replaces it.
+    notice_expiry: Task<()>,
 }
 
 impl Workspace {
@@ -539,6 +547,8 @@ impl Workspace {
             restored_sessions: Vec::new(),
             quitting: false,
             origin,
+            notices: Notices::default(),
+            notice_expiry: Task::ready(()),
         };
         // A close the window manager or Windows asks for (its close button,
         // alt-F4, the taskbar) quits too.
@@ -1132,7 +1142,54 @@ impl Workspace {
             cx.subscribe_in(view, window, |this, view, request: &ZoneMenuRequest, window, cx| {
                 this.open_zone_menu(view, request, window, cx)
             }),
+            // From any tab: an opener can fail after its tab went to the
+            // background.
+            cx.subscribe(view, |this, _, LinkFailed(text): &LinkFailed, cx| this.show_notice(text.clone(), cx)),
         ]
+    }
+
+    /// Shows `text` on the config line as a transient notice, until it is
+    /// dismissed or its lifetime has passed (`notices::NOTICE_LIFETIME`).
+    fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        self.notices.push(text, now);
+        let next = self.notices.expire(now);
+        self.apply_notices(next, cx);
+    }
+
+    /// Drops the notices whose time is up.
+    fn expire_notices(&mut self, cx: &mut Context<Self>) {
+        let next = self.notices.expire(std::time::Instant::now());
+        self.apply_notices(next, cx);
+    }
+
+    /// The config line's dismiss button and `dismiss_notices`: drops the
+    /// transient notices, and only those.
+    fn dismiss_notices(&mut self, _: &DismissNotices, _: &mut Window, cx: &mut Context<Self>) {
+        self.notices.dismiss_all();
+        self.apply_notices(None, cx);
+    }
+
+    /// Puts the notices' texts on the config line, and waits for `next`,
+    /// the next deadline, in place of the deadline waited for before.
+    fn apply_notices(&mut self, next: Option<std::time::Instant>, cx: &mut Context<Self>) {
+        self.put_notices_on_the_config_line(cx);
+        self.notice_expiry = match next {
+            Some(deadline) => cx.spawn(async move |this, cx| {
+                let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |this, cx| this.expire_notices(cx)).ok();
+            }),
+            None => Task::ready(()),
+        };
+        cx.notify();
+    }
+
+    /// Gives `Settings` the notices' texts, which it words into the config
+    /// line after its own.
+    fn put_notices_on_the_config_line(&self, cx: &mut Context<Self>) {
+        let texts = self.notices.texts().map(str::to_string).collect();
+        cx.update_global(|settings: &mut Settings, _| settings.set_transient_notices(texts));
     }
 
     /// A zone asked for its header menu (it has focus by now). The menu
@@ -2050,6 +2107,8 @@ impl Workspace {
             tab.refresh_title(&mut snapshot, cx);
         }
         self.apply_tab_themes(cx);
+        // The reload made new settings, without the notices.
+        self.put_notices_on_the_config_line(cx);
         cx.notify();
     }
 
@@ -2437,6 +2496,35 @@ impl Workspace {
             // marked area wins over everything inside it.
             .child(div().id("caption").flex_1().h_full().when(cfg!(windows), |d| d.window_control_area(WindowControlArea::Drag)))
             .children(window_controls.map(|c| div().flex().h_full().items_center().child(c)))
+    }
+
+    /// The config line's dismiss button, shown while transient notices
+    /// are: it drops them, and leaves the config's errors and findings. In
+    /// the line's own colour, since the line is drawn in the tab's theme.
+    fn render_dismiss_notices(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let focus = self.focus_handle.clone();
+        let button = Button::icon_only("dismiss-notices", Icon::X)
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::IconXs)
+            .text_color(theme.foreground.hsla())
+            .tooltip_with(move |window, _| Tooltip::new("Dismiss").shortcut_opt(shortcut(&DismissNotices, &focus, window)))
+            .on_click(cx.listener(|this, _, window, cx| this.dismiss_notices(&DismissNotices, window, cx)));
+        // A press stops here, so it moves focus nowhere (a `Button` without
+        // a handle lets a press bubble to the workspace, which tracks focus).
+        // The button (1.5rem) is taller than a line of text, so it reaches
+        // into the line's padding (`my_neg_1` against its `py_1`): the line
+        // keeps its height whether or not the button shows, and the
+        // terminal below doesn't move.
+        div()
+            .id("dismiss-notices-press")
+            .flex_none()
+            .my_neg_1()
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .child(button)
+            .into_any_element()
     }
 
     fn render_content(&self) -> AnyElement {
@@ -2859,6 +2947,7 @@ impl Render for Workspace {
         let inset = px(RESIZE_BORDER);
         let rounding = px(8.0);
         let config_line = Settings::get(cx).config_line.clone();
+        let dismissable = !self.notices.is_empty();
 
         // While the settings dialog previews a theme, only the overlay
         // toggles act, so nothing (such as a new tab) changes underneath it.
@@ -2871,6 +2960,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_profile_menu))
             .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::open_settings))
+            // Only while a transient notice shows, so the palette lists it
+            // only then.
+            .when(dismissable, |d| d.on_action(cx.listener(Self::dismiss_notices)))
             .when(!settings_open, |d| {
                 d.on_action(cx.listener(Self::new_tab))
                     .on_action(cx.listener(Self::new_tab_with_profile))
@@ -2925,13 +3017,17 @@ impl Render for Workspace {
             .when_some(config_line, |d, line| {
                 d.child(
                     div()
+                        .flex()
                         .flex_none()
+                        .items_center()
+                        .gap_2()
                         .px_3()
                         .py_1()
                         .text_xs()
                         .bg(theme.ansi[1].mix(theme.background, 0.6).hsla())
                         .text_color(theme.foreground.hsla())
-                        .child(line),
+                        .child(div().flex_1().min_w_0().child(line))
+                        .when(dismissable, |d| d.child(self.render_dismiss_notices(&theme, cx))),
                 )
             })
             .child(div().flex_1().min_h_0().child(self.render_content()))

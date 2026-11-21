@@ -33,7 +33,7 @@ A state file that cannot be read, is not valid, or has a format version Brindle 
 - **THEN** it is ignored with a log line, and a normal launch happens
 
 ### Requirement: State file location and writes
-The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and in `%LOCALAPPDATA%\brindle\` on Windows. When none of these can be found, Brindle SHALL run on its own, neither restoring, reattaching nor writing state, and the window SHALL say why. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits. A state that can't be serialized SHALL NOT be written: the file SHALL keep what it last held, with one log line naming the problem.
+The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is set. Otherwise it SHALL be stored in `$XDG_STATE_HOME/brindle/` on Linux, which defaults to `~/.local/state/brindle/`, and on Windows in `%LOCALAPPDATA%\brindle\`, or in `%LOCALAPPDATA%\brindle\state-elevated\` for an elevated Brindle, a directory only Administrators and SYSTEM can change. When none of these can be found, Brindle SHALL run on its own, neither restoring, reattaching nor writing state, and the window SHALL say why. Every write SHALL replace the file in one step, so an interrupted write never leaves a partial file. The file SHALL be written within a few seconds of a change to the recorded windows, tabs or directories, and again when Brindle quits. A state that can't be serialized SHALL NOT be written: the file SHALL keep what it last held, with one log line naming the problem.
 
 #### Scenario: Crash after a change
 - **WHEN** the user opens a tab, waits a few seconds, and Brindle is then killed
@@ -66,6 +66,10 @@ The state SHALL be stored in `session.toml` in `$BRINDLE_STATE_DIR` when that is
 #### Scenario: No state directory
 - **WHEN** on Linux `BRINDLE_STATE_DIR`, `XDG_STATE_HOME` and `HOME` are unset, the user has no home directory, and Brindle starts in `/tmp`
 - **THEN** the window opens with a default tab and says the session can't be saved, and nothing is written to `/tmp`
+
+#### Scenario: Elevated state on Windows
+- **WHEN** Brindle runs elevated on Windows with restore on and `BRINDLE_STATE_DIR` unset
+- **THEN** its state is in `%LOCALAPPDATA%\brindle\state-elevated\session.toml`, and an unelevated Brindle's `session.toml` is untouched
 
 ### Requirement: One process owns the state
 Only one Brindle process at a time SHALL own the session state: the instance, which records and restores it and reattaches detached sessions. A launch while an instance runs SHALL hand its request to the instance, as defined by "A launch goes to the running Brindle" in `command-line`, and exit. A launch with debug options (`--send`, `--action`, `--dump-screen-after`, `--latency-log`, `--latency-bench`) while an instance runs SHALL instead run on its own, and SHALL neither restore, reattach, nor write the state file, and SHALL log that it doesn't.

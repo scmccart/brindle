@@ -287,8 +287,8 @@ pub enum OpenError {
     Shell { code: usize },
 }
 
-/// What a failed open says in the tab where the link was clicked
-/// (`railway R8`: the action, then the cause).
+/// What a failed open says, as a notice on the config line of the window
+/// where the link was clicked (`railway R8`: the action, then the cause).
 pub fn failure_text(uri: &str, error: &OpenError) -> String {
     let why = match error {
         OpenError::Refused(Refusal::NoScheme) => "it has no URI scheme".to_string(),

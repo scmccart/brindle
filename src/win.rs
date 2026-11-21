@@ -112,6 +112,60 @@ pub fn hwnd(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
     }
 }
 
+/// Whether this process runs elevated (high integrity or above), which
+/// decides its default state directory.
+pub fn elevated() -> Result<bool, String> {
+    crate::remote::protocol::win::is_elevated().map_err(|error| format!("reading this process's token: {error}"))
+}
+
+/// What [`protect_state_dir`] makes the directory as; it says why.
+const STATE_DIR_CONTENTS: crate::remote::protocol::win::Contents =
+    crate::remote::protocol::win::Contents::Executables;
+
+/// Makes or checks an elevated Brindle's state directory `dir` for
+/// Administrators and SYSTEM only, as its terminal server's `run-elevated`
+/// is ([`win::protected_dir`](crate::remote::protocol::win::protected_dir)),
+/// and holds it until the process exits, so an unelevated process can't add,
+/// swap or rename what is read from it. `Err` says why, naming `dir`.
+///
+/// It is made with `Contents::Executables`, not `State`: a directory found
+/// there without the elevated descriptor is set aside and made fresh, never
+/// re-protected in place, since an unelevated process could have planted a
+/// `session.toml` in it that an elevated Brindle would then restore
+/// ([`STATE_DIR_CONTENTS`], which a test pins).
+pub fn protect_state_dir(dir: &std::path::Path) -> Result<(), String> {
+    use crate::remote::protocol::win::{ProtectedDir, protected_dir};
+
+    static HELD: std::sync::OnceLock<ProtectedDir> = std::sync::OnceLock::new();
+    let held = protected_dir(dir, STATE_DIR_CONTENTS).map_err(|error| error.to_string())?;
+    // Called once, before the session lock; a second hold would be the same
+    // directory's.
+    HELD.set(held).ok();
+    Ok(())
+}
+
+/// Shows `text` in a message box (an error icon, titled Brindle) when this
+/// process has no console and its stderr goes nowhere, so what it printed
+/// was lost: a launch from the Start Menu or Explorer that gives up. Called
+/// after [`attach_parent_console`]; one started from a console, or with its
+/// stderr redirected, has printed it already and shows nothing.
+pub fn show_unprinted(text: &str) {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+    // SAFETY: reads the process's console window; no argument.
+    let console = !unsafe { GetConsoleWindow() }.is_invalid();
+    // SAFETY: GetStdHandle only reads the process's standard handles.
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok_and(|handle| !handle.is_invalid());
+    if console || stderr {
+        return;
+    }
+    // SAFETY: both strings are NUL-terminated and outlive the call; the box
+    // has no owner window.
+    unsafe {
+        MessageBoxW(None, &windows::core::HSTRING::from(text), w!("Brindle"), MB_OK | MB_ICONERROR | MB_SETFOREGROUND)
+    };
+}
+
 /// Points stdout and stderr at the console Brindle was started from, for
 /// output printed just before exiting.
 ///
@@ -154,5 +208,22 @@ pub fn attach_parent_console() {
     }
     if err {
         set(STD_ERROR_HANDLE, console);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::remote::protocol::access::{Found, Step, protected_step};
+
+    /// The elevated state directory keeps nothing it didn't make: whatever
+    /// is found in its place without the elevated descriptor (a directory
+    /// an unelevated process made, a link, a file) is set aside, never
+    /// protected again with its files.
+    #[test]
+    fn a_state_directory_found_unprotected_is_set_aside() {
+        for found in [Found::Other, Found::Link, Found::NotDir] {
+            assert_eq!(protected_step(found, super::STATE_DIR_CONTENTS, false), Step::SetAside, "{found:?}");
+        }
+        assert_eq!(protected_step(Found::Matches, super::STATE_DIR_CONTENTS, false), Step::Use);
     }
 }
