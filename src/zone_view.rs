@@ -625,7 +625,7 @@ impl ZoneTreeView {
             TerminalEvent::Exited => {
                 self.close_zone_by_id(id, window, cx);
             }
-            TerminalEvent::Bell | TerminalEvent::Notify(_) => {
+            TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Notify99(_) => {
                 cx.emit(event.clone());
             }
             TerminalEvent::Status(_) => {

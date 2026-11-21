@@ -100,7 +100,9 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
             AlacEvent::MouseCursorDirty | AlacEvent::CursorBlinkingChange => Kind::Ignored,
         },
         ChannelEvent::Osc(found) => match found {
-            Found::Notice(_) => SIDE,
+            // A dropped OSC 99 chunk loses that part of its notification
+            // only.
+            Found::Notice(_) | Found::Kitty(_) => SIDE,
             // A dropped progress report or context message leaves the
             // progress or the contexts stale, as a dropped status report
             // leaves the records: all three start over.
@@ -497,6 +499,8 @@ mod tests {
         }
         let notice = Notice { source: Source::Osc9, title: "t".into(), body: "b".into() };
         assert_eq!(found(Found::Notice(notice)), SIDE);
+        let chunk = brindle_term_core::kitty::parse(b"i=a:d=0;part").unwrap();
+        assert_eq!(found(Found::Kitty(chunk)), SIDE, "a dropped chunk resets nothing");
         for status in [
             Found::Status(Message::Query),
             Found::Status(Message::Clear { id: None }),

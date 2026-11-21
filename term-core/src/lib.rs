@@ -1,6 +1,6 @@
 //! The GPUI-free terminal state that Brindle and its server share: the
-//! shell-integration parser with its OSC 133 marks, the OSC scanner and the
-//! OSC 7501 program status records, the OSC 9;4 progress, the OSC 3008
+//! shell-integration parser with its OSC 133 marks, the OSC scanner, kitty's
+//! OSC 99 notification chunks and the OSC 7501 program status records, the OSC 9;4 progress, the OSC 3008
 //! context stack, the OSC 22 pointer shape stacks, the replay renderer, and
 //! the server's per-session emulator.
 
@@ -14,6 +14,7 @@ pub mod context;
 pub mod emulator;
 #[cfg(test)]
 mod fuzz;
+pub mod kitty;
 pub mod notice;
 pub mod osc;
 pub mod pointer;

@@ -21,8 +21,9 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 - **Shell integration** (OSC 133, and VS Code's OSC 633): jump between prompts, select or
   copy the last command's output or command line, and see failed commands marked in the
   gutter.
-- **Desktop notifications** from OSC 9, OSC 777 and bells in tabs you can't see;
-  clicking one takes you to its tab.
+- **Desktop notifications** from OSC 9, OSC 777, kitty's OSC 99 and bells in tabs
+  you can't see; clicking one takes you to its tab. OSC 99 notifications can be
+  updated, closed, given buttons and silenced, and report clicks back.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
@@ -44,7 +45,7 @@ which Brindle reaches through `brindle-remote relay`, one connection per
 endpoint for all its tabs. The `brindle-remote` helper is copied to a
 versioned cache on first connection (user-only on an SSH host) and reused
 while its build matches. Output remains the terminal's original byte stream,
-so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status, OSC 9;4
+so OSC 7 directories, OSC 9/777/99 notifications, OSC 7501 program status, OSC 9;4
 progress, OSC 3008 contexts, OSC 22 pointer shapes, clipboard/color replies and
 shell-integration marks work as in a local tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
@@ -778,9 +779,44 @@ desktop. Configure it in `config.toml`:
 bell = true          # bells
 osc9 = true          # OSC 9
 osc777 = true        # OSC 777
+osc99 = true         # kitty's OSC 99, see below (off: no replies either)
 osc7501 = true       # program status (OSC 7501), see below
 when = "unfocused"   # or "always"
 ```
+
+#### kitty's notification protocol (OSC 99)
+
+Programs that speak [kitty's desktop notification protocol][osc99] can do more
+than raise a notification. Brindle supports:
+
+- **Titles and bodies, in chunks** (`d=0` holds a notification for more), plain
+  or base64 (`e=1`, cut anywhere between chunks), named by `i=`.
+- **Updates and closes:** a notification with the id of one still open replaces
+  it; `p=close` closes it, and `p=alive` lists the terminal's open ids.
+- **Clicks:** `a=focus` (the default) raises the window and shows the tab, as for
+  other notifications; `a=report` writes `ESC ] 99;i=<id>; ESC \` back to the
+  program; `a=-focus` leaves the window where it is. `c=1` reports the close too.
+- **Buttons** (`p=buttons`, labels separated by U+2028, up to 4): shown as
+  freedesktop actions where the notification service shows them, and as toast
+  buttons on Windows. With `a=report`, pressing button N writes
+  `ESC ] 99;i=<id>;N ESC \`, without raising the window. Some services hide or
+  fold actions, so a program asking a question should keep its tab as a fallback.
+- **When and how:** `o=unfocused` and `o=invisible` can only make a notification
+  quieter than `when`; `s=silent` (base64) shows it without a sound; on Linux,
+  `u=` sets its urgency and `w=` its timeout.
+- **The query** `p=?`, answered with what Brindle supports there.
+
+Icons, named sounds, application names and types are ignored. Replies go only to
+the program's own terminal.
+
+```sh
+printf '\033]99;i=build:d=0;Build\033\\\033]99;i=build:p=body;running\033\\'
+sleep 5
+printf '\033]99;i=build:d=0;Build\033\\\033]99;i=build:p=body;3 failed\033\\'  # updates it
+printf '\033]99;i=build:p=close;\033\\'                  # and closes it
+```
+
+[osc99]: https://sw.kovidgoyal.net/kitty/desktop-notifications/
 
 #### Program status
 

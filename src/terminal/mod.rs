@@ -46,7 +46,7 @@ use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::StreamExt as _;
-use gpui::{ClipboardItem, Context, EventEmitter, Task};
+use gpui::{ClipboardItem, Context, EventEmitter, Task, WeakEntity};
 use parking_lot::Mutex;
 
 use self::events::{EventGate, Merge, Recovered};
@@ -58,6 +58,8 @@ use self::shell_integration::{Marks, Parser};
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
 use crate::notify::osc::{Found, Notice};
+use crate::notify::{Notifier, kitty};
+use crate::settings::Settings;
 use crate::remote::Host;
 use crate::theme::{Color, Theme};
 
@@ -232,12 +234,35 @@ impl From<GridSize> for WindowSize {
     }
 }
 
+/// An OSC 99 request that needs `Notifier`, with the terminal its replies
+/// and reports go to. Shows, closes and alives travel as one event kind, so
+/// they reach `Notifier` in stream order: a close right after its show
+/// finds it open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notify99 {
+    pub request: Request99,
+    pub terminal: WeakEntity<Terminal>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request99 {
+    /// A finished notification.
+    Show(kitty::Notice99),
+    /// `p=close` of this id.
+    Close(kitty::KittyId),
+    /// `p=alive`, answered under this id.
+    Alive(kitty::KittyId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalEvent {
     TitleChanged,
     Bell,
     /// A program asked for a desktop notification (OSC 9 / OSC 777).
     Notify(Notice),
+    /// A program finished an OSC 99 notification, or closed or listed its
+    /// notifications.
+    Notify99(Box<Notify99>),
     /// The child process exited (PTY) or the pane closed (remote).
     Exited,
     /// The program status records (OSC 7501) changed. The notice is set
@@ -325,6 +350,9 @@ pub struct Terminal {
     /// full reset, the program's end or a replay's start: the server keeps
     /// none, so an attach starts with both empty.
     pointer: pointer::Stacks,
+    /// The program's incomplete OSC 99 notifications, until they complete,
+    /// the program ends or a replay begins.
+    notices99: kitty::Assembly,
     /// Whether the directory the program reports exists, where that is the
     /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
     /// refreshed when output brings another report, by a check off the UI
@@ -408,6 +436,7 @@ impl Terminal {
                 // starts with Brindle's own.
                 if active {
                     self.pointer.clear();
+                    self.notices99 = kitty::Assembly::default();
                 }
                 if active && self.clear_contexts() {
                     cx.emit(TerminalEvent::Status(None));
@@ -510,6 +539,7 @@ impl Terminal {
             contexts: Contexts::default(),
             badge: None,
             pointer: pointer::Stacks::default(),
+            notices99: kitty::Assembly::default(),
             dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
@@ -764,8 +794,10 @@ impl Terminal {
             let activity = self.status.end_activity();
             let progress = self.progress.take().is_some();
             let contexts = self.clear_contexts();
-            // Its pointer shapes go too; the grid repaints anyway.
+            // Its pointer shapes go too; the grid repaints anyway. So do
+            // its unfinished notifications.
             self.pointer.clear();
+            self.notices99 = kitty::Assembly::default();
             if activity || progress || contexts {
                 cx.emit(TerminalEvent::Status(None));
             }
@@ -833,6 +865,10 @@ impl Terminal {
                 self.emit_from_output(TerminalEvent::Notify(notice), cx);
                 return;
             }
+            Found::Kitty(chunk) => {
+                self.handle_kitty(chunk, cx);
+                return;
+            }
             Found::Status(status::Message::Query) => {
                 self.write(status::QUERY_REPLY);
                 return;
@@ -867,6 +903,32 @@ impl Terminal {
         if changed || progress_changed {
             cx.emit(TerminalEvent::Status(None));
         }
+    }
+
+    /// A chunk of kitty's OSC 99 from the output: assembled, and a finished
+    /// notification, a close or an alive sent on to `Notifier` (through the
+    /// workspace, in stream order); a query answered at once, to this
+    /// terminal's program only, so its reply comes before the answer to any
+    /// request that follows it. A replay recreates a screen, not a
+    /// program's requests, so its chunks are dropped, and with `osc99` off
+    /// Brindle answers nothing, as a terminal without OSC 99.
+    fn handle_kitty(&mut self, chunk: kitty::Chunk, cx: &mut Context<Self>) {
+        let enabled = cx.try_global::<Settings>().is_none_or(|s| s.config.notifications.osc99);
+        if self.replaying || !enabled {
+            return;
+        }
+        let request = match self.notices99.feed(chunk) {
+            kitty::Step::Pending | kitty::Step::Ignored => return,
+            kitty::Step::Query(id) => {
+                self.write(kitty::reply_query(id.as_ref(), Notifier::caps(cx)).into_bytes());
+                return;
+            }
+            kitty::Step::Show(notice) => Request99::Show(notice),
+            kitty::Step::Close(id) => Request99::Close(id),
+            kitty::Step::Alive(id) => Request99::Alive(id),
+        };
+        let terminal = cx.entity().downgrade();
+        self.emit_from_output(TerminalEvent::Notify99(Box::new(Notify99 { request, terminal })), cx);
     }
 
     #[allow(
@@ -1592,7 +1654,7 @@ fn palette_color(t: &Theme, index: usize) -> Color {
 /// bell, no notification, and no status notice.
 fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
     match event {
-        TerminalEvent::Bell | TerminalEvent::Notify(_) => None,
+        TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Notify99(_) => None,
         TerminalEvent::Status(Some(_)) => Some(TerminalEvent::Status(None)),
         other @ (TerminalEvent::TitleChanged | TerminalEvent::Exited | TerminalEvent::Status(_)) => Some(other),
     }

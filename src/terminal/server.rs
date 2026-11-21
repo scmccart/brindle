@@ -134,6 +134,7 @@ impl Sink {
                         self.listener.send(ChannelEvent::Pointer(screen, op));
                     }
                     Found::Notice(_)
+                    | Found::Kitty(_)
                     | Found::Status(_)
                     | Found::Progress(_)
                     | Found::Context(_)

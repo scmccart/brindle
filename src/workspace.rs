@@ -52,7 +52,7 @@ use crate::terminal::shell_integration::PathStyle;
 use crate::terminal::context::Badge;
 use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
-use crate::terminal::{Terminal, TerminalEvent};
+use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView, describe_badge, ui_badge};
@@ -1235,6 +1235,11 @@ impl Workspace {
             TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Status(_) => {
                 self.on_attention(ix, event, window, cx)
             }
+            TerminalEvent::Notify99(notify) => match &notify.request {
+                Request99::Show(_) => self.on_attention(ix, event, window, cx),
+                Request99::Close(id) => Notifier::close_program(&notify.terminal, id, cx),
+                Request99::Alive(id) => Notifier::answer_alive(&notify.terminal, id, cx),
+            },
             TerminalEvent::TitleChanged => {
                 // The tree says so when another zone becomes active, whose
                 // badge the face then shows.
@@ -1263,30 +1268,37 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
-        let visible = Some(self.tabs[ix].id) == self.strip.active() && window.is_window_active();
-        let (source, title, body) = match event {
+        let active = Some(self.tabs[ix].id) == self.strip.active();
+        let visible = active && window.is_window_active();
+        let always = notify::kitty::Occasion::Always;
+        let (source, title, body, occasion, program) = match event {
             TerminalEvent::Bell => {
                 if !visible {
                     self.tabs[ix].bell = true;
                     cx.notify();
                 }
-                (Source::Bell, "", "")
+                (Source::Bell, "", "", always, None)
             }
-            TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str()),
+            TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str(), always, None),
+            TerminalEvent::Notify99(notify) => {
+                let Request99::Show(notice) = &notify.request else { return };
+                let program = notify::ProgramNotice { terminal: notify.terminal.clone(), program: notice.program.clone() };
+                (Source::Osc99, notice.title.as_str(), notice.body.as_str(), notice.occasion, Some(program))
+            }
             TerminalEvent::Status(notice) => {
                 self.refresh_status(ix, cx);
                 let Some(notice) = notice else { return };
-                (notice.source, notice.title.as_str(), notice.body.as_str())
+                (notice.source, notice.title.as_str(), notice.body.as_str(), always, None)
             }
             TerminalEvent::TitleChanged | TerminalEvent::Exited => return,
         };
-        if !notify::policy::wanted(&Self::settings(cx).notifications, source, visible) {
+        if !notify::policy::wanted(&Self::settings(cx).notifications, source, occasion, visible, active) {
             return;
         }
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
         let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
-        let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0 };
+        let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }
 
