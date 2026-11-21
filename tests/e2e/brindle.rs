@@ -37,6 +37,7 @@ pub mod theme {
         Rgb(0xff, 0xff, 0xff),
     ];
     pub const RED: Rgb = ANSI[1];
+    pub const YELLOW: Rgb = ANSI[3];
     pub const BLUE: Rgb = ANSI[4];
 
     /// The window chrome's `background` token for the `e2e` theme: its
@@ -1109,8 +1110,8 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.screen == ["hi"], "screen after progress {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- context id=\"s\" type=session\n\
-         --- context id=\"e\" type=elevate label=\"root\"\n--- badge tab=1 kind=privileged label=\"root\"\n\
-         --- badge zone=1 kind=privileged label=\"root\"\nhi\n",
+         --- context id=\"e\" type=elevate label=\"root\"\n--- badge tab=1 kind=privileged label=\"root\" draw=icon\n\
+         --- badge zone=1 kind=privileged label=\"root\" draw=icon\nhi\n",
     );
     ensure!(
         dump.contexts == ["id=\"s\" type=session", "id=\"e\" type=elevate label=\"root\""],
@@ -1118,7 +1119,7 @@ pub fn self_test_dump() -> Result {
         dump.contexts
     );
     ensure!(
-        dump.badges == ["tab=1 kind=privileged label=\"root\"", "zone=1 kind=privileged label=\"root\""],
+        dump.badges == ["tab=1 kind=privileged label=\"root\" draw=icon", "zone=1 kind=privileged label=\"root\" draw=icon"],
         "badges {:?}",
         dump.badges
     );

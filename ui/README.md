@@ -113,8 +113,8 @@ rule, not a convenience.
       it, with focus resting on the active trigger: left and right activate
       the previous and next enabled trigger, wrapping, home/PageUp and
       end/PageDown the first and last (`tab_key`, `tab_target`). A primary
-      press asks to activate and moves no focus. A trigger takes a leading
-      element (an icon), trailing adornments (status dots), a tooltip,
+      press asks to activate and moves no focus. A trigger takes leading
+      elements (an icon, status and bell dots), trailing adornments, a tooltip,
       `disabled` (half opacity, skipped, asks nothing) and `closable`: a
       ghost `IconXs` close button (its X 16px at a 2px stroke, in the
       trigger's text colour) shown on the active trigger and on a hovered
@@ -138,14 +138,18 @@ rule, not a convenience.
       `badge(Badge::new(label, color))` puts a badge right after the
       label, before the adornments; as the trigger narrows, the label is cut
       first, down to its first `TITLE_KEEPS` (8) characters (`kept_title`,
-      measured in the trigger's font), then the badge.
+      measured in the trigger's font), then a label badge (an icon badge
+      isn't cut).
 
     Four of the builders are not controls:
-    - `Badge` (`Badge::new("root", color)`): shadcn's badge, outline
+    - `Badge` (`Badge::new("web", color)`): shadcn's badge, outline
       variant, its text and border in the one colour given (`text-xs`,
       `font-medium`, `rounded-md`, `px-1.5`). It is placed by
       `TabTrigger::badge` and `CardHeader::badge`, which cut it with an
       ellipsis once the title beside it is down to what it keeps.
+      `Badge::icon(Icon::TriangleAlert, color)` is an icon alone (16px, a
+      2px stroke) in that colour, with no box, and isn't cut. Either takes a
+      `tooltip(text)`.
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
       rule in the border colour that takes no focus and no pointer events.
     - `Kbd` (`Kbd::new("ctrl-shift-t")`): keycaps from a keymap string, one
@@ -258,14 +262,15 @@ rule, not a convenience.
 - **Icons** (`icon.rs`): lucide's shapes drawn from polylines, circles and
   rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
-  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2`, `Rows2` and
-  `Lock`. Strokes have butt caps and miter joins, since gpui doesn't expose
-  lucide's round caps. Lucide's stroke (2 on its 24 grid) scales with the
+  `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2`, `Rows2`,
+  `Lock` and `TriangleAlert`. Strokes have butt caps and miter joins, since
+  gpui doesn't expose lucide's round caps (so `TriangleAlert`'s dot is a
+  short rule). Lucide's stroke (2 on its 24 grid) scales with the
   icon, which leaves a 16px icon 1.33px thin; `IconElement::min_stroke`
   (and `Button::icon_min_stroke`, with `Button::icon_size` for a bigger
   icon than the button size's) sets a minimum in pixels, and
   `LEGIBLE_ICON_STROKE` (2px) is the one window chrome uses: a tab strip's
-  buttons, the caption buttons and a trigger's close button. Other icons
+  buttons, the caption buttons, a trigger's close button and an icon badge. Other icons
   keep lucide's weight.
 - **`TextInput`** (`text_input.rs`) and **`filter`** (`fuzzy_match`, the
   case-insensitive subsequence match palettes use).
@@ -608,8 +613,8 @@ needs:
   Tabs have no menu; one would wrap the trigger in a `ContextMenu.Trigger`.
   Reason: a tab strip's tabs have a menu (rename, move, close), and the list
   draws the triggers, so it is the only place that can hear the press.
-- **Adornments and a tooltip** (additions): a leading element (an icon),
-  trailing adornments (status and bell dots) and a tooltip on the trigger and
+- **Adornments and a tooltip** (additions): leading elements (an icon,
+  status and bell dots), trailing adornments and a tooltip on the trigger and
   on its close button. Radix's trigger takes any children, so the slots are
   an API shape rather than a behaviour; the tooltip is gpui's (see Tooltip).
   Reason: a tab shows its program's state and its whole title.
@@ -642,10 +647,12 @@ needs:
   do.
 - **A badge** (an addition): `TabTrigger::badge` puts a `Badge` after the
   label. The label gives way first, down to its first 8 characters, and
-  then the badge, which (unlike shadcn's `shrink-0` badge) is cut with an
-  ellipsis; the trigger keeps its height. Reason: a tab names the context
-  its program runs in (OSC 3008: `run0`, a container), and a long label
-  shouldn't hide that, nor a long badge the label.
+  then a label badge, which (unlike shadcn's `shrink-0` badge) is cut with
+  an ellipsis; an icon badge (`Badge::icon`, an addition: no box, and a
+  tooltip) keeps its size. The trigger keeps its height. Reason: a tab
+  names the context its program runs in (OSC 3008: a container, or a
+  warning for `run0`), and a long label shouldn't hide that, nor a long
+  badge the label.
 - **A window's strip drops the pill's surface (owner styling, not the component).** Brindle's strip gives its `TabList` a transparent background, no left padding and a gap between faces, through `Styled`, since each face has its own surface. The component still draws shadcn's pill unless told otherwise.
 - **One look, the pill.** shadcn also has a `line` variant (no surfaces, an
   underline under the active trigger); it isn't offered. Reason: the spec

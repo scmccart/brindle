@@ -236,12 +236,15 @@ impl Theme {
         (progress.fraction(), color)
     }
 
-    /// A context badge's colour on a face or header in this theme: its red
-    /// (ANSI 1) for an elevation or privilege change, else the muted text
-    /// the theme's cards use, legible on its background.
+    /// A context badge's colour on a face or header in this theme, both of
+    /// which are drawn on its background: its yellow (ANSI 3) for the
+    /// warning icon of an elevation or privilege change, else the muted
+    /// text the theme's cards use. Either is pushed towards black or white
+    /// until it reaches 3:1 on the background (WCAG's minimum for icons and
+    /// for the muted text), so a light theme's pale yellow still shows.
     pub fn badge_color(&self, kind: BadgeKind) -> Hsla {
         match kind {
-            BadgeKind::Privileged => self.ansi[1].hsla(),
+            BadgeKind::Privileged => self.ansi[3].legible_on(self.background, 3.0).hsla(),
             BadgeKind::Elsewhere => self.card_muted_foreground().hsla(),
         }
     }
@@ -574,12 +577,33 @@ mod tests {
         assert_eq!(theme.status_color(State::Idle, muted), muted);
     }
 
+    /// A privileged badge is the theme's yellow, unchanged where it already
+    /// reads on the background, and the rest the cards' muted text.
     #[test]
-    fn privileged_badges_are_red_and_the_rest_muted() {
+    fn privileged_badges_are_yellow_and_the_rest_muted() {
+        let dark = builtin_theme("tokyo-night").unwrap();
+        assert_eq!(dark.badge_color(BadgeKind::Privileged), dark.ansi[3].hsla());
         for name in ["tokyo-night", "brindle-light"] {
             let theme = builtin_theme(name).unwrap();
-            assert_eq!(theme.badge_color(BadgeKind::Privileged), theme.ansi[1].hsla(), "{name}");
+            let yellow = theme.ansi[3].legible_on(theme.background, 3.0);
+            assert_eq!(theme.badge_color(BadgeKind::Privileged), yellow.hsla(), "{name}");
             assert_eq!(theme.badge_color(BadgeKind::Elsewhere), theme.card_muted_foreground().hsla(), "{name}");
+        }
+    }
+
+    /// The spec's badge colours read on the face and the zone header, which
+    /// are both the theme's background: 3:1 for every built-in, for the
+    /// warning icon and the muted label alike.
+    #[test]
+    fn badges_are_legible_for_every_builtin() {
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            let surface = color_of(theme.card_colors().surface.unwrap());
+            assert_eq!(surface, theme.background, "{name}: the header is drawn on the background");
+            for kind in [BadgeKind::Privileged, BadgeKind::Elsewhere] {
+                let ratio = color_of(theme.badge_color(kind)).contrast(theme.background);
+                assert!(ratio >= 3.0, "{name}: {kind:?} badge contrast {ratio:.2} < 3");
+            }
         }
     }
 

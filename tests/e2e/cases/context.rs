@@ -1,7 +1,8 @@
 //! Program contexts (UAPI.15's `OSC 3008`): the stack in the dump
 //! (`--- context …`), the badges shown (`--- badge tab=N …` and `--- badge
 //! zone=ID …`), a context outliving `ESC c`, ends and nesting, the tab
-//! showing only its active zone's badge, and the badge's red in a capture.
+//! showing only its active zone's badge, and the privileged badge's yellow
+//! warning icon in a capture.
 //! The sequences are printed with `printf`, since no runner can rely on
 //! `run0` or `systemd-nspawn`.
 
@@ -42,8 +43,10 @@ fn window_rect(scale: f32, x: f32, y: f32, w: f32, h: f32) -> PxRect {
 }
 
 /// `run0`'s start, then `ESC c`: the context stays, the tab's face shows a
-/// red `root` badge after its title (the `e2e` theme's ANSI 1), and the
-/// face is as tall as ever (nothing red under it).
+/// warning icon after its title in the `e2e` theme's yellow (ANSI 3, which
+/// reads on its background as it is), its target user only in the dump's
+/// label and the tooltip, and the face is as tall as ever (nothing yellow
+/// under it).
 pub fn badge(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "run0")
         .profile("Shell")
@@ -56,18 +59,21 @@ pub fn badge(ctx: &Ctx) -> Result<Outcome> {
     expect(
         &out,
         &["id=\"a1\" type=elevate label=\"root\""],
-        &["tab=1 kind=privileged label=\"root\""],
+        &["tab=1 kind=privileged label=\"root\" draw=icon"],
         "inside run0, after a reset",
     )?;
     let image: &Image = out.image.as_ref().ok_or("no capture")?;
     let strip = Strip::locate(&out, image)?;
     let scale = out.dump.grid()?.scale;
-    let red = theme::RED;
-    // The badge follows the title (`bash`, about 30px after the face's 12px
-    // padding), its text and border red, within the face's height.
+    let yellow = theme::YELLOW;
+    // The icon follows the title (`bash`, about 30px after the face's 12px
+    // padding), within the face's height; nothing before the title is
+    // yellow, and nothing is red, as the badge was before.
     let face = strip.rect(FACE_LEFT + 30.0, FACE_TOP + 4.0, 80.0, FACE_HEIGHT - 8.0);
-    image.expect("the red badge on the face", face, red, (6.0 * scale * scale) as usize)?;
-    image.expect_none("red under the face", strip.under_face(0), red)?;
+    image.expect("the yellow warning icon on the face", face, yellow, (6.0 * scale * scale) as usize)?;
+    image.expect_none("yellow before the title", strip.rect(FACE_LEFT + 2.0, FACE_TOP + 4.0, 10.0, FACE_HEIGHT - 8.0), yellow)?;
+    image.expect_none("red on the face", face, theme::RED)?;
+    image.expect_none("yellow under the face", strip.under_face(0), yellow)?;
     Ok(Outcome::Pass)
 }
 
@@ -96,7 +102,7 @@ pub fn end(ctx: &Ctx) -> Result<Outcome> {
             "id=\"c1\" type=container label=\"a-very-long-container-n…\"",
             "id=\"s1\" type=shell",
         ],
-        &["tab=1 kind=elsewhere label=\"a-very-long-container-n…\""],
+        &["tab=1 kind=elsewhere label=\"a-very-long-container-n…\" draw=text"],
         "nested",
     )?;
 
@@ -114,7 +120,7 @@ pub fn end(ctx: &Ctx) -> Result<Outcome> {
 
 /// Two zones, the left inside `run0`, the right (active) in none: the tab
 /// face shows no badge, since its active zone has none, while the left
-/// zone's header shows the red badge and the right one's doesn't.
+/// zone's header shows the yellow warning icon and the right one's doesn't.
 pub fn zones(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "zones")
         .profile("Shell")
@@ -128,18 +134,18 @@ pub fn zones(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(6.5)
         .run()?;
     ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
-    expect(&out, &[], &["zone=1 kind=privileged label=\"root\""], "two zones, the left elevated")?;
+    expect(&out, &[], &["zone=1 kind=privileged label=\"root\" draw=icon"], "two zones, the left elevated")?;
     let image = out.image.as_ref().ok_or("no capture")?;
     let grid = out.dump.grid()?;
-    let red = theme::RED;
+    let yellow = theme::YELLOW;
     // The right zone's grid starts a padding below its header, which is
     // 28px tall; the left zone's header is at the same height. Each badge
     // follows its header's title.
     let header_top = grid.y - PADDING - 26.0;
     let left = window_rect(grid.scale, 16.0, header_top, grid.x - 40.0, 24.0);
-    image.expect("the left zone's red badge", left, red, (6.0 * grid.scale * grid.scale) as usize)?;
+    image.expect("the left zone's yellow warning icon", left, yellow, (6.0 * grid.scale * grid.scale) as usize)?;
     let right = window_rect(grid.scale, grid.x, header_top, 160.0, 24.0);
-    image.expect_none("red in the right zone's header", right, red)?;
+    image.expect_none("yellow in the right zone's header", right, yellow)?;
     Ok(Outcome::Pass)
 }
 

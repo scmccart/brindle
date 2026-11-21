@@ -26,7 +26,7 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
-  logins): a red `root` badge on a tab while it runs elevated.
+  logins): a yellow warning icon on a tab while it runs elevated.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -784,7 +784,7 @@ when = "unfocused"   # or "always"
 
 Programs that speak the [Program Status Protocol][osc7501] (OSC 7501: Claude
 Code, Codex, Terraform, Homebrew, …) tell Brindle what they are doing, and each
-tab shows a dot for it: yellow while the program is **blocked** on you (a
+tab shows a dot before its title for it: yellow while the program is **blocked** on you (a
 permission, a question, a login), red when it **failed**, green when it is
 **done** with something you haven't looked at, and grey while it is **working**.
 A `blocked`, `done` or `error` report also raises a desktop notification, with
@@ -843,17 +843,19 @@ systemd on the far side, and more. Brindle keeps each terminal's stack of
 contexts and shows the innermost notable one as a badge after the tab's title
 (the active zone's), and after each zone header's title in a split tab:
 
-- an elevation or privilege change (`elevate`, `chpriv`): the target user, in
-  the theme's red (`root`, or `elevated` with no user named);
+- an elevation or privilege change (`elevate`, `chpriv`): a warning icon in
+  the theme's yellow, with no name beside it; resting the pointer on it shows
+  the target user ("Running as root"). Brindle leaves what the program shows
+  itself alone: `run0` tints the background red and puts a glyph in the title;
 - a remote host (`remote`), a container or a VM: `user@host`, the host, or the
   container's or VM's name, in the muted foreground.
 
 Shell, session and command contexts show no badge. Labels are cut to 24
-characters, and a narrow tab cuts its title to 8 characters before it cuts the
-badge.
+characters, and a narrow tab cuts its title to 8 characters before it cuts a
+label badge.
 
 ```sh
-printf '\033]3008;start=a1;type=elevate;user=me;targetuser=root\033\\'  # a red "root" badge
+printf '\033]3008;start=a1;type=elevate;user=me;targetuser=root\033\\'  # a yellow warning icon
 printf '\033]3008;start=c1;type=container;container=web\033\\'          # "web", muted
 printf '\033]3008;end=a1\033\\'   # ends a1 and everything started inside it: no badge
 ```

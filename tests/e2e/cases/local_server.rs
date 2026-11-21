@@ -622,7 +622,7 @@ pub fn progress_attach(ctx: &Ctx) -> Result<Outcome> {
 
 /// A detached session's contexts (OSC 3008) stay in the server: after a
 /// quit and a plain launch, which attaches the detached session, its tab
-/// shows the red `root` badge again, from the replay. Then, detached once
+/// shows the privileged badge again, from the replay. Then, detached once
 /// more, the program ends the context (a file the case creates lets it),
 /// and the next attach shows no badge. Linux only: the command is bash's.
 pub fn context_attach(ctx: &Ctx) -> Result<Outcome> {
@@ -645,7 +645,7 @@ pub fn context_attach(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(5.0)
         .run()?;
     ensure!(first.dump.wait_timeouts.is_empty(), "the start didn't run: {:?}", first.dump.screen);
-    let want = ["tab=1 kind=privileged label=\"root\""];
+    let want = ["tab=1 kind=privileged label=\"root\" draw=icon"];
     ensure!(first.dump.badges == want, "before the quit: {:?}", first.dump.badges);
     detached_pids(&Server::of(ctx), 10.0, 1)?;
     let second = Run::new(ctx, "second").keep_detached().restore().wait_for("context-set").dump_at(6.0).run()?;

@@ -56,6 +56,8 @@ Alternative considered: a tree keyed by id with an explicit active pointer. Reje
 
 As built: the badge is a new `brindle_ui::Badge` (shadcn's outline badge), placed by `TabTrigger::badge` and `CardHeader::badge`, and coloured by the tab's own theme (`Theme::badge_color`: ANSI 1, or the cards' muted text), as the face is. The two-step give-way can't be had from a `min_w_0` box alone, since gpui's text measures the same at min- and max-content: the title's flex basis is the measured width of its first 8 characters and an ellipsis, it grows up to its whole measured width, and the badge shrinks 1000 times as fast, so the title is cut to 8 characters before the badge is cut, and only then further. `Tab::badge` is also refreshed on the tree's `TitleChanged`, which a change of active zone sends. The event-overload reset (side events dropped while the UI thread was behind) clears the stack with the status records and progress, since a dropped message leaves it stale.
 
+After hand testing, the user decided: "A warning icon, follow the theme's color, no name needed." A privileged badge is now `brindle_ui::Badge::icon(Icon::TriangleAlert, …)` in the theme's yellow (ANSI 3, made legible on the background at 3:1), with "Running as <user>" in its tooltip; `BadgeDraw::of` in `zone_view.rs` makes that choice, and the dump's badge lines end in `draw=icon|text`. The status and bell dots moved before the tab's title (`TabTrigger::leading`). run0's own background tint and title glyph are its output, which Brindle leaves alone.
+
 ### Testing
 
 - `context.rs` unit tests: every `program-contexts` scenario (escapes, bad ids, bad type, nesting, update ends subcontexts, unknown end, depth 32, label rules and truncation).

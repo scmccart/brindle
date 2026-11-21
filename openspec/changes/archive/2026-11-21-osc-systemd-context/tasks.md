@@ -20,7 +20,7 @@
 - [x] 4.1 Cache `Tab::badge` from the active zone and draw the badge on the tab face (title truncating first, to 8 characters), and verify `cargo test -p brindle workspace`
 - [x] 4.2 Draw the badge on zone headers in `zone_view.rs`
 - [x] 4.3 Add e2e cases (`tests/e2e/cases/context.rs`): `context-badge` (dump and a red pixel sample), `context-end`, `context-zones`, and `local-server-context-attach` in `local_server.rs`; verify `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- context`
-- [ ] 4.4 Manual check for the user: on a systemd ≥ 257 machine, `run0 bash` shows a red `root` badge that goes when it exits
+- [ ] 4.4 Manual check for the user: on a systemd ≥ 257 machine, `run0 bash` shows a yellow warning icon (tooltip "Running as root") that goes when it exits
 
 ## 5. Docs and integration
 

@@ -23,7 +23,7 @@ use crate::config::{Config, Profile};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
-use crate::terminal::context::Badge;
+use crate::terminal::context::{Badge, BadgeKind};
 use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
 use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
@@ -339,10 +339,58 @@ pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
     out
 }
 
+/// How a context badge is drawn on a tab face or a zone header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeDraw {
+    /// A warning icon, its label in the tooltip.
+    Icon,
+    /// The label as text.
+    Text,
+}
+
+impl BadgeDraw {
+    /// The user's call: "a warning icon, follow the theme's color, no name
+    /// needed" for an elevation or privilege change; the other contexts
+    /// (a host, a container, a VM) keep their name.
+    pub fn of(kind: BadgeKind) -> Self {
+        match kind {
+            BadgeKind::Privileged => BadgeDraw::Icon,
+            BadgeKind::Elsewhere => BadgeDraw::Text,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            BadgeDraw::Icon => "icon",
+            BadgeDraw::Text => "text",
+        }
+    }
+}
+
+/// The `brindle-ui` badge a tab face or zone header shows for `badge`, in
+/// `theme` (the face's or header's own, `Theme::badge_color`): a warning
+/// icon whose tooltip names the target user ("Running as root"), or the
+/// label ([`BadgeDraw::of`]).
+pub fn ui_badge(badge: &Badge, theme: &Theme) -> brindle_ui::Badge {
+    let color = theme.badge_color(badge.kind());
+    match BadgeDraw::of(badge.kind()) {
+        BadgeDraw::Icon => {
+            brindle_ui::Badge::icon(Icon::TriangleAlert, color).tooltip(format!("Running as {}", badge.label()))
+        }
+        BadgeDraw::Text => brindle_ui::Badge::new(badge.label().to_owned(), color),
+    }
+}
+
+/// A badge for the dump: `kind=… label="…" draw=icon|text`, the label kept
+/// as data even when only an icon is drawn.
+pub fn describe_badge(badge: &Badge) -> String {
+    format!("{} draw={}", badge.describe(), BadgeDraw::of(badge.kind()).name())
+}
+
 /// Formats `--dump-screen-after` zone badge lines when a tab has 2 or more
-/// zones (`--- badge zone=ID kind=… label="…"`, the active zone first, then
-/// by id), one per zone whose header shows a badge, or returns an empty
-/// string for a single-zone tab, which has no headers.
+/// zones (`--- badge zone=ID kind=… label="…" draw=…`, the active zone
+/// first, then by id), one per zone whose header shows a badge, or returns
+/// an empty string for a single-zone tab, which has no headers.
 pub fn describe_zone_badges<'a>(zones: impl IntoIterator<Item = (ZoneId, Option<&'a Badge>)>, active: ZoneId) -> String {
     let mut zones: Vec<(ZoneId, Option<&Badge>)> = zones.into_iter().collect();
     if zones.len() < 2 {
@@ -351,7 +399,7 @@ pub fn describe_zone_badges<'a>(zones: impl IntoIterator<Item = (ZoneId, Option<
     zones.sort_by_key(|(id, _)| (*id != active, id.0));
     zones
         .into_iter()
-        .filter_map(|(id, badge)| Some(format!("--- badge zone={} {}\n", id.0, badge?.describe())))
+        .filter_map(|(id, badge)| Some(format!("--- badge zone={} {}\n", id.0, describe_badge(badge?))))
         .collect()
 }
 
@@ -1125,10 +1173,9 @@ impl ZoneTreeView {
         if let Some(bar) = progress_bar {
             header = header.edge_bar(bar);
         }
-        // Its context badge, coloured as the tab face's is.
+        // Its context badge, drawn as the tab face's is.
         if let Some(badge) = &zone.badge {
-            let color = self.theme.badge_color(badge.kind());
-            header = header.badge(brindle_ui::Badge::new(badge.label().to_owned(), color));
+            header = header.badge(ui_badge(badge, &self.theme));
         }
         let header = header
             .title(title)
@@ -1380,9 +1427,41 @@ mod tests {
         let zones = [(ZoneId(3), web.as_ref()), (ZoneId(1), root.as_ref()), (ZoneId(2), None)];
         assert_eq!(
             describe_zone_badges(zones, ZoneId(3)),
-            "--- badge zone=3 kind=elsewhere label=\"web\"\n--- badge zone=1 kind=privileged label=\"root\"\n"
+            "--- badge zone=3 kind=elsewhere label=\"web\" draw=text\n\
+             --- badge zone=1 kind=privileged label=\"root\" draw=icon\n"
         );
         assert_eq!(describe_zone_badges(zones, ZoneId(2)).lines().count(), 2);
+    }
+
+    /// The user's decision: a privileged context is a warning icon in the
+    /// theme's yellow, its target user only in the tooltip; the others keep
+    /// their muted label and have no tooltip. The dump says which.
+    #[test]
+    fn a_privileged_badge_draws_as_a_warning_icon() {
+        use crate::terminal::context::{Contexts, parse};
+        use brindle_ui::BadgeContent;
+        let badge = |payload: &[u8]| {
+            let mut contexts = Contexts::default();
+            contexts.apply(parse(payload).unwrap());
+            contexts.notable().unwrap()
+        };
+        let theme = crate::theme::builtin_theme("tokyo-night").unwrap();
+        let root = badge(b"start=a;type=elevate;targetuser=root");
+        let drawn = ui_badge(&root, &theme);
+        assert_eq!(drawn.content(), &BadgeContent::Icon(Icon::TriangleAlert));
+        assert_eq!(drawn.color(), theme.badge_color(BadgeKind::Privileged));
+        assert_eq!(drawn.tooltip_text().map(|text| text.as_ref()), Some("Running as root"));
+        assert_eq!(describe_badge(&root), "kind=privileged label=\"root\" draw=icon");
+        let chpriv = badge(b"start=b;type=chpriv;targetuser=postgres");
+        assert_eq!(BadgeDraw::of(chpriv.kind()), BadgeDraw::Icon);
+        assert_eq!(ui_badge(&chpriv, &theme).tooltip_text().map(|text| text.as_ref()), Some("Running as postgres"));
+
+        let web = badge(b"start=c;type=container;container=web");
+        let drawn = ui_badge(&web, &theme);
+        assert_eq!(drawn.content(), &BadgeContent::Label("web".into()));
+        assert_eq!(drawn.color(), theme.badge_color(BadgeKind::Elsewhere));
+        assert_eq!(drawn.tooltip_text(), None);
+        assert_eq!(describe_badge(&web), "kind=elsewhere label=\"web\" draw=text");
     }
 
     /// Zone progress lines: none for one zone (the tab's line says it),

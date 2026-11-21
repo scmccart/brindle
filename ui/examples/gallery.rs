@@ -187,7 +187,8 @@ pub struct DemoTab {
     bell: bool,
     /// A progress bar along its bottom edge: the share filled and its colour.
     bar: Option<(f32, u32)>,
-    /// A badge after its label: the text and its colour.
+    /// A warning-icon badge after its label: the user it names in its
+    /// tooltip, and its colour.
     badge: Option<(&'static str, u32)>,
 }
 
@@ -221,8 +222,9 @@ pub struct TabsDemo {
 /// - `strip`: a tab strip whose tabs close, move and show a tooltip: bash
 ///   (active, the spec's `#c0caf5` on `#1a1b26`), a long nvim title
 ///   (Solarized light colours, inactive but on its own surface), ssh (a
-///   leading icon, the tokens' colours) and a build with a status dot, a
-///   bell, a progress bar 40% along its bottom edge and a red `root` badge;
+///   leading icon, the tokens' colours) and a build with a status dot and
+///   a bell before its label, a progress bar 40% along its bottom edge and
+///   a yellow warning-icon badge ("Running as root");
 /// - `crowded`: six sessions in a list too narrow for them.
 fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let labelled = |labels: &[&'static str]| -> Vec<DemoTab> {
@@ -239,7 +241,7 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
             status: Some(0xe0af68),
             bell: true,
             bar: Some((0.4, 0xe0af68)),
-            badge: Some(("root", 0xf7768e)),
+            badge: Some(("root", 0xe0af68)),
             ..DemoTab::new(3, "cargo build")
         },
     ];
@@ -257,7 +259,7 @@ fn demo_tab_width() -> TabWidth {
     TabWidth::new(rems(5.), rems(15.))
 }
 
-/// A 6px dot, as a tab's status and bell adornments.
+/// A 6px dot, as a tab's leading status and bell dots.
 /// The demo cards' size.
 const CARD_DEMO_WIDTH: f32 = 240.;
 const CARD_DEMO_HEIGHT: f32 = 120.;
@@ -1141,17 +1143,19 @@ impl Gallery {
                 if tab.icon {
                     trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
                 }
+                // The dots lead the label, as on a window's tab strip.
                 if let Some(status) = tab.status {
-                    trigger = trigger.adornment(dot(rgb(status).into()));
+                    trigger = trigger.leading(dot(rgb(status).into()));
                 }
                 if tab.bell {
-                    trigger = trigger.adornment(dot(primary));
+                    trigger = trigger.leading(dot(primary));
                 }
                 if let Some((fraction, color)) = tab.bar {
                     trigger = trigger.edge_bar(EdgeBar::new(fraction, rgb(color)));
                 }
-                if let Some((label, color)) = tab.badge {
-                    trigger = trigger.badge(Badge::new(label, rgb(color)));
+                if let Some((user, color)) = tab.badge {
+                    let badge = Badge::icon(Icon::TriangleAlert, rgb(color)).tooltip(format!("Running as {user}"));
+                    trigger = trigger.badge(badge);
                 }
                 trigger
             })

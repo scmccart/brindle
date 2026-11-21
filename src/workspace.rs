@@ -37,7 +37,7 @@ use crate::picker::{
 };
 use crate::settings::Zoom;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Badge as UiBadge, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
@@ -55,7 +55,7 @@ use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
+use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView, describe_badge, ui_badge};
 
 /// The tab strip's height in logical pixels: the pill tab list's
 /// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
@@ -2347,20 +2347,21 @@ impl Workspace {
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
                     .text_color(text);
+                // The status and bell dots lead the face, before its title.
                 if let Some(state) = tab.status {
-                    trigger = trigger.adornment(dot(status_color(state)));
+                    trigger = trigger.leading(dot(status_color(state)));
+                }
+                if tab.bell {
+                    trigger = trigger.leading(dot(tokens.primary));
                 }
                 if let Some(progress) = tab.progress {
                     trigger = trigger.edge_bar(progress_bar(progress));
                 }
                 // The face's own theme colours its badge, as it does the
-                // face: red for an elevation, its muted text otherwise.
+                // face: a yellow warning icon for an elevation, its muted
+                // text otherwise.
                 if let Some(badge) = &tab.badge {
-                    let color = tab.zones.read(cx).theme.badge_color(badge.kind());
-                    trigger = trigger.badge(UiBadge::new(badge.label().to_owned(), color));
-                }
-                if tab.bell {
-                    trigger = trigger.adornment(dot(tokens.primary));
+                    trigger = trigger.badge(ui_badge(badge, &tab.zones.read(cx).theme));
                 }
                 trigger
             })
@@ -2920,12 +2921,12 @@ fn describe_tab_progress(tabs: impl IntoIterator<Item = Option<Progress>>) -> St
 }
 
 /// The tabs' context badges, for `--dump-screen-after`: `--- badge tab=N
-/// kind=… label="…"` for each tab whose face shows one, numbered from 1 as
-/// the `--- tab` lines are.
+/// kind=… label="…" draw=icon|text` for each tab whose face shows one,
+/// numbered from 1 as the `--- tab` lines are.
 fn describe_tab_badges<'a>(tabs: impl IntoIterator<Item = Option<&'a Badge>>) -> String {
     tabs.into_iter()
         .enumerate()
-        .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, badge?.describe())))
+        .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, describe_badge(badge?))))
         .collect()
 }
 
@@ -3636,7 +3637,7 @@ mod tests {
         contexts.apply(parse(b"start=a;type=remote;targetuser=me;targethost=box").unwrap());
         let badge = contexts.notable();
         assert_eq!(describe_tab_badges([None, None]), "");
-        assert_eq!(describe_tab_badges([None, badge.as_ref()]), "--- badge tab=2 kind=elsewhere label=\"me@box\"\n");
+        assert_eq!(describe_tab_badges([None, badge.as_ref()]), "--- badge tab=2 kind=elsewhere label=\"me@box\" draw=text\n");
     }
 
     #[test]

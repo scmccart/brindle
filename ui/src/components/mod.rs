@@ -66,7 +66,7 @@ use gpui::{
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::style::ring_geometry;
 
-pub use badge::{Badge, TITLE_KEEPS, kept_title};
+pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
