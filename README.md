@@ -156,7 +156,7 @@ Their sockets, locks and logs (`core.log`, `holder-*.log`) are in
 `$BRINDLE_SERVER_DIR`, else `$XDG_RUNTIME_DIR/brindle`, else
 `~/.cache/brindle/run`. A socket path must fit in 108 bytes, so keep a custom
 `BRINDLE_SERVER_DIR` short. On Windows the directory is
-`%LOCALAPPDATA%rindleun` (`run-elevated` for an elevated Brindle), or
+`%LOCALAPPDATA%\brindle\run` (`run-elevated` for an elevated Brindle), or
 `%BRINDLE_SERVER_DIR%`, and the roles run from a per-build copy of
 `brindle-remote.exe`, so a rebuild or an upgrade never needs a running one
 replaced.
