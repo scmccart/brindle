@@ -2189,12 +2189,23 @@ mod on_windows {
         let held = working_set_kib(core_pid);
         assert!(held < 128 * 1024, "the core holds {held} KiB");
 
-        // Once the stalled client reads again, its session flows again: far
-        // more arrives than was queued when it was paused.
+        // Once the stalled client reads again, its session flows again. Two
+        // things say so, and neither is an amount within a time, which the
+        // pseudoconsole's rate would decide (under 0.5 MB/s on a slow CI
+        // runner): more of the flood arrives than the holder had read at all
+        // while the session was paused, so the holder reads the console
+        // again and the core passes it on, and the program writes again.
+        let queued = bytes_read(holder).expect("the holder") as usize;
+        let blocked_at = io_calls(flood_pid).expect("the flooding program");
+        let writes_again = || io_calls(flood_pid).is_some_and(|calls| calls != blocked_at);
         let mut received = 0usize;
         let deadline = Instant::now() + TIMEOUT;
-        while received < 16 * 1024 * 1024 {
-            assert!(Instant::now() < deadline, "only {received} bytes resumed");
+        while received <= queued || !writes_again() {
+            assert!(
+                Instant::now() < deadline,
+                "only {received} bytes resumed, with {queued} queued (writing again: {})",
+                writes_again()
+            );
             match stalled.recv() {
                 ToClient::Data(data) if data.session == flood => received += data.bytes.len(),
                 _ => {}
