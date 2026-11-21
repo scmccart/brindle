@@ -38,6 +38,7 @@ impl Notices {
     /// text never shows twice: it keeps its id and shows for the lifetime
     /// again. Past [`NOTICE_CAP`] the oldest goes.
     pub fn push(&mut self, text: String, now: Instant) -> NoticeId {
+        let text = clean(&text);
         let until = now + NOTICE_LIFETIME;
         let id = match self.shown.iter().position(|notice| notice.text == text) {
             Some(ix) => self.shown.remove(ix).id,
@@ -76,9 +77,61 @@ impl Notices {
     }
 }
 
+/// The most characters a notice shows; a longer one ends in `…`.
+pub const NOTICE_MAX_CHARS: usize = 200;
+
+/// What a notice shows of `text`, which may hold a program's bytes (a link
+/// it printed): its lines joined with `; `, without control characters or
+/// the invisible format characters that reorder or hide text (bidi
+/// embeddings, overrides and isolates, zero-width marks), and cut to
+/// [`NOTICE_MAX_CHARS`], so a link can't pass for another notice.
+pub fn clean(text: &str) -> String {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    };
+    let joined = text
+        .split(['\n', '\r'])
+        .map(|part| part.chars().filter(|c| !hidden(*c)).collect::<String>())
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.chars().count() <= NOTICE_MAX_CHARS {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(NOTICE_MAX_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program's link can't hide text, reorder it or run past one line.
+    #[test]
+    fn a_notice_shows_no_hidden_or_reordering_characters_and_is_cut() {
+        assert_eq!(
+            clean("could not open\nhttps://a\u{202E}gpj.exe\u{1b}[2m\u{200B}"),
+            "could not open; https://agpj.exe[2m"
+        );
+        let shown = clean(&"x".repeat(500));
+        assert_eq!(shown.chars().count(), NOTICE_MAX_CHARS);
+        assert!(shown.ends_with('…'));
+        let mut notices = Notices::default();
+        notices.push("a\u{2066}b".to_string(), Instant::now());
+        assert_eq!(texts(&notices), ["ab"]);
+    }
 
     fn texts(notices: &Notices) -> Vec<&str> {
         notices.texts().collect()
