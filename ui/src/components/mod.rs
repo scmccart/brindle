@@ -35,6 +35,7 @@
 //! component keeps across a refresh and what its events name the chosen
 //! item by, never a position.
 
+pub mod badge;
 pub mod button;
 pub mod card;
 pub mod checkbox;
@@ -65,6 +66,7 @@ use gpui::{
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::style::ring_geometry;
 
+pub use badge::{Badge, TITLE_KEEPS, kept_title};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};

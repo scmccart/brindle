@@ -1,8 +1,9 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
 //! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
-//! program status reports, ConEmu's `OSC 9 ; 4` progress reports, and the
-//! OSC 133 (and VS Code's OSC 633) `A` prompt starts and `ESC c` resets
-//! that end status records and progress.
+//! program status reports, ConEmu's `OSC 9 ; 4` progress reports, UAPI.15's
+//! `OSC 3008` context starts and ends, and the OSC 133 (and VS Code's OSC
+//! 633) `A` prompt starts and `ESC c` resets that end status records and
+//! progress (but not contexts).
 //!
 //! The scanner keeps its state between calls, so a sequence split across
 //! reads is still found, and it never buffers anything but the payload of
@@ -10,6 +11,7 @@
 
 pub use crate::{Notice, Source};
 
+use crate::context;
 use crate::progress::{self, Progress, Report};
 use crate::status::{self, Message};
 
@@ -21,6 +23,8 @@ pub enum Found {
     Status(Message),
     /// An `OSC 9 ; 4` progress report.
     Progress(Report),
+    /// An `OSC 3008` context start or end.
+    Context(context::Message),
     /// OSC 133 `A` (or OSC 633 `A`): a new shell prompt begins.
     PromptStart,
     /// `ESC c`: a full reset.
@@ -37,7 +41,7 @@ impl Found {
         match self {
             Found::Progress(report) => progress::apply(current, *report),
             Found::PromptStart | Found::Reset => None,
-            Found::Notice(_) | Found::Status(_) => current,
+            Found::Notice(_) | Found::Status(_) | Found::Context(_) => current,
         }
     }
 }
@@ -147,7 +151,7 @@ impl Scanner {
                 }
                 b';' => {
                     // Written as the number is: `0009` isn't 9.
-                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133 | 633, 3) | (7501, 4));
+                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4));
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -206,6 +210,7 @@ impl Scanner {
             // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
             133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
             7501 => status::parse(&payload).map(Found::Status),
+            3008 => context::parse(&payload).map(Found::Context),
             _ => None,
         }
     }
@@ -402,6 +407,51 @@ mod tests {
         assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]9;hi\x07\x1b]7501;state=working\x07\x1b]133;B\x07"), p(40));
         // A report after the prompt sets it again.
         assert_eq!(fold(b"\x1b]133;A\x07\x1b]9;4;1;7\x07"), p(7));
+        // A context start leaves it.
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]3008;start=a\x07"), p(40));
+    }
+
+    fn context(payload: &[u8]) -> Found {
+        Found::Context(crate::context::parse(payload).unwrap())
+    }
+
+    #[test]
+    fn context_sequences_with_either_terminator() {
+        assert_eq!(
+            scan(b"\x1b]3008;start=a1;type=elevate;targetuser=root\x1b\\"),
+            [context(b"start=a1;type=elevate;targetuser=root")]
+        );
+        assert_eq!(scan(b"\x1b]3008;end=a1\x07"), [context(b"end=a1")]);
+        // Not first, a bad id, or the number not written as is: nothing.
+        assert!(scan(b"\x1b]3008;type=elevate;start=a1\x1b\\").is_empty());
+        assert!(scan(b"\x1b]3008;start=\x07").is_empty());
+        assert!(scan(b"\x1b]03008;start=a\x07\x1b]300;start=a\x07").is_empty());
+        // The scanner never changes the grid: it only reports.
+        assert_eq!(scan(b"a\x1b]3008;start=b\x07c"), [context(b"start=b")]);
+    }
+
+    #[test]
+    fn a_context_sequence_split_at_every_byte_is_found_once() {
+        let input = b"x\x1b]3008;start=c1;type=container;container=web\\x3bdb\x1b\\y\x1b]3008;end=c1\x07";
+        let want = [context(b"start=c1;type=container;container=web\\x3bdb"), context(b"end=c1")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_context_sequence_is_ignored() {
+        assert!(scan(b"\x1b]3008;start=a\x18").is_empty());
+        assert!(scan(b"\x1b]3008;start=a\x1a").is_empty());
+        assert!(scan(b"\x1b]3008;start=a\x1b[0m").is_empty());
+        let mut big = b"\x1b]3008;start=a;comm=".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_PAYLOAD));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]3008;start=b\x07");
+        assert_eq!(scan(&big), [context(b"start=b")]);
     }
 
     #[test]

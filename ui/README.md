@@ -135,8 +135,17 @@ rule, not a convenience.
       (`EDGE_BAR_HEIGHT`) over the bottom edge of a trigger, inside its
       rounded corners, filling `fraction` of the width from the left (a
       progress bar); it takes no room and no press.
+      `badge(Badge::new(label, color))` puts a badge right after the
+      label, before the adornments; as the trigger narrows, the label is cut
+      first, down to its first `TITLE_KEEPS` (8) characters (`kept_title`,
+      measured in the trigger's font), then the badge.
 
-    Three of the builders are not controls:
+    Four of the builders are not controls:
+    - `Badge` (`Badge::new("root", color)`): shadcn's badge, outline
+      variant, its text and border in the one colour given (`text-xs`,
+      `font-medium`, `rounded-md`, `px-1.5`). It is placed by
+      `TabTrigger::badge` and `CardHeader::badge`, which cut it with an
+      ellipsis once the title beside it is down to what it keeps.
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
       rule in the border colour that takes no focus and no pointer events.
     - `Kbd` (`Kbd::new("ctrl-shift-t")`): keycaps from a keymap string, one
@@ -154,7 +163,9 @@ rule, not a convenience.
       an ellipsis (`trigger_label`), drawn muted with `title_muted(true)`,
       and `action`s at its end (icon buttons) over a border line, with an
       optional `edge_bar` (an `EdgeBar`, as a tab trigger's) along its
-      bottom edge, above the line. The slot's
+      bottom edge, above the line, and an optional `badge` after the title
+      (cut as on a tab trigger; the actions then keep to the end through an
+      auto margin). The slot's
       text colour is the muted one, which a `Button` takes only when given
       it (`text_color`), since a button sets its own. It is a stateful element, so the owner gives it handlers
       (a press, `on_context_menu`); `Card::on_header_bounds` reports where it
@@ -629,6 +640,12 @@ needs:
   colour; the trigger keeps its size and the bar takes no press. Reason: a
   tab shows its program's progress (OSC 9;4), as Windows Terminal's tabs
   do.
+- **A badge** (an addition): `TabTrigger::badge` puts a `Badge` after the
+  label. The label gives way first, down to its first 8 characters, and
+  then the badge, which (unlike shadcn's `shrink-0` badge) is cut with an
+  ellipsis; the trigger keeps its height. Reason: a tab names the context
+  its program runs in (OSC 3008: `run0`, a container), and a long label
+  shouldn't hide that, nor a long badge the label.
 - **A window's strip drops the pill's surface (owner styling, not the component).** Brindle's strip gives its `TabList` a transparent background, no left padding and a gap between faces, through `Styled`, since each face has its own surface. The component still draws shadcn's pill unless told otherwise.
 - **One look, the pill.** shadcn also has a `line` variant (no surfaces, an
   underline under the active trigger); it isn't offered. Reason: the spec
@@ -673,6 +690,9 @@ content below it. The differences, mostly what a terminal pane needs:
 - **An edge bar** (an addition): `CardHeader::edge_bar`, the tab trigger's
   `EdgeBar` along the header's bottom edge, above its line, taking no room.
   Reason: a pane shows its program's progress, as its tab does.
+- **A badge** (an addition): `CardHeader::badge`, after the title and cut
+  as on a tab trigger. Reason: a pane names its program's context, as its
+  tab does.
 - **Owner colours** (an addition): `CardColors` replaces the surface, text,
   muted, border and surround colours one by one; the ring stays the
   tokens'. Reason: a pane is drawn in its terminal's colours, as a tab

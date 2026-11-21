@@ -25,6 +25,8 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   clicking one takes you to its tab.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
+- **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
+  logins): a red `root` badge on a tab while it runs elevated.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -41,8 +43,8 @@ endpoint for all its tabs. The `brindle-remote` helper is copied to a
 versioned cache on first connection (user-only on an SSH host) and reused
 while its build matches. Output remains the terminal's original byte stream,
 so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status, OSC 9;4
-progress, clipboard/color replies and shell-integration marks work as in a local
-tab.
+progress, OSC 3008 contexts, clipboard/color replies and shell-integration marks
+work as in a local tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
 
 SSH uses your normal OpenSSH configuration, agent and host aliases:
@@ -831,6 +833,41 @@ progress.term-integration = true
 ```
 
 winget reports its downloads and installs the same way.
+
+#### Context badges
+
+systemd 257 and later announce where a terminal's output comes from with
+OSC 3008, the UAPI group's [context signalling][uapi15]: `run0` (elevation),
+`systemd-nspawn` and `machinectl` (containers and VMs), ssh logins with
+systemd on the far side, and more. Brindle keeps each terminal's stack of
+contexts and shows the innermost notable one as a badge after the tab's title
+(the active zone's), and after each zone header's title in a split tab:
+
+- an elevation or privilege change (`elevate`, `chpriv`): the target user, in
+  the theme's red (`root`, or `elevated` with no user named);
+- a remote host (`remote`), a container or a VM: `user@host`, the host, or the
+  container's or VM's name, in the muted foreground.
+
+Shell, session and command contexts show no badge. Labels are cut to 24
+characters, and a narrow tab cuts its title to 8 characters before it cuts the
+badge.
+
+```sh
+printf '\033]3008;start=a1;type=elevate;user=me;targetuser=root\033\\'  # a red "root" badge
+printf '\033]3008;start=c1;type=container;container=web\033\\'          # "web", muted
+printf '\033]3008;end=a1\033\\'   # ends a1 and everything started inside it: no badge
+```
+
+Contexts outlive resets, prompts and full-screen programs; they end when their
+program sends the end, or when the terminal's program exits. A detached tab keeps
+them in the terminal server. Up to 32 nest, and malformed sequences are ignored.
+A context whose end never arrives (an ssh connection that dropped) keeps its
+badge until the zone's program exits.
+
+The badge is informational: any program can print these sequences, so a badge
+can be spoofed, and Brindle grants nothing on the strength of one.
+
+[uapi15]: https://uapi-group.org/specifications/specs/osc_context/
 
 On Windows, notifications are toasts from "Brindle". Brindle registers that name
 for your user account the first time it shows one (under
