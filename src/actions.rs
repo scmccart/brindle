@@ -36,6 +36,7 @@ actions!(
         JumpToNextPrompt,
         SelectLastOutput,
         CopyLastOutput,
+        CopyLastCommand,
         Find,
         FindNext,
         FindPrevious,
@@ -143,6 +144,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("jump_to_next_prompt", Some("Jump to Next Prompt"), || Box::new(JumpToNextPrompt)),
     ("select_last_output", Some("Select Last Command Output"), || Box::new(SelectLastOutput)),
     ("copy_last_output", Some("Copy Last Command Output"), || Box::new(CopyLastOutput)),
+    ("copy_last_command", Some("Copy Last Command Line"), || Box::new(CopyLastCommand)),
     ("find", Some("Find"), || Box::new(Find)),
     // The find bar's own actions act on an open bar, so they stay out of
     // the palette.

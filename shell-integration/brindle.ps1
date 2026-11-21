@@ -12,7 +12,8 @@
 # It works in PowerShell 7 (pwsh) and Windows PowerShell 5.1. It marks the
 # prompt (A), where the command line starts (B), where the command's output
 # starts (C; needs PSReadLine, which both load by default) and the command's
-# end with its exit status (D). The directory report is what new tabs and
+# end with its exit status (D). Just before C it reports the command line
+# with VS Code's OSC 633 E. The directory report is what new tabs and
 # session restore start in on Windows. Terminals that don't know these
 # sequences ignore them.
 
@@ -61,12 +62,35 @@ if ($Host.Name -eq 'ConsoleHost' -and -not $__brindleBatch -and -not $global:__B
         "$out$esc]133;A$bel$text$esc]133;B$bel"
     }
 
-    # The command line is read: its output starts here.
+    # The command line as VS Code's OSC 633 E escapes it: `\` as `\\`, and
+    # `;` and control characters as `\xHH`, a byte at a time in UTF-8. A
+    # line typed over several lines is joined by newlines (`r`n becomes `n).
+    function global:__BrindleEscapeLine([string]$Line) {
+        $out = New-Object System.Text.StringBuilder
+        foreach ($c in ($Line -replace "`r`n", "`n").ToCharArray()) {
+            if ($c -eq [char]'\') {
+                [void]$out.Append('\\')
+            } elseif ($c -eq [char]';' -or [char]::IsControl($c)) {
+                foreach ($b in [Text.Encoding]::UTF8.GetBytes([string]$c)) {
+                    [void]$out.Append(('\x{0:x2}' -f $b))
+                }
+            } else {
+                [void]$out.Append($c)
+            }
+        }
+        $out.ToString()
+    }
+
+    # The command line is read: it is reported, and its output starts here.
     if (Get-Command PSConsoleHostReadLine -ErrorAction Ignore) {
         $global:__BrindleReadLine = $function:PSConsoleHostReadLine
         function global:PSConsoleHostReadLine {
             $line = & $global:__BrindleReadLine
-            if ($line) { [Console]::Write("$([char]27)]133;C$([char]7)") }
+            if ($line) {
+                $esc = [char]27
+                $bel = [char]7
+                [Console]::Write("$esc]633;E;$(__BrindleEscapeLine $line)$bel$esc]133;C$bel")
+            }
             $line
         }
     }

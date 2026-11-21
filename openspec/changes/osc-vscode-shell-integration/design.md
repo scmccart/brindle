@@ -60,6 +60,8 @@ A command that `HISTCONTROL` (`ignorespace`, `ignoredups`, `erasedups`), `HISTIG
 
 The scripts keep their existing guarantees (`$?`, existing hooks, loading twice), which the `Shipped shell scripts` scenarios already check.
 
+Found while implementing: fish 4 writes its own OSC 133 marks, and its `C` (`133;C;cmdline_url=<percent-encoded line>`) comes before `fish_preexec` runs, so the script's `E` always arrives after `C`, too late. The parser therefore also takes a `C` mark's `cmdline_url` as the command's line, set just before the mark is recorded. For fish 3, which writes no marks of its own, the script's `E` is what reports the line.
+
 ### Testing
 
 - `shell_integration.rs` unit tests: 633 `A`–`D` and the ignored kinds; `E` decoding (`\\`, `\x3b`, a nonce, invalid escapes, controls, overflow); `E` after `C` ignored; `P;Cwd` on both path styles, including a UNC path rejected on Windows; `last_command_line` for both sources and for commands gone from the scrollback.

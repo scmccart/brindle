@@ -25,6 +25,7 @@ pub fn all() -> Vec<Case> {
         display("windows-flood-responsive", flood_responsive),
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
+        display("windows-pwsh-line", pwsh_line),
         display("windows-caption", caption),
         display("windows-tab-menu-background", tab_menu_background),
         display("windows-zones", zones),
@@ -730,6 +731,60 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
         ensure!(restored.dump.tabs.len() == 2, "{shell}: restored tabs {:?}", restored.dump.tabs);
         ensure!(text.contains("redir=C:\\Windows"), "{shell}: the restored tab's directory:\n{text}");
         std::fs::remove_dir_all(ctx.dir.join("state")).ok();
+    }
+    Ok(Outcome::Pass)
+}
+
+/// Brindle's PowerShell script reports each command line with OSC 633 `E`,
+/// in PowerShell 7 and 5.1: Copy Last Command Line copies the line as typed,
+/// `;` included, which the shell then reads back with `Get-Clipboard`
+/// (printed as `clip=[…]`, split so the typed line doesn't match). Windows
+/// PowerShell is skipped where it isn't installed.
+fn pwsh_line(ctx: &Ctx) -> Result<Outcome> {
+    let bin = ctx.bin.display().to_string().replace('\\', "/");
+    let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
+    let typed = "Get-ChildItem C:/; 'gci' + 'done'";
+    let send = format!("{typed}\r");
+    for shell in ["pwsh.exe", "powershell.exe"] {
+        if shell == "powershell.exe" && !on_path(shell) {
+            println!("         {shell} isn't on PATH; its checks are skipped");
+            continue;
+        }
+        let config = format!(
+            "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+             args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
+        );
+        let label = format!("{}-line", shell.trim_end_matches(".exe"));
+        if shell == "powershell.exe" {
+            powershell_warmup(ctx, &bin);
+        }
+        let ran = run_with(
+            ctx,
+            &config,
+            &label,
+            &[
+                "-p",
+                "si",
+                "--wait-for",
+                "MYPROMPT>",
+                "--send",
+                send.as_str(),
+                "--wait-for",
+                "gcidone\\nMYPROMPT>",
+                "--action",
+                "copy_last_command",
+                "--send",
+                "'cl' + 'ip=[' + (Get-Clipboard -Raw) + ']'\r",
+                "--wait-for",
+                "clip=[",
+            ],
+            &[],
+            15.0,
+            None,
+        )?;
+        let text = screen(&ran.dump);
+        ensure!(ran.dump.wait_timeouts.is_empty(), "{shell}: waits {:?}; see {label}.dump", ran.dump.wait_timeouts);
+        ensure!(text.contains(&format!("clip=[{typed}]")), "{shell}: the clipboard isn't the typed line:\n{text}");
     }
     Ok(Outcome::Pass)
 }

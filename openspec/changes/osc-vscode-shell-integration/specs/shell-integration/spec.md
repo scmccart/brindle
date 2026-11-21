@@ -105,7 +105,7 @@ Each shipped script SHALL send the command line as typed with OSC 633 `E` before
 - **THEN** the clipboard holds `Get-ChildItem C:/`
 
 ### Requirement: Reported command lines
-`ESC ] 633 ; E ; <line> [; <nonce>] ST` SHALL set the command line of the latest command, if it has no `C` mark yet. `\\` SHALL decode to `\`, and `\xHH` to that byte. A line that is not UTF-8 after decoding, contains a control character other than a newline, or arrives in a sequence over 4096 bytes SHALL be ignored. The nonce SHALL be ignored, and a reported line SHALL never be run.
+`ESC ] 633 ; E ; <line> [; <nonce>] ST` SHALL set the command line of the latest command, if it has no `C` mark yet. `\\` SHALL decode to `\`, and `\xHH` to that byte. A `C` mark (OSC 133 or 633) with a `cmdline_url=<percent-encoded line>` parameter, as fish 4 writes its own, SHALL set the line of the command whose output it starts, `%XX` decoded. A line that is not UTF-8 after decoding, contains a control character other than a newline, or arrives in a sequence over 4096 bytes SHALL be ignored. The nonce SHALL be ignored, and a reported line SHALL never be run.
 
 #### Scenario: Escaped line
 - **WHEN** a shell emits `A`, `B`, then `ESC ] 633 ; E ; echo a\x3bb ; 1f2e BEL` and `C`
@@ -114,6 +114,10 @@ Each shipped script SHALL send the command line as typed with OSC 633 `E` before
 #### Scenario: Too late
 - **WHEN** a shell emits `A`, `B`, `C`, and only then `ESC ] 633 ; E ; ls BEL`
 - **THEN** that command has no reported line
+
+#### Scenario: Line on the output mark
+- **WHEN** fish 4 emits `A`, then `ESC ] 133 ; C ; cmdline_url=echo%20%22a%3Bb%22 ESC \`, and its script's `E` arrives only after that
+- **THEN** that command's line is `echo "a;b"`
 
 ### Requirement: Copy Last Command Line
 **Copy Last Command Line** SHALL put on the clipboard the reported line of the most recent command that has one of: a reported line, or both `B` and `C` marks. Without a reported line it SHALL copy the text from the `B` mark to the `C` mark with leading and trailing whitespace removed. It SHALL do nothing when there is no such command or its marks have left the scrollback.

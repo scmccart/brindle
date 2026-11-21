@@ -573,6 +573,30 @@ pub fn reattach_quit(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A command line a shell reported with OSC 633 `E` stays with its marks in
+/// the server: after a quit and a plain launch, which attaches the detached
+/// session, Copy Last Command Line copies `make test` (not the screen's
+/// `wrong`). Linux only: the command is bash's.
+pub fn attach_633(ctx: &Ctx) -> Result<Outcome> {
+    use super::shell::{Clip, fake_633_command};
+    let clip = Clip::new(ctx, "clip")?;
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=\\r")
+        .send(&fake_633_command("make test"))
+        .wait_for("fake-done")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the command didn't run: {:?}", first.dump.screen);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("fake-done");
+    let out = clip.copy(second).dump_at(10.0).run()?;
+    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    clip.expect("make test", &out)?;
+    Ok(Outcome::Pass)
+}
+
 /// Brindle killed (SIGKILL, on Windows `taskkill /F`) with a split tab: a
 /// plain launch brings back both zones' sessions, and the left one's output.
 pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
