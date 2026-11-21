@@ -28,7 +28,7 @@ use std::rc::Rc;
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Combobox, ComboboxEvent, Command,
     CommandEvent, CommandGroup, CommandItem,
-    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, ItemKey, Kbd,
+    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, EdgeBar, FocusScope, FocusStops, Icon, Input, ItemKey, Kbd,
     MenuEntry, MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
     Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
@@ -185,11 +185,13 @@ pub struct DemoTab {
     /// A status dot in this colour, and a bell dot.
     status: Option<u32>,
     bell: bool,
+    /// A progress bar along its bottom edge: the share filled and its colour.
+    bar: Option<(f32, u32)>,
 }
 
 impl DemoTab {
     fn new(id: usize, label: impl Into<SharedString>) -> Self {
-        Self { id, label: label.into(), disabled: false, colors: None, icon: false, status: None, bell: false }
+        Self { id, label: label.into(), disabled: false, colors: None, icon: false, status: None, bell: false, bar: None }
     }
 }
 
@@ -207,8 +209,8 @@ pub struct TabsDemo {
 /// - `strip`: a tab strip whose tabs close, move and show a tooltip: bash
 ///   (active, the spec's `#c0caf5` on `#1a1b26`), a long nvim title
 ///   (Solarized light colours, inactive but on its own surface), ssh (a
-///   leading icon, the tokens' colours) and a build with a status dot and
-///   a bell;
+///   leading icon, the tokens' colours) and a build with a status dot, a
+///   bell and a progress bar 40% along its bottom edge;
 /// - `crowded`: six sessions in a list too narrow for them.
 fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let labelled = |labels: &[&'static str]| -> Vec<DemoTab> {
@@ -221,7 +223,7 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
         DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
         DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
         DemoTab { icon: true, ..DemoTab::new(2, "ssh: work") },
-        DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
+        DemoTab { status: Some(0xe0af68), bell: true, bar: Some((0.4, 0xe0af68)), ..DemoTab::new(3, "cargo build") },
     ];
     let crowded = (0..6).map(|n| DemoTab::new(n, format!("Session {}", n + 1))).collect();
     HashMap::from([
@@ -1126,6 +1128,9 @@ impl Gallery {
                 }
                 if tab.bell {
                     trigger = trigger.adornment(dot(primary));
+                }
+                if let Some((fraction, color)) = tab.bar {
+                    trigger = trigger.edge_bar(EdgeBar::new(fraction, rgb(color)));
                 }
                 trigger
             })

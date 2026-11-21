@@ -23,6 +23,8 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   gutter.
 - **Desktop notifications** from OSC 9, OSC 777 and bells in tabs you can't see;
   clicking one takes you to its tab.
+- **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
+  bottom of the tab, and of each zone's header in a split tab.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -38,8 +40,9 @@ which Brindle reaches through `brindle-remote relay`, one connection per
 endpoint for all its tabs. The `brindle-remote` helper is copied to a
 versioned cache on first connection (user-only on an SSH host) and reused
 while its build matches. Output remains the terminal's original byte stream,
-so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status,
-clipboard/color replies and shell-integration marks work as in a local tab.
+so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status, OSC 9;4
+progress, clipboard/color replies and shell-integration marks work as in a local
+tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
 
 SSH uses your normal OpenSSH configuration, agent and host aliases:
@@ -795,6 +798,37 @@ rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error 
 `notifications.osc7501 = false` keeps the dots and drops the notifications.
 
 [osc7501]: https://gist.github.com/mitchellh/7acae3abd8355c1c00287d67e96c913a
+
+#### Progress
+
+Programs that report progress with ConEmu's `OSC 9;4`, as Windows Terminal and
+Ghostty show it, get a 2-pixel bar along the bottom of their tab, and of their
+zone's header in a split tab. The tab shows its most pressing zone: an error,
+then a pause, then the least far along, then one of unknown length.
+
+```sh
+printf '\033]9;4;1;30\033\\'   # normal, 30%: the muted foreground, a third of the way
+printf '\033]9;4;2\033\\'      # error, at the last percent: the theme's red
+printf '\033]9;4;4;50\033\\'   # paused, 50%: the theme's yellow
+printf '\033]9;4;3\033\\'      # under way, length unknown: a faint bar across the tab
+printf '\033]9;4;0\033\\'      # done: no bar
+```
+
+The bar also goes at the next shell prompt (with shell integration), when the
+program exits and on a reset, and a detached tab keeps it in the terminal
+server. It never notifies.
+
+Recent cargo releases report build progress this way only in terminals they
+recognise (Windows Terminal, ConEmu, Ghostty, WezTerm), not yet Brindle, so
+turn it on for Brindle with `CARGO_TERM_PROGRESS_TERM_INTEGRATION=true` or in
+`~/.cargo/config.toml`:
+
+```toml
+[term]
+progress.term-integration = true
+```
+
+winget reports its downloads and installs the same way.
 
 On Windows, notifications are toasts from "Brindle". Brindle registers that name
 for your user account the first time it shows one (under

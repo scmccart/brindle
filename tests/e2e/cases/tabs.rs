@@ -47,10 +47,10 @@ const STRIP_PADDING: f32 = 6.0;
 /// high; they start 6px in (the strip's padding: the list has none at its
 /// left), are at least 80px wide (a `bash` tab is exactly that) and 4px
 /// apart (`TAB_FACE_GAP`). The samples keep clear of the rounded corners.
-const FACE_TOP: f32 = STRIP_PADDING + 3.0;
-const FACE_HEIGHT: f32 = 30.0;
-const FACE_LEFT: f32 = STRIP_PADDING;
-const FACE_WIDTH: f32 = 80.0;
+pub(super) const FACE_TOP: f32 = STRIP_PADDING + 3.0;
+pub(super) const FACE_HEIGHT: f32 = 30.0;
+pub(super) const FACE_LEFT: f32 = STRIP_PADDING;
+pub(super) const FACE_WIDTH: f32 = 80.0;
 const FACE_GAP: f32 = 4.0;
 const FACE_STEP: f32 = FACE_WIDTH + FACE_GAP;
 
@@ -75,7 +75,7 @@ fn step_time(step: usize) -> f64 {
 /// terminal's top-left plus the padding, and the terminal sits in its card
 /// right under the strip, inside the card's margin and border, so the
 /// strip's bottom-left is the origin less the padding and those.
-struct Strip {
+pub(super) struct Strip {
     left: f32,
     top: f32,
     scale: f32,
@@ -84,7 +84,7 @@ struct Strip {
 }
 
 impl Strip {
-    fn locate(out: &Output, image: &Image) -> Result<Strip> {
+    pub(super) fn locate(out: &Output, image: &Image) -> Result<Strip> {
         let grid = out.dump.grid()?;
         Ok(Strip {
             left: grid.x - PADDING - CARD_INSET,
@@ -96,7 +96,7 @@ impl Strip {
 
     /// `w` x `h` logical pixels at `x`,`y` from the strip's top-left corner,
     /// in device pixels.
-    fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> PxRect {
+    pub(super) fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> PxRect {
         let px = |v: f32| (v * self.scale).round().max(0.0) as u32;
         PxRect { x0: px(self.left + x), y0: px(self.top + y), x1: px(self.left + x + w), y1: px(self.top + y + h) }
     }
@@ -149,7 +149,7 @@ impl Strip {
     }
 
     /// The list's bottom padding under tab `ix`'s face.
-    fn under_face(&self, ix: usize) -> PxRect {
+    pub(super) fn under_face(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
         self.rect(left + 8.0, FACE_TOP + FACE_HEIGHT + 0.5, 56.0, 2.0)
     }

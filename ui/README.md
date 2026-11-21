@@ -131,6 +131,10 @@ rule, not a convenience.
       (`DraggedTab`, carrying the trigger's id and previewed as a pill with
       its label) asks to move there, and a 2px primary bar marks the side it
       will land on (`drop_target`, from where the dragged trigger is now).
+      `edge_bar(EdgeBar::new(fraction, color))` lays a 2px bar
+      (`EDGE_BAR_HEIGHT`) over the bottom edge of a trigger, inside its
+      rounded corners, filling `fraction` of the width from the left (a
+      progress bar); it takes no room and no press.
 
     Three of the builders are not controls:
     - `Separator` (`Separator::horizontal()` / `vertical()`): a one-pixel
@@ -148,7 +152,9 @@ rule, not a convenience.
       padding. `CardHeader` is a `CARD_HEADER_HEIGHT` (28px) row with a
       `leading` adornment (a status dot), the `title` on one line cut with
       an ellipsis (`trigger_label`), drawn muted with `title_muted(true)`,
-      and `action`s at its end (icon buttons) over a border line. The slot's
+      and `action`s at its end (icon buttons) over a border line, with an
+      optional `edge_bar` (an `EdgeBar`, as a tab trigger's) along its
+      bottom edge, above the line. The slot's
       text colour is the muted one, which a `Button` takes only when given
       it (`text_color`), since a button sets its own. It is a stateful element, so the owner gives it handlers
       (a press, `on_context_menu`); `Card::on_header_bounds` reports where it
@@ -617,6 +623,12 @@ needs:
   window's tab strip draws each tab in its own terminal's background and
   foreground (a profile can theme a tab differently from the window),
   background tabs included.
+- **An edge bar** (an addition): `TabTrigger::edge_bar` lays a 2px bar
+  (`EdgeBar`) over the bottom edge of the trigger, inside its rounded
+  corners, filling a share of its width from the left in the owner's
+  colour; the trigger keeps its size and the bar takes no press. Reason: a
+  tab shows its program's progress (OSC 9;4), as Windows Terminal's tabs
+  do.
 - **A window's strip drops the pill's surface (owner styling, not the component).** Brindle's strip gives its `TabList` a transparent background, no left padding and a gap between faces, through `Styled`, since each face has its own surface. The component still draws shadcn's pill unless told otherwise.
 - **One look, the pill.** shadcn also has a `line` variant (no surfaces, an
   underline under the active trigger); it isn't offered. Reason: the spec
@@ -658,6 +670,9 @@ content below it. The differences, mostly what a terminal pane needs:
   `trigger_label` (one line, ellipsis), and the content is the card's
   children. Missing features nothing needs yet.
 - **A leading adornment** (an addition): before the title, a status dot.
+- **An edge bar** (an addition): `CardHeader::edge_bar`, the tab trigger's
+  `EdgeBar` along the header's bottom edge, above its line, taking no room.
+  Reason: a pane shows its program's progress, as its tab does.
 - **Owner colours** (an addition): `CardColors` replaces the surface, text,
   muted, border and surround colours one by one; the ring stays the
   tokens'. Reason: a pane is drawn in its terminal's colours, as a tab
