@@ -6,7 +6,12 @@ use std::fmt;
 use gpui::{Hsla, Rgba};
 use serde::{Deserialize, Deserializer};
 
+use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
+
+/// How opaque an indeterminate progress bar is: it is faint, and doesn't
+/// move.
+const INDETERMINATE_OPACITY: f32 = 0.4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Color {
@@ -213,6 +218,21 @@ impl Theme {
             State::Done => self.ansi[2].hsla(),
             State::Working | State::Idle => muted,
         }
+    }
+
+    /// A progress bar's length (the share of the width it fills from the
+    /// left) and colour in window chrome, which draws it as the status dots
+    /// are drawn: `muted` (the muted-foreground token) for normal, red for
+    /// error, yellow for paused, and `muted` at 40% across the whole width
+    /// for indeterminate.
+    pub fn progress_bar(&self, progress: Progress, muted: Hsla) -> (f32, Hsla) {
+        let color = match progress {
+            Progress::Normal(_) => muted,
+            Progress::Error(_) => self.ansi[1].hsla(),
+            Progress::Paused(_) => self.ansi[3].hsla(),
+            Progress::Indeterminate => muted.opacity(INDETERMINATE_OPACITY),
+        };
+        (progress.fraction(), color)
     }
 
     pub fn is_dark(&self) -> bool {
@@ -541,6 +561,23 @@ mod tests {
         assert_eq!(theme.status_color(State::Done, muted), theme.ansi[2].hsla());
         assert_eq!(theme.status_color(State::Working, muted), muted);
         assert_eq!(theme.status_color(State::Idle, muted), muted);
+    }
+
+    /// Progress bars: muted for normal, the theme's red for error and
+    /// yellow for paused, each at its percent; a faint muted bar across the
+    /// whole width for indeterminate.
+    #[test]
+    fn progress_bars_take_their_length_from_the_percent_and_colour_from_the_palette() {
+        use crate::terminal::progress::Percent;
+        let theme = builtin_theme("tokyo-night").unwrap();
+        let muted = Color::hex(0x123456).hsla();
+        let pct = |n| Percent::clamped(n);
+        assert_eq!(theme.progress_bar(Progress::Normal(pct(25)), muted), (0.25, muted));
+        assert_eq!(theme.progress_bar(Progress::Error(Some(pct(10))), muted), (0.1, theme.ansi[1].hsla()));
+        assert_eq!(theme.progress_bar(Progress::Paused(Some(pct(50))), muted), (0.5, theme.ansi[3].hsla()));
+        let (length, faint) = theme.progress_bar(Progress::Indeterminate, muted);
+        assert_eq!((length, faint), (1.0, muted.opacity(0.4)));
+        assert!((faint.a - 0.4).abs() < 1e-6);
     }
 
     #[test]

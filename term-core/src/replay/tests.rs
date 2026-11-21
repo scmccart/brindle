@@ -93,7 +93,7 @@ impl Session {
 
     fn render(&mut self) -> Vec<u8> {
         let title = self.titles.0.lock().clone();
-        render(&mut self.term, &self.marks.lock(), &self.records, title.as_deref())
+        render(&mut self.term, &self.marks.lock(), &self.records, None, title.as_deref())
     }
 
     /// A fresh session of the same size and limit, fed this one's replay.

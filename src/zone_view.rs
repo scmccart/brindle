@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, Icon, Modality,
-    Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, EdgeBar, Icon,
+    Modality, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -24,6 +24,7 @@ use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
 use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
+use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
@@ -337,6 +338,22 @@ pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
     out
 }
 
+/// Formats `--dump-screen-after` zone progress lines when a tab has 2 or
+/// more zones (`--- progress zone=ID state=…[ percent=N]`, the active zone
+/// first, then by id), one per zone with progress, or returns an empty
+/// string for a single-zone tab, whose tab line says the same.
+pub fn describe_zone_progress(zones: impl IntoIterator<Item = (ZoneId, Option<Progress>)>, active: ZoneId) -> String {
+    let mut zones: Vec<(ZoneId, Option<Progress>)> = zones.into_iter().collect();
+    if zones.len() < 2 {
+        return String::new();
+    }
+    zones.sort_by_key(|(id, _)| (*id != active, id.0));
+    zones
+        .into_iter()
+        .filter_map(|(id, progress)| Some(format!("--- progress zone={} {}\n", id.0, progress?.describe())))
+        .collect()
+}
+
 fn fmt_unit(v: f64) -> String {
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
@@ -359,6 +376,8 @@ pub struct Zone {
     pub content: ZoneContent,
     pub title: SharedString,
     pub status: Option<State>,
+    /// Its terminal's progress, cached for its header's bar.
+    pub progress: Option<Progress>,
     pub last_focused: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -499,10 +518,12 @@ impl ZoneTreeView {
             terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
         };
         let status = terminal.read(cx).status().summary();
+        let progress = terminal.read(cx).progress();
         let zone = Zone {
             content: ZoneContent::Terminal(view),
             title: initial_title,
             status,
+            progress,
             last_focused: self.focus_serial,
             _subscriptions: vec![focus_in, events, link_failed],
         };
@@ -539,8 +560,8 @@ impl ZoneTreeView {
             }
             TerminalEvent::Status(_) => {
                 if let Some(zone) = self.zones.get_mut(&id) {
-                    let status = zone.content.as_terminal_view().read(cx).terminal.read(cx).status().summary();
-                    zone.status = status;
+                    let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
+                    (zone.status, zone.progress) = (terminal.status().summary(), terminal.progress());
                 }
                 cx.emit(event.clone());
                 cx.notify();
@@ -669,6 +690,18 @@ impl ZoneTreeView {
             .values()
             .filter_map(|z| z.content.as_terminal_view().read(cx).terminal.read(cx).status().summary())
             .max()
+    }
+
+    /// The most pressing progress across all zones in this tab
+    /// ([`progress::most_pressing`]), from the zones' cached values.
+    pub fn progress_summary(&self) -> Option<Progress> {
+        progress::most_pressing(self.zones.values().filter_map(|z| z.progress))
+    }
+
+    /// The zones' progress lines for `--dump-screen-after`
+    /// ([`describe_zone_progress`]).
+    pub fn describe_progress(&self) -> String {
+        describe_zone_progress(self.zones.iter().map(|(id, z)| (*id, z.progress)), self.active)
     }
 
     /// Takes the tab's profile as the config now has it (or the settings
@@ -1001,6 +1034,11 @@ impl ZoneTreeView {
         // Status dots in the chrome theme's colours, like the strip's.
         let status_color =
             zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
+        // Its progress bar, drawn as the tab's is, from the same colours.
+        let progress_bar = zone.progress.map(|progress| {
+            let (length, color) = Settings::chrome_theme(cx).progress_bar(progress, tokens.muted_foreground);
+            EdgeBar::new(length, color)
+        });
         let title = zone.title.clone();
         let muted = colors.muted.unwrap_or(tokens.muted_foreground);
 
@@ -1048,6 +1086,9 @@ impl ZoneTreeView {
         let mut header = CardHeader::new(("zone-header", id.0 as usize));
         if let Some(color) = status_color {
             header = header.leading(div().flex_none().size(px(6.0)).rounded_full().bg(color));
+        }
+        if let Some(bar) = progress_bar {
+            header = header.edge_bar(bar);
         }
         let header = header
             .title(title)
@@ -1280,6 +1321,25 @@ mod tests {
         assert_eq!(
             describe_zone_tree(&tree, z2),
             "--- zones count=2 active=2\n--- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\n"
+        );
+    }
+
+    /// Zone progress lines: none for one zone (the tab's line says it),
+    /// else one per zone with progress, the active one first.
+    #[test]
+    fn zone_progress_lines_put_the_active_zone_first() {
+        use crate::terminal::progress::Percent;
+        let normal = Some(Progress::Normal(Percent::clamped(30)));
+        let paused = Some(Progress::Paused(Some(Percent::clamped(70))));
+        assert_eq!(describe_zone_progress([(ZoneId(1), normal)], ZoneId(1)), "");
+        let zones = [(ZoneId(3), paused), (ZoneId(1), normal), (ZoneId(2), None)];
+        assert_eq!(
+            describe_zone_progress(zones, ZoneId(3)),
+            "--- progress zone=3 state=paused percent=70\n--- progress zone=1 state=normal percent=30\n"
+        );
+        assert_eq!(
+            describe_zone_progress(zones, ZoneId(1)),
+            "--- progress zone=1 state=normal percent=30\n--- progress zone=3 state=paused percent=70\n"
         );
     }
 }

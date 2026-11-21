@@ -31,6 +31,8 @@
 //!   the owner for its menu ([`TabContextMenu`]) and goes no further;
 //! - leading and trailing adornments (an icon, status dots), and a tooltip
 //!   on the trigger and on its close button;
+//! - a bar along the bottom edge of a trigger ([`TabTrigger::edge_bar`]),
+//!   such as a progress bar, which doesn't change its size;
 //! - a minimum and maximum width ([`TabWidth`]) with the label cut by an
 //!   ellipsis;
 //! - with `on_move`, a trigger can be dragged onto another, which asks the
@@ -56,7 +58,7 @@ use gpui::{
 
 use crate::components::button::Button;
 use crate::components::tooltip::{Tooltip, TooltipFor, TooltipHandler, attach};
-use crate::components::{DISABLED_OPACITY, FocusRing};
+use crate::components::{DISABLED_OPACITY, EdgeBar, FocusRing};
 use crate::icon::{Icon, LEGIBLE_ICON_STROKE};
 use crate::primitives::focus_visible::{Modality, modality, set_modality, shows_ring};
 use crate::primitives::nav::ListNav;
@@ -262,6 +264,7 @@ pub struct TabTrigger {
     colors: TabColors,
     tooltip: Option<TooltipHandler>,
     close_tooltip: Option<TooltipHandler>,
+    edge_bar: Option<EdgeBar>,
 }
 
 impl TabTrigger {
@@ -279,6 +282,7 @@ impl TabTrigger {
             colors: TabColors::default(),
             tooltip: None,
             close_tooltip: None,
+            edge_bar: None,
         }
     }
 
@@ -293,6 +297,13 @@ impl TabTrigger {
     /// bell. Adornments keep their size when the label is cut.
     pub fn adornment(mut self, element: impl IntoElement) -> Self {
         self.adornments.push(element.into_any_element());
+        self
+    }
+
+    /// A bar along the bottom edge of the face (a progress bar), inside its
+    /// rounded corners; the face keeps its size ([`EdgeBar`]).
+    pub fn edge_bar(mut self, bar: EdgeBar) -> Self {
+        self.edge_bar = Some(bar);
         self
     }
 
@@ -671,7 +682,8 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         .children(trigger.leading)
         .child(label)
         .children(trigger.adornments)
-        .children(close);
+        .children(close)
+        .children(trigger.edge_bar.map(|bar| bar.element(style.radius)));
     element = element.rounded(style.radius);
     if let Some(on_move) = on_move {
         let value = DraggedTab { list: list.id.clone(), trigger: id.clone(), label: trigger.label };

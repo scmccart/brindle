@@ -43,6 +43,7 @@ pub mod command;
 pub mod context_menu;
 pub mod dialog;
 pub mod dropdown_menu;
+pub mod edge_bar;
 pub mod input;
 pub mod kbd;
 pub mod menu;
@@ -74,6 +75,7 @@ pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, 
 pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};
 pub use dropdown_menu::{DropdownMenu, trigger_key_opens};
+pub use edge_bar::{EDGE_BAR_HEIGHT, EdgeBar};
 pub use input::Input;
 pub use kbd::{Kbd, KbdStyle, kbd_style, keycaps};
 pub use menu::{

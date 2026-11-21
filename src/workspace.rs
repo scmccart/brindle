@@ -37,7 +37,7 @@ use crate::picker::{
 };
 use crate::settings::Zoom;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
@@ -49,6 +49,7 @@ use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
 use crate::terminal::shell_integration::PathStyle;
+use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
@@ -93,6 +94,9 @@ pub struct Tab {
     /// The most pressing program status (OSC 7501) across the tab's
     /// terminals; see [`Workspace::refresh_status`].
     pub status: Option<State>,
+    /// The most pressing progress (OSC 9;4) across the tab's terminals,
+    /// drawn as the bar on its face; refreshed with `status`.
+    pub progress: Option<Progress>,
     /// A user-chosen label (`Rename Tab`), shown instead of the automatic
     /// title until changed or cleared.
     manual_title: Option<String>,
@@ -119,6 +123,7 @@ impl Tab {
             origin,
             bell: false,
             status: None,
+            progress: None,
             manual_title: None,
             title: SharedString::default(),
             _subscriptions: subscriptions,
@@ -1272,8 +1277,10 @@ impl Workspace {
     /// records do (a new report, a new prompt, the user typing).
     fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
         let status = self.tabs[ix].status_summary(cx);
-        if self.tabs[ix].status != status {
-            self.tabs[ix].status = status;
+        let progress = self.tabs[ix].zones.read(cx).progress_summary();
+        let tab = &mut self.tabs[ix];
+        if (tab.status, tab.progress) != (status, progress) {
+            (tab.status, tab.progress) = (status, progress);
             cx.notify();
         }
     }
@@ -2189,6 +2196,10 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
+            out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_progress());
+            }
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
@@ -2279,6 +2290,11 @@ impl Workspace {
         let global = Settings::chrome_theme(cx).clone();
         let status_color = |state: State| global.status_color(state, tokens.muted_foreground);
         let dot = |color: Hsla| div().flex_none().size(px(6.0)).rounded_full().bg(color);
+        // Progress bars take the same theme's colours as the dots.
+        let progress_bar = |progress: Progress| {
+            let (length, color) = global.progress_bar(progress, tokens.muted_foreground);
+            EdgeBar::new(length, color)
+        };
 
         // A tooltip naming a control and the key bound to its action in this
         // window, looked up when the tooltip is shown (a rebound key shows
@@ -2302,6 +2318,9 @@ impl Workspace {
                     .text_color(text);
                 if let Some(state) = tab.status {
                     trigger = trigger.adornment(dot(status_color(state)));
+                }
+                if let Some(progress) = tab.progress {
+                    trigger = trigger.edge_bar(progress_bar(progress));
                 }
                 if tab.bell {
                     trigger = trigger.adornment(dot(tokens.primary));
@@ -2851,6 +2870,16 @@ fn describe_fonts(cx: &App) -> String {
 /// the text escaped onto one line, or nothing when the window shows none.
 fn describe_config(line: Option<&str>) -> String {
     line.map_or_else(String::new, |line| format!("--- config {line:?}\n"))
+}
+
+/// The tabs' bars, for `--dump-screen-after`: `--- progress tab=N
+/// state=…[ percent=N]` for each tab whose face shows one, numbered from 1
+/// as the `--- tab` lines are.
+fn describe_tab_progress(tabs: impl IntoIterator<Item = Option<Progress>>) -> String {
+    tabs.into_iter()
+        .enumerate()
+        .filter_map(|(ix, progress)| Some(format!("--- progress tab={} {}\n", ix + 1, progress?.describe())))
+        .collect()
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
@@ -3551,6 +3580,16 @@ mod tests {
             "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
+    }
+
+    #[test]
+    fn tab_progress_lines_name_the_tabs_with_a_bar() {
+        use crate::terminal::progress::Percent;
+        assert_eq!(describe_tab_progress([None, None]), "");
+        assert_eq!(
+            describe_tab_progress([None, Some(Progress::Normal(Percent::clamped(25))), Some(Progress::Indeterminate)]),
+            "--- progress tab=2 state=normal percent=25\n--- progress tab=3 state=indeterminate\n"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod restore;
 mod notify;
 mod palette;
 mod profile_menu;
+mod progress;
 mod remote;
 mod reload;
 mod search;
@@ -136,6 +137,10 @@ fn unix() -> Vec<Case> {
         display("notify-log-at-exit", notify::log_at_exit),
         display("status-local", status::local),
         display("status-background-tab", status::background_tab),
+        display("progress-report", progress::report_split),
+        display("progress-clears-at-prompt", progress::clears_at_prompt),
+        display("progress-zones", progress::zones),
+        display("progress-bar-colour", progress::bar_colour),
         display("search-local", search::local),
         display("search-step", search::step),
         display("search-long-query", search::long_query),
@@ -185,6 +190,7 @@ fn unix() -> Vec<Case> {
         display("local-server-close-command", local_server::close_command),
         display("local-server-reattach-quit", local_server::reattach_quit),
         display("local-server-633-attach", local_server::attach_633),
+        display("local-server-progress-attach", local_server::progress_attach),
         display("local-server-reattach-crash", local_server::reattach_crash),
         display("local-server-reattach-killed", local_server::reattach_killed),
         display("local-server-reattach-inactive", local_server::reattach_inactive),

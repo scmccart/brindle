@@ -1,7 +1,8 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
 //! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
-//! program status reports, and the OSC 133 (and VS Code's OSC 633) `A`
-//! prompt starts and `ESC c` resets that end status records.
+//! program status reports, ConEmu's `OSC 9 ; 4` progress reports, and the
+//! OSC 133 (and VS Code's OSC 633) `A` prompt starts and `ESC c` resets
+//! that end status records and progress.
 //!
 //! The scanner keeps its state between calls, so a sequence split across
 //! reads is still found, and it never buffers anything but the payload of
@@ -9,6 +10,7 @@
 
 pub use crate::{Notice, Source};
 
+use crate::progress::{self, Progress, Report};
 use crate::status::{self, Message};
 
 /// What the scanner found.
@@ -17,10 +19,27 @@ pub enum Found {
     Notice(Notice),
     /// An OSC 7501 report, clear or query.
     Status(Message),
+    /// An `OSC 9 ; 4` progress report.
+    Progress(Report),
     /// OSC 133 `A` (or OSC 633 `A`): a new shell prompt begins.
     PromptStart,
     /// `ESC c`: a full reset.
     Reset,
+}
+
+impl Found {
+    /// A terminal's progress once this find is applied to `current`: a
+    /// report replaces it, a new prompt and a full reset drop it, anything
+    /// else keeps it. The client and the server's emulator both use it, so
+    /// their progress follows the stream alike (a program's exit, which no
+    /// find marks, drops it too).
+    pub fn progress_after(&self, current: Option<Progress>) -> Option<Progress> {
+        match self {
+            Found::Progress(report) => progress::apply(current, *report),
+            Found::PromptStart | Found::Reset => None,
+            Found::Notice(_) | Found::Status(_) => current,
+        }
+    }
 }
 
 /// Payloads longer than this are ignored.
@@ -180,7 +199,9 @@ impl Scanner {
         }
         let payload = std::mem::take(&mut self.payload);
         match self.number {
-            9 => parse_osc9(&payload).map(Found::Notice),
+            9 => progress::parse(&payload)
+                .map(Found::Progress)
+                .or_else(|| parse_osc9(&payload).map(Found::Notice)),
             777 => parse_osc777(&payload).map(Found::Notice),
             // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
             133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
@@ -191,7 +212,9 @@ impl Scanner {
 }
 
 /// `OSC 9 ; <message>`. ConEmu uses `OSC 9 ; <1-12> [; ...]` for commands
-/// (progress, working directory, ...), which are not messages.
+/// (progress, working directory, ...), which are not messages; the
+/// scanner reads `4` as progress ([`progress::parse`]) first, and the
+/// others are ignored.
 pub fn parse_osc9(payload: &[u8]) -> Option<Notice> {
     let text = String::from_utf8_lossy(payload);
     let first = text.split(';').next().unwrap_or("");
@@ -317,7 +340,9 @@ mod tests {
 
     #[test]
     fn conemu_subcommands_are_not_messages() {
-        for seq in ["4;1;50", "4;0", "9;/home/me", "1;100", "12", "2;box", "3;tab"] {
+        // `4;…` with a known state is progress (below); the rest are not
+        // messages.
+        for seq in ["4", "4;", "4;7;50", "4;x", "9;/home/me", "1;100", "12", "2;box", "3;tab"] {
             assert!(scan(format!("\x1b]9;{seq}\x07").as_bytes()).is_empty(), "{seq}");
         }
         assert_eq!(scan(b"\x1b]9;42\x07"), [osc9("42")]);
@@ -325,6 +350,58 @@ mod tests {
         assert_eq!(scan(b"\x1b]9;3 files copied\x07"), [osc9("3 files copied")]);
         assert_eq!(scan(b"\x1b]9;a;b\x07"), [osc9("a;b")]);
         assert!(scan(b"\x1b]9;\x07").is_empty());
+    }
+
+    fn normal(percent: u64) -> Found {
+        Found::Progress(Report::Set(progress::Reported::Normal(Some(progress::Percent::clamped(percent)))))
+    }
+
+    #[test]
+    fn progress_reports_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]9;4;1;30\x07"), [normal(30)]);
+        assert_eq!(scan(b"\x1b]9;4;1;30\x1b\\"), [normal(30)]);
+        assert_eq!(scan(b"\x1b]9;4;0\x07"), [Found::Progress(Report::Clear)]);
+        assert_eq!(
+            scan(b"\x1b]9;4;3\x07"),
+            [Found::Progress(Report::Set(progress::Reported::Indeterminate))]
+        );
+        // `9;4` is progress, `9;9` a directory (shell integration's), and
+        // `9;42` a message.
+        assert_eq!(scan(b"\x1b]9;4;1;5\x07\x1b]9;9;/home\x07\x1b]9;42\x07"), [normal(5), osc9("42")]);
+    }
+
+    #[test]
+    fn a_progress_report_split_at_every_byte_is_found_once() {
+        let input = b"a\x1b]9;4;1;30\x07b\x1b]9;4;2\x1b\\";
+        let error = Found::Progress(Report::Set(progress::Reported::Error(None)));
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, [normal(30), error.clone()], "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_progress_report_is_ignored() {
+        assert!(scan(b"\x1b]9;4;1;30\x18").is_empty());
+        assert!(scan(b"\x1b]9;4;1;30\x1a").is_empty());
+        assert!(scan(b"\x1b]9;4;1;30\x1b[0m").is_empty());
+        assert_eq!(scan(b"\x1b]9;4;1;10\x1b]9;4;1;20\x07"), [normal(20)]);
+    }
+
+    #[test]
+    fn progress_follows_reports_prompts_and_resets() {
+        let fold = |bytes: &[u8]| scan(bytes).iter().fold(None, |current, found| found.progress_after(current));
+        let p = |n| Some(Progress::Normal(progress::Percent::clamped(n)));
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07"), p(40));
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]133;A\x07"), None);
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]633;A\x07"), None);
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1bc"), None);
+        // Notices, status reports and other marks leave it.
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]9;hi\x07\x1b]7501;state=working\x07\x1b]133;B\x07"), p(40));
+        // A report after the prompt sets it again.
+        assert_eq!(fold(b"\x1b]133;A\x07\x1b]9;4;1;7\x07"), p(7));
     }
 
     #[test]

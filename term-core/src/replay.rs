@@ -24,7 +24,11 @@
 //!   insert, LNM, kitty keyboard flags), the cursor shape and blink
 //!   (DECSCUSR), and the title (OSC 2);
 //! - the working directory the shell last reported (OSC 7), then the latest
-//!   OSC 7501 report of each status record, least recently updated first.
+//!   OSC 7501 report of each status record, least recently updated first;
+//! - the progress, if any, as one `OSC 9 ; 4` report. It comes last, after
+//!   the marks, because a replayed OSC 133 `A` drops the receiver's
+//!   progress. A client that predates progress ignores it (it reads `9;4`
+//!   as a ConEmu command, not a message).
 //!
 //! # The receiver
 //! The stream is rendered at the session's size. The receiver must be a
@@ -32,8 +36,8 @@
 //! least the session's (use the session's limit), and it resizes to its own
 //! size only after the whole replay. Its parser must be Brindle's `Parser`
 //! (for the marks), and its OSC 7501 scanner must see the stream in order:
-//! the reports come after the marks, because OSC 133 `A` ends `working`
-//! records. A `blocked`, `done` or `error` record arrives as a fresh report,
+//! the reports and the progress come after the marks, because OSC 133 `A`
+//! ends `working` records and drops the progress. A `blocked`, `done` or `error` record arrives as a fresh report,
 //! so a client that notifies on those should not notify during a replay.
 //!
 //! # Fidelity limits
@@ -87,16 +91,18 @@ use alacritty_terminal::vte::ansi::{
     CharsetIndex, Color, CursorShape, CursorStyle, Handler, NamedColor, StandardCharset,
 };
 
+use crate::progress::Progress;
 use crate::shell_integration::{Mark, Marks, encode_vscode};
 use crate::status::Records;
 
-/// Renders `term`, its `marks` and `records`, and the window `title` (which
-/// `Term` doesn't expose) as a replay stream. See the module docs for what
-/// the receiver must be and what doesn't round-trip.
+/// Renders `term`, its `marks`, `records` and `progress`, and the window
+/// `title` (which `Term` doesn't expose) as a replay stream. See the module
+/// docs for what the receiver must be and what doesn't round-trip.
 pub fn render<T: EventListener>(
     term: &mut Term<T>,
     marks: &Marks,
     records: &Records,
+    progress: Option<Progress>,
     title: Option<&str>,
 ) -> Vec<u8> {
     let hidden = Hidden::probe(term);
@@ -240,6 +246,9 @@ pub fn render<T: EventListener>(
     }
     for (id, record) in records.iter_by_update() {
         out.raw(&format!("\x1b]7501;{}\x1b\\", record.encode(id)));
+    }
+    if let Some(progress) = progress {
+        out.raw(&format!("\x1b]9;{}\x1b\\", progress.encode()));
     }
     out.buf
 }

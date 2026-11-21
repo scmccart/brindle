@@ -1,7 +1,7 @@
 //! A session's terminal state as the terminal server keeps it: a `Term`
 //! fed through Brindle's [`Parser`], its [`Marks`], its status [`Records`]
-//! (kept by the same [`osc::Scanner`] the client uses, so both follow the
-//! stream alike) and its title. It answers nothing: its listener drops
+//! and its [`Progress`] (kept by the same [`osc::Scanner`] the client uses,
+//! so both follow the stream alike) and its title. It answers nothing: its listener drops
 //! every event, `PtyWrite` included, except the title changes the replay
 //! needs, since `Term` keeps its title private.
 //!
@@ -17,6 +17,7 @@ use alacritty_terminal::term::{self, Term};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::osc::{self, Found};
+use crate::progress::Progress;
 use crate::replay;
 use crate::shell_integration::{Marks, Parser, PathStyle};
 use crate::status::Records;
@@ -93,6 +94,9 @@ pub struct Emulator {
     parser: Parser,
     marks: Mutex<Marks>,
     records: Records,
+    /// The latest `OSC 9 ; 4` report's progress, until a clear, a prompt or
+    /// a reset ([`Found::progress_after`]).
+    progress: Option<Progress>,
     scanner: osc::Scanner,
     titles: Titles,
 }
@@ -115,16 +119,19 @@ impl Emulator {
             parser: Parser::new(style),
             marks: Mutex::new(Marks::default()),
             records: Records::default(),
+            progress: None,
             scanner: osc::Scanner::new(),
             titles,
         }
     }
 
-    /// Feeds program output. The status lifetimes the client applies
-    /// (`ESC c` resets, OSC 133 `A` ends activity) apply in stream order.
+    /// Feeds program output. The status and progress lifetimes the client
+    /// applies (`ESC c` resets, OSC 133 `A` ends activity and drops the
+    /// progress) apply in stream order.
     pub fn feed(&mut self, bytes: &[u8]) {
         let mut fed = 0;
         for (at, found) in self.scanner.scan_positions(bytes) {
+            self.progress = found.progress_after(self.progress);
             match found {
                 Found::Reset => {
                     self.records.reset();
@@ -139,7 +146,7 @@ impl Emulator {
                 Found::Status(message) => {
                     self.records.apply(&message);
                 }
-                Found::Notice(_) => {}
+                Found::Progress(_) | Found::Notice(_) => {}
             }
         }
         self.parser.advance(&mut self.term, &self.marks, &bytes[fed..]);
@@ -166,7 +173,7 @@ impl Emulator {
             self.parser.stop_sync(&mut self.term, &self.marks);
         }
         let title = self.titles.0.lock().clone();
-        replay::render(&mut self.term, &self.marks.lock(), &self.records, title.as_deref())
+        replay::render(&mut self.term, &self.marks.lock(), &self.records, self.progress, title.as_deref())
     }
 
     pub fn term(&self) -> &Term<Titles> {
@@ -179,6 +186,11 @@ impl Emulator {
 
     pub fn records(&self) -> &Records {
         &self.records
+    }
+
+    /// The session's `OSC 9 ; 4` progress, if any.
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress
     }
 
     pub fn title(&self) -> Option<String> {
@@ -342,6 +354,52 @@ mod tests {
         third.feed(&second.render());
         assert_eq!(line(&third), line(&first));
         assert_eq!(text(&third, 0), "$ echo 'a;b' \\\\");
+    }
+
+    fn normal(n: u64) -> Option<Progress> {
+        Some(Progress::Normal(crate::progress::Percent::clamped(n)))
+    }
+
+    #[test]
+    fn progress_follows_reports_and_goes_at_a_prompt_or_a_reset() {
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
+        emulator.feed(b"\x1b]9;4;1;3");
+        emulator.feed(b"0\x07");
+        assert_eq!(emulator.progress(), normal(30), "split across feeds");
+        emulator.feed(b"\x1b]9;4;7;50\x07working");
+        assert_eq!(emulator.progress(), normal(30), "an unknown state changes nothing");
+        emulator.input_seen();
+        emulator.feed(b"\x1b[?1049hfull screen\x1b[?1049l");
+        assert_eq!(emulator.progress(), normal(30), "typing and the alternate screen leave it");
+        emulator.feed(b"\x1b]133;A\x07$ ");
+        assert_eq!(emulator.progress(), None, "a new prompt drops it");
+        emulator.feed(b"\x1b]9;4;4;20\x07");
+        assert_eq!(emulator.progress().map(|p| p.describe()).as_deref(), Some("state=paused percent=20"));
+        emulator.feed(b"\x1bc");
+        assert_eq!(emulator.progress(), None, "a reset drops it");
+    }
+
+    /// The progress is replayed after the marks, so the replayed prompt's
+    /// `A` doesn't drop it, and it survives a second emulator (a core
+    /// restart from a checkpoint).
+    #[test]
+    fn progress_survives_a_render_with_prompt_marks_and_two_emulators() {
+        let mut first = Emulator::new(30, 4, 50, PathStyle::Posix);
+        first.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07\x1b]9;4;1;60\x07\x1b]9;4;2\x07");
+        let error = Some(Progress::Error(Some(crate::progress::Percent::clamped(60))));
+        assert_eq!(first.progress(), error);
+        let render = first.render();
+        assert!(replays(&render, b"\x1b]133;A"), "{:?}", String::from_utf8_lossy(&render));
+        let mut second = Emulator::new(30, 4, 50, PathStyle::Posix);
+        second.feed(&render);
+        assert_eq!(second.progress(), error);
+        let mut third = Emulator::new(30, 4, 50, PathStyle::Posix);
+        third.feed(&second.render());
+        assert_eq!(third.progress(), error);
+        // And none replays as none.
+        let mut empty = Emulator::new(30, 4, 50, PathStyle::Posix);
+        empty.feed(b"\x1b]9;4;1;5\x07\x1b]9;4;0\x07");
+        assert!(!replays(&empty.render(), b"\x1b]9;4"));
     }
 
     #[test]
