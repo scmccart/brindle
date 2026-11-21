@@ -1,0 +1,19 @@
+#!/bin/sh
+# Checks .github/workflows/ with actionlint (which runs shellcheck on each
+# `run:` script), configured by .github/actionlint.yaml:
+#
+#   scripts/lint-workflows            # every workflow
+#   scripts/lint-workflows FILE...    # these files
+#
+# It runs actionlint's Docker image, which bundles shellcheck, at the version
+# pinned here (moved by hand), so it needs a Docker daemon.
+set -eu
+
+ACTIONLINT_VERSION=1.7.12
+
+cd "$(dirname "$0")/.."
+if ! command -v docker >/dev/null 2>&1; then
+    echo "lint-workflows: docker is missing" >&2
+    exit 1
+fi
+exec docker run --rm -v "$(pwd):/repo" -w /repo "rhysd/actionlint:$ACTIONLINT_VERSION" -no-color "$@"

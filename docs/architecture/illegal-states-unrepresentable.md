@@ -97,5 +97,5 @@ A removed config key stays as a field that is parsed, warned about and ignored (
 ## References
 
 - The architecture plugin's `illegal-states-unrepresentable` skill.
-- `CLAUDE.md`, "Architecture": `Host`, "Reattach", "Sessions palette state", "Grid geometry".
+- `docs/code-map.md`: `Host`, "Reattach", "Sessions palette state", "Grid geometry".
 - Exceptions in force: [README.md](README.md#exceptions-in-force).

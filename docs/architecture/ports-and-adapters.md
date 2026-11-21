@@ -112,5 +112,5 @@ R6–R9, R11 and R13 rely on review.
 ## References
 
 - The architecture plugin's `ports-and-adapters` skill (the default, "values in, values out" variant).
-- `CLAUDE.md`: "Platform layer", "`brindle-ui`: Boundary", "Windows" (the `cfg` seams).
+- `docs/code-map.md`: "Platform layer", "`brindle-ui`: Boundary"; `CLAUDE.md`: "Windows" (the `cfg` seams).
 - `openspec/changes/archive/` for `add-brindle-ui` (why the UI crate was split out) and `terminal-server-windows` (the platform layer); `openspec/changes/port-to-macos`.
