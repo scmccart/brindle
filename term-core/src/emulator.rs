@@ -327,6 +327,23 @@ mod tests {
         assert!(!replays(&render, b"C:"), "{:?}", String::from_utf8_lossy(&render));
     }
 
+    /// A reported command line survives a render into a new emulator and
+    /// that one's render (a core restart from a checkpoint), escaped.
+    #[test]
+    fn a_reported_command_line_survives_two_emulators() {
+        let mut first = Emulator::new(30, 4, 50, PathStyle::Posix);
+        first.feed(b"\x1b]633;A\x07$ \x1b]633;B\x07echo 'a;b' \\\\\r\n");
+        first.feed(b"\x1b]633;E;echo 'a\\x3bb' \\\\\\\\;f00d\x07\x1b]633;C\x07a;b \\\r\n\x1b]633;D;0\x07");
+        let line = |e: &Emulator| e.marks().commands().front().and_then(|c| c.line.clone());
+        assert_eq!(line(&first).as_deref(), Some("echo 'a;b' \\\\"));
+        let mut second = Emulator::new(30, 4, 50, PathStyle::Posix);
+        second.feed(&first.render());
+        let mut third = Emulator::new(30, 4, 50, PathStyle::Posix);
+        third.feed(&second.render());
+        assert_eq!(line(&third), line(&first));
+        assert_eq!(text(&third, 0), "$ echo 'a;b' \\\\");
+    }
+
     #[test]
     fn a_replayed_directory_survives_a_second_emulator() {
         let mut first = Emulator::new(20, 4, 0, PathStyle::Windows);

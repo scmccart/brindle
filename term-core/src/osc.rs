@@ -1,7 +1,7 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
 //! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
-//! program status reports, and the OSC 133 `A` prompt starts and `ESC c`
-//! resets that end status records.
+//! program status reports, and the OSC 133 (and VS Code's OSC 633) `A`
+//! prompt starts and `ESC c` resets that end status records.
 //!
 //! The scanner keeps its state between calls, so a sequence split across
 //! reads is still found, and it never buffers anything but the payload of
@@ -17,7 +17,7 @@ pub enum Found {
     Notice(Notice),
     /// An OSC 7501 report, clear or query.
     Status(Message),
-    /// OSC 133 `A`: a new shell prompt begins.
+    /// OSC 133 `A` (or OSC 633 `A`): a new shell prompt begins.
     PromptStart,
     /// `ESC c`: a full reset.
     Reset,
@@ -128,7 +128,7 @@ impl Scanner {
                 }
                 b';' => {
                     // Written as the number is: `0009` isn't 9.
-                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133, 3) | (7501, 4));
+                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133 | 633, 3) | (7501, 4));
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -182,8 +182,8 @@ impl Scanner {
         match self.number {
             9 => parse_osc9(&payload).map(Found::Notice),
             777 => parse_osc777(&payload).map(Found::Notice),
-            // `133;A` may carry options after a `;`.
-            133 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
+            // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
+            133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
             7501 => status::parse(&payload).map(Found::Status),
             _ => None,
         }
@@ -382,6 +382,9 @@ mod tests {
         let two_prompts = b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;A;k=i\x1b\\";
         assert_eq!(scan(two_prompts), [Found::PromptStart, Found::PromptStart]);
         assert!(scan(b"\x1b]133;D;0\x07\x1b]133;AB\x07").is_empty());
+        // VS Code's prompt start is the same, and its other kinds are not.
+        assert_eq!(scan(b"\x1b]633;A\x07"), [Found::PromptStart]);
+        assert!(scan(b"\x1b]633;E;A\x07\x1b]633;P;Cwd=/A\x07\x1b]6330;A\x07").is_empty());
         assert_eq!(scan(b"a\x1bcb\x1b[0m\x1b]9;x\x07"), [Found::Reset, osc9("x")]);
         // `ESC c` inside an OSC cancels it, as any other ESC does.
         assert_eq!(scan(b"\x1b]9;lost\x1bc"), [Found::Reset]);

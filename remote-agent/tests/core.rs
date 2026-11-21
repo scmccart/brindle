@@ -1038,6 +1038,29 @@ fn attaching_replays_status_records_and_prompt_marks() {
     assert_eq!(marks.prompt_lines().collect::<Vec<_>>(), [0, 2, 4, 6]);
 }
 
+/// The core keeps a detached session's reported command lines (OSC 633
+/// `E`) with its marks, and an attach replays them: Copy Last Command Line
+/// after the attach gets `make test`.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_reported_command_lines() {
+    let (dir, mut client) = core("attach-lines");
+    let fixture = b"\x1b]633;A\x07$ \x1b]633;B\x07make test\r\n\x1b]633;E;make test;n0nce\x07\x1b]633;C\x07ok\r\n\
+        \x1b]633;D;0\x07\x1b]633;A\x07$ \x1b]633;B\x07printf a\\x3bb\r\n\x1b]633;E;printf a\\\\x3bb\x07\x1b]633;C\x07a;b\r\n\
+        \x1b]633;D;0\x07\x1b]633;A\x07$ ";
+    let (session, _) = detached_fixture(&dir, &mut client, fixture, 1000);
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    let marks = screen.marks();
+    let lines: Vec<Option<&str>> = marks.commands().iter().map(|c| c.line.as_deref()).collect();
+    assert_eq!(lines, [Some("make test"), Some("printf a\\x3bb"), None]);
+    use brindle_term_core::shell_integration::LineSource;
+    assert_eq!(
+        marks.last_command_line(screen.term()),
+        Some(LineSource::Reported("printf a\\x3bb".into()))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {

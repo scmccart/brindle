@@ -1010,6 +1010,15 @@ impl Terminal {
         Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
     }
 
+    /// The last command's line as text: the line its shell reported (OSC
+    /// 633 `E`), else what is between its `B` and `C` marks
+    /// ([`Marks::last_command_line`]).
+    pub fn last_command_line_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        let source = self.marks.lock().last_command_line(&term)?;
+        source.text(&term)
+    }
+
     // ---- selection ----------------------------------------------------------
 
     /// Converts a viewport cell to a grid point (accounting for scrollback).

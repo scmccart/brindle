@@ -459,6 +459,12 @@ impl TerminalView {
         }
     }
 
+    fn copy_last_command(&mut self, _: &CopyLastCommand, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal.read(cx).last_command_line_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     // ---- mouse ----------------------------------------------------------------
 
     #[allow(
@@ -686,6 +692,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &JumpToNextPrompt, _, cx| this.jump_to_prompt(false, cx)))
             .on_action(cx.listener(Self::select_last_output))
             .on_action(cx.listener(Self::copy_last_output))
+            .on_action(cx.listener(Self::copy_last_command))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))

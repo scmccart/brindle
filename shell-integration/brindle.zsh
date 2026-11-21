@@ -10,7 +10,9 @@
 #
 # It marks the prompt (A), where the command line starts (B), where the
 # command's output starts (C) and the command's end with its exit status
-# (D). Terminals that don't know OSC 133 ignore them.
+# (D). Just before C it reports the command line as typed with VS Code's
+# OSC 633 E, so a right prompt or an autosuggestion never reads as part of
+# it. Terminals that don't know these sequences ignore them.
 
 if [[ -o interactive && -z ${__brindle_si-} ]]; then
   typeset -g __brindle_si=1 __brindle_status=0 __brindle_ran=
@@ -32,8 +34,31 @@ if [[ -o interactive && -z ${__brindle_si-} ]]; then
     [[ $PS1 == *$'\e]133;B'* ]] || PS1="$PS1"$'%{\e]133;B\a%}'
   }
 
+  # The line as OSC 633 E: `\` as `\\`, then `;` and control characters as
+  # `\xHH` (a newline in a command typed over several lines too). zsh gives
+  # preexec the line as typed, also when history drops it, and an empty one
+  # only when history is off: then nothing is sent.
+  __brindle_line() {
+    emulate -L zsh
+    [[ -n $1 ]] || return 0
+    local bs='\' bs2='\\' semi=';' semi_x='\x3b' nl=$'\n' nl_x='\x0a'
+    local line=${1//"$bs"/$bs2}
+    line=${line//"$semi"/$semi_x}
+    line=${line//"$nl"/$nl_x}
+    if [[ $line == *[[:cntrl:]]* ]]; then
+      local out= c
+      for c in "${(@s::)line}"; do
+        [[ $c == [[:cntrl:]] ]] && printf -v c '\\x%02x' "'$c"
+        out+=$c
+      done
+      line=$out
+    fi
+    printf '\e]633;E;%s\a' "$line"
+  }
+
   __brindle_preexec() {
     __brindle_ran=1
+    __brindle_line "$1"
     printf '\e]133;C\a'
   }
 

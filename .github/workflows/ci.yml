@@ -207,9 +207,10 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
+          # zsh and fish: the shell-script-line cases, which skip without them.
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
-            xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less
+            xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish
       - name: Install Rust
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
