@@ -904,8 +904,11 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
 /// run at once, each as an instance with its own `session.toml`: the
 /// elevated one in `state-elevated` under `%LOCALAPPDATA%\brindle` (here a
 /// private `LOCALAPPDATA` in the case directory), made for Administrators
-/// and SYSTEM only, and the unelevated one in `brindle` itself. Neither
-/// runs on its own for want of the other's session lock. The unelevated one
+/// and SYSTEM only, and the unelevated one in `brindle` itself. A
+/// `state-elevated` already there without that protection, with a
+/// `session.toml` planted in it, is set aside, not protected again with the
+/// file in it. Neither runs on its own for want of the other's session
+/// lock. The unelevated one
 /// starts once the elevated one's tab is up, and the elevated one's shell
 /// waits for it to be done before Brindle quits, so they overlap. Needs an
 /// elevated runner whose desktop shell runs unelevated (UAC on); skipped
@@ -922,6 +925,12 @@ fn elevated_instances(ctx: &Ctx) -> Result<Outcome> {
     std::fs::create_dir_all(&appdata).map_err(|e| e.to_string())?;
     let appdata_text = appdata.to_str().ok_or("the case directory isn't UTF-8")?.to_string();
     let (medium, high) = (appdata.join("brindle"), appdata.join("brindle").join("state-elevated"));
+    // A `state-elevated` someone else made, with a session in it: the
+    // elevated Brindle sets it aside and makes the directory fresh, rather
+    // than protecting it again with the planted file in it.
+    const PLANTED: &str = "version = 1\n# planted\n";
+    std::fs::create_dir_all(&high).map_err(|e| e.to_string())?;
+    std::fs::write(high.join("session.toml"), PLANTED).map_err(|e| e.to_string())?;
     let done = ctx.dir.join("unelevated-done");
     let slashed = |path: &std::path::Path| path.display().to_string().replace('\\', "/");
     // The elevated tab's shell prints `both-ran` once the unelevated run is
@@ -967,6 +976,17 @@ fn elevated_instances(ctx: &Ctx) -> Result<Outcome> {
         Ok(None) => return Err(format!("{} is missing", high.display())),
         Err(why) => return Err(format!("{} isn't protected: {why}", high.display())),
     }
+    let kept = std::fs::read_to_string(high.join("session.toml")).unwrap_or_default();
+    ensure!(!kept.contains("# planted"), "the planted session.toml is still in {}", high.display());
+    let set_aside = std::fs::read_dir(&medium)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            brindle_remote_protocol::server_dir::is_untrusted_name(&name) && name.starts_with("state-elevated.")
+        })
+        .any(|entry| std::fs::read_to_string(entry.path().join("session.toml")).is_ok_and(|text| text == PLANTED));
+    ensure!(set_aside, "the planted state-elevated wasn't set aside beside {}", high.display());
     let dump = Dump::parse(&std::fs::read_to_string(ctx.dir.join("unelevated.dump")).unwrap_or_default());
     ensure!(screen(&dump).contains("unelevated-tab"), "the unelevated tab: see unelevated.dump");
     ensure!(dump.config.is_none(), "the unelevated window's config line: {:?}", dump.config);

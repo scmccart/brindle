@@ -118,6 +118,10 @@ pub fn elevated() -> Result<bool, String> {
     crate::remote::protocol::win::is_elevated().map_err(|error| format!("reading this process's token: {error}"))
 }
 
+/// What [`protect_state_dir`] makes the directory as; it says why.
+const STATE_DIR_CONTENTS: crate::remote::protocol::win::Contents =
+    crate::remote::protocol::win::Contents::Executables;
+
 /// Makes or checks an elevated Brindle's state directory `dir` for
 /// Administrators and SYSTEM only, as its terminal server's `run-elevated`
 /// is ([`win::protected_dir`](crate::remote::protocol::win::protected_dir)),
@@ -127,12 +131,13 @@ pub fn elevated() -> Result<bool, String> {
 /// It is made with `Contents::Executables`, not `State`: a directory found
 /// there without the elevated descriptor is set aside and made fresh, never
 /// re-protected in place, since an unelevated process could have planted a
-/// `session.toml` in it that an elevated Brindle would then restore.
+/// `session.toml` in it that an elevated Brindle would then restore
+/// ([`STATE_DIR_CONTENTS`], which a test pins).
 pub fn protect_state_dir(dir: &std::path::Path) -> Result<(), String> {
-    use crate::remote::protocol::win::{Contents, ProtectedDir, protected_dir};
+    use crate::remote::protocol::win::{ProtectedDir, protected_dir};
 
     static HELD: std::sync::OnceLock<ProtectedDir> = std::sync::OnceLock::new();
-    let held = protected_dir(dir, Contents::Executables).map_err(|error| error.to_string())?;
+    let held = protected_dir(dir, STATE_DIR_CONTENTS).map_err(|error| error.to_string())?;
     // Called once, before the session lock; a second hold would be the same
     // directory's.
     HELD.set(held).ok();
@@ -203,5 +208,22 @@ pub fn attach_parent_console() {
     }
     if err {
         set(STD_ERROR_HANDLE, console);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::remote::protocol::access::{Found, Step, protected_step};
+
+    /// The elevated state directory keeps nothing it didn't make: whatever
+    /// is found in its place without the elevated descriptor (a directory
+    /// an unelevated process made, a link, a file) is set aside, never
+    /// protected again with its files.
+    #[test]
+    fn a_state_directory_found_unprotected_is_set_aside() {
+        for found in [Found::Other, Found::Link, Found::NotDir] {
+            assert_eq!(protected_step(found, super::STATE_DIR_CONTENTS, false), Step::SetAside, "{found:?}");
+        }
+        assert_eq!(protected_step(Found::Matches, super::STATE_DIR_CONTENTS, false), Step::Use);
     }
 }
