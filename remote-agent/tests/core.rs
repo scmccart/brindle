@@ -1061,6 +1061,34 @@ fn attaching_replays_reported_command_lines() {
     );
 }
 
+/// The core keeps a detached session's progress (OSC 9;4) through the
+/// prompt marks before it, an attach replays it, and so does a restarted
+/// core: paused, keeping the 60% the program reported before.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_progress_and_so_does_a_restarted_core() {
+    use brindle_term_core::progress::{Percent, Progress};
+    let mut dir = TempDir::new("attach-progress");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    // The text comes after the reports, so a screen that shows it has had
+    // them.
+    let fixture = b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07\
+        \x1b]9;4;1;60\x07\x1b]9;4;4\x1b\\paused\r\n";
+    let (session, pid) = detached_fixture(&dir, &mut client, fixture, 1000);
+    dir.track(parent(pid).unwrap());
+    let paused = Some(Progress::Paused(Some(Percent::clamped(60))));
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(screen.progress(), paused);
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(start.pid, pid);
+    assert_eq!(screen.progress(), paused);
+}
+
 #[cfg(unix)]
 #[test]
 fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {

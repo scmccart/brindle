@@ -100,7 +100,9 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
         },
         ChannelEvent::Osc(found) => match found {
             Found::Notice(_) => SIDE,
-            Found::Status(_) | Found::PromptStart | Found::Reset => Kind::Side { status: true },
+            // A dropped progress report leaves the progress stale, as a
+            // dropped status report leaves the records: both start over.
+            Found::Status(_) | Found::Progress(_) | Found::PromptStart | Found::Reset => Kind::Side { status: true },
         },
         ChannelEvent::Merged(merge) => Kind::Merged(*merge),
         ChannelEvent::Foreground => Kind::Merged(Merge::Foreground),
@@ -484,8 +486,13 @@ mod tests {
         }
         let notice = Notice { source: Source::Osc9, title: "t".into(), body: "b".into() };
         assert_eq!(found(Found::Notice(notice)), SIDE);
-        for status in [Found::Status(Message::Query), Found::Status(Message::Clear { id: None }), Found::PromptStart, Found::Reset]
-        {
+        for status in [
+            Found::Status(Message::Query),
+            Found::Status(Message::Clear { id: None }),
+            Found::Progress(brindle_term_core::progress::Report::Clear),
+            Found::PromptStart,
+            Found::Reset,
+        ] {
             assert_eq!(found(status), STATUS);
         }
 
