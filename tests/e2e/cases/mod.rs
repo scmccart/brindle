@@ -128,6 +128,7 @@ fn unix() -> Vec<Case> {
         display("shell-633-marks", shell::marks_633),
         display("shell-633-copy-line", shell::copy_line_633),
         display("shell-633-cwd", shell::cwd_633),
+        display("shell-633-palette", shell::palette_gating_633),
         display("shell-script-line-bash", shell::script_line_bash),
         display("shell-script-line-zsh", shell::script_line_zsh),
         display("shell-script-line-fish", shell::script_line_fish),

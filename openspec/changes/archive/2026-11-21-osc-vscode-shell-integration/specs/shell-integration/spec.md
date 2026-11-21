@@ -120,7 +120,7 @@ Each shipped script SHALL send the command line as typed with OSC 633 `E` before
 - **THEN** that command's line is `echo "a;b"`
 
 ### Requirement: Copy Last Command Line
-**Copy Last Command Line** SHALL put on the clipboard the reported line of the most recent command that has one of: a reported line, or both `B` and `C` marks. Without a reported line it SHALL copy the text from the `B` mark to the `C` mark with leading and trailing whitespace removed. It SHALL do nothing when there is no such command or its marks have left the scrollback.
+**Copy Last Command Line** SHALL put on the clipboard the reported line of the most recent command that has one of: a reported line, or both `B` and `C` marks. Without a reported line it SHALL copy the text from the `B` mark to the `C` mark with leading and trailing whitespace removed. It SHALL do nothing when there is no such command or its marks have left the scrollback. It SHALL also do nothing, and the command palette SHALL NOT list it, until the terminal has received at least one prompt mark (`A`, from OSC 133 or 633): a program that has sent none has no shell integration, so there is nothing for the command to read. Once a prompt mark has been received the command stays listed for that terminal.
 
 #### Scenario: Reported line wins
 - **WHEN** a shell reported `git commit -m "x"` with `633;E` for a command whose prompt line wrapped across two rows, and the user runs Copy Last Command Line
@@ -129,3 +129,11 @@ Each shipped script SHALL send the command line as typed with OSC 633 `E` before
 #### Scenario: From the marks
 - **WHEN** a shell emitting only OSC 133 ran `ls -la`, and the user runs Copy Last Command Line
 - **THEN** the clipboard holds `ls -la`
+
+#### Scenario: Hidden without a prompt mark
+- **WHEN** a terminal has received no prompt mark, as with a shell that loaded no integration script, and the user opens the command palette and filters for "last command"
+- **THEN** the palette does not list Copy Last Command Line, and running the `copy_last_command` action does nothing
+
+#### Scenario: Listed after a prompt mark
+- **WHEN** the terminal receives `OSC 133;A`, and the user opens the command palette and filters for "last command"
+- **THEN** the palette lists Copy Last Command Line

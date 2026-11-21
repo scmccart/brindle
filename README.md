@@ -733,7 +733,9 @@ them ignore them. With a script loaded:
   command palette. They have no default key; bind `select_last_output` or
   `copy_last_output`. Copy leaves your selection alone.
 - **Copy Last Command Line** (`copy_last_command`, no default key) copies the last
-  command as you typed it. The scripts report each line with OSC 633 `E` (fish 4
+  command as you typed it. It is in the palette only once the terminal has received a
+  prompt mark, so a shell with no script loaded doesn't list it, and a key bound to it
+  does nothing there. The scripts report each line with OSC 633 `E` (fish 4
   reports it on its own output mark), so a right prompt or a wrapped line never gets
   in; without a report it copies the text between the command's `B` and `C` marks.
   bash reports a line only when it adds a history entry, so a command

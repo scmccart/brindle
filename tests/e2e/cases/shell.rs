@@ -2,7 +2,8 @@
 //! last-output selection, in local tabs. VS Code's OSC 633: its marks, a
 //! reported command line copied with Copy Last Command Line, and its
 //! directory report (in a container tab, where a new tab starts in the
-//! reported directory); and each shipped script reporting its command lines.
+//! reported directory); Copy Last Command Line listed in the palette only
+//! after a prompt mark; and each shipped script reporting its command lines.
 //!
 //! What Copy Last Command Line put on the clipboard is read back by pasting
 //! it into a bash `read` in the tab ([`Clip`]), which saves it to a file.
@@ -336,5 +337,45 @@ pub fn script_line_fish(ctx: &Ctx) -> Result<Outcome> {
         .send(r#"echo "a;b"\r"#);
     let out = clip.copy(run).dump_at(12.0).run()?;
     clip.expect(r#"echo "a;b""#, &out)?;
+    Ok(Outcome::Pass)
+}
+
+/// Copy Last Command Line is in the palette only once the terminal has
+/// sent a prompt mark: a bash tab with no integration doesn't list it (its
+/// neighbour, Copy Last Command Output, which the filter also matches, is
+/// there), and the same tab lists it after a printed `A` mark.
+pub fn palette_gating_633(ctx: &Ctx) -> Result<Outcome> {
+    let listed = |label: &'static str, mark: &str| -> Result<(bool, Vec<String>)> {
+        // The marker is printed in pieces, so the line that runs it doesn't show it.
+        let out = Run::new(ctx, label)
+            .profile("Shell")
+            .send(&format!("PS1='$ '; clear; {mark}printf '%s-%s\\n' gate ready\\r"))
+            .wait_for("gate-ready")
+            .action("open_command_palette")
+            .send("last command")
+            .dump_after_last_step(1.0) // one step interval, Brindle's own
+            .run()?;
+        ensure!(
+            out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+            "{label}: waits {:?} {:?}",
+            out.dump.wait_timeouts,
+            out.dump.wait_pending
+        );
+        ensure!(
+            out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"last command\" ")),
+            "{label}: palette {:?}",
+            out.dump.palette
+        );
+        ensure!(
+            out.dump.palette.iter().any(|l| l.starts_with("Copy Last Command Output")),
+            "{label}: the filter doesn't list Copy Last Command Output: {:?}",
+            out.dump.palette
+        );
+        Ok((out.dump.palette.iter().any(|l| l.starts_with("Copy Last Command Line")), out.dump.palette))
+    };
+    let (without, rows) = listed("plain", "")?;
+    ensure!(!without, "listed with no prompt mark: {rows:?}");
+    let (with, rows) = listed("marked", r"printf '\033]133;A\007'; ")?;
+    ensure!(with, "not listed after a prompt mark: {rows:?}");
     Ok(Outcome::Pass)
 }

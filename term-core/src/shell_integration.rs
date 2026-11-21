@@ -616,9 +616,19 @@ pub struct Marks {
     /// The working directory the program last reported (OSC 7, 9;9 or 633
     /// `P;Cwd`). A reset keeps it: the shell is still there.
     reported_dir: Option<PathBuf>,
+    /// Whether a prompt mark (`A`) has ever been recorded: the program
+    /// runs a shell-integration script. Sticky: a reset, a clear or a
+    /// prune keeps it.
+    prompt_seen: bool,
 }
 
 impl Marks {
+    /// Whether the program has sent a prompt mark (OSC 133 or 633 `A`),
+    /// which is what tells a shell with integration from one without.
+    pub fn prompt_seen(&self) -> bool {
+        self.prompt_seen
+    }
+
     /// The commands recorded, oldest first.
     pub fn commands(&self) -> &VecDeque<Command> {
         &self.commands
@@ -646,6 +656,9 @@ impl Marks {
 
     /// Records `mark` at the cursor.
     pub fn record<T>(&mut self, term: &Term<T>, mark: Mark) {
+        if mark == Mark::PromptStart {
+            self.prompt_seen = true;
+        }
         if term.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
@@ -1951,6 +1964,24 @@ mod tests {
 
     fn last_line(h: &Harness) -> Option<String> {
         h.marks.lock().last_command_line(&h.term).and_then(|source| source.text(&h.term))
+    }
+
+    #[test]
+    fn a_prompt_mark_is_what_shows_a_shell_with_integration() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        assert!(!h.marks.lock().prompt_seen());
+        // Marks after the prompt's own, and a reported directory, don't count.
+        h.feed(b"\x1b]7;file:///tmp\x07\x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(!h.marks.lock().prompt_seen());
+        h.feed(b"\x1b]633;A\x07");
+        assert!(h.marks.lock().prompt_seen());
+        // It stays once the marks are gone, and for a prompt on the alternate screen.
+        h.marks.lock().clear();
+        assert!(h.marks.lock().commands().is_empty());
+        assert!(h.marks.lock().prompt_seen());
+        let mut alt = Harness::new(PathStyle::Posix, 20, 5, 100);
+        alt.feed(b"\x1b[?1049h\x1b]133;A\x07");
+        assert!(alt.marks.lock().prompt_seen());
     }
 
     #[test]
