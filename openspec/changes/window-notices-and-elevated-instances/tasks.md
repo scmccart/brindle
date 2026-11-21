@@ -24,6 +24,6 @@
   - A new case checks that the notice is gone after `NOTICE_LIFETIME`. Time the dump against that limit unscaled, through `Run::dump_after_last_step`.
   - A new case checks that `dismiss_notices` clears the notice.
 - [x] 3.2 Add an e2e Windows case: an elevated and an unelevated Brindle run at once, each with its own `session.toml`. It skips without an elevated runner.
-- [ ] 3.3 Manual checks:
+- [x] 3.3 Manual checks:
   - a pointer click on the config line's dismiss button;
-  - a Start Menu launch that is refused shows its message box.
+  - a Start Menu launch that is refused shows its message box (not run: with separate state directories it needs a shared `BRINDLE_STATE_DIR` to trigger).
