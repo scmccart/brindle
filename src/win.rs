@@ -135,6 +135,28 @@ pub fn protect_state_dir(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows `text` in a message box (an error icon, titled Brindle) when this
+/// process has no console and its stderr goes nowhere, so what it printed
+/// was lost: a launch from the Start Menu or Explorer that gives up. Called
+/// after [`attach_parent_console`]; one started from a console, or with its
+/// stderr redirected, has printed it already and shows nothing.
+pub fn show_unprinted(text: &str) {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+    // SAFETY: reads the process's console window; no argument.
+    let console = !unsafe { GetConsoleWindow() }.is_invalid();
+    // SAFETY: GetStdHandle only reads the process's standard handles.
+    let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) }.is_ok_and(|handle| !handle.is_invalid());
+    if console || stderr {
+        return;
+    }
+    // SAFETY: both strings are NUL-terminated and outlive the call; the box
+    // has no owner window.
+    unsafe {
+        MessageBoxW(None, &windows::core::HSTRING::from(text), w!("Brindle"), MB_OK | MB_ICONERROR | MB_SETFOREGROUND)
+    };
+}
+
 /// Points stdout and stderr at the console Brindle was started from, for
 /// output printed just before exiting.
 ///

@@ -431,6 +431,16 @@ fn console_output() {
     win::attach_parent_console();
 }
 
+/// Shows `text`, already printed after [`console_output`], in a message box
+/// when the launch has no console for it (on Windows, a Start Menu launch).
+/// Elsewhere stderr is all: a desktop launch on Linux has the journal.
+fn show_unprinted(text: &str) {
+    #[cfg(windows)]
+    win::show_unprinted(text);
+    #[cfg(not(windows))]
+    let _ = text;
+}
+
 /// Whether this process runs elevated: from its token on Windows, never on
 /// Linux.
 #[cfg(windows)]
@@ -1043,6 +1053,7 @@ fn session_lock(state_dir: &Path, args: &Args) -> Option<session::Lock> {
                     Err(_) => {
                         console_output();
                         eprintln!("brindle: {why}");
+                        show_unprinted(&why);
                         std::process::exit(1);
                     }
                 },
