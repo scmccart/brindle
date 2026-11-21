@@ -28,7 +28,12 @@
 //! - the progress, if any, as one `OSC 9 ; 4` report. It comes last, after
 //!   the marks, because a replayed OSC 133 `A` drops the receiver's
 //!   progress. A client that predates progress ignores it (it reads `9;4`
-//!   as a ConEmu command, not a message).
+//!   as a ConEmu command, not a message);
+//! - one `OSC 3008 ; start=…` per open context, outermost first, its id and
+//!   values re-escaped (`;`, `\` and bytes outside 0x20–0x7E as `\xHH`).
+//!   Nothing in the stream ends a context (not even its `ESC c`), so the
+//!   receiver must start from no contexts: a client drops its own when the
+//!   replay begins. A client that predates contexts ignores them.
 //!
 //! # The receiver
 //! The stream is rendered at the session's size. The receiver must be a
@@ -91,18 +96,21 @@ use alacritty_terminal::vte::ansi::{
     CharsetIndex, Color, CursorShape, CursorStyle, Handler, NamedColor, StandardCharset,
 };
 
+use crate::context::Contexts;
 use crate::progress::Progress;
 use crate::shell_integration::{Mark, Marks, encode_vscode};
 use crate::status::Records;
 
-/// Renders `term`, its `marks`, `records` and `progress`, and the window
-/// `title` (which `Term` doesn't expose) as a replay stream. See the module
-/// docs for what the receiver must be and what doesn't round-trip.
+/// Renders `term`, its `marks`, `records`, `progress` and `contexts`, and
+/// the window `title` (which `Term` doesn't expose) as a replay stream. See
+/// the module docs for what the receiver must be and what doesn't
+/// round-trip.
 pub fn render<T: EventListener>(
     term: &mut Term<T>,
     marks: &Marks,
     records: &Records,
     progress: Option<Progress>,
+    contexts: &Contexts,
     title: Option<&str>,
 ) -> Vec<u8> {
     let hidden = Hidden::probe(term);
@@ -249,6 +257,9 @@ pub fn render<T: EventListener>(
     }
     if let Some(progress) = progress {
         out.raw(&format!("\x1b]9;{}\x1b\\", progress.encode()));
+    }
+    for payload in contexts.encode() {
+        out.raw(&format!("\x1b]3008;{payload}\x1b\\"));
     }
     out.buf
 }

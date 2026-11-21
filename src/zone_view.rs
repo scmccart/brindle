@@ -23,6 +23,7 @@ use crate::config::{Config, Profile};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
+use crate::terminal::context::Badge;
 use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
 use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
@@ -338,6 +339,22 @@ pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
     out
 }
 
+/// Formats `--dump-screen-after` zone badge lines when a tab has 2 or more
+/// zones (`--- badge zone=ID kind=… label="…"`, the active zone first, then
+/// by id), one per zone whose header shows a badge, or returns an empty
+/// string for a single-zone tab, which has no headers.
+pub fn describe_zone_badges<'a>(zones: impl IntoIterator<Item = (ZoneId, Option<&'a Badge>)>, active: ZoneId) -> String {
+    let mut zones: Vec<(ZoneId, Option<&Badge>)> = zones.into_iter().collect();
+    if zones.len() < 2 {
+        return String::new();
+    }
+    zones.sort_by_key(|(id, _)| (*id != active, id.0));
+    zones
+        .into_iter()
+        .filter_map(|(id, badge)| Some(format!("--- badge zone={} {}\n", id.0, badge?.describe())))
+        .collect()
+}
+
 /// Formats `--dump-screen-after` zone progress lines when a tab has 2 or
 /// more zones (`--- progress zone=ID state=…[ percent=N]`, the active zone
 /// first, then by id), one per zone with progress, or returns an empty
@@ -378,6 +395,9 @@ pub struct Zone {
     pub status: Option<State>,
     /// Its terminal's progress, cached for its header's bar.
     pub progress: Option<Progress>,
+    /// Its terminal's context badge, cached for its header and the tab's
+    /// face; both refreshed on its terminal's `Status`.
+    pub badge: Option<Badge>,
     pub last_focused: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -519,11 +539,13 @@ impl ZoneTreeView {
         };
         let status = terminal.read(cx).status().summary();
         let progress = terminal.read(cx).progress();
+        let badge = terminal.read(cx).badge().cloned();
         let zone = Zone {
             content: ZoneContent::Terminal(view),
             title: initial_title,
             status,
             progress,
+            badge,
             last_focused: self.focus_serial,
             _subscriptions: vec![focus_in, events, link_failed],
         };
@@ -562,6 +584,7 @@ impl ZoneTreeView {
                 if let Some(zone) = self.zones.get_mut(&id) {
                     let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
                     (zone.status, zone.progress) = (terminal.status().summary(), terminal.progress());
+                    zone.badge = terminal.badge().cloned();
                 }
                 cx.emit(event.clone());
                 cx.notify();
@@ -702,6 +725,18 @@ impl ZoneTreeView {
     /// ([`describe_zone_progress`]).
     pub fn describe_progress(&self) -> String {
         describe_zone_progress(self.zones.iter().map(|(id, z)| (*id, z.progress)), self.active)
+    }
+
+    /// The active zone's context badge, from its cached value: what the
+    /// tab's face shows.
+    pub fn active_badge(&self) -> Option<&Badge> {
+        self.zones.get(&self.active).and_then(|z| z.badge.as_ref())
+    }
+
+    /// The zones' badge lines for `--dump-screen-after`
+    /// ([`describe_zone_badges`]).
+    pub fn describe_badges(&self) -> String {
+        describe_zone_badges(self.zones.iter().map(|(id, z)| (*id, z.badge.as_ref())), self.active)
     }
 
     /// Takes the tab's profile as the config now has it (or the settings
@@ -1090,6 +1125,11 @@ impl ZoneTreeView {
         if let Some(bar) = progress_bar {
             header = header.edge_bar(bar);
         }
+        // Its context badge, coloured as the tab face's is.
+        if let Some(badge) = &zone.badge {
+            let color = self.theme.badge_color(badge.kind());
+            header = header.badge(brindle_ui::Badge::new(badge.label().to_owned(), color));
+        }
         let header = header
             .title(title)
             .title_muted(!active)
@@ -1322,6 +1362,27 @@ mod tests {
             describe_zone_tree(&tree, z2),
             "--- zones count=2 active=2\n--- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\n"
         );
+    }
+
+    /// Zone badge lines: none for one zone (it has no header), else one per
+    /// zone with a badge, the active one first.
+    #[test]
+    fn zone_badge_lines_put_the_active_zone_first() {
+        use crate::terminal::context::{Contexts, parse};
+        let badge = |payload: &[u8]| {
+            let mut contexts = Contexts::default();
+            contexts.apply(parse(payload).unwrap());
+            contexts.notable()
+        };
+        let root = badge(b"start=a;type=elevate;targetuser=root");
+        let web = badge(b"start=c;type=container;container=web");
+        assert_eq!(describe_zone_badges([(ZoneId(1), root.as_ref())], ZoneId(1)), "");
+        let zones = [(ZoneId(3), web.as_ref()), (ZoneId(1), root.as_ref()), (ZoneId(2), None)];
+        assert_eq!(
+            describe_zone_badges(zones, ZoneId(3)),
+            "--- badge zone=3 kind=elsewhere label=\"web\"\n--- badge zone=1 kind=privileged label=\"root\"\n"
+        );
+        assert_eq!(describe_zone_badges(zones, ZoneId(2)).lines().count(), 2);
     }
 
     /// Zone progress lines: none for one zone (the tab's line says it),

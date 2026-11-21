@@ -782,6 +782,13 @@ pub struct Dump {
     /// one, then `--- progress zone=ID …` for the active tab's zones), one
     /// line each without the prefix.
     pub progress: Vec<String>,
+    /// The active terminal's open contexts (`--- context …`), outermost
+    /// first, one line each without the prefix.
+    pub contexts: Vec<String>,
+    /// The context badges shown (`--- badge tab=N …` for each tab with one,
+    /// then `--- badge zone=ID …` for the active tab's zones), one line
+    /// each without the prefix.
+    pub badges: Vec<String>,
     /// The active tab's zone header (`--- zones …`), when it has 2+ zones.
     pub zones: Option<String>,
     /// The active tab's zone lines (`--- zone …`), one line each without the prefix.
@@ -868,6 +875,10 @@ impl Dump {
                 dump.status.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- progress ") {
                 dump.progress.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- context ") {
+                dump.contexts.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- badge ") {
+                dump.badges.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -1096,6 +1107,22 @@ pub fn self_test_dump() -> Result {
         dump.progress
     );
     ensure!(dump.screen == ["hi"], "screen after progress {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- context id=\"s\" type=session\n\
+         --- context id=\"e\" type=elevate label=\"root\"\n--- badge tab=1 kind=privileged label=\"root\"\n\
+         --- badge zone=1 kind=privileged label=\"root\"\nhi\n",
+    );
+    ensure!(
+        dump.contexts == ["id=\"s\" type=session", "id=\"e\" type=elevate label=\"root\""],
+        "contexts {:?}",
+        dump.contexts
+    );
+    ensure!(
+        dump.badges == ["tab=1 kind=privileged label=\"root\"", "zone=1 kind=privileged label=\"root\""],
+        "badges {:?}",
+        dump.badges
+    );
+    ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",

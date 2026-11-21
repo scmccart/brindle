@@ -76,7 +76,7 @@ pub enum Admit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recovered {
     pub dropped: u64,
-    /// A status report was among them.
+    /// A status, progress or context report was among them.
     pub statuses: bool,
 }
 
@@ -100,9 +100,12 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
         },
         ChannelEvent::Osc(found) => match found {
             Found::Notice(_) => SIDE,
-            // A dropped progress report leaves the progress stale, as a
-            // dropped status report leaves the records: both start over.
-            Found::Status(_) | Found::Progress(_) | Found::PromptStart | Found::Reset => Kind::Side { status: true },
+            // A dropped progress report or context message leaves the
+            // progress or the contexts stale, as a dropped status report
+            // leaves the records: all three start over.
+            Found::Status(_) | Found::Progress(_) | Found::Context(_) | Found::PromptStart | Found::Reset => {
+                Kind::Side { status: true }
+            }
         },
         ChannelEvent::Merged(merge) => Kind::Merged(*merge),
         ChannelEvent::Foreground => Kind::Merged(Merge::Foreground),
@@ -490,6 +493,7 @@ mod tests {
             Found::Status(Message::Query),
             Found::Status(Message::Clear { id: None }),
             Found::Progress(brindle_term_core::progress::Report::Clear),
+            Found::Context(brindle_term_core::context::parse(b"end=a").unwrap()),
             Found::PromptStart,
             Found::Reset,
         ] {

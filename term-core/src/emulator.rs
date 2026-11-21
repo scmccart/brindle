@@ -1,7 +1,8 @@
 //! A session's terminal state as the terminal server keeps it: a `Term`
-//! fed through Brindle's [`Parser`], its [`Marks`], its status [`Records`]
-//! and its [`Progress`] (kept by the same [`osc::Scanner`] the client uses,
-//! so both follow the stream alike) and its title. It answers nothing: its listener drops
+//! fed through Brindle's [`Parser`], its [`Marks`], its status [`Records`],
+//! its [`Progress`] and its [`Contexts`] (kept by the same
+//! [`osc::Scanner`] the client uses, so both follow the stream alike) and
+//! its title. It answers nothing: its listener drops
 //! every event, `PtyWrite` included, except the title changes the replay
 //! needs, since `Term` keeps its title private.
 //!
@@ -16,6 +17,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{self, Term};
 use parking_lot::{Mutex, MutexGuard};
 
+use crate::context::Contexts;
 use crate::osc::{self, Found};
 use crate::progress::Progress;
 use crate::replay;
@@ -97,6 +99,9 @@ pub struct Emulator {
     /// The latest `OSC 9 ; 4` report's progress, until a clear, a prompt or
     /// a reset ([`Found::progress_after`]).
     progress: Option<Progress>,
+    /// The open `OSC 3008` contexts, until they end or the program exits
+    /// ([`Emulator::process_exited`]); resets leave them.
+    contexts: Contexts,
     scanner: osc::Scanner,
     titles: Titles,
 }
@@ -120,6 +125,7 @@ impl Emulator {
             marks: Mutex::new(Marks::default()),
             records: Records::default(),
             progress: None,
+            contexts: Contexts::default(),
             scanner: osc::Scanner::new(),
             titles,
         }
@@ -146,10 +152,19 @@ impl Emulator {
                 Found::Status(message) => {
                     self.records.apply(&message);
                 }
+                Found::Context(message) => {
+                    self.contexts.apply(message);
+                }
                 Found::Progress(_) | Found::Notice(_) => {}
             }
         }
         self.parser.advance(&mut self.term, &self.marks, &bytes[fed..]);
+    }
+
+    /// The session's program exited: as in the client, its contexts end
+    /// (UAPI.15's hangup reset), so a replay after it carries none.
+    pub fn process_exited(&mut self) {
+        self.contexts.clear();
     }
 
     /// The user typed: as in the client, `done` and `error` records go.
@@ -173,7 +188,8 @@ impl Emulator {
             self.parser.stop_sync(&mut self.term, &self.marks);
         }
         let title = self.titles.0.lock().clone();
-        replay::render(&mut self.term, &self.marks.lock(), &self.records, self.progress, title.as_deref())
+        let marks = self.marks.lock();
+        replay::render(&mut self.term, &marks, &self.records, self.progress, &self.contexts, title.as_deref())
     }
 
     pub fn term(&self) -> &Term<Titles> {
@@ -191,6 +207,11 @@ impl Emulator {
     /// The session's `OSC 9 ; 4` progress, if any.
     pub fn progress(&self) -> Option<Progress> {
         self.progress
+    }
+
+    /// The session's open `OSC 3008` contexts.
+    pub fn contexts(&self) -> &Contexts {
+        &self.contexts
     }
 
     pub fn title(&self) -> Option<String> {
@@ -382,6 +403,49 @@ mod tests {
     /// The progress is replayed after the marks, so the replayed prompt's
     /// `A` doesn't drop it, and it survives a second emulator (a core
     /// restart from a checkpoint).
+    fn context_ids(emulator: &Emulator) -> Vec<String> {
+        emulator.contexts().iter().map(|(id, _)| id.as_str().to_owned()).collect()
+    }
+
+    #[test]
+    fn contexts_outlive_resets_prompts_and_screens_but_not_the_program() {
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
+        emulator.feed(b"\x1b]3008;start=a;type=elev");
+        emulator.feed(b"ate;targetuser=root\x1b\\");
+        assert_eq!(context_ids(&emulator), ["a"], "split across feeds");
+        emulator.feed(b"\x1bc\x1b[!p\x1b]133;A\x07$ \x1b[?1049hfull\x1b[?1049l");
+        emulator.input_seen();
+        assert_eq!(context_ids(&emulator), ["a"], "a reset, a soft reset, a prompt and the alternate screen leave it");
+        assert_eq!(emulator.contexts().notable().map(|b| b.label().to_owned()).as_deref(), Some("root"));
+        emulator.process_exited();
+        assert!(emulator.contexts().is_empty());
+    }
+
+    /// The stack is replayed after everything else, with its escapes, so
+    /// a fresh emulator (a client, or a core restarted from a checkpoint)
+    /// rebuilds it, and the replay's own `ESC c` doesn't end it.
+    #[test]
+    fn contexts_survive_a_render_and_two_emulators() {
+        let mut first = Emulator::new(30, 4, 50, PathStyle::Posix);
+        first.feed(
+            b"\x1b]3008;start=s;type=session\x07\x1b]133;A\x07$ \x1b]3008;start=e\\x3b1;type=elevate;targetuser=root\x07\
+              \x1bc\x1b]3008;start=c;type=container;container=web\\x3bdb\x07\x1b]3008;start=gone\x07\x1b]3008;end=gone\x07",
+        );
+        assert_eq!(context_ids(&first), ["s", "e;1", "c"]);
+        let render = first.render();
+        assert!(replays(&render, b"\x1b]3008;start=e\\x3b1;type=elevate;targetuser=root\x1b\\"));
+        let mut second = Emulator::new(30, 4, 50, PathStyle::Posix);
+        second.feed(&render);
+        assert_eq!(second.contexts(), first.contexts());
+        let mut third = Emulator::new(30, 4, 50, PathStyle::Posix);
+        third.feed(&second.render());
+        assert_eq!(third.contexts(), first.contexts());
+        assert_eq!(third.contexts().notable().map(|b| b.label().to_owned()).as_deref(), Some("web;db"));
+        // An exited program's replay has none.
+        first.process_exited();
+        assert!(!replays(&first.render(), b"\x1b]3008"));
+    }
+
     #[test]
     fn progress_survives_a_render_with_prompt_marks_and_two_emulators() {
         let mut first = Emulator::new(30, 4, 50, PathStyle::Posix);

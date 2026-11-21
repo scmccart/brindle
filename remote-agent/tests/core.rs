@@ -1089,6 +1089,56 @@ fn attaching_replays_progress_and_so_does_a_restarted_core() {
     assert_eq!(screen.progress(), paused);
 }
 
+/// The core keeps a detached session's contexts (OSC 3008) through the
+/// `ESC c` and prompt after them, and an attach replays them, as does a
+/// restarted core. Once the program exits they are gone with it: the
+/// client gets the `EXIT`, and an attach after it is refused rather than
+/// replaying them.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_contexts_until_the_program_exits() {
+    let mut dir = TempDir::new("attach-contexts");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    // The text comes after the sequences, so a screen that shows it has
+    // had them.
+    let fixture = b"\x1b]3008;start=s1;type=session;user=me\x1b\\\
+        \x1b]3008;start=e1;type=elevate;user=me;targetuser=root\x1b\\\
+        \x1bc\x1b]133;A\x07# \x1b]3008;start=c\\x3b1;type=container;container=web\x07\
+        \x1b]3008;end=c\\x3b1\x07elevated\r\n";
+    let path = dir.path.join("fixture");
+    fs::write(&path, fixture).unwrap();
+    // It exits on the first byte it is sent.
+    let mut spawn = client_shell(&format!(
+        "stty raw -echo; cat '{}'; head -c 1 >/dev/null",
+        path.display()
+    ));
+    spawn.scrollback = 1000;
+    spawn.policy = client::Policy::Detach;
+    let (session, pid) = client.spawn(spawn);
+    client.detach(session);
+    dir.track(parent(pid).unwrap());
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let ids = |screen: &brindle_term_core::emulator::Emulator| -> Vec<String> {
+        screen.contexts().iter().map(|(id, _)| id.as_str().to_owned()).collect()
+    };
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(ids(&screen), ["s1", "e1"]);
+    let badge = screen.contexts().notable().unwrap();
+    assert_eq!(badge.label(), "root");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(start.pid, pid);
+    assert_eq!(ids(&screen), ["s1", "e1"]);
+
+    other.input(session, b"x");
+    other.exit_code(session);
+    let mut late = TestClient::hello(&dir.path, "late");
+    assert!(late.attach(session, 80, 24).is_err(), "an exited session replayed");
+}
+
 #[cfg(unix)]
 #[test]
 fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {

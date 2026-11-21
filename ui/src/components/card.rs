@@ -26,11 +26,11 @@
 use gpui::{
     AnyElement, App, Bounds, Div, ElementId, Hsla, InteractiveElement, Interactivity, IntoElement, ParentElement,
     PathBuilder, Pixels, Point, Refineable, RenderOnce, SharedString, Stateful, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, canvas, div, point, prelude::FluentBuilder, px,
+    StyleRefinement, Styled, Window, canvas, div, point, prelude::FluentBuilder, px, FontWeight,
 };
 
+use crate::components::badge::{Badge, TitleText, title_and_badge};
 use crate::components::{EdgeBar, FocusRing};
-use crate::components::tabs::trigger_label;
 use crate::style::{CardColors, CardStyle, card_style};
 use crate::theme::ActiveTheme;
 
@@ -48,6 +48,7 @@ pub struct CardHeader {
     title_muted: bool,
     actions: Vec<AnyElement>,
     edge_bar: Option<EdgeBar>,
+    badge: Option<Badge>,
 }
 
 impl CardHeader {
@@ -60,7 +61,16 @@ impl CardHeader {
             title_muted: false,
             actions: Vec::new(),
             edge_bar: None,
+            badge: None,
         }
+    }
+
+    /// A badge right after the title, cut only once the title is down to
+    /// its first [`TITLE_KEEPS`](crate::TITLE_KEEPS) characters, as on a
+    /// tab trigger ([`Badge`]); the header keeps its height.
+    pub fn badge(mut self, badge: Badge) -> Self {
+        self.badge = Some(badge);
+        self
     }
 
     /// Something before the title: a status dot, an icon. It keeps its size
@@ -99,8 +109,10 @@ impl CardHeader {
     }
 
     /// The header row in style `s`.
-    fn build(self, s: &CardStyle) -> Stateful<Div> {
-        let Self { mut base, leading, title, title_muted, actions, edge_bar } = self;
+    fn build(self, s: &CardStyle, window: &mut Window, cx: &App) -> Stateful<Div> {
+        let Self { mut base, leading, title, title_muted, actions, edge_bar, badge } = self;
+        let text = TitleText { size: s.text_size, weight: FontWeight::NORMAL };
+        let (title, badge) = title_and_badge(title, badge, text, window, cx);
         // The owner's refinements (a cursor), applied over the header's own.
         let owner = std::mem::take(base.style());
         let mut header = base
@@ -116,9 +128,12 @@ impl CardHeader {
             .text_size(s.text_size)
             .text_color(if title_muted { s.muted } else { s.text })
             .children(leading)
-            .child(trigger_label(title))
+            .child(title)
+            .children(badge)
             .when(!actions.is_empty(), |d| {
-                d.child(div().flex().flex_none().items_center().gap_0p5().text_color(s.muted).children(actions))
+                // At the end, whether the title fills the row or (beside a
+                // badge) only its own width.
+                d.child(div().flex().flex_none().ml_auto().items_center().gap_0p5().text_color(s.muted).children(actions))
             })
             // Over the bottom edge, above the border line; the header's
             // bottom corners are square.
@@ -254,7 +269,7 @@ impl RenderOnce for Card {
             .border(border)
             .border_color(s.border)
             .rounded(radius)
-            .when_some(self.header, |d, header| d.child(header.build(&s)))
+            .when_some(self.header, |d, header| d.child(header.build(&s, window, cx)))
             .child(content)
             .child(cutouts);
         // The owner's layout refinements win over the component's.

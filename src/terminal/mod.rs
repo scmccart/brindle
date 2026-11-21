@@ -28,7 +28,7 @@ mod server;
 pub const SINK_PANIC: &str = "BRINDLE_TEST_SINK_PANIC";
 // Moved to `brindle-term-core`, which the server core shares.
 pub use brindle_term_core::emulator::MIN_COLS;
-pub use brindle_term_core::{progress, shell_integration, status};
+pub use brindle_term_core::{context, progress, shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -49,6 +49,7 @@ use gpui::{ClipboardItem, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
 use self::events::{EventGate, Merge, Recovered};
+use self::context::{Badge, Contexts};
 use self::pace::Pace;
 use self::progress::Progress;
 use self::shell_integration::{Marks, Parser};
@@ -308,6 +309,12 @@ pub struct Terminal {
     /// The program's progress (OSC 9;4), until a clear report, a new
     /// prompt, a reset or the program's end.
     progress: Option<Progress>,
+    /// The program's open contexts (OSC 3008), until they end, the program
+    /// ends, or a replay begins (which rebuilds them).
+    contexts: Contexts,
+    /// `contexts`' notable context, recomputed whenever `contexts` changes,
+    /// so the chrome never computes it while drawing.
+    badge: Option<Badge>,
     /// Whether the directory the program reports exists, where that is the
     /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
     /// refreshed when output brings another report, by a check off the UI
@@ -384,6 +391,11 @@ impl Terminal {
             ChannelEvent::Foreground => self.merged(Merge::Foreground, cx),
             ChannelEvent::Replay(active) => {
                 self.replaying = active;
+                // A replay's `ESC c` ends no context, and it carries the
+                // session's open ones, so the old stack goes first.
+                if active && self.clear_contexts() {
+                    cx.emit(TerminalEvent::Status(None));
+                }
                 if !active {
                     self.release_notes(cx);
                 }
@@ -434,8 +446,15 @@ impl Terminal {
         if statuses {
             self.status.reset();
             self.progress = None;
+            self.clear_contexts();
             cx.emit(TerminalEvent::Status(None));
         }
+    }
+
+    /// Drops every context and the badge; true when there were any.
+    fn clear_contexts(&mut self) -> bool {
+        self.badge = None;
+        self.contexts.clear()
     }
 
     #[allow(
@@ -471,6 +490,8 @@ impl Terminal {
             replaying: false,
             status: status::Records::default(),
             progress: None,
+            contexts: Contexts::default(),
+            badge: None,
             dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
@@ -715,7 +736,8 @@ impl Terminal {
     }
 
     /// Moves the terminal's life on by `event`. True when that ended a
-    /// running terminal, whose status activity and progress then end.
+    /// running terminal, whose status activity, progress and contexts then
+    /// end.
     fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
         let was = self.life;
         self.life = was.after(event);
@@ -723,7 +745,8 @@ impl Terminal {
         if ended {
             let activity = self.status.end_activity();
             let progress = self.progress.take().is_some();
-            if activity || progress {
+            let contexts = self.clear_contexts();
+            if activity || progress || contexts {
                 cx.emit(TerminalEvent::Status(None));
             }
         }
@@ -738,6 +761,17 @@ impl Terminal {
     /// The program's progress (OSC 9;4), if it reported one.
     pub fn progress(&self) -> Option<Progress> {
         self.progress
+    }
+
+    /// The program's open contexts (OSC 3008), outermost first.
+    pub fn contexts(&self) -> &Contexts {
+        &self.contexts
+    }
+
+    /// The badge of the program's notable context, if any
+    /// ([`Contexts::notable`]).
+    pub fn badge(&self) -> Option<&Badge> {
+        self.badge.as_ref()
     }
 
     /// Emits an event the output caused, quietly during a replay.
@@ -771,6 +805,15 @@ impl Terminal {
                 return;
             }
             Found::Progress(_) => false,
+            // The same stack the server's emulator keeps, so a replay
+            // agrees; resets and prompts leave it.
+            Found::Context(message) => {
+                let changed = self.contexts.apply(message);
+                if changed {
+                    self.badge = self.contexts.notable();
+                }
+                changed
+            }
             Found::PromptStart => self.status.end_activity(),
             Found::Reset => self.status.reset(),
         };

@@ -69,6 +69,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
 | `term-core/src/progress.rs` | a terminal's OSC 9;4 progress after each report, and which of its terminals' progress a tab's bar shows |
+| `term-core/src/context.rs` | a terminal's OSC 3008 context stack after each start or end, its limits, and the badge its notable context gives |
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
 | `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment, the Unix default program |
 | `src/terminal/dir_check.rs` | whether the directory a local program last reported exists, from checks the terminal runs off the UI thread: which directory to check next, one at a time, and which answer still counts |
