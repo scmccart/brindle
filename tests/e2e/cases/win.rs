@@ -739,11 +739,13 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
 /// in PowerShell 7 and 5.1: Copy Last Command Line copies the line as typed,
 /// `;` included, which the shell then reads back with `Get-Clipboard`
 /// (printed as `clip=[…]`, split so the typed line doesn't match). Windows
-/// PowerShell is skipped where it isn't installed.
+/// PowerShell is skipped where it isn't installed. The command prints only
+/// its marker: a table before it would end in a blank line, and the wait for
+/// the marker over the next prompt would never match.
 fn pwsh_line(ctx: &Ctx) -> Result<Outcome> {
     let bin = ctx.bin.display().to_string().replace('\\', "/");
     let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
-    let typed = "Get-ChildItem C:/; 'gci' + 'done'";
+    let typed = "$null = Get-ChildItem C:/; 'gci' + 'done'";
     let send = format!("{typed}\r");
     for shell in ["pwsh.exe", "powershell.exe"] {
         if shell == "powershell.exe" && !on_path(shell) {
