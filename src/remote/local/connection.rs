@@ -2863,12 +2863,32 @@ pub(super) mod fake {
         pub hello: mpsc::Receiver<Hello>,
         /// The client's heartbeats, which the relay drops.
         pub heartbeats: Arc<AtomicUsize>,
-        /// The next `LIST` is a test's round trip: the far end answers it
-        /// with no sessions itself, without the link's `answer`.
-        pub settle: Arc<AtomicBool>,
+        /// The request of a test's round trip ([`Far::round_trip`]): the far
+        /// end answers the `LIST` with this id itself, with no sessions and
+        /// without the link's `answer`.
+        settle: Arc<Mutex<Option<RequestId>>>,
     }
 
     impl Far {
+        /// A round trip through this link: `connection` sends a `LIST`,
+        /// which the far end answers itself, with no sessions, once it has
+        /// read everything the client sent before. The far end knows the
+        /// `LIST` by its request id, told before the `LIST` is sent, never
+        /// by its place: a link sends `LIST`s of its own (after a loss, or
+        /// for a listing hook), which the far end may still have to read.
+        /// Returns the id, to tell the round trip's `LIST` among the
+        /// messages the far end got.
+        pub fn round_trip(&self, connection: &Connection) -> RequestId {
+            let mut asked = None;
+            let listed = connection.ask("list its sessions", None, None, |req, reply| {
+                *self.settle.lock() = Some(req);
+                asked = Some(req);
+                (Waiting::List(reply), Some(ToCore::List(Request { req })))
+            });
+            assert!(listed.unwrap().is_empty(), "the round trip's LIST");
+            asked.expect("the request was made")
+        }
+
         pub fn next(&self) -> ToCore {
             self.got.recv_timeout(Duration::from_secs(10)).expect("a message")
         }
@@ -2889,7 +2909,7 @@ pub(super) mod fake {
         let (got_tx, got) = mpsc::channel();
         let (hello_tx, hello) = mpsc::channel();
         let heartbeats = Arc::new(AtomicUsize::new(0));
-        let settle = Arc::new(AtomicBool::new(false));
+        let settle = Arc::new(Mutex::new(None));
         let (far, counting, settling) = (out.clone(), heartbeats.clone(), settle.clone());
         std::thread::spawn(move || {
             let mut welcomed = false;
@@ -2915,7 +2935,7 @@ pub(super) mod fake {
                     continue;
                 }
                 match &message {
-                    ToCore::List(list) if settling.swap(false, Ordering::AcqRel) => {
+                    ToCore::List(list) if *settling.lock() == Some(list.req) => {
                         far.send(ToClient::Sessions(client::Sessions { req: list.req, sessions: Vec::new() }));
                     }
                     _ => answer(&message, &far),
@@ -3066,14 +3086,14 @@ mod tests {
     /// client takes the answer only after everything the far end sent
     /// before it. So once this returns, the tabs have been told all the far
     /// end caused, and `far` has had every message the client sent before:
-    /// those are returned, the `LIST` left out.
+    /// those are returned, the round trip's `LIST` left out. A `LIST` of
+    /// the link's own that the test hasn't taken is among them.
     fn settled(connection: &Connection, far: &fake::Far) -> Vec<ToCore> {
-        far.settle.store(true, Ordering::Release);
-        assert!(connection.list().unwrap().is_empty(), "the round trip's LIST");
+        let round_trip = far.round_trip(connection);
         let mut before = Vec::new();
         loop {
             match far.next() {
-                ToCore::List(_) => return before,
+                ToCore::List(list) if list.req == round_trip => return before,
                 other => before.push(other),
             }
         }
