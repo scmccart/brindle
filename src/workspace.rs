@@ -37,7 +37,7 @@ use crate::picker::{
 };
 use crate::settings::Zoom;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Badge as UiBadge, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
@@ -49,6 +49,7 @@ use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
 use crate::terminal::process::Snapshot;
 use crate::terminal::shell_integration::PathStyle;
+use crate::terminal::context::Badge;
 use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
@@ -97,6 +98,10 @@ pub struct Tab {
     /// The most pressing progress (OSC 9;4) across the tab's terminals,
     /// drawn as the bar on its face; refreshed with `status`.
     pub progress: Option<Progress>,
+    /// The active zone's context badge (OSC 3008), drawn after the title on
+    /// its face; refreshed with `status`, and when another zone becomes
+    /// active (the tree's `TitleChanged`).
+    pub badge: Option<Badge>,
     /// A user-chosen label (`Rename Tab`), shown instead of the automatic
     /// title until changed or cleared.
     manual_title: Option<String>,
@@ -124,6 +129,7 @@ impl Tab {
             bell: false,
             status: None,
             progress: None,
+            badge: None,
             manual_title: None,
             title: SharedString::default(),
             _subscriptions: subscriptions,
@@ -1230,11 +1236,23 @@ impl Workspace {
                 self.on_attention(ix, event, window, cx)
             }
             TerminalEvent::TitleChanged => {
-                if self.tabs[ix].refresh_title(&mut None, cx) {
+                // The tree says so when another zone becomes active, whose
+                // badge the face then shows.
+                if self.tabs[ix].refresh_title(&mut None, cx) | self.refresh_badge(ix, cx) {
                     cx.notify();
                 }
             }
         }
+    }
+
+    /// Takes tab `ix`'s badge from its active zone's cached one; true when
+    /// it changed.
+    fn refresh_badge(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+        let badge = self.tabs[ix].zones.read(cx).active_badge().cloned();
+        let tab = &mut self.tabs[ix];
+        let changed = tab.badge != badge;
+        tab.badge = badge;
+        changed
     }
 
     /// A bell, a notification request or a program status change from tab
@@ -1278,8 +1296,9 @@ impl Workspace {
     fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
         let status = self.tabs[ix].status_summary(cx);
         let progress = self.tabs[ix].zones.read(cx).progress_summary();
+        let badge = self.refresh_badge(ix, cx);
         let tab = &mut self.tabs[ix];
-        if (tab.status, tab.progress) != (status, progress) {
+        if (tab.status, tab.progress) != (status, progress) || badge {
             (tab.status, tab.progress) = (status, progress);
             cx.notify();
         }
@@ -2196,9 +2215,14 @@ impl Workspace {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
+            out.push_str(&terminal.contexts().describe());
             out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_progress());
+            }
+            out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_badges());
             }
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_zones());
@@ -2321,6 +2345,12 @@ impl Workspace {
                 }
                 if let Some(progress) = tab.progress {
                     trigger = trigger.edge_bar(progress_bar(progress));
+                }
+                // The face's own theme colours its badge, as it does the
+                // face: red for an elevation, its muted text otherwise.
+                if let Some(badge) = &tab.badge {
+                    let color = tab.zones.read(cx).theme.badge_color(badge.kind());
+                    trigger = trigger.badge(UiBadge::new(badge.label().to_owned(), color));
                 }
                 if tab.bell {
                     trigger = trigger.adornment(dot(tokens.primary));
@@ -2879,6 +2909,16 @@ fn describe_tab_progress(tabs: impl IntoIterator<Item = Option<Progress>>) -> St
     tabs.into_iter()
         .enumerate()
         .filter_map(|(ix, progress)| Some(format!("--- progress tab={} {}\n", ix + 1, progress?.describe())))
+        .collect()
+}
+
+/// The tabs' context badges, for `--dump-screen-after`: `--- badge tab=N
+/// kind=… label="…"` for each tab whose face shows one, numbered from 1 as
+/// the `--- tab` lines are.
+fn describe_tab_badges<'a>(tabs: impl IntoIterator<Item = Option<&'a Badge>>) -> String {
+    tabs.into_iter()
+        .enumerate()
+        .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, badge?.describe())))
         .collect()
 }
 
@@ -3580,6 +3620,16 @@ mod tests {
             "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
+    }
+
+    #[test]
+    fn tab_badge_lines_name_the_tabs_with_a_badge() {
+        use crate::terminal::context::{Contexts, parse};
+        let mut contexts = Contexts::default();
+        contexts.apply(parse(b"start=a;type=remote;targetuser=me;targethost=box").unwrap());
+        let badge = contexts.notable();
+        assert_eq!(describe_tab_badges([None, None]), "");
+        assert_eq!(describe_tab_badges([None, badge.as_ref()]), "--- badge tab=2 kind=elsewhere label=\"me@box\"\n");
     }
 
     #[test]

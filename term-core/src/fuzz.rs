@@ -164,6 +164,17 @@ pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
             format!("9;4;{state}{percent}")
         }
         10 => format!("{};{}", pick(rng, &["9", "777", "777;notify", "0009;x", "9;4"]), name(rng, 20)),
+        // UAPI.15's contexts: starts and ends of a few ids (so they nest,
+        // update and end), escapes good and bad, long values, unknown
+        // types and fields, and a missing or misplaced `start=`.
+        11 if rng.below(2) == 0 => {
+            let id = pick(rng, &["a", "b", "c", "d", "a\\x3bb", "", "\\x", "\\x0a", "é"]);
+            let verb = pick(rng, &["start=", "start=", "start=", "end=", "type=shell;start=", "", "start"]);
+            let kind = pick(rng, &["", ";type=elevate", ";type=container", ";type=remote", ";type=shell", ";type=spaceship"]);
+            let long = "v".repeat(rng.below(300));
+            let field = pick(rng, &["", ";targetuser=root", ";container=web\\x3bdb", ";vm=\\xff", ";hostname=h\\q", ";pid=12", ";novalue"]);
+            format!("3008;{verb}{id}{kind}{field};comm={long}")
+        }
         _ => {
             let len = rng.below(24);
             return [format!("{};", rng.below(10_000)).into_bytes(), rng.bytes(len)].concat();
@@ -266,6 +277,9 @@ fn the_emulator_never_panics_on_random_streams() {
         assert!(fresh.records().iter().count() <= status::MAX_RECORDS);
         // The progress is replayed last, so nothing in the replay drops it.
         assert_eq!(fresh.progress(), emulator.progress(), "round {round}");
+        // Nothing in a replay ends a context, and none outlives the limit.
+        assert!(emulator.contexts().iter().count() <= crate::context::MAX_DEPTH);
+        assert_eq!(fresh.contexts(), emulator.contexts(), "round {round}");
     }
 }
 

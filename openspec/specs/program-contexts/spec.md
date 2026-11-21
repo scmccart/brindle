@@ -1,0 +1,61 @@
+# program-contexts Specification
+
+## Purpose
+Track the nested contexts (elevation, containers, VMs, remote logins, commands) that systemd and other programs announce with OSC 3008, so Brindle can show where a terminal's output is coming from.
+
+## Requirements
+
+### Requirement: Context sequence recognition
+Brindle SHALL recognise `ESC ] 3008 ; start=<id> [; <field>=<value>]…` and `ESC ] 3008 ; end=<id> [; <field>=<value>]…`, ended by BEL or ST, in the output of every terminal, however the output is split into reads. `start=` or `end=` SHALL come first; otherwise the sequence is ignored. A cancelled sequence or one longer than 4096 bytes SHALL be ignored. No sequence SHALL change the grid.
+
+#### Scenario: run0
+- **WHEN** a program prints `ESC ] 3008 ; start=a1 ; type=elevate ; user=me ; targetuser=root ESC \`
+- **THEN** the terminal's active context is `a1`, of type `elevate`, with target user `root`
+
+#### Scenario: Not first
+- **WHEN** a program prints `ESC ] 3008 ; type=elevate ; start=a1 ESC \`
+- **THEN** the terminal's contexts don't change
+
+### Requirement: Context identifiers and fields
+An id SHALL be 1 to 64 bytes in 0x20–0x7E without a raw `;` or `\`; a sequence with any other id SHALL be ignored. In ids and values, `\xHH` SHALL decode to that byte. Fields are `name=value`, in any order. An unknown field, a value over 255 bytes, a value with a control character or invalid UTF-8 after decoding, and a `type` outside UAPI.15's list SHALL be dropped, and the rest kept.
+
+#### Scenario: Escaped separator
+- **WHEN** a program prints `ESC ] 3008 ; start=c1 ; type=container ; container=web\x3bdb ESC \`
+- **THEN** context `c1` has the container name `web;db`
+
+#### Scenario: Bad type
+- **WHEN** a program prints `ESC ] 3008 ; start=x ; type=spaceship ; hostname=h ESC \`
+- **THEN** context `x` exists with no type and the hostname `h`
+
+### Requirement: Context nesting
+A start with a new id SHALL make it the active context, its parent being the context active before. A start with a known id SHALL replace that context's fields, end its subcontexts and make it active. An end SHALL end that context and its subcontexts, making its parent active; an end for an unknown id SHALL be ignored. Past 32 contexts, a new start SHALL be ignored and earlier contexts kept.
+
+#### Scenario: Container inside an elevation
+- **WHEN** contexts `a` (elevate) then `b` (container) start, and then `ESC ] 3008 ; end=a ESC \` arrives
+- **THEN** the terminal has no contexts
+
+#### Scenario: Unknown end
+- **WHEN** context `a` is active and `ESC ] 3008 ; end=zzz ESC \` arrives
+- **THEN** `a` is still active
+
+#### Scenario: Too deep
+- **WHEN** 32 contexts are open and a 33rd starts
+- **THEN** the 33rd is not recorded, and an `end` for the 32nd makes the 31st active
+
+### Requirement: Context lifetime
+A terminal's contexts SHALL be dropped when its process exits. A full reset (`ESC c`), a soft reset, a new shell prompt and switching screens SHALL NOT affect them, and they SHALL NOT expire on their own.
+
+#### Scenario: Reset inside run0
+- **WHEN** a context of type `elevate` is active and the program prints `ESC c`
+- **THEN** the context is still active
+
+### Requirement: Notable context
+A terminal's notable context SHALL be the innermost context of type `elevate`, `chpriv`, `remote`, `container` or `vm` among the active context and its ancestors. Its label SHALL be the target user (else `elevated`) for `elevate` and `chpriv`; `targetuser@targethost`, the target host alone, else `remote` for `remote`; and the container or VM name, else `container` or `vm`. Labels over 24 characters SHALL end in `…`.
+
+#### Scenario: Shell inside a container
+- **WHEN** a `container` context with `container=web` is active, and a `shell` context starts inside it
+- **THEN** the terminal's notable context is the container, labelled `web`
+
+#### Scenario: No notable context
+- **WHEN** only `session` and `shell` contexts are open
+- **THEN** the terminal has no notable context

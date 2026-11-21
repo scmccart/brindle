@@ -6,6 +6,7 @@ use std::fmt;
 use gpui::{Hsla, Rgba};
 use serde::{Deserialize, Deserializer};
 
+use crate::terminal::context::BadgeKind;
 use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
 
@@ -233,6 +234,16 @@ impl Theme {
             Progress::Indeterminate => muted.opacity(INDETERMINATE_OPACITY),
         };
         (progress.fraction(), color)
+    }
+
+    /// A context badge's colour on a face or header in this theme: its red
+    /// (ANSI 1) for an elevation or privilege change, else the muted text
+    /// the theme's cards use, legible on its background.
+    pub fn badge_color(&self, kind: BadgeKind) -> Hsla {
+        match kind {
+            BadgeKind::Privileged => self.ansi[1].hsla(),
+            BadgeKind::Elsewhere => self.card_muted_foreground().hsla(),
+        }
     }
 
     pub fn is_dark(&self) -> bool {
@@ -561,6 +572,15 @@ mod tests {
         assert_eq!(theme.status_color(State::Done, muted), theme.ansi[2].hsla());
         assert_eq!(theme.status_color(State::Working, muted), muted);
         assert_eq!(theme.status_color(State::Idle, muted), muted);
+    }
+
+    #[test]
+    fn privileged_badges_are_red_and_the_rest_muted() {
+        for name in ["tokyo-night", "brindle-light"] {
+            let theme = builtin_theme(name).unwrap();
+            assert_eq!(theme.badge_color(BadgeKind::Privileged), theme.ansi[1].hsla(), "{name}");
+            assert_eq!(theme.badge_color(BadgeKind::Elsewhere), theme.card_muted_foreground().hsla(), "{name}");
+        }
     }
 
     /// Progress bars: muted for normal, the theme's red for error and

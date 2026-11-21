@@ -73,6 +73,12 @@ impl Screen {
         self.guard(id, "resizing", |emulator| emulator.resize(cols, rows));
     }
 
+    /// The session's program exited: its contexts (OSC 3008) end, so a
+    /// replay sent after it shows none.
+    pub(super) fn process_exited(&mut self, id: SessionId) {
+        self.guard(id, "ending its contexts", Emulator::process_exited);
+    }
+
     /// The user typed into the session.
     pub(super) fn input_seen(&mut self, id: SessionId) {
         self.guard(id, "taking input", Emulator::input_seen);
